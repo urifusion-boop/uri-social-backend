@@ -1,0 +1,24 @@
+version: "3.9"
+
+services:
+  uri-agent.api:
+    image: uriteam/urisvc:uriagentdev
+    container_name: uri-agent.api
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "80", "--workers", "4"]
+    env_file:
+      - .env
+    environment:
+      - ENV=Development
+      - URI_GATEWAY_BASE_API_URL=http://uri-gateway.api
+    restart: always
+    ports:
+      - "9003:80"
+    networks:
+      - uritest-network
+
+networks:
+  uritest-network:
+    external: true

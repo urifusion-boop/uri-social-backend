@@ -1,0 +1,9 @@
+from enum import Enum
+
+
+class MicroServiceTypeEnum(str, Enum):
+    URI_INSIGHTS = "URI_INSIGHTS"
+    URI_BACKEND = "URI_BACKEND"
+    URI_TASK_MANAGER = "URI_TASK_MANAGER"
+    URI_FRONTEND = "URI_FRONTEND"
+    URI_TRANSACTIONS = "URI_TRANSACTIONS"
