@@ -25,10 +25,9 @@ class SocialAccountService:
         The frontend should open each auth_url for the user to authorise.
         """
         outstand = OutstandService()
-        callback_url = (
-            f"{settings.URI_GATEWAY_BASE_API_URL}"
-            "/uri-insights/social-media/connect/callback/outstand"
-        )
+        _base = settings.URI_GATEWAY_BASE_API_URL.rstrip("/")
+        _prefix = "" if _base in ("http://localhost:9003", "http://127.0.0.1:9003") else "/uri-insights"
+        callback_url = f"{_base}{_prefix}/social-media/connect/callback/outstand"
 
         auth_urls: Dict[str, str] = {}
         unsupported: List[str] = []

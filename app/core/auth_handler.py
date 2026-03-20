@@ -8,6 +8,20 @@ from app.core.config import settings
 
 SECRET_KEY = settings.AUTHJWT_SECRET_KEY
 ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_SECONDS = 60 * 60 * 24  # 24 hours
+
+
+def sign_jwt(user_id: str, email: str, first_name: str = "", last_name: str = "") -> str:
+    payload = {
+        "exp": time.time() + ACCESS_TOKEN_EXPIRE_SECONDS,
+        "claims": {
+            "userId": user_id,
+            "email": email,
+            "firstName": first_name,
+            "lastName": last_name,
+        },
+    }
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
 
 def decode_jwt(token: str) -> Any:

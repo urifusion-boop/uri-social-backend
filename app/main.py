@@ -7,6 +7,7 @@ from app.database import connect_to_mongo
 from app.core.config import settings
 from app.core.sentry_config import initialize_sentry
 from app.agents.social_media_manager.routers.complete_social_manager import router as social_media_router
+from app.routers.auth_router import router as auth_router
 
 # Initialize Sentry
 initialize_sentry()
@@ -39,6 +40,8 @@ app.add_middleware(
 def http_exception_handler(request, exc):
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 
+
+app.include_router(auth_router)
 
 app.include_router(
     social_media_router,

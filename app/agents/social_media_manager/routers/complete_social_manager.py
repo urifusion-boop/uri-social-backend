@@ -1,11 +1,13 @@
 # app/agents/social_media_manager/routers/complete_social_manager.py
 
+import asyncio
+import json
 import traceback
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query, UploadFile, File
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, StreamingResponse
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from pydantic import BaseModel, Field
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, AsyncGenerator
 from datetime import datetime
 
 from app.dependencies import get_db_dependency
@@ -212,10 +214,20 @@ async def generate_content(
             db=db,
         )
 
-        # If images were requested, kick off a background task per draft.
-        # The response is returned to the frontend before image generation starts.
+        # If images were requested, mark drafts as has_image=True immediately so the
+        # frontend shimmer shows right away, then kick off background generation.
         if request.include_images and result.get("status"):
             drafts = result.get("responseData", {}).get("drafts", [])
+            draft_ids = [d["id"] for d in drafts if d.get("id")]
+            if draft_ids:
+                await db["content_drafts"].update_many(
+                    {"id": {"$in": draft_ids}},
+                    {"$set": {"has_image": True}},
+                )
+                # Mirror the flag in the response so the frontend sees it immediately
+                for d in drafts:
+                    d["has_image"] = True
+
             for draft in drafts:
                 background_tasks.add_task(
                     _generate_image_bg,
@@ -655,13 +667,13 @@ async def get_content_calendar(
                 "_draft_key": {"$ifNull": ["$id", "$draft_id"]},
             }},
             {"$addFields": {
-                "has_image": "$_img_exists",
+                "has_image": {"$or": ["$_img_exists", {"$eq": ["$has_image", True]}]},
                 "image_url": {
                     "$cond": {
                         "if": "$_img_is_base64",
                         # Return a relative path — the frontend prepends its own API base URL
                         "then": {"$concat": [
-                            "/uri-insights/social-media/draft-image/", "$_draft_key"
+                            "/social-media/draft-image/", "$_draft_key"
                         ]},
                         "else": {"$cond": {
                             "if": "$_img_exists",
@@ -817,6 +829,86 @@ async def get_draft_image(
     mime_type = match.group(1)
     image_bytes = base64.b64decode(match.group(2))
     return Response(content=image_bytes, media_type=mime_type)
+
+
+@router.get("/drafts/{draft_id}")
+async def get_draft(
+    draft_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """Get a single draft by ID — poll this to check if an image has been generated."""
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    draft = await db["content_drafts"].find_one({"id": draft_id, "user_id": user_id}, {"_id": 0})
+    if not draft:
+        raise HTTPException(status_code=404, detail="Draft not found")
+
+    # Serve base64 images via proxy path (same logic as content-calendar)
+    img = draft.get("image_url") or ""
+    if img.startswith("data:"):
+        draft["image_url"] = f"/social-media/draft-image/{draft_id}"
+        draft["has_image"] = True
+
+    return UriResponse.get_single_data_response("draft", draft)
+
+
+@router.get("/drafts/{draft_id}/image-stream")
+async def stream_draft_image(
+    draft_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    SSE stream — sends a `image_ready` event with the draft payload the moment
+    an image lands on the draft. Times out after 3 minutes.
+
+    Frontend usage:
+        const es = new EventSource(`/social-media/drafts/${draftId}/image-stream?token=...`)
+        es.addEventListener('image_ready', e => { const draft = JSON.parse(e.data); es.close() })
+        es.addEventListener('timeout', () => es.close())
+    """
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    async def event_stream() -> AsyncGenerator[str, None]:
+        poll_interval = 2   # seconds between DB checks
+        max_wait = 180      # seconds before giving up
+        elapsed = 0
+
+        yield "event: connected\ndata: {}\n\n"
+
+        while elapsed < max_wait:
+            await asyncio.sleep(poll_interval)
+            elapsed += poll_interval
+
+            draft = await db["content_drafts"].find_one(
+                {"id": draft_id, "user_id": user_id},
+                {"_id": 0}
+            )
+            if draft and draft.get("has_image") and draft.get("image_url"):
+                img = draft.get("image_url", "")
+                if img.startswith("data:"):
+                    draft["image_url"] = f"/social-media/draft-image/{draft_id}"
+                payload = json.dumps(draft)
+                yield f"event: image_ready\ndata: {payload}\n\n"
+                return
+
+            yield f"event: waiting\ndata: {elapsed}\n\n"
+
+        yield "event: timeout\ndata: Image generation took too long\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.get("/test")
