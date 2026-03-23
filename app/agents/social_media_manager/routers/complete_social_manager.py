@@ -135,6 +135,7 @@ class BrandProfileRequest(BaseModel):
     # Identity
     logo_url: Optional[str] = None
     brand_colors: Optional[List[str]] = None
+    sample_template_urls: Optional[List[str]] = None
     # Personality
     personality_quiz: Optional[Dict[str, str]] = None
     derived_voice: Optional[str] = None
@@ -1083,6 +1084,70 @@ async def upload_brand_logo(
         )
 
         return UriResponse.get_single_data_response("logo_upload", {"logo_url": logo_url})
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/brand-profile/sample-template")
+async def upload_sample_template(
+    file: UploadFile = File(...),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Upload a sample design or content template. Stores it to imgBB and appends
+    the public URL to the user's brand profile sample_template_urls list.
+    Accepted formats: PNG, JPG, WEBP, PDF. Max 10 MB per file.
+    """
+    import base64
+    import httpx
+
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    allowed_types = {"image/png", "image/jpeg", "image/jpg", "image/webp", "application/pdf"}
+    if file.content_type not in allowed_types:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type: {file.content_type}. Use PNG, JPG, WEBP, or PDF.",
+        )
+
+    try:
+        contents = await file.read()
+        if len(contents) > 10 * 1024 * 1024:  # 10 MB limit
+            raise HTTPException(status_code=400, detail="File must be under 10 MB.")
+
+        b64 = base64.b64encode(contents).decode()
+
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                "https://api.imgbb.com/1/upload",
+                data={"key": settings.IMGBB_API_KEY, "image": b64, "name": file.filename},
+            )
+            resp_json = resp.json()
+
+        if not resp_json.get("success"):
+            raise HTTPException(
+                status_code=502,
+                detail=f"File host upload failed: {resp_json.get('error', {}).get('message', 'unknown error')}",
+            )
+
+        file_url = resp_json["data"]["url"]
+
+        await db["brand_profiles"].update_one(
+            {"user_id": user_id},
+            {
+                "$push": {"sample_template_urls": file_url},
+                "$set": {"updated_at": datetime.utcnow()},
+            },
+            upsert=True,
+        )
+
+        return UriResponse.get_single_data_response("sample_template_upload", {"file_url": file_url})
 
     except HTTPException:
         raise

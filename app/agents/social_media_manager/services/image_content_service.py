@@ -200,6 +200,20 @@ class ImageContentService:
             )
 
             if image_response.get('success'):
+                # Composite brand logo onto generated image if available
+                logo_url = (brand_context or {}).get('logo_url')
+                if logo_url:
+                    import re as _re_logo
+                    data_url = image_response['url']
+                    _m = _re_logo.match(r"data:[^;]+;base64,(.+)", data_url, _re_logo.DOTALL)
+                    if _m:
+                        loop = asyncio.get_running_loop()
+                        b64_final = await loop.run_in_executor(
+                            None,
+                            lambda: ImageContentService._overlay_logo(_m.group(1), logo_url)
+                        )
+                        image_response['url'] = f"data:image/webp;base64,{b64_final}"
+
                 return UriResponse.get_single_data_response("platform_image", {
                     "image_url": image_response['url'],
                     "platform": platform,
@@ -245,12 +259,14 @@ class ImageContentService:
             brand_name           = bc.get('brand_name', '')
             tagline              = bc.get('tagline', '')
             business_description_raw = bc.get('business_description', '')
+            voice_sample         = bc.get('voice_sample', '')
             brand_voice          = bc.get('brand_voice', '')
             target_audience      = bc.get('target_audience', '')
             primary_goal         = bc.get('primary_goal', '')
             region               = bc.get('region', '')
             brand_colors_str     = ', '.join(str(c) for c in (bc.get('brand_colors') or []))
             key_products_str     = ', '.join(str(p) for p in (bc.get('key_products_services') or [])[:5])
+            cta_styles           = ', '.join(bc.get('cta_styles') or [])
             key_dates            = bc.get('key_dates', '')
             preferred_formats    = ', '.join(bc.get('preferred_formats') or [])
 
@@ -340,6 +356,14 @@ class ImageContentService:
                 brand_lines.append(
                     f"Upcoming key dates: {key_dates} — if relevant, let the image reflect a seasonal or event context."
                 )
+            if voice_sample:
+                brand_lines.append(
+                    f"Brand voice sample: \"{voice_sample[:200]}\" — let the tone and style of this writing inform the image's mood."
+                )
+            if cta_styles:
+                brand_lines.append(
+                    f"Call-to-action styles used by this brand: {cta_styles} — the image composition should naturally lead the eye toward action."
+                )
             brand_block = (
                 "\n\nBRAND CONTEXT:\n" + "\n".join(brand_lines)
                 if brand_lines else ""
@@ -356,16 +380,18 @@ class ImageContentService:
                 "    Prompt format: SCENE / SUBJECT / DETAILS / CONSTRAINTS\n\n"
 
                 "  POSTER\n"
-                "    Bold graphic design poster. Brand colors dominant, strong typography layout area, "
-                "powerful single visual. No actual text rendered — leave space where copy would go.\n"
+                "    Bold graphic design poster with rendered headline text. Brand colors dominant. "
+                "Large legible headline extracted from post content rendered as typography in the image. "
+                "Brand name rendered smaller. Strong single focal visual behind or around the text.\n"
                 "    Best for: product launches, announcements, campaigns, sales.\n"
-                "    Prompt format: BACKGROUND / FOCAL_ELEMENT / COLOR_PALETTE / LAYOUT / CONSTRAINTS\n\n"
+                "    Prompt format: BACKGROUND / FOCAL_ELEMENT / COLOR_PALETTE / LAYOUT / TEXT_CONTENT\n\n"
 
                 "  STAT_CARD\n"
-                "    Clean typographic layout built around one key number, fact, or short quote. "
-                "Brand colors as background. Minimal, bold, scannable.\n"
+                "    Clean typographic card with the key number, percentage, or short quote from the post "
+                "rendered as oversized bold text in the centre. Brand colors as background. "
+                "Brand name or label in smaller text below. Minimal, bold, scannable.\n"
                 "    Best for: milestones, achievements, data-driven content.\n"
-                "    Prompt format: BACKGROUND / TYPOGRAPHY_AREA / ACCENT_ELEMENTS / COLOR_PALETTE / CONSTRAINTS\n\n"
+                "    Prompt format: BACKGROUND / TEXT_CONTENT / ACCENT_ELEMENTS / COLOR_PALETTE\n\n"
 
                 "  PRODUCT_SHOWCASE\n"
                 "    Editorial product or service mockup. Subject isolated or in minimal setting, "
@@ -388,12 +414,23 @@ class ImageContentService:
                 "STEP 2 — Write the prompt for the chosen type.\n\n"
 
                 "RULES THAT APPLY TO ALL TYPES:\n"
-                "• No readable text, words, letters, or numbers rendered in the image\n"
-                "• No watermarks, no logos, no brand marks\n"
+                "• No watermarks. The brand logo will be composited separately — do NOT render it.\n"
                 "• Nigerian cultural context — Lagos/Abuja settings, West African aesthetics, "
                 "authentic dark skin tones for any people shown\n"
                 "• Brand colors must appear visibly in the image\n"
                 "• The image must directly relate to the specific content provided\n\n"
+
+                "TEXT RENDERING RULES BY TYPE:\n"
+                "• PHOTO, BRAND_ILLUSTRATION: NO text overlays. Keep image purely visual.\n"
+                "• POSTER: MUST render the brand name and a punchy 4-7 word headline extracted from "
+                "the post content as large bold legible typography directly in the image. "
+                "Place headline in the upper or lower third. Brand name smaller below/above it.\n"
+                "• STAT_CARD: MUST render the single most important number, percentage, or "
+                "short quote from the post as oversized bold text in the centre of the card. "
+                "Brand name or label in smaller text below it.\n"
+                "• INFOGRAPHIC: Include short section labels and icon labels as readable text. "
+                "Keep individual text elements to 1-3 words each.\n"
+                "• PRODUCT_SHOWCASE: May include the product name or one short benefit headline.\n\n"
 
                 "ADDITIONAL RULES FOR PHOTO TYPE:\n"
                 "• Subjects must be DOING something specific — not posing\n"
@@ -404,7 +441,8 @@ class ImageContentService:
                 "OUTPUT FORMAT:\n"
                 "TYPE: [chosen type]\n"
                 "[prompt in the format specified for that type]\n\n"
-                "Output ONLY the TYPE line followed by the prompt. No explanation or commentary."
+                "For POSTER/STAT_CARD/INFOGRAPHIC include a TEXT: line listing the exact words to render.\n"
+                "Output ONLY the TYPE line, optional TEXT line, then the prompt. No other commentary."
             )
 
             user_prompt = (
@@ -415,7 +453,11 @@ class ImageContentService:
                 f"POST CONTENT TO VISUALIZE:\n{content[:700]}\n\n"
                 f"Original business topic: {seed_content[:300]}\n\n"
                 "Choose the image type that will make this post most compelling on this platform. "
-                "Apply the brand colors prominently. Write the full image prompt."
+                "Apply the brand colors prominently. Write the full image prompt.\n\n"
+                "IMPORTANT — if you choose POSTER, STAT_CARD, or INFOGRAPHIC: extract a 4-8 word "
+                "headline (or the single most impactful number/quote) from the post content above "
+                f"and the brand name '{brand_name}' to render as actual text in the image. "
+                "Include a TEXT: line in your output listing the exact words to render."
             )
 
             logo_url = brand_context.get("logo_url") if brand_context else None
@@ -524,33 +566,45 @@ class ImageContentService:
         scene = ImageContentService._extract_visual_concepts(content, seed_content)
 
         if image_type == 'poster':
-            brand_ref = f"{brand_name} " if brand_name else ""
+            brand_ref = f"{brand_name}" if brand_name else industry
+            # Extract a short headline from seed content
+            words = seed_content.split()
+            headline_words = words[:6] if len(words) >= 6 else words
+            headline = ' '.join(headline_words).rstrip('.,!?')
             return (
-                f"BACKGROUND: Bold flat graphic poster for a {industry} brand. "
-                f"{color_note}{logo_note}"
+                f"BACKGROUND: Bold flat graphic poster for {brand_ref}. "
+                f"{color_note}"
                 f"Strong geometric shapes and color blocks in the brand palette fill the frame. "
                 f"FOCAL_ELEMENT: A single powerful visual — a Nigerian professional in action, "
                 f"or a stylised icon representing {industry} — placed in the upper two-thirds. "
                 f"{product_note}"
                 f"COLOR_PALETTE: {color_list if color_list else 'deep navy, warm amber, white'}. "
-                f"LAYOUT: {aspect} format, bold asymmetric layout, clear space in the lower third "
-                f"for copy, strong visual hierarchy. {voice_note}"
-                f"CONSTRAINTS: no readable text, no watermarks, no logos, graphic design only, "
-                f"not a photograph."
+                f"LAYOUT: {aspect} format, bold asymmetric layout, strong visual hierarchy. "
+                f"TEXT_CONTENT: Render the headline '{headline}' as large bold white typography "
+                f"in the lower third of the image. "
+                f"{'Render brand name \"' + brand_name + '\" in smaller text below the headline. ' if brand_name else ''}"
+                f"{voice_note}"
+                f"No watermarks, no logos."
             )
 
         if image_type == 'stat_card':
+            brand_ref = f"{brand_name}" if brand_name else industry
+            # Try to pull a number from content, fallback to generic
+            import re as _re_fb
+            nums = _re_fb.findall(r'\b\d+[%+x]?\b', seed_content)
+            key_stat = nums[0] if nums else "1"
+            stat_label = seed_content[:40].rstrip('.,!?') if seed_content else industry
             return (
                 f"BACKGROUND: Clean minimal flat design card, "
                 f"{color_list if color_list else 'deep brand color'} background. "
-                f"TYPOGRAPHY_AREA: A large bold placeholder numeral or symbol in the centre — "
-                f"oversized, white or contrasting, representing the key metric in the post. "
+                f"TEXT_CONTENT: Render '{key_stat}' as an oversized bold centred number in white "
+                f"or high-contrast colour. Below it render the label '{stat_label}' in smaller text. "
+                f"{'Below the label render brand name \"' + brand_name + '\" in small caps. ' if brand_name else ''}"
                 f"ACCENT_ELEMENTS: Thin geometric lines or small icons in a lighter shade of the "
                 f"brand color, subtle grid pattern in background. "
                 f"{color_note}"
                 f"COLOR_PALETTE: {color_list if color_list else 'bold single brand color with white accents'}. "
-                f"CONSTRAINTS: no readable text or words, no watermarks, no logos, "
-                f"flat design only, not photographic."
+                f"Flat design only, not photographic. No watermarks, no logos."
             )
 
         if image_type == 'brand_illustration':
@@ -697,6 +751,57 @@ class ImageContentService:
         )
     
     @staticmethod
+    def _overlay_logo(b64: str, logo_url: str, position: str = "bottom_right") -> str:
+        """
+        Download the brand logo and composite it onto the generated image using Pillow.
+        Logo is resized to ~14% of image width and placed at the specified corner.
+        Falls back to the original image if anything fails.
+        """
+        import base64 as _b64
+        import io
+        import requests as _req
+        from PIL import Image
+
+        try:
+            # Decode generated image
+            img_bytes = _b64.b64decode(b64)
+            base_img = Image.open(io.BytesIO(img_bytes)).convert("RGBA")
+            bw, bh = base_img.size
+
+            # Download logo
+            resp = _req.get(logo_url, timeout=10)
+            resp.raise_for_status()
+            logo_img = Image.open(io.BytesIO(resp.content)).convert("RGBA")
+
+            # Resize logo to 14% of image width, preserve aspect ratio
+            target_w = max(60, int(bw * 0.14))
+            lw, lh = logo_img.size
+            scale = target_w / lw
+            logo_img = logo_img.resize((target_w, int(lh * scale)), Image.LANCZOS)
+            lw, lh = logo_img.size
+
+            # Edge padding (~2.5% of image width)
+            pad = max(20, int(bw * 0.025))
+
+            if position == "bottom_left":
+                x, y = pad, bh - lh - pad
+            else:  # bottom_right (default)
+                x, y = bw - lw - pad, bh - lh - pad
+
+            # Composite logo onto base image
+            base_img.paste(logo_img, (x, y), logo_img)
+
+            buf = io.BytesIO()
+            base_img.convert("RGB").save(buf, format="WEBP", quality=95)
+            result_b64 = _b64.b64encode(buf.getvalue()).decode()
+            print(f"✅ Logo composited at {position} ({lw}×{lh}px on {bw}×{bh}px image)")
+            return result_b64
+
+        except Exception as e:
+            print(f"⚠️ Logo overlay failed: {e}, returning original image")
+            return b64
+
+    @staticmethod
     def _map_to_dalle_size(size: str) -> str:
         """Map platform dimensions to gpt-image-1 supported sizes (1024x1024, 1536x1024, 1024x1536)"""
         try:
@@ -711,13 +816,59 @@ class ImageContentService:
             return "1024x1024"
 
     @staticmethod
+    def _crop_to_ratio(b64: str, target_w: int, target_h: int) -> str:
+        """
+        Center-crop a base64-encoded WebP image to the exact target aspect ratio.
+        Returns the cropped image as a base64 string (WebP).
+        Skips cropping if the ratio already matches within 2%.
+        """
+        import base64 as _b64
+        import io
+        from PIL import Image
+
+        target_ratio = target_w / target_h
+
+        img_bytes = _b64.b64decode(b64)
+        img = Image.open(io.BytesIO(img_bytes))
+        gen_w, gen_h = img.size
+        gen_ratio = gen_w / gen_h
+
+        # Already close enough — skip
+        if abs(gen_ratio - target_ratio) / target_ratio < 0.02:
+            return b64
+
+        if target_ratio > gen_ratio:
+            # Target is wider → crop top and bottom
+            new_h = int(gen_w / target_ratio)
+            top = (gen_h - new_h) // 2
+            box = (0, top, gen_w, top + new_h)
+        else:
+            # Target is taller → crop left and right
+            new_w = int(gen_h * target_ratio)
+            left = (gen_w - new_w) // 2
+            box = (left, 0, left + new_w, gen_h)
+
+        cropped = img.crop(box)
+        buf = io.BytesIO()
+        cropped.save(buf, format="WEBP", quality=95)
+        return _b64.b64encode(buf.getvalue()).decode()
+
+    @staticmethod
     async def _call_dalle_api(prompt: str, size: str = "1024x1024") -> Dict[str, Any]:
         """
         Call OpenAI gpt-image-1.5 API for image generation.
+        Generates at the nearest supported DALL-E size, then center-crops to the
+        exact target ratio so platform specs (e.g. Instagram 4:5) are met.
         Returns a base64 data URL since gpt-image-1.5 only supports b64_json output.
         """
         try:
             from app.services.AIService import client
+
+            # Parse requested dimensions for post-generation crop
+            try:
+                target_w, target_h = map(int, size.split("x"))
+            except (ValueError, AttributeError):
+                target_w, target_h = 1024, 1024
 
             image_size = ImageContentService._map_to_dalle_size(size)
 
@@ -736,6 +887,10 @@ class ImageContentService:
             )
 
             b64 = response.data[0].b64_json
+
+            # Crop to exact target ratio (< 5 ms, negligible vs. DALL-E latency)
+            b64 = ImageContentService._crop_to_ratio(b64, target_w, target_h)
+
             data_url = f"data:image/webp;base64,{b64}"
             return {
                 "success": True,
