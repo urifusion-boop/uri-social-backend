@@ -2,6 +2,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from pydantic import BaseModel, EmailStr
 from passlib.context import CryptContext
+from bson import ObjectId
+import secrets
 
 from app.core.auth_handler import sign_jwt
 from app.database import get_db
@@ -41,13 +43,8 @@ async def signup(body: SignupRequest, db: AsyncIOMotorDatabase = Depends(get_db_
 
     hashed = pwd_context.hash(body.password)
 
-    # Generate userId from ObjectId
-    from bson import ObjectId
-    import secrets
     user_object_id = ObjectId()
     user_id = str(user_object_id)
-
-    # Generate unique referral code
     referral_code = secrets.token_urlsafe(8)
 
     result = await db["users"].insert_one({
@@ -59,6 +56,7 @@ async def signup(body: SignupRequest, db: AsyncIOMotorDatabase = Depends(get_db_
         "last_name": body.last_name,
         "referralCode": referral_code,
     })
+
     token = sign_jwt(user_id, body.email, body.first_name, body.last_name)
 
     return {
