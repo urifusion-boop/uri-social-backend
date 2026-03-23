@@ -13,7 +13,7 @@ def connect_to_mongo(database_name: str) -> None:
             user = quote_plus(settings.MONGODB_USER)
             password = quote_plus(settings.MONGODB_PASSWORD)
             host = settings.MONGODB_HOST
-            uri = f"mongodb://{user}:{password}@{host}/{database_name}"
+            uri = f"mongodb://{user}:{password}@{host}/{database_name}?authSource=admin"
             print(f"Generated URI: {uri.replace(password, '*****')}")
         else:
             uri = settings.MONGODB_URI
