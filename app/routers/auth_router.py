@@ -43,8 +43,12 @@ async def signup(body: SignupRequest, db: AsyncIOMotorDatabase = Depends(get_db_
 
     # Generate userId from ObjectId
     from bson import ObjectId
+    import secrets
     user_object_id = ObjectId()
     user_id = str(user_object_id)
+
+    # Generate unique referral code
+    referral_code = secrets.token_urlsafe(8)
 
     result = await db["users"].insert_one({
         "_id": user_object_id,
@@ -53,6 +57,7 @@ async def signup(body: SignupRequest, db: AsyncIOMotorDatabase = Depends(get_db_
         "password": hashed,
         "first_name": body.first_name,
         "last_name": body.last_name,
+        "referralCode": referral_code,
     })
     token = sign_jwt(user_id, body.email, body.first_name, body.last_name)
 
