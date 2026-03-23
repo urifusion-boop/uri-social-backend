@@ -1,3 +1,4 @@
+import uuid
 from fastapi import APIRouter, Depends, HTTPException
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from pydantic import BaseModel, EmailStr
@@ -40,14 +41,17 @@ async def signup(body: SignupRequest, db: AsyncIOMotorDatabase = Depends(get_db_
         raise HTTPException(status_code=409, detail="A user with this email already exists.")
 
     hashed = pwd_context.hash(body.password)
+    user_id = str(uuid.uuid4())
+    referral_code = uuid.uuid4().hex[:8].upper()
     result = await db["users"].insert_one({
+        "userId": user_id,
         "email": body.email,
         "password": hashed,
         "first_name": body.first_name,
         "last_name": body.last_name,
+        "referralCode": referral_code,
     })
 
-    user_id = str(result.inserted_id)
     token = sign_jwt(user_id, body.email, body.first_name, body.last_name)
 
     return {
