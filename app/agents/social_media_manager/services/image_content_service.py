@@ -571,6 +571,7 @@ class ImageContentService:
             words = seed_content.split()
             headline_words = words[:6] if len(words) >= 6 else words
             headline = ' '.join(headline_words).rstrip('.,!?')
+            brand_name_text = f'Render brand name "{brand_name}" in smaller text below the headline. ' if brand_name else ''
             return (
                 f"BACKGROUND: Bold flat graphic poster for {brand_ref}. "
                 f"{color_note}"
@@ -582,7 +583,7 @@ class ImageContentService:
                 f"LAYOUT: {aspect} format, bold asymmetric layout, strong visual hierarchy. "
                 f"TEXT_CONTENT: Render the headline '{headline}' as large bold white typography "
                 f"in the lower third of the image. "
-                f"{'Render brand name \"' + brand_name + '\" in smaller text below the headline. ' if brand_name else ''}"
+                f"{brand_name_text}"
                 f"{voice_note}"
                 f"No watermarks, no logos."
             )
@@ -599,7 +600,7 @@ class ImageContentService:
                 f"{color_list if color_list else 'deep brand color'} background. "
                 f"TEXT_CONTENT: Render '{key_stat}' as an oversized bold centred number in white "
                 f"or high-contrast colour. Below it render the label '{stat_label}' in smaller text. "
-                f"{'Below the label render brand name \"' + brand_name + '\" in small caps. ' if brand_name else ''}"
+                f"{'Below the label render brand name ' + chr(34) + brand_name + chr(34) + ' in small caps. ' if brand_name else ''}"
                 f"ACCENT_ELEMENTS: Thin geometric lines or small icons in a lighter shade of the "
                 f"brand color, subtle grid pattern in background. "
                 f"{color_note}"

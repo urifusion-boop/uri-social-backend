@@ -47,6 +47,11 @@ class Settings(BaseSettings):
     BYPASS_FEATURE_LIMIT_CHECK: bool = False
     LOCAL_DEV_MODE: bool = False
 
+    # Twilio (WhatsApp)
+    TWILIO_ACCOUNT_SID: str = ""
+    TWILIO_AUTH_TOKEN: str = ""
+    TWILIO_WHATSAPP_FROM: str = ""  # e.g. whatsapp:+14155238886
+
     # Sentry (optional)
     SENTRY_DSN: Optional[str] = None
 
