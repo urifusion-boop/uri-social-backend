@@ -40,14 +40,20 @@ async def signup(body: SignupRequest, db: AsyncIOMotorDatabase = Depends(get_db_
         raise HTTPException(status_code=409, detail="A user with this email already exists.")
 
     hashed = pwd_context.hash(body.password)
+
+    # Generate userId from ObjectId
+    from bson import ObjectId
+    user_object_id = ObjectId()
+    user_id = str(user_object_id)
+
     result = await db["users"].insert_one({
+        "_id": user_object_id,
+        "userId": user_id,
         "email": body.email,
         "password": hashed,
         "first_name": body.first_name,
         "last_name": body.last_name,
     })
-
-    user_id = str(result.inserted_id)
     token = sign_jwt(user_id, body.email, body.first_name, body.last_name)
 
     return {
