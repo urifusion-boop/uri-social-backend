@@ -1152,6 +1152,8 @@ async def upload_sample_template(
     except HTTPException:
         raise
     except Exception as e:
+        import traceback
+        print(f"❌ sample-template upload error: {e}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
