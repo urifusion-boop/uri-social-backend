@@ -271,8 +271,18 @@ class ImageContentService:
             key_dates            = bc.get('key_dates', '')
             preferred_formats    = ', '.join(bc.get('preferred_formats') or [])
             website              = bc.get('website', '')
-            guardrails_raw       = bc.get('guardrails') or []
-            guardrails_str       = '; '.join(str(g) for g in guardrails_raw[:6]) if guardrails_raw else ''
+            guardrails_raw       = bc.get('guardrails') or {}
+            if isinstance(guardrails_raw, dict):
+                _g_parts = []
+                if guardrails_raw.get('avoid_topics'):
+                    _g_parts.append(f"avoid: {guardrails_raw['avoid_topics']}")
+                if guardrails_raw.get('banned_words'):
+                    _g_parts.append(f"banned words: {guardrails_raw['banned_words']}")
+                if guardrails_raw.get('compliance_notes'):
+                    _g_parts.append(guardrails_raw['compliance_notes'])
+                guardrails_str = '; '.join(_g_parts)
+            else:
+                guardrails_str = '; '.join(str(g) for g in list(guardrails_raw)[:6]) if guardrails_raw else ''
             sample_template_urls = [u for u in (bc.get('sample_template_urls') or []) if u and isinstance(u, str)][:3]
 
             # Content pillars → use as content themes for image brief
@@ -555,12 +565,12 @@ class ImageContentService:
             response = await loop.run_in_executor(
                 None,
                 lambda: ai_client.chat.completions.create(
-                    model="gpt-4.1",
+                    model="gpt-5.4",
                     messages=[
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_message_content}
                     ],
-                    max_tokens=1100,
+                    max_completion_tokens=1100,
                     temperature=0.75
                 )
             )
@@ -667,9 +677,12 @@ class ImageContentService:
         aspect = specs.get('format', 'landscape') if specs else 'landscape'
 
         # Extract brand fields (static fallback)
+        import re as _re_hex_fb
         bc = brand_context or {}
         colors    = bc.get('brand_colors') or []
         color_list = ', '.join(str(c) for c in colors[:3]) if colors else ''
+        # Strip hex codes — image models render them as literal text
+        color_list = _re_hex_fb.sub(r'#[0-9A-Fa-f]{3,6}\b', '', color_list).strip().strip(',')
         audience   = bc.get('target_audience', '')
         region_fb  = bc.get('region', '')
         products   = bc.get('key_products_services') or []
@@ -1110,7 +1123,7 @@ class ImageContentService:
                 response = await loop.run_in_executor(
                     None,
                     lambda: client.images.generate(
-                        model="gpt-image-1",
+                        model="gpt-image-1.5",
                         prompt=prompt,
                         n=1,
                         size=image_size,
@@ -1125,7 +1138,7 @@ class ImageContentService:
                 return {
                     "success": True,
                     "url": data_url,
-                    "model": "gpt-image-1"
+                    "model": "gpt-image-1.5"
                 }
 
         except Exception as e:

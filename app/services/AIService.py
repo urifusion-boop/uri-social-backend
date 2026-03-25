@@ -25,7 +25,7 @@ class AIService:
 
     @staticmethod
     def build_ai_model(
-        messages: List[dict], model: str = "gpt-4o-mini", temperature: float = 0.7
+        messages: List[dict], model: str = "gpt-5.4-mini", temperature: float = 0.7
     ):
         return ChatModel(model=model, messages=messages, temperature=temperature)
 
@@ -41,6 +41,7 @@ class AIService:
                     temperature=request.temperature,
                 ),
             )
+            print("Chat Completion Messages: ", [message.dict() for message in request.messages])
             print("Chat Completion Response: ", completion)
             return completion
         except Exception as e:
@@ -114,6 +115,6 @@ class AIService:
     @staticmethod
     async def create_embedding(request: EmbeddingModel):
         response = client.embeddings.create(
-            model="text-embedding-ada-002", input=request.input
+            model="text-embedding-3-small", input=request.input
         )
         return response
