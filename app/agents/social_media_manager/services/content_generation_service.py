@@ -2,7 +2,7 @@
 
 import asyncio
 import json
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Tuple
 from datetime import datetime
 from bson import ObjectId
 from motor.motor_asyncio import AsyncIOMotorDatabase
@@ -635,7 +635,7 @@ Write as if you're sharing hard-won business wisdom with fellow African entrepre
         return {'content': raw_content.strip()}
     
     @staticmethod
-    def _extract_and_clean_hashtags(content: str, platform: str) -> tuple[str, List[str]]:
+    def _extract_and_clean_hashtags(content: str, platform: str) -> Tuple[str, List[str]]:
         """
         Extract hashtags from content and clean up the text
         

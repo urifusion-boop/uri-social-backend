@@ -34,6 +34,9 @@ class Settings(BaseSettings):
     # imgBB
     IMGBB_API_KEY: Optional[str] = None
 
+    # Google Gemini (Nano Banana 2 image generation)
+    GOOGLE_GEMINI_API_KEY: Optional[str] = None
+
     # SSL (optional for local dev)
     SSL_KEY_PATH: str = ""
     SSL_CERT_PATH: str = ""
