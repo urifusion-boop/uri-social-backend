@@ -536,14 +536,22 @@ class ImageContentService:
                 )
             )
             brief = response.choices[0].message.content.strip()
-            chosen_type = brief.split('\n')[0].replace('TYPE:', '').strip() if brief.startswith('TYPE:') else 'UNKNOWN'
+
+            # Strip hex color codes — image models render them as literal text in the image.
+            # Replace each #RRGGBB / #RGB token with its descriptive neighbor words.
+            import re as _re_hex
+            brief_clean = _re_hex.sub(r'#[0-9A-Fa-f]{3,6}\b', '', brief)
+            # Collapse any double spaces left behind
+            brief_clean = _re_hex.sub(r'  +', ' ', brief_clean).strip()
+
+            chosen_type = brief_clean.split('\n')[0].replace('TYPE:', '').strip() if brief_clean.startswith('TYPE:') else 'UNKNOWN'
             logo_note = " (logo reference used)" if logo_url else ""
             print(f"\n{'━'*60}")
             print(f"🎨 IMAGE BRIEF — {platform.upper()} | type: {chosen_type}{logo_note}")
             print(f"{'━'*60}")
-            print(brief)
+            print(brief_clean)
             print(f"{'━'*60}\n")
-            return brief
+            return brief_clean
 
         except Exception as e:
             print(f"⚠️ Image brief generation failed, using static prompt: {e}")
@@ -845,8 +853,8 @@ class ImageContentService:
             resp.raise_for_status()
             logo_img = Image.open(io.BytesIO(resp.content)).convert("RGBA")
 
-            # Resize logo to 12% of image width, preserve aspect ratio
-            target_w = max(60, int(bw * 0.12))
+            # Resize logo to 7% of image width, preserve aspect ratio
+            target_w = max(40, int(bw * 0.07))
             lw, lh = logo_img.size
             scale = target_w / lw
             logo_img = logo_img.resize((target_w, int(lh * scale)), Image.LANCZOS)
