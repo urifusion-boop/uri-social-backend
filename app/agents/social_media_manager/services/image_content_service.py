@@ -262,6 +262,7 @@ class ImageContentService:
             voice_sample         = bc.get('voice_sample', '')
             brand_voice          = bc.get('brand_voice', '')
             target_audience      = bc.get('target_audience', '')
+            audience_age_range   = bc.get('audience_age_range', '')
             primary_goal         = bc.get('primary_goal', '')
             region               = bc.get('region', '')
             brand_colors_str     = ', '.join(str(c) for c in (bc.get('brand_colors') or []))
@@ -269,6 +270,10 @@ class ImageContentService:
             cta_styles           = ', '.join(bc.get('cta_styles') or [])
             key_dates            = bc.get('key_dates', '')
             preferred_formats    = ', '.join(bc.get('preferred_formats') or [])
+            website              = bc.get('website', '')
+            guardrails_raw       = bc.get('guardrails') or []
+            guardrails_str       = '; '.join(str(g) for g in guardrails_raw[:6]) if guardrails_raw else ''
+            sample_template_urls = [u for u in (bc.get('sample_template_urls') or []) if u and isinstance(u, str)][:3]
 
             # Content pillars → use as content themes for image brief
             pillars = bc.get('content_pillars') or []
@@ -336,6 +341,10 @@ class ImageContentService:
                 brand_lines.append(
                     f"Target audience: {target_audience} — any people shown should match this demographic."
                 )
+            if audience_age_range:
+                brand_lines.append(
+                    f"Audience age range: {audience_age_range} — people and settings in the image should feel relatable to this age group."
+                )
             if primary_goal:
                 brand_lines.append(
                     f"Brand goal: {primary_goal} — the image should visually reinforce this aspiration."
@@ -363,6 +372,14 @@ class ImageContentService:
             if cta_styles:
                 brand_lines.append(
                     f"Call-to-action styles used by this brand: {cta_styles} — the image composition should naturally lead the eye toward action."
+                )
+            if website:
+                brand_lines.append(
+                    f"Website: {website} — for HEADLINE or FULL text level images, include this in small text as a URL/CTA element."
+                )
+            if guardrails_str:
+                brand_lines.append(
+                    f"Brand guardrails (must follow): {guardrails_str} — these are hard constraints the brand has set. Respect them in the image."
                 )
             brand_block = (
                 "\n\nBRAND CONTEXT:\n" + "\n".join(brand_lines)
@@ -507,18 +524,30 @@ class ImageContentService:
 
             logo_url = brand_context.get("logo_url") if brand_context else None
 
-            # Build user message — attach logo as a vision image if available so
-            # GPT-4.1 can extract exact brand colors and visual style from it.
-            if logo_url:
-                user_message_content = [
-                    {"type": "text", "text": (
-                        user_prompt +
-                        "\n\nA brand logo image is attached. Analyse its colors, shapes, and visual "
-                        "style and let these directly inform the image prompt you write. "
-                        "Reflect the logo's visual identity in the color palette and overall aesthetic."
-                    )},
-                    {"type": "image_url", "image_url": {"url": logo_url}},
-                ]
+            # Build user message — attach logo + sample templates as vision images so
+            # GPT-4.1 can extract exact brand colors, layout style, and visual identity.
+            has_vision = logo_url or sample_template_urls
+            if has_vision:
+                vision_note_parts = []
+                if logo_url:
+                    vision_note_parts.append(
+                        "A brand logo image is attached. Analyse its colors, shapes, and visual "
+                        "style and let these directly inform the color palette and overall aesthetic."
+                    )
+                if sample_template_urls:
+                    vision_note_parts.append(
+                        f"{len(sample_template_urls)} brand design template(s) are attached after the logo. "
+                        "Study their layout, typography style, color application, spacing, and visual hierarchy. "
+                        "Your prompt should produce an image that feels like a natural extension of these templates — "
+                        "same energy, same visual language, same brand identity."
+                    )
+                vision_note = "\n\n" + " ".join(vision_note_parts)
+
+                user_message_content = [{"type": "text", "text": user_prompt + vision_note}]
+                if logo_url:
+                    user_message_content.append({"type": "image_url", "image_url": {"url": logo_url}})
+                for tmpl_url in sample_template_urls:
+                    user_message_content.append({"type": "image_url", "image_url": {"url": tmpl_url}})
             else:
                 user_message_content = user_prompt
 
@@ -531,7 +560,7 @@ class ImageContentService:
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_message_content}
                     ],
-                    max_tokens=950,
+                    max_tokens=1100,
                     temperature=0.75
                 )
             )
@@ -545,9 +574,45 @@ class ImageContentService:
             brief_clean = _re_hex.sub(r'  +', ' ', brief_clean).strip()
 
             chosen_type = brief_clean.split('\n')[0].replace('TYPE:', '').strip() if brief_clean.startswith('TYPE:') else 'UNKNOWN'
-            logo_note = " (logo reference used)" if logo_url else ""
+
+            # Diagnostic: show which brand fields were available for this generation
+            field_status = {
+                "brand_name": bool(brand_name),
+                "tagline": bool(tagline),
+                "business_desc": bool(business_description_raw),
+                "products": bool(key_products_str),
+                "colors": bool(brand_colors_str),
+                "voice": bool(brand_voice),
+                "voice_sample": bool(voice_sample),
+                "audience": bool(target_audience),
+                "age_range": bool(audience_age_range),
+                "goal": bool(primary_goal),
+                "region": bool(region),
+                "pillars": bool(themes_str),
+                "formats": bool(preferred_formats),
+                "cta": bool(cta_styles),
+                "key_dates": bool(key_dates),
+                "website": bool(website),
+                "guardrails": bool(guardrails_str),
+                "logo": bool(logo_url),
+                "templates": len(sample_template_urls),
+            }
+            filled = [k for k, v in field_status.items() if v and k != "templates"]
+            missing = [k for k, v in field_status.items() if not v and k != "templates"]
+            tmpl_count = field_status["templates"]
+
+            vision_refs = []
+            if logo_url:
+                vision_refs.append("logo")
+            if tmpl_count:
+                vision_refs.append(f"{tmpl_count} template(s)")
+            vision_ref_note = f" | vision refs: {', '.join(vision_refs)}" if vision_refs else ""
+
             print(f"\n{'━'*60}")
-            print(f"🎨 IMAGE BRIEF — {platform.upper()} | type: {chosen_type}{logo_note}")
+            print(f"🎨 IMAGE BRIEF — {platform.upper()} | type: {chosen_type}{vision_ref_note}")
+            print(f"   ✅ fields used ({len(filled)}): {', '.join(filled)}")
+            if missing:
+                print(f"   ⚠️  fields missing ({len(missing)}): {', '.join(missing)}")
             print(f"{'━'*60}")
             print(brief_clean)
             print(f"{'━'*60}\n")
