@@ -370,94 +370,139 @@ class ImageContentService:
             )
 
             system_prompt = (
-                "You are a creative director writing image prompts for gpt-image-1.5.\n\n"
+                "You are a senior creative director at a top African brand agency. "
+                "You write structured image generation prompts fed directly into "
+                "Nano Banana 2 (Google Imagen 4), a state-of-the-art AI image model.\n\n"
 
-                "STEP 1 — Choose the best image type for the content and platform from this list:\n\n"
+                "Every prompt must produce a commercially ready, industry-standard image — "
+                "the kind used in real brand campaigns by companies like Flutterwave, Paystack, "
+                "or MTN. Think like a professional: what would a real art director commission here?\n\n"
 
-                "  PHOTO\n"
-                "    Authentic photorealistic documentary photograph. Real people, real moments, no posing.\n"
-                "    Best for: human stories, testimonials, behind-the-scenes, community updates.\n"
-                "    Prompt format: SCENE / SUBJECT / DETAILS / CONSTRAINTS\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "STEP 1 — Pick the best image type:\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
 
-                "  POSTER\n"
-                "    Bold graphic design poster with rendered headline text. Brand colors dominant. "
-                "Large legible headline extracted from post content rendered as typography in the image. "
-                "Brand name rendered smaller. Strong single focal visual behind or around the text.\n"
-                "    Best for: product launches, announcements, campaigns, sales.\n"
-                "    Prompt format: BACKGROUND / FOCAL_ELEMENT / COLOR_PALETTE / LAYOUT / TEXT_CONTENT\n\n"
+                "  PHOTO              — Premium editorial photograph. Real people, real action.\n"
+                "                       Best for: human stories, behind-the-scenes, community.\n\n"
+                "  POSTER             — Graphic design poster. Brand colors dominant.\n"
+                "                       Text is OPTIONAL — use only when it genuinely adds value.\n"
+                "                       Best for: campaigns, launches, promotions, awareness.\n\n"
+                "  STAT_CARD          — Typographic card. Key number/quote is the hero. Always has text.\n"
+                "                       Best for: milestones, achievements, data.\n\n"
+                "  PRODUCT_SHOWCASE   — Editorial product/service visual. Luxury magazine quality.\n"
+                "                       Best for: product features, service reveals.\n\n"
+                "  INFOGRAPHIC        — Visual layout: process, comparison, steps. Always has labels.\n"
+                "                       Best for: how-it-works, comparisons, step-by-step.\n\n"
+                "  BRAND_ILLUSTRATION — Flat/semi-realistic illustration. Nigerian cultural context.\n"
+                "                       Best for: abstract concepts, values, lifestyle.\n\n"
 
-                "  STAT_CARD\n"
-                "    Clean typographic card with the key number, percentage, or short quote from the post "
-                "rendered as oversized bold text in the centre. Brand colors as background. "
-                "Brand name or label in smaller text below. Minimal, bold, scannable.\n"
-                "    Best for: milestones, achievements, data-driven content.\n"
-                "    Prompt format: BACKGROUND / TEXT_CONTENT / ACCENT_ELEMENTS / COLOR_PALETTE\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "STEP 2 — Decide the text approach (POSTER only):\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
 
-                "  PRODUCT_SHOWCASE\n"
-                "    Editorial product or service mockup. Subject isolated or in minimal setting, "
-                "clean and aspirational.\n"
-                "    Best for: product features, service highlights, app screenshots.\n"
-                "    Prompt format: SUBJECT / BACKGROUND / LIGHTING / DETAILS / CONSTRAINTS\n\n"
+                "For POSTER, choose the right text level based on what the content actually needs:\n\n"
 
-                "  INFOGRAPHIC\n"
-                "    Clean visual layout representing a process, comparison, or set of steps. "
-                "Icons, arrows, sections — no actual readable text, just the visual structure and style.\n"
-                "    Best for: how-it-works, comparisons, step-by-step content.\n"
-                "    Prompt format: LAYOUT / VISUAL_ELEMENTS / COLOR_PALETTE / STYLE / CONSTRAINTS\n\n"
+                "  TEXT_LEVEL: NONE\n"
+                "    The image is powerful enough alone. The social media caption carries the message.\n"
+                "    Use when: the visual concept is striking, emotional, or abstract.\n"
+                "    The brand logo will be composited separately — no other text in the image.\n\n"
 
-                "  BRAND_ILLUSTRATION\n"
-                "    Modern flat or semi-realistic illustrated scene in brand colors. "
-                "Characters or abstract environments. Nigerian cultural context.\n"
-                "    Best for: abstract concepts, values, explainer content, lifestyle.\n"
-                "    Prompt format: STYLE / SCENE / COLOR_PALETTE / CHARACTERS / CONSTRAINTS\n\n"
+                "  TEXT_LEVEL: BRAND_ONLY\n"
+                "    Just the brand name or tagline, small and unobtrusive — like a Nike swoosh.\n"
+                "    Use when: the image speaks for itself but needs brand attribution.\n\n"
 
-                "STEP 2 — Write the prompt for the chosen type.\n\n"
+                "  TEXT_LEVEL: HEADLINE\n"
+                "    Brand name + one bold 4-6 word headline extracted from the post.\n"
+                "    Use when: there's a specific offer, launch, or call-to-action to announce.\n\n"
 
-                "RULES THAT APPLY TO ALL TYPES:\n"
-                "• No watermarks. The brand logo will be composited separately — do NOT render it.\n"
-                "• Nigerian cultural context — Lagos/Abuja settings, West African aesthetics, "
-                "authentic dark skin tones for any people shown\n"
-                "• Brand colors must appear visibly in the image\n"
-                "• The image must directly relate to the specific content provided\n\n"
+                "  TEXT_LEVEL: FULL\n"
+                "    Headline + supporting subtext + brand name. Full typographic layout.\n"
+                "    Use when: the post is a formal announcement, event, or product launch that needs "
+                "all the information visible in the image itself.\n\n"
 
-                "TEXT RENDERING RULES BY TYPE:\n"
-                "• PHOTO, BRAND_ILLUSTRATION: NO text overlays. Keep image purely visual.\n"
-                "• POSTER: MUST render the brand name and a punchy 4-7 word headline extracted from "
-                "the post content as large bold legible typography directly in the image. "
-                "Place headline in the upper or lower third. Brand name smaller below/above it.\n"
-                "• STAT_CARD: MUST render the single most important number, percentage, or "
-                "short quote from the post as oversized bold text in the centre of the card. "
-                "Brand name or label in smaller text below it.\n"
-                "• INFOGRAPHIC: Include short section labels and icon labels as readable text. "
-                "Keep individual text elements to 1-3 words each.\n"
-                "• PRODUCT_SHOWCASE: May include the product name or one short benefit headline.\n\n"
+                "For all other types:\n"
+                "  STAT_CARD, INFOGRAPHIC → always have text (the numbers/labels are the point)\n"
+                "  PHOTO, BRAND_ILLUSTRATION → never have text overlays\n"
+                "  PRODUCT_SHOWCASE → brand name only, optional\n\n"
 
-                "ADDITIONAL RULES FOR PHOTO TYPE:\n"
-                "• Subjects must be DOING something specific — not posing\n"
-                "• Include: natural skin texture, visible pores, slight forehead shine, real hair\n"
-                "• Use camera language (85mm f/1.4, soft window light) — not 'stunning', 'HDR', '8K'\n"
-                "• Never: cinematic, dramatic, film stock names, CGI, render\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "STEP 3 — Write the prompt in this EXACT format:\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
 
-                "OUTPUT FORMAT:\n"
-                "TYPE: [chosen type]\n"
-                "[prompt in the format specified for that type]\n\n"
-                "For POSTER/STAT_CARD/INFOGRAPHIC include a TEXT: line listing the exact words to render.\n"
-                "Output ONLY the TYPE line, optional TEXT line, then the prompt. No other commentary."
+                "COLOR_PALETTE: [Brand hex codes and their exact role. "
+                "e.g. '#CD1B78 magenta as dominant background, white for text, #1A1A2E navy accent']\n\n"
+
+                "BACKGROUND: [Precise environment, backdrop, or graphic setting — "
+                "include texture, depth, lighting mood, and any geometric or architectural details.]\n\n"
+
+                "FOCAL_ELEMENT: [The single most important visual. For people: skin tone, hair, "
+                "clothing, exact action, expression. For graphics: shapes, icons, objects. Be specific.]\n\n"
+
+                "LAYOUT: [Platform + dimensions + composition. "
+                "e.g. 'Landscape 1200×628, subject left-third, negative space right, strong visual hierarchy'.]\n\n"
+
+                "TYPOGRAPHY: [Your text decision. Write one of:\n"
+                "  • 'No text overlays.' — for NONE level or PHOTO/BRAND_ILLUSTRATION\n"
+                "  • 'Brand name only: [exact text], small, [placement], [color].' — for BRAND_ONLY\n"
+                "  • Specific typographic layout — for HEADLINE or FULL level, including exact words, "
+                "font style (bold sans-serif / display / condensed), size hierarchy, placement, color.]\n\n"
+
+                "QUALITY: [Editorial standard, specific to this image. Always end with: "
+                "'No watermarks, no logos, not stock-photo stiffness.']\n\n"
+
+                "CONSTRAINTS: [What NOT to do, specific to this content and type.]\n\n"
+
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "UNIVERSAL RULES:\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "• Brand colors in COLOR_PALETTE always — with exact hex codes from the brand data\n"
+                "• Nigerian/West African context — Lagos/Abuja settings, dark skin tones, "
+                "natural and protective hairstyles, culturally appropriate attire\n"
+                "• Fill every section with brand-specific detail — never leave anything generic\n"
+                "• The image must illustrate the post content, not just the brand\n\n"
+
+                "PHOTO RULES:\n"
+                "• Subject mid-action, never posed\n"
+                "• Specify camera + lens + aperture (Sony A7R V, 85mm f/1.4 at f/2.0)\n"
+                "• Name the light source (north window, late-afternoon ambient, soft box)\n"
+                "• Skin: natural texture, visible pores, slight forehead sheen\n"
+                "• Colour grade: lifted shadows, natural white balance, no heavy LUT\n"
+                "• Never: cinematic, dramatic, HDR, 8K, stunning, render\n\n"
+
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "OUTPUT (strict — these labeled lines only, no other text):\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "TYPE: [type]\n"
+                "TEXT_LEVEL: [NONE | BRAND_ONLY | HEADLINE | FULL | N/A]\n"
+                "COLOR_PALETTE: ...\n"
+                "BACKGROUND: ...\n"
+                "FOCAL_ELEMENT: ...\n"
+                "LAYOUT: ...\n"
+                "TYPOGRAPHY: ...\n"
+                "QUALITY: ...\n"
+                "CONSTRAINTS: ..."
             )
 
             user_prompt = (
                 f"PLATFORM: {platform} ({aspect} format)\n"
-                f"BUSINESS TYPE: {business_description}\n"
-                f"PLATFORM GUIDANCE: {platform_note}"
-                f"{brand_block}\n\n"
+                f"PLATFORM GUIDANCE: {platform_note}\n\n"
                 f"POST CONTENT TO VISUALIZE:\n{content[:700]}\n\n"
                 f"Original business topic: {seed_content[:300]}\n\n"
-                "Choose the image type that will make this post most compelling on this platform. "
-                "Apply the brand colors prominently. Write the full image prompt.\n\n"
-                "IMPORTANT — if you choose POSTER, STAT_CARD, or INFOGRAPHIC: extract a 4-8 word "
-                "headline (or the single most impactful number/quote) from the post content above "
-                f"and the brand name '{brand_name}' to render as actual text in the image. "
-                "Include a TEXT: line in your output listing the exact words to render."
+                f"{brand_block}\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "YOUR TASK:\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "1. Choose the image type that will make this post most compelling on this platform.\n"
+                "2. If POSTER — decide the right TEXT_LEVEL honestly. Ask yourself: does this post "
+                "benefit from text in the image, or is a strong visual with the caption enough? "
+                "A striking visual with TEXT_LEVEL: NONE is often more powerful than a cluttered poster. "
+                "Only use HEADLINE or FULL when there is a specific offer, launch, or CTA to announce.\n"
+                "3. Use EVERY piece of brand context to write rich, specific detail in each section. "
+                "If the post topic is short, draw on the business description, products, audience, "
+                "brand voice, and region — never leave a section generic.\n"
+                f"4. Brand colors ({brand_colors_str if brand_colors_str else 'from brand identity'}) "
+                "must appear in COLOR_PALETTE and dominate the image.\n"
+                "5. Output ONLY the labeled sections. No preamble, no explanation."
             )
 
             logo_url = brand_context.get("logo_url") if brand_context else None
@@ -486,32 +531,50 @@ class ImageContentService:
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_message_content}
                     ],
-                    max_tokens=700,
-                    temperature=0.7
+                    max_tokens=950,
+                    temperature=0.75
                 )
             )
             brief = response.choices[0].message.content.strip()
             chosen_type = brief.split('\n')[0].replace('TYPE:', '').strip() if brief.startswith('TYPE:') else 'UNKNOWN'
             logo_note = " (logo reference used)" if logo_url else ""
-            print(f"🎨 Image brief generated — type: {chosen_type} ({len(brief)} chars){logo_note}")
+            print(f"\n{'━'*60}")
+            print(f"🎨 IMAGE BRIEF — {platform.upper()} | type: {chosen_type}{logo_note}")
+            print(f"{'━'*60}")
+            print(brief)
+            print(f"{'━'*60}\n")
             return brief
 
         except Exception as e:
             print(f"⚠️ Image brief generation failed, using static prompt: {e}")
             return None
     
+    # Best-performing default image type per platform
+    PLATFORM_DEFAULT_TYPE = {
+        "instagram": "post_portrait",   # 4:5 — highest organic reach on Instagram
+        "linkedin":  "post_image",      # 1.91:1 — LinkedIn standard
+        "twitter":   "post_image",      # 16:9 — Twitter/X standard
+        "facebook":  "post_image",      # 1.91:1 — Facebook standard
+    }
+
     @staticmethod
     def _get_platform_image_specs(platform: str, image_type: str = "post_image") -> Dict[str, Any]:
-        """Get optimal image specifications for platform"""
+        """Get optimal image specifications for platform, using best-performing defaults."""
         platform_specs = ImageContentService.IMAGE_SPECS.get(platform, {})
-        
-        # Default to post_image, or first available spec
-        if image_type in platform_specs:
-            return platform_specs[image_type]
+
+        # Use platform-specific best default if caller didn't specify
+        if image_type == "post_image":
+            preferred = ImageContentService.PLATFORM_DEFAULT_TYPE.get(platform, "post_image")
+        else:
+            preferred = image_type
+
+        if preferred in platform_specs:
+            return platform_specs[preferred]
+        elif "post_image" in platform_specs:
+            return platform_specs["post_image"]
         elif platform_specs:
             return list(platform_specs.values())[0]
         else:
-            # Default fallback
             return {"width": 1200, "height": 630, "format": "landscape"}
     
     @staticmethod
@@ -571,20 +634,22 @@ class ImageContentService:
             words = seed_content.split()
             headline_words = words[:6] if len(words) >= 6 else words
             headline = ' '.join(headline_words).rstrip('.,!?')
+            brand_name_line = f'Render brand name "{brand_name}" in smaller text below the headline. ' if brand_name else ''
             return (
+                f"COLOR_PALETTE: {color_list if color_list else 'deep navy, warm amber, white'} — "
+                f"these colors are the dominant palette, filling backgrounds and accents. "
                 f"BACKGROUND: Bold flat graphic poster for {brand_ref}. "
-                f"{color_note}"
                 f"Strong geometric shapes and color blocks in the brand palette fill the frame. "
                 f"FOCAL_ELEMENT: A single powerful visual — a Nigerian professional in action, "
                 f"or a stylised icon representing {industry} — placed in the upper two-thirds. "
                 f"{product_note}"
-                f"COLOR_PALETTE: {color_list if color_list else 'deep navy, warm amber, white'}. "
-                f"LAYOUT: {aspect} format, bold asymmetric layout, strong visual hierarchy. "
-                f"TEXT_CONTENT: Render the headline '{headline}' as large bold white typography "
-                f"in the lower third of the image. "
-                f"{'Render brand name \"' + brand_name + '\" in smaller text below the headline. ' if brand_name else ''}"
+                f"LAYOUT: {aspect} format, bold asymmetric layout, strong visual hierarchy, "
+                f"clear negative space for text. "
+                f"TYPOGRAPHY: Render the headline '{headline}' as large bold clean sans-serif white "
+                f"typography in the lower third. Maximum legibility, high contrast against background. "
+                f"{brand_name_line}"
                 f"{voice_note}"
-                f"No watermarks, no logos."
+                f"No watermarks, no logos. Professional quality, publishable brand asset."
             )
 
         if image_type == 'stat_card':
@@ -594,17 +659,20 @@ class ImageContentService:
             nums = _re_fb.findall(r'\b\d+[%+x]?\b', seed_content)
             key_stat = nums[0] if nums else "1"
             stat_label = seed_content[:40].rstrip('.,!?') if seed_content else industry
+            stat_brand_line = f'Below the label render brand name "{brand_name}" in small caps. ' if brand_name else ''
             return (
-                f"BACKGROUND: Clean minimal flat design card, "
-                f"{color_list if color_list else 'deep brand color'} background. "
-                f"TEXT_CONTENT: Render '{key_stat}' as an oversized bold centred number in white "
-                f"or high-contrast colour. Below it render the label '{stat_label}' in smaller text. "
-                f"{'Below the label render brand name \"' + brand_name + '\" in small caps. ' if brand_name else ''}"
-                f"ACCENT_ELEMENTS: Thin geometric lines or small icons in a lighter shade of the "
-                f"brand color, subtle grid pattern in background. "
-                f"{color_note}"
-                f"COLOR_PALETTE: {color_list if color_list else 'bold single brand color with white accents'}. "
-                f"Flat design only, not photographic. No watermarks, no logos."
+                f"COLOR_PALETTE: {color_list if color_list else 'bold single brand color with white accents'} — "
+                f"dominant background and accent colors. "
+                f"BACKGROUND: Clean minimal flat design card. "
+                f"{color_list if color_list else 'Deep brand color'} solid or subtle gradient background. "
+                f"TYPOGRAPHY: Render '{key_stat}' as a massive bold centred number/stat in white "
+                f"or maximum-contrast color — it must dominate the card visually. "
+                f"Below it render '{stat_label}' in clean smaller sans-serif text. "
+                f"{stat_brand_line}"
+                f"ACCENT_ELEMENTS: Thin geometric lines or minimal icons in a lighter shade of "
+                f"brand color, subtle texture or grid in background for depth. "
+                f"QUALITY: Flat design only, pixel-perfect, publishable brand asset. "
+                f"No watermarks, no logos, not photographic."
             )
 
         if image_type == 'brand_illustration':
@@ -652,15 +720,19 @@ class ImageContentService:
 
         location = f"{region_fb} business district" if region_fb else "Lagos business district, Victoria Island or Lekki Phase 1"
         return (
+            f"{color_note}"
             f"SCENE: {scene}, {location}. "
             f"SUBJECT: a confident Nigerian {industry} professional with warm dark-brown skin, "
-            f"natural hair, actively engaged in the task — candid documentary, not posing. "
-            f"Natural skin texture, visible pores, slight forehead shine. "
+            f"natural hair, actively engaged mid-action — candid documentary style, never posing. "
+            f"Skin: natural texture, visible pores, subtle forehead sheen, no heavy retouching. "
             f"{audience_note}{product_note}{region_note}"
-            f"DETAILS: {camera_light}, {composition}, shallow depth of field. "
-            f"Colour: {colour}. {brand_color_note}{logo_note}{tagline_note}{goal_note}{voice_note}"
+            f"CAMERA: {camera_light}. Composition: {composition}. "
+            f"Subject tack sharp, background softly blurred (shallow depth of field). "
+            f"COLOUR: {colour}. Lifted shadows, no heavy LUT or Instagram filter. "
+            f"{brand_color_note}{logo_note}{tagline_note}{goal_note}{voice_note}"
+            f"QUALITY: editorial-grade, publishable in a premium African business magazine. "
             f"CONSTRAINTS: no text overlays, no watermarks, no logos, "
-            f"not stock-photo aesthetic, not illustrated, not cinematic."
+            f"not stock-photo stiffness, not illustrated, not CGI render, not cinematic."
         )
     
     @staticmethod
@@ -773,28 +845,52 @@ class ImageContentService:
             resp.raise_for_status()
             logo_img = Image.open(io.BytesIO(resp.content)).convert("RGBA")
 
-            # Resize logo to 14% of image width, preserve aspect ratio
-            target_w = max(60, int(bw * 0.14))
+            # Resize logo to 12% of image width, preserve aspect ratio
+            target_w = max(60, int(bw * 0.12))
             lw, lh = logo_img.size
             scale = target_w / lw
             logo_img = logo_img.resize((target_w, int(lh * scale)), Image.LANCZOS)
             lw, lh = logo_img.size
 
-            # Edge padding (~2.5% of image width)
-            pad = max(20, int(bw * 0.025))
+            # Badge padding (inner: 8px each side, outer edge: 2.5% of width)
+            badge_pad_inner = max(8, int(bw * 0.008))
+            edge_pad = max(20, int(bw * 0.025))
+
+            badge_w = lw + badge_pad_inner * 2
+            badge_h = lh + badge_pad_inner * 2
 
             if position == "bottom_left":
-                x, y = pad, bh - lh - pad
+                bx = edge_pad
             else:  # bottom_right (default)
-                x, y = bw - lw - pad, bh - lh - pad
+                bx = bw - badge_w - edge_pad
+            by = bh - badge_h - edge_pad
 
-            # Composite logo onto base image
-            base_img.paste(logo_img, (x, y), logo_img)
+            # Draw semi-transparent white rounded-rectangle badge behind logo
+            badge = Image.new("RGBA", (badge_w, badge_h), (0, 0, 0, 0))
+            try:
+                from PIL import ImageDraw
+                draw = ImageDraw.Draw(badge)
+                radius = max(6, badge_h // 5)
+                draw.rounded_rectangle(
+                    [(0, 0), (badge_w - 1, badge_h - 1)],
+                    radius=radius,
+                    fill=(255, 255, 255, 210)  # white at 82% opacity
+                )
+            except Exception:
+                # Fallback: plain white rectangle if rounded_rectangle unavailable
+                badge = Image.new("RGBA", (badge_w, badge_h), (255, 255, 255, 210))
+
+            base_img.paste(badge, (bx, by), badge)
+
+            # Paste logo on top of badge
+            logo_x = bx + badge_pad_inner
+            logo_y = by + badge_pad_inner
+            base_img.paste(logo_img, (logo_x, logo_y), logo_img)
 
             buf = io.BytesIO()
             base_img.convert("RGB").save(buf, format="WEBP", quality=95)
             result_b64 = _b64.b64encode(buf.getvalue()).decode()
-            print(f"✅ Logo composited at {position} ({lw}×{lh}px on {bw}×{bh}px image)")
+            print(f"✅ Logo composited at {position} with badge ({lw}×{lh}px on {bw}×{bh}px image)")
             return result_b64
 
         except Exception as e:
@@ -802,18 +898,23 @@ class ImageContentService:
             return b64
 
     @staticmethod
-    def _map_to_dalle_size(size: str) -> str:
-        """Map platform dimensions to gpt-image-1 supported sizes (1024x1024, 1536x1024, 1024x1536)"""
+    def _map_to_gemini_aspect(size: str) -> str:
+        """Map platform dimensions to Nano Banana 2 (Imagen) supported aspect ratios."""
         try:
             width, height = map(int, size.split("x"))
-            if width > height:
-                return "1536x1024"
-            elif height > width:
-                return "1024x1536"
+            ratio = width / height
+            if ratio >= 1.6:
+                return "16:9"
+            elif ratio >= 1.3:
+                return "4:3"
+            elif ratio <= 0.65:
+                return "9:16"
+            elif ratio <= 0.85:
+                return "3:4"
             else:
-                return "1024x1024"
+                return "1:1"
         except (ValueError, AttributeError):
-            return "1024x1024"
+            return "1:1"
 
     @staticmethod
     def _crop_to_ratio(b64: str, target_w: int, target_h: int) -> str:
@@ -856,13 +957,11 @@ class ImageContentService:
     @staticmethod
     async def _call_dalle_api(prompt: str, size: str = "1024x1024") -> Dict[str, Any]:
         """
-        Call OpenAI gpt-image-1.5 API for image generation.
-        Generates at the nearest supported DALL-E size, then center-crops to the
-        exact target ratio so platform specs (e.g. Instagram 4:5) are met.
-        Returns a base64 data URL since gpt-image-1.5 only supports b64_json output.
+        Generate an image using Nano Banana 2 (Google Imagen via Gemini API).
+        Falls back to gpt-image-1 if the Gemini key is not configured.
         """
         try:
-            from app.services.AIService import client
+            from app.core.config import settings as _cfg
 
             # Parse requested dimensions for post-generation crop
             try:
@@ -870,38 +969,95 @@ class ImageContentService:
             except (ValueError, AttributeError):
                 target_w, target_h = 1024, 1024
 
-            image_size = ImageContentService._map_to_dalle_size(size)
+            if _cfg.GOOGLE_GEMINI_API_KEY:
+                # ── Nano Banana 2 via Google GenAI SDK ────────────────────────
+                from google import genai as _genai
+                from google.genai import types as _gtypes
+                import base64 as _b64
 
-            loop = asyncio.get_running_loop()
-            response = await loop.run_in_executor(
-                None,
-                lambda: client.images.generate(
-                    model="gpt-image-1.5",
-                    prompt=prompt,
-                    n=1,
-                    size=image_size,
-                    quality="high",
-                    output_format="webp",
-                    moderation="low",
+                aspect_ratio = ImageContentService._map_to_gemini_aspect(size)
+
+                client_g = _genai.Client(api_key=_cfg.GOOGLE_GEMINI_API_KEY)
+
+                loop = asyncio.get_running_loop()
+                response = await loop.run_in_executor(
+                    None,
+                    lambda: client_g.models.generate_images(
+                        model="imagen-4.0-ultra-generate-001",
+                        prompt=prompt,
+                        config=_gtypes.GenerateImagesConfig(
+                            number_of_images=1,
+                            aspect_ratio=aspect_ratio,
+                            safety_filter_level="block_low_and_above",
+                            person_generation="allow_adult",
+                        ),
+                    )
                 )
-            )
 
-            b64 = response.data[0].b64_json
+                generated = response.generated_images[0]
+                b64 = _b64.b64encode(generated.image.image_bytes).decode()
 
-            # Crop to exact target ratio (< 5 ms, negligible vs. DALL-E latency)
-            b64 = ImageContentService._crop_to_ratio(b64, target_w, target_h)
+                # Crop to exact target ratio
+                b64 = ImageContentService._crop_to_ratio(b64, target_w, target_h)
 
-            data_url = f"data:image/webp;base64,{b64}"
-            return {
-                "success": True,
-                "url": data_url
-            }
+                # Nano Banana 2 returns PNG — convert to WebP for consistency
+                import io
+                from PIL import Image as _PILImage
+                img = _PILImage.open(io.BytesIO(_b64.b64decode(b64)))
+                buf = io.BytesIO()
+                img.convert("RGB").save(buf, format="WEBP", quality=95)
+                b64 = _b64.b64encode(buf.getvalue()).decode()
+
+                print(f"🎨 Nano Banana 2 image generated ({aspect_ratio})")
+                data_url = f"data:image/webp;base64,{b64}"
+                return {
+                    "success": True,
+                    "url": data_url,
+                    "model": "nano-banana-2"
+                }
+
+            else:
+                # ── Fallback: gpt-image-1 ──────────────────────────────────────
+                from app.services.AIService import client
+                from openai import OpenAI as _OAI
+
+                dall_e_sizes = {
+                    "landscape": "1536x1024",
+                    "portrait":  "1024x1536",
+                    "square":    "1024x1024",
+                }
+                if target_w > target_h:
+                    image_size = "1536x1024"
+                elif target_h > target_w:
+                    image_size = "1024x1536"
+                else:
+                    image_size = "1024x1024"
+
+                loop = asyncio.get_running_loop()
+                response = await loop.run_in_executor(
+                    None,
+                    lambda: client.images.generate(
+                        model="gpt-image-1",
+                        prompt=prompt,
+                        n=1,
+                        size=image_size,
+                        quality="high",
+                        output_format="webp",
+                    )
+                )
+                import base64 as _b64
+                b64 = response.data[0].b64_json
+                b64 = ImageContentService._crop_to_ratio(b64, target_w, target_h)
+                data_url = f"data:image/webp;base64,{b64}"
+                return {
+                    "success": True,
+                    "url": data_url,
+                    "model": "gpt-image-1"
+                }
 
         except Exception as e:
-            return {
-                "success": False,
-                "error": str(e)
-            }
+            print(f"❌ Image generation failed: {e}")
+            return {"success": False, "error": str(e)}
     
     @staticmethod
     async def generate_brand_consistent_images(
