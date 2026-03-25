@@ -1,8 +1,9 @@
+from typing import Optional
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 from urllib.parse import quote_plus
 from app.core.config import settings
 
-client: AsyncIOMotorClient | None = None
+client: Optional[AsyncIOMotorClient] = None
 
 
 def connect_to_mongo(database_name: str) -> None:
