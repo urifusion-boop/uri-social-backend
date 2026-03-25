@@ -8,6 +8,7 @@ from app.core.config import settings
 from app.core.sentry_config import initialize_sentry
 from app.agents.social_media_manager.routers.complete_social_manager import router as social_media_router
 from app.agents.social_media_manager.routers.whatsapp_router import router as whatsapp_router
+from app.agents.social_media_manager.routers.x_router import router as x_router
 from app.routers.auth_router import router as auth_router
 
 # Initialize Sentry
@@ -51,6 +52,7 @@ app.include_router(
 )
 
 app.include_router(whatsapp_router)
+app.include_router(x_router)
 
 
 @app.get("/")

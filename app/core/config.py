@@ -29,6 +29,7 @@ class Settings(BaseSettings):
 
     # Outstand
     OUTSTAND_API_KEY: Optional[str] = None
+    OUTSTAND_WEBHOOK_SECRET: Optional[str] = None  # For verifying Outstand webhook signatures
 
     # imgBB
     IMGBB_API_KEY: Optional[str] = None
