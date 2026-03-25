@@ -463,7 +463,7 @@ class WhatsAppFlowService:
             ChatMessage(role="system", content="You are a social media strategist."),
             ChatMessage(role="user", content=prompt),
         ]
-        request = ChatModel(model="gpt-4o-mini", messages=messages, temperature=0.8)
+        request = ChatModel(model="gpt-5.4-mini", messages=messages, temperature=0.8)
         result = await AIService.chat_completion(request)
 
         if isinstance(result, dict) and result.get("error"):
@@ -510,7 +510,7 @@ class WhatsAppFlowService:
                     ChatMessage(role="system", content="You are a social media strategist."),
                     ChatMessage(role="user", content=prompt),
                 ]
-                req = ChatModel(model="gpt-4o-mini", messages=messages, temperature=0.9)
+                req = ChatModel(model="gpt-5.4-mini", messages=messages, temperature=0.9)
                 ai = await AIService.chat_completion(req)
 
                 idea = (
