@@ -21,6 +21,7 @@ from ..services.social_account_service import SocialAccountService
 from ..services.approval_workflow_service import ApprovalWorkflowService
 from ..services.auto_content_service import AutoContentService
 from ..services.brand_profile_service import BrandProfileService
+from ..services.outstand_service import OutstandService
 
 router = APIRouter(tags=["Social Media Manager"])
 
@@ -783,6 +784,128 @@ async def get_content_analytics(
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# ==============================================================================
+# PERFORMANCE / ANALYTICS
+# ==============================================================================
+
+@router.get("/performance")
+async def get_performance(
+    days: int = 30,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer())
+):
+    """
+    Fetch real-time post analytics from Outstand for the user's published drafts.
+    Returns aggregated summary + per-post breakdown + per-platform summary.
+    """
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    from datetime import timedelta
+    import asyncio as _asyncio
+
+    try:
+        date_filter = datetime.utcnow() - timedelta(days=days)
+        published = await db["content_drafts"].find({
+            "user_id": user_id,
+            "status": "published",
+            "platform_post_id": {"$exists": True, "$ne": None},
+            "published_date": {"$gte": date_filter},
+        }).sort("published_date", -1).to_list(length=50)
+
+        if not published:
+            return UriResponse.get_single_data_response("performance", {
+                "has_data": False,
+                "total_published": 0,
+                "date_range_days": days,
+                "summary": {},
+                "by_platform": {},
+                "top_posts": [],
+            })
+
+        outstand = OutstandService()
+
+        async def _fetch(draft):
+            post_id = draft.get("platform_post_id")
+            if not post_id:
+                return None
+            try:
+                data = await outstand.get_post_analytics(post_id)
+                agg = data.get("aggregated_metrics") or {}
+                by_account = data.get("metrics_by_account") or []
+                platform = draft.get("platform", "unknown")
+                network = by_account[0]["social_account"]["network"] if by_account else platform
+                return {
+                    "draft_id": draft.get("id"),
+                    "platform_post_id": post_id,
+                    "platform": network or platform,
+                    "content_preview": (draft.get("content") or "")[:120],
+                    "published_at": draft.get("published_date", ""),
+                    "image_url": draft.get("image_url"),
+                    "likes": agg.get("total_likes", 0),
+                    "comments": agg.get("total_comments", 0),
+                    "shares": agg.get("total_shares", 0),
+                    "views": agg.get("total_views", 0),
+                    "impressions": agg.get("total_impressions", 0),
+                    "reach": agg.get("total_reach", 0),
+                    "engagement_rate": round(agg.get("average_engagement_rate", 0) * 100, 2),
+                }
+            except Exception as e:
+                print(f"⚠️ Analytics fetch failed for post {post_id}: {e}")
+                return None
+
+        results = await _asyncio.gather(*[_fetch(d) for d in published])
+        posts = [r for r in results if r is not None]
+
+        # Aggregate summary
+        def _sum(key): return sum(p.get(key, 0) or 0 for p in posts)
+        total_posts = len(posts)
+        summary = {
+            "total_posts": total_posts,
+            "total_impressions": _sum("impressions"),
+            "total_reach": _sum("reach"),
+            "total_likes": _sum("likes"),
+            "total_comments": _sum("comments"),
+            "total_shares": _sum("shares"),
+            "total_views": _sum("views"),
+            "avg_engagement_rate": round(
+                sum(p.get("engagement_rate", 0) or 0 for p in posts) / total_posts, 2
+            ) if total_posts else 0,
+        }
+
+        # Per-platform breakdown
+        by_platform: dict = {}
+        for p in posts:
+            pl = p["platform"]
+            if pl not in by_platform:
+                by_platform[pl] = {"posts": 0, "impressions": 0, "reach": 0, "likes": 0, "comments": 0, "shares": 0, "engagement_rate_sum": 0}
+            by_platform[pl]["posts"] += 1
+            for k in ("impressions", "reach", "likes", "comments", "shares"):
+                by_platform[pl][k] += p.get(k, 0) or 0
+            by_platform[pl]["engagement_rate_sum"] += p.get("engagement_rate", 0) or 0
+        for pl, data in by_platform.items():
+            n = data["posts"]
+            data["avg_engagement_rate"] = round(data.pop("engagement_rate_sum") / n, 2) if n else 0
+
+        # Top posts by impressions
+        top_posts = sorted(posts, key=lambda x: x.get("impressions", 0), reverse=True)[:10]
+
+        return UriResponse.get_single_data_response("performance", {
+            "has_data": True,
+            "total_published": len(published),
+            "date_range_days": days,
+            "summary": summary,
+            "by_platform": by_platform,
+            "top_posts": top_posts,
+        })
+
+    except Exception as e:
+        import traceback
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 # ==============================================================================
 # UTILITY ENDPOINTS
