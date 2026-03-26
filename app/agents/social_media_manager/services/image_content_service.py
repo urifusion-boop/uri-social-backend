@@ -52,7 +52,8 @@ class ImageContentService:
         platforms: List[str],
         include_images: bool = True,
         brand_context: Optional[Dict[str, Any]] = None,
-        db=None
+        db=None,
+        reference_image: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Generate complete social media content with text and images
@@ -91,7 +92,8 @@ class ImageContentService:
                         platform=draft['platform'],
                         content=draft['content'],
                         seed_content=seed_content,
-                        brand_context=brand_context
+                        brand_context=brand_context,
+                        reference_image=reference_image,
                     )
                     
                     if image_result.get('status'):
@@ -166,7 +168,8 @@ class ImageContentService:
         platform: str,
         content: str,
         seed_content: str,
-        brand_context: Optional[Dict[str, Any]] = None
+        brand_context: Optional[Dict[str, Any]] = None,
+        reference_image: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Generate an AI image optimized for a specific platform
@@ -175,13 +178,14 @@ class ImageContentService:
             # Get platform image specifications
             specs = ImageContentService._get_platform_image_specs(platform)
 
-            # Try GPT-4.1 meta-prompting first — picks image type and generates brief
+            # Try GPT-5.4 meta-prompting first — picks image type and generates brief
             image_prompt = await ImageContentService._generate_image_brief(
                 content=content,
                 seed_content=seed_content,
                 platform=platform,
                 brand_context=brand_context,
-                specs=specs
+                specs=specs,
+                reference_image=reference_image,
             )
 
             # Fall back to static prompt if GPT-4.1 fails
@@ -233,7 +237,8 @@ class ImageContentService:
         seed_content: str,
         platform: str,
         brand_context: Optional[Dict[str, Any]] = None,
-        specs: Optional[Dict[str, Any]] = None
+        specs: Optional[Dict[str, Any]] = None,
+        reference_image: Optional[str] = None,
     ) -> Optional[str]:
         """
         Use GPT-4.1 to select the most appropriate image type for the content,
@@ -397,128 +402,81 @@ class ImageContentService:
             )
 
             system_prompt = (
-                "You are a senior creative director at a top African brand agency. "
-                "You write structured image generation prompts fed directly into "
-                "Nano Banana 2 (Google Imagen 4), a state-of-the-art AI image model.\n\n"
+                "You are a world-class creative director and AI image prompt engineer at a top African brand agency. "
+                "Your job is to commission visually stunning, commercially ready images for social media — "
+                "the kind that appear in real campaigns by Flutterwave, Paystack, Moniepoint, and MTN. "
+                "You brief Nano Banana 2 (Google Imagen 4 Ultra), a state-of-the-art photorealistic image model.\n\n"
 
-                "Every prompt must produce a commercially ready, industry-standard image — "
-                "the kind used in real brand campaigns by companies like Flutterwave, Paystack, "
-                "or MTN. Think like a professional: what would a real art director commission here?\n\n"
+                "Nano Banana 2 performs best with flowing, scene-rich natural-language prompts — "
+                "NOT structured notes or labeled sections. Your final deliverable is a single master prompt "
+                "that reads like a director's brief to a photographer and art director simultaneously.\n\n"
 
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 "STEP 1 — Pick the best image type:\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
 
                 "  PHOTO              — Premium editorial photograph. Real people, real action.\n"
-                "                       Best for: human stories, behind-the-scenes, community.\n\n"
-                "  POSTER             — Graphic design poster. Brand colors dominant.\n"
-                "                       Text is OPTIONAL — use only when it genuinely adds value.\n"
-                "                       Best for: campaigns, launches, promotions, awareness.\n\n"
-                "  STAT_CARD          — Typographic card. Key number/quote is the hero. Always has text.\n"
-                "                       Best for: milestones, achievements, data.\n\n"
-                "  PRODUCT_SHOWCASE   — Editorial product/service visual. Luxury magazine quality.\n"
-                "                       Best for: product features, service reveals.\n\n"
-                "  INFOGRAPHIC        — Visual layout: process, comparison, steps. Always has labels.\n"
-                "                       Best for: how-it-works, comparisons, step-by-step.\n\n"
-                "  BRAND_ILLUSTRATION — Flat/semi-realistic illustration. Nigerian cultural context.\n"
-                "                       Best for: abstract concepts, values, lifestyle.\n\n"
+                "                       Best for: human stories, culture, community, behind-the-scenes.\n\n"
+                "  POSTER             — Graphic design poster. Bold brand colors, clean layout.\n"
+                "                       Best for: campaigns, launches, announcements, promotions.\n\n"
+                "  STAT_CARD          — Typographic impact card. A single key number or quote is the hero.\n"
+                "                       Best for: milestones, data, achievements.\n\n"
+                "  PRODUCT_SHOWCASE   — Editorial product or service visual. Luxury magazine quality.\n"
+                "                       Best for: product reveals, service spotlights.\n\n"
+                "  BRAND_ILLUSTRATION — Modern flat or semi-realistic illustrated scene.\n"
+                "                       Best for: abstract values, concepts, lifestyle.\n\n"
 
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "STEP 2 — Decide the text approach (POSTER only):\n"
+                "STEP 2 — Decide text approach:\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
 
-                "For POSTER, choose the right text level based on what the content actually needs:\n\n"
+                "PHOTO / BRAND_ILLUSTRATION: NEVER include text overlays — the caption carries the message.\n\n"
 
-                "  TEXT_LEVEL: NONE\n"
-                "    The image is powerful enough alone. The social media caption carries the message.\n"
-                "    Use when: the visual concept is striking, emotional, or abstract.\n"
-                "    The brand logo will be composited separately — no other text in the image.\n\n"
+                "POSTER:\n"
+                "  NONE — Striking visual alone, no text. Most often the right choice.\n"
+                "  BRAND_ONLY — Tiny brand name or tagline only, like a Nike swoosh.\n"
+                "  HEADLINE — Brand name + one 4-6 word bold headline from the post.\n"
+                "  FULL — Headline + subtext + brand name. Only for formal announcements.\n\n"
 
-                "  TEXT_LEVEL: BRAND_ONLY\n"
-                "    Just the brand name or tagline, small and unobtrusive — like a Nike swoosh.\n"
-                "    Use when: the image speaks for itself but needs brand attribution.\n\n"
+                "STAT_CARD: Always show the key number/stat + short label.\n"
+                "PRODUCT_SHOWCASE: Brand name only, optional.\n\n"
 
-                "  TEXT_LEVEL: HEADLINE\n"
-                "    Brand name + one bold 4-6 word headline extracted from the post.\n"
-                "    Use when: there's a specific offer, launch, or call-to-action to announce.\n\n"
-
-                "  TEXT_LEVEL: FULL\n"
-                "    Headline + supporting subtext + brand name. Full typographic layout.\n"
-                "    Use when: the post is a formal announcement, event, or product launch that needs "
-                "all the information visible in the image itself.\n\n"
-
-                "For all other types:\n"
-                "  STAT_CARD, INFOGRAPHIC → always have text (the numbers/labels are the point)\n"
-                "  PHOTO, BRAND_ILLUSTRATION → never have text overlays\n"
-                "  PRODUCT_SHOWCASE → brand name only, optional\n\n"
+                "TEXT SAFE ZONE (critical): ALL text must sit in the middle 80% of the canvas. "
+                "The top 15% and bottom 10% must be completely free of text — "
+                "social platforms and display frames crop these margins. "
+                "Place headlines in the lower-centre or centre of the frame — NEVER at the top edge.\n\n"
 
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "STEP 3 — Write the prompt in this EXACT format:\n"
+                "STEP 3 — Write the reasoning sections (internal):\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
 
-                "COLOR_PALETTE: [Brand hex codes and their exact role. "
-                "e.g. '#CD1B78 magenta as dominant background, white for text, #1A1A2E navy accent']\n\n"
-
-                "BACKGROUND: [Precise environment, backdrop, or graphic setting — "
-                "include texture, depth, lighting mood, and any geometric or architectural details.]\n\n"
-
-                "FOCAL_ELEMENT: [The single most important visual. For people: skin tone, hair, "
-                "clothing, exact action, expression. For graphics: shapes, icons, objects. Be specific.]\n\n"
-
-                "LAYOUT: [Platform + dimensions + composition. "
-                "e.g. 'Landscape 1200×628, subject left-third, negative space right, strong visual hierarchy'. "
-                "IMPORTANT: All visual elements and text must stay within a 10% safe zone margin from every edge — "
-                "nothing important placed within the outermost 10% of the frame.]\n\n"
-
-                "TYPOGRAPHY: [Your text decision. Write one of:\n"
-                "  • 'No text overlays.' — for NONE level or PHOTO/BRAND_ILLUSTRATION\n"
-                "  • 'Brand name only: [exact text], small, [placement], [color].' — for BRAND_ONLY\n"
-                "  • Specific typographic layout — for HEADLINE or FULL level, including exact words, "
-                "font style (bold sans-serif / display / condensed), size hierarchy, placement, color.\n"
-                "  SAFE ZONE RULE: ALL text must be placed in the middle 80% of the canvas — "
-                "never in the top 15%, never in the bottom 15%, never within 10% of the left or right edges. "
-                "For HEADLINE: place headline in the lower-centre or centre of the frame, never at the top. "
-                "For FULL: stack brand name + headline + subtext in the vertical centre or lower half only. "
-                "Text placed at the top edge will be cropped — do not place any text in the upper portion.]\n\n"
-
-                "QUALITY: [Editorial standard, specific to this image. Always end with: "
-                "'No watermarks, no logos, not stock-photo stiffness.']\n\n"
-
-                "CONSTRAINTS: [What NOT to do, specific to this content and type. "
-                "Always include: 'No text or critical elements within 15% of the top edge or 10% of any edge.']\n\n"
-
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "UNIVERSAL RULES:\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "• Brand colors in COLOR_PALETTE always — with exact hex codes from the brand data\n"
-                "• Nigerian/West African context — Lagos/Abuja settings, dark skin tones, "
-                "natural and protective hairstyles, culturally appropriate attire\n"
-                "• Fill every section with brand-specific detail — never leave anything generic\n"
-                "• The image must illustrate the post content, not just the brand\n"
-                "• SAFE ZONE: All text and key visual elements must be fully inside the central 80% "
-                "of the canvas. The top 15% and bottom 10% must be free of any text or overlays — "
-                "these margins are cropped by most social platforms and display frames.\n\n"
-
-                "PHOTO RULES:\n"
-                "• Subject mid-action, never posed\n"
-                "• Specify camera + lens + aperture (Sony A7R V, 85mm f/1.4 at f/2.0)\n"
-                "• Name the light source (north window, late-afternoon ambient, soft box)\n"
-                "• Skin: natural texture, visible pores, slight forehead sheen\n"
-                "• Colour grade: lifted shadows, natural white balance, no heavy LUT\n"
-                "• Never: cinematic, dramatic, HDR, 8K, stunning, render\n\n"
-
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "OUTPUT (strict — these labeled lines only, no other text):\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "TYPE: [type]\n"
+                "TYPE: [chosen type]\n"
                 "TEXT_LEVEL: [NONE | BRAND_ONLY | HEADLINE | FULL | N/A]\n"
-                "COLOR_PALETTE: ...\n"
-                "BACKGROUND: ...\n"
-                "FOCAL_ELEMENT: ...\n"
-                "LAYOUT: ...\n"
-                "TYPOGRAPHY: ...\n"
-                "QUALITY: ...\n"
-                "CONSTRAINTS: ..."
+                "PALETTE_NOTES: [Describe brand colors in words only — NO hex codes. "
+                "e.g. 'deep magenta, ivory white, muted gold'. Explain where each appears.]\n"
+                "SCENE_NOTES: [Describe the setting, subject, action, and composition in detail.]\n"
+                "QUALITY_NOTES: [Camera, light, mood, finish standard for this image type.]\n\n"
+
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "STEP 4 — Write the FINAL_PROMPT (the only part sent to the image model):\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+                "FINAL_PROMPT: [A single flowing paragraph of 200-260 words that Imagen 4 Ultra will "
+                "render directly. Rules:\n"
+                "• Open with the image type and format (e.g. 'Premium editorial photograph,' or 'Bold graphic design poster,')\n"
+                "• Describe the subject with cinematic specificity: person's age range, skin tone, hair, exact clothing, "
+                "expression, and precise action — never generic, always specific\n"
+                "• Describe the setting with architectural and environmental detail — specific city district, "
+                "time of day, light source and direction, material textures\n"
+                "• For PHOTO: include camera model, lens, aperture, and colour grade\n"
+                "• Brand colors described in words only (NO hex codes) — say 'deep magenta' not '#CD1B78'\n"
+                "• For text-bearing types: specify the EXACT words, font style (bold condensed sans-serif / "
+                "display serif), relative size, and placement in the lower half or centre of frame\n"
+                "• Nigerian/West African cultural context always: Lagos or Abuja settings, warm dark-brown "
+                "complexion, natural or protective hairstyles, culturally appropriate styling\n"
+                "• End with quality standard: 'No watermarks, no logos, no stock-photo stiffness, "
+                "no CGI render. Publishable in [relevant premium publication].'\n"
+                "• No labels, no sections, no parenthetical notes — pure flowing prose only]"
             )
 
             user_prompt = (
@@ -530,26 +488,38 @@ class ImageContentService:
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 "YOUR TASK:\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "1. Choose the image type that will make this post most compelling on this platform.\n"
-                "2. If POSTER — decide the right TEXT_LEVEL honestly. Ask yourself: does this post "
-                "benefit from text in the image, or is a strong visual with the caption enough? "
-                "A striking visual with TEXT_LEVEL: NONE is often more powerful than a cluttered poster. "
-                "Only use HEADLINE or FULL when there is a specific offer, launch, or CTA to announce.\n"
-                "3. Use EVERY piece of brand context to write rich, specific detail in each section. "
-                "If the post topic is short, draw on the business description, products, audience, "
-                "brand voice, and region — never leave a section generic.\n"
+                "1. Choose the image type that will make this post most compelling and scroll-stopping "
+                "on this specific platform.\n"
+                "2. If POSTER — be honest about TEXT_LEVEL. A bold visual with NONE often outperforms "
+                "a cluttered poster with text. Only use HEADLINE or FULL for a specific offer or launch.\n"
+                "3. In PALETTE_NOTES and SCENE_NOTES, use every piece of brand context — never leave "
+                "anything generic. If the post topic is short, pull from business description, products, "
+                "audience, and region to enrich the scene.\n"
                 f"4. Brand colors ({brand_colors_str if brand_colors_str else 'from brand identity'}) "
-                "must appear in COLOR_PALETTE and dominate the image.\n"
-                "5. Output ONLY the labeled sections. No preamble, no explanation."
+                "must appear prominently — described in words only, no hex codes.\n"
+                "5. In FINAL_PROMPT: write a single flowing paragraph of cinematic richness. "
+                "This paragraph is fed DIRECTLY to Imagen 4 Ultra — it must be vivid, specific, "
+                "and commercially ready. Every word counts. Describe things the camera would see, "
+                "not abstract concepts. No labels, no sections — pure prose only."
             )
 
             logo_url = brand_context.get("logo_url") if brand_context else None
 
-            # Build user message — attach logo + sample templates as vision images so
-            # GPT-4.1 can extract exact brand colors, layout style, and visual identity.
-            has_vision = logo_url or sample_template_urls
+            # Build user message — attach logo + sample templates + reference image as vision
+            # so GPT-5.4 can extract brand identity and user-provided contextual details.
+            has_vision = logo_url or sample_template_urls or reference_image
             if has_vision:
                 vision_note_parts = []
+                if reference_image:
+                    vision_note_parts.append(
+                        "A user-uploaded REFERENCE IMAGE is attached first. This is the most important image — "
+                        "study it carefully and extract: the subject(s) and their appearance, the setting/environment, "
+                        "the occasion or event depicted, any products, text, or notable objects present, "
+                        "the mood and lighting, and any cultural or contextual cues. "
+                        "Your generated image brief MUST incorporate the specific details from this reference — "
+                        "the same people, setting, occasion, and visual story should be reflected in the image you brief. "
+                        "This is NOT stock imagery inspiration — treat it as the actual scene to depict or directly reference."
+                    )
                 if logo_url:
                     vision_note_parts.append(
                         "A brand logo image is attached. Analyse its colors, shapes, and visual "
@@ -557,7 +527,7 @@ class ImageContentService:
                     )
                 if sample_template_urls:
                     vision_note_parts.append(
-                        f"{len(sample_template_urls)} brand design template(s) are attached after the logo. "
+                        f"{len(sample_template_urls)} brand design template(s) are attached. "
                         "Study their layout, typography style, color application, spacing, and visual hierarchy. "
                         "Your prompt should produce an image that feels like a natural extension of these templates — "
                         "same energy, same visual language, same brand identity."
@@ -565,6 +535,9 @@ class ImageContentService:
                 vision_note = "\n\n" + " ".join(vision_note_parts)
 
                 user_message_content = [{"type": "text", "text": user_prompt + vision_note}]
+                # Reference image goes first so it is the primary focus
+                if reference_image:
+                    user_message_content.append({"type": "image_url", "image_url": {"url": reference_image}})
                 if logo_url:
                     user_message_content.append({"type": "image_url", "image_url": {"url": logo_url}})
                 for tmpl_url in sample_template_urls:
@@ -581,20 +554,38 @@ class ImageContentService:
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_message_content}
                     ],
-                    max_completion_tokens=1100,
-                    temperature=0.75
+                    max_completion_tokens=1600,
+                    temperature=0.85
                 )
             )
             brief = response.choices[0].message.content.strip()
 
             # Strip hex color codes — image models render them as literal text in the image.
-            # Replace each #RRGGBB / #RGB token with its descriptive neighbor words.
             import re as _re_hex
-            brief_clean = _re_hex.sub(r'#[0-9A-Fa-f]{3,6}\b', '', brief)
-            # Collapse any double spaces left behind
-            brief_clean = _re_hex.sub(r'  +', ' ', brief_clean).strip()
+            brief_no_hex = _re_hex.sub(r'#[0-9A-Fa-f]{3,6}\b', '', brief)
+            brief_no_hex = _re_hex.sub(r'  +', ' ', brief_no_hex).strip()
 
-            chosen_type = brief_clean.split('\n')[0].replace('TYPE:', '').strip() if brief_clean.startswith('TYPE:') else 'UNKNOWN'
+            # Extract only the FINAL_PROMPT section to send to the image model.
+            # GPT reasons through the structure but only the flowing prose prompt
+            # gets sent to Imagen — it performs dramatically better this way.
+            final_prompt_match = _re_hex.search(
+                r'FINAL_PROMPT:\s*(.*?)(?:\n\n[A-Z_]+:|$)',
+                brief_no_hex,
+                _re_hex.DOTALL
+            )
+            if final_prompt_match:
+                brief_clean = final_prompt_match.group(1).strip()
+            else:
+                # Fallback: try a more lenient extraction (everything after FINAL_PROMPT:)
+                if 'FINAL_PROMPT:' in brief_no_hex:
+                    brief_clean = brief_no_hex.split('FINAL_PROMPT:', 1)[1].strip()
+                else:
+                    brief_clean = brief_no_hex
+
+            chosen_type = 'UNKNOWN'
+            type_match = _re_hex.search(r'TYPE:\s*(\w+)', brief_no_hex)
+            if type_match:
+                chosen_type = type_match.group(1).strip()
 
             # Diagnostic: show which brand fields were available for this generation
             field_status = {
@@ -623,6 +614,8 @@ class ImageContentService:
             tmpl_count = field_status["templates"]
 
             vision_refs = []
+            if reference_image:
+                vision_refs.append("user reference image")
             if logo_url:
                 vision_refs.append("logo")
             if tmpl_count:
@@ -630,10 +623,11 @@ class ImageContentService:
             vision_ref_note = f" | vision refs: {', '.join(vision_refs)}" if vision_refs else ""
 
             print(f"\n{'━'*60}")
-            print(f"🎨 IMAGE BRIEF — {platform.upper()} | type: {chosen_type}{vision_ref_note}")
+            print(f"🎨 IMAGEN PROMPT — {platform.upper()} | type: {chosen_type}{vision_ref_note}")
             print(f"   ✅ fields used ({len(filled)}): {', '.join(filled)}")
             if missing:
                 print(f"   ⚠️  fields missing ({len(missing)}): {', '.join(missing)}")
+            print(f"   📝 prompt length: {len(brief_clean)} chars")
             print(f"{'━'*60}")
             print(brief_clean)
             print(f"{'━'*60}\n")
@@ -985,7 +979,7 @@ class ImageContentService:
             base_img.paste(logo_img, (logo_x, logo_y), logo_img)
 
             buf = io.BytesIO()
-            base_img.convert("RGB").save(buf, format="WEBP", quality=95)
+            base_img.convert("RGB").save(buf, format="WEBP", quality=97, method=6)
             result_b64 = _b64.b64encode(buf.getvalue()).decode()
             print(f"✅ Logo composited at {position} with badge ({lw}×{lh}px on {bw}×{bh}px image)")
             return result_b64
@@ -1048,7 +1042,7 @@ class ImageContentService:
 
         cropped = img.crop(box)
         buf = io.BytesIO()
-        cropped.save(buf, format="WEBP", quality=95)
+        cropped.save(buf, format="WEBP", quality=97, method=6)
         return _b64.b64encode(buf.getvalue()).decode()
 
     @staticmethod
@@ -1085,7 +1079,7 @@ class ImageContentService:
                         config=_gtypes.GenerateImagesConfig(
                             number_of_images=1,
                             aspect_ratio=aspect_ratio,
-                            safety_filter_level="block_low_and_above",
+                            safety_filter_level="block_only_high",
                             person_generation="allow_adult",
                         ),
                     )
@@ -1102,7 +1096,7 @@ class ImageContentService:
                 from PIL import Image as _PILImage
                 img = _PILImage.open(io.BytesIO(_b64.b64decode(b64)))
                 buf = io.BytesIO()
-                img.convert("RGB").save(buf, format="WEBP", quality=95)
+                img.convert("RGB").save(buf, format="WEBP", quality=97, method=6)
                 b64 = _b64.b64encode(buf.getvalue()).decode()
 
                 print(f"🎨 Nano Banana 2 image generated ({aspect_ratio})")
