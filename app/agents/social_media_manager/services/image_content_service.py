@@ -466,18 +466,26 @@ class ImageContentService:
                 "clothing, exact action, expression. For graphics: shapes, icons, objects. Be specific.]\n\n"
 
                 "LAYOUT: [Platform + dimensions + composition. "
-                "e.g. 'Landscape 1200×628, subject left-third, negative space right, strong visual hierarchy'.]\n\n"
+                "e.g. 'Landscape 1200×628, subject left-third, negative space right, strong visual hierarchy'. "
+                "IMPORTANT: All visual elements and text must stay within a 10% safe zone margin from every edge — "
+                "nothing important placed within the outermost 10% of the frame.]\n\n"
 
                 "TYPOGRAPHY: [Your text decision. Write one of:\n"
                 "  • 'No text overlays.' — for NONE level or PHOTO/BRAND_ILLUSTRATION\n"
                 "  • 'Brand name only: [exact text], small, [placement], [color].' — for BRAND_ONLY\n"
                 "  • Specific typographic layout — for HEADLINE or FULL level, including exact words, "
-                "font style (bold sans-serif / display / condensed), size hierarchy, placement, color.]\n\n"
+                "font style (bold sans-serif / display / condensed), size hierarchy, placement, color.\n"
+                "  SAFE ZONE RULE: ALL text must be placed in the middle 80% of the canvas — "
+                "never in the top 15%, never in the bottom 15%, never within 10% of the left or right edges. "
+                "For HEADLINE: place headline in the lower-centre or centre of the frame, never at the top. "
+                "For FULL: stack brand name + headline + subtext in the vertical centre or lower half only. "
+                "Text placed at the top edge will be cropped — do not place any text in the upper portion.]\n\n"
 
                 "QUALITY: [Editorial standard, specific to this image. Always end with: "
                 "'No watermarks, no logos, not stock-photo stiffness.']\n\n"
 
-                "CONSTRAINTS: [What NOT to do, specific to this content and type.]\n\n"
+                "CONSTRAINTS: [What NOT to do, specific to this content and type. "
+                "Always include: 'No text or critical elements within 15% of the top edge or 10% of any edge.']\n\n"
 
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 "UNIVERSAL RULES:\n"
@@ -486,7 +494,10 @@ class ImageContentService:
                 "• Nigerian/West African context — Lagos/Abuja settings, dark skin tones, "
                 "natural and protective hairstyles, culturally appropriate attire\n"
                 "• Fill every section with brand-specific detail — never leave anything generic\n"
-                "• The image must illustrate the post content, not just the brand\n\n"
+                "• The image must illustrate the post content, not just the brand\n"
+                "• SAFE ZONE: All text and key visual elements must be fully inside the central 80% "
+                "of the canvas. The top 15% and bottom 10% must be free of any text or overlays — "
+                "these margins are cropped by most social platforms and display frames.\n\n"
 
                 "PHOTO RULES:\n"
                 "• Subject mid-action, never posed\n"
