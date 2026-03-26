@@ -97,7 +97,10 @@ async def google_auth(body: GoogleAuthRequest, db: AsyncIOMotorDatabase = Depend
         )
         token_data = token_resp.json()
         if "error" in token_data:
-            raise HTTPException(status_code=400, detail=f"Google token exchange failed: {token_data.get('error_description', token_data['error'])}")
+            error_code = token_data.get("error", "")
+            if error_code == "invalid_grant":
+                raise HTTPException(status_code=400, detail="This Google sign-in link has already been used or expired. Please try signing in again.")
+            raise HTTPException(status_code=400, detail=f"Google token exchange failed: {token_data.get('error_description', error_code)}")
 
         access_token = token_data["access_token"]
 
