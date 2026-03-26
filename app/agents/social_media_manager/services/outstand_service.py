@@ -116,6 +116,16 @@ class OutstandService:
             resp.raise_for_status()
             return resp.json()
 
+    async def get_post_analytics(self, post_id: str) -> Dict[str, Any]:
+        """Fetch analytics for a published post from Outstand's GET /v1/posts/{id}/analytics."""
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            resp = await client.get(
+                f"{self.base_url}/v1/posts/{post_id}/analytics",
+                headers=self.headers,
+            )
+            resp.raise_for_status()
+            return resp.json()
+
     async def publish_post(
         self,
         outstand_account_ids: List[str],
