@@ -69,6 +69,7 @@ class ContentGenerationRequest(BaseModel):
     seed_type: str = "text"
     include_images: bool = False
     brand_context: Optional[BrandContextRequest] = None
+    reference_image: Optional[str] = None  # base64 data URL uploaded by user for contextual reference
 
 class SocialConnectionRequest(BaseModel):
     platforms: List[str] = Field(..., min_items=1, max_items=10)
@@ -239,6 +240,7 @@ async def generate_content(
                     seed_content=request.seed_content,
                     brand_context=brand_context_dict,
                     db=db,
+                    reference_image=request.reference_image,
                 )
 
         return result
@@ -1321,6 +1323,7 @@ async def _generate_image_bg(
     seed_content: str,
     brand_context: Dict[str, Any],
     db: AsyncIOMotorDatabase,
+    reference_image: Optional[str] = None,
 ):
     """
     Background task: generate an image for an existing draft and save it to DB.
@@ -1337,6 +1340,7 @@ async def _generate_image_bg(
             content=content,
             seed_content=seed_content,
             brand_context=brand_context,
+            reference_image=reference_image,
         )
 
         if not image_result.get("status"):
