@@ -73,6 +73,7 @@ class ContentGenerationRequest(BaseModel):
 
 class SocialConnectionRequest(BaseModel):
     platforms: List[str] = Field(..., min_items=1, max_items=10)
+    source: str = "onboarding"  # "onboarding" | "settings"
 
 class FinalizeConnectionRequest(BaseModel):
     session_token: str
@@ -300,6 +301,7 @@ async def initiate_social_connections(
     return await SocialAccountService.initiate_connection_flow(
         user_id=user_id,
         platforms=request.platforms,
+        source=request.source,
     )
 
 
@@ -314,6 +316,7 @@ async def outstand_oauth_callback(
     network: Optional[str] = Query(None),
     success: Optional[str] = Query(None),
     error: Optional[str] = Query(None),
+    source: Optional[str] = Query(None),
 ):
     """
     OAuth callback — Outstand redirects the user's browser here after they
@@ -325,17 +328,18 @@ async def outstand_oauth_callback(
     2. Direct flow (X/Twitter OAuth 2.0):
        Outstand sends account_id + username directly → redirect frontend
        with account details so it can call POST /x/finalize-direct.
+
+    source: "onboarding" → redirect to brand-setup, "settings" → redirect to settings/social-accounts
     """
     import urllib.parse
 
     web_app_url = settings.WEB_APP_URL
+    is_settings = source == "settings"
+    base_redirect = f"{web_app_url}/settings/social-accounts" if is_settings else f"{web_app_url}/social-media/brand-setup"
 
     if error:
         encoded_error = urllib.parse.quote(error)
-        return RedirectResponse(
-            f"{web_app_url}/social-media/brand-setup"
-            f"?connected=false&error={encoded_error}"
-        )
+        return RedirectResponse(f"{base_redirect}?connected=false&error={encoded_error}")
 
     # Direct flow — X OAuth 2.0 returns account_id immediately
     if success == "true" and account_id:
@@ -346,19 +350,15 @@ async def outstand_oauth_callback(
             params += f"&network_unique_id={urllib.parse.quote(network_unique_id)}"
         if network:
             params += f"&network={urllib.parse.quote(network)}"
-        return RedirectResponse(f"{web_app_url}/social-media/brand-setup?{params}")
+        return RedirectResponse(f"{base_redirect}?{params}")
 
     # Session token flow
     token_value = sessionToken or session_token or session
     if not token_value:
-        return RedirectResponse(
-            f"{web_app_url}/social-media/brand-setup"
-            f"?connected=false&error=missing_session_token"
-        )
+        return RedirectResponse(f"{base_redirect}?connected=false&error=missing_session_token")
 
     return RedirectResponse(
-        f"{web_app_url}/social-media/brand-setup"
-        f"?sessionToken={urllib.parse.quote(token_value)}&connected=pending"
+        f"{base_redirect}?sessionToken={urllib.parse.quote(token_value)}&connected=pending"
     )
 
 
