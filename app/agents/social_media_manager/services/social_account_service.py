@@ -17,6 +17,7 @@ class SocialAccountService:
     async def initiate_connection_flow(
         user_id: str,
         platforms: List[str],
+        source: str = "onboarding",
     ) -> Dict[str, Any]:
         """
         Build Outstand OAuth URLs for each requested platform.
@@ -26,7 +27,7 @@ class SocialAccountService:
         """
         outstand = OutstandService()
         _base = settings.URI_GATEWAY_BASE_API_URL.rstrip("/")
-        callback_url = f"{_base}/social-media/connect/callback/outstand"
+        callback_url = f"{_base}/social-media/connect/callback/outstand?source={source}"
 
         auth_urls: Dict[str, str] = {}
         unsupported: List[str] = []
