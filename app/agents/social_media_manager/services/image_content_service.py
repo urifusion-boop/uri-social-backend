@@ -1079,7 +1079,7 @@ class ImageContentService:
                         config=_gtypes.GenerateImagesConfig(
                             number_of_images=1,
                             aspect_ratio=aspect_ratio,
-                            safety_filter_level="block_only_high",
+                            safety_filter_level="block_low_and_above",
                             person_generation="allow_adult",
                         ),
                     )
