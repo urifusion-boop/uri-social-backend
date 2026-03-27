@@ -13,6 +13,7 @@ services:
     environment:
       - ENV=Production
       - URI_GATEWAY_BASE_API_URL=http://uri-gateway.api
+      - PUBLIC_API_URL=https://api.urisocial.com
     restart: always
     ports:
       - "9003:80"
