@@ -26,7 +26,8 @@ class SocialAccountService:
         The frontend should open each auth_url for the user to authorise.
         """
         outstand = OutstandService()
-        _base = settings.URI_GATEWAY_BASE_API_URL.rstrip("/")
+        # Use PUBLIC_API_URL if set (browser-reachable), otherwise fall back to gateway URL
+        _base = (settings.PUBLIC_API_URL or settings.URI_GATEWAY_BASE_API_URL).rstrip("/")
         callback_url = f"{_base}/social-media/connect/callback/outstand?source={source}"
 
         auth_urls: Dict[str, str] = {}
