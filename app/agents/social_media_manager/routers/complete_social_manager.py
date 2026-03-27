@@ -1267,7 +1267,7 @@ async def upload_sample_template(
 
         b64 = base64.b64encode(contents).decode()
 
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=120) as client:
             resp = await client.post(
                 "https://api.imgbb.com/1/upload",
                 data={"key": settings.IMGBB_API_KEY, "image": b64, "name": file.filename},

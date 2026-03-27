@@ -685,7 +685,7 @@ class ApprovalWorkflowService:
                 return None
             b64_data = match.group(1)
 
-            async with _httpx.AsyncClient(timeout=30) as client:
+            async with _httpx.AsyncClient(timeout=120) as client:
                 resp = await client.post(
                     "https://api.imgbb.com/1/upload",
                     data={"key": api_key, "image": b64_data},
