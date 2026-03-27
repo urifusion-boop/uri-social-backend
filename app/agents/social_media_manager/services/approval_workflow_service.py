@@ -140,12 +140,13 @@ class ApprovalWorkflowService:
                 except Exception as e:
                     errors.append({"draft_id": draft_id, "error": str(e)})
             
-            # If immediate publishing, trigger publishing process
-            if schedule_option == "immediate" and approved_drafts:
+            # Publish immediately or send to Outstand with scheduledAt
+            if schedule_option in ("immediate", "schedule") and approved_drafts:
                 publish_results = await ApprovalWorkflowService._trigger_immediate_publishing(
-                    db, user_id, [d["draft_id"] for d in approved_drafts]
+                    db, user_id, [d["draft_id"] for d in approved_drafts],
+                    scheduled_datetime=scheduled_datetime if schedule_option == "schedule" else None,
                 )
-                
+
                 # Update drafts with publishing results
                 for draft in approved_drafts:
                     draft_result = publish_results.get(draft["draft_id"])
@@ -545,11 +546,12 @@ class ApprovalWorkflowService:
     async def _trigger_immediate_publishing(
         db: AsyncIOMotorDatabase,
         user_id: str,
-        draft_ids: List[str]
+        draft_ids: List[str],
+        scheduled_datetime: Optional[datetime] = None,
     ) -> Dict[str, Any]:
         """
-        Immediately publish approved drafts using the platform's own API.
-        Currently supports: facebook
+        Publish approved drafts via Outstand. Pass scheduled_datetime to schedule
+        via Outstand's native scheduledAt support instead of publishing immediately.
         """
         results = {}
 
@@ -628,7 +630,7 @@ class ApprovalWorkflowService:
                     platform=platform,
                     draft=draft,
                     connection=connection,
-                    scheduled_datetime=None,
+                    scheduled_datetime=scheduled_datetime,
                     db=db,
                 )
                 print(f"📊 Publish result for draft_id={draft_id}: {publish_result}")
@@ -638,11 +640,13 @@ class ApprovalWorkflowService:
                     else {"user_id": user_id, "outstand_account_id": connection.get("outstand_account_id")}
                 )
                 if publish_result.get("success"):
+                    is_scheduled = scheduled_datetime is not None
                     await db["content_drafts"].update_one(
                         {"id": draft_id},
                         {"$set": {
-                            "status": "published",
-                            "published_date": datetime.utcnow(),
+                            "status": "scheduled" if is_scheduled else "published",
+                            "published_date": None if is_scheduled else datetime.utcnow(),
+                            "scheduled_date": scheduled_datetime if is_scheduled else None,
                             "platform_post_id": publish_result.get("post_id"),
                             "publish_response": publish_result.get("raw_response"),
                             "updated_at": datetime.utcnow(),
