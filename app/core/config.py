@@ -50,6 +50,10 @@ class Settings(BaseSettings):
     DEV_ENV: str = "Development"
     WEB_APP_URL: str = ""
 
+    # Public-facing API base URL used for OAuth callbacks (must be reachable by browsers)
+    # e.g. https://api-staging.urisocial.com  or  http://localhost:9003
+    PUBLIC_API_URL: str = ""
+
     # Bypass flags for local development
     BYPASS_SUBSCRIPTION_CHECK: bool = False
     BYPASS_FEATURE_LIMIT_CHECK: bool = False
