@@ -110,7 +110,7 @@ class ImageContentService:
                                 from app.core.config import settings as _cfg
                                 _match = _re.match(r"data:[^;]+;base64,(.+)", raw_image_url, _re.DOTALL)
                                 if _match and _cfg.IMGBB_API_KEY:
-                                    async with _httpx.AsyncClient(timeout=30) as _c:
+                                    async with _httpx.AsyncClient(timeout=120) as _c:
                                         _r = await _c.post(
                                             "https://api.imgbb.com/1/upload",
                                             data={"key": _cfg.IMGBB_API_KEY, "image": _match.group(1)},
@@ -505,6 +505,27 @@ class ImageContentService:
 
             logo_url = brand_context.get("logo_url") if brand_context else None
 
+            # Pre-fetch external images as base64 data URLs so OpenAI vision doesn't
+            # need to download from imgBB (which times out frequently).
+            async def _fetch_as_data_url(url: str) -> Optional[str]:
+                if not url:
+                    return None
+                if url.startswith("data:"):
+                    return url  # already inline
+                try:
+                    import httpx as _httpx
+                    import base64 as _b64
+                    import mimetypes as _mt
+                    async with _httpx.AsyncClient(timeout=15) as _c:
+                        r = await _c.get(url)
+                        r.raise_for_status()
+                    content_type = r.headers.get("content-type", "image/jpeg").split(";")[0].strip()
+                    data = _b64.b64encode(r.content).decode()
+                    return f"data:{content_type};base64,{data}"
+                except Exception as _e:
+                    print(f"⚠️  Could not pre-fetch image for vision ({url[:60]}…): {_e}")
+                    return None
+
             # Build user message — attach logo + sample templates + reference image as vision
             # so GPT-5.4 can extract brand identity and user-provided contextual details.
             has_vision = logo_url or sample_template_urls or reference_image
@@ -537,11 +558,20 @@ class ImageContentService:
                 user_message_content = [{"type": "text", "text": user_prompt + vision_note}]
                 # Reference image goes first so it is the primary focus
                 if reference_image:
-                    user_message_content.append({"type": "image_url", "image_url": {"url": reference_image}})
+                    ref_data = await _fetch_as_data_url(reference_image)
+                    if ref_data:
+                        user_message_content.append({"type": "image_url", "image_url": {"url": ref_data}})
                 if logo_url:
-                    user_message_content.append({"type": "image_url", "image_url": {"url": logo_url}})
+                    logo_data = await _fetch_as_data_url(logo_url)
+                    if logo_data:
+                        user_message_content.append({"type": "image_url", "image_url": {"url": logo_data}})
                 for tmpl_url in sample_template_urls:
-                    user_message_content.append({"type": "image_url", "image_url": {"url": tmpl_url}})
+                    tmpl_data = await _fetch_as_data_url(tmpl_url)
+                    if tmpl_data:
+                        user_message_content.append({"type": "image_url", "image_url": {"url": tmpl_data}})
+                # If none of the images could be fetched, fall back to plain text
+                if len(user_message_content) == 1:
+                    user_message_content = user_prompt
             else:
                 user_message_content = user_prompt
 
