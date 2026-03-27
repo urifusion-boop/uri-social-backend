@@ -193,6 +193,60 @@ async def publish_to_x(
     }
 
 
+# ── Finalize direct connection (X OAuth 2.0) ───────────────────────────────
+
+
+class FinalizeDirectRequest(BaseModel):
+    account_id: str
+    username: Optional[str] = None
+    network_unique_id: Optional[str] = None
+
+
+@router.post("/finalize-direct")
+async def finalize_x_direct(
+    body: FinalizeDirectRequest,
+    token: dict = Depends(JWTBearer()),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """
+    Finalize an X connection when Outstand returns the account_id directly
+    (OAuth 2.0 / BYOK flow) without a session token.
+    Call this after the /connect/callback/outstand redirect with connected=direct.
+    """
+    from datetime import datetime
+    user_id = _extract_user_id(token)
+    now = datetime.utcnow()
+
+    doc = {
+        "id": body.account_id,
+        "user_id": user_id,
+        "platform": "x",
+        "outstand_account_id": body.account_id,
+        "username": body.username,
+        "account_name": body.username,
+        "network_unique_id": body.network_unique_id,
+        "connection_status": "active",
+        "connected_via": "outstand",
+        "connected_at": now,
+        "updated_at": now,
+    }
+    await db["social_connections"].update_one(
+        {"user_id": user_id, "platform": "x"},
+        {"$set": doc},
+        upsert=True,
+    )
+
+    return {
+        "status": True,
+        "responseCode": 200,
+        "responseMessage": "X account connected successfully.",
+        "responseData": {
+            "username": body.username,
+            "account_id": body.account_id,
+        },
+    }
+
+
 # ── Daily push (cron) ──────────────────────────────────────────────────────
 
 

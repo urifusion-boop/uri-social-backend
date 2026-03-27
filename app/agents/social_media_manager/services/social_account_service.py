@@ -26,8 +26,7 @@ class SocialAccountService:
         """
         outstand = OutstandService()
         _base = settings.URI_GATEWAY_BASE_API_URL.rstrip("/")
-        _prefix = "" if _base in ("http://localhost:9003", "http://127.0.0.1:9003") else "/uri-insights"
-        callback_url = f"{_base}{_prefix}/social-media/connect/callback/outstand"
+        callback_url = f"{_base}/social-media/connect/callback/outstand"
 
         auth_urls: Dict[str, str] = {}
         unsupported: List[str] = []

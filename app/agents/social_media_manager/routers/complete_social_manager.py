@@ -308,21 +308,27 @@ async def outstand_oauth_callback(
     sessionToken: Optional[str] = Query(None),
     session_token: Optional[str] = Query(None),
     session: Optional[str] = Query(None),
+    account_id: Optional[str] = Query(None),
+    username: Optional[str] = Query(None),
+    network_unique_id: Optional[str] = Query(None),
+    network: Optional[str] = Query(None),
+    success: Optional[str] = Query(None),
     error: Optional[str] = Query(None),
 ):
     """
     OAuth callback — Outstand redirects the user's browser here after they
     authorise on the social platform. No JWT required.
 
-    Redirects the user to the frontend brand-setup page with the sessionToken
-    so the frontend can call GET /connect/pending/{sessionToken} and then
-    POST /connect/finalize to complete the connection.
+    Two possible flows:
+    1. Session token flow (Facebook, LinkedIn etc.):
+       Outstand sends sessionToken → redirect frontend to pending/finalize.
+    2. Direct flow (X/Twitter OAuth 2.0):
+       Outstand sends account_id + username directly → redirect frontend
+       with account details so it can call POST /x/finalize-direct.
     """
     import urllib.parse
 
     web_app_url = settings.WEB_APP_URL
-    # Outstand may send the token as "session", "sessionToken", or "session_token"
-    token_value = sessionToken or session_token or session
 
     if error:
         encoded_error = urllib.parse.quote(error)
@@ -331,6 +337,19 @@ async def outstand_oauth_callback(
             f"?connected=false&error={encoded_error}"
         )
 
+    # Direct flow — X OAuth 2.0 returns account_id immediately
+    if success == "true" and account_id:
+        params = f"account_id={urllib.parse.quote(account_id)}&connected=direct"
+        if username:
+            params += f"&username={urllib.parse.quote(username)}"
+        if network_unique_id:
+            params += f"&network_unique_id={urllib.parse.quote(network_unique_id)}"
+        if network:
+            params += f"&network={urllib.parse.quote(network)}"
+        return RedirectResponse(f"{web_app_url}/social-media/brand-setup?{params}")
+
+    # Session token flow
+    token_value = sessionToken or session_token or session
     if not token_value:
         return RedirectResponse(
             f"{web_app_url}/social-media/brand-setup"
