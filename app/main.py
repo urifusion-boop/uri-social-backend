@@ -45,6 +45,7 @@ def http_exception_handler(request, exc):
 
 
 app.include_router(auth_router, prefix="/social-media")
+app.include_router(auth_router)  # also mount at /auth/login for frontend compatibility
 
 app.include_router(
     social_media_router,

@@ -159,7 +159,7 @@ async def login(body: LoginRequest, db: AsyncIOMotorDatabase = Depends(get_db_de
     if not user or not pwd_context.verify(body.password, user["password"]):
         raise HTTPException(status_code=401, detail="Invalid email or password.")
 
-    user_id = str(user["_id"])
+    user_id = user.get("userId") or str(user["_id"])
     token = sign_jwt(user_id, user["email"], user.get("first_name", ""), user.get("last_name", ""))
 
     return {
