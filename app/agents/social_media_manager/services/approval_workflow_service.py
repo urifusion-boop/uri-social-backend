@@ -13,6 +13,7 @@ from app.domain.responses.uri_response import UriResponse
 from app.services.FacebookService import FacebookService
 from app.core.config import settings
 from app.agents.social_media_manager.services.outstand_service import OutstandService
+from app.agents.social_media_manager.services.x_direct_service import XDirectService
 
 
 class ApprovalWorkflowService:
@@ -512,6 +513,7 @@ class ApprovalWorkflowService:
                                 "status": "published",
                                 "published_date": datetime.utcnow(),
                                 "platform_post_id": publish_result.get("post_id"),
+                                "outstand_post_status": publish_result.get("outstand_status", "queued"),
                                 "publish_response": publish_result.get("raw_response"),
                                 "updated_at": datetime.utcnow(),
                             }},
@@ -648,6 +650,7 @@ class ApprovalWorkflowService:
                             "published_date": None if is_scheduled else datetime.utcnow(),
                             "scheduled_date": scheduled_datetime if is_scheduled else None,
                             "platform_post_id": publish_result.get("post_id"),
+                            "outstand_post_status": publish_result.get("outstand_status", "queued"),
                             "publish_response": publish_result.get("raw_response"),
                             "updated_at": datetime.utcnow(),
                         }},
@@ -763,6 +766,43 @@ class ApprovalWorkflowService:
             tags = " ".join(f"#{t.strip('#')}" for t in draft["hashtags"])
             content = f"{content} {tags}"
 
+        # ── X direct (OAuth 1.0a) ─────────────────────────────────────────────
+        if platform in ("x", "twitter") and connection.get("connected_via") == "x_direct":
+            access_token = connection.get("x_oauth_token")
+            access_token_secret = connection.get("x_oauth_token_secret")
+            if not access_token or not access_token_secret:
+                return {"success": False, "error": "X connection is missing OAuth tokens. Please reconnect your account."}
+            credits_depleted = False
+            try:
+                svc = XDirectService()
+                tweets = draft.get("tweets") if draft.get("is_twitter_thread") and draft.get("tweets") else None
+                if tweets and len(tweets) > 1:
+                    results = await svc.post_thread(access_token, access_token_secret, tweets)
+                    tweet_id = (results[0].get("data") or {}).get("id") if results else None
+                else:
+                    result = await svc.post_tweet(access_token, access_token_secret, content)
+                    tweet_id = (result.get("data") or {}).get("id")
+                return {"success": tweet_id is not None, "post_id": tweet_id, "raw_response": result if not tweets else results}
+            except Exception as e:
+                if "402" in str(e) or "CreditsDepleted" in str(e):
+                    print(f"⚠️ X direct credits depleted — attempting Outstand fallback")
+                    credits_depleted = True
+                else:
+                    return {"success": False, "error": f"X direct publish failed: {str(e)}"}
+
+            # Outstand fallback when X API credits are exhausted
+            if credits_depleted and db is not None:
+                user_id = connection.get("user_id")
+                outstand_conn = await db["social_connections"].find_one(
+                    {"user_id": user_id, "platform": {"$in": ["x", "twitter"]}, "connected_via": "outstand", "connection_status": "active"}
+                )
+                if outstand_conn and outstand_conn.get("outstand_account_id"):
+                    print(f"✅ Outstand X connection found — routing via Outstand (account_id={outstand_conn['outstand_account_id']})")
+                    connection = outstand_conn
+                    # fall through to the Outstand block below
+                else:
+                    return {"success": False, "error": "X API credits depleted and no Outstand X account connected as fallback."}
+
         # ── Outstand-connected accounts ───────────────────────────────────────
         if connection.get("connected_via") == "outstand":
             try:
@@ -810,16 +850,29 @@ class ApprovalWorkflowService:
                 )
                 print(f"📬 Outstand publish response: {result}")
 
-                # Outstand returns {"data": {"id": "..."}} or {"success": true, "post": {"id": "..."}}
+                # Outstand returns {"data": {"id": "...", "status": "queued|processing|published|failed"}}
+                # or {"success": true, "post": {"id": "..."}}
                 post_obj = result.get("post") or result.get("data") or {}
                 if isinstance(post_obj, list):
                     post_obj = post_obj[0] if post_obj else {}
                 post_id = post_obj.get("id")
-                # Treat a returned post ID as success (Outstand may omit "success" key)
-                success = post_id is not None
+                post_status = post_obj.get("status", "")
+
+                # A returned post ID means Outstand accepted the request.
+                # Statuses "queued" and "processing" mean it will be dispatched
+                # to the social network imminently — treat these as success so the
+                # draft is marked published in our DB.
+                # Only "failed" (or no ID at all) should be treated as a failure.
+                if post_id and post_status == "failed":
+                    print(f"⚠️ Outstand accepted post {post_id} but status=failed: {result}")
+                    success = False
+                else:
+                    success = post_id is not None
                 if not success:
                     print(f"⚠️ Outstand returned no post ID — possible publish failure: {result}")
-                return {"success": success, "post_id": post_id, "raw_response": result}
+                else:
+                    print(f"✅ Outstand post accepted | post_id={post_id} status={post_status or 'unknown'}")
+                return {"success": success, "post_id": post_id, "outstand_status": post_status, "raw_response": result}
             except Exception as e:
                 print(f"❌ Outstand publish exception: {e}")
                 return {"success": False, "error": f"Outstand publish failed: {str(e)}"}

@@ -932,6 +932,22 @@ async def get_performance(
 # UTILITY ENDPOINTS
 # ==============================================================================
 
+@router.get("/debug/outstand-post/{post_id}")
+async def debug_outstand_post(
+    post_id: str,
+    token: dict = Depends(JWTBearer())
+):
+    """
+    Fetch the live status of an Outstand post by its ID.
+    Use this to diagnose why a post appears queued but hasn't appeared on the social network.
+    """
+    try:
+        outstand = OutstandService()
+        data = await outstand.get_post(post_id)
+        return UriResponse.get_single_data_response("outstand_post", data)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @router.get("/platform-requirements/{platform}")
 async def get_platform_requirements(platform: str):
     """Get content requirements for a specific platform"""

@@ -126,6 +126,16 @@ class OutstandService:
             resp.raise_for_status()
             return resp.json()
 
+    async def get_post(self, post_id: str) -> Dict[str, Any]:
+        """Fetch the current status/details of a post from Outstand's GET /v1/posts/{id}."""
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            resp = await client.get(
+                f"{self.base_url}/v1/posts/{post_id}",
+                headers=self.headers,
+            )
+            resp.raise_for_status()
+            return resp.json()
+
     async def publish_post(
         self,
         outstand_account_ids: List[str],

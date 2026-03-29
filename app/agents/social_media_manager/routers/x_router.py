@@ -1,34 +1,30 @@
 """
-X (Twitter) router  —  via Outstand
--------------------------------------
-POST   /x/connect          Start X OAuth flow, returns auth_url  (JWT required)
-DELETE /x/connect          Disconnect X account                   (JWT required)
-GET    /x/status           Check if user has X connected          (JWT required)
-POST   /x/publish          Publish (or schedule) a post to X      (JWT required)
-POST   /x/daily-push       Daily content push to all X users      (cron secret)
-POST   /x/webhook          Outstand post-event webhook            (Outstand sig)
+X (Twitter) router — OAuth 1.0a direct posting (no Outstand required)
+----------------------------------------------------------------------
+POST   /x/connect          Start X OAuth 1.0a flow, returns auth_url    (JWT required)
+GET    /x/callback         OAuth 1.0a callback — stores tokens, redirects frontend
+DELETE /x/connect          Disconnect X account                          (JWT required)
+GET    /x/status           Check if user has X connected                 (JWT required)
+POST   /x/publish          Publish (or thread) to X directly             (JWT required)
+POST   /x/daily-push       Daily content push to all X users             (cron secret)
 
-Connection flow (3 steps, handled by the existing social-media router):
+Connection flow:
   1. POST /x/connect                → returns auth_url
-  2. User authorises → Outstand redirects to
-     GET /social-media/connect/callback/outstand?sessionToken=...
-     Frontend then calls:
-  3. GET  /social-media/connect/pending/{sessionToken}
-  4. POST /social-media/connect/finalize
+  2. Frontend opens auth_url in a popup / redirect
+  3. User authorises on X → X redirects to GET /x/callback?oauth_token=...&oauth_verifier=...
+  4. Backend stores tokens, redirects browser to frontend with ?connected=true&platform=x
 """
 
-import hashlib
-import hmac
-import json
-from datetime import datetime
+import urllib.parse
+from datetime import datetime, timedelta
 from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import RedirectResponse
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from pydantic import BaseModel
 
-from app.agents.social_media_manager.services.outstand_service import OutstandService
-from app.agents.social_media_manager.services.social_account_service import SocialAccountService
+from app.agents.social_media_manager.services.x_direct_service import XDirectService
 from app.core.auth_bearer import JWTBearer
 from app.core.config import settings
 from app.dependencies import get_db_dependency
@@ -50,38 +46,141 @@ def _extract_user_id(token: dict) -> str:
 
 
 async def _get_x_connection(user_id: str, db: AsyncIOMotorDatabase) -> Optional[dict]:
-    """Return the user's active X connection doc from social_connections, or None."""
+    """Return the user's active X connection doc, or None."""
     return await db["social_connections"].find_one(
         {"user_id": user_id, "platform": "x", "connection_status": "active"}
     )
 
 
-# ── Connect / OAuth ────────────────────────────────────────────────────────
+def _x_service() -> XDirectService:
+    if not settings.X_API_KEY or not settings.X_API_SECRET:
+        raise HTTPException(status_code=503, detail="X API credentials not configured.")
+    return XDirectService()
+
+
+# ── Connect — Step 1 ────────────────────────────────────────────────────────
 
 
 @router.post("/connect")
 async def connect_x(
     token: dict = Depends(JWTBearer()),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """
-    Step 1: start the X OAuth flow via Outstand.
-    Returns an auth_url — redirect the user's browser there to authorise X.
-    After authorisation the user lands on /social-media/connect/callback/outstand;
-    complete the flow with GET /social-media/connect/pending/{sessionToken} then
-    POST /social-media/connect/finalize.
+    Start the X OAuth 1.0a flow.
+    Returns auth_url — open this in a browser so the user can authorise.
+    After authorisation X will redirect to GET /x/callback.
     """
-    if not settings.OUTSTAND_API_KEY:
-        raise HTTPException(status_code=503, detail="Outstand integration not configured.")
+    if not settings.X_OAUTH_CALLBACK_URL:
+        raise HTTPException(status_code=503, detail="X_OAUTH_CALLBACK_URL not configured.")
 
     user_id = _extract_user_id(token)
-    result = await SocialAccountService.initiate_connection_flow(
-        user_id=user_id,
-        platforms=["x"],
+    svc = _x_service()
+
+    oauth_token, oauth_token_secret, auth_url = await svc.get_request_token(
+        callback_url=settings.X_OAUTH_CALLBACK_URL
     )
-    return result
+
+    # Store the request token temporarily (10-minute TTL via expires_at)
+    await db["x_oauth_pending"].update_one(
+        {"oauth_token": oauth_token},
+        {
+            "$set": {
+                "oauth_token": oauth_token,
+                "oauth_token_secret": oauth_token_secret,
+                "user_id": user_id,
+                "expires_at": datetime.utcnow() + timedelta(minutes=10),
+            }
+        },
+        upsert=True,
+    )
+
+    return {
+        "status": True,
+        "responseCode": 200,
+        "responseData": {"auth_url": auth_url},
+    }
 
 
-# ── Disconnect ──────────────────────────────────────────────────────────────
+# ── Connect — Step 2 (OAuth callback, no JWT) ───────────────────────────────
+
+
+@router.get("/callback")
+async def x_oauth_callback(
+    oauth_token: Optional[str] = Query(None),
+    oauth_verifier: Optional[str] = Query(None),
+    denied: Optional[str] = Query(None),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """
+    X redirects the user's browser here after they authorise (or deny) the app.
+    No JWT — the user is identified by the oauth_token stored during /connect.
+    Stores per-user OAuth 1.0a tokens then redirects to the frontend.
+    """
+    web_app_url = settings.WEB_APP_URL
+
+    if denied or not oauth_token or not oauth_verifier:
+        return RedirectResponse(
+            f"{web_app_url}/social-media/brand-setup?connected=false&platform=x&error=access_denied"
+        )
+
+    # Look up the pending auth doc
+    pending = await db["x_oauth_pending"].find_one({"oauth_token": oauth_token})
+    if not pending:
+        return RedirectResponse(
+            f"{web_app_url}/social-media/brand-setup?connected=false&platform=x&error=session_expired"
+        )
+    if pending.get("expires_at") and datetime.utcnow() > pending["expires_at"]:
+        await db["x_oauth_pending"].delete_one({"oauth_token": oauth_token})
+        return RedirectResponse(
+            f"{web_app_url}/social-media/brand-setup?connected=false&platform=x&error=session_expired"
+        )
+
+    user_id = pending["user_id"]
+    oauth_token_secret = pending["oauth_token_secret"]
+
+    try:
+        svc = _x_service()
+        result = await svc.get_access_token(oauth_token, oauth_token_secret, oauth_verifier)
+    except Exception as e:
+        return RedirectResponse(
+            f"{web_app_url}/social-media/brand-setup"
+            f"?connected=false&platform=x&error={urllib.parse.quote(str(e))}"
+        )
+    finally:
+        await db["x_oauth_pending"].delete_one({"oauth_token": oauth_token})
+
+    now = datetime.utcnow()
+    screen_name = result.get("screen_name", "")
+    x_user_id = result.get("user_id", "")
+
+    await db["social_connections"].update_one(
+        {"user_id": user_id, "platform": "x"},
+        {
+            "$set": {
+                "user_id": user_id,
+                "platform": "x",
+                "username": screen_name,
+                "account_name": screen_name,
+                "network_unique_id": x_user_id,
+                "connection_status": "active",
+                "connected_via": "x_direct",
+                "x_oauth_token": result["access_token"],
+                "x_oauth_token_secret": result["access_token_secret"],
+                "connected_at": now,
+                "updated_at": now,
+            }
+        },
+        upsert=True,
+    )
+
+    return RedirectResponse(
+        f"{web_app_url}/social-media/brand-setup"
+        f"?connected=true&platform=x&username={urllib.parse.quote(screen_name)}"
+    )
+
+
+# ── Disconnect ───────────────────────────────────────────────────────────────
 
 
 @router.delete("/connect")
@@ -96,14 +195,6 @@ async def disconnect_x(
     if not conn:
         raise HTTPException(status_code=400, detail="No X account connected.")
 
-    outstand_account_id = conn["outstand_account_id"]
-
-    outstand = OutstandService()
-    try:
-        await outstand.delete_account(outstand_account_id)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Failed to disconnect from Outstand: {e}")
-
     await db["social_connections"].delete_one({"_id": conn["_id"]})
 
     return {
@@ -113,7 +204,7 @@ async def disconnect_x(
     }
 
 
-# ── Status ─────────────────────────────────────────────────────────────────
+# ── Status ───────────────────────────────────────────────────────────────────
 
 
 @router.get("/status")
@@ -138,13 +229,12 @@ async def x_status(
     }
 
 
-# ── Publish / Schedule ─────────────────────────────────────────────────────
+# ── Publish / Thread ─────────────────────────────────────────────────────────
 
 
 class PublishRequest(BaseModel):
     content: str
-    scheduled_at: Optional[str] = None   # ISO 8601 e.g. "2025-09-20T14:00:00Z"
-    tweets: Optional[list] = None         # For threads: list of tweet strings
+    tweets: Optional[list] = None  # For threads: list of tweet strings
 
 
 @router.post("/publish")
@@ -154,8 +244,8 @@ async def publish_to_x(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """
-    Publish (or schedule) a post to the authenticated user's X account.
-    Pass scheduled_at to schedule up to 30 days ahead (ISO 8601).
+    Publish a tweet (or thread) directly to the authenticated user's X account
+    via OAuth 1.0a — no Outstand, no paid X API tier required.
     Pass tweets as a list to publish a thread.
     """
     user_id = _extract_user_id(token)
@@ -166,114 +256,69 @@ async def publish_to_x(
             status_code=400, detail="No X account connected. Call POST /x/connect first."
         )
 
-    outstand = OutstandService()
-    try:
-        result = await outstand.publish_post(
-            outstand_account_ids=[conn["outstand_account_id"]],
-            content=body.content,
-            scheduled_at=body.scheduled_at,
-            tweets=body.tweets,
+    access_token = conn.get("x_oauth_token")
+    access_token_secret = conn.get("x_oauth_token_secret")
+    if not access_token or not access_token_secret:
+        raise HTTPException(
+            status_code=400,
+            detail="X connection is missing OAuth tokens. Please reconnect your account.",
         )
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Failed to publish to X: {e}")
 
-    post = result.get("post", {})
-    action = "scheduled" if body.scheduled_at else "published"
+    svc = _x_service()
+
+    try:
+        if body.tweets and len(body.tweets) > 1:
+            results = await svc.post_thread(access_token, access_token_secret, body.tweets)
+            tweet_id = (results[0].get("data") or {}).get("id") if results else None
+        else:
+            result = await svc.post_tweet(access_token, access_token_secret, body.content)
+            tweet_id = (result.get("data") or {}).get("id")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to post to X: {e}")
 
     return {
         "status": True,
         "responseCode": 200,
-        "responseMessage": f"Post {action} to X successfully.",
+        "responseMessage": "Post published to X successfully.",
         "responseData": {
-            "post_id": post.get("id"),
-            "scheduled_at": post.get("scheduledAt"),
-            "published_at": post.get("publishedAt"),
+            "tweet_id": tweet_id,
             "content": body.content,
         },
     }
 
 
-# ── Finalize direct connection (X OAuth 2.0) ───────────────────────────────
-
-
-class FinalizeDirectRequest(BaseModel):
-    account_id: str
-    username: Optional[str] = None
-    network_unique_id: Optional[str] = None
-
-
-@router.post("/finalize-direct")
-async def finalize_x_direct(
-    body: FinalizeDirectRequest,
-    token: dict = Depends(JWTBearer()),
-    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-):
-    """
-    Finalize an X connection when Outstand returns the account_id directly
-    (OAuth 2.0 / BYOK flow) without a session token.
-    Call this after the /connect/callback/outstand redirect with connected=direct.
-    """
-    from datetime import datetime
-    user_id = _extract_user_id(token)
-    now = datetime.utcnow()
-
-    doc = {
-        "id": body.account_id,
-        "user_id": user_id,
-        "platform": "x",
-        "outstand_account_id": body.account_id,
-        "username": body.username,
-        "account_name": body.username,
-        "network_unique_id": body.network_unique_id,
-        "connection_status": "active",
-        "connected_via": "outstand",
-        "connected_at": now,
-        "updated_at": now,
-    }
-    await db["social_connections"].update_one(
-        {"user_id": user_id, "platform": "x"},
-        {"$set": doc},
-        upsert=True,
-    )
-
-    return {
-        "status": True,
-        "responseCode": 200,
-        "responseMessage": "X account connected successfully.",
-        "responseData": {
-            "username": body.username,
-            "account_id": body.account_id,
-        },
-    }
-
-
-# ── Daily push (cron) ──────────────────────────────────────────────────────
+# ── Daily push (cron) ────────────────────────────────────────────────────────
 
 
 async def _send_x_daily_push(db: AsyncIOMotorDatabase) -> dict:
     """
     Background task: for every user with an active X connection, generate one
-    tweet and publish it via Outstand.
+    tweet and publish it directly via OAuth 1.0a.
     """
     from app.agents.social_media_manager.services.whatsapp_session_service import (
         WhatsAppSessionService,
     )
+    from app.domain.models.chat_model import ChatMessage, ChatModel
     from app.services.AIService import AIService
-    from app.domain.models.chat_model import ChatModel, ChatMessage
 
     cursor = db["social_connections"].find(
         {"platform": "x", "connection_status": "active"},
-        {"user_id": 1, "outstand_account_id": 1, "username": 1},
+        {"user_id": 1, "x_oauth_token": 1, "x_oauth_token_secret": 1, "username": 1},
     )
     connections = await cursor.to_list(length=None)
 
     sent = 0
     failed = 0
-    outstand = OutstandService()
 
     for conn in connections:
         user_id = conn.get("user_id")
-        outstand_account_id = conn.get("outstand_account_id")
+        access_token = conn.get("x_oauth_token")
+        access_token_secret = conn.get("x_oauth_token_secret")
+
+        if not access_token or not access_token_secret:
+            failed += 1
+            continue
+
         try:
             brand = await WhatsAppSessionService.get_brand_profile(user_id, db)
             brand_name = (brand or {}).get("brand_name", "your brand")
@@ -296,10 +341,8 @@ async def _send_x_daily_push(db: AsyncIOMotorDatabase) -> dict:
 
             tweet_text = result.choices[0].message.content.strip()
 
-            await outstand.publish_post(
-                outstand_account_ids=[outstand_account_id],
-                content=tweet_text,
-            )
+            svc = XDirectService()
+            await svc.post_tweet(access_token, access_token_secret, tweet_text)
             sent += 1
         except Exception as e:
             print(f"X daily push failed for user {user_id}: {e}")
@@ -311,65 +354,22 @@ async def _send_x_daily_push(db: AsyncIOMotorDatabase) -> dict:
 @router.post("/daily-push")
 async def x_daily_push(
     request: Request,
-    background_tasks: BackgroundTasks,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """
     Trigger daily X content push for all connected users.
     Protected by X-Cron-Secret header.
     """
+    import asyncio
+
     cron_secret = request.headers.get("X-Cron-Secret", "")
     expected = getattr(settings, "CRON_SECRET", "")
     if expected and cron_secret != expected:
         raise HTTPException(status_code=403, detail="Forbidden.")
 
-    background_tasks.add_task(_send_x_daily_push, db)
+    asyncio.create_task(_send_x_daily_push(db))
     return {
         "status": True,
         "responseCode": 200,
         "responseMessage": "X daily push queued.",
     }
-
-
-# ── Outstand webhook ────────────────────────────────────────────────────────
-
-
-@router.post("/webhook")
-async def outstand_webhook(
-    request: Request,
-    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-):
-    """
-    Receives post-event webhooks from Outstand (post.published / post.error).
-    Configure this URL in the Outstand dashboard under Settings → Webhooks.
-    Validates X-Outstand-Signature if OUTSTAND_WEBHOOK_SECRET is set.
-    """
-    body_bytes = await request.body()
-
-    if settings.OUTSTAND_WEBHOOK_SECRET:
-        sig_header = request.headers.get("X-Outstand-Signature", "")
-        expected_sig = "sha256=" + hmac.new(
-            settings.OUTSTAND_WEBHOOK_SECRET.encode(), body_bytes, hashlib.sha256
-        ).hexdigest()
-        if not hmac.compare_digest(sig_header, expected_sig):
-            raise HTTPException(status_code=403, detail="Invalid webhook signature.")
-
-    try:
-        payload = json.loads(body_bytes)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON payload.")
-
-    event = payload.get("event")
-    data = payload.get("data", {})
-    post_id = data.get("postId")
-    org_id = data.get("orgId")
-
-    if event == "post.published":
-        print(f"✅ Outstand: post {post_id} published (org={org_id})")
-        # Extend here: update post status in DB, send notification, etc.
-
-    elif event == "post.error":
-        print(f"❌ Outstand: post {post_id} failed (org={org_id})")
-        # Extend here: alert user, retry logic, etc.
-
-    return {"status": "ok"}
