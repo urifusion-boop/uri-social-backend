@@ -31,6 +31,16 @@ class Settings(BaseSettings):
     OUTSTAND_API_KEY: Optional[str] = None
     OUTSTAND_WEBHOOK_SECRET: Optional[str] = None  # For verifying Outstand webhook signatures
 
+    # X (Twitter) OAuth 1.0a — direct posting without Outstand
+    X_API_KEY: Optional[str] = None         # Consumer Key
+    X_API_SECRET: Optional[str] = None      # Consumer Secret
+    X_OAUTH_CALLBACK_URL: Optional[str] = None  # Public backend URL, e.g. https://api.yourdomain.com/x/callback
+
+    # LinkedIn OAuth 2.0 — direct posting
+    LINKEDIN_CLIENT_ID: Optional[str] = None
+    LINKEDIN_CLIENT_SECRET: Optional[str] = None
+    LINKEDIN_OAUTH_CALLBACK_URL: Optional[str] = None  # e.g. https://api.yourdomain.com/linkedin/callback
+
     # imgBB
     IMGBB_API_KEY: Optional[str] = None
 
