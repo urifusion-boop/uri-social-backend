@@ -1447,6 +1447,25 @@ async def scheduled_content_publisher(db: AsyncIOMotorDatabase):
         result = await ApprovalWorkflowService.publish_scheduled_content(db=db)
         if result.get("published_count", 0) > 0:
             print(f"✅ Published {result['published_count']} scheduled posts")
-        
+
     except Exception as e:
         print(f"❌ Scheduled publishing failed: {str(e)}")
+
+
+@router.post("/publish-scheduled")
+async def trigger_publish_scheduled(
+    request: Request,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """
+    Cron endpoint — called every 5 minutes to check and update scheduled posts.
+    Protected by X-Cron-Secret header.
+    """
+    from app.core.config import settings as _cfg
+    expected = getattr(_cfg, "CRON_SECRET", "") or ""
+    cron_secret = request.headers.get("X-Cron-Secret", "")
+    if expected and cron_secret != expected:
+        raise HTTPException(status_code=403, detail="Invalid cron secret")
+
+    result = await ApprovalWorkflowService.publish_scheduled_content(db=db)
+    return result
