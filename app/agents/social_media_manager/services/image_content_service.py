@@ -1092,89 +1092,89 @@ class ImageContentService:
 
             if _cfg.GOOGLE_GEMINI_API_KEY:
                 # ── Nano Banana 2 via Google GenAI SDK ────────────────────────
-                from google import genai as _genai
-                from google.genai import types as _gtypes
-                import base64 as _b64
+                try:
+                    from google import genai as _genai
+                    from google.genai import types as _gtypes
+                    import base64 as _b64
 
-                aspect_ratio = ImageContentService._map_to_gemini_aspect(size)
+                    aspect_ratio = ImageContentService._map_to_gemini_aspect(size)
 
-                client_g = _genai.Client(api_key=_cfg.GOOGLE_GEMINI_API_KEY)
+                    client_g = _genai.Client(api_key=_cfg.GOOGLE_GEMINI_API_KEY)
 
-                loop = asyncio.get_running_loop()
-                response = await loop.run_in_executor(
-                    None,
-                    lambda: client_g.models.generate_images(
-                        model="imagen-4.0-ultra-generate-001",
-                        prompt=prompt,
-                        config=_gtypes.GenerateImagesConfig(
-                            number_of_images=1,
-                            aspect_ratio=aspect_ratio,
-                            safety_filter_level="block_low_and_above",
-                            person_generation="allow_adult",
-                        ),
+                    loop = asyncio.get_running_loop()
+                    response = await loop.run_in_executor(
+                        None,
+                        lambda: client_g.models.generate_images(
+                            model="imagen-4.0-ultra-generate-001",
+                            prompt=prompt,
+                            config=_gtypes.GenerateImagesConfig(
+                                number_of_images=1,
+                                aspect_ratio=aspect_ratio,
+                                safety_filter_level="block_low_and_above",
+                                person_generation="allow_adult",
+                            ),
+                        )
                     )
-                )
 
-                generated = response.generated_images[0]
-                b64 = _b64.b64encode(generated.image.image_bytes).decode()
+                    if not response.generated_images:
+                        raise ValueError("Nano Banana 2 returned no images (blocked/filtered)")
 
-                # Crop to exact target ratio
-                b64 = ImageContentService._crop_to_ratio(b64, target_w, target_h)
+                    generated = response.generated_images[0]
+                    b64 = _b64.b64encode(generated.image.image_bytes).decode()
 
-                # Nano Banana 2 returns PNG — convert to WebP for consistency
-                import io
-                from PIL import Image as _PILImage
-                img = _PILImage.open(io.BytesIO(_b64.b64decode(b64)))
-                buf = io.BytesIO()
-                img.convert("RGB").save(buf, format="WEBP", quality=97, method=6)
-                b64 = _b64.b64encode(buf.getvalue()).decode()
+                    # Crop to exact target ratio
+                    b64 = ImageContentService._crop_to_ratio(b64, target_w, target_h)
 
-                print(f"🎨 Nano Banana 2 image generated ({aspect_ratio})")
-                data_url = f"data:image/webp;base64,{b64}"
-                return {
-                    "success": True,
-                    "url": data_url,
-                    "model": "nano-banana-2"
-                }
+                    # Nano Banana 2 returns PNG — convert to WebP for consistency
+                    import io
+                    from PIL import Image as _PILImage
+                    img = _PILImage.open(io.BytesIO(_b64.b64decode(b64)))
+                    buf = io.BytesIO()
+                    img.convert("RGB").save(buf, format="WEBP", quality=97, method=6)
+                    b64 = _b64.b64encode(buf.getvalue()).decode()
 
+                    print(f"🎨 Nano Banana 2 image generated ({aspect_ratio})")
+                    data_url = f"data:image/webp;base64,{b64}"
+                    return {
+                        "success": True,
+                        "url": data_url,
+                        "model": "nano-banana-2"
+                    }
+                except Exception as _nb_err:
+                    print(f"⚠️ Nano Banana 2 failed: {_nb_err} — falling back to gpt-image-1")
+
+            # ── Fallback: gpt-image-1 ──────────────────────────────────────
+            from app.services.AIService import client
+
+            if target_w > target_h:
+                image_size = "1536x1024"
+            elif target_h > target_w:
+                image_size = "1024x1536"
             else:
-                # ── Fallback: gpt-image-1 ──────────────────────────────────────
-                from app.services.AIService import client
-                from openai import OpenAI as _OAI
+                image_size = "1024x1024"
 
-                dall_e_sizes = {
-                    "landscape": "1536x1024",
-                    "portrait":  "1024x1536",
-                    "square":    "1024x1024",
-                }
-                if target_w > target_h:
-                    image_size = "1536x1024"
-                elif target_h > target_w:
-                    image_size = "1024x1536"
-                else:
-                    image_size = "1024x1024"
-
-                loop = asyncio.get_running_loop()
-                response = await loop.run_in_executor(
-                    None,
-                    lambda: client.images.generate(
-                        model="gpt-image-1.5",
-                        prompt=prompt,
-                        n=1,
-                        size=image_size,
-                        quality="high",
-                        output_format="webp",
-                    )
+            loop = asyncio.get_running_loop()
+            response = await loop.run_in_executor(
+                None,
+                lambda: client.images.generate(
+                    model="gpt-image-1.5",
+                    prompt=prompt,
+                    n=1,
+                    size=image_size,
+                    quality="high",
+                    output_format="webp",
                 )
-                import base64 as _b64
-                b64 = response.data[0].b64_json
-                b64 = ImageContentService._crop_to_ratio(b64, target_w, target_h)
-                data_url = f"data:image/webp;base64,{b64}"
-                return {
-                    "success": True,
-                    "url": data_url,
-                    "model": "gpt-image-1.5"
-                }
+            )
+            import base64 as _b64
+            b64 = response.data[0].b64_json
+            b64 = ImageContentService._crop_to_ratio(b64, target_w, target_h)
+            data_url = f"data:image/webp;base64,{b64}"
+            print(f"🎨 gpt-image-1 image generated ({image_size})")
+            return {
+                "success": True,
+                "url": data_url,
+                "model": "gpt-image-1.5"
+            }
 
         except Exception as e:
             print(f"❌ Image generation failed: {e}")
