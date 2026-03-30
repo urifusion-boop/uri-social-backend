@@ -60,8 +60,10 @@ async def whatsapp_webhook(
 
         validator = RequestValidator(settings.TWILIO_AUTH_TOKEN)
         twilio_sig = request.headers.get("X-Twilio-Signature", "")
-        # Build the full URL Twilio signed (must match exactly)
-        url = str(request.url)
+        # Build the full URL Twilio signed (must match exactly).
+        # Use PUBLIC_API_URL so the scheme is always https even behind a proxy.
+        _base = str(settings.PUBLIC_API_URL).rstrip("/")
+        url = f"{_base}/whatsapp/webhook"
         body_bytes = await request.body()
         # Parse form params into a plain dict for validation
         import urllib.parse
