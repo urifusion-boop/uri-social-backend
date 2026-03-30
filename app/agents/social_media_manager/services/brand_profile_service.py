@@ -58,6 +58,9 @@ class BrandProfileService:
 
         existing = await db[BrandProfileService.COLLECTION].find_one({"user_id": user_id})
         if existing:
+            # Once onboarding_completed is True, never allow it to be reset to False
+            if existing.get("onboarding_completed") and not doc.get("onboarding_completed"):
+                doc["onboarding_completed"] = True
             await db[BrandProfileService.COLLECTION].update_one(
                 {"user_id": user_id}, {"$set": doc}
             )
