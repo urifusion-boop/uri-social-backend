@@ -682,11 +682,27 @@ class ApprovalWorkflowService:
             return None
 
         try:
-            match = re.match(r'data:[^;]+;base64,(.+)', data_url, re.DOTALL)
+            match = re.match(r'data:([^;]+);base64,(.+)', data_url, re.DOTALL)
             if not match:
                 print("⚠️ imgBB upload: invalid data URL format")
                 return None
-            b64_data = match.group(1)
+            mime_type = match.group(1)
+            b64_data = match.group(2)
+
+            # Convert to JPEG if the image is WebP or any format unsupported by social platforms
+            if mime_type in ("image/webp", "image/gif") or not mime_type.startswith("image/jpeg"):
+                try:
+                    import base64
+                    import io
+                    from PIL import Image
+                    img_bytes = base64.b64decode(b64_data)
+                    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+                    out = io.BytesIO()
+                    img.save(out, format="JPEG", quality=90)
+                    b64_data = base64.b64encode(out.getvalue()).decode()
+                    print(f"🔄 Converted image from {mime_type} to JPEG for social platform compatibility")
+                except Exception as conv_err:
+                    print(f"⚠️ Image conversion to JPEG failed, uploading original: {conv_err}")
 
             async with _httpx.AsyncClient(timeout=120) as client:
                 resp = await client.post(
@@ -827,7 +843,35 @@ class ApprovalWorkflowService:
                                 {"$set": {"image_url": public_image_url, "updated_at": datetime.utcnow()}},
                             )
                     else:
-                        media_urls = [image_url]
+                        # Re-upload WebP images since Facebook/Instagram don't support WebP
+                        if image_url.lower().endswith(".webp"):
+                            print(f"🔄 Cached image is WebP — re-uploading as JPEG for social platform compatibility")
+                            try:
+                                import base64
+                                import io
+                                import httpx as _httpx
+                                from PIL import Image
+                                async with _httpx.AsyncClient(timeout=30) as _client:
+                                    img_resp = await _client.get(image_url)
+                                img = Image.open(io.BytesIO(img_resp.content)).convert("RGB")
+                                out = io.BytesIO()
+                                img.save(out, format="JPEG", quality=90)
+                                b64_jpeg = base64.b64encode(out.getvalue()).decode()
+                                fake_data_url = f"data:image/jpeg;base64,{b64_jpeg}"
+                                converted_url = await ApprovalWorkflowService._upload_base64_to_imgbb(fake_data_url)
+                                if converted_url:
+                                    media_urls = [converted_url]
+                                    await db["content_drafts"].update_one(
+                                        {"id": draft["id"]},
+                                        {"$set": {"image_url": converted_url, "updated_at": datetime.utcnow()}},
+                                    )
+                                else:
+                                    media_urls = [image_url]
+                            except Exception as webp_err:
+                                print(f"⚠️ WebP re-upload failed, using original URL: {webp_err}")
+                                media_urls = [image_url]
+                        else:
+                            media_urls = [image_url]
 
                 # Instagram requires at least one image — warn and skip if no media
                 if platform == "instagram" and not media_urls:
