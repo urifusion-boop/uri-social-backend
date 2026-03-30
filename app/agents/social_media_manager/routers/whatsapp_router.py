@@ -21,6 +21,7 @@ from app.agents.social_media_manager.services.whatsapp_session_service import (
 )
 from app.agents.social_media_manager.services.whatsapp_flow_service import (
     WhatsAppFlowService,
+    _send,
 )
 
 router = APIRouter(prefix="/whatsapp", tags=["WhatsApp"])
@@ -140,6 +141,14 @@ async def connect_whatsapp(
                 status_code=503,
                 detail="Database is unavailable. Please try again in a moment.",
             )
+
+    try:
+        _send(
+            body.phone,
+            "Hi👋 Your WhatsApp is now connected to Uri Social! Message me anytime to create content.",
+        )
+    except Exception:
+        pass  # Don't fail the connect if the greeting message errors
 
     return {
         "status": True,
