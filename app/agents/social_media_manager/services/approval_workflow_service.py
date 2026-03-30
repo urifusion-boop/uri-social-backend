@@ -416,14 +416,17 @@ class ApprovalWorkflowService:
         This should be run periodically (e.g., every 5 minutes)
         """
         try:
-            # Find content scheduled for now or past
+            # Find content scheduled for now or past, plus publish_failed drafts
+            # that may have been incorrectly failed (Outstand-handled posts).
             current_time = datetime.utcnow()
-            
+
             scheduled_content = await db["content_drafts"].find({
-                "status": "scheduled",
-                "scheduled_date": {"$lte": current_time}
+                "$or": [
+                    {"status": "scheduled", "scheduled_date": {"$lte": current_time}},
+                    {"status": "publish_failed", "platform_post_id": {"$exists": True, "$ne": None}},
+                ]
             }).to_list(length=100)
-            
+
             if not scheduled_content:
                 return {"message": "No scheduled content to publish", "published": 0}
             
