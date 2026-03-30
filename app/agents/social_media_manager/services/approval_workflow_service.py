@@ -432,6 +432,32 @@ class ApprovalWorkflowService:
             
             for draft in scheduled_content:
                 try:
+                    # If this draft was already submitted to Outstand (has platform_post_id),
+                    # poll Outstand for its published status instead of re-publishing.
+                    existing_post_id = draft.get("platform_post_id")
+                    if existing_post_id:
+                        try:
+                            from app.agents.social_media_manager.services.outstand_service import OutstandService
+                            outstand = OutstandService()
+                            post_data = await outstand.get_post(existing_post_id)
+                            post = post_data.get("post", {})
+                            if post.get("publishedAt") and not post.get("isDraft"):
+                                await db["content_drafts"].update_one(
+                                    {"id": draft["id"]},
+                                    {"$set": {
+                                        "status": "published",
+                                        "published_date": datetime.utcnow(),
+                                        "updated_at": datetime.utcnow(),
+                                    }},
+                                )
+                                published_count += 1
+                                print(f"✅ Outstand-scheduled post confirmed published | draft_id={draft['id']} post_id={existing_post_id}")
+                            else:
+                                print(f"⏳ Outstand post not yet published | draft_id={draft['id']} post_id={existing_post_id}")
+                        except Exception as e:
+                            print(f"⚠️ Could not poll Outstand for draft_id={draft['id']}: {e}")
+                        continue
+
                     # Use user_id stored directly on the draft
                     draft_user_id = draft.get("user_id")
                     if not draft_user_id:
