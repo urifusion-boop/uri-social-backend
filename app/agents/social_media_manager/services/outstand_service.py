@@ -126,6 +126,27 @@ class OutstandService:
             resp.raise_for_status()
             return resp.json()
 
+    async def get_account_metrics(
+        self,
+        account_id: str,
+        since: Optional[int] = None,
+        until: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Fetch account-level metrics from Outstand's GET /v1/social-accounts/{id}/metrics."""
+        params: Dict[str, Any] = {}
+        if since is not None:
+            params["since"] = since
+        if until is not None:
+            params["until"] = until
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            resp = await client.get(
+                f"{self.base_url}/v1/social-accounts/{account_id}/metrics",
+                headers=self.headers,
+                params=params,
+            )
+            resp.raise_for_status()
+            return resp.json()
+
     async def get_post(self, post_id: str) -> Dict[str, Any]:
         """Fetch the current status/details of a post from Outstand's GET /v1/posts/{id}."""
         async with httpx.AsyncClient(timeout=self.timeout) as client:
