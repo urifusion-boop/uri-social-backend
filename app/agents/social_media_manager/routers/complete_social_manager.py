@@ -928,9 +928,113 @@ async def get_performance(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/account-metrics")
+async def get_account_metrics(
+    days: int = 30,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer())
+):
+    """
+    Fetch account-level metrics (followers, engagement totals) for all of the
+    user's connected social accounts via Outstand.
+    """
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    import asyncio as _asyncio
+    import time as _time
+    from datetime import timedelta
+
+    try:
+        outstand = OutstandService()
+
+        # List all connected accounts for this user
+        result = await outstand.list_accounts(tenant_id=user_id)
+        accounts = result.get("data", [])
+
+        if not accounts:
+            return UriResponse.get_single_data_response("account_metrics", {
+                "has_data": False,
+                "accounts": [],
+            })
+
+        until_ts = int(_time.time())
+        since_ts = int((datetime.utcnow() - timedelta(days=days)).timestamp())
+
+        async def _fetch_metrics(acc):
+            account_id = acc.get("id")
+            if not account_id:
+                return None
+            try:
+                data = await outstand.get_account_metrics(account_id, since=since_ts, until=until_ts)
+                m = data.get("data", {})
+                eng = m.get("engagement")
+                period = m.get("period") or {}
+                ps = m.get("platform_specific") or {}
+                return {
+                    "account_id": account_id,
+                    "network": acc.get("network", "unknown"),
+                    "page_name": ps.get("page_name") or acc.get("nickname") or acc.get("username"),
+                    "category": ps.get("category"),
+                    "followers_count": m.get("followers_count") or ps.get("followers_count") or ps.get("fan_count") or 0,
+                    "following_count": m.get("following_count"),
+                    "posts_count": m.get("posts_count"),
+                    "engagement": {
+                        "views": eng.get("views", 0),
+                        "likes": eng.get("likes", 0),
+                        "comments": eng.get("comments", 0),
+                        "shares": eng.get("shares", 0),
+                        "reposts": eng.get("reposts", 0),
+                        "quotes": eng.get("quotes", 0),
+                    } if eng else None,
+                    "engagement_note": period.get("note"),
+                    "platform_specific": ps,
+                    "period": {
+                        "since": since_ts,
+                        "until": until_ts,
+                    },
+                }
+            except Exception as e:
+                print(f"⚠️ Account metrics fetch failed for {account_id}: {e}")
+                return None
+
+        results = await _asyncio.gather(*[_fetch_metrics(a) for a in accounts])
+        account_metrics = [r for r in results if r is not None]
+
+        return UriResponse.get_single_data_response("account_metrics", {
+            "has_data": len(account_metrics) > 0,
+            "accounts": account_metrics,
+        })
+
+    except Exception as e:
+        import traceback
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ==============================================================================
 # UTILITY ENDPOINTS
 # ==============================================================================
+
+@router.get("/debug/outstand-account-metrics/{account_id}")
+async def debug_outstand_account_metrics(
+    account_id: str,
+    days: int = 30,
+    token: dict = Depends(JWTBearer())
+):
+    """Return raw Outstand account metrics response for debugging field mapping."""
+    import time as _time
+    from datetime import timedelta
+    try:
+        until_ts = int(_time.time())
+        since_ts = int((datetime.utcnow() - timedelta(days=days)).timestamp())
+        outstand = OutstandService()
+        data = await outstand.get_account_metrics(account_id, since=since_ts, until=until_ts)
+        return UriResponse.get_single_data_response("debug_account_metrics", data)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @router.get("/debug/outstand-post/{post_id}")
 async def debug_outstand_post(
