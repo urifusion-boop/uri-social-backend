@@ -366,6 +366,7 @@ async def outstand_oauth_callback(
 @router.get("/connect/pending/{session_token}")
 async def get_pending_connection(
     session_token: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
     token: dict = Depends(JWTBearer()),
 ):
     """
@@ -379,7 +380,7 @@ async def get_pending_connection(
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
-    return await SocialAccountService.get_pending_connection(session_token)
+    return await SocialAccountService.get_pending_connection(session_token, db=db)
 
 
 @router.post("/connect/finalize")
