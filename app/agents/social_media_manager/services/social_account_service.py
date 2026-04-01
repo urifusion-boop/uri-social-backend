@@ -199,7 +199,12 @@ class SocialAccountService:
                     "connected_at": now,
                     "updated_at": now,
                 }
-                await db["social_connections"].delete_many({"user_id": user_id, "platform": network})
+                await db["social_connections"].delete_many({
+                    "$or": [
+                        {"id": outstand_account_id},
+                        {"user_id": user_id, "platform": network},
+                    ]
+                })
                 await db["social_connections"].insert_one(doc)
                 stored.append({
                     "outstand_account_id": outstand_account_id,
@@ -239,7 +244,14 @@ class SocialAccountService:
                         "connected_at": now,
                         "updated_at": now,
                     }
-                    await db["social_connections"].delete_many({"user_id": user_id, "platform": "instagram"})
+                    # Delete any existing doc that could conflict on either the id_1 index
+                    # or the user+platform combination (stale docs from prior test runs).
+                    await db["social_connections"].delete_many({
+                        "$or": [
+                            {"id": ig["id"]},
+                            {"user_id": user_id, "platform": "instagram"},
+                        ]
+                    })
                     await db["social_connections"].insert_one(ig_doc)
                     stored.append({
                         "platform": "instagram",
