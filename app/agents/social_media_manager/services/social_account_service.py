@@ -199,14 +199,8 @@ class SocialAccountService:
                     "connected_at": now,
                     "updated_at": now,
                 }
-                await db["social_connections"].replace_one(
-                    {
-                        "user_id": user_id,
-                        "platform": network,
-                    },
-                    doc,
-                    upsert=True,
-                )
+                await db["social_connections"].delete_many({"user_id": user_id, "platform": network})
+                await db["social_connections"].insert_one(doc)
                 stored.append({
                     "outstand_account_id": outstand_account_id,
                     "platform": network,
@@ -245,11 +239,8 @@ class SocialAccountService:
                         "connected_at": now,
                         "updated_at": now,
                     }
-                    await db["social_connections"].replace_one(
-                        {"user_id": user_id, "platform": "instagram"},
-                        ig_doc,
-                        upsert=True,
-                    )
+                    await db["social_connections"].delete_many({"user_id": user_id, "platform": "instagram"})
+                    await db["social_connections"].insert_one(ig_doc)
                     stored.append({
                         "platform": "instagram",
                         "username": ig.get("username"),
