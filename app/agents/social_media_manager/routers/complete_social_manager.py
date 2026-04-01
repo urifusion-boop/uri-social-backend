@@ -22,6 +22,7 @@ from ..services.approval_workflow_service import ApprovalWorkflowService
 from ..services.auto_content_service import AutoContentService
 from ..services.brand_profile_service import BrandProfileService
 from ..services.outstand_service import OutstandService
+from ..services import content_calendar_service as cal_svc
 
 router = APIRouter(tags=["Social Media Manager"])
 
@@ -637,6 +638,170 @@ async def get_scheduled_content(
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# ==============================================================================
+# CONTENT CALENDAR PLAN ENDPOINTS (Issues 5, 6, 7)
+# ==============================================================================
+
+class CalendarGenerateRequest(BaseModel):
+    platforms: List[str] = ["facebook", "instagram"]
+    force_regenerate: bool = False
+
+
+class CalendarCreateDraftRequest(BaseModel):
+    platforms: List[str] = ["facebook", "instagram"]
+    include_images: bool = False
+
+
+@router.get("/content-calendar/plan")
+async def get_calendar_plan(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """Return the active 7-day plan for this week, or 404 if none exists."""
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+    plan = await cal_svc.get_active_plan(user_id, db)
+    if not plan:
+        raise HTTPException(status_code=404, detail="No active plan for this week")
+    return UriResponse.get_single_data_response("calendar_plan", plan)
+
+
+@router.post("/content-calendar/plan/generate")
+async def generate_calendar_plan(
+    request: CalendarGenerateRequest,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """Generate (or force-regenerate) the 7-day content plan for this week."""
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+    try:
+        profile_result = await BrandProfileService.get(user_id, db)
+        brand = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
+        plan = await cal_svc.generate_plan(
+            user_id=user_id,
+            platforms=request.platforms,
+            brand=brand,
+            db=db,
+            force=request.force_regenerate,
+        )
+        return UriResponse.get_single_data_response("calendar_plan", plan)
+    except Exception as e:
+        import traceback as _tb
+        print(_tb.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/content-calendar/plan/{plan_id}/day/{day_index}/regenerate")
+async def regenerate_calendar_day(
+    plan_id: str,
+    day_index: int,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """Regenerate the content idea for a single day."""
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+    try:
+        updated_plan = await cal_svc.regenerate_day(plan_id, day_index, user_id, db)
+        return UriResponse.get_single_data_response("calendar_plan", updated_plan)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        import traceback as _tb
+        print(_tb.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/content-calendar/plan/{plan_id}/day/{day_index}/create-draft")
+async def create_draft_from_calendar_day(
+    plan_id: str,
+    day_index: int,
+    request: CalendarCreateDraftRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """Create a full content draft from a calendar day's idea."""
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+    try:
+        plan = await db["content_calendar_plans"].find_one(
+            {"plan_id": plan_id, "user_id": user_id}, {"_id": 0}
+        )
+        if not plan:
+            raise HTTPException(status_code=404, detail="Plan not found")
+        day = next((d for d in plan["days"] if d["day_index"] == day_index), None)
+        if not day:
+            raise HTTPException(status_code=404, detail=f"Day {day_index} not found")
+
+        seed_content = f"{day['title']}. {day['description']}"
+        profile_result = await BrandProfileService.get(user_id, db)
+        brand = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
+        brand_context = BrandProfileService.to_brand_context(brand) if brand else {}
+
+        result = await ContentGenerationService.generate_multi_platform_content(
+            user_id=user_id,
+            seed_content=seed_content,
+            platforms=request.platforms,
+            seed_type="calendar_idea",
+            brand_context=brand_context,
+            db=db,
+        )
+
+        if result.get("status"):
+            drafts = result.get("responseData", {}).get("drafts", [])
+            draft_ids = [d.get("draft_id") or d.get("id") for d in drafts if d]
+            await cal_svc.mark_acted_on(plan_id, day_index, draft_ids, user_id, db)
+
+            if request.include_images:
+                draft_ids = [d.get("draft_id") or d.get("id") for d in drafts if d]
+                if draft_ids:
+                    await db["content_drafts"].update_many(
+                        {"id": {"$in": draft_ids}},
+                        {"$set": {"has_image": True}},
+                    )
+                    for d in drafts:
+                        d["has_image"] = True
+
+                for d in drafts:
+                    background_tasks.add_task(
+                        _generate_image_bg,
+                        draft_id=d.get("draft_id") or d.get("id"),
+                        platform=d.get("platform", "facebook"),
+                        content=d.get("content", seed_content),
+                        seed_content=seed_content,
+                        brand_context=brand_context,
+                        db=db,
+                        reference_image=None,
+                    )
+
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback as _tb
+        print(_tb.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/content-calendar/today")
+async def get_today_suggestion(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """Return today's content suggestion from the active plan."""
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+    result = await cal_svc.get_today_suggestion(user_id, db)
+    return UriResponse.get_single_data_response("today_suggestion", result)
+
 
 # ==============================================================================
 # CONTENT MANAGEMENT ENDPOINTS
