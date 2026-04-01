@@ -108,17 +108,34 @@ class SocialAccountService:
 
             # Store page access tokens server-side so finalize_connection can use
             # them to auto-detect linked Instagram Business Accounts.
+            augmented_pages = list(raw_pages)
             if raw_pages and db is not None:
-                token_docs = [
-                    {
+                from .instagram_direct_service import InstagramDirectService
+                token_docs = []
+                for p in raw_pages:
+                    if not p.get("id") or not p.get("pageAccessToken"):
+                        continue
+                    token_docs.append({
                         "session_token": session_token,
                         "page_id": p["id"],
-                        "page_access_token": p.get("pageAccessToken", ""),
+                        "page_access_token": p["pageAccessToken"],
                         "page_name": p.get("name", ""),
-                    }
-                    for p in raw_pages
-                    if p.get("id") and p.get("pageAccessToken")
-                ]
+                    })
+                    # Preview linked Instagram account for the selector UI
+                    ig = await InstagramDirectService.get_instagram_account_from_page(
+                        p["id"], p["pageAccessToken"]
+                    )
+                    if ig:
+                        augmented_pages.append({
+                            "id": ig["id"],
+                            "name": ig.get("name") or ig.get("username"),
+                            "username": ig.get("username"),
+                            "type": "instagram_business_account",
+                            "network": "instagram",
+                            "profilePictureUrl": ig.get("profile_picture_url"),
+                            "auto_connect": True,
+                            "linked_page_id": p["id"],
+                        })
                 if token_docs:
                     await db["pending_page_tokens"].delete_many({"session_token": session_token})
                     await db["pending_page_tokens"].insert_many(token_docs)
@@ -127,7 +144,7 @@ class SocialAccountService:
                 "session_token": session_token,
                 "network": pending_data.get("network"),
                 "expires_at": pending_data.get("expiresAt"),
-                "available_pages": raw_pages,
+                "available_pages": augmented_pages,
             })
         except Exception as e:
             return UriResponse.error_response(
@@ -155,9 +172,11 @@ class SocialAccountService:
         outstand = OutstandService()
         try:
             result = await outstand.finalize_connection(session_token, selected_page_ids)
-            accounts = result.get("data", [])
+            print(f"[Finalize] raw result: {result}")
+            accounts = result.get("connectedAccounts") or result.get("data", [])
             if not isinstance(accounts, list):
                 accounts = [accounts]
+            print(f"[Finalize] accounts: {accounts}")
 
             now = datetime.utcnow()
             stored = []
@@ -166,6 +185,7 @@ class SocialAccountService:
                 network = acc.get("network")
 
                 doc = {
+                    "id": outstand_account_id,
                     "user_id": user_id,
                     "platform": network,
                     "outstand_account_id": outstand_account_id,
@@ -183,7 +203,6 @@ class SocialAccountService:
                     {
                         "user_id": user_id,
                         "platform": network,
-                        "outstand_account_id": outstand_account_id,
                     },
                     doc,
                     upsert=True,
@@ -197,6 +216,7 @@ class SocialAccountService:
 
             # Auto-detect Instagram Business Accounts linked to connected Facebook Pages.
             # Page access tokens were captured server-side in get_pending_connection.
+            print(f"[Finalize] stored platforms: {[s['platform'] for s in stored]}")
             if any(s["platform"] == "facebook" for s in stored):
                 from .instagram_direct_service import InstagramDirectService
                 for page_id in selected_page_ids:
@@ -211,6 +231,7 @@ class SocialAccountService:
                         print(f"ℹ️ No Instagram Business Account linked to Facebook Page {page_id}")
                         continue
                     ig_doc = {
+                        "id": ig["id"],
                         "user_id": user_id,
                         "platform": "instagram",
                         "connected_via": "instagram_direct",
@@ -245,6 +266,8 @@ class SocialAccountService:
             })
 
         except Exception as e:
+            import traceback as _tb
+            print(f"[Finalize] EXCEPTION: {e}\n{_tb.format_exc()}")
             return UriResponse.error_response(
                 f"Failed to finalise connection: {str(e)}",
                 code=500,
