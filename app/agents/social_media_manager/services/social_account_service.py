@@ -246,7 +246,7 @@ class SocialAccountService:
                         "updated_at": now,
                     }
                     await db["social_connections"].replace_one(
-                        {"user_id": user_id, "platform": "instagram", "ig_user_id": ig["id"]},
+                        {"user_id": user_id, "platform": "instagram"},
                         ig_doc,
                         upsert=True,
                     )
