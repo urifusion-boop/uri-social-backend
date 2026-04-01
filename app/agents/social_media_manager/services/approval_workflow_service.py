@@ -848,6 +848,24 @@ class ApprovalWorkflowService:
                 else:
                     return {"success": False, "error": "X API credits depleted and no Outstand X account connected as fallback."}
 
+        # ── Instagram direct (via Facebook Page Access Token) ────────────────
+        if platform == "instagram" and connection.get("connected_via") == "instagram_direct":
+            from app.agents.social_media_manager.services.instagram_direct_service import InstagramDirectService
+            ig_user_id = connection.get("ig_user_id")
+            page_token = connection.get("page_access_token")
+            if not ig_user_id or not page_token:
+                return {"success": False, "error": "Instagram direct connection is missing credentials. Please reconnect Facebook."}
+            image_url = draft.get("image_url") or ""
+            if image_url and image_url.startswith("data:"):
+                image_url = await ApprovalWorkflowService._upload_base64_to_imgbb(image_url) or ""
+            return await InstagramDirectService.publish_post(
+                ig_user_id=ig_user_id,
+                page_access_token=page_token,
+                content=content,
+                image_url=image_url or None,
+                scheduled_at=scheduled_datetime.strftime("%Y-%m-%dT%H:%M:%SZ") if scheduled_datetime else None,
+            )
+
         # ── Outstand-connected accounts ───────────────────────────────────────
         if connection.get("connected_via") == "outstand":
             try:
