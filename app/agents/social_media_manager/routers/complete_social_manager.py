@@ -1042,6 +1042,7 @@ async def get_performance(
 
     from datetime import timedelta
     import asyncio as _asyncio
+    import httpx as _httpx
 
     try:
         date_filter = datetime.utcnow() - timedelta(days=days)
@@ -1062,17 +1063,82 @@ async def get_performance(
                 "top_posts": [],
             })
 
+        # Load all direct (non-Outstand) connections so we can use their tokens
+        direct_conns = await db["social_connections"].find(
+            {"user_id": user_id, "connected_via": {"$ne": "outstand"}},
+            {"_id": 0, "platform": 1, "connected_via": 1, "page_access_token": 1, "ig_user_id": 1},
+        ).to_list(length=20)
+        direct_conn_map = {c["platform"]: c for c in direct_conns}
+
         outstand = OutstandService()
+        _graph_base = f"https://graph.facebook.com/{settings.FACEBOOK_API_VERSION}"
+
+        async def _fetch_instagram_direct(draft, conn):
+            media_id = draft.get("platform_post_id")
+            token = conn.get("page_access_token")
+            if not media_id or not token:
+                return None
+            try:
+                async with _httpx.AsyncClient(timeout=20) as _c:
+                    media_resp = await _c.get(
+                        f"{_graph_base}/{media_id}",
+                        params={"fields": "like_count,comments_count,timestamp,media_type", "access_token": token},
+                    )
+                    media_data = media_resp.json()
+                    if "error" in media_data:
+                        print(f"⚠️ IG media fetch error for {media_id}: {media_data['error'].get('message')}")
+                        return None
+
+                    impressions = reach = 0
+                    try:
+                        ins_resp = await _c.get(
+                            f"{_graph_base}/{media_id}/insights",
+                            params={"metric": "impressions,reach", "period": "lifetime", "access_token": token},
+                        )
+                        for item in ins_resp.json().get("data", []):
+                            val = (item.get("values") or [{}])[0].get("value", 0)
+                            if item["name"] == "impressions":
+                                impressions = val
+                            elif item["name"] == "reach":
+                                reach = val
+                    except Exception:
+                        pass
+
+                likes = media_data.get("like_count", 0)
+                comments = media_data.get("comments_count", 0)
+                return {
+                    "draft_id": draft.get("id"),
+                    "platform_post_id": media_id,
+                    "platform": "instagram",
+                    "content_preview": (draft.get("content") or "")[:120],
+                    "published_at": draft.get("published_date", ""),
+                    "image_url": draft.get("image_url"),
+                    "likes": likes,
+                    "comments": comments,
+                    "shares": 0,
+                    "views": 0,
+                    "impressions": impressions,
+                    "reach": reach,
+                    "engagement_rate": round(((likes + comments) / max(reach, 1)) * 100, 2) if reach else 0,
+                }
+            except Exception as e:
+                print(f"⚠️ Instagram direct analytics failed for {media_id}: {e}")
+                return None
 
         async def _fetch(draft):
             post_id = draft.get("platform_post_id")
+            platform = draft.get("platform", "unknown")
             if not post_id:
                 return None
+
+            # Route to direct Graph API for non-Outstand platforms
+            if platform in direct_conn_map:
+                return await _fetch_instagram_direct(draft, direct_conn_map[platform])
+
             try:
                 data = await outstand.get_post_analytics(post_id)
                 agg = data.get("aggregated_metrics") or {}
                 by_account = data.get("metrics_by_account") or []
-                platform = draft.get("platform", "unknown")
                 network = by_account[0]["social_account"]["network"] if by_account else platform
                 return {
                     "draft_id": draft.get("id"),
@@ -1160,25 +1226,19 @@ async def get_account_metrics(
 
     import asyncio as _asyncio
     import time as _time
+    import httpx as _httpx
     from datetime import timedelta
 
     try:
         outstand = OutstandService()
-
-        # List all connected accounts for this user
-        result = await outstand.list_accounts(tenant_id=user_id)
-        accounts = result.get("data", [])
-
-        if not accounts:
-            return UriResponse.get_single_data_response("account_metrics", {
-                "has_data": False,
-                "accounts": [],
-            })
-
         until_ts = int(_time.time())
         since_ts = int((datetime.utcnow() - timedelta(days=days)).timestamp())
 
-        async def _fetch_metrics(acc):
+        # ── Outstand accounts ─────────────────────────────────────────────────
+        result = await outstand.list_accounts(tenant_id=user_id)
+        outstand_accounts = result.get("data", [])
+
+        async def _fetch_outstand_metrics(acc):
             account_id = acc.get("id")
             if not account_id:
                 return None
@@ -1206,17 +1266,94 @@ async def get_account_metrics(
                     } if eng else None,
                     "engagement_note": period.get("note"),
                     "platform_specific": ps,
-                    "period": {
-                        "since": since_ts,
-                        "until": until_ts,
-                    },
+                    "period": {"since": since_ts, "until": until_ts},
                 }
             except Exception as e:
-                print(f"⚠️ Account metrics fetch failed for {account_id}: {e}")
+                print(f"⚠️ Outstand account metrics failed for {account_id}: {e}")
                 return None
 
-        results = await _asyncio.gather(*[_fetch_metrics(a) for a in accounts])
-        account_metrics = [r for r in results if r is not None]
+        # ── Direct (non-Outstand) connections ─────────────────────────────────
+        direct_conns = await db["social_connections"].find(
+            {"user_id": user_id, "connected_via": {"$ne": "outstand"}},
+            {"_id": 0, "platform": 1, "connected_via": 1, "page_access_token": 1, "ig_user_id": 1, "page_name": 1},
+        ).to_list(length=20)
+
+        _graph_base = f"https://graph.facebook.com/{settings.FACEBOOK_API_VERSION}"
+
+        async def _fetch_instagram_direct_metrics(conn):
+            ig_user_id = conn.get("ig_user_id")
+            token = conn.get("page_access_token")
+            if not ig_user_id or not token:
+                return None
+            try:
+                async with _httpx.AsyncClient(timeout=20) as _c:
+                    profile_resp = await _c.get(
+                        f"{_graph_base}/{ig_user_id}",
+                        params={"fields": "name,username,followers_count,media_count,biography,profile_picture_url", "access_token": token},
+                    )
+                    profile = profile_resp.json()
+                    if "error" in profile:
+                        print(f"⚠️ IG profile fetch error: {profile['error'].get('message')}")
+                        return None
+
+                    # Aggregate engagement from published posts in the period
+                    posts_resp = await _c.get(
+                        f"{_graph_base}/{ig_user_id}/media",
+                        params={"fields": "like_count,comments_count,timestamp", "limit": 50, "access_token": token},
+                    )
+                    posts = posts_resp.json().get("data", [])
+                    from datetime import timezone as _tz
+                    since_dt = datetime.utcfromtimestamp(since_ts).replace(tzinfo=_tz.utc)
+                    total_likes = total_comments = 0
+                    for post in posts:
+                        try:
+                            from datetime import datetime as _dt
+                            post_dt = _dt.fromisoformat(post["timestamp"].replace("Z", "+00:00"))
+                            if post_dt >= since_dt:
+                                total_likes += post.get("like_count", 0)
+                                total_comments += post.get("comments_count", 0)
+                        except Exception:
+                            pass
+
+                return {
+                    "account_id": ig_user_id,
+                    "network": "instagram",
+                    "page_name": profile.get("name") or profile.get("username") or conn.get("page_name"),
+                    "category": None,
+                    "followers_count": profile.get("followers_count", 0),
+                    "following_count": None,
+                    "posts_count": profile.get("media_count"),
+                    "engagement": {
+                        "views": 0,
+                        "likes": total_likes,
+                        "comments": total_comments,
+                        "shares": 0,
+                        "reposts": 0,
+                        "quotes": 0,
+                    },
+                    "engagement_note": f"Likes + comments on posts published in the last {days} days",
+                    "platform_specific": {
+                        "username": profile.get("username"),
+                        "biography": profile.get("biography"),
+                        "profile_picture_url": profile.get("profile_picture_url"),
+                    },
+                    "period": {"since": since_ts, "until": until_ts},
+                }
+            except Exception as e:
+                print(f"⚠️ Instagram direct account metrics failed: {e}")
+                return None
+
+        async def _fetch_direct_metrics(conn):
+            if conn.get("connected_via") == "instagram_direct":
+                return await _fetch_instagram_direct_metrics(conn)
+            return None  # extend here for other direct platforms
+
+        outstand_results, direct_results = await _asyncio.gather(
+            _asyncio.gather(*[_fetch_outstand_metrics(a) for a in outstand_accounts]),
+            _asyncio.gather(*[_fetch_direct_metrics(c) for c in direct_conns]),
+        )
+
+        account_metrics = [r for r in (*outstand_results, *direct_results) if r is not None]
 
         return UriResponse.get_single_data_response("account_metrics", {
             "has_data": len(account_metrics) > 0,
