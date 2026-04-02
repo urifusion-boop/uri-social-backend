@@ -11,6 +11,9 @@ Flow:
   3. On publish: create media container → publish container
 """
 
+import base64
+import io
+
 import httpx
 from typing import Any, Dict, Optional
 
@@ -48,6 +51,34 @@ class InstagramDirectService:
         return None
 
     @staticmethod
+    async def _convert_webp_to_jpeg_imgbb(webp_url: str) -> Optional[str]:
+        """Download a WebP image, convert to JPEG, upload to imgBB, return public JPEG URL."""
+        from PIL import Image
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.get(webp_url)
+                resp.raise_for_status()
+                img = Image.open(io.BytesIO(resp.content)).convert("RGB")
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=92)
+                b64 = base64.b64encode(buf.getvalue()).decode()
+
+            api_key = settings.IMGBB_API_KEY
+            if not api_key:
+                print("⚠️ IMGBB_API_KEY not set — cannot re-upload converted image")
+                return None
+            async with httpx.AsyncClient(timeout=30) as client:
+                upload = await client.post(
+                    "https://api.imgbb.com/1/upload",
+                    data={"key": api_key, "image": b64},
+                )
+                data = upload.json()
+                return data.get("data", {}).get("url")
+        except Exception as e:
+            print(f"⚠️ WebP→JPEG conversion failed: {e}")
+            return None
+
+    @staticmethod
     async def publish_post(
         ig_user_id: str,
         page_access_token: str,
@@ -78,12 +109,17 @@ class InstagramDirectService:
                 "error": f"Instagram cannot fetch the image — URL must be a public HTTPS link (got: {image_url[:80]}). Re-generate the post with 'include_images: true'.",
             }
 
-        # Instagram does not support WebP — requires JPEG or PNG
+        # Instagram does not support WebP — convert to JPEG via imgBB before publishing
         if image_url.lower().split("?")[0].endswith(".webp"):
-            return {
-                "success": False,
-                "error": "Instagram does not support WebP images. Please re-generate the post without an image, or use a JPEG/PNG image.",
-            }
+            print(f"🔄 Converting WebP to JPEG for Instagram: {image_url}")
+            converted = await InstagramDirectService._convert_webp_to_jpeg_imgbb(image_url)
+            if not converted:
+                return {
+                    "success": False,
+                    "error": "Could not convert image to JPEG for Instagram. Please re-generate the post.",
+                }
+            print(f"✅ Converted image URL: {converted}")
+            image_url = converted
 
         async with httpx.AsyncClient(timeout=60) as client:
             # Step 1 — create media container
