@@ -861,6 +861,7 @@ class ApprovalWorkflowService:
             from app.agents.social_media_manager.services.instagram_direct_service import InstagramDirectService
             ig_user_id = connection.get("ig_user_id")
             page_token = connection.get("page_access_token")
+            page_id = connection.get("page_id")
             if not ig_user_id or not page_token:
                 return {"success": False, "error": "Instagram direct connection is missing credentials. Please reconnect Facebook."}
             image_url = draft.get("image_url") or ""
@@ -872,6 +873,7 @@ class ApprovalWorkflowService:
                 content=content,
                 image_url=image_url or None,
                 scheduled_at=scheduled_datetime.strftime("%Y-%m-%dT%H:%M:%SZ") if scheduled_datetime else None,
+                page_id=page_id,
             )
 
         # ── Outstand-connected accounts ───────────────────────────────────────
