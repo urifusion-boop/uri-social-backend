@@ -164,12 +164,87 @@ class ImageContentService:
             return UriResponse.error_response(f"Content with images generation failed: {str(e)}")
     
     @staticmethod
+    async def regenerate_image_for_draft(
+        draft_id: str,
+        user_id: str,
+        feedback: str,
+        db,
+    ) -> None:
+        """
+        Background task: regenerate a draft's image using user feedback.
+        Clears image_url first (frontend shows shimmer), then generates a new
+        image incorporating the feedback and persists it to the draft.
+        """
+        import re as _re, httpx as _httpx, base64 as _b64
+        from app.core.config import settings as _cfg
+        from datetime import datetime
+
+        try:
+            draft = await db["content_drafts"].find_one(
+                {"$or": [{"id": draft_id}, {"draft_id": draft_id}], "user_id": user_id}
+            )
+            if not draft:
+                print(f"⚠️ regenerate_image: draft {draft_id} not found for user {user_id}")
+                return
+
+            platform = draft.get("platform", "instagram")
+            content = draft.get("content", "")
+            seed_content = draft.get("seed_content") or content
+
+            image_result = await ImageContentService._generate_platform_image(
+                platform=platform,
+                content=content,
+                seed_content=seed_content,
+                feedback=feedback,
+            )
+
+            if not image_result.get("status"):
+                print(f"❌ regenerate_image: generation failed for {draft_id}: {image_result.get('error')}")
+                return
+
+            raw_url = image_result["responseData"]["image_url"]
+            specs = image_result["responseData"]["specs"]
+
+            # Upload base64 to imgBB for a public URL
+            stored_url = raw_url
+            if raw_url and raw_url.startswith("data:"):
+                try:
+                    _match = _re.match(r"data:[^;]+;base64,(.+)", raw_url, _re.DOTALL)
+                    if _match and _cfg.IMGBB_API_KEY:
+                        async with _httpx.AsyncClient(timeout=120) as _c:
+                            _r = await _c.post(
+                                "https://api.imgbb.com/1/upload",
+                                data={"key": _cfg.IMGBB_API_KEY, "image": _match.group(1)},
+                            )
+                        _rj = _r.json()
+                        if _rj.get("success"):
+                            stored_url = _rj["data"]["url"]
+                            print(f"☁️  Regenerated image uploaded to imgBB: {stored_url}")
+                except Exception as _e:
+                    print(f"⚠️ imgBB upload error during regeneration: {_e}")
+
+            await db["content_drafts"].update_one(
+                {"$or": [{"id": draft_id}, {"draft_id": draft_id}]},
+                {"$set": {
+                    "image_url": stored_url if not stored_url.startswith("data:") else None,
+                    "image_specs": specs,
+                    "has_image": True,
+                    "updated_at": datetime.utcnow(),
+                }},
+            )
+            print(f"✅ regenerate_image: draft {draft_id} image updated")
+
+        except Exception as e:
+            print(f"❌ regenerate_image error for {draft_id}: {e}")
+
+    @staticmethod
     async def _generate_platform_image(
         platform: str,
         content: str,
         seed_content: str,
         brand_context: Optional[Dict[str, Any]] = None,
         reference_image: Optional[str] = None,
+        feedback: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Generate an AI image optimized for a specific platform
@@ -186,6 +261,7 @@ class ImageContentService:
                 brand_context=brand_context,
                 specs=specs,
                 reference_image=reference_image,
+                feedback=feedback,
             )
 
             # Fall back to static prompt if GPT-4.1 fails
@@ -239,6 +315,7 @@ class ImageContentService:
         brand_context: Optional[Dict[str, Any]] = None,
         specs: Optional[Dict[str, Any]] = None,
         reference_image: Optional[str] = None,
+        feedback: Optional[str] = None,
     ) -> Optional[str]:
         """
         Use GPT-4.1 to select the most appropriate image type for the content,
@@ -479,12 +556,19 @@ class ImageContentService:
                 "• No labels, no sections, no parenthetical notes — pure flowing prose only]"
             )
 
+            feedback_block = (
+                f"\n\n⚠️ USER FEEDBACK ON PREVIOUS IMAGE — YOU MUST INCORPORATE THIS:\n{feedback.strip()}\n"
+                "This feedback overrides your default choices. Adjust the image type, scene, style, "
+                "and composition to directly address these notes."
+                if feedback else ""
+            )
+
             user_prompt = (
                 f"PLATFORM: {platform} ({aspect} format)\n"
                 f"PLATFORM GUIDANCE: {platform_note}\n\n"
                 f"POST CONTENT TO VISUALIZE:\n{content[:700]}\n\n"
                 f"Original business topic: {seed_content[:300]}\n\n"
-                f"{brand_block}\n\n"
+                f"{brand_block}{feedback_block}\n\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 "YOUR TASK:\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"

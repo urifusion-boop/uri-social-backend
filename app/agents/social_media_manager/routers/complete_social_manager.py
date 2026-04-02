@@ -503,6 +503,56 @@ async def approve_content(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@router.post("/drafts/{draft_id}/regenerate-image")
+async def regenerate_draft_image(
+    draft_id: str,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer())
+):
+    """
+    Regenerate the image for an existing draft using user feedback.
+    Clears the current image immediately (frontend shows shimmer),
+    then generates a new image in the background incorporating the feedback.
+    """
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    body = await request.json()
+    feedback = (body.get("feedback") or "").strip()
+    if not feedback:
+        raise HTTPException(status_code=400, detail="feedback is required")
+
+    # Verify the draft belongs to this user
+    draft = await db["content_drafts"].find_one(
+        {"$or": [{"id": draft_id}, {"draft_id": draft_id}], "user_id": user_id},
+        {"_id": 0, "id": 1},
+    )
+    if not draft:
+        raise HTTPException(status_code=404, detail="Draft not found")
+
+    # Clear the image so the frontend shimmer shows while regeneration runs
+    from datetime import datetime as _dt
+    await db["content_drafts"].update_one(
+        {"$or": [{"id": draft_id}, {"draft_id": draft_id}]},
+        {"$set": {"image_url": None, "has_image": True, "updated_at": _dt.utcnow()}},
+    )
+
+    from app.agents.social_media_manager.services.image_content_service import ImageContentService
+    background_tasks.add_task(
+        ImageContentService.regenerate_image_for_draft,
+        draft_id=draft_id,
+        user_id=user_id,
+        feedback=feedback,
+        db=db,
+    )
+
+    from app.domain.responses.uri_response import UriResponse
+    return UriResponse.get_single_data_response("regenerate_image", {"draft_id": draft_id, "status": "generating"})
+
+
 @router.delete("/drafts/{draft_id}")
 async def delete_draft(
     draft_id: str,
