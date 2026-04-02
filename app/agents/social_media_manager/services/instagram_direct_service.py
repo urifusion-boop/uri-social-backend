@@ -71,6 +71,20 @@ class InstagramDirectService:
                 "error": "Instagram requires an image for feed posts. Re-generate with 'include_images: true'.",
             }
 
+        # Must be a publicly accessible absolute HTTPS URL
+        if not image_url.startswith("https://"):
+            return {
+                "success": False,
+                "error": f"Instagram cannot fetch the image — URL must be a public HTTPS link (got: {image_url[:80]}). Re-generate the post with 'include_images: true'.",
+            }
+
+        # Instagram does not support WebP — requires JPEG or PNG
+        if image_url.lower().split("?")[0].endswith(".webp"):
+            return {
+                "success": False,
+                "error": "Instagram does not support WebP images. Please re-generate the post without an image, or use a JPEG/PNG image.",
+            }
+
         async with httpx.AsyncClient(timeout=60) as client:
             # Step 1 — create media container
             container_resp = await client.post(
