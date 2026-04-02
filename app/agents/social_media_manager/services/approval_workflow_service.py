@@ -686,6 +686,14 @@ class ApprovalWorkflowService:
                     )
                     await db["social_connections"].update_one(conn_filter, {"$inc": {"total_posts_published": 1}})
                 else:
+                    await db["content_drafts"].update_one(
+                        {"id": draft_id},
+                        {"$set": {
+                            "status": "publish_failed",
+                            "error_message": publish_result.get("error"),
+                            "updated_at": datetime.utcnow(),
+                        }},
+                    )
                     await db["social_connections"].update_one(conn_filter, {"$inc": {"total_publish_errors": 1}})
 
                 results[draft_id] = publish_result
