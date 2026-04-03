@@ -71,6 +71,8 @@ class ContentGenerationRequest(BaseModel):
     include_images: bool = False
     brand_context: Optional[BrandContextRequest] = None
     reference_image: Optional[str] = None  # base64 data URL uploaded by user for contextual reference
+    post_type: str = "feed"   # feed | carousel | story
+    num_slides: int = 3        # carousel only (2–5)
 
 class SocialConnectionRequest(BaseModel):
     platforms: List[str] = Field(..., min_items=1, max_items=10)
@@ -209,15 +211,41 @@ async def generate_content(
             overrides = request.brand_context.dict(exclude_none=True)
             brand_context_dict = {**brand_context_dict, **overrides}
 
-        # Always generate text synchronously and return immediately.
-        result = await ContentGenerationService.generate_multi_platform_content(
-            user_id=user_id,
-            seed_content=request.seed_content,
-            platforms=request.platforms,
-            seed_type=request.seed_type,
-            brand_context=brand_context_dict,
-            db=db,
-        )
+        post_type = request.post_type or "feed"
+        num_slides = max(2, min(5, request.num_slides or 3))
+
+        if post_type == "carousel":
+            from ..services.carousel_generation_service import CarouselGenerationService
+            result = await CarouselGenerationService.generate_multi_platform(
+                user_id=user_id,
+                seed_content=request.seed_content,
+                platforms=request.platforms,
+                brand_context=brand_context_dict,
+                num_slides=num_slides,
+                db=db,
+            )
+        else:
+            # story uses standard text gen but we tag it after; feed is unchanged
+            result = await ContentGenerationService.generate_multi_platform_content(
+                user_id=user_id,
+                seed_content=request.seed_content,
+                platforms=request.platforms,
+                seed_type=request.seed_type,
+                brand_context=brand_context_dict,
+                db=db,
+            )
+
+        # Tag post_type on all resulting drafts in DB
+        if result.get("status") and post_type != "feed":
+            drafts = result.get("responseData", {}).get("drafts", [])
+            draft_ids = [d["id"] for d in drafts if d.get("id")]
+            if draft_ids:
+                await db["content_drafts"].update_many(
+                    {"id": {"$in": draft_ids}},
+                    {"$set": {"post_type": post_type}},
+                )
+                for d in drafts:
+                    d["post_type"] = post_type
 
         # If images were requested, mark drafts as has_image=True immediately so the
         # frontend shimmer shows right away, then kick off background generation.
@@ -234,16 +262,33 @@ async def generate_content(
                     d["has_image"] = True
 
             for draft in drafts:
-                background_tasks.add_task(
-                    _generate_image_bg,
-                    draft_id=draft["id"],
-                    platform=draft["platform"],
-                    content=draft["content"],
-                    seed_content=request.seed_content,
-                    brand_context=brand_context_dict,
-                    db=db,
-                    reference_image=request.reference_image,
-                )
+                if post_type == "carousel":
+                    slides = draft.get("slides") or []
+                    for slide_index, slide in enumerate(slides):
+                        background_tasks.add_task(
+                            _generate_image_bg,
+                            draft_id=draft["id"],
+                            platform=draft["platform"],
+                            content=f"{slide.get('headline', '')} {slide.get('body', '')}".strip() or draft["content"],
+                            seed_content=request.seed_content,
+                            brand_context=brand_context_dict,
+                            db=db,
+                            reference_image=request.reference_image,
+                            post_type=post_type,
+                            slide_index=slide_index,
+                        )
+                else:
+                    background_tasks.add_task(
+                        _generate_image_bg,
+                        draft_id=draft["id"],
+                        platform=draft["platform"],
+                        content=draft["content"],
+                        seed_content=request.seed_content,
+                        brand_context=brand_context_dict,
+                        db=db,
+                        reference_image=request.reference_image,
+                        post_type=post_type,
+                    )
 
         return result
 
@@ -1816,10 +1861,14 @@ async def _generate_image_bg(
     brand_context: Dict[str, Any],
     db: AsyncIOMotorDatabase,
     reference_image: Optional[str] = None,
+    post_type: str = "feed",
+    slide_index: Optional[int] = None,
 ):
     """
     Background task: generate an image for an existing draft and save it to DB.
     Runs after the text-only response has already been returned to the frontend.
+    For carousel posts, slide_index indicates which slide this image belongs to.
+    For story posts, uses the story (9:16) image spec.
     """
     import re
     import base64
@@ -1827,12 +1876,16 @@ async def _generate_image_bg(
     from app.core.config import settings as _cfg
 
     try:
+        # For story posts pass image_type="story" so we get 1080x1920 dimensions
+        image_type = "story" if post_type == "story" else "post_image"
+
         image_result = await ImageContentService._generate_platform_image(
             platform=platform,
             content=content,
             seed_content=seed_content,
             brand_context=brand_context,
             reference_image=reference_image,
+            image_type=image_type,
         )
 
         if not image_result.get("status"):
@@ -1863,11 +1916,22 @@ async def _generate_image_bg(
 
         final_url = stored_url if not stored_url.startswith("data:") else None
         if final_url and db is not None:
-            result = await db["content_drafts"].update_one(
-                {"id": draft_id},
-                {"$set": {"image_url": final_url, "has_image": True}},
-            )
-            print(f"✅ BG image saved for draft {draft_id}: matched={result.matched_count}")
+            if post_type == "carousel" and slide_index is not None:
+                # Update the specific slide's image_url in the slides array
+                result = await db["content_drafts"].update_one(
+                    {"id": draft_id},
+                    {"$set": {
+                        f"slides.{slide_index}.image_url": final_url,
+                        "has_image": True,
+                    }},
+                )
+                print(f"✅ BG carousel slide {slide_index} image saved for draft {draft_id}: matched={result.matched_count}")
+            else:
+                result = await db["content_drafts"].update_one(
+                    {"id": draft_id},
+                    {"$set": {"image_url": final_url, "has_image": True}},
+                )
+                print(f"✅ BG image saved for draft {draft_id}: matched={result.matched_count}")
         else:
             print(f"⚠️  BG image not saved for draft {draft_id} (no public URL)")
 

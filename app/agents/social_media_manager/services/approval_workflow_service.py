@@ -864,17 +864,40 @@ class ApprovalWorkflowService:
             page_id = connection.get("page_id")
             if not ig_user_id or not page_token:
                 return {"success": False, "error": "Instagram direct connection is missing credentials. Please reconnect Facebook."}
-            image_url = draft.get("image_url") or ""
-            if image_url and image_url.startswith("data:"):
-                image_url = await ApprovalWorkflowService._upload_base64_to_imgbb(image_url) or ""
-            return await InstagramDirectService.publish_post(
-                ig_user_id=ig_user_id,
-                page_access_token=page_token,
-                content=content,
-                image_url=image_url or None,
-                scheduled_at=scheduled_datetime.strftime("%Y-%m-%dT%H:%M:%SZ") if scheduled_datetime else None,
-                page_id=page_id,
-            )
+
+            post_type = draft.get("post_type", "feed")
+
+            if post_type == "carousel":
+                slides = draft.get("slides", [])
+                return await InstagramDirectService.publish_carousel(
+                    ig_user_id=ig_user_id,
+                    page_access_token=page_token,
+                    caption=content,
+                    slides=slides,
+                    page_id=page_id,
+                )
+            elif post_type == "story":
+                image_url = draft.get("image_url") or ""
+                if image_url and image_url.startswith("data:"):
+                    image_url = await ApprovalWorkflowService._upload_base64_to_imgbb(image_url) or ""
+                return await InstagramDirectService.publish_story(
+                    ig_user_id=ig_user_id,
+                    page_access_token=page_token,
+                    image_url=image_url or None,
+                    page_id=page_id,
+                )
+            else:
+                image_url = draft.get("image_url") or ""
+                if image_url and image_url.startswith("data:"):
+                    image_url = await ApprovalWorkflowService._upload_base64_to_imgbb(image_url) or ""
+                return await InstagramDirectService.publish_post(
+                    ig_user_id=ig_user_id,
+                    page_access_token=page_token,
+                    content=content,
+                    image_url=image_url or None,
+                    scheduled_at=scheduled_datetime.strftime("%Y-%m-%dT%H:%M:%SZ") if scheduled_datetime else None,
+                    page_id=page_id,
+                )
 
         # ── Outstand-connected accounts ───────────────────────────────────────
         if connection.get("connected_via") == "outstand":
@@ -986,55 +1009,151 @@ class ApprovalWorkflowService:
             if not page_id or not page_token:
                 return {"success": False, "error": "No valid Facebook credentials on this connection. Reconnect your account."}
 
-            post_data: Dict[str, Any] = {
-                "message": content,
-                "published": True,
-            }
+            post_type = draft.get("post_type", "feed")
 
-            image_url = draft.get("image_url")
-            if image_url:
-                if image_url.startswith("data:"):
-                    media_fbid = await ApprovalWorkflowService._upload_base64_image_to_facebook(
-                        page_id=page_id,
-                        page_token=page_token,
-                        data_url=image_url,
-                    )
-                    if media_fbid:
-                        post_data["attached_media"] = [{"media_fbid": media_fbid}]
-                else:
-                    post_data["media"] = [{"url": image_url, "media_type": "IMAGE"}]
+            # ── Facebook carousel: upload each slide image as unpublished photo, then post feed with attached_media ──
+            if post_type == "carousel":
+                slides = draft.get("slides", [])
+                attached_media = []
+                for i, slide in enumerate(slides):
+                    slide_image_url = slide.get("image_url") or ""
+                    if not slide_image_url:
+                        print(f"⚠️ FB carousel slide {i} has no image_url — skipping")
+                        continue
+                    # Upload as unpublished photo to get a media_fbid
+                    try:
+                        import httpx as _httpx
+                        from PIL import Image as _Image
+                        import io as _io
+                        async with _httpx.AsyncClient(timeout=30) as _c:
+                            img_resp = await _c.get(slide_image_url)
+                        _img = _Image.open(_io.BytesIO(img_resp.content)).convert("RGB")
+                        _buf = _io.BytesIO()
+                        _img.save(_buf, format="JPEG", quality=92)
+                        _jpeg_bytes = _buf.getvalue()
+                        async with _httpx.AsyncClient(timeout=60) as _c2:
+                            upload_resp = await _c2.post(
+                                f"https://graph.facebook.com/{settings.FACEBOOK_API_VERSION}/{page_id}/photos",
+                                data={"access_token": page_token, "published": "false"},
+                                files={"source": ("image.jpg", _jpeg_bytes, "image/jpeg")},
+                            )
+                        photo_id = upload_resp.json().get("id")
+                        if photo_id:
+                            attached_media.append({"media_fbid": photo_id})
+                            print(f"✅ FB carousel slide {i} uploaded: photo_id={photo_id}")
+                        else:
+                            print(f"⚠️ FB carousel slide {i} upload failed: {upload_resp.json()}")
+                    except Exception as slide_err:
+                        print(f"⚠️ FB carousel slide {i} upload error: {slide_err}")
 
-            if scheduled_datetime:
+                if not attached_media:
+                    return {"success": False, "error": "No carousel slide images could be uploaded to Facebook."}
+
                 import calendar
-                post_data["published"] = False
-                post_data["scheduled_publish_time"] = int(
-                    calendar.timegm(scheduled_datetime.utctimetuple())
-                )
-
-            if post_data.get("attached_media"):
-                payload: Dict[str, Any] = {
-                    "message": post_data["message"],
-                    "published": post_data["published"],
-                    "attached_media": post_data["attached_media"],
+                carousel_payload: Dict[str, Any] = {
+                    "message": content,
+                    "published": True,
+                    "attached_media": attached_media,
                 }
-                if post_data.get("scheduled_publish_time"):
-                    payload["scheduled_publish_time"] = post_data["scheduled_publish_time"]
+                if scheduled_datetime:
+                    carousel_payload["published"] = False
+                    carousel_payload["scheduled_publish_time"] = int(
+                        calendar.timegm(scheduled_datetime.utctimetuple())
+                    )
                 response = await FacebookService.publish_post(
-                    page_id=page_id, payload=payload, access_token=page_token,
+                    page_id=page_id, payload=carousel_payload, access_token=page_token,
                 )
+                post_id = None
+                success = False
+                if isinstance(response, dict):
+                    resp_data = response.get("responseData") or {}
+                    post_id = resp_data.get("id") or resp_data.get("post_id")
+                    success = response.get("status", False) and post_id is not None
+                return {"success": success, "post_id": post_id, "raw_response": response}
+
+            # ── Facebook story ─────────────────────────────────────────────────
+            elif post_type == "story":
+                story_image_url = draft.get("image_url") or ""
+                if story_image_url.startswith("data:"):
+                    story_image_url = await ApprovalWorkflowService._upload_base64_to_imgbb(story_image_url) or ""
+                if not story_image_url:
+                    return {"success": False, "error": "Facebook stories require an image. Re-generate with 'include_images: true'."}
+                try:
+                    import httpx as _httpx
+                    async with _httpx.AsyncClient(timeout=30) as _c:
+                        story_resp = await _c.post(
+                            f"https://graph.facebook.com/{settings.FACEBOOK_API_VERSION}/{page_id}/photo_stories",
+                            params={"url": story_image_url, "access_token": page_token},
+                        )
+                    story_data = story_resp.json()
+                    post_id = story_data.get("post_id") or story_data.get("id")
+                    if post_id:
+                        print(f"✅ FB story publish success: post_id={post_id}")
+                        return {"success": True, "post_id": post_id, "raw_response": story_data}
+                    else:
+                        error_msg = (story_data.get("error") or {}).get("message", str(story_data))
+                        print(f"❌ FB story publish failed: {story_data}")
+                        return {
+                            "success": False,
+                            "error": f"Facebook stories require additional permissions. Try publishing as a feed post instead. (Detail: {error_msg})",
+                        }
+                except Exception as story_err:
+                    return {
+                        "success": False,
+                        "error": f"Facebook stories require additional permissions. Try publishing as a feed post instead. (Detail: {story_err})",
+                    }
+
+            # ── Facebook feed (existing logic) ─────────────────────────────────
             else:
-                response = await FacebookService.post_on_facebook(
-                    page_id=page_id, post_data=post_data, access_token=page_token,
-                )
+                post_data: Dict[str, Any] = {
+                    "message": content,
+                    "published": True,
+                }
 
-            post_id = None
-            success = False
-            if isinstance(response, dict):
-                resp_data = response.get("responseData") or {}
-                post_id = resp_data.get("id") or resp_data.get("post_id")
-                success = response.get("status", False) and post_id is not None
+                image_url = draft.get("image_url")
+                if image_url:
+                    if image_url.startswith("data:"):
+                        media_fbid = await ApprovalWorkflowService._upload_base64_image_to_facebook(
+                            page_id=page_id,
+                            page_token=page_token,
+                            data_url=image_url,
+                        )
+                        if media_fbid:
+                            post_data["attached_media"] = [{"media_fbid": media_fbid}]
+                    else:
+                        post_data["media"] = [{"url": image_url, "media_type": "IMAGE"}]
 
-            return {"success": success, "post_id": post_id, "raw_response": response}
+                if scheduled_datetime:
+                    import calendar
+                    post_data["published"] = False
+                    post_data["scheduled_publish_time"] = int(
+                        calendar.timegm(scheduled_datetime.utctimetuple())
+                    )
+
+                if post_data.get("attached_media"):
+                    payload: Dict[str, Any] = {
+                        "message": post_data["message"],
+                        "published": post_data["published"],
+                        "attached_media": post_data["attached_media"],
+                    }
+                    if post_data.get("scheduled_publish_time"):
+                        payload["scheduled_publish_time"] = post_data["scheduled_publish_time"]
+                    response = await FacebookService.publish_post(
+                        page_id=page_id, payload=payload, access_token=page_token,
+                    )
+                else:
+                    response = await FacebookService.post_on_facebook(
+                        page_id=page_id, post_data=post_data, access_token=page_token,
+                    )
+
+                post_id = None
+                success = False
+                if isinstance(response, dict):
+                    resp_data = response.get("responseData") or {}
+                    post_id = resp_data.get("id") or resp_data.get("post_id")
+                    success = response.get("status", False) and post_id is not None
+
+                return {"success": success, "post_id": post_id, "raw_response": response}
 
         return {"success": False, "error": f"Platform '{platform}' publishing not implemented yet"}
 

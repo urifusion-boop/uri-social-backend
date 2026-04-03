@@ -235,3 +235,209 @@ class InstagramDirectService:
                 "post_id": post_id,
                 "raw_response": publish_data,
             }
+
+    @staticmethod
+    async def publish_carousel(
+        ig_user_id: str,
+        page_access_token: str,
+        caption: str,
+        slides: list,
+        page_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Publish a carousel post to Instagram.
+
+        slides: list of dicts with at least "image_url" key.
+
+        Steps:
+          1. Re-host each slide image to Facebook CDN.
+          2. Create carousel item containers (sequentially — Instagram requirement).
+          3. Create carousel container with media_type=CAROUSEL.
+          4. Poll carousel container until status_code == FINISHED.
+          5. Publish via /media_publish.
+        """
+        import asyncio as _asyncio
+
+        item_ids = []
+        async with httpx.AsyncClient(timeout=60) as client:
+            for i, slide in enumerate(slides):
+                image_url = slide.get("image_url") or ""
+                if not image_url:
+                    print(f"⚠️ Carousel slide {i} has no image_url — skipping")
+                    continue
+
+                # Re-host to Facebook CDN so Instagram can always fetch it
+                jpeg_bytes = await InstagramDirectService._download_as_jpeg(image_url)
+                if not jpeg_bytes:
+                    print(f"⚠️ Could not download slide {i} image — skipping")
+                    continue
+                if page_id:
+                    cdn_url = await InstagramDirectService._upload_to_facebook_cdn(
+                        page_id, page_access_token, jpeg_bytes
+                    )
+                else:
+                    cdn_url = image_url  # best-effort fallback
+                if not cdn_url:
+                    print(f"⚠️ CDN upload failed for slide {i} — skipping")
+                    continue
+
+                # Create carousel item container
+                item_resp = await client.post(
+                    f"{GRAPH_BASE}/{ig_user_id}/media",
+                    params={
+                        "image_url": cdn_url,
+                        "is_carousel_item": "true",
+                        "access_token": page_access_token,
+                    },
+                )
+                item_data = item_resp.json()
+                item_id = item_data.get("id")
+                if not item_id:
+                    error_msg = (item_data.get("error") or {}).get("message", str(item_data))
+                    print(f"❌ Carousel item {i} container failed: {item_data}")
+                    return {"success": False, "error": f"Carousel item {i} container error: {error_msg}"}
+                item_ids.append(item_id)
+                print(f"✅ Carousel item {i} container created: {item_id}")
+
+            if not item_ids:
+                return {"success": False, "error": "No carousel items could be created (all slides missing images)."}
+
+            # Create carousel container
+            carousel_resp = await client.post(
+                f"{GRAPH_BASE}/{ig_user_id}/media",
+                params={
+                    "media_type": "CAROUSEL",
+                    "children": ",".join(item_ids),
+                    "caption": caption,
+                    "access_token": page_access_token,
+                },
+            )
+            carousel_data = carousel_resp.json()
+            creation_id = carousel_data.get("id")
+            if not creation_id:
+                error_msg = (carousel_data.get("error") or {}).get("message", str(carousel_data))
+                print(f"❌ Carousel container failed: {carousel_data}")
+                return {"success": False, "error": f"Carousel container error: {error_msg}"}
+
+            # Poll until FINISHED
+            for attempt in range(12):
+                status_resp = await client.get(
+                    f"{GRAPH_BASE}/{creation_id}",
+                    params={"fields": "status_code", "access_token": page_access_token},
+                )
+                status_code = status_resp.json().get("status_code", "")
+                print(f"⏳ Carousel container {creation_id} status: {status_code} (attempt {attempt + 1})")
+                if status_code == "FINISHED":
+                    break
+                if status_code == "ERROR":
+                    return {"success": False, "error": "Instagram carousel container processing failed (status=ERROR)."}
+                await _asyncio.sleep(5)
+            else:
+                return {"success": False, "error": "Instagram carousel container timed out waiting for FINISHED status."}
+
+            # Publish
+            publish_resp = await client.post(
+                f"{GRAPH_BASE}/{ig_user_id}/media_publish",
+                params={
+                    "creation_id": creation_id,
+                    "access_token": page_access_token,
+                },
+            )
+            publish_data = publish_resp.json()
+            post_id = publish_data.get("id")
+            if post_id:
+                print(f"✅ Instagram carousel publish success: post_id={post_id}")
+            else:
+                print(f"❌ Instagram carousel publish failed: {publish_data}")
+            return {
+                "success": bool(post_id),
+                "post_id": post_id,
+                "raw_response": publish_data,
+            }
+
+    @staticmethod
+    async def publish_story(
+        ig_user_id: str,
+        page_access_token: str,
+        image_url: Optional[str] = None,
+        page_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Publish a story to Instagram.
+
+        Steps:
+          1. Re-host image to Facebook CDN.
+          2. POST /{ig_user_id}/media with media_type=STORIES.
+          3. Poll until FINISHED.
+          4. POST /{ig_user_id}/media_publish.
+        """
+        import asyncio as _asyncio
+
+        if not image_url:
+            return {"success": False, "error": "Instagram Stories require an image."}
+
+        # Re-host to Facebook CDN
+        jpeg_bytes = await InstagramDirectService._download_as_jpeg(image_url)
+        if not jpeg_bytes:
+            return {"success": False, "error": "Could not download/convert story image."}
+        if page_id:
+            cdn_url = await InstagramDirectService._upload_to_facebook_cdn(
+                page_id, page_access_token, jpeg_bytes
+            )
+        else:
+            cdn_url = image_url
+        if not cdn_url:
+            return {"success": False, "error": "Could not host story image for Instagram publishing."}
+
+        async with httpx.AsyncClient(timeout=60) as client:
+            # Create story container
+            container_resp = await client.post(
+                f"{GRAPH_BASE}/{ig_user_id}/media",
+                params={
+                    "image_url": cdn_url,
+                    "media_type": "STORIES",
+                    "access_token": page_access_token,
+                },
+            )
+            container_data = container_resp.json()
+            creation_id = container_data.get("id")
+            if not creation_id:
+                error_msg = (container_data.get("error") or {}).get("message", str(container_data))
+                print(f"❌ Instagram story container failed: {container_data}")
+                return {"success": False, "error": f"Story container error: {error_msg}"}
+
+            # Poll until FINISHED
+            for attempt in range(12):
+                status_resp = await client.get(
+                    f"{GRAPH_BASE}/{creation_id}",
+                    params={"fields": "status_code", "access_token": page_access_token},
+                )
+                status_code = status_resp.json().get("status_code", "")
+                print(f"⏳ Story container {creation_id} status: {status_code} (attempt {attempt + 1})")
+                if status_code == "FINISHED":
+                    break
+                if status_code == "ERROR":
+                    return {"success": False, "error": "Instagram story container processing failed (status=ERROR)."}
+                await _asyncio.sleep(5)
+            else:
+                return {"success": False, "error": "Instagram story container timed out waiting for FINISHED status."}
+
+            # Publish
+            publish_resp = await client.post(
+                f"{GRAPH_BASE}/{ig_user_id}/media_publish",
+                params={
+                    "creation_id": creation_id,
+                    "access_token": page_access_token,
+                },
+            )
+            publish_data = publish_resp.json()
+            post_id = publish_data.get("id")
+            if post_id:
+                print(f"✅ Instagram story publish success: post_id={post_id}")
+            else:
+                print(f"❌ Instagram story publish failed: {publish_data}")
+            return {
+                "success": bool(post_id),
+                "post_id": post_id,
+                "raw_response": publish_data,
+            }
