@@ -285,6 +285,15 @@ class ImageContentService:
                     specs=specs
                 )
 
+            # When a reference image is provided, always append a hard no-crop directive
+            # directly to the prompt so the image model cannot ignore it.
+            if reference_image:
+                image_prompt = (
+                    image_prompt.rstrip()
+                    + " Full body shown completely from head to toe. Entire garment/product fully visible in frame — "
+                    "no cropping of any part of the clothing, subject, or object. Wide enough framing to show everything."
+                )
+
             image_response = await ImageContentService._call_dalle_api(
                 prompt=image_prompt,
                 size=f"{specs['width']}x{specs['height']}",
@@ -643,13 +652,19 @@ class ImageContentService:
                         "• You MAY expand the scene beyond the reference: add a person wearing/holding/using the product, "
                         "add a setting or background, add brand design overlays, add text — but ONLY if the user's prompt requests it.\n"
                         "• Read the 'Original business topic' field carefully — that is the user's explicit instruction for what to do with the image.\n"
+                        "• FRAMING — ABSOLUTELY NO CROPPING: The entire subject must be fully visible in the frame. "
+                        "If the image contains a person, their full body must be shown from head to toe — no cutting off at the waist, knees, or ankles. "
+                        "If the image contains clothing or a garment, the entire garment must be visible — no cropping of hemlines, sleeves, collars, or any part of the outfit. "
+                        "Frame the shot wide enough to show everything completely with comfortable breathing room around the subject. "
+                        "Use phrases like 'full body shot', 'full-length view', 'entire outfit visible from head to toe', 'wide enough frame to show the complete garment' in your FINAL_PROMPT.\n"
                         "• Write the FINAL_PROMPT as a direct edit instruction to the image model. "
                         "Be specific: describe the EXACT product from the reference (its colours, shape, details) and what to add or place around it. "
-                        "Example for a dress: 'A Black woman with a natural afro wearing the exact navy blue wrap dress from the reference image — "
-                        "same fabric pattern, same belt, same silhouette — standing in a sunlit Lagos boutique. The dress is unchanged.' "
-                        "Example for a product: 'The white ceramic coffee mug from the reference image, exact as shown, held in the hands of a young professional "
+                        "Example for a dress: 'Full-length shot — a Black woman with a natural afro wearing the exact navy blue wrap dress from the reference image — "
+                        "same fabric pattern, same belt, same silhouette — full body visible from head to toe, standing in a sunlit Lagos boutique. The dress is unchanged, entire garment shown.' "
+                        "Example for a product: 'The white ceramic coffee mug from the reference image, exact as shown, fully visible, held in the hands of a young professional "
                         "at a modern Lagos office desk. Do not alter the mug.'\n"
-                        "• Never describe the reference as a 'scene to inspire' — treat it as the definitive source of truth for the product."
+                        "• Never describe the reference as a 'scene to inspire' — treat it as the definitive source of truth for the product.\n"
+                        "• Never use tight crops, close-ups, or portrait framing that would cut off any part of the clothing or subject."
                     )
                 if logo_url:
                     vision_note_parts.append(
