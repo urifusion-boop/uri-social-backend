@@ -189,7 +189,16 @@ class ImageContentService:
 
             platform = draft.get("platform", "instagram")
             content = draft.get("content", "")
-            seed_content = draft.get("seed_content") or content
+            seed_content = draft.get("seed_content") or ""
+
+            # Fall back to content_requests if seed_content wasn't stored on the draft
+            if not seed_content:
+                request_id = draft.get("request_id")
+                if request_id:
+                    req = await db["content_requests"].find_one({"id": request_id}, {"seed_content": 1})
+                    seed_content = (req or {}).get("seed_content") or ""
+            if not seed_content:
+                seed_content = content  # last resort
 
             image_result = await ImageContentService._generate_platform_image(
                 platform=platform,

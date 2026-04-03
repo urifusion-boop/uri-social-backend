@@ -444,6 +444,7 @@ Write as if you're sharing hard-won business wisdom with fellow African entrepre
                     'id': draft_data['draft_id'],
                     'platform': platform,
                     'content': draft_data['content'],
+                    'seed_content': seed_content,
                     'hashtags': draft_data.get('hashtags', []),
                     'word_count': len(draft_data['content'].split()),
                     'ai_metadata': draft_data.get('ai_metadata', {}),
