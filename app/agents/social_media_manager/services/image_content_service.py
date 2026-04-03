@@ -575,9 +575,15 @@ class ImageContentService:
                 if feedback else ""
             )
 
+            ref_instruction = (
+                f"USER'S INSTRUCTION FOR THE REFERENCE IMAGE: {seed_content[:400]}\n\n"
+                if reference_image and seed_content else ""
+            )
+
             user_prompt = (
                 f"PLATFORM: {platform} ({aspect} format)\n"
                 f"PLATFORM GUIDANCE: {platform_note}\n\n"
+                f"{ref_instruction}"
                 f"POST CONTENT TO VISUALIZE:\n{content[:700]}\n\n"
                 f"Original business topic: {seed_content[:300]}\n\n"
                 f"{brand_block}{feedback_block}\n\n"
@@ -629,15 +635,21 @@ class ImageContentService:
                 vision_note_parts = []
                 if reference_image:
                     vision_note_parts.append(
-                        "A user-uploaded REFERENCE IMAGE is attached first. "
-                        "⚠️ CRITICAL: This reference image will be used DIRECTLY as the base image for generation via an image-editing model. "
-                        "The reference image MUST appear exactly as-is — do NOT describe it as a scene to recreate. "
-                        "Your FINAL_PROMPT must ONLY describe what to OVERLAY or ADD on top of the reference image: "
-                        "brand design elements, text overlays, colour grade adjustments, logo placement, graphic borders, "
-                        "or social media post formatting. "
-                        "Write the FINAL_PROMPT as an edit instruction: start with 'Keep the photo exactly as-is. Add...' "
-                        "or 'Preserve the original image. Overlay...'. "
-                        "Never instruct the model to change, replace, or reimagine the subject, people, products, or setting in the photo."
+                        "A user-uploaded REFERENCE IMAGE is attached. "
+                        "⚠️ CRITICAL RULES for the FINAL_PROMPT:\n"
+                        "• This image will be used as the BASE for an image-editing model (gpt-image-1 edit endpoint).\n"
+                        "• The product, garment, object, or item shown in the reference image MUST appear in the output "
+                        "EXACTLY as it is — same design, same colours, same texture, same details. It must not be altered, reimagined, or replaced.\n"
+                        "• You MAY expand the scene beyond the reference: add a person wearing/holding/using the product, "
+                        "add a setting or background, add brand design overlays, add text — but ONLY if the user's prompt requests it.\n"
+                        "• Read the 'Original business topic' field carefully — that is the user's explicit instruction for what to do with the image.\n"
+                        "• Write the FINAL_PROMPT as a direct edit instruction to the image model. "
+                        "Be specific: describe the EXACT product from the reference (its colours, shape, details) and what to add or place around it. "
+                        "Example for a dress: 'A Black woman with a natural afro wearing the exact navy blue wrap dress from the reference image — "
+                        "same fabric pattern, same belt, same silhouette — standing in a sunlit Lagos boutique. The dress is unchanged.' "
+                        "Example for a product: 'The white ceramic coffee mug from the reference image, exact as shown, held in the hands of a young professional "
+                        "at a modern Lagos office desk. Do not alter the mug.'\n"
+                        "• Never describe the reference as a 'scene to inspire' — treat it as the definitive source of truth for the product."
                     )
                 if logo_url:
                     vision_note_parts.append(
