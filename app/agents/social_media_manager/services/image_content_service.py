@@ -245,13 +245,15 @@ class ImageContentService:
         brand_context: Optional[Dict[str, Any]] = None,
         reference_image: Optional[str] = None,
         feedback: Optional[str] = None,
+        image_type: str = "post_image",
     ) -> Dict[str, Any]:
         """
-        Generate an AI image optimized for a specific platform
+        Generate an AI image optimized for a specific platform.
+        image_type: "post_image" (default), "story" (9:16), or any key in IMAGE_SPECS[platform].
         """
         try:
             # Get platform image specifications
-            specs = ImageContentService._get_platform_image_specs(platform)
+            specs = ImageContentService._get_platform_image_specs(platform, image_type=image_type)
 
             # Try GPT-5.4 meta-prompting first — picks image type and generates brief
             image_prompt = await ImageContentService._generate_image_brief(
