@@ -287,7 +287,8 @@ class ImageContentService:
 
             image_response = await ImageContentService._call_dalle_api(
                 prompt=image_prompt,
-                size=f"{specs['width']}x{specs['height']}"
+                size=f"{specs['width']}x{specs['height']}",
+                reference_image=reference_image,
             )
 
             if image_response.get('success'):
@@ -628,13 +629,15 @@ class ImageContentService:
                 vision_note_parts = []
                 if reference_image:
                     vision_note_parts.append(
-                        "A user-uploaded REFERENCE IMAGE is attached first. This is the most important image — "
-                        "study it carefully and extract: the subject(s) and their appearance, the setting/environment, "
-                        "the occasion or event depicted, any products, text, or notable objects present, "
-                        "the mood and lighting, and any cultural or contextual cues. "
-                        "Your generated image brief MUST incorporate the specific details from this reference — "
-                        "the same people, setting, occasion, and visual story should be reflected in the image you brief. "
-                        "This is NOT stock imagery inspiration — treat it as the actual scene to depict or directly reference."
+                        "A user-uploaded REFERENCE IMAGE is attached first. "
+                        "⚠️ CRITICAL: This reference image will be used DIRECTLY as the base image for generation via an image-editing model. "
+                        "The reference image MUST appear exactly as-is — do NOT describe it as a scene to recreate. "
+                        "Your FINAL_PROMPT must ONLY describe what to OVERLAY or ADD on top of the reference image: "
+                        "brand design elements, text overlays, colour grade adjustments, logo placement, graphic borders, "
+                        "or social media post formatting. "
+                        "Write the FINAL_PROMPT as an edit instruction: start with 'Keep the photo exactly as-is. Add...' "
+                        "or 'Preserve the original image. Overlay...'. "
+                        "Never instruct the model to change, replace, or reimagine the subject, people, products, or setting in the photo."
                     )
                 if logo_url:
                     vision_note_parts.append(
@@ -1171,11 +1174,23 @@ class ImageContentService:
         return _b64.b64encode(buf.getvalue()).decode()
 
     @staticmethod
-    async def _call_dalle_api(prompt: str, size: str = "1024x1024") -> Dict[str, Any]:
+    async def _call_dalle_api(
+        prompt: str,
+        size: str = "1024x1024",
+        reference_image: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
         Generate an image using Nano Banana 2 (Google Imagen via Gemini API).
         Falls back to gpt-image-1 if the Gemini key is not configured.
+
+        When reference_image (base64 data URL or public URL) is provided, uses
+        gpt-image-1's edit endpoint so the reference appears exactly as-is and
+        only brand/design overlays are added — bypassing Imagen which would
+        reimagine the scene from scratch.
         """
+        import base64 as _b64
+        import io
+
         try:
             from app.core.config import settings as _cfg
 
@@ -1184,6 +1199,76 @@ class ImageContentService:
                 target_w, target_h = map(int, size.split("x"))
             except (ValueError, AttributeError):
                 target_w, target_h = 1024, 1024
+
+            # ── Image-edit path (reference image provided) ─────────────────────
+            # Skip Imagen (text-to-image only) and use gpt-image-1 edit endpoint,
+            # which takes the reference as a base and applies the prompt as overlays.
+            if reference_image:
+                try:
+                    from app.services.AIService import client as _ai_client
+                    from PIL import Image as _PILImage
+
+                    # Decode reference image to raw PNG bytes (gpt-image-1 edit requires PNG)
+                    if reference_image.startswith("data:"):
+                        import re as _re_ref
+                        _m = _re_ref.match(r"data:[^;]+;base64,(.+)", reference_image, _re_ref.DOTALL)
+                        raw_bytes = _b64.b64decode(_m.group(1)) if _m else None
+                    else:
+                        import httpx as _httpx
+                        async with _httpx.AsyncClient(timeout=20) as _c:
+                            r = await _c.get(reference_image)
+                            raw_bytes = r.content if r.status_code == 200 else None
+
+                    if not raw_bytes:
+                        raise ValueError("Could not load reference image bytes")
+
+                    # Convert to RGBA PNG (required by the edit endpoint)
+                    img = _PILImage.open(io.BytesIO(raw_bytes)).convert("RGBA")
+
+                    # Resize to match requested output dimensions
+                    if target_w > target_h:
+                        edit_size = "1536x1024"
+                    elif target_h > target_w:
+                        edit_size = "1024x1536"
+                    else:
+                        edit_size = "1024x1024"
+                    tw, th = map(int, edit_size.split("x"))
+                    img = img.resize((tw, th), _PILImage.LANCZOS)
+
+                    png_buf = io.BytesIO()
+                    img.save(png_buf, format="PNG")
+                    png_buf.seek(0)
+
+                    loop = asyncio.get_running_loop()
+                    response = await loop.run_in_executor(
+                        None,
+                        lambda: _ai_client.images.edit(
+                            model="gpt-image-1",
+                            image=("reference.png", png_buf, "image/png"),
+                            prompt=prompt,
+                            n=1,
+                            size=edit_size,
+                        )
+                    )
+
+                    b64 = response.data[0].b64_json
+                    b64 = ImageContentService._crop_to_ratio(b64, target_w, target_h)
+
+                    # Convert to WebP
+                    out_img = _PILImage.open(io.BytesIO(_b64.b64decode(b64))).convert("RGB")
+                    webp_buf = io.BytesIO()
+                    out_img.save(webp_buf, format="WEBP", quality=97, method=6)
+                    b64_webp = _b64.b64encode(webp_buf.getvalue()).decode()
+
+                    print(f"🎨 gpt-image-1 edit generated (reference image preserved, {edit_size})")
+                    return {
+                        "success": True,
+                        "url": f"data:image/webp;base64,{b64_webp}",
+                        "model": "gpt-image-1-edit",
+                    }
+                except Exception as _edit_err:
+                    print(f"⚠️ gpt-image-1 edit failed: {_edit_err} — falling back to standard generation")
+                    # Fall through to standard generation below
 
             if _cfg.GOOGLE_GEMINI_API_KEY:
                 # ── Nano Banana 2 via Google GenAI SDK ────────────────────────
