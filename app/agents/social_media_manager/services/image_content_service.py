@@ -432,8 +432,7 @@ class ImageContentService:
 
             # ── Build brand context block for the image prompt ────────────────
             brand_lines = []
-            if brand_name:
-                brand_lines.append(f"Brand: {brand_name}")
+            # brand_name intentionally excluded — do NOT add business name text to images
             if tagline:
                 brand_lines.append(f"Tagline: \"{tagline}\" — let this inform the aspirational feeling of the image.")
             if business_description_raw:
@@ -532,12 +531,14 @@ class ImageContentService:
 
                 "POSTER:\n"
                 "  NONE — Striking visual alone, no text. Most often the right choice.\n"
-                "  BRAND_ONLY — Tiny brand name or tagline only, like a Nike swoosh.\n"
-                "  HEADLINE — Brand name + one 4-6 word bold headline from the post.\n"
-                "  FULL — Headline + subtext + brand name. Only for formal announcements.\n\n"
+                "  BRAND_ONLY — Website URL only in tiny text (e.g. 'urisocial.com'). No brand name written out.\n"
+                "  HEADLINE — One 4-6 word bold headline from the post + website URL in small text. No brand name written out.\n"
+                "  FULL — Headline + subtext + website URL. Only for formal announcements. No brand name written out.\n\n"
 
-                "STAT_CARD: Always show the key number/stat + short label.\n"
-                "PRODUCT_SHOWCASE: Brand name only, optional.\n\n"
+                "STAT_CARD: Always show the key number/stat + short label. Website URL optional in small text.\n"
+                "PRODUCT_SHOWCASE: Website URL only in small text, optional.\n\n"
+                "CRITICAL: NEVER write the business name or brand name as text on the image. "
+                "Logo overlays are handled separately in post-processing — do NOT add any logo or brand name text.\n\n"
 
                 "TEXT SAFE ZONE (critical): ALL text must sit in the middle 80% of the canvas. "
                 "The top 15% and bottom 10% must be completely free of text — "
@@ -568,7 +569,8 @@ class ImageContentService:
                 "time of day, light source and direction, material textures\n"
                 "• For PHOTO: include camera model, lens, aperture, and colour grade\n"
                 "• Brand colors described in words only (NO hex codes) — say 'deep magenta' not '#CD1B78'\n"
-                "• For text-bearing types: specify the EXACT words, font style (bold condensed sans-serif / "
+                "• For text-bearing types: specify the EXACT words (headline text and/or website URL only — "
+                "NEVER the brand name), font style (bold condensed sans-serif / "
                 "display serif), relative size, and placement in the lower half or centre of frame\n"
                 "• Nigerian/West African cultural context always: Lagos or Abuja settings, warm dark-brown "
                 "complexion, natural or protective hairstyles, culturally appropriate styling\n"
