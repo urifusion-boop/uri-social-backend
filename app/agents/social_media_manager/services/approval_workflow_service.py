@@ -277,8 +277,13 @@ class ApprovalWorkflowService:
                 {"id": draft_id},
                 {"$set": update_data}
             )
-            
-            return UriResponse.get_single_data_response("content_refinement", {
+
+            # Return the full updated draft so the frontend can update its local state
+            updated_draft = await db["content_drafts"].find_one({"id": draft_id})
+            if updated_draft:
+                updated_draft.pop("_id", None)
+
+            return UriResponse.get_single_data_response("content_refinement", updated_draft or {
                 "draft_id": draft_id,
                 "changes_made": changes,
                 "edit_count": current_edit_count + 1,
