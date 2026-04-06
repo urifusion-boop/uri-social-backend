@@ -34,6 +34,7 @@ class ImageContentService:
         },
         "facebook": {
             "post_image": {"width": 1200, "height": 630, "format": "landscape"},
+            "post_portrait": {"width": 1080, "height": 1350, "format": "portrait"},
             "cover_image": {"width": 820, "height": 312, "format": "banner"},
             "profile_image": {"width": 180, "height": 180, "format": "square"}
         },
@@ -799,7 +800,7 @@ class ImageContentService:
         "instagram": "post_portrait",   # 4:5 — highest organic reach on Instagram
         "linkedin":  "post_image",      # 1.91:1 — LinkedIn standard
         "twitter":   "post_image",      # 16:9 — Twitter/X standard
-        "facebook":  "post_image",      # 1.91:1 — Facebook standard
+        "facebook":  "post_portrait",    # 4:5 — matches Instagram for consistent cross-posting
     }
 
     @staticmethod
