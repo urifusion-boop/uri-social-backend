@@ -42,15 +42,18 @@ def http_exception_handler(request, exc):
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 
 
-app.include_router(auth_router)
-
 app.include_router(
     social_media_router,
     prefix="/social-media",
     tags=["Social Media Manager"],
 )
 
-app.include_router(whatsapp_router)
+# Include auth under /social-media prefix for frontend compatibility
+app.include_router(
+    auth_router,
+    prefix="/social-media",
+    tags=["Auth"],
+)
 
 
 @app.get("/")

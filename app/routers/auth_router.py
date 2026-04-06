@@ -41,9 +41,18 @@ async def signup(body: SignupRequest, db: AsyncIOMotorDatabase = Depends(get_db_
         raise HTTPException(status_code=409, detail="A user with this email already exists.")
 
     hashed = pwd_context.hash(body.password)
-    user_id = str(uuid.uuid4())
-    referral_code = uuid.uuid4().hex[:8].upper()
+
+    # Generate userId from ObjectId
+    from bson import ObjectId
+    import secrets
+    user_object_id = ObjectId()
+    user_id = str(user_object_id)
+
+    # Generate unique referral code
+    referral_code = secrets.token_urlsafe(8)
+
     result = await db["users"].insert_one({
+        "_id": user_object_id,
         "userId": user_id,
         "email": body.email,
         "password": hashed,
@@ -51,7 +60,6 @@ async def signup(body: SignupRequest, db: AsyncIOMotorDatabase = Depends(get_db_
         "last_name": body.last_name,
         "referralCode": referral_code,
     })
-
     token = sign_jwt(user_id, body.email, body.first_name, body.last_name)
 
     return {
