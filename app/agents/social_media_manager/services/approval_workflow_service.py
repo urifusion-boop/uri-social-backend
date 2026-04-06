@@ -858,6 +858,14 @@ class ApprovalWorkflowService:
 
         # ── Instagram direct (via Facebook Page Access Token) ────────────────
         if platform == "instagram" and connection.get("connected_via") == "instagram_direct":
+            # Instagram Graph API does not support native scheduling for standard feed posts.
+            # When scheduled_datetime is set the draft is already stored with status="scheduled"
+            # and the cron job (publish_scheduled_content) will call this again at the right
+            # time with scheduled_datetime=None to do the actual publish.
+            if scheduled_datetime:
+                print(f"⏰ Instagram direct — deferred to cron scheduler for {scheduled_datetime.isoformat()}")
+                return {"success": True, "scheduled": True, "post_id": None}
+
             from app.agents.social_media_manager.services.instagram_direct_service import InstagramDirectService
             ig_user_id = connection.get("ig_user_id")
             page_token = connection.get("page_access_token")
