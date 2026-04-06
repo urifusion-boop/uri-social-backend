@@ -3,7 +3,7 @@ name: Build and Deploy Dockerized Python FastAPI App to Azure VM (PROD)
 on:
   push:
     branches:
-      - master
+      - main
   workflow_dispatch:
 
 jobs:
@@ -57,9 +57,9 @@ jobs:
       - name: Copy source files to VM
         uses: appleboy/scp-action@v0.1.7
         with:
-          host: ${{ secrets.VM_IP }}
-          username: uriprod
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          host: ${{ secrets.VM_IP_DEV }}
+          username: uridev
+          key: ${{ secrets.SSH_PRIVATE_KEY_DEV }}
           source: "./app/,./docker-compose.prod.yml,./.env.example,./Dockerfile,./requirements.txt"
           target: "~/uri-social-backend/"
           strip_components: 0
@@ -69,9 +69,9 @@ jobs:
       - name: SSH into VM and Deploy
         uses: appleboy/ssh-action@v0.1.6
         with:
-          host: ${{ secrets.VM_IP }}
-          username: uriprod
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          host: ${{ secrets.VM_IP_DEV }}
+          username: uridev
+          key: ${{ secrets.SSH_PRIVATE_KEY_DEV }}
           port: 22
           timeout: 120s
           command_timeout: 15m
@@ -82,12 +82,15 @@ jobs:
             cd ~/uri-social-backend
             echo '${{ secrets.DOCKER_PASSWORD }}' | docker login -u '${{ secrets.DOCKER_USERNAME }}' --password-stdin
 
-            # Build fresh image from synced source code
-            docker build -t uriteam/urisvc:uriagentprod .
+            # Pull latest image
+            docker pull uriteam/urisvc:uriagentprod
 
-            # Deploy container
+            # Deploy container (will restart uri-agent.api.prod)
             docker-compose -f docker-compose.prod.yml down
             docker-compose -f docker-compose.prod.yml up -d
 
             # Cleanup redundant images
             docker image prune -f
+
+            # Verify container is running
+            docker ps | grep uri-agent.api.prod
