@@ -198,6 +198,7 @@ class CarouselGenerationService:
                 "status": "draft",
                 "approval_status": "pending",
                 "has_image": False,
+                "image_retry_count": 0,  # PRD 4.3: Track image retry count
                 "created_at": datetime.utcnow(),
                 "updated_at": datetime.utcnow(),
             }
