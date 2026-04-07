@@ -8,6 +8,7 @@ GET  /whatsapp/status        — Check if the authed user has WhatsApp linked (J
 POST /whatsapp/daily-push    — Trigger daily content push to all linked users (internal)
 """
 
+import pymongo.errors
 from fastapi import APIRouter, Depends, HTTPException, Request, BackgroundTasks
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from pydantic import BaseModel
@@ -20,6 +21,7 @@ from app.agents.social_media_manager.services.whatsapp_session_service import (
 )
 from app.agents.social_media_manager.services.whatsapp_flow_service import (
     WhatsAppFlowService,
+    _send,
 )
 
 router = APIRouter(prefix="/whatsapp", tags=["WhatsApp"])
@@ -59,8 +61,10 @@ async def whatsapp_webhook(
 
         validator = RequestValidator(settings.TWILIO_AUTH_TOKEN)
         twilio_sig = request.headers.get("X-Twilio-Signature", "")
-        # Build the full URL Twilio signed (must match exactly)
-        url = str(request.url)
+        # Build the full URL Twilio signed (must match exactly).
+        # Use PUBLIC_API_URL so the scheme is always https even behind a proxy.
+        _base = str(settings.PUBLIC_API_URL).rstrip("/")
+        url = f"{_base}/whatsapp/webhook"
         body_bytes = await request.body()
         # Parse form params into a plain dict for validation
         import urllib.parse
@@ -69,10 +73,6 @@ async def whatsapp_webhook(
         if not validator.validate(url, params, twilio_sig):
             raise HTTPException(status_code=403, detail="Invalid Twilio signature.")
 
-        # Re-parse form from already-read body
-        from starlette.datastructures import FormData, Headers
-        from starlette.formparsers import FormParser
-        import io
         raw_from: str = params.get("From", "")
         body: str = params.get("Body", "")
     else:
@@ -108,14 +108,47 @@ async def connect_whatsapp(
     user_id = _extract_user_id(token)
 
     # Ensure the phone isn't already linked to another account
-    existing = await WhatsAppSessionService.get_user_by_phone(body.phone, db)
-    if existing and existing.get("userId") != user_id:
-        raise HTTPException(
-            status_code=409,
-            detail="This phone number is already linked to a different account.",
-        )
+    try:
+        existing = await WhatsAppSessionService.get_user_by_phone(body.phone, db)
+        if existing and existing.get("userId") != user_id:
+            raise HTTPException(
+                status_code=409,
+                detail="This phone number is already linked to a different account.",
+            )
+    except pymongo.errors.NetworkTimeout:
+        pass  # Can't check duplicate — proceed optimistically
 
-    await WhatsAppSessionService.link_phone_to_user(user_id, body.phone, db)
+    try:
+        await WhatsAppSessionService.link_phone_to_user(user_id, body.phone, db)
+    except pymongo.errors.NetworkTimeout:
+        # Verify whether the write actually landed.
+        # Compare against the normalized phone (same transformation link_phone_to_user applies).
+        from app.agents.social_media_manager.services.whatsapp_session_service import (
+            WhatsAppSessionService as _WSS,
+        )
+        normalized = _WSS._normalize_phone(body.phone)
+        try:
+            check = await db["users"].find_one(
+                {"userId": user_id}, {"whatsapp_phone": 1}
+            )
+            if not check or check.get("whatsapp_phone") != normalized:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Database is slow — your number may not have been saved. Please try again.",
+                )
+        except pymongo.errors.NetworkTimeout:
+            raise HTTPException(
+                status_code=503,
+                detail="Database is unavailable. Please try again in a moment.",
+            )
+
+    try:
+        _send(
+            body.phone,
+            "Hi👋 Your WhatsApp is now connected to Uri Social! Message me anytime to create content.",
+        )
+    except Exception:
+        pass  # Don't fail the connect if the greeting message errors
 
     return {
         "status": True,
@@ -133,12 +166,27 @@ async def disconnect_whatsapp(
     """Removes the WhatsApp link for the authenticated user."""
     user_id = _extract_user_id(token)
 
-    result = await db["users"].update_one(
-        {"userId": user_id},
-        {"$unset": {"whatsapp_phone": "", "whatsapp_linked_at": ""}},
-    )
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="User not found.")
+    try:
+        result = await db["users"].update_one(
+            {"userId": user_id},
+            {"$unset": {"whatsapp_phone": "", "whatsapp_linked_at": ""}},
+        )
+        if result.matched_count == 0:
+            raise HTTPException(status_code=404, detail="User not found.")
+    except pymongo.errors.NetworkTimeout:
+        # Verify whether the unset actually landed
+        try:
+            check = await db["users"].find_one({"userId": user_id}, {"whatsapp_phone": 1})
+            if check and check.get("whatsapp_phone"):
+                raise HTTPException(
+                    status_code=503,
+                    detail="Database is slow — your number may still be linked. Please try again.",
+                )
+        except pymongo.errors.NetworkTimeout:
+            raise HTTPException(
+                status_code=503,
+                detail="Database is unavailable. Please try again in a moment.",
+            )
 
     return {
         "status": True,
@@ -157,10 +205,17 @@ async def whatsapp_status(
 ):
     """Returns whether the authenticated user has WhatsApp linked."""
     user_id = _extract_user_id(token)
-    user = await db["users"].find_one(
-        {"userId": user_id}, {"whatsapp_phone": 1, "whatsapp_linked_at": 1}
-    )
-    if not user:
+    try:
+        user = await db["users"].find_one(
+            {"userId": user_id}, {"whatsapp_phone": 1, "whatsapp_linked_at": 1}
+        )
+    except pymongo.errors.NetworkTimeout:
+        raise HTTPException(
+            status_code=503,
+            detail="Database is unavailable. Please try again in a moment.",
+        )
+
+    if user is None:
         raise HTTPException(status_code=404, detail="User not found.")
 
     linked = bool(user.get("whatsapp_phone"))

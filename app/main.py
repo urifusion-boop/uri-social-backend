@@ -8,7 +8,10 @@ from app.core.config import settings
 from app.core.sentry_config import initialize_sentry
 from app.agents.social_media_manager.routers.complete_social_manager import router as social_media_router
 from app.agents.social_media_manager.routers.whatsapp_router import router as whatsapp_router
+from app.agents.social_media_manager.routers.x_router import router as x_router
+from app.agents.social_media_manager.routers.linkedin_router import router as linkedin_router
 from app.routers.auth_router import router as auth_router
+from app.routers.billing_router import router as billing_router
 
 # Initialize Sentry
 initialize_sentry()
@@ -24,17 +27,32 @@ app = FastAPI(
     license_info={"name": "MIT License"},
 )
 
+
+@app.on_event("startup")
+async def startup_event():
+    """
+    Initialize billing system on startup
+    PRD Section 5: Plan Structure - Seed default subscription tiers
+    """
+    try:
+        from app.services.SubscriptionService import subscription_service
+        await subscription_service.initialize_default_tiers()
+        print("✅ Subscription tiers initialized successfully")
+    except Exception as e:
+        print(f"⚠️  Warning: Failed to initialize subscription tiers: {e}")
+
 # CORS
-# allow_credentials must be False when allow_origins=["*"].
-# The frontend uses Bearer tokens (Authorization header), not cookies,
-# so credentials mode is not needed.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# CORS is now handled at nginx level to avoid duplicate headers
+# Commenting out FastAPI CORS middleware
+# app.add_middleware(
+#     CORSMiddleware,
+#     allow_origins=["*"],
+#     allow_credentials=False,
+#     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+#     allow_headers=["*"],
+#     expose_headers=["*"],
+#     max_age=3600,
+# )
 
 
 @app.exception_handler(HTTPException)
@@ -54,6 +72,21 @@ app.include_router(
     prefix="/social-media",
     tags=["Auth"],
 )
+
+# Also mount auth at /auth for backwards compatibility
+app.include_router(auth_router)
+
+# Include billing router under /social-media prefix (PRD: Credit-Based Pricing System)
+app.include_router(
+    billing_router,
+    prefix="/social-media",
+    tags=["Billing"],
+)
+
+# Include additional social platform routers
+app.include_router(whatsapp_router)
+app.include_router(x_router)
+app.include_router(linkedin_router)
 
 
 @app.get("/")
