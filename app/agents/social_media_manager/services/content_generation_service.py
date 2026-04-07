@@ -444,6 +444,7 @@ Write as if you're sharing hard-won business wisdom with fellow African entrepre
                     'id': draft_data['draft_id'],
                     'platform': platform,
                     'content': draft_data['content'],
+                    'seed_content': seed_content,
                     'hashtags': draft_data.get('hashtags', []),
                     'word_count': len(draft_data['content'].split()),
                     'ai_metadata': draft_data.get('ai_metadata', {}),
@@ -461,6 +462,7 @@ Write as if you're sharing hard-won business wisdom with fellow African entrepre
         if db is not None and drafts:
             try:
                 # Save the request record
+                # PRD Section 9: Campaign Schema - must track retry_count and image_retry_count
                 await db["content_requests"].replace_one(
                     {"id": request_id},
                     {
@@ -470,6 +472,10 @@ Write as if you're sharing hard-won business wisdom with fellow African entrepre
                         "seed_type": seed_type,
                         "platforms": platforms,
                         "status": status,
+                        "retry_count": 0,  # PRD 9: Track full campaign retries
+                        "image_retry_count": 0,  # PRD 9: Track image-only retries
+                        "text_edit_count": 0,  # PRD 9: Track text rewrites (unlimited, no cost)
+                        "credits_used": 1,  # PRD 9: Credits consumed by this campaign
                         "created_at": generated_at,
                         "updated_at": generated_at,
                     },

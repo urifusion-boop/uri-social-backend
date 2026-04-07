@@ -25,6 +25,7 @@ class BrandProfileService:
             "product_description": data.get("product_description", ""),
             "key_products_services": data.get("key_products_services", []),
             "logo_url": data.get("logo_url"),
+            "sample_template_urls": data.get("sample_template_urls", []),
             "brand_colors": data.get("brand_colors", []),
             "personality_quiz": data.get("personality_quiz", {}),
             "derived_voice": data.get("derived_voice", ""),
@@ -57,6 +58,9 @@ class BrandProfileService:
 
         existing = await db[BrandProfileService.COLLECTION].find_one({"user_id": user_id})
         if existing:
+            # Once onboarding_completed is True, never allow it to be reset to False
+            if existing.get("onboarding_completed") and not doc.get("onboarding_completed"):
+                doc["onboarding_completed"] = True
             await db[BrandProfileService.COLLECTION].update_one(
                 {"user_id": user_id}, {"$set": doc}
             )
@@ -124,6 +128,7 @@ class BrandProfileService:
             "business_description": profile.get("product_description", ""),
             "key_products_services": [p for p in (profile.get("key_products_services") or []) if p],
             "logo_url":             profile.get("logo_url"),
+            "sample_template_urls": [u for u in (profile.get("sample_template_urls") or []) if u],
             "brand_colors":         profile.get("brand_colors") or [],
             "brand_voice":          brand_voice,
             "voice_sample":         profile.get("voice_sample", ""),

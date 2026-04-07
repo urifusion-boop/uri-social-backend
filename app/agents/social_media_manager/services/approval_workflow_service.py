@@ -13,6 +13,7 @@ from app.domain.responses.uri_response import UriResponse
 from app.services.FacebookService import FacebookService
 from app.core.config import settings
 from app.agents.social_media_manager.services.outstand_service import OutstandService
+from app.agents.social_media_manager.services.x_direct_service import XDirectService
 
 
 class ApprovalWorkflowService:
@@ -140,12 +141,13 @@ class ApprovalWorkflowService:
                 except Exception as e:
                     errors.append({"draft_id": draft_id, "error": str(e)})
             
-            # If immediate publishing, trigger publishing process
-            if schedule_option == "immediate" and approved_drafts:
+            # Publish immediately or send to Outstand with scheduledAt
+            if schedule_option in ("immediate", "schedule") and approved_drafts:
                 publish_results = await ApprovalWorkflowService._trigger_immediate_publishing(
-                    db, user_id, [d["draft_id"] for d in approved_drafts]
+                    db, user_id, [d["draft_id"] for d in approved_drafts],
+                    scheduled_datetime=scheduled_datetime if schedule_option == "schedule" else None,
                 )
-                
+
                 # Update drafts with publishing results
                 for draft in approved_drafts:
                     draft_result = publish_results.get(draft["draft_id"])
@@ -275,8 +277,13 @@ class ApprovalWorkflowService:
                 {"id": draft_id},
                 {"$set": update_data}
             )
-            
-            return UriResponse.get_single_data_response("content_refinement", {
+
+            # Return the full updated draft so the frontend can update its local state
+            updated_draft = await db["content_drafts"].find_one({"id": draft_id})
+            if updated_draft:
+                updated_draft.pop("_id", None)
+
+            return UriResponse.get_single_data_response("content_refinement", updated_draft or {
                 "draft_id": draft_id,
                 "changes_made": changes,
                 "edit_count": current_edit_count + 1,
@@ -296,35 +303,79 @@ class ApprovalWorkflowService:
     ) -> Dict[str, Any]:
         """
         Regenerate content based on feedback
+
+        PRD Credit Logic:
+        - First retry (retry_count=1): FREE (PRD 3.2)
+        - Second retry (retry_count=2): Costs 1 credit (PRD 3.2)
+        - PRD 3.3: System must show "This action will use 1 credit. Continue?" before second retry
         """
         try:
             from .content_generation_service import ContentGenerationService
-            
+            from app.services.CreditService import credit_service
+
             # Get original draft details
             draft = await db["content_drafts"].find_one({"id": draft_id})
             if not draft:
                 return UriResponse.error_response("Draft not found")
-            
+
             # Get original request
             request = await db["content_requests"].find_one({"id": draft["request_id"]})
             if not request:
                 return UriResponse.error_response("Original request not found")
-            
+
+            # ==================== PRD 3.2: Retry Rules ====================
+            # Track current retry count
+            current_retry_count = request.get("retry_count", 0)
+            new_retry_count = current_retry_count + 1
+
+            # PRD 3.2: First retry FREE, Second retry = 1 credit
+            if new_retry_count >= 2:
+                # Check if user has sufficient credits
+                has_credits = await credit_service.check_sufficient_credits(user_id)
+                if not has_credits:
+                    return UriResponse.error_response(
+                        "Insufficient credits for retry. This action requires 1 credit.",
+                        response_code=402
+                    )
+
             # Generate new content with feedback
             enhanced_seed = request["seed_content"]
             if regeneration_feedback:
                 enhanced_seed += f"\n\nUser feedback: {regeneration_feedback}"
-            
+
             result = await ContentGenerationService._generate_platform_content(
                 platform=draft["platform"],
                 seed_content=enhanced_seed,
                 request_id=draft["request_id"],
                 user_id=user_id
             )
-            
+
             if result.get('status'):
                 new_draft_data = result['responseData']
-                
+
+                # ==================== PRD 7.2: Credit Deduction ====================
+                # Deduct credit if this is second+ retry
+                if new_retry_count >= 2:
+                    await credit_service.deduct_credit(
+                        user_id=user_id,
+                        campaign_id=draft["request_id"],
+                        reason="retry",
+                        retry_count=new_retry_count
+                    )
+                    print(f"✅ Deducted 1 credit for retry #{new_retry_count} - user {user_id}")
+
+                # Update request retry count (PRD 9: Campaign Tracking)
+                await db["content_requests"].update_one(
+                    {"id": draft["request_id"]},
+                    {
+                        "$set": {
+                            "retry_count": new_retry_count,
+                            "updated_at": datetime.utcnow()
+                        },
+                        "$inc": {"credits_used": 1 if new_retry_count >= 2 else 0}
+                    }
+                )
+
                 # Create new draft with regenerated content
                 new_draft_id = str(ObjectId())
                 new_draft = {
@@ -337,13 +388,15 @@ class ApprovalWorkflowService:
                     "status": "regenerated",
                     "regenerated_from": draft_id,
                     "regeneration_feedback": regeneration_feedback,
+                    "retry_number": new_retry_count,  # Track which retry this is
+                    "credit_charged": new_retry_count >= 2,  # Was credit charged?
                     "ai_metadata": new_draft_data.get("ai_metadata"),
                     "created_at": datetime.utcnow(),
                     "updated_at": datetime.utcnow()
                 }
-                
+
                 await db["content_drafts"].insert_one(new_draft)
-                
+
                 # Mark original as replaced
                 await db["content_drafts"].update_one(
                     {"id": draft_id},
@@ -353,18 +406,21 @@ class ApprovalWorkflowService:
                         "updated_at": datetime.utcnow()
                     }}
                 )
-                
+
                 return UriResponse.get_single_data_response("content_regeneration", {
                     "original_draft_id": draft_id,
                     "new_draft_id": new_draft_id,
                     "new_content": new_draft_data["content"],
                     "hashtags": new_draft_data.get("hashtags", []),
                     "regeneration_feedback": regeneration_feedback,
+                    "retry_number": new_retry_count,
+                    "credit_charged": new_retry_count >= 2,
+                    "remaining_free_retries": max(0, 1 - current_retry_count),  # PRD: First retry free
                     "regenerated_at": datetime.utcnow().isoformat()
                 })
             else:
                 return result
-                
+
         except Exception as e:
             return UriResponse.error_response(f"Content regeneration failed: {str(e)}")
     
@@ -414,14 +470,17 @@ class ApprovalWorkflowService:
         This should be run periodically (e.g., every 5 minutes)
         """
         try:
-            # Find content scheduled for now or past
+            # Find content scheduled for now or past, plus publish_failed drafts
+            # that may have been incorrectly failed (Outstand-handled posts).
             current_time = datetime.utcnow()
-            
+
             scheduled_content = await db["content_drafts"].find({
-                "status": "scheduled",
-                "scheduled_date": {"$lte": current_time}
+                "$or": [
+                    {"status": "scheduled", "scheduled_date": {"$lte": current_time}},
+                    {"status": "publish_failed", "platform_post_id": {"$exists": True, "$ne": None}},
+                ]
             }).to_list(length=100)
-            
+
             if not scheduled_content:
                 return {"message": "No scheduled content to publish", "published": 0}
             
@@ -430,6 +489,32 @@ class ApprovalWorkflowService:
             
             for draft in scheduled_content:
                 try:
+                    # If this draft was already submitted to Outstand (has platform_post_id),
+                    # poll Outstand for its published status instead of re-publishing.
+                    existing_post_id = draft.get("platform_post_id")
+                    if existing_post_id:
+                        try:
+                            from app.agents.social_media_manager.services.outstand_service import OutstandService
+                            outstand = OutstandService()
+                            post_data = await outstand.get_post(existing_post_id)
+                            post = post_data.get("post", {})
+                            if post.get("publishedAt") and not post.get("isDraft"):
+                                await db["content_drafts"].update_one(
+                                    {"id": draft["id"]},
+                                    {"$set": {
+                                        "status": "published",
+                                        "published_date": datetime.utcnow(),
+                                        "updated_at": datetime.utcnow(),
+                                    }},
+                                )
+                                published_count += 1
+                                print(f"✅ Outstand-scheduled post confirmed published | draft_id={draft['id']} post_id={existing_post_id}")
+                            else:
+                                print(f"⏳ Outstand post not yet published | draft_id={draft['id']} post_id={existing_post_id}")
+                        except Exception as e:
+                            print(f"⚠️ Could not poll Outstand for draft_id={draft['id']}: {e}")
+                        continue
+
                     # Use user_id stored directly on the draft
                     draft_user_id = draft.get("user_id")
                     if not draft_user_id:
@@ -511,6 +596,7 @@ class ApprovalWorkflowService:
                                 "status": "published",
                                 "published_date": datetime.utcnow(),
                                 "platform_post_id": publish_result.get("post_id"),
+                                "outstand_post_status": publish_result.get("outstand_status", "queued"),
                                 "publish_response": publish_result.get("raw_response"),
                                 "updated_at": datetime.utcnow(),
                             }},
@@ -545,11 +631,12 @@ class ApprovalWorkflowService:
     async def _trigger_immediate_publishing(
         db: AsyncIOMotorDatabase,
         user_id: str,
-        draft_ids: List[str]
+        draft_ids: List[str],
+        scheduled_datetime: Optional[datetime] = None,
     ) -> Dict[str, Any]:
         """
-        Immediately publish approved drafts using the platform's own API.
-        Currently supports: facebook
+        Publish approved drafts via Outstand. Pass scheduled_datetime to schedule
+        via Outstand's native scheduledAt support instead of publishing immediately.
         """
         results = {}
 
@@ -628,7 +715,7 @@ class ApprovalWorkflowService:
                     platform=platform,
                     draft=draft,
                     connection=connection,
-                    scheduled_datetime=None,
+                    scheduled_datetime=scheduled_datetime,
                     db=db,
                 )
                 print(f"📊 Publish result for draft_id={draft_id}: {publish_result}")
@@ -638,18 +725,29 @@ class ApprovalWorkflowService:
                     else {"user_id": user_id, "outstand_account_id": connection.get("outstand_account_id")}
                 )
                 if publish_result.get("success"):
+                    is_scheduled = scheduled_datetime is not None
                     await db["content_drafts"].update_one(
                         {"id": draft_id},
                         {"$set": {
-                            "status": "published",
-                            "published_date": datetime.utcnow(),
+                            "status": "scheduled" if is_scheduled else "published",
+                            "published_date": None if is_scheduled else datetime.utcnow(),
+                            "scheduled_date": scheduled_datetime if is_scheduled else None,
                             "platform_post_id": publish_result.get("post_id"),
+                            "outstand_post_status": publish_result.get("outstand_status", "queued"),
                             "publish_response": publish_result.get("raw_response"),
                             "updated_at": datetime.utcnow(),
                         }},
                     )
                     await db["social_connections"].update_one(conn_filter, {"$inc": {"total_posts_published": 1}})
                 else:
+                    await db["content_drafts"].update_one(
+                        {"id": draft_id},
+                        {"$set": {
+                            "status": "publish_failed",
+                            "error_message": publish_result.get("error"),
+                            "updated_at": datetime.utcnow(),
+                        }},
+                    )
                     await db["social_connections"].update_one(conn_filter, {"$inc": {"total_publish_errors": 1}})
 
                 results[draft_id] = publish_result
@@ -675,13 +773,29 @@ class ApprovalWorkflowService:
             return None
 
         try:
-            match = re.match(r'data:[^;]+;base64,(.+)', data_url, re.DOTALL)
+            match = re.match(r'data:([^;]+);base64,(.+)', data_url, re.DOTALL)
             if not match:
                 print("⚠️ imgBB upload: invalid data URL format")
                 return None
-            b64_data = match.group(1)
+            mime_type = match.group(1)
+            b64_data = match.group(2)
 
-            async with _httpx.AsyncClient(timeout=30) as client:
+            # Convert to JPEG if the image is WebP or any format unsupported by social platforms
+            if mime_type in ("image/webp", "image/gif") or not mime_type.startswith("image/jpeg"):
+                try:
+                    import base64
+                    import io
+                    from PIL import Image
+                    img_bytes = base64.b64decode(b64_data)
+                    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+                    out = io.BytesIO()
+                    img.save(out, format="JPEG", quality=90)
+                    b64_data = base64.b64encode(out.getvalue()).decode()
+                    print(f"🔄 Converted image from {mime_type} to JPEG for social platform compatibility")
+                except Exception as conv_err:
+                    print(f"⚠️ Image conversion to JPEG failed, uploading original: {conv_err}")
+
+            async with _httpx.AsyncClient(timeout=120) as client:
                 resp = await client.post(
                     "https://api.imgbb.com/1/upload",
                     data={"key": api_key, "image": b64_data},
@@ -759,6 +873,94 @@ class ApprovalWorkflowService:
             tags = " ".join(f"#{t.strip('#')}" for t in draft["hashtags"])
             content = f"{content} {tags}"
 
+        # ── X direct (OAuth 1.0a) ─────────────────────────────────────────────
+        if platform in ("x", "twitter") and connection.get("connected_via") == "x_direct":
+            access_token = connection.get("x_oauth_token")
+            access_token_secret = connection.get("x_oauth_token_secret")
+            if not access_token or not access_token_secret:
+                return {"success": False, "error": "X connection is missing OAuth tokens. Please reconnect your account."}
+            credits_depleted = False
+            try:
+                svc = XDirectService()
+                tweets = draft.get("tweets") if draft.get("is_twitter_thread") and draft.get("tweets") else None
+                if tweets and len(tweets) > 1:
+                    results = await svc.post_thread(access_token, access_token_secret, tweets)
+                    tweet_id = (results[0].get("data") or {}).get("id") if results else None
+                else:
+                    result = await svc.post_tweet(access_token, access_token_secret, content)
+                    tweet_id = (result.get("data") or {}).get("id")
+                return {"success": tweet_id is not None, "post_id": tweet_id, "raw_response": result if not tweets else results}
+            except Exception as e:
+                if "402" in str(e) or "CreditsDepleted" in str(e):
+                    print(f"⚠️ X direct credits depleted — attempting Outstand fallback")
+                    credits_depleted = True
+                else:
+                    return {"success": False, "error": f"X direct publish failed: {str(e)}"}
+
+            # Outstand fallback when X API credits are exhausted
+            if credits_depleted and db is not None:
+                user_id = connection.get("user_id")
+                outstand_conn = await db["social_connections"].find_one(
+                    {"user_id": user_id, "platform": {"$in": ["x", "twitter"]}, "connected_via": "outstand", "connection_status": "active"}
+                )
+                if outstand_conn and outstand_conn.get("outstand_account_id"):
+                    print(f"✅ Outstand X connection found — routing via Outstand (account_id={outstand_conn['outstand_account_id']})")
+                    connection = outstand_conn
+                    # fall through to the Outstand block below
+                else:
+                    return {"success": False, "error": "X API credits depleted and no Outstand X account connected as fallback."}
+
+        # ── Instagram direct (via Facebook Page Access Token) ────────────────
+        if platform == "instagram" and connection.get("connected_via") == "instagram_direct":
+            # Instagram Graph API does not support native scheduling for standard feed posts.
+            # When scheduled_datetime is set the draft is already stored with status="scheduled"
+            # and the cron job (publish_scheduled_content) will call this again at the right
+            # time with scheduled_datetime=None to do the actual publish.
+            if scheduled_datetime:
+                print(f"⏰ Instagram direct — deferred to cron scheduler for {scheduled_datetime.isoformat()}")
+                return {"success": True, "scheduled": True, "post_id": None}
+
+            from app.agents.social_media_manager.services.instagram_direct_service import InstagramDirectService
+            ig_user_id = connection.get("ig_user_id")
+            page_token = connection.get("page_access_token")
+            page_id = connection.get("page_id")
+            if not ig_user_id or not page_token:
+                return {"success": False, "error": "Instagram direct connection is missing credentials. Please reconnect Facebook."}
+
+            post_type = draft.get("post_type", "feed")
+
+            if post_type == "carousel":
+                slides = draft.get("slides", [])
+                return await InstagramDirectService.publish_carousel(
+                    ig_user_id=ig_user_id,
+                    page_access_token=page_token,
+                    caption=content,
+                    slides=slides,
+                    page_id=page_id,
+                )
+            elif post_type == "story":
+                image_url = draft.get("image_url") or ""
+                if image_url and image_url.startswith("data:"):
+                    image_url = await ApprovalWorkflowService._upload_base64_to_imgbb(image_url) or ""
+                return await InstagramDirectService.publish_story(
+                    ig_user_id=ig_user_id,
+                    page_access_token=page_token,
+                    image_url=image_url or None,
+                    page_id=page_id,
+                )
+            else:
+                image_url = draft.get("image_url") or ""
+                if image_url and image_url.startswith("data:"):
+                    image_url = await ApprovalWorkflowService._upload_base64_to_imgbb(image_url) or ""
+                return await InstagramDirectService.publish_post(
+                    ig_user_id=ig_user_id,
+                    page_access_token=page_token,
+                    content=content,
+                    image_url=image_url or None,
+                    scheduled_at=scheduled_datetime.strftime("%Y-%m-%dT%H:%M:%SZ") if scheduled_datetime else None,
+                    page_id=page_id,
+                )
+
         # ── Outstand-connected accounts ───────────────────────────────────────
         if connection.get("connected_via") == "outstand":
             try:
@@ -783,7 +985,35 @@ class ApprovalWorkflowService:
                                 {"$set": {"image_url": public_image_url, "updated_at": datetime.utcnow()}},
                             )
                     else:
-                        media_urls = [image_url]
+                        # Re-upload WebP images since Facebook/Instagram don't support WebP
+                        if image_url.lower().endswith(".webp"):
+                            print(f"🔄 Cached image is WebP — re-uploading as JPEG for social platform compatibility")
+                            try:
+                                import base64
+                                import io
+                                import httpx as _httpx
+                                from PIL import Image
+                                async with _httpx.AsyncClient(timeout=30) as _client:
+                                    img_resp = await _client.get(image_url)
+                                img = Image.open(io.BytesIO(img_resp.content)).convert("RGB")
+                                out = io.BytesIO()
+                                img.save(out, format="JPEG", quality=90)
+                                b64_jpeg = base64.b64encode(out.getvalue()).decode()
+                                fake_data_url = f"data:image/jpeg;base64,{b64_jpeg}"
+                                converted_url = await ApprovalWorkflowService._upload_base64_to_imgbb(fake_data_url)
+                                if converted_url:
+                                    media_urls = [converted_url]
+                                    await db["content_drafts"].update_one(
+                                        {"id": draft["id"]},
+                                        {"$set": {"image_url": converted_url, "updated_at": datetime.utcnow()}},
+                                    )
+                                else:
+                                    media_urls = [image_url]
+                            except Exception as webp_err:
+                                print(f"⚠️ WebP re-upload failed, using original URL: {webp_err}")
+                                media_urls = [image_url]
+                        else:
+                            media_urls = [image_url]
 
                 # Instagram requires at least one image — warn and skip if no media
                 if platform == "instagram" and not media_urls:
@@ -806,16 +1036,29 @@ class ApprovalWorkflowService:
                 )
                 print(f"📬 Outstand publish response: {result}")
 
-                # Outstand returns {"data": {"id": "..."}} or {"success": true, "post": {"id": "..."}}
+                # Outstand returns {"data": {"id": "...", "status": "queued|processing|published|failed"}}
+                # or {"success": true, "post": {"id": "..."}}
                 post_obj = result.get("post") or result.get("data") or {}
                 if isinstance(post_obj, list):
                     post_obj = post_obj[0] if post_obj else {}
                 post_id = post_obj.get("id")
-                # Treat a returned post ID as success (Outstand may omit "success" key)
-                success = post_id is not None
+                post_status = post_obj.get("status", "")
+
+                # A returned post ID means Outstand accepted the request.
+                # Statuses "queued" and "processing" mean it will be dispatched
+                # to the social network imminently — treat these as success so the
+                # draft is marked published in our DB.
+                # Only "failed" (or no ID at all) should be treated as a failure.
+                if post_id and post_status == "failed":
+                    print(f"⚠️ Outstand accepted post {post_id} but status=failed: {result}")
+                    success = False
+                else:
+                    success = post_id is not None
                 if not success:
                     print(f"⚠️ Outstand returned no post ID — possible publish failure: {result}")
-                return {"success": success, "post_id": post_id, "raw_response": result}
+                else:
+                    print(f"✅ Outstand post accepted | post_id={post_id} status={post_status or 'unknown'}")
+                return {"success": success, "post_id": post_id, "outstand_status": post_status, "raw_response": result}
             except Exception as e:
                 print(f"❌ Outstand publish exception: {e}")
                 return {"success": False, "error": f"Outstand publish failed: {str(e)}"}
@@ -828,55 +1071,151 @@ class ApprovalWorkflowService:
             if not page_id or not page_token:
                 return {"success": False, "error": "No valid Facebook credentials on this connection. Reconnect your account."}
 
-            post_data: Dict[str, Any] = {
-                "message": content,
-                "published": True,
-            }
+            post_type = draft.get("post_type", "feed")
 
-            image_url = draft.get("image_url")
-            if image_url:
-                if image_url.startswith("data:"):
-                    media_fbid = await ApprovalWorkflowService._upload_base64_image_to_facebook(
-                        page_id=page_id,
-                        page_token=page_token,
-                        data_url=image_url,
-                    )
-                    if media_fbid:
-                        post_data["attached_media"] = [{"media_fbid": media_fbid}]
-                else:
-                    post_data["media"] = [{"url": image_url, "media_type": "IMAGE"}]
+            # ── Facebook carousel: upload each slide image as unpublished photo, then post feed with attached_media ──
+            if post_type == "carousel":
+                slides = draft.get("slides", [])
+                attached_media = []
+                for i, slide in enumerate(slides):
+                    slide_image_url = slide.get("image_url") or ""
+                    if not slide_image_url:
+                        print(f"⚠️ FB carousel slide {i} has no image_url — skipping")
+                        continue
+                    # Upload as unpublished photo to get a media_fbid
+                    try:
+                        import httpx as _httpx
+                        from PIL import Image as _Image
+                        import io as _io
+                        async with _httpx.AsyncClient(timeout=30) as _c:
+                            img_resp = await _c.get(slide_image_url)
+                        _img = _Image.open(_io.BytesIO(img_resp.content)).convert("RGB")
+                        _buf = _io.BytesIO()
+                        _img.save(_buf, format="JPEG", quality=92)
+                        _jpeg_bytes = _buf.getvalue()
+                        async with _httpx.AsyncClient(timeout=60) as _c2:
+                            upload_resp = await _c2.post(
+                                f"https://graph.facebook.com/{settings.FACEBOOK_API_VERSION}/{page_id}/photos",
+                                data={"access_token": page_token, "published": "false"},
+                                files={"source": ("image.jpg", _jpeg_bytes, "image/jpeg")},
+                            )
+                        photo_id = upload_resp.json().get("id")
+                        if photo_id:
+                            attached_media.append({"media_fbid": photo_id})
+                            print(f"✅ FB carousel slide {i} uploaded: photo_id={photo_id}")
+                        else:
+                            print(f"⚠️ FB carousel slide {i} upload failed: {upload_resp.json()}")
+                    except Exception as slide_err:
+                        print(f"⚠️ FB carousel slide {i} upload error: {slide_err}")
 
-            if scheduled_datetime:
+                if not attached_media:
+                    return {"success": False, "error": "No carousel slide images could be uploaded to Facebook."}
+
                 import calendar
-                post_data["published"] = False
-                post_data["scheduled_publish_time"] = int(
-                    calendar.timegm(scheduled_datetime.utctimetuple())
-                )
-
-            if post_data.get("attached_media"):
-                payload: Dict[str, Any] = {
-                    "message": post_data["message"],
-                    "published": post_data["published"],
-                    "attached_media": post_data["attached_media"],
+                carousel_payload: Dict[str, Any] = {
+                    "message": content,
+                    "published": True,
+                    "attached_media": attached_media,
                 }
-                if post_data.get("scheduled_publish_time"):
-                    payload["scheduled_publish_time"] = post_data["scheduled_publish_time"]
+                if scheduled_datetime:
+                    carousel_payload["published"] = False
+                    carousel_payload["scheduled_publish_time"] = int(
+                        calendar.timegm(scheduled_datetime.utctimetuple())
+                    )
                 response = await FacebookService.publish_post(
-                    page_id=page_id, payload=payload, access_token=page_token,
+                    page_id=page_id, payload=carousel_payload, access_token=page_token,
                 )
+                post_id = None
+                success = False
+                if isinstance(response, dict):
+                    resp_data = response.get("responseData") or {}
+                    post_id = resp_data.get("id") or resp_data.get("post_id")
+                    success = response.get("status", False) and post_id is not None
+                return {"success": success, "post_id": post_id, "raw_response": response}
+
+            # ── Facebook story ─────────────────────────────────────────────────
+            elif post_type == "story":
+                story_image_url = draft.get("image_url") or ""
+                if story_image_url.startswith("data:"):
+                    story_image_url = await ApprovalWorkflowService._upload_base64_to_imgbb(story_image_url) or ""
+                if not story_image_url:
+                    return {"success": False, "error": "Facebook stories require an image. Re-generate with 'include_images: true'."}
+                try:
+                    import httpx as _httpx
+                    async with _httpx.AsyncClient(timeout=30) as _c:
+                        story_resp = await _c.post(
+                            f"https://graph.facebook.com/{settings.FACEBOOK_API_VERSION}/{page_id}/photo_stories",
+                            params={"url": story_image_url, "access_token": page_token},
+                        )
+                    story_data = story_resp.json()
+                    post_id = story_data.get("post_id") or story_data.get("id")
+                    if post_id:
+                        print(f"✅ FB story publish success: post_id={post_id}")
+                        return {"success": True, "post_id": post_id, "raw_response": story_data}
+                    else:
+                        error_msg = (story_data.get("error") or {}).get("message", str(story_data))
+                        print(f"❌ FB story publish failed: {story_data}")
+                        return {
+                            "success": False,
+                            "error": f"Facebook stories require additional permissions. Try publishing as a feed post instead. (Detail: {error_msg})",
+                        }
+                except Exception as story_err:
+                    return {
+                        "success": False,
+                        "error": f"Facebook stories require additional permissions. Try publishing as a feed post instead. (Detail: {story_err})",
+                    }
+
+            # ── Facebook feed (existing logic) ─────────────────────────────────
             else:
-                response = await FacebookService.post_on_facebook(
-                    page_id=page_id, post_data=post_data, access_token=page_token,
-                )
+                post_data: Dict[str, Any] = {
+                    "message": content,
+                    "published": True,
+                }
 
-            post_id = None
-            success = False
-            if isinstance(response, dict):
-                resp_data = response.get("responseData") or {}
-                post_id = resp_data.get("id") or resp_data.get("post_id")
-                success = response.get("status", False) and post_id is not None
+                image_url = draft.get("image_url")
+                if image_url:
+                    if image_url.startswith("data:"):
+                        media_fbid = await ApprovalWorkflowService._upload_base64_image_to_facebook(
+                            page_id=page_id,
+                            page_token=page_token,
+                            data_url=image_url,
+                        )
+                        if media_fbid:
+                            post_data["attached_media"] = [{"media_fbid": media_fbid}]
+                    else:
+                        post_data["media"] = [{"url": image_url, "media_type": "IMAGE"}]
 
-            return {"success": success, "post_id": post_id, "raw_response": response}
+                if scheduled_datetime:
+                    import calendar
+                    post_data["published"] = False
+                    post_data["scheduled_publish_time"] = int(
+                        calendar.timegm(scheduled_datetime.utctimetuple())
+                    )
+
+                if post_data.get("attached_media"):
+                    payload: Dict[str, Any] = {
+                        "message": post_data["message"],
+                        "published": post_data["published"],
+                        "attached_media": post_data["attached_media"],
+                    }
+                    if post_data.get("scheduled_publish_time"):
+                        payload["scheduled_publish_time"] = post_data["scheduled_publish_time"]
+                    response = await FacebookService.publish_post(
+                        page_id=page_id, payload=payload, access_token=page_token,
+                    )
+                else:
+                    response = await FacebookService.post_on_facebook(
+                        page_id=page_id, post_data=post_data, access_token=page_token,
+                    )
+
+                post_id = None
+                success = False
+                if isinstance(response, dict):
+                    resp_data = response.get("responseData") or {}
+                    post_id = resp_data.get("id") or resp_data.get("post_id")
+                    success = response.get("status", False) and post_id is not None
+
+                return {"success": success, "post_id": post_id, "raw_response": response}
 
         return {"success": False, "error": f"Platform '{platform}' publishing not implemented yet"}
 

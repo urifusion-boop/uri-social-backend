@@ -34,6 +34,7 @@ class ImageContentService:
         },
         "facebook": {
             "post_image": {"width": 1200, "height": 630, "format": "landscape"},
+            "post_portrait": {"width": 1080, "height": 1350, "format": "portrait"},
             "cover_image": {"width": 820, "height": 312, "format": "banner"},
             "profile_image": {"width": 180, "height": 180, "format": "square"}
         },
@@ -52,7 +53,8 @@ class ImageContentService:
         platforms: List[str],
         include_images: bool = True,
         brand_context: Optional[Dict[str, Any]] = None,
-        db=None
+        db=None,
+        reference_image: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Generate complete social media content with text and images
@@ -91,7 +93,8 @@ class ImageContentService:
                         platform=draft['platform'],
                         content=draft['content'],
                         seed_content=seed_content,
-                        brand_context=brand_context
+                        brand_context=brand_context,
+                        reference_image=reference_image,
                     )
                     
                     if image_result.get('status'):
@@ -108,7 +111,7 @@ class ImageContentService:
                                 from app.core.config import settings as _cfg
                                 _match = _re.match(r"data:[^;]+;base64,(.+)", raw_image_url, _re.DOTALL)
                                 if _match and _cfg.IMGBB_API_KEY:
-                                    async with _httpx.AsyncClient(timeout=30) as _c:
+                                    async with _httpx.AsyncClient(timeout=120) as _c:
                                         _r = await _c.post(
                                             "https://api.imgbb.com/1/upload",
                                             data={"key": _cfg.IMGBB_API_KEY, "image": _match.group(1)},
@@ -162,26 +165,115 @@ class ImageContentService:
             return UriResponse.error_response(f"Content with images generation failed: {str(e)}")
     
     @staticmethod
+    async def regenerate_image_for_draft(
+        draft_id: str,
+        user_id: str,
+        feedback: str,
+        db,
+    ) -> None:
+        """
+        Background task: regenerate a draft's image using user feedback.
+        Clears image_url first (frontend shows shimmer), then generates a new
+        image incorporating the feedback and persists it to the draft.
+        """
+        import re as _re, httpx as _httpx, base64 as _b64
+        from app.core.config import settings as _cfg
+        from datetime import datetime
+
+        try:
+            draft = await db["content_drafts"].find_one(
+                {"$or": [{"id": draft_id}, {"draft_id": draft_id}], "user_id": user_id}
+            )
+            if not draft:
+                print(f"⚠️ regenerate_image: draft {draft_id} not found for user {user_id}")
+                return
+
+            platform = draft.get("platform", "instagram")
+            content = draft.get("content", "")
+            seed_content = draft.get("seed_content") or ""
+
+            # Fall back to content_requests if seed_content wasn't stored on the draft
+            if not seed_content:
+                request_id = draft.get("request_id")
+                if request_id:
+                    req = await db["content_requests"].find_one({"id": request_id}, {"seed_content": 1})
+                    seed_content = (req or {}).get("seed_content") or ""
+            if not seed_content:
+                seed_content = content  # last resort
+
+            image_result = await ImageContentService._generate_platform_image(
+                platform=platform,
+                content=content,
+                seed_content=seed_content,
+                feedback=feedback,
+            )
+
+            if not image_result.get("status"):
+                print(f"❌ regenerate_image: generation failed for {draft_id}: {image_result.get('error')}")
+                return
+
+            raw_url = image_result["responseData"]["image_url"]
+            specs = image_result["responseData"]["specs"]
+
+            # Upload base64 to imgBB for a public URL
+            stored_url = raw_url
+            if raw_url and raw_url.startswith("data:"):
+                try:
+                    _match = _re.match(r"data:[^;]+;base64,(.+)", raw_url, _re.DOTALL)
+                    if _match and _cfg.IMGBB_API_KEY:
+                        async with _httpx.AsyncClient(timeout=120) as _c:
+                            _r = await _c.post(
+                                "https://api.imgbb.com/1/upload",
+                                data={"key": _cfg.IMGBB_API_KEY, "image": _match.group(1)},
+                            )
+                        _rj = _r.json()
+                        if _rj.get("success"):
+                            stored_url = _rj["data"]["url"]
+                            print(f"☁️  Regenerated image uploaded to imgBB: {stored_url}")
+                except Exception as _e:
+                    print(f"⚠️ imgBB upload error during regeneration: {_e}")
+
+            await db["content_drafts"].update_one(
+                {"$or": [{"id": draft_id}, {"draft_id": draft_id}]},
+                {"$set": {
+                    "image_url": stored_url if not stored_url.startswith("data:") else None,
+                    "image_specs": specs,
+                    "has_image": True,
+                    "updated_at": datetime.utcnow(),
+                }},
+            )
+            print(f"✅ regenerate_image: draft {draft_id} image updated")
+
+        except Exception as e:
+            print(f"❌ regenerate_image error for {draft_id}: {e}")
+
+    @staticmethod
     async def _generate_platform_image(
         platform: str,
         content: str,
         seed_content: str,
-        brand_context: Optional[Dict[str, Any]] = None
+        brand_context: Optional[Dict[str, Any]] = None,
+        reference_image: Optional[str] = None,
+        feedback: Optional[str] = None,
+        image_type: str = "post_image",
     ) -> Dict[str, Any]:
         """
-        Generate an AI image optimized for a specific platform
+        Generate an AI image optimized for a specific platform.
+        image_type: "post_image" (default), "story" (9:16), or any key in IMAGE_SPECS[platform].
         """
         try:
             # Get platform image specifications
-            specs = ImageContentService._get_platform_image_specs(platform)
+            specs = ImageContentService._get_platform_image_specs(platform, image_type=image_type)
 
-            # Try GPT-4.1 meta-prompting first — picks image type and generates brief
+            # Try GPT-5.4 meta-prompting first — picks image type and generates brief
             image_prompt = await ImageContentService._generate_image_brief(
                 content=content,
                 seed_content=seed_content,
                 platform=platform,
                 brand_context=brand_context,
-                specs=specs
+                specs=specs,
+                reference_image=reference_image,
+                feedback=feedback,
             )
 
             # Fall back to static prompt if GPT-4.1 fails
@@ -194,9 +286,19 @@ class ImageContentService:
                     specs=specs
                 )
 
+            # When a reference image is provided, always append a hard no-crop directive
+            # directly to the prompt so the image model cannot ignore it.
+            if reference_image:
+                image_prompt = (
+                    image_prompt.rstrip()
+                    + " Full body shown completely from head to toe. Entire garment/product fully visible in frame — "
+                    "no cropping of any part of the clothing, subject, or object. Wide enough framing to show everything."
+                )
+
             image_response = await ImageContentService._call_dalle_api(
                 prompt=image_prompt,
-                size=f"{specs['width']}x{specs['height']}"
+                size=f"{specs['width']}x{specs['height']}",
+                reference_image=reference_image,
             )
 
             if image_response.get('success'):
@@ -233,7 +335,9 @@ class ImageContentService:
         seed_content: str,
         platform: str,
         brand_context: Optional[Dict[str, Any]] = None,
-        specs: Optional[Dict[str, Any]] = None
+        specs: Optional[Dict[str, Any]] = None,
+        reference_image: Optional[str] = None,
+        feedback: Optional[str] = None,
     ) -> Optional[str]:
         """
         Use GPT-4.1 to select the most appropriate image type for the content,
@@ -262,6 +366,7 @@ class ImageContentService:
             voice_sample         = bc.get('voice_sample', '')
             brand_voice          = bc.get('brand_voice', '')
             target_audience      = bc.get('target_audience', '')
+            audience_age_range   = bc.get('audience_age_range', '')
             primary_goal         = bc.get('primary_goal', '')
             region               = bc.get('region', '')
             brand_colors_str     = ', '.join(str(c) for c in (bc.get('brand_colors') or []))
@@ -269,6 +374,20 @@ class ImageContentService:
             cta_styles           = ', '.join(bc.get('cta_styles') or [])
             key_dates            = bc.get('key_dates', '')
             preferred_formats    = ', '.join(bc.get('preferred_formats') or [])
+            website              = bc.get('website', '')
+            guardrails_raw       = bc.get('guardrails') or {}
+            if isinstance(guardrails_raw, dict):
+                _g_parts = []
+                if guardrails_raw.get('avoid_topics'):
+                    _g_parts.append(f"avoid: {guardrails_raw['avoid_topics']}")
+                if guardrails_raw.get('banned_words'):
+                    _g_parts.append(f"banned words: {guardrails_raw['banned_words']}")
+                if guardrails_raw.get('compliance_notes'):
+                    _g_parts.append(guardrails_raw['compliance_notes'])
+                guardrails_str = '; '.join(_g_parts)
+            else:
+                guardrails_str = '; '.join(str(g) for g in list(guardrails_raw)[:6]) if guardrails_raw else ''
+            sample_template_urls = [u for u in (bc.get('sample_template_urls') or []) if u and isinstance(u, str)][:3]
 
             # Content pillars → use as content themes for image brief
             pillars = bc.get('content_pillars') or []
@@ -314,8 +433,7 @@ class ImageContentService:
 
             # ── Build brand context block for the image prompt ────────────────
             brand_lines = []
-            if brand_name:
-                brand_lines.append(f"Brand: {brand_name}")
+            # brand_name intentionally excluded — do NOT add business name text to images
             if tagline:
                 brand_lines.append(f"Tagline: \"{tagline}\" — let this inform the aspirational feeling of the image.")
             if business_description_raw:
@@ -335,6 +453,10 @@ class ImageContentService:
             if target_audience:
                 brand_lines.append(
                     f"Target audience: {target_audience} — any people shown should match this demographic."
+                )
+            if audience_age_range:
+                brand_lines.append(
+                    f"Audience age range: {audience_age_range} — people and settings in the image should feel relatable to this age group."
                 )
             if primary_goal:
                 brand_lines.append(
@@ -364,161 +486,220 @@ class ImageContentService:
                 brand_lines.append(
                     f"Call-to-action styles used by this brand: {cta_styles} — the image composition should naturally lead the eye toward action."
                 )
+            if website:
+                brand_lines.append(
+                    f"Website: {website} — for HEADLINE or FULL text level images, include this in small text as a URL/CTA element."
+                )
+            if guardrails_str:
+                brand_lines.append(
+                    f"Brand guardrails (must follow): {guardrails_str} — these are hard constraints the brand has set. Respect them in the image."
+                )
             brand_block = (
                 "\n\nBRAND CONTEXT:\n" + "\n".join(brand_lines)
                 if brand_lines else ""
             )
 
             system_prompt = (
-                "You are a senior creative director at a top African brand agency. "
-                "You write structured image generation prompts fed directly into "
-                "Nano Banana 2 (Google Imagen 4), a state-of-the-art AI image model.\n\n"
+                "You are a world-class creative director and AI image prompt engineer at a top African brand agency. "
+                "Your job is to commission visually stunning, commercially ready images for social media — "
+                "the kind that appear in real campaigns by Flutterwave, Paystack, Moniepoint, and MTN. "
+                "You brief Nano Banana 2 (Google Imagen 4 Ultra), a state-of-the-art photorealistic image model.\n\n"
 
-                "Every prompt must produce a commercially ready, industry-standard image — "
-                "the kind used in real brand campaigns by companies like Flutterwave, Paystack, "
-                "or MTN. Think like a professional: what would a real art director commission here?\n\n"
+                "Nano Banana 2 performs best with flowing, scene-rich natural-language prompts — "
+                "NOT structured notes or labeled sections. Your final deliverable is a single master prompt "
+                "that reads like a director's brief to a photographer and art director simultaneously.\n\n"
 
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 "STEP 1 — Pick the best image type:\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
 
                 "  PHOTO              — Premium editorial photograph. Real people, real action.\n"
-                "                       Best for: human stories, behind-the-scenes, community.\n\n"
-                "  POSTER             — Graphic design poster. Brand colors dominant.\n"
-                "                       Text is OPTIONAL — use only when it genuinely adds value.\n"
-                "                       Best for: campaigns, launches, promotions, awareness.\n\n"
-                "  STAT_CARD          — Typographic card. Key number/quote is the hero. Always has text.\n"
-                "                       Best for: milestones, achievements, data.\n\n"
-                "  PRODUCT_SHOWCASE   — Editorial product/service visual. Luxury magazine quality.\n"
-                "                       Best for: product features, service reveals.\n\n"
-                "  INFOGRAPHIC        — Visual layout: process, comparison, steps. Always has labels.\n"
-                "                       Best for: how-it-works, comparisons, step-by-step.\n\n"
-                "  BRAND_ILLUSTRATION — Flat/semi-realistic illustration. Nigerian cultural context.\n"
-                "                       Best for: abstract concepts, values, lifestyle.\n\n"
+                "                       Best for: human stories, culture, community, behind-the-scenes.\n\n"
+                "  POSTER             — Graphic design poster. Bold brand colors, clean layout.\n"
+                "                       Best for: campaigns, launches, announcements, promotions.\n\n"
+                "  STAT_CARD          — Typographic impact card. A single key number or quote is the hero.\n"
+                "                       Best for: milestones, data, achievements.\n\n"
+                "  PRODUCT_SHOWCASE   — Editorial product or service visual. Luxury magazine quality.\n"
+                "                       Best for: product reveals, service spotlights.\n\n"
+                "  BRAND_ILLUSTRATION — Modern flat or semi-realistic illustrated scene.\n"
+                "                       Best for: abstract values, concepts, lifestyle.\n\n"
 
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "STEP 2 — Decide the text approach (POSTER only):\n"
+                "STEP 2 — Decide text approach:\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
 
-                "For POSTER, choose the right text level based on what the content actually needs:\n\n"
+                "PHOTO / BRAND_ILLUSTRATION: NEVER include text overlays — the caption carries the message.\n\n"
 
-                "  TEXT_LEVEL: NONE\n"
-                "    The image is powerful enough alone. The social media caption carries the message.\n"
-                "    Use when: the visual concept is striking, emotional, or abstract.\n"
-                "    The brand logo will be composited separately — no other text in the image.\n\n"
+                "POSTER:\n"
+                "  NONE — Striking visual alone, no text. Most often the right choice.\n"
+                "  BRAND_ONLY — Website URL only in tiny text (e.g. 'urisocial.com'). No brand name written out.\n"
+                "  HEADLINE — One 4-6 word bold headline from the post + website URL in small text. No brand name written out.\n"
+                "  FULL — Headline + subtext + website URL. Only for formal announcements. No brand name written out.\n\n"
 
-                "  TEXT_LEVEL: BRAND_ONLY\n"
-                "    Just the brand name or tagline, small and unobtrusive — like a Nike swoosh.\n"
-                "    Use when: the image speaks for itself but needs brand attribution.\n\n"
+                "STAT_CARD: Always show the key number/stat + short label. Website URL optional in small text.\n"
+                "PRODUCT_SHOWCASE: Website URL only in small text, optional.\n\n"
+                "CRITICAL: NEVER write the business name or brand name as text on the image. "
+                "Logo overlays are handled separately in post-processing — do NOT add any logo or brand name text.\n\n"
 
-                "  TEXT_LEVEL: HEADLINE\n"
-                "    Brand name + one bold 4-6 word headline extracted from the post.\n"
-                "    Use when: there's a specific offer, launch, or call-to-action to announce.\n\n"
-
-                "  TEXT_LEVEL: FULL\n"
-                "    Headline + supporting subtext + brand name. Full typographic layout.\n"
-                "    Use when: the post is a formal announcement, event, or product launch that needs "
-                "all the information visible in the image itself.\n\n"
-
-                "For all other types:\n"
-                "  STAT_CARD, INFOGRAPHIC → always have text (the numbers/labels are the point)\n"
-                "  PHOTO, BRAND_ILLUSTRATION → never have text overlays\n"
-                "  PRODUCT_SHOWCASE → brand name only, optional\n\n"
+                "TEXT SAFE ZONE (critical): ALL text must sit in the middle 80% of the canvas. "
+                "The top 15% and bottom 10% must be completely free of text — "
+                "social platforms and display frames crop these margins. "
+                "Place headlines in the lower-centre or centre of the frame — NEVER at the top edge.\n\n"
 
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "STEP 3 — Write the prompt in this EXACT format:\n"
+                "STEP 3 — Write the reasoning sections (internal):\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
 
-                "COLOR_PALETTE: [Brand hex codes and their exact role. "
-                "e.g. '#CD1B78 magenta as dominant background, white for text, #1A1A2E navy accent']\n\n"
-
-                "BACKGROUND: [Precise environment, backdrop, or graphic setting — "
-                "include texture, depth, lighting mood, and any geometric or architectural details.]\n\n"
-
-                "FOCAL_ELEMENT: [The single most important visual. For people: skin tone, hair, "
-                "clothing, exact action, expression. For graphics: shapes, icons, objects. Be specific.]\n\n"
-
-                "LAYOUT: [Platform + dimensions + composition. "
-                "e.g. 'Landscape 1200×628, subject left-third, negative space right, strong visual hierarchy'.]\n\n"
-
-                "TYPOGRAPHY: [Your text decision. Write one of:\n"
-                "  • 'No text overlays.' — for NONE level or PHOTO/BRAND_ILLUSTRATION\n"
-                "  • 'Brand name only: [exact text], small, [placement], [color].' — for BRAND_ONLY\n"
-                "  • Specific typographic layout — for HEADLINE or FULL level, including exact words, "
-                "font style (bold sans-serif / display / condensed), size hierarchy, placement, color.]\n\n"
-
-                "QUALITY: [Editorial standard, specific to this image. Always end with: "
-                "'No watermarks, no logos, not stock-photo stiffness.']\n\n"
-
-                "CONSTRAINTS: [What NOT to do, specific to this content and type.]\n\n"
-
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "UNIVERSAL RULES:\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "• Brand colors in COLOR_PALETTE always — with exact hex codes from the brand data\n"
-                "• Nigerian/West African context — Lagos/Abuja settings, dark skin tones, "
-                "natural and protective hairstyles, culturally appropriate attire\n"
-                "• Fill every section with brand-specific detail — never leave anything generic\n"
-                "• The image must illustrate the post content, not just the brand\n\n"
-
-                "PHOTO RULES:\n"
-                "• Subject mid-action, never posed\n"
-                "• Specify camera + lens + aperture (Sony A7R V, 85mm f/1.4 at f/2.0)\n"
-                "• Name the light source (north window, late-afternoon ambient, soft box)\n"
-                "• Skin: natural texture, visible pores, slight forehead sheen\n"
-                "• Colour grade: lifted shadows, natural white balance, no heavy LUT\n"
-                "• Never: cinematic, dramatic, HDR, 8K, stunning, render\n\n"
-
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "OUTPUT (strict — these labeled lines only, no other text):\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "TYPE: [type]\n"
+                "TYPE: [chosen type]\n"
                 "TEXT_LEVEL: [NONE | BRAND_ONLY | HEADLINE | FULL | N/A]\n"
-                "COLOR_PALETTE: ...\n"
-                "BACKGROUND: ...\n"
-                "FOCAL_ELEMENT: ...\n"
-                "LAYOUT: ...\n"
-                "TYPOGRAPHY: ...\n"
-                "QUALITY: ...\n"
-                "CONSTRAINTS: ..."
+                "PALETTE_NOTES: [Describe brand colors in words only — NO hex codes. "
+                "e.g. 'deep magenta, ivory white, muted gold'. Explain where each appears.]\n"
+                "SCENE_NOTES: [Describe the setting, subject, action, and composition in detail.]\n"
+                "QUALITY_NOTES: [Camera, light, mood, finish standard for this image type.]\n\n"
+
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "STEP 4 — Write the FINAL_PROMPT (the only part sent to the image model):\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+                "FINAL_PROMPT: [A single flowing paragraph of 200-260 words that Imagen 4 Ultra will "
+                "render directly. Rules:\n"
+                "• Open with the image type and format (e.g. 'Premium editorial photograph,' or 'Bold graphic design poster,')\n"
+                "• Describe the subject with cinematic specificity: person's age range, skin tone, hair, exact clothing, "
+                "expression, and precise action — never generic, always specific\n"
+                "• Describe the setting with architectural and environmental detail — specific city district, "
+                "time of day, light source and direction, material textures\n"
+                "• For PHOTO: include camera model, lens, aperture, and colour grade\n"
+                "• Brand colors described in words only (NO hex codes) — say 'deep magenta' not '#CD1B78'\n"
+                "• For text-bearing types: specify the EXACT words (headline text and/or website URL only — "
+                "NEVER the brand name), font style (bold condensed sans-serif / "
+                "display serif), relative size, and placement in the lower half or centre of frame\n"
+                "• Nigerian/West African cultural context always: Lagos or Abuja settings, warm dark-brown "
+                "complexion, natural or protective hairstyles, culturally appropriate styling\n"
+                "• End with quality standard: 'No watermarks, no logos, no stock-photo stiffness, "
+                "no CGI render. Publishable in [relevant premium publication].'\n"
+                "• No labels, no sections, no parenthetical notes — pure flowing prose only]"
+            )
+
+            feedback_block = (
+                f"\n\n⚠️ USER FEEDBACK ON PREVIOUS IMAGE — YOU MUST INCORPORATE THIS:\n{feedback.strip()}\n"
+                "This feedback overrides your default choices. Adjust the image type, scene, style, "
+                "and composition to directly address these notes."
+                if feedback else ""
+            )
+
+            ref_instruction = (
+                f"USER'S INSTRUCTION FOR THE REFERENCE IMAGE: {seed_content[:400]}\n\n"
+                if reference_image and seed_content else ""
             )
 
             user_prompt = (
                 f"PLATFORM: {platform} ({aspect} format)\n"
                 f"PLATFORM GUIDANCE: {platform_note}\n\n"
+                f"{ref_instruction}"
                 f"POST CONTENT TO VISUALIZE:\n{content[:700]}\n\n"
                 f"Original business topic: {seed_content[:300]}\n\n"
-                f"{brand_block}\n\n"
+                f"{brand_block}{feedback_block}\n\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 "YOUR TASK:\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "1. Choose the image type that will make this post most compelling on this platform.\n"
-                "2. If POSTER — decide the right TEXT_LEVEL honestly. Ask yourself: does this post "
-                "benefit from text in the image, or is a strong visual with the caption enough? "
-                "A striking visual with TEXT_LEVEL: NONE is often more powerful than a cluttered poster. "
-                "Only use HEADLINE or FULL when there is a specific offer, launch, or CTA to announce.\n"
-                "3. Use EVERY piece of brand context to write rich, specific detail in each section. "
-                "If the post topic is short, draw on the business description, products, audience, "
-                "brand voice, and region — never leave a section generic.\n"
+                "1. Choose the image type that will make this post most compelling and scroll-stopping "
+                "on this specific platform.\n"
+                "2. If POSTER — be honest about TEXT_LEVEL. A bold visual with NONE often outperforms "
+                "a cluttered poster with text. Only use HEADLINE or FULL for a specific offer or launch.\n"
+                "3. In PALETTE_NOTES and SCENE_NOTES, use every piece of brand context — never leave "
+                "anything generic. If the post topic is short, pull from business description, products, "
+                "audience, and region to enrich the scene.\n"
                 f"4. Brand colors ({brand_colors_str if brand_colors_str else 'from brand identity'}) "
-                "must appear in COLOR_PALETTE and dominate the image.\n"
-                "5. Output ONLY the labeled sections. No preamble, no explanation."
+                "must appear prominently — described in words only, no hex codes.\n"
+                "5. In FINAL_PROMPT: write a single flowing paragraph of cinematic richness. "
+                "This paragraph is fed DIRECTLY to Imagen 4 Ultra — it must be vivid, specific, "
+                "and commercially ready. Every word counts. Describe things the camera would see, "
+                "not abstract concepts. No labels, no sections — pure prose only."
             )
 
             logo_url = brand_context.get("logo_url") if brand_context else None
 
-            # Build user message — attach logo as a vision image if available so
-            # GPT-4.1 can extract exact brand colors and visual style from it.
-            if logo_url:
-                user_message_content = [
-                    {"type": "text", "text": (
-                        user_prompt +
-                        "\n\nA brand logo image is attached. Analyse its colors, shapes, and visual "
-                        "style and let these directly inform the image prompt you write. "
-                        "Reflect the logo's visual identity in the color palette and overall aesthetic."
-                    )},
-                    {"type": "image_url", "image_url": {"url": logo_url}},
-                ]
+            # Pre-fetch external images as base64 data URLs so OpenAI vision doesn't
+            # need to download from imgBB (which times out frequently).
+            async def _fetch_as_data_url(url: str) -> Optional[str]:
+                if not url:
+                    return None
+                if url.startswith("data:"):
+                    return url  # already inline
+                try:
+                    import httpx as _httpx
+                    import base64 as _b64
+                    import mimetypes as _mt
+                    async with _httpx.AsyncClient(timeout=15) as _c:
+                        r = await _c.get(url)
+                        r.raise_for_status()
+                    content_type = r.headers.get("content-type", "image/jpeg").split(";")[0].strip()
+                    data = _b64.b64encode(r.content).decode()
+                    return f"data:{content_type};base64,{data}"
+                except Exception as _e:
+                    print(f"⚠️  Could not pre-fetch image for vision ({url[:60]}…): {_e}")
+                    return None
+
+            # Build user message — attach logo + sample templates + reference image as vision
+            # so GPT-5.4 can extract brand identity and user-provided contextual details.
+            has_vision = logo_url or sample_template_urls or reference_image
+            if has_vision:
+                vision_note_parts = []
+                if reference_image:
+                    vision_note_parts.append(
+                        "A user-uploaded REFERENCE IMAGE is attached. "
+                        "⚠️ CRITICAL RULES for the FINAL_PROMPT:\n"
+                        "• This image will be used as the BASE for an image-editing model (gpt-image-1 edit endpoint).\n"
+                        "• The product, garment, object, or item shown in the reference image MUST appear in the output "
+                        "EXACTLY as it is — same design, same colours, same texture, same details. It must not be altered, reimagined, or replaced.\n"
+                        "• You MAY expand the scene beyond the reference: add a person wearing/holding/using the product, "
+                        "add a setting or background, add brand design overlays, add text — but ONLY if the user's prompt requests it.\n"
+                        "• Read the 'Original business topic' field carefully — that is the user's explicit instruction for what to do with the image.\n"
+                        "• FRAMING — ABSOLUTELY NO CROPPING: The entire subject must be fully visible in the frame. "
+                        "If the image contains a person, their full body must be shown from head to toe — no cutting off at the waist, knees, or ankles. "
+                        "If the image contains clothing or a garment, the entire garment must be visible — no cropping of hemlines, sleeves, collars, or any part of the outfit. "
+                        "Frame the shot wide enough to show everything completely with comfortable breathing room around the subject. "
+                        "Use phrases like 'full body shot', 'full-length view', 'entire outfit visible from head to toe', 'wide enough frame to show the complete garment' in your FINAL_PROMPT.\n"
+                        "• Write the FINAL_PROMPT as a direct edit instruction to the image model. "
+                        "Be specific: describe the EXACT product from the reference (its colours, shape, details) and what to add or place around it. "
+                        "Example for a dress: 'Full-length shot — a Black woman with a natural afro wearing the exact navy blue wrap dress from the reference image — "
+                        "same fabric pattern, same belt, same silhouette — full body visible from head to toe, standing in a sunlit Lagos boutique. The dress is unchanged, entire garment shown.' "
+                        "Example for a product: 'The white ceramic coffee mug from the reference image, exact as shown, fully visible, held in the hands of a young professional "
+                        "at a modern Lagos office desk. Do not alter the mug.'\n"
+                        "• Never describe the reference as a 'scene to inspire' — treat it as the definitive source of truth for the product.\n"
+                        "• Never use tight crops, close-ups, or portrait framing that would cut off any part of the clothing or subject."
+                    )
+                if logo_url:
+                    vision_note_parts.append(
+                        "A brand logo image is attached. Analyse its colors, shapes, and visual "
+                        "style and let these directly inform the color palette and overall aesthetic."
+                    )
+                if sample_template_urls:
+                    vision_note_parts.append(
+                        f"{len(sample_template_urls)} brand design template(s) are attached. "
+                        "Study their layout, typography style, color application, spacing, and visual hierarchy. "
+                        "Your prompt should produce an image that feels like a natural extension of these templates — "
+                        "same energy, same visual language, same brand identity."
+                    )
+                vision_note = "\n\n" + " ".join(vision_note_parts)
+
+                user_message_content = [{"type": "text", "text": user_prompt + vision_note}]
+                # Reference image goes first so it is the primary focus
+                if reference_image:
+                    ref_data = await _fetch_as_data_url(reference_image)
+                    if ref_data:
+                        user_message_content.append({"type": "image_url", "image_url": {"url": ref_data}})
+                if logo_url:
+                    logo_data = await _fetch_as_data_url(logo_url)
+                    if logo_data:
+                        user_message_content.append({"type": "image_url", "image_url": {"url": logo_data}})
+                for tmpl_url in sample_template_urls:
+                    tmpl_data = await _fetch_as_data_url(tmpl_url)
+                    if tmpl_data:
+                        user_message_content.append({"type": "image_url", "image_url": {"url": tmpl_data}})
+                # If none of the images could be fetched, fall back to plain text
+                if len(user_message_content) == 1:
+                    user_message_content = user_prompt
             else:
                 user_message_content = user_prompt
 
@@ -526,24 +707,89 @@ class ImageContentService:
             response = await loop.run_in_executor(
                 None,
                 lambda: ai_client.chat.completions.create(
-                    model="gpt-4.1",
+                    model="gpt-5.4",
                     messages=[
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_message_content}
                     ],
-                    max_tokens=950,
-                    temperature=0.75
+                    max_completion_tokens=1600,
+                    temperature=0.85
                 )
             )
             brief = response.choices[0].message.content.strip()
-            chosen_type = brief.split('\n')[0].replace('TYPE:', '').strip() if brief.startswith('TYPE:') else 'UNKNOWN'
-            logo_note = " (logo reference used)" if logo_url else ""
+
+            # Strip hex color codes — image models render them as literal text in the image.
+            import re as _re_hex
+            brief_no_hex = _re_hex.sub(r'#[0-9A-Fa-f]{3,6}\b', '', brief)
+            brief_no_hex = _re_hex.sub(r'  +', ' ', brief_no_hex).strip()
+
+            # Extract only the FINAL_PROMPT section to send to the image model.
+            # GPT reasons through the structure but only the flowing prose prompt
+            # gets sent to Imagen — it performs dramatically better this way.
+            final_prompt_match = _re_hex.search(
+                r'FINAL_PROMPT:\s*(.*?)(?:\n\n[A-Z_]+:|$)',
+                brief_no_hex,
+                _re_hex.DOTALL
+            )
+            if final_prompt_match:
+                brief_clean = final_prompt_match.group(1).strip()
+            else:
+                # Fallback: try a more lenient extraction (everything after FINAL_PROMPT:)
+                if 'FINAL_PROMPT:' in brief_no_hex:
+                    brief_clean = brief_no_hex.split('FINAL_PROMPT:', 1)[1].strip()
+                else:
+                    brief_clean = brief_no_hex
+
+            chosen_type = 'UNKNOWN'
+            type_match = _re_hex.search(r'TYPE:\s*(\w+)', brief_no_hex)
+            if type_match:
+                chosen_type = type_match.group(1).strip()
+
+            # Diagnostic: show which brand fields were available for this generation
+            field_status = {
+                "brand_name": bool(brand_name),
+                "tagline": bool(tagline),
+                "business_desc": bool(business_description_raw),
+                "products": bool(key_products_str),
+                "colors": bool(brand_colors_str),
+                "voice": bool(brand_voice),
+                "voice_sample": bool(voice_sample),
+                "audience": bool(target_audience),
+                "age_range": bool(audience_age_range),
+                "goal": bool(primary_goal),
+                "region": bool(region),
+                "pillars": bool(themes_str),
+                "formats": bool(preferred_formats),
+                "cta": bool(cta_styles),
+                "key_dates": bool(key_dates),
+                "website": bool(website),
+                "guardrails": bool(guardrails_str),
+                "logo": bool(logo_url),
+                "templates": len(sample_template_urls),
+            }
+            filled = [k for k, v in field_status.items() if v and k != "templates"]
+            missing = [k for k, v in field_status.items() if not v and k != "templates"]
+            tmpl_count = field_status["templates"]
+
+            vision_refs = []
+            if reference_image:
+                vision_refs.append("user reference image")
+            if logo_url:
+                vision_refs.append("logo")
+            if tmpl_count:
+                vision_refs.append(f"{tmpl_count} template(s)")
+            vision_ref_note = f" | vision refs: {', '.join(vision_refs)}" if vision_refs else ""
+
             print(f"\n{'━'*60}")
-            print(f"🎨 IMAGE BRIEF — {platform.upper()} | type: {chosen_type}{logo_note}")
+            print(f"🎨 IMAGEN PROMPT — {platform.upper()} | type: {chosen_type}{vision_ref_note}")
+            print(f"   ✅ fields used ({len(filled)}): {', '.join(filled)}")
+            if missing:
+                print(f"   ⚠️  fields missing ({len(missing)}): {', '.join(missing)}")
+            print(f"   📝 prompt length: {len(brief_clean)} chars")
             print(f"{'━'*60}")
-            print(brief)
+            print(brief_clean)
             print(f"{'━'*60}\n")
-            return brief
+            return brief_clean
 
         except Exception as e:
             print(f"⚠️ Image brief generation failed, using static prompt: {e}")
@@ -554,7 +800,7 @@ class ImageContentService:
         "instagram": "post_portrait",   # 4:5 — highest organic reach on Instagram
         "linkedin":  "post_image",      # 1.91:1 — LinkedIn standard
         "twitter":   "post_image",      # 16:9 — Twitter/X standard
-        "facebook":  "post_image",      # 1.91:1 — Facebook standard
+        "facebook":  "post_portrait",    # 4:5 — matches Instagram for consistent cross-posting
     }
 
     @staticmethod
@@ -594,9 +840,12 @@ class ImageContentService:
         aspect = specs.get('format', 'landscape') if specs else 'landscape'
 
         # Extract brand fields (static fallback)
+        import re as _re_hex_fb
         bc = brand_context or {}
         colors    = bc.get('brand_colors') or []
         color_list = ', '.join(str(c) for c in colors[:3]) if colors else ''
+        # Strip hex codes — image models render them as literal text
+        color_list = _re_hex_fb.sub(r'#[0-9A-Fa-f]{3,6}\b', '', color_list).strip().strip(',')
         audience   = bc.get('target_audience', '')
         region_fb  = bc.get('region', '')
         products   = bc.get('key_products_services') or []
@@ -845,8 +1094,8 @@ class ImageContentService:
             resp.raise_for_status()
             logo_img = Image.open(io.BytesIO(resp.content)).convert("RGBA")
 
-            # Resize logo to 12% of image width, preserve aspect ratio
-            target_w = max(60, int(bw * 0.12))
+            # Resize logo to 7% of image width, preserve aspect ratio
+            target_w = max(40, int(bw * 0.07))
             lw, lh = logo_img.size
             scale = target_w / lw
             logo_img = logo_img.resize((target_w, int(lh * scale)), Image.LANCZOS)
@@ -888,7 +1137,7 @@ class ImageContentService:
             base_img.paste(logo_img, (logo_x, logo_y), logo_img)
 
             buf = io.BytesIO()
-            base_img.convert("RGB").save(buf, format="WEBP", quality=95)
+            base_img.convert("RGB").save(buf, format="WEBP", quality=97, method=6)
             result_b64 = _b64.b64encode(buf.getvalue()).decode()
             print(f"✅ Logo composited at {position} with badge ({lw}×{lh}px on {bw}×{bh}px image)")
             return result_b64
@@ -951,15 +1200,27 @@ class ImageContentService:
 
         cropped = img.crop(box)
         buf = io.BytesIO()
-        cropped.save(buf, format="WEBP", quality=95)
+        cropped.save(buf, format="WEBP", quality=97, method=6)
         return _b64.b64encode(buf.getvalue()).decode()
 
     @staticmethod
-    async def _call_dalle_api(prompt: str, size: str = "1024x1024") -> Dict[str, Any]:
+    async def _call_dalle_api(
+        prompt: str,
+        size: str = "1024x1024",
+        reference_image: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
         Generate an image using Nano Banana 2 (Google Imagen via Gemini API).
         Falls back to gpt-image-1 if the Gemini key is not configured.
+
+        When reference_image (base64 data URL or public URL) is provided, uses
+        gpt-image-1's edit endpoint so the reference appears exactly as-is and
+        only brand/design overlays are added — bypassing Imagen which would
+        reimagine the scene from scratch.
         """
+        import base64 as _b64
+        import io
+
         try:
             from app.core.config import settings as _cfg
 
@@ -969,91 +1230,161 @@ class ImageContentService:
             except (ValueError, AttributeError):
                 target_w, target_h = 1024, 1024
 
+            # ── Image-edit path (reference image provided) ─────────────────────
+            # Skip Imagen (text-to-image only) and use gpt-image-1 edit endpoint,
+            # which takes the reference as a base and applies the prompt as overlays.
+            if reference_image:
+                try:
+                    from app.services.AIService import client as _ai_client
+                    from PIL import Image as _PILImage
+
+                    # Decode reference image to raw PNG bytes (gpt-image-1 edit requires PNG)
+                    if reference_image.startswith("data:"):
+                        import re as _re_ref
+                        _m = _re_ref.match(r"data:[^;]+;base64,(.+)", reference_image, _re_ref.DOTALL)
+                        raw_bytes = _b64.b64decode(_m.group(1)) if _m else None
+                    else:
+                        import httpx as _httpx
+                        async with _httpx.AsyncClient(timeout=20) as _c:
+                            r = await _c.get(reference_image)
+                            raw_bytes = r.content if r.status_code == 200 else None
+
+                    if not raw_bytes:
+                        raise ValueError("Could not load reference image bytes")
+
+                    # Convert to RGBA PNG (required by the edit endpoint)
+                    img = _PILImage.open(io.BytesIO(raw_bytes)).convert("RGBA")
+
+                    # Resize to match requested output dimensions
+                    if target_w > target_h:
+                        edit_size = "1536x1024"
+                    elif target_h > target_w:
+                        edit_size = "1024x1536"
+                    else:
+                        edit_size = "1024x1024"
+                    tw, th = map(int, edit_size.split("x"))
+                    img = img.resize((tw, th), _PILImage.LANCZOS)
+
+                    png_buf = io.BytesIO()
+                    img.save(png_buf, format="PNG")
+                    png_buf.seek(0)
+
+                    loop = asyncio.get_running_loop()
+                    response = await loop.run_in_executor(
+                        None,
+                        lambda: _ai_client.images.edit(
+                            model="gpt-image-1",
+                            image=("reference.png", png_buf, "image/png"),
+                            prompt=prompt,
+                            n=1,
+                            size=edit_size,
+                        )
+                    )
+
+                    b64 = response.data[0].b64_json
+                    b64 = ImageContentService._crop_to_ratio(b64, target_w, target_h)
+
+                    # Convert to WebP
+                    out_img = _PILImage.open(io.BytesIO(_b64.b64decode(b64))).convert("RGB")
+                    webp_buf = io.BytesIO()
+                    out_img.save(webp_buf, format="WEBP", quality=97, method=6)
+                    b64_webp = _b64.b64encode(webp_buf.getvalue()).decode()
+
+                    print(f"🎨 gpt-image-1 edit generated (reference image preserved, {edit_size})")
+                    return {
+                        "success": True,
+                        "url": f"data:image/webp;base64,{b64_webp}",
+                        "model": "gpt-image-1-edit",
+                    }
+                except Exception as _edit_err:
+                    print(f"⚠️ gpt-image-1 edit failed: {_edit_err} — falling back to standard generation")
+                    # Fall through to standard generation below
+
             if _cfg.GOOGLE_GEMINI_API_KEY:
                 # ── Nano Banana 2 via Google GenAI SDK ────────────────────────
-                from google import genai as _genai
-                from google.genai import types as _gtypes
-                import base64 as _b64
+                try:
+                    from google import genai as _genai
+                    from google.genai import types as _gtypes
+                    import base64 as _b64
 
-                aspect_ratio = ImageContentService._map_to_gemini_aspect(size)
+                    aspect_ratio = ImageContentService._map_to_gemini_aspect(size)
 
-                client_g = _genai.Client(api_key=_cfg.GOOGLE_GEMINI_API_KEY)
+                    client_g = _genai.Client(api_key=_cfg.GOOGLE_GEMINI_API_KEY)
 
-                loop = asyncio.get_running_loop()
-                response = await loop.run_in_executor(
-                    None,
-                    lambda: client_g.models.generate_images(
-                        model="imagen-4.0-ultra-generate-001",
-                        prompt=prompt,
-                        config=_gtypes.GenerateImagesConfig(
-                            number_of_images=1,
-                            aspect_ratio=aspect_ratio,
-                            safety_filter_level="block_low_and_above",
-                            person_generation="allow_adult",
-                        ),
+                    loop = asyncio.get_running_loop()
+                    response = await loop.run_in_executor(
+                        None,
+                        lambda: client_g.models.generate_images(
+                            model="imagen-4.0-ultra-generate-001",
+                            prompt=prompt,
+                            config=_gtypes.GenerateImagesConfig(
+                                number_of_images=1,
+                                aspect_ratio=aspect_ratio,
+                                safety_filter_level="block_low_and_above",
+                                person_generation="allow_adult",
+                            ),
+                        )
                     )
-                )
 
-                generated = response.generated_images[0]
-                b64 = _b64.b64encode(generated.image.image_bytes).decode()
+                    if not response.generated_images:
+                        raise ValueError("Nano Banana 2 returned no images (blocked/filtered)")
 
-                # Crop to exact target ratio
-                b64 = ImageContentService._crop_to_ratio(b64, target_w, target_h)
+                    generated = response.generated_images[0]
+                    b64 = _b64.b64encode(generated.image.image_bytes).decode()
 
-                # Nano Banana 2 returns PNG — convert to WebP for consistency
-                import io
-                from PIL import Image as _PILImage
-                img = _PILImage.open(io.BytesIO(_b64.b64decode(b64)))
-                buf = io.BytesIO()
-                img.convert("RGB").save(buf, format="WEBP", quality=95)
-                b64 = _b64.b64encode(buf.getvalue()).decode()
+                    # Crop to exact target ratio
+                    b64 = ImageContentService._crop_to_ratio(b64, target_w, target_h)
 
-                print(f"🎨 Nano Banana 2 image generated ({aspect_ratio})")
-                data_url = f"data:image/webp;base64,{b64}"
-                return {
-                    "success": True,
-                    "url": data_url,
-                    "model": "nano-banana-2"
-                }
+                    # Nano Banana 2 returns PNG — convert to WebP for consistency
+                    import io
+                    from PIL import Image as _PILImage
+                    img = _PILImage.open(io.BytesIO(_b64.b64decode(b64)))
+                    buf = io.BytesIO()
+                    img.convert("RGB").save(buf, format="WEBP", quality=97, method=6)
+                    b64 = _b64.b64encode(buf.getvalue()).decode()
 
+                    print(f"🎨 Nano Banana 2 image generated ({aspect_ratio})")
+                    data_url = f"data:image/webp;base64,{b64}"
+                    return {
+                        "success": True,
+                        "url": data_url,
+                        "model": "nano-banana-2"
+                    }
+                except Exception as _nb_err:
+                    print(f"⚠️ Nano Banana 2 failed: {_nb_err} — falling back to gpt-image-1")
+
+            # ── Fallback: gpt-image-1 ──────────────────────────────────────
+            from app.services.AIService import client
+
+            if target_w > target_h:
+                image_size = "1536x1024"
+            elif target_h > target_w:
+                image_size = "1024x1536"
             else:
-                # ── Fallback: gpt-image-1 ──────────────────────────────────────
-                from app.services.AIService import client
-                from openai import OpenAI as _OAI
+                image_size = "1024x1024"
 
-                dall_e_sizes = {
-                    "landscape": "1536x1024",
-                    "portrait":  "1024x1536",
-                    "square":    "1024x1024",
-                }
-                if target_w > target_h:
-                    image_size = "1536x1024"
-                elif target_h > target_w:
-                    image_size = "1024x1536"
-                else:
-                    image_size = "1024x1024"
-
-                loop = asyncio.get_running_loop()
-                response = await loop.run_in_executor(
-                    None,
-                    lambda: client.images.generate(
-                        model="gpt-image-1",
-                        prompt=prompt,
-                        n=1,
-                        size=image_size,
-                        quality="high",
-                        output_format="webp",
-                    )
+            loop = asyncio.get_running_loop()
+            response = await loop.run_in_executor(
+                None,
+                lambda: client.images.generate(
+                    model="gpt-image-1.5",
+                    prompt=prompt,
+                    n=1,
+                    size=image_size,
+                    quality="high",
+                    output_format="webp",
                 )
-                import base64 as _b64
-                b64 = response.data[0].b64_json
-                b64 = ImageContentService._crop_to_ratio(b64, target_w, target_h)
-                data_url = f"data:image/webp;base64,{b64}"
-                return {
-                    "success": True,
-                    "url": data_url,
-                    "model": "gpt-image-1"
-                }
+            )
+            import base64 as _b64
+            b64 = response.data[0].b64_json
+            b64 = ImageContentService._crop_to_ratio(b64, target_w, target_h)
+            data_url = f"data:image/webp;base64,{b64}"
+            print(f"🎨 gpt-image-1 image generated ({image_size})")
+            return {
+                "success": True,
+                "url": data_url,
+                "model": "gpt-image-1.5"
+            }
 
         except Exception as e:
             print(f"❌ Image generation failed: {e}")

@@ -386,7 +386,7 @@ class AutoContentService:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-                model="gpt-4o",
+                model="gpt-5.4",
                 temperature=0.6,
             )
             ai_response = await AIService.chat_completion(ai_request)

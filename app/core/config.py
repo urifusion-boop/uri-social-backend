@@ -29,12 +29,33 @@ class Settings(BaseSettings):
 
     # Outstand
     OUTSTAND_API_KEY: Optional[str] = None
+    OUTSTAND_WEBHOOK_SECRET: Optional[str] = None  # For verifying Outstand webhook signatures
+
+    # X (Twitter) OAuth 1.0a — direct posting without Outstand
+    X_API_KEY: Optional[str] = None         # Consumer Key
+    X_API_SECRET: Optional[str] = None      # Consumer Secret
+    X_OAUTH_CALLBACK_URL: Optional[str] = None  # Public backend URL, e.g. https://api.yourdomain.com/x/callback
+
+    # LinkedIn OAuth 2.0 — direct posting
+    LINKEDIN_CLIENT_ID: Optional[str] = None
+    LINKEDIN_CLIENT_SECRET: Optional[str] = None
+    LINKEDIN_OAUTH_CALLBACK_URL: Optional[str] = None  # e.g. https://api.yourdomain.com/linkedin/callback
 
     # imgBB
     IMGBB_API_KEY: Optional[str] = None
 
     # Google Gemini (Nano Banana 2 image generation)
     GOOGLE_GEMINI_API_KEY: Optional[str] = None
+
+    # Google OAuth (Sign in with Google)
+    GOOGLE_CLIENT_ID: Optional[str] = None
+    GOOGLE_CLIENT_SECRET: Optional[str] = None
+
+    # SQUAD Payment Gateway (PRD Section 6.2: Payment Integration)
+    SQUAD_SECRET_KEY: Optional[str] = None
+    SQUAD_PUBLIC_KEY: Optional[str] = None
+    SQUAD_WEBHOOK_SECRET: Optional[str] = None
+    SQUAD_CALLBACK_URL: str = "https://www.urisocial.com/checkout/callback"
 
     # SSL (optional for local dev)
     SSL_KEY_PATH: str = ""
@@ -44,6 +65,10 @@ class Settings(BaseSettings):
     ENV: str = "Development"
     DEV_ENV: str = "Development"
     WEB_APP_URL: str = ""
+
+    # Public-facing API base URL used for OAuth callbacks (must be reachable by browsers)
+    # e.g. https://api-staging.urisocial.com  or  http://localhost:9003
+    PUBLIC_API_URL: str = ""
 
     # Bypass flags for local development
     BYPASS_SUBSCRIPTION_CHECK: bool = False

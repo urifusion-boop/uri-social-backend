@@ -3,7 +3,7 @@
 import asyncio
 import json
 import traceback
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query, Request, UploadFile, File
 from fastapi.responses import RedirectResponse, StreamingResponse
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from pydantic import BaseModel, Field
@@ -21,6 +21,8 @@ from ..services.social_account_service import SocialAccountService
 from ..services.approval_workflow_service import ApprovalWorkflowService
 from ..services.auto_content_service import AutoContentService
 from ..services.brand_profile_service import BrandProfileService
+from ..services.outstand_service import OutstandService
+from ..services import content_calendar_service as cal_svc
 
 router = APIRouter(tags=["Social Media Manager"])
 
@@ -68,9 +70,13 @@ class ContentGenerationRequest(BaseModel):
     seed_type: str = "text"
     include_images: bool = False
     brand_context: Optional[BrandContextRequest] = None
+    reference_image: Optional[str] = None  # base64 data URL uploaded by user for contextual reference
+    post_type: str = "feed"   # feed | carousel | story
+    num_slides: int = 3        # carousel only (2–5)
 
 class SocialConnectionRequest(BaseModel):
     platforms: List[str] = Field(..., min_items=1, max_items=10)
+    source: str = "onboarding"  # "onboarding" | "settings"
 
 class FinalizeConnectionRequest(BaseModel):
     session_token: str
@@ -189,12 +195,37 @@ async def generate_content(
     Text content is always returned immediately.
     When include_images=True, images are generated in the background and
     saved to the draft — the frontend can pick them up via GET /content-calendar.
+
+    PRD Credit System:
+    - Deducts 1 credit per campaign generation
+    - Blocks if credits = 0 (PRD 8: Credit Exhaustion Behavior)
     """
     user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
     try:
+        # ==================== PRD 7.2 & 8: Credit Check ====================
+        # Check if user has sufficient credits before generation
+        # PRD 8: When credits = 0, block new campaign generation
+        from app.services.CreditService import credit_service
+
+        has_credits = await credit_service.check_sufficient_credits(user_id)
+        if not has_credits:
+            # PRD 8: "You've run out of credits. Upgrade to continue."
+            raise HTTPException(
+                status_code=402,
+                detail={
+                    "status": False,
+                    "responseCode": 402,
+                    "responseMessage": "You've run out of credits. Upgrade to continue.",
+                    "responseData": {
+                        "credits_remaining": 0,
+                        "upgrade_url": "/pricing"
+                    }
+                }
+            )
+
         # Load brand profile from onboarding (source of truth).
         profile_result = await BrandProfileService.get(user_id, db)
         profile_data = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
@@ -205,15 +236,55 @@ async def generate_content(
             overrides = request.brand_context.dict(exclude_none=True)
             brand_context_dict = {**brand_context_dict, **overrides}
 
-        # Always generate text synchronously and return immediately.
-        result = await ContentGenerationService.generate_multi_platform_content(
-            user_id=user_id,
-            seed_content=request.seed_content,
-            platforms=request.platforms,
-            seed_type=request.seed_type,
-            brand_context=brand_context_dict,
-            db=db,
-        )
+        post_type = request.post_type or "feed"
+        num_slides = max(2, min(5, request.num_slides or 3))
+
+        if post_type == "carousel":
+            from ..services.carousel_generation_service import CarouselGenerationService
+            result = await CarouselGenerationService.generate_multi_platform(
+                user_id=user_id,
+                seed_content=request.seed_content,
+                platforms=request.platforms,
+                brand_context=brand_context_dict,
+                num_slides=num_slides,
+                db=db,
+            )
+        else:
+            # story uses standard text gen but we tag it after; feed is unchanged
+            result = await ContentGenerationService.generate_multi_platform_content(
+                user_id=user_id,
+                seed_content=request.seed_content,
+                platforms=request.platforms,
+                seed_type=request.seed_type,
+                brand_context=brand_context_dict,
+                db=db,
+            )
+
+        # Tag post_type on all resulting drafts in DB
+        if result.get("status") and post_type != "feed":
+            drafts = result.get("responseData", {}).get("drafts", [])
+            draft_ids = [d["id"] for d in drafts if d.get("id")]
+            if draft_ids:
+                await db["content_drafts"].update_many(
+                    {"id": {"$in": draft_ids}},
+                    {"$set": {"post_type": post_type}},
+                )
+                for d in drafts:
+                    d["post_type"] = post_type
+
+        # ==================== PRD 7.2: Credit Deduction ====================
+        # Deduct 1 credit after successful generation
+        # PRD 3.1: First campaign generation = 1 credit
+        if result.get("status"):
+            request_id = result.get("responseData", {}).get("request_id")
+            if request_id:
+                await credit_service.deduct_credit(
+                    user_id=user_id,
+                    campaign_id=request_id,
+                    reason="campaign_generation",
+                    retry_count=0  # Initial generation (not a retry)
+                )
+                print(f"✅ Deducted 1 credit from user {user_id} for campaign {request_id}")
 
         # If images were requested, mark drafts as has_image=True immediately so the
         # frontend shimmer shows right away, then kick off background generation.
@@ -230,15 +301,33 @@ async def generate_content(
                     d["has_image"] = True
 
             for draft in drafts:
-                background_tasks.add_task(
-                    _generate_image_bg,
-                    draft_id=draft["id"],
-                    platform=draft["platform"],
-                    content=draft["content"],
-                    seed_content=request.seed_content,
-                    brand_context=brand_context_dict,
-                    db=db,
-                )
+                if post_type == "carousel":
+                    slides = draft.get("slides") or []
+                    for slide_index, slide in enumerate(slides):
+                        background_tasks.add_task(
+                            _generate_image_bg,
+                            draft_id=draft["id"],
+                            platform=draft["platform"],
+                            content=f"{slide.get('headline', '')} {slide.get('body', '')}".strip() or draft["content"],
+                            seed_content=request.seed_content,
+                            brand_context=brand_context_dict,
+                            db=db,
+                            reference_image=request.reference_image,
+                            post_type=post_type,
+                            slide_index=slide_index,
+                        )
+                else:
+                    background_tasks.add_task(
+                        _generate_image_bg,
+                        draft_id=draft["id"],
+                        platform=draft["platform"],
+                        content=draft["content"],
+                        seed_content=request.seed_content,
+                        brand_context=brand_context_dict,
+                        db=db,
+                        reference_image=request.reference_image,
+                        post_type=post_type,
+                    )
 
         return result
 
@@ -297,6 +386,7 @@ async def initiate_social_connections(
     return await SocialAccountService.initiate_connection_flow(
         user_id=user_id,
         platforms=request.platforms,
+        source=request.source,
     )
 
 
@@ -305,44 +395,62 @@ async def outstand_oauth_callback(
     sessionToken: Optional[str] = Query(None),
     session_token: Optional[str] = Query(None),
     session: Optional[str] = Query(None),
+    account_id: Optional[str] = Query(None),
+    username: Optional[str] = Query(None),
+    network_unique_id: Optional[str] = Query(None),
+    network: Optional[str] = Query(None),
+    success: Optional[str] = Query(None),
     error: Optional[str] = Query(None),
+    source: Optional[str] = Query(None),
 ):
     """
     OAuth callback — Outstand redirects the user's browser here after they
     authorise on the social platform. No JWT required.
 
-    Redirects the user to the frontend brand-setup page with the sessionToken
-    so the frontend can call GET /connect/pending/{sessionToken} and then
-    POST /connect/finalize to complete the connection.
+    Two possible flows:
+    1. Session token flow (Facebook, LinkedIn etc.):
+       Outstand sends sessionToken → redirect frontend to pending/finalize.
+    2. Direct flow (X/Twitter OAuth 2.0):
+       Outstand sends account_id + username directly → redirect frontend
+       with account details so it can call POST /x/finalize-direct.
+
+    source: "onboarding" → redirect to brand-setup, "settings" → redirect to settings/social-accounts
     """
     import urllib.parse
 
     web_app_url = settings.WEB_APP_URL
-    # Outstand may send the token as "session", "sessionToken", or "session_token"
-    token_value = sessionToken or session_token or session
+    is_settings = source == "settings"
+    base_redirect = f"{web_app_url}/settings/social-accounts" if is_settings else f"{web_app_url}/social-media/brand-setup"
 
     if error:
         encoded_error = urllib.parse.quote(error)
-        return RedirectResponse(
-            f"{web_app_url}/social-media/brand-setup"
-            f"?connected=false&error={encoded_error}"
-        )
+        return RedirectResponse(f"{base_redirect}?connected=false&error={encoded_error}")
 
+    # Direct flow — X OAuth 2.0 returns account_id immediately
+    if success == "true" and account_id:
+        params = f"account_id={urllib.parse.quote(account_id)}&connected=direct"
+        if username:
+            params += f"&username={urllib.parse.quote(username)}"
+        if network_unique_id:
+            params += f"&network_unique_id={urllib.parse.quote(network_unique_id)}"
+        if network:
+            params += f"&network={urllib.parse.quote(network)}"
+        return RedirectResponse(f"{base_redirect}?{params}")
+
+    # Session token flow
+    token_value = sessionToken or session_token or session
     if not token_value:
-        return RedirectResponse(
-            f"{web_app_url}/social-media/brand-setup"
-            f"?connected=false&error=missing_session_token"
-        )
+        return RedirectResponse(f"{base_redirect}?connected=false&error=missing_session_token")
 
     return RedirectResponse(
-        f"{web_app_url}/social-media/brand-setup"
-        f"?sessionToken={urllib.parse.quote(token_value)}&connected=pending"
+        f"{base_redirect}?sessionToken={urllib.parse.quote(token_value)}&connected=pending"
     )
 
 
 @router.get("/connect/pending/{session_token}")
 async def get_pending_connection(
     session_token: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
     token: dict = Depends(JWTBearer()),
 ):
     """
@@ -356,7 +464,7 @@ async def get_pending_connection(
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
-    return await SocialAccountService.get_pending_connection(session_token)
+    return await SocialAccountService.get_pending_connection(session_token, db=db)
 
 
 @router.post("/connect/finalize")
@@ -478,6 +586,56 @@ async def approve_content(
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/drafts/{draft_id}/regenerate-image")
+async def regenerate_draft_image(
+    draft_id: str,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer())
+):
+    """
+    Regenerate the image for an existing draft using user feedback.
+    Clears the current image immediately (frontend shows shimmer),
+    then generates a new image in the background incorporating the feedback.
+    """
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    body = await request.json()
+    feedback = (body.get("feedback") or "").strip()
+    if not feedback:
+        raise HTTPException(status_code=400, detail="feedback is required")
+
+    # Verify the draft belongs to this user
+    draft = await db["content_drafts"].find_one(
+        {"$or": [{"id": draft_id}, {"draft_id": draft_id}], "user_id": user_id},
+        {"_id": 0, "id": 1},
+    )
+    if not draft:
+        raise HTTPException(status_code=404, detail="Draft not found")
+
+    # Clear the image so the frontend shimmer shows while regeneration runs
+    from datetime import datetime as _dt
+    await db["content_drafts"].update_one(
+        {"$or": [{"id": draft_id}, {"draft_id": draft_id}]},
+        {"$set": {"image_url": None, "has_image": True, "updated_at": _dt.utcnow()}},
+    )
+
+    from app.agents.social_media_manager.services.image_content_service import ImageContentService
+    background_tasks.add_task(
+        ImageContentService.regenerate_image_for_draft,
+        draft_id=draft_id,
+        user_id=user_id,
+        feedback=feedback,
+        db=db,
+    )
+
+    from app.domain.responses.uri_response import UriResponse
+    return UriResponse.get_single_data_response("regenerate_image", {"draft_id": draft_id, "status": "generating"})
+
 
 @router.delete("/drafts/{draft_id}")
 async def delete_draft(
@@ -615,6 +773,170 @@ async def get_scheduled_content(
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# ==============================================================================
+# CONTENT CALENDAR PLAN ENDPOINTS (Issues 5, 6, 7)
+# ==============================================================================
+
+class CalendarGenerateRequest(BaseModel):
+    platforms: List[str] = ["facebook", "instagram"]
+    force_regenerate: bool = False
+
+
+class CalendarCreateDraftRequest(BaseModel):
+    platforms: List[str] = ["facebook", "instagram"]
+    include_images: bool = False
+
+
+@router.get("/content-calendar/plan")
+async def get_calendar_plan(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """Return the active 7-day plan for this week, or 404 if none exists."""
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+    plan = await cal_svc.get_active_plan(user_id, db)
+    if not plan:
+        raise HTTPException(status_code=404, detail="No active plan for this week")
+    return UriResponse.get_single_data_response("calendar_plan", plan)
+
+
+@router.post("/content-calendar/plan/generate")
+async def generate_calendar_plan(
+    request: CalendarGenerateRequest,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """Generate (or force-regenerate) the 7-day content plan for this week."""
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+    try:
+        profile_result = await BrandProfileService.get(user_id, db)
+        brand = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
+        plan = await cal_svc.generate_plan(
+            user_id=user_id,
+            platforms=request.platforms,
+            brand=brand,
+            db=db,
+            force=request.force_regenerate,
+        )
+        return UriResponse.get_single_data_response("calendar_plan", plan)
+    except Exception as e:
+        import traceback as _tb
+        print(_tb.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/content-calendar/plan/{plan_id}/day/{day_index}/regenerate")
+async def regenerate_calendar_day(
+    plan_id: str,
+    day_index: int,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """Regenerate the content idea for a single day."""
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+    try:
+        updated_plan = await cal_svc.regenerate_day(plan_id, day_index, user_id, db)
+        return UriResponse.get_single_data_response("calendar_plan", updated_plan)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        import traceback as _tb
+        print(_tb.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/content-calendar/plan/{plan_id}/day/{day_index}/create-draft")
+async def create_draft_from_calendar_day(
+    plan_id: str,
+    day_index: int,
+    request: CalendarCreateDraftRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """Create a full content draft from a calendar day's idea."""
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+    try:
+        plan = await db["content_calendar_plans"].find_one(
+            {"plan_id": plan_id, "user_id": user_id}, {"_id": 0}
+        )
+        if not plan:
+            raise HTTPException(status_code=404, detail="Plan not found")
+        day = next((d for d in plan["days"] if d["day_index"] == day_index), None)
+        if not day:
+            raise HTTPException(status_code=404, detail=f"Day {day_index} not found")
+
+        seed_content = f"{day['title']}. {day['description']}"
+        profile_result = await BrandProfileService.get(user_id, db)
+        brand = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
+        brand_context = BrandProfileService.to_brand_context(brand) if brand else {}
+
+        result = await ContentGenerationService.generate_multi_platform_content(
+            user_id=user_id,
+            seed_content=seed_content,
+            platforms=request.platforms,
+            seed_type="calendar_idea",
+            brand_context=brand_context,
+            db=db,
+        )
+
+        if result.get("status"):
+            drafts = result.get("responseData", {}).get("drafts", [])
+            draft_ids = [d.get("draft_id") or d.get("id") for d in drafts if d]
+            await cal_svc.mark_acted_on(plan_id, day_index, draft_ids, user_id, db)
+
+            if request.include_images:
+                draft_ids = [d.get("draft_id") or d.get("id") for d in drafts if d]
+                if draft_ids:
+                    await db["content_drafts"].update_many(
+                        {"id": {"$in": draft_ids}},
+                        {"$set": {"has_image": True}},
+                    )
+                    for d in drafts:
+                        d["has_image"] = True
+
+                for d in drafts:
+                    background_tasks.add_task(
+                        _generate_image_bg,
+                        draft_id=d.get("draft_id") or d.get("id"),
+                        platform=d.get("platform", "facebook"),
+                        content=d.get("content", seed_content),
+                        seed_content=seed_content,
+                        brand_context=brand_context,
+                        db=db,
+                        reference_image=None,
+                    )
+
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback as _tb
+        print(_tb.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/content-calendar/today")
+async def get_today_suggestion(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """Return today's content suggestion from the active plan."""
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+    result = await cal_svc.get_today_suggestion(user_id, db)
+    return UriResponse.get_single_data_response("today_suggestion", result)
+
 
 # ==============================================================================
 # CONTENT MANAGEMENT ENDPOINTS
@@ -785,8 +1107,387 @@ async def get_content_analytics(
         raise HTTPException(status_code=500, detail=str(e))
 
 # ==============================================================================
+# PERFORMANCE / ANALYTICS
+# ==============================================================================
+
+@router.get("/performance")
+async def get_performance(
+    days: int = 30,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer())
+):
+    """
+    Fetch real-time post analytics from Outstand for the user's published drafts.
+    Returns aggregated summary + per-post breakdown + per-platform summary.
+    """
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    from datetime import timedelta
+    import asyncio as _asyncio
+    import httpx as _httpx
+
+    try:
+        date_filter = datetime.utcnow() - timedelta(days=days)
+        published = await db["content_drafts"].find({
+            "user_id": user_id,
+            "status": "published",
+            "platform_post_id": {"$exists": True, "$ne": None},
+            "published_date": {"$gte": date_filter},
+        }).sort("published_date", -1).to_list(length=50)
+
+        if not published:
+            return UriResponse.get_single_data_response("performance", {
+                "has_data": False,
+                "total_published": 0,
+                "date_range_days": days,
+                "summary": {},
+                "by_platform": {},
+                "top_posts": [],
+            })
+
+        # Load all direct (non-Outstand) connections so we can use their tokens
+        direct_conns = await db["social_connections"].find(
+            {"user_id": user_id, "connected_via": {"$ne": "outstand"}},
+            {"_id": 0, "platform": 1, "connected_via": 1, "page_access_token": 1, "ig_user_id": 1},
+        ).to_list(length=20)
+        direct_conn_map = {c["platform"]: c for c in direct_conns}
+
+        outstand = OutstandService()
+        _graph_base = f"https://graph.facebook.com/{settings.FACEBOOK_API_VERSION}"
+
+        async def _fetch_instagram_direct(draft, conn):
+            media_id = draft.get("platform_post_id")
+            token = conn.get("page_access_token")
+            if not media_id or not token:
+                return None
+            try:
+                async with _httpx.AsyncClient(timeout=20) as _c:
+                    media_resp = await _c.get(
+                        f"{_graph_base}/{media_id}",
+                        params={"fields": "like_count,comments_count,timestamp,media_type", "access_token": token},
+                    )
+                    media_data = media_resp.json()
+                    if "error" in media_data:
+                        print(f"⚠️ IG media fetch error for {media_id}: {media_data['error'].get('message')}")
+                        return None
+
+                    impressions = reach = 0
+                    try:
+                        ins_resp = await _c.get(
+                            f"{_graph_base}/{media_id}/insights",
+                            params={"metric": "impressions,reach", "period": "lifetime", "access_token": token},
+                        )
+                        for item in ins_resp.json().get("data", []):
+                            val = (item.get("values") or [{}])[0].get("value", 0)
+                            if item["name"] == "impressions":
+                                impressions = val
+                            elif item["name"] == "reach":
+                                reach = val
+                    except Exception:
+                        pass
+
+                likes = media_data.get("like_count", 0)
+                comments = media_data.get("comments_count", 0)
+                return {
+                    "draft_id": draft.get("id"),
+                    "platform_post_id": media_id,
+                    "platform": "instagram",
+                    "content_preview": (draft.get("content") or "")[:120],
+                    "published_at": draft.get("published_date", ""),
+                    "image_url": draft.get("image_url"),
+                    "likes": likes,
+                    "comments": comments,
+                    "shares": 0,
+                    "views": 0,
+                    "impressions": impressions,
+                    "reach": reach,
+                    "engagement_rate": round(((likes + comments) / max(reach, 1)) * 100, 2) if reach else 0,
+                }
+            except Exception as e:
+                print(f"⚠️ Instagram direct analytics failed for {media_id}: {e}")
+                return None
+
+        async def _fetch(draft):
+            post_id = draft.get("platform_post_id")
+            platform = draft.get("platform", "unknown")
+            if not post_id:
+                return None
+
+            # Route to direct Graph API for non-Outstand platforms
+            if platform in direct_conn_map:
+                return await _fetch_instagram_direct(draft, direct_conn_map[platform])
+
+            try:
+                data = await outstand.get_post_analytics(post_id)
+                agg = data.get("aggregated_metrics") or {}
+                by_account = data.get("metrics_by_account") or []
+                network = by_account[0]["social_account"]["network"] if by_account else platform
+                return {
+                    "draft_id": draft.get("id"),
+                    "platform_post_id": post_id,
+                    "platform": network or platform,
+                    "content_preview": (draft.get("content") or "")[:120],
+                    "published_at": draft.get("published_date", ""),
+                    "image_url": draft.get("image_url"),
+                    "likes": agg.get("total_likes", 0),
+                    "comments": agg.get("total_comments", 0),
+                    "shares": agg.get("total_shares", 0),
+                    "views": agg.get("total_views", 0),
+                    "impressions": agg.get("total_impressions", 0),
+                    "reach": agg.get("total_reach", 0),
+                    "engagement_rate": round(agg.get("average_engagement_rate", 0) * 100, 2),
+                }
+            except Exception as e:
+                print(f"⚠️ Analytics fetch failed for post {post_id}: {e}")
+                return None
+
+        results = await _asyncio.gather(*[_fetch(d) for d in published])
+        posts = [r for r in results if r is not None]
+
+        # Aggregate summary
+        def _sum(key): return sum(p.get(key, 0) or 0 for p in posts)
+        total_posts = len(posts)
+        summary = {
+            "total_posts": total_posts,
+            "total_impressions": _sum("impressions"),
+            "total_reach": _sum("reach"),
+            "total_likes": _sum("likes"),
+            "total_comments": _sum("comments"),
+            "total_shares": _sum("shares"),
+            "total_views": _sum("views"),
+            "avg_engagement_rate": round(
+                sum(p.get("engagement_rate", 0) or 0 for p in posts) / total_posts, 2
+            ) if total_posts else 0,
+        }
+
+        # Per-platform breakdown
+        by_platform: dict = {}
+        for p in posts:
+            pl = p["platform"]
+            if pl not in by_platform:
+                by_platform[pl] = {"posts": 0, "impressions": 0, "reach": 0, "likes": 0, "comments": 0, "shares": 0, "engagement_rate_sum": 0}
+            by_platform[pl]["posts"] += 1
+            for k in ("impressions", "reach", "likes", "comments", "shares"):
+                by_platform[pl][k] += p.get(k, 0) or 0
+            by_platform[pl]["engagement_rate_sum"] += p.get("engagement_rate", 0) or 0
+        for pl, data in by_platform.items():
+            n = data["posts"]
+            data["avg_engagement_rate"] = round(data.pop("engagement_rate_sum") / n, 2) if n else 0
+
+        # Top posts by impressions
+        top_posts = sorted(posts, key=lambda x: x.get("impressions", 0), reverse=True)[:10]
+
+        return UriResponse.get_single_data_response("performance", {
+            "has_data": True,
+            "total_published": len(published),
+            "date_range_days": days,
+            "summary": summary,
+            "by_platform": by_platform,
+            "top_posts": top_posts,
+        })
+
+    except Exception as e:
+        import traceback
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/account-metrics")
+async def get_account_metrics(
+    days: int = 30,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer())
+):
+    """
+    Fetch account-level metrics (followers, engagement totals) for all of the
+    user's connected social accounts via Outstand.
+    """
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    import asyncio as _asyncio
+    import time as _time
+    import httpx as _httpx
+    from datetime import timedelta
+
+    try:
+        outstand = OutstandService()
+        until_ts = int(_time.time())
+        since_ts = int((datetime.utcnow() - timedelta(days=days)).timestamp())
+
+        # ── Outstand accounts ─────────────────────────────────────────────────
+        result = await outstand.list_accounts(tenant_id=user_id)
+        outstand_accounts = result.get("data", [])
+
+        async def _fetch_outstand_metrics(acc):
+            account_id = acc.get("id")
+            if not account_id:
+                return None
+            try:
+                data = await outstand.get_account_metrics(account_id, since=since_ts, until=until_ts)
+                m = data.get("data", {})
+                eng = m.get("engagement")
+                period = m.get("period") or {}
+                ps = m.get("platform_specific") or {}
+                return {
+                    "account_id": account_id,
+                    "network": acc.get("network", "unknown"),
+                    "page_name": ps.get("page_name") or acc.get("nickname") or acc.get("username"),
+                    "category": ps.get("category"),
+                    "followers_count": m.get("followers_count") or ps.get("followers_count") or ps.get("fan_count") or 0,
+                    "following_count": m.get("following_count"),
+                    "posts_count": m.get("posts_count"),
+                    "engagement": {
+                        "views": eng.get("views", 0),
+                        "likes": eng.get("likes", 0),
+                        "comments": eng.get("comments", 0),
+                        "shares": eng.get("shares", 0),
+                        "reposts": eng.get("reposts", 0),
+                        "quotes": eng.get("quotes", 0),
+                    } if eng else None,
+                    "engagement_note": period.get("note"),
+                    "platform_specific": ps,
+                    "period": {"since": since_ts, "until": until_ts},
+                }
+            except Exception as e:
+                print(f"⚠️ Outstand account metrics failed for {account_id}: {e}")
+                return None
+
+        # ── Direct (non-Outstand) connections ─────────────────────────────────
+        direct_conns = await db["social_connections"].find(
+            {"user_id": user_id, "connected_via": {"$ne": "outstand"}},
+            {"_id": 0, "platform": 1, "connected_via": 1, "page_access_token": 1, "ig_user_id": 1, "page_name": 1},
+        ).to_list(length=20)
+
+        _graph_base = f"https://graph.facebook.com/{settings.FACEBOOK_API_VERSION}"
+
+        async def _fetch_instagram_direct_metrics(conn):
+            ig_user_id = conn.get("ig_user_id")
+            token = conn.get("page_access_token")
+            if not ig_user_id or not token:
+                return None
+            try:
+                async with _httpx.AsyncClient(timeout=20) as _c:
+                    profile_resp = await _c.get(
+                        f"{_graph_base}/{ig_user_id}",
+                        params={"fields": "name,username,followers_count,media_count,biography,profile_picture_url", "access_token": token},
+                    )
+                    profile = profile_resp.json()
+                    if "error" in profile:
+                        print(f"⚠️ IG profile fetch error: {profile['error'].get('message')}")
+                        return None
+
+                    # Aggregate engagement from published posts in the period
+                    posts_resp = await _c.get(
+                        f"{_graph_base}/{ig_user_id}/media",
+                        params={"fields": "like_count,comments_count,timestamp", "limit": 50, "access_token": token},
+                    )
+                    posts = posts_resp.json().get("data", [])
+                    from datetime import timezone as _tz
+                    since_dt = datetime.utcfromtimestamp(since_ts).replace(tzinfo=_tz.utc)
+                    total_likes = total_comments = 0
+                    for post in posts:
+                        try:
+                            from datetime import datetime as _dt
+                            post_dt = _dt.fromisoformat(post["timestamp"].replace("Z", "+00:00"))
+                            if post_dt >= since_dt:
+                                total_likes += post.get("like_count", 0)
+                                total_comments += post.get("comments_count", 0)
+                        except Exception:
+                            pass
+
+                return {
+                    "account_id": ig_user_id,
+                    "network": "instagram",
+                    "page_name": profile.get("name") or profile.get("username") or conn.get("page_name"),
+                    "category": None,
+                    "followers_count": profile.get("followers_count", 0),
+                    "following_count": None,
+                    "posts_count": profile.get("media_count"),
+                    "engagement": {
+                        "views": 0,
+                        "likes": total_likes,
+                        "comments": total_comments,
+                        "shares": 0,
+                        "reposts": 0,
+                        "quotes": 0,
+                    },
+                    "engagement_note": f"Likes + comments on posts published in the last {days} days",
+                    "platform_specific": {
+                        "username": profile.get("username"),
+                        "biography": profile.get("biography"),
+                        "profile_picture_url": profile.get("profile_picture_url"),
+                    },
+                    "period": {"since": since_ts, "until": until_ts},
+                }
+            except Exception as e:
+                print(f"⚠️ Instagram direct account metrics failed: {e}")
+                return None
+
+        async def _fetch_direct_metrics(conn):
+            if conn.get("connected_via") == "instagram_direct":
+                return await _fetch_instagram_direct_metrics(conn)
+            return None  # extend here for other direct platforms
+
+        outstand_results, direct_results = await _asyncio.gather(
+            _asyncio.gather(*[_fetch_outstand_metrics(a) for a in outstand_accounts]),
+            _asyncio.gather(*[_fetch_direct_metrics(c) for c in direct_conns]),
+        )
+
+        account_metrics = [r for r in (*outstand_results, *direct_results) if r is not None]
+
+        return UriResponse.get_single_data_response("account_metrics", {
+            "has_data": len(account_metrics) > 0,
+            "accounts": account_metrics,
+        })
+
+    except Exception as e:
+        import traceback
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==============================================================================
 # UTILITY ENDPOINTS
 # ==============================================================================
+
+@router.get("/debug/outstand-account-metrics/{account_id}")
+async def debug_outstand_account_metrics(
+    account_id: str,
+    days: int = 30,
+    token: dict = Depends(JWTBearer())
+):
+    """Return raw Outstand account metrics response for debugging field mapping."""
+    import time as _time
+    from datetime import timedelta
+    try:
+        until_ts = int(_time.time())
+        since_ts = int((datetime.utcnow() - timedelta(days=days)).timestamp())
+        outstand = OutstandService()
+        data = await outstand.get_account_metrics(account_id, since=since_ts, until=until_ts)
+        return UriResponse.get_single_data_response("debug_account_metrics", data)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/debug/outstand-post/{post_id}")
+async def debug_outstand_post(
+    post_id: str,
+    token: dict = Depends(JWTBearer())
+):
+    """
+    Fetch the live status of an Outstand post by its ID.
+    Use this to diagnose why a post appears queued but hasn't appeared on the social network.
+    """
+    try:
+        outstand = OutstandService()
+        data = await outstand.get_post(post_id)
+        return UriResponse.get_single_data_response("outstand_post", data)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/platform-requirements/{platform}")
 async def get_platform_requirements(platform: str):
@@ -1123,7 +1824,7 @@ async def upload_sample_template(
 
         b64 = base64.b64encode(contents).decode()
 
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=120) as client:
             resp = await client.post(
                 "https://api.imgbb.com/1/upload",
                 data={"key": settings.IMGBB_API_KEY, "image": b64, "name": file.filename},
@@ -1152,6 +1853,8 @@ async def upload_sample_template(
     except HTTPException:
         raise
     except Exception as e:
+        import traceback
+        print(f"❌ sample-template upload error: {e}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1196,10 +1899,15 @@ async def _generate_image_bg(
     seed_content: str,
     brand_context: Dict[str, Any],
     db: AsyncIOMotorDatabase,
+    reference_image: Optional[str] = None,
+    post_type: str = "feed",
+    slide_index: Optional[int] = None,
 ):
     """
     Background task: generate an image for an existing draft and save it to DB.
     Runs after the text-only response has already been returned to the frontend.
+    For carousel posts, slide_index indicates which slide this image belongs to.
+    For story posts, uses the story (9:16) image spec.
     """
     import re
     import base64
@@ -1207,11 +1915,16 @@ async def _generate_image_bg(
     from app.core.config import settings as _cfg
 
     try:
+        # For story posts pass image_type="story" so we get 1080x1920 dimensions
+        image_type = "story" if post_type == "story" else "post_image"
+
         image_result = await ImageContentService._generate_platform_image(
             platform=platform,
             content=content,
             seed_content=seed_content,
             brand_context=brand_context,
+            reference_image=reference_image,
+            image_type=image_type,
         )
 
         if not image_result.get("status"):
@@ -1242,11 +1955,22 @@ async def _generate_image_bg(
 
         final_url = stored_url if not stored_url.startswith("data:") else None
         if final_url and db is not None:
-            result = await db["content_drafts"].update_one(
-                {"id": draft_id},
-                {"$set": {"image_url": final_url, "has_image": True}},
-            )
-            print(f"✅ BG image saved for draft {draft_id}: matched={result.matched_count}")
+            if post_type == "carousel" and slide_index is not None:
+                # Update the specific slide's image_url in the slides array
+                result = await db["content_drafts"].update_one(
+                    {"id": draft_id},
+                    {"$set": {
+                        f"slides.{slide_index}.image_url": final_url,
+                        "has_image": True,
+                    }},
+                )
+                print(f"✅ BG carousel slide {slide_index} image saved for draft {draft_id}: matched={result.matched_count}")
+            else:
+                result = await db["content_drafts"].update_one(
+                    {"id": draft_id},
+                    {"$set": {"image_url": final_url, "has_image": True}},
+                )
+                print(f"✅ BG image saved for draft {draft_id}: matched={result.matched_count}")
         else:
             print(f"⚠️  BG image not saved for draft {draft_id} (no public URL)")
 
@@ -1283,6 +2007,25 @@ async def scheduled_content_publisher(db: AsyncIOMotorDatabase):
         result = await ApprovalWorkflowService.publish_scheduled_content(db=db)
         if result.get("published_count", 0) > 0:
             print(f"✅ Published {result['published_count']} scheduled posts")
-        
+
     except Exception as e:
         print(f"❌ Scheduled publishing failed: {str(e)}")
+
+
+@router.post("/publish-scheduled")
+async def trigger_publish_scheduled(
+    request: Request,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """
+    Cron endpoint — called every 5 minutes to check and update scheduled posts.
+    Protected by X-Cron-Secret header.
+    """
+    from app.core.config import settings as _cfg
+    expected = getattr(_cfg, "CRON_SECRET", "") or ""
+    cron_secret = request.headers.get("X-Cron-Secret", "")
+    if expected and cron_secret != expected:
+        raise HTTPException(status_code=403, detail="Invalid cron secret")
+
+    result = await ApprovalWorkflowService.publish_scheduled_content(db=db)
+    return result

@@ -1,3 +1,4 @@
+import pymongo.errors
 from datetime import datetime
 from typing import Any, Dict, Optional
 
@@ -11,8 +12,13 @@ class WhatsAppSessionService:
 
     @staticmethod
     def _normalize_phone(raw: str) -> str:
-        """Strip the 'whatsapp:' prefix Twilio adds and return a bare E.164 number."""
-        return raw.replace("whatsapp:", "").strip()
+        """Strip the 'whatsapp:' prefix Twilio adds and return a bare E.164 number.
+        Always ensures the number starts with '+' so stored and inbound formats match.
+        """
+        phone = raw.replace("whatsapp:", "").strip()
+        if phone and not phone.startswith("+"):
+            phone = "+" + phone
+        return phone
 
     # ── Session CRUD ──────────────────────────────────────────────────────────
 
@@ -55,14 +61,18 @@ class WhatsAppSessionService:
         phone: str, db: AsyncIOMotorDatabase
     ) -> Optional[Dict[str, Any]]:
         phone = WhatsAppSessionService._normalize_phone(phone)
-        return await db["users"].find_one({"whatsapp_phone": phone})
+        # Try both +2348... and 2348... so old records without '+' still match
+        without_plus = phone.lstrip("+")
+        return await db["users"].find_one(
+            {"whatsapp_phone": {"$in": [phone, without_plus]}}
+        )
 
     @staticmethod
     async def link_phone_to_user(
         user_id: str, phone: str, db: AsyncIOMotorDatabase
     ) -> None:
         phone = WhatsAppSessionService._normalize_phone(phone)
-        await db["users"].update_one(
+        result = await db["users"].update_one(
             {"userId": user_id},
             {
                 "$set": {
@@ -71,12 +81,17 @@ class WhatsAppSessionService:
                 }
             },
         )
-        # Seed an initial session row so the user is ready
-        await WhatsAppSessionService.upsert_session(
-            phone,
-            {"state": "linked", "user_id": user_id},
-            db,
-        )
+        print(f"[WA LINK DEBUG] update_one userId={user_id!r} phone={phone!r} matched={result.matched_count} modified={result.modified_count}")
+        # Seed an initial session row — if this times out it's non-fatal;
+        # the handle() function defaults to state="linked" when no session exists.
+        try:
+            await WhatsAppSessionService.upsert_session(
+                phone,
+                {"state": "linked", "user_id": user_id},
+                db,
+            )
+        except pymongo.errors.NetworkTimeout:
+            pass
 
     @staticmethod
     async def get_brand_profile(
