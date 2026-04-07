@@ -3,7 +3,7 @@ name: Build and Deploy Dockerized Python FastAPI App to Azure VM (PROD)
 on:
   push:
     branches:
-      - main
+      - master
   workflow_dispatch:
 
 jobs:
