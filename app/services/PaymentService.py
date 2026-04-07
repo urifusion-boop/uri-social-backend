@@ -31,8 +31,7 @@ class PaymentService:
     """
 
     def __init__(self):
-        self.db: AsyncIOMotorDatabase = get_db()
-        self.payment_transactions_collection = self.db["payment_transactions"]
+        self._db: Optional[AsyncIOMotorDatabase] = None
 
         # SQUAD API configuration
         self.squad_secret_key = getattr(settings, 'SQUAD_SECRET_KEY', '')
@@ -40,6 +39,16 @@ class PaymentService:
         self.squad_webhook_secret = getattr(settings, 'SQUAD_WEBHOOK_SECRET', '')
         self.squad_api_url = "https://api.squadco.com"
         self.callback_url = getattr(settings, 'SQUAD_CALLBACK_URL', 'https://www.urisocial.com/checkout/callback')
+
+    @property
+    def db(self) -> AsyncIOMotorDatabase:
+        if self._db is None:
+            self._db = get_db()
+        return self._db
+
+    @property
+    def payment_transactions_collection(self):
+        return self.db["payment_transactions"]
 
     # ==================== PRD 6.3: Payment Flow ====================
 

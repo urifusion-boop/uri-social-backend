@@ -28,9 +28,21 @@ class CreditService:
     """
 
     def __init__(self):
-        self.db: AsyncIOMotorDatabase = get_db()
-        self.user_credits_collection = self.db["user_credits"]
-        self.credit_transactions_collection = self.db["credit_transactions"]
+        self._db: Optional[AsyncIOMotorDatabase] = None
+
+    @property
+    def db(self) -> AsyncIOMotorDatabase:
+        if self._db is None:
+            self._db = get_db()
+        return self._db
+
+    @property
+    def user_credits_collection(self):
+        return self.db["user_credits"]
+
+    @property
+    def credit_transactions_collection(self):
+        return self.db["credit_transactions"]
 
     # ==================== PRD 7.1: User Wallet ====================
 
