@@ -33,6 +33,12 @@ class Settings(BaseSettings):
     # imgBB
     IMGBB_API_KEY: Optional[str] = None
 
+    # SQUAD Payment Gateway (PRD Section 6.2: Payment Integration)
+    SQUAD_SECRET_KEY: Optional[str] = None
+    SQUAD_PUBLIC_KEY: Optional[str] = None
+    SQUAD_WEBHOOK_SECRET: Optional[str] = None
+    SQUAD_CALLBACK_URL: str = "https://www.urisocial.com/checkout/callback"
+
     # SSL (optional for local dev)
     SSL_KEY_PATH: str = ""
     SSL_CERT_PATH: str = ""

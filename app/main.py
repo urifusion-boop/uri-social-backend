@@ -8,6 +8,7 @@ from app.core.config import settings
 from app.core.sentry_config import initialize_sentry
 from app.agents.social_media_manager.routers.complete_social_manager import router as social_media_router
 from app.routers.auth_router import router as auth_router
+from app.routers.billing_router import router as billing_router
 
 # Initialize Sentry
 initialize_sentry()
@@ -22,6 +23,20 @@ app = FastAPI(
     contact={"name": "Uri Fusion", "email": "urifusion@gmail.com"},
     license_info={"name": "MIT License"},
 )
+
+
+@app.on_event("startup")
+async def startup_event():
+    """
+    Initialize billing system on startup
+    PRD Section 5: Plan Structure - Seed default subscription tiers
+    """
+    try:
+        from app.services.SubscriptionService import subscription_service
+        await subscription_service.initialize_default_tiers()
+        print("✅ Subscription tiers initialized successfully")
+    except Exception as e:
+        print(f"⚠️  Warning: Failed to initialize subscription tiers: {e}")
 
 # CORS
 # allow_credentials must be False when allow_origins=["*"].
@@ -52,6 +67,13 @@ app.include_router(
     auth_router,
     prefix="/social-media",
     tags=["Auth"],
+)
+
+# Include billing router under /social-media prefix (PRD: Credit-Based Pricing System)
+app.include_router(
+    billing_router,
+    prefix="/social-media",
+    tags=["Billing"],
 )
 
 

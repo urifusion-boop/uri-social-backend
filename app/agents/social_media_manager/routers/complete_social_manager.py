@@ -189,12 +189,37 @@ async def generate_content(
     Text content is always returned immediately.
     When include_images=True, images are generated in the background and
     saved to the draft — the frontend can pick them up via GET /content-calendar.
+
+    PRD Credit System:
+    - Deducts 1 credit per campaign generation
+    - Blocks if credits = 0 (PRD 8: Credit Exhaustion Behavior)
     """
     user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
     try:
+        # ==================== PRD 7.2 & 8: Credit Check ====================
+        # Check if user has sufficient credits before generation
+        # PRD 8: When credits = 0, block new campaign generation
+        from app.services.CreditService import credit_service
+
+        has_credits = await credit_service.check_sufficient_credits(user_id)
+        if not has_credits:
+            # PRD 8: "You've run out of credits. Upgrade to continue."
+            raise HTTPException(
+                status_code=402,
+                detail={
+                    "status": False,
+                    "responseCode": 402,
+                    "responseMessage": "You've run out of credits. Upgrade to continue.",
+                    "responseData": {
+                        "credits_remaining": 0,
+                        "upgrade_url": "/pricing"
+                    }
+                }
+            )
+
         # Load brand profile from onboarding (source of truth).
         profile_result = await BrandProfileService.get(user_id, db)
         profile_data = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
@@ -214,6 +239,20 @@ async def generate_content(
             brand_context=brand_context_dict,
             db=db,
         )
+
+        # ==================== PRD 7.2: Credit Deduction ====================
+        # Deduct 1 credit after successful generation
+        # PRD 3.1: First campaign generation = 1 credit
+        if result.get("status"):
+            request_id = result.get("responseData", {}).get("request_id")
+            if request_id:
+                await credit_service.deduct_credit(
+                    user_id=user_id,
+                    campaign_id=request_id,
+                    reason="campaign_generation",
+                    retry_count=0  # Initial generation (not a retry)
+                )
+                print(f"✅ Deducted 1 credit from user {user_id} for campaign {request_id}")
 
         # If images were requested, mark drafts as has_image=True immediately so the
         # frontend shimmer shows right away, then kick off background generation.

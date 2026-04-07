@@ -296,35 +296,79 @@ class ApprovalWorkflowService:
     ) -> Dict[str, Any]:
         """
         Regenerate content based on feedback
+
+        PRD Credit Logic:
+        - First retry (retry_count=1): FREE (PRD 3.2)
+        - Second retry (retry_count=2): Costs 1 credit (PRD 3.2)
+        - PRD 3.3: System must show "This action will use 1 credit. Continue?" before second retry
         """
         try:
             from .content_generation_service import ContentGenerationService
-            
+            from app.services.CreditService import credit_service
+
             # Get original draft details
             draft = await db["content_drafts"].find_one({"id": draft_id})
             if not draft:
                 return UriResponse.error_response("Draft not found")
-            
+
             # Get original request
             request = await db["content_requests"].find_one({"id": draft["request_id"]})
             if not request:
                 return UriResponse.error_response("Original request not found")
-            
+
+            # ==================== PRD 3.2: Retry Rules ====================
+            # Track current retry count
+            current_retry_count = request.get("retry_count", 0)
+            new_retry_count = current_retry_count + 1
+
+            # PRD 3.2: First retry FREE, Second retry = 1 credit
+            if new_retry_count >= 2:
+                # Check if user has sufficient credits
+                has_credits = await credit_service.check_sufficient_credits(user_id)
+                if not has_credits:
+                    return UriResponse.error_response(
+                        "Insufficient credits for retry. This action requires 1 credit.",
+                        response_code=402
+                    )
+
             # Generate new content with feedback
             enhanced_seed = request["seed_content"]
             if regeneration_feedback:
                 enhanced_seed += f"\n\nUser feedback: {regeneration_feedback}"
-            
+
             result = await ContentGenerationService._generate_platform_content(
                 platform=draft["platform"],
                 seed_content=enhanced_seed,
                 request_id=draft["request_id"],
                 user_id=user_id
             )
-            
+
             if result.get('status'):
                 new_draft_data = result['responseData']
-                
+
+                # ==================== PRD 7.2: Credit Deduction ====================
+                # Deduct credit if this is second+ retry
+                if new_retry_count >= 2:
+                    await credit_service.deduct_credit(
+                        user_id=user_id,
+                        campaign_id=draft["request_id"],
+                        reason="retry",
+                        retry_count=new_retry_count
+                    )
+                    print(f"✅ Deducted 1 credit for retry #{new_retry_count} - user {user_id}")
+
+                # Update request retry count (PRD 9: Campaign Tracking)
+                await db["content_requests"].update_one(
+                    {"id": draft["request_id"]},
+                    {
+                        "$set": {
+                            "retry_count": new_retry_count,
+                            "updated_at": datetime.utcnow()
+                        },
+                        "$inc": {"credits_used": 1 if new_retry_count >= 2 else 0}
+                    }
+                )
+
                 # Create new draft with regenerated content
                 new_draft_id = str(ObjectId())
                 new_draft = {
@@ -337,13 +381,15 @@ class ApprovalWorkflowService:
                     "status": "regenerated",
                     "regenerated_from": draft_id,
                     "regeneration_feedback": regeneration_feedback,
+                    "retry_number": new_retry_count,  # Track which retry this is
+                    "credit_charged": new_retry_count >= 2,  # Was credit charged?
                     "ai_metadata": new_draft_data.get("ai_metadata"),
                     "created_at": datetime.utcnow(),
                     "updated_at": datetime.utcnow()
                 }
-                
+
                 await db["content_drafts"].insert_one(new_draft)
-                
+
                 # Mark original as replaced
                 await db["content_drafts"].update_one(
                     {"id": draft_id},
@@ -353,18 +399,21 @@ class ApprovalWorkflowService:
                         "updated_at": datetime.utcnow()
                     }}
                 )
-                
+
                 return UriResponse.get_single_data_response("content_regeneration", {
                     "original_draft_id": draft_id,
                     "new_draft_id": new_draft_id,
                     "new_content": new_draft_data["content"],
                     "hashtags": new_draft_data.get("hashtags", []),
                     "regeneration_feedback": regeneration_feedback,
+                    "retry_number": new_retry_count,
+                    "credit_charged": new_retry_count >= 2,
+                    "remaining_free_retries": max(0, 1 - current_retry_count),  # PRD: First retry free
                     "regenerated_at": datetime.utcnow().isoformat()
                 })
             else:
                 return result
-                
+
         except Exception as e:
             return UriResponse.error_response(f"Content regeneration failed: {str(e)}")
     
