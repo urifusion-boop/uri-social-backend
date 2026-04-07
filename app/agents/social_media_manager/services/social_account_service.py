@@ -17,6 +17,7 @@ class SocialAccountService:
     async def initiate_connection_flow(
         user_id: str,
         platforms: List[str],
+        source: str = "onboarding",
     ) -> Dict[str, Any]:
         """
         Build Outstand OAuth URLs for each requested platform.
@@ -25,8 +26,9 @@ class SocialAccountService:
         The frontend should open each auth_url for the user to authorise.
         """
         outstand = OutstandService()
-        _base = settings.URI_GATEWAY_BASE_API_URL.rstrip("/")
-        callback_url = f"{_base}/social-media/connect/callback/outstand"
+        # Use PUBLIC_API_URL if set (browser-reachable), otherwise fall back to gateway URL
+        _base = (settings.PUBLIC_API_URL or settings.URI_GATEWAY_BASE_API_URL).rstrip("/")
+        callback_url = f"{_base}/social-media/connect/callback/outstand?source={source}"
 
         auth_urls: Dict[str, str] = {}
         unsupported: List[str] = []
@@ -92,7 +94,7 @@ class SocialAccountService:
     # -------------------------------------------------------------------------
 
     @staticmethod
-    async def get_pending_connection(session_token: str) -> Dict[str, Any]:
+    async def get_pending_connection(session_token: str, db=None) -> Dict[str, Any]:
         """
         After Outstand OAuth redirect, retrieve available pages/accounts.
         The frontend shows these to the user for selection before finalising.
@@ -101,11 +103,48 @@ class SocialAccountService:
         try:
             result = await outstand.get_pending_connection(session_token)
             pending_data = result.get("data", {})
+            raw_pages = pending_data.get("availablePages", [])
+            print(f"[PendingConnection] raw availablePages: {raw_pages}")
+
+            # Store page access tokens server-side so finalize_connection can use
+            # them to auto-detect linked Instagram Business Accounts.
+            augmented_pages = list(raw_pages)
+            if raw_pages and db is not None:
+                from .instagram_direct_service import InstagramDirectService
+                token_docs = []
+                for p in raw_pages:
+                    if not p.get("id") or not p.get("pageAccessToken"):
+                        continue
+                    token_docs.append({
+                        "session_token": session_token,
+                        "page_id": p["id"],
+                        "page_access_token": p["pageAccessToken"],
+                        "page_name": p.get("name", ""),
+                    })
+                    # Preview linked Instagram account for the selector UI
+                    ig = await InstagramDirectService.get_instagram_account_from_page(
+                        p["id"], p["pageAccessToken"]
+                    )
+                    if ig:
+                        augmented_pages.append({
+                            "id": ig["id"],
+                            "name": ig.get("name") or ig.get("username"),
+                            "username": ig.get("username"),
+                            "type": "instagram_business_account",
+                            "network": "instagram",
+                            "profilePictureUrl": ig.get("profile_picture_url"),
+                            "auto_connect": True,
+                            "linked_page_id": p["id"],
+                        })
+                if token_docs:
+                    await db["pending_page_tokens"].delete_many({"session_token": session_token})
+                    await db["pending_page_tokens"].insert_many(token_docs)
+
             return UriResponse.get_single_data_response("pending_connection", {
                 "session_token": session_token,
                 "network": pending_data.get("network"),
                 "expires_at": pending_data.get("expiresAt"),
-                "available_pages": pending_data.get("availablePages", []),
+                "available_pages": augmented_pages,
             })
         except Exception as e:
             return UriResponse.error_response(
@@ -133,9 +172,11 @@ class SocialAccountService:
         outstand = OutstandService()
         try:
             result = await outstand.finalize_connection(session_token, selected_page_ids)
-            accounts = result.get("data", [])
+            print(f"[Finalize] raw result: {result}")
+            accounts = result.get("connectedAccounts") or result.get("data", [])
             if not isinstance(accounts, list):
                 accounts = [accounts]
+            print(f"[Finalize] accounts: {accounts}")
 
             now = datetime.utcnow()
             stored = []
@@ -143,8 +184,8 @@ class SocialAccountService:
                 outstand_account_id = acc.get("id")
                 network = acc.get("network")
 
-                # Mirror in local DB for fast publish-time lookups
                 doc = {
+                    "id": outstand_account_id,
                     "user_id": user_id,
                     "platform": network,
                     "outstand_account_id": outstand_account_id,
@@ -158,21 +199,67 @@ class SocialAccountService:
                     "connected_at": now,
                     "updated_at": now,
                 }
-                await db["social_connections"].replace_one(
-                    {
-                        "user_id": user_id,
-                        "platform": network,
-                        "outstand_account_id": outstand_account_id,
-                    },
-                    doc,
-                    upsert=True,
-                )
+                await db["social_connections"].delete_many({
+                    "$or": [
+                        {"id": outstand_account_id},
+                        {"user_id": user_id, "platform": network},
+                    ]
+                })
+                await db["social_connections"].insert_one(doc)
                 stored.append({
                     "outstand_account_id": outstand_account_id,
                     "platform": network,
                     "username": acc.get("username"),
                     "account_name": acc.get("nickname") or acc.get("username"),
                 })
+
+            # Auto-detect Instagram Business Accounts linked to connected Facebook Pages.
+            # Page access tokens were captured server-side in get_pending_connection.
+            print(f"[Finalize] stored platforms: {[s['platform'] for s in stored]}")
+            if any(s["platform"] == "facebook" for s in stored):
+                from .instagram_direct_service import InstagramDirectService
+                for page_id in selected_page_ids:
+                    token_doc = await db["pending_page_tokens"].find_one(
+                        {"session_token": session_token, "page_id": page_id}
+                    )
+                    if not token_doc or not token_doc.get("page_access_token"):
+                        continue
+                    page_token = token_doc["page_access_token"]
+                    ig = await InstagramDirectService.get_instagram_account_from_page(page_id, page_token)
+                    if not ig:
+                        print(f"ℹ️ No Instagram Business Account linked to Facebook Page {page_id}")
+                        continue
+                    ig_doc = {
+                        "id": ig["id"],
+                        "user_id": user_id,
+                        "platform": "instagram",
+                        "connected_via": "instagram_direct",
+                        "ig_user_id": ig["id"],
+                        "page_id": page_id,
+                        "page_access_token": page_token,
+                        "username": ig.get("username"),
+                        "account_name": ig.get("name") or ig.get("username"),
+                        "profile_picture_url": ig.get("profile_picture_url"),
+                        "connection_status": "active",
+                        "connected_at": now,
+                        "updated_at": now,
+                    }
+                    # Delete any existing doc that could conflict on either the id_1 index
+                    # or the user+platform combination (stale docs from prior test runs).
+                    await db["social_connections"].delete_many({
+                        "$or": [
+                            {"id": ig["id"]},
+                            {"user_id": user_id, "platform": "instagram"},
+                        ]
+                    })
+                    await db["social_connections"].insert_one(ig_doc)
+                    stored.append({
+                        "platform": "instagram",
+                        "username": ig.get("username"),
+                        "account_name": ig.get("name") or ig.get("username"),
+                    })
+                    print(f"✅ Instagram direct: @{ig.get('username')} (ig_user_id={ig['id']})")
+                await db["pending_page_tokens"].delete_many({"session_token": session_token})
 
             return UriResponse.get_single_data_response("accounts_connected", {
                 "user_id": user_id,
@@ -182,6 +269,8 @@ class SocialAccountService:
             })
 
         except Exception as e:
+            import traceback as _tb
+            print(f"[Finalize] EXCEPTION: {e}\n{_tb.format_exc()}")
             return UriResponse.error_response(
                 f"Failed to finalise connection: {str(e)}",
                 code=500,
@@ -220,11 +309,31 @@ class SocialAccountService:
                     "connected_at": acc.get("createdAt"),
                 })
 
+            # Merge in direct connections (e.g. Instagram via Facebook Page token)
+            direct_cursor = db["social_connections"].find({
+                "user_id": user_id,
+                "connected_via": {"$ne": "outstand"},
+                "connection_status": "active",
+            })
+            async for doc in direct_cursor:
+                platform = doc.get("platform", "unknown")
+                by_platform.setdefault(platform, []).append({
+                    "platform": platform,
+                    "connected_via": doc.get("connected_via"),
+                    "username": doc.get("username"),
+                    "account_name": doc.get("account_name"),
+                    "profile_picture_url": doc.get("profile_picture_url"),
+                    "is_active": True,
+                    "connected_at": doc.get("connected_at"),
+                    "page_name": doc.get("account_name"),
+                })
+
+            total = sum(len(v) for v in by_platform.values())
             return UriResponse.get_single_data_response("user_connections", {
                 "user_id": user_id,
                 "connected_platforms": list(by_platform.keys()),
                 "connections": by_platform,
-                "total_connections": len(accounts),
+                "total_connections": total,
             })
 
         except Exception as e:
