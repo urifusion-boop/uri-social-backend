@@ -18,8 +18,8 @@ services:
     ports:
       - "9005:80"
     networks:
-      - uri-network
+      - uritest-network
 
 networks:
-  uri-network:
+  uritest-network:
     external: true
