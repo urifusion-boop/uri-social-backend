@@ -27,9 +27,21 @@ class SubscriptionService:
     """
 
     def __init__(self):
-        self.db: AsyncIOMotorDatabase = get_db()
-        self.subscription_tiers_collection = self.db["subscription_tiers"]
-        self.user_credits_collection = self.db["user_credits"]
+        self._db: Optional[AsyncIOMotorDatabase] = None
+
+    @property
+    def db(self) -> AsyncIOMotorDatabase:
+        if self._db is None:
+            self._db = get_db()
+        return self._db
+
+    @property
+    def subscription_tiers_collection(self):
+        return self.db["subscription_tiers"]
+
+    @property
+    def user_credits_collection(self):
+        return self.db["user_credits"]
 
     # ==================== PRD 5: Plan Structure ====================
 
