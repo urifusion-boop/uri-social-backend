@@ -89,8 +89,8 @@ jobs:
             docker build -t uriteam/urisvc:uriagentdev .
 
             # Deploy container
-            docker-compose -f docker-compose.dev.yml down
-            docker-compose -f docker-compose.dev.yml up -d
+            docker-compose -p uri-social-backend-dev -f docker-compose.dev.yml down
+            docker-compose -p uri-social-backend-dev -f docker-compose.dev.yml up -d
 
             # Cleanup redundant images
             docker image prune -f
