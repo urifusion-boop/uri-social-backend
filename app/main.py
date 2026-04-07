@@ -42,18 +42,17 @@ async def startup_event():
         print(f"⚠️  Warning: Failed to initialize subscription tiers: {e}")
 
 # CORS
-# allow_credentials must be False when allow_origins=["*"].
-# The frontend uses Bearer tokens (Authorization header), not cookies,
-# so credentials mode is not needed.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["*"],
-    expose_headers=["*"],
-    max_age=3600,
-)
+# CORS is now handled at nginx level to avoid duplicate headers
+# Commenting out FastAPI CORS middleware
+# app.add_middleware(
+#     CORSMiddleware,
+#     allow_origins=["*"],
+#     allow_credentials=False,
+#     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+#     allow_headers=["*"],
+#     expose_headers=["*"],
+#     max_age=3600,
+# )
 
 
 @app.exception_handler(HTTPException)
