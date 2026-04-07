@@ -597,6 +597,10 @@ async def regenerate_draft_image(
 ):
     """
     Regenerate the image for an existing draft using user feedback.
+    PRD 3.2 & 4.2: Image Retry Rules
+    - First retry: FREE
+    - Second retry: 1 credit (requires confirmation)
+
     Clears the current image immediately (frontend shows shimmer),
     then generates a new image in the background incorporating the feedback.
     """
@@ -609,19 +613,91 @@ async def regenerate_draft_image(
     if not feedback:
         raise HTTPException(status_code=400, detail="feedback is required")
 
-    # Verify the draft belongs to this user
+    # PRD 3.3: Check if user confirmed second retry (optional - for second retry)
+    confirmed = body.get("confirmed", False)
+
+    # Verify the draft belongs to this user and get retry count
     draft = await db["content_drafts"].find_one(
         {"$or": [{"id": draft_id}, {"draft_id": draft_id}], "user_id": user_id},
-        {"_id": 0, "id": 1},
+        {"_id": 0, "id": 1, "image_retry_count": 1, "request_id": 1},
     )
     if not draft:
         raise HTTPException(status_code=404, detail="Draft not found")
 
-    # Clear the image so the frontend shimmer shows while regeneration runs
+    # PRD 4.3: Track image retry count per campaign
+    image_retry_count = draft.get("image_retry_count", 0)
+
+    # PRD 3.2 & 4.2: First retry is FREE, second retry requires 1 credit
+    if image_retry_count >= 1:
+        # This is the second or later retry - requires credit
+        # PRD 3.3: Show confirmation prompt before second retry
+        if not confirmed:
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "status": True,
+                    "responseCode": 200,
+                    "responseMessage": "This action will use 1 credit. Continue?",
+                    "responseData": {
+                        "requires_confirmation": True,
+                        "requires_credit": True,
+                        "image_retry_count": image_retry_count,
+                        "message": "This action will use 1 credit. Continue?"
+                    }
+                }
+            )
+
+        # User confirmed - check and deduct credit
+        from app.services.CreditService import credit_service
+
+        has_credits = await credit_service.check_sufficient_credits(user_id, required=1)
+        if not has_credits:
+            # PRD 8: Out of credits - block action
+            return JSONResponse(
+                status_code=402,
+                content={
+                    "status": False,
+                    "responseCode": 402,
+                    "responseMessage": "You've run out of credits. Upgrade to continue.",
+                    "responseData": {
+                        "credits_remaining": 0,
+                        "upgrade_url": "/pricing"
+                    }
+                }
+            )
+
+        # Deduct 1 credit for second retry
+        request_id = draft.get("request_id", draft_id)
+        deducted = await credit_service.deduct_credit(
+            user_id=user_id,
+            campaign_id=request_id,
+            reason="image_retry",
+            retry_count=image_retry_count
+        )
+
+        if not deducted:
+            return JSONResponse(
+                status_code=402,
+                content={
+                    "status": False,
+                    "responseCode": 402,
+                    "responseMessage": "Failed to deduct credit. Please try again.",
+                    "responseData": {}
+                }
+            )
+
+    # PRD 4.3: Increment image retry count and clear image
     from datetime import datetime as _dt
     await db["content_drafts"].update_one(
         {"$or": [{"id": draft_id}, {"draft_id": draft_id}]},
-        {"$set": {"image_url": None, "has_image": True, "updated_at": _dt.utcnow()}},
+        {
+            "$set": {
+                "image_url": None,
+                "has_image": True,
+                "updated_at": _dt.utcnow()
+            },
+            "$inc": {"image_retry_count": 1}  # Track retry count
+        },
     )
 
     from app.agents.social_media_manager.services.image_content_service import ImageContentService
@@ -634,7 +710,15 @@ async def regenerate_draft_image(
     )
 
     from app.domain.responses.uri_response import UriResponse
-    return UriResponse.get_single_data_response("regenerate_image", {"draft_id": draft_id, "status": "generating"})
+    return UriResponse.get_single_data_response(
+        "regenerate_image",
+        {
+            "draft_id": draft_id,
+            "status": "generating",
+            "image_retry_count": image_retry_count + 1,
+            "credit_deducted": image_retry_count >= 1  # True if credit was deducted
+        }
+    )
 
 
 @router.delete("/drafts/{draft_id}")
