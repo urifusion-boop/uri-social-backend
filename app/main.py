@@ -7,6 +7,9 @@ from app.database import connect_to_mongo
 from app.core.config import settings
 from app.core.sentry_config import initialize_sentry
 from app.agents.social_media_manager.routers.complete_social_manager import router as social_media_router
+from app.agents.social_media_manager.routers.whatsapp_router import router as whatsapp_router
+from app.agents.social_media_manager.routers.x_router import router as x_router
+from app.agents.social_media_manager.routers.linkedin_router import router as linkedin_router
 from app.routers.auth_router import router as auth_router
 from app.routers.billing_router import router as billing_router
 
@@ -69,12 +72,20 @@ app.include_router(
     tags=["Auth"],
 )
 
+# Also mount auth at /auth for backwards compatibility
+app.include_router(auth_router)
+
 # Include billing router under /social-media prefix (PRD: Credit-Based Pricing System)
 app.include_router(
     billing_router,
     prefix="/social-media",
     tags=["Billing"],
 )
+
+# Include additional social platform routers
+app.include_router(whatsapp_router)
+app.include_router(x_router)
+app.include_router(linkedin_router)
 
 
 @app.get("/")

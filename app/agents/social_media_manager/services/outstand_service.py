@@ -116,6 +116,47 @@ class OutstandService:
             resp.raise_for_status()
             return resp.json()
 
+    async def get_post_analytics(self, post_id: str) -> Dict[str, Any]:
+        """Fetch analytics for a published post from Outstand's GET /v1/posts/{id}/analytics."""
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            resp = await client.get(
+                f"{self.base_url}/v1/posts/{post_id}/analytics",
+                headers=self.headers,
+            )
+            resp.raise_for_status()
+            return resp.json()
+
+    async def get_account_metrics(
+        self,
+        account_id: str,
+        since: Optional[int] = None,
+        until: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Fetch account-level metrics from Outstand's GET /v1/social-accounts/{id}/metrics."""
+        params: Dict[str, Any] = {}
+        if since is not None:
+            params["since"] = since
+        if until is not None:
+            params["until"] = until
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            resp = await client.get(
+                f"{self.base_url}/v1/social-accounts/{account_id}/metrics",
+                headers=self.headers,
+                params=params,
+            )
+            resp.raise_for_status()
+            return resp.json()
+
+    async def get_post(self, post_id: str) -> Dict[str, Any]:
+        """Fetch the current status/details of a post from Outstand's GET /v1/posts/{id}."""
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            resp = await client.get(
+                f"{self.base_url}/v1/posts/{post_id}",
+                headers=self.headers,
+            )
+            resp.raise_for_status()
+            return resp.json()
+
     async def publish_post(
         self,
         outstand_account_ids: List[str],
@@ -124,14 +165,22 @@ class OutstandService:
         media_urls: Optional[List[str]] = None,
         tweets: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
+        def _media_objects(urls: List[str]) -> List[Dict[str, str]]:
+            result = []
+            for u in urls:
+                ext = u.rsplit(".", 1)[-1].split("?")[0].lower() if "." in u else "jpg"
+                filename = u.rsplit("/", 1)[-1].split("?")[0] or f"image.{ext}"
+                result.append({"url": u, "filename": filename})
+            return result
+
         if tweets and len(tweets) > 1:
             containers = [{"content": t} for t in tweets]
             if media_urls:
-                containers[0]["media"] = [{"url": u} for u in media_urls]
+                containers[0]["media"] = _media_objects(media_urls)
         else:
             container: Dict[str, Any] = {"content": content}
             if media_urls:
-                container["media"] = [{"url": u} for u in media_urls]
+                container["media"] = _media_objects(media_urls)
             containers = [container]
 
         payload: Dict[str, Any] = {
@@ -148,6 +197,6 @@ class OutstandService:
                 headers=self.headers,
                 json=payload,
             )
-            print(f"📡 Outstand response status: {resp.status_code} body: {resp.text[:500]}")
+            print(f"📡 Outstand response status: {resp.status_code} body: {resp.text[:2000]}")
             resp.raise_for_status()
             return resp.json()
