@@ -4,7 +4,7 @@ import asyncio
 import json
 import traceback
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query, Request, UploadFile, File
-from fastapi.responses import RedirectResponse, StreamingResponse
+from fastapi.responses import RedirectResponse, StreamingResponse, JSONResponse
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any, AsyncGenerator
@@ -213,9 +213,9 @@ async def generate_content(
         has_credits = await credit_service.check_sufficient_credits(user_id)
         if not has_credits:
             # PRD 8: "You've run out of credits. Upgrade to continue."
-            raise HTTPException(
+            return JSONResponse(
                 status_code=402,
-                detail={
+                content={
                     "status": False,
                     "responseCode": 402,
                     "responseMessage": "You've run out of credits. Upgrade to continue.",
