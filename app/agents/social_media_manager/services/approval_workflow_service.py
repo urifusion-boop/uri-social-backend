@@ -390,6 +390,7 @@ class ApprovalWorkflowService:
                     "regeneration_feedback": regeneration_feedback,
                     "retry_number": new_retry_count,  # Track which retry this is
                     "credit_charged": new_retry_count >= 2,  # Was credit charged?
+                    "image_retry_count": 0,  # PRD 4.3: Initialize image retry count
                     "ai_metadata": new_draft_data.get("ai_metadata"),
                     "created_at": datetime.utcnow(),
                     "updated_at": datetime.utcnow()
