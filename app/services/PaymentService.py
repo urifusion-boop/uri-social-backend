@@ -11,6 +11,7 @@ Handles payment processing:
 import httpx
 import hashlib
 import hmac
+import json
 from typing import Optional, Dict
 from datetime import datetime
 from bson import ObjectId
@@ -36,8 +37,8 @@ class PaymentService:
         # SQUAD API configuration
         self.squad_secret_key = getattr(settings, 'SQUAD_SECRET_KEY', '')
         self.squad_public_key = getattr(settings, 'SQUAD_PUBLIC_KEY', '')
-        self.squad_webhook_secret = getattr(settings, 'SQUAD_WEBHOOK_SECRET', '')
-        self.squad_api_url = "https://api.squadco.com"
+        # SQUAD uses same secret key for webhook validation (HMAC-SHA512)
+        self.squad_api_url = getattr(settings, 'SQUAD_BASE_URL', 'https://sandbox-api-d.squadco.com')  # Use sandbox by default
         self.callback_url = getattr(settings, 'SQUAD_CALLBACK_URL', 'https://www.urisocial.com/checkout/callback')
 
     @property
@@ -99,13 +100,15 @@ class PaymentService:
                     "Content-Type": "application/json"
                 }
 
+                # SQUAD API payload structure (per official docs)
                 payload = {
                     "email": user_email,
-                    "amount": tier.price_ngn * 100,  # SQUAD expects amount in kobo (₦1 = 100 kobo)
+                    "amount": tier.price_ngn,  # SQUAD expects amount in Naira (not kobo)
                     "currency": "NGN",
+                    "initiate_type": "inline",  # Required: opens payment modal
                     "transaction_ref": transaction_ref,
                     "callback_url": self.callback_url,
-                    "metadata": {
+                    "meta": {  # Note: SQUAD uses "meta" not "metadata"
                         "user_id": user_id,
                         "tier_id": tier_id,
                         "tier_name": tier.name
@@ -121,9 +124,14 @@ class PaymentService:
 
                 response_data = response.json()
 
+                # SQUAD response structure: { "status": 200, "success": true, "message": "", "data": { "checkout_url": "..." } }
                 if response.status_code == 200 and response_data.get("success"):
                     # Extract checkout URL from SQUAD response
-                    checkout_url = response_data.get("data", {}).get("checkout_url")
+                    data = response_data.get("data", {})
+                    checkout_url = data.get("checkout_url") or data.get("authorization_url")  # Some gateways use authorization_url
+
+                    if not checkout_url:
+                        raise Exception(f"SQUAD response missing checkout_url: {response_data}")
 
                     return InitializePaymentResponse(
                         payment_url=checkout_url,
@@ -255,15 +263,29 @@ class PaymentService:
         """
         Handle SQUAD webhook callback
         PRD 6.3: SQUAD sends webhook to POST /billing/webhook
+
+        Webhook structure (per SQUAD docs):
+        {
+            "Event": "charge_successful",
+            "TransactionRef": "4678388588A0",
+            "Body": {
+                "transaction_ref": "4678388588A0",
+                "transaction_status": "success" or "Success",
+                "amount": 83000,
+                "email": "user@example.com",
+                ...
+            }
+        }
         """
-        # Verify webhook signature (SQUAD HMAC-SHA512)
-        if signature and self.squad_webhook_secret:
+        # Verify webhook signature (SQUAD HMAC-SHA512 via x-squad-encrypted-body header)
+        if signature and self.squad_secret_key:
             if not self._verify_webhook_signature(payload, signature):
                 raise ValueError("Invalid webhook signature")
 
-        # Extract transaction details
-        transaction_ref = payload.get("transaction_ref")
-        transaction_status = payload.get("transaction_status")
+        # SQUAD webhook structure: Event + TransactionRef + Body
+        transaction_ref = payload.get("TransactionRef") or payload.get("transaction_ref")
+        body = payload.get("Body", {})
+        transaction_status = body.get("transaction_status", "").lower()  # Normalize to lowercase
 
         if not transaction_ref:
             raise ValueError("Missing transaction_ref in webhook payload")
@@ -294,16 +316,25 @@ class PaymentService:
     def _verify_webhook_signature(self, payload: Dict, signature: str) -> bool:
         """
         Verify SQUAD webhook signature using HMAC-SHA512
-        """
-        # Create HMAC hash of payload
-        payload_string = str(payload)
-        expected_signature = hmac.new(
-            self.squad_webhook_secret.encode(),
-            payload_string.encode(),
-            hashlib.sha512
-        ).hexdigest()
 
-        return hmac.compare_digest(expected_signature, signature)
+        Per SQUAD docs:
+        - Header: x-squad-encrypted-body
+        - Algorithm: HMAC SHA512
+        - Key: Your secret key
+        - Payload: JSON string of the webhook body
+        """
+        # Serialize payload to JSON string (SQUAD uses JSON.stringify equivalent)
+        payload_string = json.dumps(payload, separators=(',', ':'), sort_keys=False)
+
+        # Create HMAC-SHA512 hash
+        expected_signature = hmac.new(
+            self.squad_secret_key.encode('utf-8'),
+            payload_string.encode('utf-8'),
+            hashlib.sha512
+        ).hexdigest().upper()  # SQUAD sends signature in UPPERCASE
+
+        # Use timing-safe comparison
+        return hmac.compare_digest(expected_signature, signature.upper())
 
     # ==================== Transaction Retrieval ====================
 
