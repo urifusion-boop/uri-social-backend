@@ -764,6 +764,34 @@ async def deny_content(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@router.post("/drafts/{draft_id}/unschedule")
+async def unschedule_draft(
+    draft_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """Move a scheduled draft back to draft status."""
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    draft = await db["content_drafts"].find_one({"id": draft_id})
+    if not draft:
+        raise HTTPException(status_code=404, detail="Draft not found")
+
+    await db["content_drafts"].update_one(
+        {"id": draft_id},
+        {"$set": {
+            "status": "draft",
+            "scheduled_date": None,
+            "platform_post_id": None,
+            "updated_at": datetime.utcnow(),
+        }},
+    )
+    from app.domain.responses.uri_response import UriResponse
+    return UriResponse.get_single_data_response("unschedule", {"draft_id": draft_id, "status": "draft"})
+
+
 @router.put("/refine")
 async def refine_content(
     request: RefinementRequest,
