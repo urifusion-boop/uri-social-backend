@@ -101,18 +101,14 @@ class PaymentService:
                 }
 
                 # SQUAD API payload structure (per official docs)
+                # Note: Sandbox doesn't accept "meta" field, only live does
                 payload = {
                     "email": user_email,
                     "amount": tier.price_ngn,  # SQUAD expects amount in Naira (not kobo)
                     "currency": "NGN",
                     "initiate_type": "inline",  # Required: opens payment modal
                     "transaction_ref": transaction_ref,
-                    "callback_url": self.callback_url,
-                    "meta": {  # Note: SQUAD uses "meta" not "metadata"
-                        "user_id": user_id,
-                        "tier_id": tier_id,
-                        "tier_name": tier.name
-                    }
+                    "callback_url": self.callback_url
                 }
 
                 response = await client.post(
