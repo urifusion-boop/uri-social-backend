@@ -38,21 +38,32 @@ class InstagramDirectService:
                 resp = await client.get(
                     f"{GRAPH_BASE}/{page_id}",
                     params={
-                        "fields": "instagram_business_account{id,name,username,profile_picture_url}",
+                        "fields": (
+                            "instagram_business_account{id,name,username,profile_picture_url},"
+                            "connected_instagram_account{id,name,username,profile_picture_url}"
+                        ),
                         "access_token": page_access_token,
                     },
                 )
                 data = resp.json()
                 print(f"[IG Lookup] page_id={page_id} raw_response={data}")
-                ig = data.get("instagram_business_account")
-                if ig and ig.get("id"):
-                    print(f"[IG Lookup] ✅ Found Instagram account: id={ig.get('id')} username=@{ig.get('username')}")
-                    return ig
-                elif "error" in data:
+
+                if "error" in data:
                     err = data["error"]
                     print(f"[IG Lookup] ❌ Graph API error: code={err.get('code')} subcode={err.get('error_subcode')} msg={err.get('message')}")
-                else:
-                    print(f"[IG Lookup] ℹ️ No instagram_business_account field returned — account may not be linked or is a Personal account")
+                    return None
+
+                # Prefer instagram_business_account; fall back to connected_instagram_account
+                ig = data.get("instagram_business_account") or data.get("connected_instagram_account")
+                if ig and ig.get("id"):
+                    source = "instagram_business_account" if data.get("instagram_business_account") else "connected_instagram_account"
+                    print(f"[IG Lookup] ✅ Found Instagram account via {source}: id={ig.get('id')} username=@{ig.get('username')}")
+                    return ig
+
+                print(
+                    f"[IG Lookup] ℹ️ Neither instagram_business_account nor connected_instagram_account returned. "
+                    f"Token may lack instagram_basic permission, or the Instagram account is not linked to this page."
+                )
         except Exception as e:
             print(f"⚠️ Instagram account lookup failed for page {page_id}: {e}")
         return None
