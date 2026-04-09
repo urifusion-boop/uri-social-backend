@@ -43,9 +43,16 @@ class InstagramDirectService:
                     },
                 )
                 data = resp.json()
+                print(f"[IG Lookup] page_id={page_id} raw_response={data}")
                 ig = data.get("instagram_business_account")
                 if ig and ig.get("id"):
+                    print(f"[IG Lookup] ✅ Found Instagram account: id={ig.get('id')} username=@{ig.get('username')}")
                     return ig
+                elif "error" in data:
+                    err = data["error"]
+                    print(f"[IG Lookup] ❌ Graph API error: code={err.get('code')} subcode={err.get('error_subcode')} msg={err.get('message')}")
+                else:
+                    print(f"[IG Lookup] ℹ️ No instagram_business_account field returned — account may not be linked or is a Personal account")
         except Exception as e:
             print(f"⚠️ Instagram account lookup failed for page {page_id}: {e}")
         return None

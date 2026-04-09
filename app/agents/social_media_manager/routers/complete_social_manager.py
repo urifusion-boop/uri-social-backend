@@ -764,6 +764,35 @@ async def deny_content(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@router.post("/drafts/{draft_id}/unschedule")
+async def unschedule_draft(
+    draft_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """Move a scheduled draft back to draft status."""
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    draft = await db["content_drafts"].find_one({"id": draft_id})
+    if not draft:
+        raise HTTPException(status_code=404, detail="Draft not found")
+
+    await db["content_drafts"].update_one(
+        {"id": draft_id},
+        {"$set": {
+            "status": "draft",
+            "scheduled_date": None,
+            "platform_post_id": None,
+            "user_id": user_id,  # ensure user_id is on the doc so fetchDrafts finds it
+            "updated_at": datetime.utcnow(),
+        }},
+    )
+    from app.domain.responses.uri_response import UriResponse
+    return UriResponse.get_single_data_response("unschedule", {"draft_id": draft_id, "status": "draft"})
+
+
 @router.put("/refine")
 async def refine_content(
     request: RefinementRequest,
@@ -834,27 +863,35 @@ async def get_scheduled_content(
         raise HTTPException(status_code=401, detail="User ID not found in token")
     
     try:
-        # Get user's content requests to filter by user
-        requests = await db["content_requests"].find({"user_id": user_id}).to_list(length=100)
-        request_ids = [req["id"] for req in requests]
-        
-        # Get scheduled drafts for these requests
+        # Query scheduled drafts directly by user_id (same pattern as /content-calendar).
+        # Also fall back to request_id lookup for older drafts that may not have user_id
+        # stored directly on the draft document.
+        requests = await db["content_requests"].find({"user_id": user_id}, {"id": 1}).to_list(length=200)
+        request_ids = [req["id"] for req in requests if req.get("id")]
+
         scheduled_drafts = await db["content_drafts"].find({
-            "request_id": {"$in": request_ids},
-            "status": "scheduled"
+            "$or": [
+                {"user_id": user_id, "status": "scheduled"},
+                {"request_id": {"$in": request_ids}, "status": "scheduled"},
+            ]
         }).sort("scheduled_date", 1).to_list(length=100)
-        
-        # Clean up ObjectIds
+
+        # Deduplicate by draft id in case both conditions match the same doc
+        seen = set()
+        unique_drafts = []
         for draft in scheduled_drafts:
-            if "_id" in draft:
-                del draft["_id"]
-        
+            key = draft.get("id") or str(draft.get("_id", ""))
+            if key not in seen:
+                seen.add(key)
+                draft.pop("_id", None)
+                unique_drafts.append(draft)
+
         return UriResponse.get_single_data_response("scheduled_content", {
             "user_id": user_id,
-            "scheduled_drafts": scheduled_drafts,
-            "total_scheduled": len(scheduled_drafts)
+            "scheduled_drafts": unique_drafts,
+            "total_scheduled": len(unique_drafts)
         })
-        
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
