@@ -114,6 +114,7 @@ class SocialAccountService:
                 token_docs = []
                 for p in raw_pages:
                     if not p.get("id") or not p.get("pageAccessToken"):
+                        print(f"[PendingConnection] ⚠️ Skipping page '{p.get('name')}' (id={p.get('id')}) — no pageAccessToken returned by Outstand. Instagram cannot be detected for this page.")
                         continue
                     token_docs.append({
                         "session_token": session_token,
@@ -122,6 +123,7 @@ class SocialAccountService:
                         "page_name": p.get("name", ""),
                     })
                     # Preview linked Instagram account for the selector UI
+                    print(f"[PendingConnection] 🔍 Checking Instagram for page '{p.get('name')}' (id={p.get('id')})")
                     ig = await InstagramDirectService.get_instagram_account_from_page(
                         p["id"], p["pageAccessToken"]
                     )
