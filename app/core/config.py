@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     URI_CLIENT_SECRET: str = ""
 
     # Social platforms
-    FACEBOOK_API_VERSION: str = "v18.0"
+    FACEBOOK_API_VERSION: str = "v21.0"
     META_API_KEY: str = ""
     META_APP_ID: str = ""
     META_APP_SECRET: str = ""
