@@ -150,12 +150,21 @@ class SubscriptionService:
         """
         Get all available subscription tiers
         PRD Section 5: Plan Structure
+        Returns unique tiers by tier_id (removes duplicates)
         """
         query = {"is_active": True} if active_only else {}
         cursor = self.subscription_tiers_collection.find(query).sort("price_ngn", 1)
 
         tiers = []
+        seen_tier_ids = set()
+
         async for doc in cursor:
+            tier_id = doc.get("tier_id")
+            # Skip duplicates - only keep first occurrence of each tier_id
+            if tier_id in seen_tier_ids:
+                continue
+
+            seen_tier_ids.add(tier_id)
             doc["_id"] = str(doc["_id"])
             tiers.append(SubscriptionTier(**doc))
 

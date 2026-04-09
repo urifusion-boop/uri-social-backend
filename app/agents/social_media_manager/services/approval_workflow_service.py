@@ -725,8 +725,8 @@ class ApprovalWorkflowService:
                     {"id": connection["id"]} if connection.get("id")
                     else {"user_id": user_id, "outstand_account_id": connection.get("outstand_account_id")}
                 )
+                is_scheduled = scheduled_datetime is not None
                 if publish_result.get("success"):
-                    is_scheduled = scheduled_datetime is not None
                     await db["content_drafts"].update_one(
                         {"id": draft_id},
                         {"$set": {
@@ -740,6 +740,19 @@ class ApprovalWorkflowService:
                         }},
                     )
                     await db["social_connections"].update_one(conn_filter, {"$inc": {"total_posts_published": 1}})
+                elif is_scheduled:
+                    # When scheduling, the draft was already marked status=scheduled in
+                    # approve_content. Keep that status — don't overwrite to publish_failed.
+                    # The cron job will attempt the actual publish at the right time.
+                    print(f"⚠️ Scheduled dispatch failed for draft_id={draft_id}, keeping status=scheduled: {publish_result.get('error')}")
+                    await db["content_drafts"].update_one(
+                        {"id": draft_id},
+                        {"$set": {
+                            "status": "scheduled",
+                            "scheduled_date": scheduled_datetime,
+                            "updated_at": datetime.utcnow(),
+                        }},
+                    )
                 else:
                     await db["content_drafts"].update_one(
                         {"id": draft_id},
