@@ -394,7 +394,7 @@ async def initiate_social_connections(
 async def instagram_direct_initiate(source: Optional[str] = Query("settings")):
     """
     Redirect the user's browser to Instagram's OAuth authorization page.
-    Uses Instagram Login (api.instagram.com) with the same Meta app credentials,
+    Uses Instagram Business Login (www.instagram.com) with the same Meta app credentials,
     bypassing Outstand entirely. On completion, Instagram redirects to
     /connect/instagram-direct/callback.
     """
@@ -407,10 +407,10 @@ async def instagram_direct_initiate(source: Optional[str] = Query("settings")):
     redirect_uri = f"{_base}/social-media/connect/instagram-direct/callback"
 
     scopes = [
-        "instagram_basic",
-        "instagram_content_publish",
-        "instagram_manage_insights",
-        "instagram_manage_comments",
+        "instagram_business_basic",
+        "instagram_business_content_publish",
+        "instagram_business_manage_messages",
+        "instagram_business_manage_comments",
     ]
     params = {
         "client_id": settings.META_APP_ID,
@@ -419,7 +419,7 @@ async def instagram_direct_initiate(source: Optional[str] = Query("settings")):
         "response_type": "code",
         "state": source or "settings",
     }
-    auth_url = "https://api.instagram.com/oauth/authorize?" + urllib.parse.urlencode(params)
+    auth_url = "https://www.instagram.com/oauth/authorize?" + urllib.parse.urlencode(params)
     return RedirectResponse(auth_url)
 
 
@@ -496,9 +496,9 @@ async def instagram_direct_callback(
 
             # Step 3: fetch profile
             profile_resp = await client.get(
-                f"https://graph.instagram.com/{ig_user_id}",
+                "https://graph.instagram.com/me",
                 params={
-                    "fields": "id,username,account_type,profile_picture_url",
+                    "fields": "id,username,name,profile_picture_url",
                     "access_token": long_token,
                 },
             )
