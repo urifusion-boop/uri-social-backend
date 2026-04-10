@@ -27,6 +27,10 @@ class Settings(BaseSettings):
     META_APP_SECRET: str = ""
     META_SYSTEM_TOKEN: str = ""
 
+    # Instagram Business Login (separate app credentials from the Instagram product)
+    INSTAGRAM_APP_ID: str = ""
+    INSTAGRAM_APP_SECRET: str = ""
+
     # Outstand
     OUTSTAND_API_KEY: Optional[str] = None
     OUTSTAND_WEBHOOK_SECRET: Optional[str] = None  # For verifying Outstand webhook signatures
