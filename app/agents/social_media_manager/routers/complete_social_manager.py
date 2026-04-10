@@ -390,6 +390,184 @@ async def initiate_social_connections(
     )
 
 
+@router.get("/connect/instagram-direct/initiate")
+async def instagram_direct_initiate(source: Optional[str] = Query("settings")):
+    """
+    Redirect the user's browser to Instagram's OAuth authorization page.
+    Uses Instagram Login (api.instagram.com) with the same Meta app credentials,
+    bypassing Outstand entirely. On completion, Instagram redirects to
+    /connect/instagram-direct/callback.
+    """
+    import urllib.parse
+
+    if not settings.META_APP_ID:
+        raise HTTPException(status_code=500, detail="META_APP_ID not configured")
+
+    _base = (settings.PUBLIC_API_URL or settings.URI_GATEWAY_BASE_API_URL).rstrip("/")
+    redirect_uri = f"{_base}/social-media/connect/instagram-direct/callback"
+
+    scopes = [
+        "instagram_basic",
+        "instagram_content_publish",
+        "instagram_manage_insights",
+        "instagram_manage_comments",
+    ]
+    params = {
+        "client_id": settings.META_APP_ID,
+        "redirect_uri": redirect_uri,
+        "scope": ",".join(scopes),
+        "response_type": "code",
+        "state": source or "settings",
+    }
+    auth_url = "https://api.instagram.com/oauth/authorize?" + urllib.parse.urlencode(params)
+    return RedirectResponse(auth_url)
+
+
+@router.get("/connect/instagram-direct/callback")
+async def instagram_direct_callback(
+    code: Optional[str] = Query(None),
+    state: Optional[str] = Query(None),
+    error: Optional[str] = Query(None),
+    error_reason: Optional[str] = Query(None),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """
+    Instagram OAuth callback. Exchanges the auth code for a short-lived token,
+    then exchanges for a long-lived token (60 days), fetches profile info,
+    and stores the connection in social_connections as connected_via=instagram_direct_oauth.
+    No JWT required — the user arrives here via browser redirect from Instagram.
+    """
+    import urllib.parse
+    import httpx
+    from datetime import timezone
+
+    source = state or "settings"
+    is_settings = source == "settings"
+    web_app_url = settings.WEB_APP_URL
+    base_redirect = (
+        f"{web_app_url}/settings/social-accounts"
+        if is_settings
+        else f"{web_app_url}/social-media/brand-setup"
+    )
+
+    if error:
+        msg = urllib.parse.quote(error_reason or error)
+        return RedirectResponse(f"{base_redirect}?connected=false&error={msg}")
+
+    if not code:
+        return RedirectResponse(f"{base_redirect}?connected=false&error=missing_code")
+
+    _base = (settings.PUBLIC_API_URL or settings.URI_GATEWAY_BASE_API_URL).rstrip("/")
+    redirect_uri = f"{_base}/social-media/connect/instagram-direct/callback"
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            # Step 1: exchange code → short-lived user access token
+            token_resp = await client.post(
+                "https://api.instagram.com/oauth/access_token",
+                data={
+                    "client_id": settings.META_APP_ID,
+                    "client_secret": settings.META_APP_SECRET,
+                    "grant_type": "authorization_code",
+                    "redirect_uri": redirect_uri,
+                    "code": code,
+                },
+            )
+            token_data = token_resp.json()
+            print(f"[IGDirectOAuth] short-lived token response: {token_data}")
+            short_token = token_data.get("access_token")
+            ig_user_id = str(token_data.get("user_id", ""))
+            if not short_token or not ig_user_id:
+                err = (token_data.get("error_message") or token_data.get("error", {}).get("message", "token exchange failed"))
+                return RedirectResponse(f"{base_redirect}?connected=false&error={urllib.parse.quote(err)}")
+
+            # Step 2: exchange short-lived → long-lived token (60 days)
+            ll_resp = await client.get(
+                "https://graph.instagram.com/access_token",
+                params={
+                    "grant_type": "ig_exchange_token",
+                    "client_secret": settings.META_APP_SECRET,
+                    "access_token": short_token,
+                },
+            )
+            ll_data = ll_resp.json()
+            print(f"[IGDirectOAuth] long-lived token response: {ll_data}")
+            long_token = ll_data.get("access_token", short_token)
+
+            # Step 3: fetch profile
+            profile_resp = await client.get(
+                f"https://graph.instagram.com/{ig_user_id}",
+                params={
+                    "fields": "id,username,account_type,profile_picture_url",
+                    "access_token": long_token,
+                },
+            )
+            profile = profile_resp.json()
+            print(f"[IGDirectOAuth] profile: {profile}")
+            username = profile.get("username", ig_user_id)
+
+        # Step 4: store in social_connections
+        now = datetime.now(timezone.utc).isoformat()
+        conn_doc = {
+            "id": ig_user_id,
+            "user_id": None,  # unknown — user not authenticated here; matched on next /connections call
+            "platform": "instagram",
+            "connected_via": "instagram_direct_oauth",
+            "ig_user_id": ig_user_id,
+            "page_access_token": long_token,  # user access token (long-lived)
+            "username": username,
+            "account_name": username,
+            "profile_picture_url": profile.get("profile_picture_url"),
+            "connection_status": "pending_user_match",  # matched when user calls /connections
+            "connected_at": now,
+            "updated_at": now,
+        }
+        await db["social_connections"].update_one(
+            {"ig_user_id": ig_user_id, "connected_via": "instagram_direct_oauth"},
+            {"$set": conn_doc},
+            upsert=True,
+        )
+        print(f"[IGDirectOAuth] ✅ Stored @{username} (ig_user_id={ig_user_id}) pending user match")
+
+        # Redirect frontend with enough info to match the connection to the logged-in user
+        params_out = (
+            f"connected=instagram_direct"
+            f"&ig_user_id={urllib.parse.quote(ig_user_id)}"
+            f"&username={urllib.parse.quote(username)}"
+        )
+        return RedirectResponse(f"{base_redirect}?{params_out}")
+
+    except Exception as e:
+        print(f"[IGDirectOAuth] ❌ Error: {e}")
+        return RedirectResponse(
+            f"{base_redirect}?connected=false&error={urllib.parse.quote(str(e))}"
+        )
+
+
+@router.post("/connect/instagram-direct/finalize")
+async def instagram_direct_finalize(
+    ig_user_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Called by the frontend after the Instagram direct OAuth callback to
+    associate the pending connection with the authenticated user.
+    """
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    result = await db["social_connections"].update_one(
+        {"ig_user_id": ig_user_id, "connected_via": "instagram_direct_oauth", "connection_status": "pending_user_match"},
+        {"$set": {"user_id": user_id, "connection_status": "active", "updated_at": datetime.utcnow().isoformat()}},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Pending Instagram connection not found")
+
+    return UriResponse.get_single_data_response("instagram_connected", {"ig_user_id": ig_user_id})
+
+
 @router.get("/connect/callback/outstand")
 async def outstand_oauth_callback(
     sessionToken: Optional[str] = Query(None),
