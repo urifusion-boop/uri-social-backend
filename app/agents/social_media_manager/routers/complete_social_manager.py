@@ -400,8 +400,9 @@ async def instagram_direct_initiate(source: Optional[str] = Query("settings")):
     """
     import urllib.parse
 
-    if not settings.META_APP_ID:
-        raise HTTPException(status_code=500, detail="META_APP_ID not configured")
+    ig_app_id = settings.INSTAGRAM_APP_ID or settings.META_APP_ID
+    if not ig_app_id:
+        raise HTTPException(status_code=500, detail="INSTAGRAM_APP_ID not configured")
 
     _base = (settings.PUBLIC_API_URL or settings.URI_GATEWAY_BASE_API_URL).rstrip("/")
     redirect_uri = f"{_base}/social-media/connect/instagram-direct/callback"
@@ -413,7 +414,7 @@ async def instagram_direct_initiate(source: Optional[str] = Query("settings")):
         "instagram_business_manage_comments",
     ]
     params = {
-        "client_id": settings.META_APP_ID,
+        "client_id": ig_app_id,
         "redirect_uri": redirect_uri,
         "scope": ",".join(scopes),
         "response_type": "code",
@@ -463,11 +464,13 @@ async def instagram_direct_callback(
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             # Step 1: exchange code → short-lived user access token
+            ig_app_id = settings.INSTAGRAM_APP_ID or settings.META_APP_ID
+            ig_app_secret = settings.INSTAGRAM_APP_SECRET or settings.META_APP_SECRET
             token_resp = await client.post(
                 "https://api.instagram.com/oauth/access_token",
                 data={
-                    "client_id": settings.META_APP_ID,
-                    "client_secret": settings.META_APP_SECRET,
+                    "client_id": ig_app_id,
+                    "client_secret": ig_app_secret,
                     "grant_type": "authorization_code",
                     "redirect_uri": redirect_uri,
                     "code": code,
@@ -486,7 +489,7 @@ async def instagram_direct_callback(
                 "https://graph.instagram.com/access_token",
                 params={
                     "grant_type": "ig_exchange_token",
-                    "client_secret": settings.META_APP_SECRET,
+                    "client_secret": ig_app_secret,
                     "access_token": short_token,
                 },
             )
