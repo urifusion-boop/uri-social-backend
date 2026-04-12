@@ -85,12 +85,14 @@ jobs:
             cd ~/uri-social-backend
             echo '${{ secrets.DOCKER_PASSWORD }}' | docker login -u '${{ secrets.DOCKER_USERNAME }}' --password-stdin
 
-            # Build fresh image from synced source code
-            docker build -t uriteam/urisvc:uriagentdev .
+            # Pull the latest image from Docker Hub (built in the previous job)
+            docker pull uriteam/urisvc:uriagentdev
 
-            # Deploy container
+            # Stop and remove old containers
             docker-compose -p uri-social-backend-dev -f docker-compose.dev.yml down
+
+            # Start containers with the new image
             docker-compose -p uri-social-backend-dev -f docker-compose.dev.yml up -d
 
-            # Cleanup redundant images
+            # Cleanup old/unused images
             docker image prune -f
