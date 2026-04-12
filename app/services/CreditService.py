@@ -99,6 +99,8 @@ class CreditService:
         """
         wallet = UserCreditWallet(
             user_id=user_id,
+            bonus_credits=0,
+            subscription_credits=total_credits,
             total_credits=total_credits,
             credits_used=0,
             credits_remaining=total_credits,
@@ -109,6 +111,85 @@ class CreditService:
         )
 
         await self.user_credits_collection.insert_one(wallet.dict(exclude_none=True))
+        return wallet
+
+    async def add_bonus_credits(
+        self,
+        user_id: str,
+        bonus_amount: int,
+        reason: str = "bonus"
+    ) -> UserCreditWallet:
+        """
+        Add bonus credits to user wallet
+        Bonus credits are consumed first and never expire
+        """
+        wallet = await self.get_user_wallet(user_id)
+
+        if not wallet:
+            # Create wallet with bonus credits only
+            new_wallet = UserCreditWallet(
+                user_id=user_id,
+                bonus_credits=bonus_amount,
+                subscription_credits=0,
+                total_credits=bonus_amount,
+                credits_used=0,
+                credits_remaining=bonus_amount,
+                subscription_tier=None,
+                next_renewal=None,
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow()
+            )
+            await self.user_credits_collection.insert_one(new_wallet.dict(exclude_none=True))
+
+            # Log bonus transaction
+            await self.credit_transactions_collection.insert_one(
+                CreditTransaction(
+                    user_id=user_id,
+                    type="bonus",
+                    amount=bonus_amount,
+                    balance_before=0,
+                    balance_after=bonus_amount,
+                    reason=reason,
+                    created_at=datetime.utcnow()
+                ).dict(exclude_none=True)
+            )
+
+            return new_wallet
+
+        # Add to existing wallet
+        current_bonus = getattr(wallet, 'bonus_credits', 0)
+        new_bonus = current_bonus + bonus_amount
+        new_total = new_bonus + getattr(wallet, 'subscription_credits', 0)
+        new_remaining = new_total - wallet.credits_used
+
+        await self.user_credits_collection.update_one(
+            {"user_id": user_id},
+            {
+                "$set": {
+                    "bonus_credits": new_bonus,
+                    "total_credits": new_total,
+                    "credits_remaining": new_remaining,
+                    "updated_at": datetime.utcnow()
+                }
+            }
+        )
+
+        # Log bonus transaction
+        await self.credit_transactions_collection.insert_one(
+            CreditTransaction(
+                user_id=user_id,
+                type="bonus",
+                amount=bonus_amount,
+                balance_before=wallet.credits_remaining,
+                balance_after=new_remaining,
+                reason=reason,
+                created_at=datetime.utcnow()
+            ).dict(exclude_none=True)
+        )
+
+        wallet.bonus_credits = new_bonus
+        wallet.total_credits = new_total
+        wallet.credits_remaining = new_remaining
         return wallet
 
     # ==================== PRD 7.2: Deduction Logic ====================
@@ -140,6 +221,10 @@ class CreditService:
         PRD 7.2: Deduction Logic
         PRD 11: Must log all credit usage events
 
+        Credit deduction priority:
+        1. Bonus credits (consumed first)
+        2. Subscription credits (consumed second)
+
         Legacy users (without wallet) are not deducted - backward compatibility
 
         Returns:
@@ -154,16 +239,34 @@ class CreditService:
         if wallet.credits_remaining < 1:
             return False
 
-        # Calculate new balances
+        # Get current credit breakdown
+        current_bonus = getattr(wallet, 'bonus_credits', 0)
+        current_subscription = getattr(wallet, 'subscription_credits', 0)
         balance_before = wallet.credits_remaining
+
+        # Deduct from bonus first, then subscription
+        if current_bonus > 0:
+            # Deduct from bonus credits
+            new_bonus = current_bonus - 1
+            new_subscription = current_subscription
+        else:
+            # Deduct from subscription credits
+            new_bonus = 0
+            new_subscription = current_subscription - 1
+
+        # Calculate new totals
+        new_total = new_bonus + new_subscription
         new_credits_used = wallet.credits_used + 1
-        new_credits_remaining = wallet.total_credits - new_credits_used
+        new_credits_remaining = new_total
 
         # Update wallet
         await self.user_credits_collection.update_one(
             {"user_id": user_id},
             {
                 "$set": {
+                    "bonus_credits": new_bonus,
+                    "subscription_credits": new_subscription,
+                    "total_credits": new_total,
                     "credits_used": new_credits_used,
                     "credits_remaining": new_credits_remaining,
                     "updated_at": datetime.utcnow()
@@ -202,7 +305,8 @@ class CreditService:
         """
         Allocate credits to user after successful payment
         PRD 6.3: On success: Assign credits, Activate subscription
-        PRD 5.2: Credits reset every billing cycle (no rollover)
+        PRD 5.2: Subscription credits reset every billing cycle (no rollover)
+        Bonus credits are preserved and consumed first
         """
         existing_wallet = await self.get_user_wallet(user_id)
 
@@ -210,24 +314,37 @@ class CreditService:
             # Existing subscriber - renewal or upgrade
             balance_before = existing_wallet.credits_remaining
 
-            # Check if this is a renewal (same tier) or new purchase (different tier or no tier)
+            # Get current bonus and subscription credits
+            current_bonus = getattr(existing_wallet, 'bonus_credits', 0)
+            current_subscription = getattr(existing_wallet, 'subscription_credits', 0)
+            current_used = existing_wallet.credits_used
+
+            # Check if this is a renewal (same tier) or new purchase
             is_renewal = existing_wallet.subscription_tier == tier_id
 
             if is_renewal:
-                # PRD 5.2: Credits reset every billing cycle (no rollover for subscriptions)
-                new_total = credits
-                new_remaining = credits
+                # Monthly renewal: Reset subscription credits, preserve bonus credits
+                new_bonus = current_bonus
+                new_subscription = credits
+                new_used = 0  # Reset usage counter
             else:
-                # New purchase or upgrade - add to existing credits (preserve bonus/unused credits)
-                new_total = existing_wallet.total_credits + credits
-                new_remaining = existing_wallet.credits_remaining + credits
+                # New purchase/upgrade: Keep bonus, add new subscription credits
+                new_bonus = current_bonus
+                new_subscription = credits
+                new_used = current_used  # Keep existing usage
+
+            # Calculate totals
+            new_total = new_bonus + new_subscription
+            new_remaining = new_total - new_used
 
             await self.user_credits_collection.update_one(
                 {"user_id": user_id},
                 {
                     "$set": {
+                        "bonus_credits": new_bonus,
+                        "subscription_credits": new_subscription,
                         "total_credits": new_total,
-                        "credits_used": existing_wallet.credits_used if not is_renewal else 0,
+                        "credits_used": new_used,
                         "credits_remaining": new_remaining,
                         "subscription_tier": tier_id,
                         "next_renewal": datetime.utcnow() + timedelta(days=30),
