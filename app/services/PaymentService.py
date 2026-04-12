@@ -40,6 +40,7 @@ class PaymentService:
         # SQUAD uses same secret key for webhook validation (HMAC-SHA512)
         self.squad_api_url = getattr(settings, 'SQUAD_BASE_URL', 'https://sandbox-api-d.squadco.com')  # Use sandbox by default
         self.callback_url = getattr(settings, 'SQUAD_CALLBACK_URL', 'https://www.urisocial.com/checkout/callback')
+        self.dashboard_url = getattr(settings, 'FRONTEND_URL', 'https://www.urisocial.com') + '/dashboard/billing'
 
     @property
     def db(self) -> AsyncIOMotorDatabase:
@@ -134,7 +135,10 @@ class PaymentService:
                     return InitializePaymentResponse(
                         payment_url=checkout_url,
                         transaction_ref=transaction_ref,
-                        amount=tier.price_ngn
+                        amount=tier.price_ngn,
+                        email=user_email,
+                        currency="NGN",
+                        public_key=self.squad_public_key
                     )
                 else:
                     # PRD 6.4: Failure Handling
