@@ -207,17 +207,28 @@ class CreditService:
         existing_wallet = await self.get_user_wallet(user_id)
 
         if existing_wallet:
-            # Existing subscriber - renewal
-            # PRD 5.2: Credits reset every billing cycle (no rollover for subscriptions)
+            # Existing subscriber - renewal or upgrade
             balance_before = existing_wallet.credits_remaining
+
+            # Check if this is a renewal (same tier) or new purchase (different tier or no tier)
+            is_renewal = existing_wallet.subscription_tier == tier_id
+
+            if is_renewal:
+                # PRD 5.2: Credits reset every billing cycle (no rollover for subscriptions)
+                new_total = credits
+                new_remaining = credits
+            else:
+                # New purchase or upgrade - add to existing credits (preserve bonus/unused credits)
+                new_total = existing_wallet.total_credits + credits
+                new_remaining = existing_wallet.credits_remaining + credits
 
             await self.user_credits_collection.update_one(
                 {"user_id": user_id},
                 {
                     "$set": {
-                        "total_credits": credits,
-                        "credits_used": 0,
-                        "credits_remaining": credits,
+                        "total_credits": new_total,
+                        "credits_used": existing_wallet.credits_used if not is_renewal else 0,
+                        "credits_remaining": new_remaining,
                         "subscription_tier": tier_id,
                         "next_renewal": datetime.utcnow() + timedelta(days=30),
                         "updated_at": datetime.utcnow()
@@ -231,7 +242,7 @@ class CreditService:
                 type="allocation",
                 amount=credits,
                 balance_before=balance_before,
-                balance_after=credits,
+                balance_after=new_remaining,
                 reason=reason,
                 created_at=datetime.utcnow()
             )
