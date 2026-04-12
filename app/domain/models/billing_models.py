@@ -204,17 +204,23 @@ class InitializePaymentRequest(BaseModel):
 
 
 class InitializePaymentResponse(BaseModel):
-    """Response with SQUAD checkout URL"""
-    payment_url: str = Field(..., description="SQUAD hosted checkout page")
+    """Response with SQUAD payment data for inline modal"""
+    payment_url: str = Field(..., description="SQUAD hosted checkout page (fallback)")
     transaction_ref: str = Field(..., description="Reference for tracking")
     amount: int = Field(..., description="Payment amount in NGN")
+    email: str = Field(..., description="Customer email")
+    currency: str = Field(default="NGN", description="Payment currency")
+    public_key: str = Field(..., description="SQUAD public key for frontend")
 
     class Config:
         schema_extra = {
             "example": {
                 "payment_url": "https://checkout.squad.co/123456",
                 "transaction_ref": "SQUAD_123456789",
-                "amount": 25000
+                "amount": 25000,
+                "email": "user@example.com",
+                "currency": "NGN",
+                "public_key": "pk_test_xxxxx"
             }
         }
 
