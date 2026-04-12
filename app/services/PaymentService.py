@@ -102,9 +102,11 @@ class PaymentService:
 
                 # SQUAD API payload structure (per official docs)
                 # Note: Sandbox doesn't accept "meta" field, only live does
+                # IMPORTANT: SQUAD expects amount in KOBO (smallest unit), not Naira
+                # 1 Naira = 100 Kobo, so ₦15,000 = 1,500,000 kobo
                 payload = {
                     "email": user_email,
-                    "amount": tier.price_ngn,  # SQUAD expects amount in Naira (not kobo)
+                    "amount": tier.price_ngn * 100,  # Convert Naira to Kobo (multiply by 100)
                     "currency": "NGN",
                     "initiate_type": "inline",  # Required: opens payment modal
                     "transaction_ref": transaction_ref,
