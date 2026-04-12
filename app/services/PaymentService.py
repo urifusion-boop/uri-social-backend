@@ -39,8 +39,10 @@ class PaymentService:
         self.squad_public_key = getattr(settings, 'SQUAD_PUBLIC_KEY', '')
         # SQUAD uses same secret key for webhook validation (HMAC-SHA512)
         self.squad_api_url = getattr(settings, 'SQUAD_BASE_URL', 'https://sandbox-api-d.squadco.com')  # Use sandbox by default
-        self.callback_url = getattr(settings, 'SQUAD_CALLBACK_URL', 'https://www.urisocial.com/checkout/callback')
-        self.dashboard_url = getattr(settings, 'FRONTEND_URL', 'https://www.urisocial.com') + '/dashboard/billing'
+
+        # User-facing callback URL (where users return after payment)
+        web_app_url = getattr(settings, 'WEB_APP_URL', 'https://www.urisocial.com')
+        self.callback_url = f'{web_app_url}/dashboard/billing'
 
     @property
     def db(self) -> AsyncIOMotorDatabase:
