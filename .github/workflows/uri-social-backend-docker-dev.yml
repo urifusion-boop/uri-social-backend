@@ -88,7 +88,7 @@ jobs:
             # Pull the latest image from Docker Hub (built in the previous job)
             docker pull uriteam/urisvc:uriagentdev
 
-            # Stop and remove old containers
+            # Stop and remove old containers (using consistent project name for dev)
             docker-compose -p uri-social-backend-dev -f docker-compose.dev.yml down
 
             # Start containers with the new image
