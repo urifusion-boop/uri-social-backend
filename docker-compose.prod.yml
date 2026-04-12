@@ -9,7 +9,7 @@ services:
       dockerfile: Dockerfile
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "80", "--workers", "4"]
     env_file:
-      - .env
+      - .env.production
     environment:
       - ENV=Production
       - URI_GATEWAY_BASE_API_URL=http://uri-gateway.api
