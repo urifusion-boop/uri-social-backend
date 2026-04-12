@@ -32,11 +32,24 @@ class UserCreditWallet(BaseModel):
     """
     User credit balance tracking
     PRD Section 7.1: User Wallet
+
+    Credits are tracked separately:
+    - bonus_credits: One-time bonus credits (consumed first, never expire)
+    - subscription_credits: Monthly subscription credits (reset on renewal)
     """
     user_id: str = Field(..., description="Reference to users collection")
-    total_credits: int = Field(default=0, description="Total credits allocated this billing cycle")
+
+    # Bonus credits (consumed first, preserved on renewal)
+    bonus_credits: int = Field(default=0, description="One-time bonus credits")
+
+    # Subscription credits (reset monthly)
+    subscription_credits: int = Field(default=0, description="Monthly subscription credits")
+
+    # Legacy/computed fields (for backwards compatibility)
+    total_credits: int = Field(default=0, description="Total credits: bonus + subscription")
     credits_used: int = Field(default=0, description="Credits consumed in current cycle")
     credits_remaining: int = Field(default=0, description="Calculated: total_credits - credits_used")
+
     subscription_tier: Optional[str] = Field(default=None, description="starter|growth|pro|agency|custom")
     next_renewal: Optional[datetime] = Field(default=None, description="Next billing cycle date")
     created_at: datetime = Field(default_factory=datetime.utcnow)
@@ -47,10 +60,12 @@ class UserCreditWallet(BaseModel):
         schema_extra = {
             "example": {
                 "user_id": "507f1f77bcf86cd799439011",
-                "total_credits": 35,
+                "bonus_credits": 1000,
+                "subscription_credits": 20,
+                "total_credits": 1020,
                 "credits_used": 15,
-                "credits_remaining": 20,
-                "subscription_tier": "growth",
+                "credits_remaining": 1005,
+                "subscription_tier": "starter",
                 "next_renewal": "2026-05-06T00:00:00Z"
             }
         }
