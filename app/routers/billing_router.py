@@ -333,8 +333,17 @@ async def get_squad_mode(user_id: str = Depends(get_user_id)):
     """
     try:
         from app.core.config import settings
+        from app.database import get_db
 
-        current_mode = getattr(settings, 'SQUAD_MODE', 'sandbox').lower()
+        db = get_db()
+
+        # Check database override first
+        settings_doc = await db["app_settings"].find_one({"setting": "squad_mode"})
+        if settings_doc and settings_doc.get("value") in ["sandbox", "live"]:
+            current_mode = settings_doc["value"]
+        else:
+            current_mode = getattr(settings, 'SQUAD_MODE', 'sandbox').lower()
+
         has_sandbox = bool(getattr(settings, 'SQUAD_SANDBOX_SECRET_KEY', None))
         has_live = bool(getattr(settings, 'SQUAD_LIVE_SECRET_KEY', None))
 
@@ -361,13 +370,15 @@ async def set_squad_mode(
 ):
     """
     Switch Squad payment mode (sandbox or live)
-    WARNING: Requires server restart to take effect
-    This updates the environment variable file and requires container restart
+    NO SERVER RESTART REQUIRED - changes take effect immediately!
+    Saves mode to database and all future payments will use the new mode.
     """
     try:
         from app.core.config import settings
-        import os
+        from app.database import get_db
+        from datetime import datetime
 
+        db = get_db()
         body = await request.json()
         new_mode = body.get("mode", "").lower()
 
@@ -377,21 +388,29 @@ async def set_squad_mode(
                 detail="Invalid mode. Must be 'sandbox' or 'live'"
             )
 
-        # For now, return instructions to manually update
-        # In production, this would update the env file and restart
+        # Save mode to database (instant switch!)
+        await db["app_settings"].update_one(
+            {"setting": "squad_mode"},
+            {
+                "$set": {
+                    "setting": "squad_mode",
+                    "value": new_mode,
+                    "updated_at": datetime.utcnow(),
+                    "updated_by": user_id
+                }
+            },
+            upsert=True
+        )
+
         return {
             "status": True,
             "responseCode": 200,
-            "responseMessage": f"To switch to {new_mode} mode, update SQUAD_MODE={new_mode} in your .env file and restart the container",
+            "responseMessage": f"✅ Squad mode switched to {new_mode.upper()} successfully! Changes take effect immediately.",
             "responseData": {
-                "requested_mode": new_mode,
-                "current_mode": getattr(settings, 'SQUAD_MODE', 'sandbox'),
-                "requires_restart": True,
-                "instructions": [
-                    f"1. SSH to server and edit .env.staging or .env.production",
-                    f"2. Set SQUAD_MODE={new_mode}",
-                    "3. Restart the container: docker-compose restart"
-                ]
+                "new_mode": new_mode,
+                "requires_restart": False,
+                "instant_switch": True,
+                "warning": "LIVE MODE will process real payments!" if new_mode == "live" else "SANDBOX MODE is for testing only"
             }
         }
     except HTTPException:

@@ -34,24 +34,52 @@ class PaymentService:
     def __init__(self):
         self._db: Optional[AsyncIOMotorDatabase] = None
 
-        # SQUAD mode switching
-        self.squad_mode = getattr(settings, 'SQUAD_MODE', 'sandbox').lower()
+        # Store all credentials (we'll select dynamically based on mode)
+        self.sandbox_secret_key = getattr(settings, 'SQUAD_SANDBOX_SECRET_KEY', '')
+        self.sandbox_public_key = getattr(settings, 'SQUAD_SANDBOX_PUBLIC_KEY', '')
+        self.live_secret_key = getattr(settings, 'SQUAD_LIVE_SECRET_KEY', '')
+        self.live_public_key = getattr(settings, 'SQUAD_LIVE_PUBLIC_KEY', '')
 
-        # Select credentials based on mode
-        if self.squad_mode == 'live':
-            self.squad_secret_key = getattr(settings, 'SQUAD_LIVE_SECRET_KEY', '')
-            self.squad_public_key = getattr(settings, 'SQUAD_LIVE_PUBLIC_KEY', '')
-            self.squad_api_url = 'https://api-d.squadco.com'  # Live API
-        else:
-            self.squad_secret_key = getattr(settings, 'SQUAD_SANDBOX_SECRET_KEY', '')
-            self.squad_public_key = getattr(settings, 'SQUAD_SANDBOX_PUBLIC_KEY', '')
-            self.squad_api_url = 'https://sandbox-api-d.squadco.com'  # Sandbox API
+        # Default mode from environment (fallback)
+        self.default_mode = getattr(settings, 'SQUAD_MODE', 'sandbox').lower()
 
-        print(f"🔐 SQUAD Payment Gateway initialized in {self.squad_mode.upper()} mode")
+        print(f"🔐 SQUAD Payment Gateway initialized (default: {self.default_mode.upper()})")
 
         # User-facing callback URL (where users return after payment)
         web_app_url = getattr(settings, 'WEB_APP_URL', 'https://www.urisocial.com')
         self.callback_url = f'{web_app_url}/dashboard/billing'
+
+    async def _get_current_mode(self) -> str:
+        """Get current Squad mode from database (allows runtime switching)"""
+        try:
+            # Check if there's a mode override in settings collection
+            settings_doc = await self.db["app_settings"].find_one({"setting": "squad_mode"})
+            if settings_doc and settings_doc.get("value") in ["sandbox", "live"]:
+                return settings_doc["value"]
+        except Exception as e:
+            print(f"⚠️ Could not fetch Squad mode from DB: {e}")
+
+        # Fallback to environment variable
+        return self.default_mode
+
+    async def _get_squad_credentials(self):
+        """Get Squad credentials based on current mode"""
+        mode = await self._get_current_mode()
+
+        if mode == 'live':
+            return {
+                'secret_key': self.live_secret_key,
+                'public_key': self.live_public_key,
+                'api_url': 'https://api-d.squadco.com',
+                'mode': 'live'
+            }
+        else:
+            return {
+                'secret_key': self.sandbox_secret_key,
+                'public_key': self.sandbox_public_key,
+                'api_url': 'https://sandbox-api-d.squadco.com',
+                'mode': 'sandbox'
+            }
 
     @property
     def db(self) -> AsyncIOMotorDatabase:
@@ -104,11 +132,15 @@ class PaymentService:
             payment.dict(exclude_none=True)
         )
 
+        # Get current Squad credentials (dynamic mode switching)
+        creds = await self._get_squad_credentials()
+        print(f"💳 Initializing payment in {creds['mode'].upper()} mode")
+
         # Initialize SQUAD payment
         try:
             async with httpx.AsyncClient() as client:
                 headers = {
-                    "Authorization": f"Bearer {self.squad_secret_key}",
+                    "Authorization": f"Bearer {creds['secret_key']}",
                     "Content-Type": "application/json"
                 }
 
@@ -126,7 +158,7 @@ class PaymentService:
                 }
 
                 response = await client.post(
-                    f"{self.squad_api_url}/transaction/initiate",
+                    f"{creds['api_url']}/transaction/initiate",
                     json=payload,
                     headers=headers,
                     timeout=30.0
@@ -149,7 +181,7 @@ class PaymentService:
                         amount=tier.price_ngn,
                         email=user_email,
                         currency="NGN",
-                        public_key=self.squad_public_key
+                        public_key=creds['public_key']
                     )
                 else:
                     # PRD 6.4: Failure Handling
@@ -179,15 +211,18 @@ class PaymentService:
         if payment_doc["status"] == "completed":
             return True
 
+        # Get current Squad credentials (dynamic mode switching)
+        creds = await self._get_squad_credentials()
+
         # Verify with SQUAD
         try:
             async with httpx.AsyncClient() as client:
                 headers = {
-                    "Authorization": f"Bearer {self.squad_secret_key}"
+                    "Authorization": f"Bearer {creds['secret_key']}"
                 }
 
                 response = await client.get(
-                    f"{self.squad_api_url}/transaction/verify/{transaction_ref}",
+                    f"{creds['api_url']}/transaction/verify/{transaction_ref}",
                     headers=headers,
                     timeout=30.0
                 )
