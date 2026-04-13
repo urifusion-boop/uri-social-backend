@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Your Trial Ends Soon ⏳</h1>
+<p>Hi {{ user_name | default('there') }},</p>
+<p>Your free trial expires in <strong>less than 24 hours</strong>.</p>
+{% if credits_remaining is defined and credits_remaining > 0 %}
+<p>You still have <strong>{{ credits_remaining }} credit{{ 's' if credits_remaining != 1 else '' }}</strong> left — use them before they're gone!</p>
+{% endif %}
+<div class="divider"></div>
+<div style="background:rgba(245,158,11,.06); border-radius:10px; padding:20px; margin:16px 0;">
+  <p style="font-size:14px; color:#92400E; font-weight:600; margin:0;">Don't lose your momentum</p>
+  <p style="font-size:14px; color:#4B5563; margin:8px 0 0; line-height:1.7;">Upgrade to a plan and keep creating content without interruption. Plans start at just ₦15,000/month.</p>
+</div>
+<a href="{{ app_url | default('https://app.urisocial.com') }}/workspace?tab=billing" class="cta">Choose a Plan →</a>
+<p style="font-size:13px; color:#9CA3AF; margin-top:12px;">Or keep using your remaining credits before they expire.</p>
+{% endblock %}

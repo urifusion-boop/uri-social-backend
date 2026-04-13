@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Today's Content Idea 💡</h1>
+<p>Hi {{ user_name | default('there') }},</p>
+<p>Here's a fresh content idea for today:</p>
+<div class="divider"></div>
+<div style="background:#FDF4FF; border-radius:10px; padding:20px; text-align:left; margin:16px 0; border-left:4px solid #CD1B78;">
+  <p style="font-size:15px; color:#1F2937; margin:0; line-height:1.7; font-weight:500;">{{ suggestion | default('Share a behind-the-scenes look at your business or a quick tip your audience would love.') }}</p>
+</div>
+{% if topic %}
+<p style="font-size:13px; color:#6B7280;">Topic: <strong>{{ topic }}</strong></p>
+{% endif %}
+<a href="{{ app_url | default('https://app.urisocial.com') }}/workspace" class="cta">Generate This Content →</a>
+<p style="font-size:13px; color:#9CA3AF; margin-top:12px;">URI Agent can turn this idea into ready-to-post content in seconds.</p>
+{% endblock %}

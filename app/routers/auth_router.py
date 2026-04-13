@@ -13,6 +13,7 @@ from app.database import get_db
 from app.dependencies import get_db_dependency
 from app.domain.responses.uri_response import UriResponse
 from app.services.TrialService import trial_service
+from app.services.NotificationService import notification_service
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
 
@@ -71,6 +72,19 @@ async def signup(body: SignupRequest, db: AsyncIOMotorDatabase = Depends(get_db_
         }
     except Exception as e:
         print(f"⚠️ Trial activation failed for {user_id}: {e}")
+
+    # Notification PRD 4.1: Welcome email on signup
+    try:
+        import asyncio
+        asyncio.ensure_future(notification_service.notify_signup(
+            user_id=user_id,
+            email=body.email,
+            first_name=body.first_name,
+            trial_days=trial_status.get("days_remaining", 3) if trial_status else 0,
+            trial_credits=trial_status.get("trial_credits", 10) if trial_status else 0,
+        ))
+    except Exception as e:
+        print(f"⚠️ Signup notification failed for {user_id}: {e}")
 
     token = sign_jwt(user_id, body.email, body.first_name, body.last_name)
 
@@ -168,6 +182,19 @@ async def google_auth(body: GoogleAuthRequest, db: AsyncIOMotorDatabase = Depend
             }
         except Exception as e:
             print(f"⚠️ Trial activation failed for {user_id}: {e}")
+
+        # Notification PRD 4.1: Welcome email on Google signup
+        try:
+            import asyncio
+            asyncio.ensure_future(notification_service.notify_signup(
+                user_id=user_id,
+                email=email,
+                first_name=first_name,
+                trial_days=trial_status.get("days_remaining", 3) if trial_status else 0,
+                trial_credits=trial_status.get("trial_credits", 10) if trial_status else 0,
+            ))
+        except Exception as e:
+            print(f"⚠️ Signup notification failed for {user_id}: {e}")
 
     token = sign_jwt(user_id, email, first_name, last_name)
 

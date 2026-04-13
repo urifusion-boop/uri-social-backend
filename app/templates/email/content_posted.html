@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Content Published! 🚀</h1>
+<p>Hi {{ user_name | default('there') }},</p>
+<p>Your content was successfully posted to <strong>{{ platform | default('your social account') }}</strong>.</p>
+<div class="divider"></div>
+{% if content_preview %}
+<div style="background:#F0FDF4; border-radius:10px; padding:20px; text-align:left; margin:16px 0;">
+  <span class="badge badge-green">Published</span>
+  <p style="font-size:14px; color:#1F2937; margin:12px 0 0; line-height:1.6;">{{ content_preview | truncate(200) }}</p>
+</div>
+{% endif %}
+<a href="{{ app_url | default('https://app.urisocial.com') }}/workspace" class="cta">Create Next Content →</a>
+<p style="font-size:13px; color:#9CA3AF; margin-top:12px;">Keep the momentum going — consistency is key to social media growth.</p>
+{% endblock %}

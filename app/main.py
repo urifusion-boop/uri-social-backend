@@ -12,6 +12,7 @@ from app.agents.social_media_manager.routers.x_router import router as x_router
 from app.agents.social_media_manager.routers.linkedin_router import router as linkedin_router
 from app.routers.auth_router import router as auth_router
 from app.routers.billing_router import router as billing_router
+from app.routers.notification_router import router as notification_router
 
 # Initialize Sentry
 initialize_sentry()
@@ -40,6 +41,14 @@ async def startup_event():
         print("✅ Subscription tiers initialized successfully")
     except Exception as e:
         print(f"⚠️  Warning: Failed to initialize subscription tiers: {e}")
+
+    # Start notification scheduler (PRD 8: Scheduled Jobs)
+    try:
+        from app.services.notification_scheduler import start_notification_scheduler
+        start_notification_scheduler()
+        print("✅ Notification scheduler started")
+    except Exception as e:
+        print(f"⚠️  Warning: Failed to start notification scheduler: {e}")
 
 # CORS
 # CORS is now handled at nginx level to avoid duplicate headers
@@ -81,6 +90,13 @@ app.include_router(
     billing_router,
     prefix="/social-media",
     tags=["Billing"],
+)
+
+# Include notification router under /social-media prefix (PRD: Notification System)
+app.include_router(
+    notification_router,
+    prefix="/social-media",
+    tags=["Notifications"],
 )
 
 # Include additional social platform routers
