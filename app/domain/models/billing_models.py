@@ -34,16 +34,18 @@ class UserCreditWallet(BaseModel):
     PRD Section 7.1: User Wallet
 
     Credits are tracked separately:
-    - bonus_credits: One-time bonus credits (consumed first, never expire)
-    - subscription_credits: Monthly subscription credits (reset on renewal)
+    - subscription_credits: Monthly subscription credits (consumed FIRST, reset on renewal)
+    - bonus_credits: One-time bonus credits (consumed SECOND, never expire)
+
+    Consumption order ensures subscription credits are used before expiry.
     """
     user_id: str = Field(..., description="Reference to users collection")
 
-    # Bonus credits (consumed first, preserved on renewal)
-    bonus_credits: int = Field(default=0, description="One-time bonus credits")
+    # Bonus credits (consumed second, preserved on renewal, never expire)
+    bonus_credits: int = Field(default=0, description="One-time bonus credits (consumed after subscription)")
 
-    # Subscription credits (reset monthly)
-    subscription_credits: int = Field(default=0, description="Monthly subscription credits")
+    # Subscription credits (consumed first, reset monthly)
+    subscription_credits: int = Field(default=0, description="Monthly subscription credits (consumed first)")
 
     # Legacy/computed fields (for backwards compatibility)
     total_credits: int = Field(default=0, description="Total credits: bonus + subscription")

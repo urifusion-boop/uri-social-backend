@@ -222,8 +222,10 @@ class CreditService:
         PRD 11: Must log all credit usage events
 
         Credit deduction priority:
-        1. Bonus credits (consumed first)
-        2. Subscription credits (consumed second)
+        1. Subscription credits (consumed first - they expire monthly)
+        2. Bonus credits (consumed second - they never expire)
+
+        This ensures subscription credits are used before expiry.
 
         Legacy users (without wallet) are not deducted - backward compatibility
 
@@ -244,15 +246,15 @@ class CreditService:
         current_subscription = getattr(wallet, 'subscription_credits', 0)
         balance_before = wallet.credits_remaining
 
-        # Deduct from bonus first, then subscription
-        if current_bonus > 0:
-            # Deduct from bonus credits
-            new_bonus = current_bonus - 1
-            new_subscription = current_subscription
-        else:
-            # Deduct from subscription credits
-            new_bonus = 0
+        # Deduct from subscription first (use before expiry), then bonus (never expires)
+        if current_subscription > 0:
+            # Deduct from subscription credits first (use before monthly reset)
             new_subscription = current_subscription - 1
+            new_bonus = current_bonus
+        else:
+            # Deduct from bonus credits (only when subscription is depleted)
+            new_subscription = 0
+            new_bonus = current_bonus - 1
 
         # Calculate new totals
         new_total = new_bonus + new_subscription
