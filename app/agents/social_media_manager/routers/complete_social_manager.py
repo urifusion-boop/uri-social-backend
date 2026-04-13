@@ -304,13 +304,13 @@ async def generate_content(
                 drafts_data = result.get("responseData", {}).get("drafts", [])
                 platforms_str = ", ".join(set(d.get("platform", "") for d in drafts_data if d.get("platform")))
                 preview = drafts_data[0].get("content", "")[:120] if drafts_data else ""
-                import asyncio
-                asyncio.ensure_future(notification_service.notify_content_created(
+                background_tasks.add_task(
+                    notification_service.notify_content_created,
                     user_id=user_id,
                     content_preview=preview,
                     platforms=platforms_str,
                     campaign_id=request_id or "",
-                ))
+                )
             except Exception as e:
                 print(f"⚠️ Content created notification failed: {e}")
 
