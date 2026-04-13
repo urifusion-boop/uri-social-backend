@@ -423,7 +423,7 @@ async def set_squad_mode(
 
 # ==================== Free Trial System (PRD V1) ====================
 
-@router.get("/trial/status", response_model=TrialStatusResponse)
+@router.get("/trial/status")
 async def get_trial_status(user_id: str = Depends(get_user_id)):
     """
     Get user's free trial status
@@ -432,12 +432,17 @@ async def get_trial_status(user_id: str = Depends(get_user_id)):
     """
     try:
         status = await trial_service.get_trial_status(user_id)
-        return status
+        return {
+            "status": True,
+            "responseCode": 200,
+            "responseMessage": "Trial status retrieved",
+            "responseData": status.dict(),
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get trial status: {str(e)}")
 
 
-@router.post("/trial/activate", response_model=TrialStatusResponse)
+@router.post("/trial/activate")
 async def activate_trial(user_id: str = Depends(get_user_id)):
     """
     Manually activate free trial (if not auto-activated on signup)
@@ -446,12 +451,21 @@ async def activate_trial(user_id: str = Depends(get_user_id)):
     try:
         has_used = await trial_service.has_used_trial(user_id)
         if has_used:
-            # Return current status instead of error
             status = await trial_service.get_trial_status(user_id)
-            return status
+            return {
+                "status": True,
+                "responseCode": 200,
+                "responseMessage": "Trial already used",
+                "responseData": status.dict(),
+            }
 
         status = await trial_service.activate_trial(user_id)
-        return status
+        return {
+            "status": True,
+            "responseCode": 201,
+            "responseMessage": "Trial activated successfully",
+            "responseData": status.dict(),
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to activate trial: {str(e)}")
 

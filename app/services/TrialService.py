@@ -81,11 +81,11 @@ class TrialService:
         await self.credit_transactions_collection.insert_one(
             CreditTransaction(
                 user_id=user_id,
-                type="bonus",
+                type="trial",
                 amount=TRIAL_CREDITS,
                 balance_before=0,
                 balance_after=TRIAL_CREDITS,
-                reason="bonus",
+                reason="trial",
                 created_at=now,
             ).dict(exclude_none=True)
         )
