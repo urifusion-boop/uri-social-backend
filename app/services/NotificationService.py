@@ -192,7 +192,7 @@ class NotificationService:
     ):
         """PRD 4.2: Email when content generation completes."""
         user = await self._get_user(user_id)
-        if not user:
+        if not user or user.get("notification_opt_out"):
             return
 
         if not await self._check_rate_limit(user_id):
@@ -245,7 +245,7 @@ class NotificationService:
     ):
         """PRD 4.3: Email when content is successfully published."""
         user = await self._get_user(user_id)
-        if not user:
+        if not user or user.get("notification_opt_out"):
             return
 
         if not await self._check_rate_limit(user_id):
@@ -290,7 +290,7 @@ class NotificationService:
     ):
         """PRD 4.4: Daily content suggestion email."""
         user = await self._get_user(user_id)
-        if not user:
+        if not user or user.get("notification_opt_out"):
             return
 
         if not await self._check_rate_limit(user_id):
@@ -336,7 +336,7 @@ class NotificationService:
     ):
         """PRD 4.5: Reminder when user hasn't posted in X days."""
         user = await self._get_user(user_id)
-        if not user:
+        if not user or user.get("notification_opt_out"):
             return
 
         if not await self._check_rate_limit(user_id):
@@ -421,7 +421,7 @@ class NotificationService:
     ):
         """PRD 4.6: Trial ending soon (24h before expiry)."""
         user = await self._get_user(user_id)
-        if not user:
+        if not user or user.get("notification_opt_out"):
             return
 
         if await self._was_recently_sent(user_id, "trial_ending", hours=24):
@@ -455,7 +455,7 @@ class NotificationService:
     async def notify_trial_expired(self, user_id: str):
         """PRD 4.6: Trial expired — upgrade prompt."""
         user = await self._get_user(user_id)
-        if not user:
+        if not user or user.get("notification_opt_out"):
             return
 
         if await self._was_recently_sent(user_id, "trial_expired", hours=48):
