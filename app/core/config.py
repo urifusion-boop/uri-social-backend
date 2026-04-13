@@ -56,8 +56,18 @@ class Settings(BaseSettings):
     GOOGLE_CLIENT_SECRET: Optional[str] = None
 
     # SQUAD Payment Gateway (PRD Section 6.2: Payment Integration)
-    SQUAD_SECRET_KEY: Optional[str] = None
-    SQUAD_PUBLIC_KEY: Optional[str] = None
+    # Mode switching: Set SQUAD_MODE to "sandbox" or "live"
+    SQUAD_MODE: str = "sandbox"  # Options: "sandbox" or "live"
+
+    # Sandbox credentials (for testing)
+    SQUAD_SANDBOX_SECRET_KEY: Optional[str] = None
+    SQUAD_SANDBOX_PUBLIC_KEY: Optional[str] = None
+
+    # Live credentials (for production)
+    SQUAD_LIVE_SECRET_KEY: Optional[str] = None
+    SQUAD_LIVE_PUBLIC_KEY: Optional[str] = None
+
+    # Webhook secret (same for both modes)
     SQUAD_WEBHOOK_SECRET: Optional[str] = None
     SQUAD_CALLBACK_URL: str = "https://www.urisocial.com/checkout/callback"
 
