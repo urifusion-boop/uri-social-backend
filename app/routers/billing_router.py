@@ -321,3 +321,80 @@ async def can_generate_content(user_id: str = Depends(get_user_id)):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to check status: {str(e)}")
+
+
+# ==================== Squad Mode Management (Admin) ====================
+
+@router.get("/squad/mode")
+async def get_squad_mode(user_id: str = Depends(get_user_id)):
+    """
+    Get current Squad payment mode (sandbox or live)
+    Returns the active mode and available credentials
+    """
+    try:
+        from app.core.config import settings
+
+        current_mode = getattr(settings, 'SQUAD_MODE', 'sandbox').lower()
+        has_sandbox = bool(getattr(settings, 'SQUAD_SANDBOX_SECRET_KEY', None))
+        has_live = bool(getattr(settings, 'SQUAD_LIVE_SECRET_KEY', None))
+
+        return {
+            "status": True,
+            "responseCode": 200,
+            "responseMessage": "Squad mode retrieved",
+            "responseData": {
+                "current_mode": current_mode,
+                "available_modes": {
+                    "sandbox": has_sandbox,
+                    "live": has_live
+                }
+            }
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get Squad mode: {str(e)}")
+
+
+@router.post("/squad/mode")
+async def set_squad_mode(
+    request: Request,
+    user_id: str = Depends(get_user_id)
+):
+    """
+    Switch Squad payment mode (sandbox or live)
+    WARNING: Requires server restart to take effect
+    This updates the environment variable file and requires container restart
+    """
+    try:
+        from app.core.config import settings
+        import os
+
+        body = await request.json()
+        new_mode = body.get("mode", "").lower()
+
+        if new_mode not in ["sandbox", "live"]:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid mode. Must be 'sandbox' or 'live'"
+            )
+
+        # For now, return instructions to manually update
+        # In production, this would update the env file and restart
+        return {
+            "status": True,
+            "responseCode": 200,
+            "responseMessage": f"To switch to {new_mode} mode, update SQUAD_MODE={new_mode} in your .env file and restart the container",
+            "responseData": {
+                "requested_mode": new_mode,
+                "current_mode": getattr(settings, 'SQUAD_MODE', 'sandbox'),
+                "requires_restart": True,
+                "instructions": [
+                    f"1. SSH to server and edit .env.staging or .env.production",
+                    f"2. Set SQUAD_MODE={new_mode}",
+                    "3. Restart the container: docker-compose restart"
+                ]
+            }
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to set Squad mode: {str(e)}")
