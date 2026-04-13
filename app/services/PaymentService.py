@@ -34,11 +34,20 @@ class PaymentService:
     def __init__(self):
         self._db: Optional[AsyncIOMotorDatabase] = None
 
-        # SQUAD API configuration
-        self.squad_secret_key = getattr(settings, 'SQUAD_SECRET_KEY', '')
-        self.squad_public_key = getattr(settings, 'SQUAD_PUBLIC_KEY', '')
-        # SQUAD uses same secret key for webhook validation (HMAC-SHA512)
-        self.squad_api_url = getattr(settings, 'SQUAD_BASE_URL', 'https://sandbox-api-d.squadco.com')  # Use sandbox by default
+        # SQUAD mode switching
+        self.squad_mode = getattr(settings, 'SQUAD_MODE', 'sandbox').lower()
+
+        # Select credentials based on mode
+        if self.squad_mode == 'live':
+            self.squad_secret_key = getattr(settings, 'SQUAD_LIVE_SECRET_KEY', '')
+            self.squad_public_key = getattr(settings, 'SQUAD_LIVE_PUBLIC_KEY', '')
+            self.squad_api_url = 'https://api-d.squadco.com'  # Live API
+        else:
+            self.squad_secret_key = getattr(settings, 'SQUAD_SANDBOX_SECRET_KEY', '')
+            self.squad_public_key = getattr(settings, 'SQUAD_SANDBOX_PUBLIC_KEY', '')
+            self.squad_api_url = 'https://sandbox-api-d.squadco.com'  # Sandbox API
+
+        print(f"🔐 SQUAD Payment Gateway initialized in {self.squad_mode.upper()} mode")
 
         # User-facing callback URL (where users return after payment)
         web_app_url = getattr(settings, 'WEB_APP_URL', 'https://www.urisocial.com')
