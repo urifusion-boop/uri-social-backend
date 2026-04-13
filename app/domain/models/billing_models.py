@@ -206,6 +206,53 @@ class CampaignTracking(BaseModel):
         }
 
 
+# ==================== FREE TRIAL ====================
+# PRD: Free Trial System V1
+
+class UserTrial(BaseModel):
+    """
+    Free trial tracking per user
+    PRD Section 4.1: User Trial Fields
+    """
+    user_id: str = Field(..., description="Reference to users collection")
+    is_trial: bool = Field(default=True, description="Whether user is on trial")
+    trial_start_date: datetime = Field(default_factory=datetime.utcnow, description="When trial started")
+    trial_end_date: datetime = Field(..., description="When trial expires (start + 3 days)")
+    trial_credits: int = Field(default=10, description="Total trial credits allocated")
+    credits_remaining: int = Field(default=10, description="Trial credits remaining")
+    trial_used: bool = Field(default=False, description="Whether trial has been claimed (abuse prevention)")
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+    class Config:
+        json_encoders = {ObjectId: str}
+        schema_extra = {
+            "example": {
+                "user_id": "507f1f77bcf86cd799439011",
+                "is_trial": True,
+                "trial_start_date": "2026-04-13T00:00:00Z",
+                "trial_end_date": "2026-04-16T00:00:00Z",
+                "trial_credits": 10,
+                "credits_remaining": 10,
+                "trial_used": False
+            }
+        }
+
+
+class TrialStatusResponse(BaseModel):
+    """Trial status response for frontend"""
+    is_trial: bool = Field(default=False)
+    trial_active: bool = Field(default=False)
+    trial_start_date: Optional[datetime] = None
+    trial_end_date: Optional[datetime] = None
+    trial_credits: int = Field(default=0)
+    credits_remaining: int = Field(default=0)
+    days_remaining: int = Field(default=0)
+    hours_remaining: int = Field(default=0)
+    trial_expired: bool = Field(default=False)
+    trial_already_used: bool = Field(default=False)
+    low_credit_warning: bool = Field(default=False, description="PRD 6.2: True when credits ≤ 2")
+
+
 # ==================== API REQUEST/RESPONSE MODELS ====================
 
 class InitializePaymentRequest(BaseModel):

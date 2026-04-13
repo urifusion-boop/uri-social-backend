@@ -26,6 +26,8 @@ from app.domain.models.billing_models import (
 from app.services.CreditService import credit_service
 from app.services.SubscriptionService import subscription_service
 from app.services.PaymentService import payment_service
+from app.services.TrialService import trial_service
+from app.domain.models.billing_models import TrialStatusResponse
 
 router = APIRouter(prefix="/billing", tags=["Billing"])
 
@@ -417,3 +419,82 @@ async def set_squad_mode(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to set Squad mode: {str(e)}")
+
+
+# ==================== Free Trial System (PRD V1) ====================
+
+@router.get("/trial/status", response_model=TrialStatusResponse)
+async def get_trial_status(user_id: str = Depends(get_user_id)):
+    """
+    Get user's free trial status
+    PRD 5.3: Expiry check on login, content generation
+    PRD 4.2: trial_active = current_time < trial_end_date AND credits_remaining > 0
+    """
+    try:
+        status = await trial_service.get_trial_status(user_id)
+        return status
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get trial status: {str(e)}")
+
+
+@router.post("/trial/activate", response_model=TrialStatusResponse)
+async def activate_trial(user_id: str = Depends(get_user_id)):
+    """
+    Manually activate free trial (if not auto-activated on signup)
+    PRD 8: One trial per user — prevents duplicate activation
+    """
+    try:
+        has_used = await trial_service.has_used_trial(user_id)
+        if has_used:
+            # Return current status instead of error
+            status = await trial_service.get_trial_status(user_id)
+            return status
+
+        status = await trial_service.activate_trial(user_id)
+        return status
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to activate trial: {str(e)}")
+
+
+@router.get("/trial/can-generate")
+async def trial_can_generate(user_id: str = Depends(get_user_id)):
+    """
+    Check if trial user can generate content
+    PRD 5.4: If trial inactive → block content/image generation
+    """
+    try:
+        can = await trial_service.can_generate(user_id)
+        status = await trial_service.get_trial_status(user_id)
+
+        if not can:
+            message = "Your free trial has ended. Upgrade to continue creating content."
+            if status.trial_expired:
+                message = "Your free trial has ended. Upgrade to keep creating."
+            elif status.credits_remaining == 0:
+                message = "You've used all your trial credits. Upgrade to continue."
+
+            return {
+                "status": False,
+                "responseCode": 402,
+                "responseMessage": message,
+                "responseData": {
+                    "can_generate": False,
+                    "trial_expired": status.trial_expired,
+                    "credits_remaining": status.credits_remaining,
+                    "days_remaining": status.days_remaining,
+                }
+            }
+
+        return {
+            "status": True,
+            "responseCode": 200,
+            "responseMessage": "Trial active — you can generate content",
+            "responseData": {
+                "can_generate": True,
+                "credits_remaining": status.credits_remaining,
+                "days_remaining": status.days_remaining,
+                "low_credit_warning": status.low_credit_warning,
+            }
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to check trial: {str(e)}")

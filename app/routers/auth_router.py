@@ -12,6 +12,7 @@ from app.core.config import settings
 from app.database import get_db
 from app.dependencies import get_db_dependency
 from app.domain.responses.uri_response import UriResponse
+from app.services.TrialService import trial_service
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
 
@@ -56,6 +57,21 @@ async def signup(body: SignupRequest, db: AsyncIOMotorDatabase = Depends(get_db_
         "referralCode": referral_code,
     })
 
+    # PRD 5.1: Activate free trial on successful signup
+    trial_status = None
+    try:
+        trial_result = await trial_service.activate_trial(user_id)
+        trial_status = {
+            "is_trial": trial_result.is_trial,
+            "trial_active": trial_result.trial_active,
+            "trial_credits": trial_result.trial_credits,
+            "credits_remaining": trial_result.credits_remaining,
+            "days_remaining": trial_result.days_remaining,
+            "trial_end_date": trial_result.trial_end_date.isoformat() if trial_result.trial_end_date else None,
+        }
+    except Exception as e:
+        print(f"⚠️ Trial activation failed for {user_id}: {e}")
+
     token = sign_jwt(user_id, body.email, body.first_name, body.last_name)
 
     return {
@@ -68,6 +84,7 @@ async def signup(body: SignupRequest, db: AsyncIOMotorDatabase = Depends(get_db_
             "email": body.email,
             "firstName": body.first_name,
             "lastName": body.last_name,
+            "trial": trial_status,
         },
     }
 
@@ -120,6 +137,7 @@ async def google_auth(body: GoogleAuthRequest, db: AsyncIOMotorDatabase = Depend
 
     # 3. Find or create user
     existing = await db["users"].find_one({"email": email})
+    trial_status = None
     if existing:
         user_id = existing.get("userId") or str(existing["_id"])
         first_name = existing.get("first_name", first_name)
@@ -137,6 +155,20 @@ async def google_auth(body: GoogleAuthRequest, db: AsyncIOMotorDatabase = Depend
             "auth_provider": "google",
         })
 
+        # PRD 5.1: Activate free trial on signup
+        try:
+            trial_result = await trial_service.activate_trial(user_id)
+            trial_status = {
+                "is_trial": trial_result.is_trial,
+                "trial_active": trial_result.trial_active,
+                "trial_credits": trial_result.trial_credits,
+                "credits_remaining": trial_result.credits_remaining,
+                "days_remaining": trial_result.days_remaining,
+                "trial_end_date": trial_result.trial_end_date.isoformat() if trial_result.trial_end_date else None,
+            }
+        except Exception as e:
+            print(f"⚠️ Trial activation failed for {user_id}: {e}")
+
     token = sign_jwt(user_id, email, first_name, last_name)
 
     return {
@@ -149,6 +181,7 @@ async def google_auth(body: GoogleAuthRequest, db: AsyncIOMotorDatabase = Depend
             "email": email,
             "firstName": first_name,
             "lastName": last_name,
+            "trial": trial_status,
         },
     }
 

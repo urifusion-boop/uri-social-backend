@@ -312,6 +312,7 @@ class ApprovalWorkflowService:
         try:
             from .content_generation_service import ContentGenerationService
             from app.services.CreditService import credit_service
+            from app.services.TrialService import trial_service
 
             # Get original draft details
             draft = await db["content_drafts"].find_one({"id": draft_id})
@@ -356,12 +357,20 @@ class ApprovalWorkflowService:
                 # ==================== PRD 7.2: Credit Deduction ====================
                 # Deduct credit if this is second+ retry
                 if new_retry_count >= 2:
-                    await credit_service.deduct_credit(
-                        user_id=user_id,
-                        campaign_id=draft["request_id"],
-                        reason="retry",
-                        retry_count=new_retry_count
-                    )
+                    is_trial_user = await trial_service.has_active_trial(user_id)
+                    if is_trial_user:
+                        await trial_service.deduct_trial_credit(
+                            user_id=user_id,
+                            campaign_id=draft["request_id"],
+                            reason="retry",
+                        )
+                    else:
+                        await credit_service.deduct_credit(
+                            user_id=user_id,
+                            campaign_id=draft["request_id"],
+                            reason="retry",
+                            retry_count=new_retry_count
+                        )
                     print(f"✅ Deducted 1 credit for retry #{new_retry_count} - user {user_id}")
 
                 # Update request retry count (PRD 9: Campaign Tracking)
