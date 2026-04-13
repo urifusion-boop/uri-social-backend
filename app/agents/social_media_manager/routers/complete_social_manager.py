@@ -206,25 +206,29 @@ async def generate_content(
 
     try:
         # ==================== PRD 7.2 & 8: Credit Check ====================
-        # Check if user has sufficient credits before generation
-        # PRD 8: When credits = 0, block new campaign generation
+        # Check trial credits first, then paid credits
         from app.services.CreditService import credit_service
+        from app.services.TrialService import trial_service
 
-        has_credits = await credit_service.check_sufficient_credits(user_id)
-        if not has_credits:
-            # PRD 8: "You've run out of credits. Upgrade to continue."
-            return JSONResponse(
-                status_code=402,
-                content={
-                    "status": False,
-                    "responseCode": 402,
-                    "responseMessage": "You've run out of credits. Upgrade to continue.",
-                    "responseData": {
-                        "credits_remaining": 0,
-                        "upgrade_url": "/pricing"
+        is_trial_user = await trial_service.has_active_trial(user_id)
+
+        if not is_trial_user:
+            # Paid user path — check subscription/bonus credits
+            has_credits = await credit_service.check_sufficient_credits(user_id)
+            if not has_credits:
+                # PRD 8: "You've run out of credits. Upgrade to continue."
+                return JSONResponse(
+                    status_code=402,
+                    content={
+                        "status": False,
+                        "responseCode": 402,
+                        "responseMessage": "You've run out of credits. Upgrade to continue.",
+                        "responseData": {
+                            "credits_remaining": 0,
+                            "upgrade_url": "/pricing"
+                        }
                     }
-                }
-            )
+                )
 
         # Load brand profile from onboarding (source of truth).
         profile_result = await BrandProfileService.get(user_id, db)
@@ -278,13 +282,21 @@ async def generate_content(
         if result.get("status"):
             request_id = result.get("responseData", {}).get("request_id")
             if request_id:
-                await credit_service.deduct_credit(
-                    user_id=user_id,
-                    campaign_id=request_id,
-                    reason="campaign_generation",
-                    retry_count=0  # Initial generation (not a retry)
-                )
-                print(f"✅ Deducted 1 credit from user {user_id} for campaign {request_id}")
+                if is_trial_user:
+                    await trial_service.deduct_trial_credit(
+                        user_id=user_id,
+                        campaign_id=request_id,
+                        reason="campaign_generation",
+                    )
+                    print(f"✅ Deducted 1 trial credit from user {user_id} for campaign {request_id}")
+                else:
+                    await credit_service.deduct_credit(
+                        user_id=user_id,
+                        campaign_id=request_id,
+                        reason="campaign_generation",
+                        retry_count=0  # Initial generation (not a retry)
+                    )
+                    print(f"✅ Deducted 1 credit from user {user_id} for campaign {request_id}")
 
         # If images were requested, mark drafts as has_image=True immediately so the
         # frontend shimmer shows right away, then kick off background generation.
@@ -830,31 +842,42 @@ async def regenerate_draft_image(
 
         # User confirmed - check and deduct credit
         from app.services.CreditService import credit_service
+        from app.services.TrialService import trial_service
 
-        has_credits = await credit_service.check_sufficient_credits(user_id, required=1)
-        if not has_credits:
-            # PRD 8: Out of credits - block action
-            return JSONResponse(
-                status_code=402,
-                content={
-                    "status": False,
-                    "responseCode": 402,
-                    "responseMessage": "You've run out of credits. Upgrade to continue.",
-                    "responseData": {
-                        "credits_remaining": 0,
-                        "upgrade_url": "/pricing"
-                    }
-                }
+        is_trial_user = await trial_service.has_active_trial(user_id)
+
+        if is_trial_user:
+            request_id = draft.get("request_id", draft_id)
+            deducted = await trial_service.deduct_trial_credit(
+                user_id=user_id,
+                campaign_id=request_id,
+                reason="image_retry",
             )
+        else:
+            has_credits = await credit_service.check_sufficient_credits(user_id, required=1)
+            if not has_credits:
+                # PRD 8: Out of credits - block action
+                return JSONResponse(
+                    status_code=402,
+                    content={
+                        "status": False,
+                        "responseCode": 402,
+                        "responseMessage": "You've run out of credits. Upgrade to continue.",
+                        "responseData": {
+                            "credits_remaining": 0,
+                            "upgrade_url": "/pricing"
+                        }
+                    }
+                )
 
-        # Deduct 1 credit for second retry
-        request_id = draft.get("request_id", draft_id)
-        deducted = await credit_service.deduct_credit(
-            user_id=user_id,
-            campaign_id=request_id,
-            reason="image_retry",
-            retry_count=image_retry_count
-        )
+            # Deduct 1 credit for second retry
+            request_id = draft.get("request_id", draft_id)
+            deducted = await credit_service.deduct_credit(
+                user_id=user_id,
+                campaign_id=request_id,
+                reason="image_retry",
+                retry_count=image_retry_count
+            )
 
         if not deducted:
             return JSONResponse(
