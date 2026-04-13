@@ -1730,7 +1730,7 @@ async def get_account_metrics(
                 return None
 
         async def _fetch_direct_metrics(conn):
-            if conn.get("connected_via") == "instagram_direct":
+            if conn.get("connected_via") in ("instagram_direct", "instagram_direct_oauth"):
                 return await _fetch_instagram_direct_metrics(conn)
             return None  # extend here for other direct platforms
 
