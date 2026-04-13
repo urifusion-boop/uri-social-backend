@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Your Free Trial Has Started! 🎯</h1>
+<p>Hi {{ user_name | default('there') }},</p>
+<p>Great news — your <strong>{{ trial_days }}-day free trial</strong> is now active with <strong>{{ trial_credits }} credits</strong>.</p>
+<div class="divider"></div>
+<div style="background:rgba(205,27,120,.04); border-radius:10px; padding:20px; margin:16px 0;">
+  <p style="font-size:14px; color:#CD1B78; font-weight:700; margin:0 0 8px;">What you can do:</p>
+  <p style="font-size:14px; color:#4B5563; margin:0; line-height:1.8;">
+    ✦ Generate AI-powered social media content<br>
+    ✦ Create posts for multiple platforms at once<br>
+    ✦ Generate custom graphics and images<br>
+    ✦ Schedule and auto-publish content
+  </p>
+</div>
+<a href="{{ app_url | default('https://app.urisocial.com') }}/workspace" class="cta">Start Creating →</a>
+<p style="font-size:13px; color:#9CA3AF; margin-top:12px;">Your trial expires in {{ trial_days }} days — make the most of it!</p>
+{% endblock %}

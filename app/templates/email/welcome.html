@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Welcome to URI Social! 🎉</h1>
+<p>Hi {{ user_name | default('there') }},</p>
+<p>You're all set to start creating amazing social media content with your AI-powered assistant.</p>
+{% if trial_days %}
+<div class="divider"></div>
+<span class="badge badge-pink">Free Trial — {{ trial_days }} days &middot; {{ trial_credits }} credits</span>
+<p style="margin-top:16px;">Your free trial is active! You have <strong>{{ trial_credits }} credits</strong> to create content across all your social platforms.</p>
+{% endif %}
+<a href="{{ app_url | default('https://app.urisocial.com') }}/workspace" class="cta">Start Creating Content →</a>
+<p style="font-size:13px; color:#9CA3AF; margin-top:12px;">Connect your social accounts, set up your brand profile, and let URI Agent do the rest.</p>
+{% endblock %}

@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>We Miss You! 👋</h1>
+<p>Hi {{ user_name | default('there') }},</p>
+<p>It's been <strong>{{ days_inactive }} days</strong> since your last post. Your audience is waiting for fresh content!</p>
+<div class="divider"></div>
+<div style="background:#FDF4FF; border-radius:10px; padding:20px; text-align:left; margin:16px 0; border-left:4px solid #CD1B78;">
+  <p style="font-size:14px; color:#6B7280; margin:0 0 8px;">Here's an idea to get started:</p>
+  <p style="font-size:15px; color:#1F2937; margin:0; line-height:1.7; font-weight:500;">{{ suggestion | default('Share a quick update about what you\'ve been working on — your audience loves authenticity.') }}</p>
+</div>
+{% if credits_remaining is defined and credits_remaining is not none %}
+<p style="font-size:13px; color:#6B7280;">You still have <strong>{{ credits_remaining }}</strong> credits available.</p>
+{% endif %}
+<a href="{{ app_url | default('https://app.urisocial.com') }}/workspace" class="cta">Create Content Now →</a>
+{% endblock %}

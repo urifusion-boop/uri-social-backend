@@ -613,6 +613,19 @@ class ApprovalWorkflowService:
                         )
                         await db["social_connections"].update_one(conn_filter, {"$inc": {"total_posts_published": 1}})
                         published_count += 1
+
+                        # Notification PRD 4.3: Content posted (scheduled publish)
+                        try:
+                            from app.services.NotificationService import notification_service
+                            import asyncio
+                            asyncio.ensure_future(notification_service.notify_content_posted(
+                                user_id=draft_user_id,
+                                platform=draft.get("platform", ""),
+                                content_preview=(draft.get("content") or "")[:120],
+                                campaign_id=draft.get("campaign_id", ""),
+                            ))
+                        except Exception as e:
+                            print(f"⚠️ Content posted notification failed: {e}")
                     else:
                         await db["content_drafts"].update_one(
                             {"id": draft["id"]},
@@ -749,6 +762,21 @@ class ApprovalWorkflowService:
                         }},
                     )
                     await db["social_connections"].update_one(conn_filter, {"$inc": {"total_posts_published": 1}})
+
+                    # Notification PRD 4.3: Content posted (immediate publish)
+                    if not is_scheduled:
+                        try:
+                            from app.services.NotificationService import notification_service
+                            import asyncio
+                            asyncio.ensure_future(notification_service.notify_content_posted(
+                                user_id=user_id,
+                                platform=platform,
+                                content_preview=(draft.get("content") or "")[:120],
+                                campaign_id=draft.get("campaign_id", ""),
+                            ))
+                        except Exception as e:
+                            print(f"⚠️ Content posted notification failed: {e}")
+
                 elif is_scheduled:
                     # When scheduling, the draft was already marked status=scheduled in
                     # approve_content. Keep that status — don't overwrite to publish_failed.

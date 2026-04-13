@@ -94,6 +94,15 @@ class Settings(BaseSettings):
     TWILIO_AUTH_TOKEN: str = ""
     TWILIO_WHATSAPP_FROM: str = ""  # e.g. whatsapp:+14155238886
 
+    # Email (SMTP) — Notification System PRD
+    SMTP_HOST: str = ""
+    SMTP_PORT: int = 587
+    SMTP_USERNAME: str = ""
+    SMTP_PASSWORD: str = ""
+    SMTP_FROM_EMAIL: str = "noreply@urisocial.com"
+    SMTP_FROM_NAME: str = "URI Social"
+    SMTP_USE_TLS: bool = True
+
     # Sentry (optional)
     SENTRY_DSN: Optional[str] = None
 
