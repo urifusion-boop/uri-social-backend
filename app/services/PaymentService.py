@@ -50,16 +50,8 @@ class PaymentService:
         self.callback_url = f'{web_app_url}/dashboard/billing'
 
     async def _get_current_mode(self) -> str:
-        """Get current Squad mode from database (allows runtime switching)"""
-        try:
-            # Check if there's a mode override in settings collection
-            settings_doc = await self.db["app_settings"].find_one({"setting": "squad_mode"})
-            if settings_doc and settings_doc.get("value") in ["sandbox", "live"]:
-                return settings_doc["value"]
-        except Exception as e:
-            print(f"⚠️ Could not fetch Squad mode from DB: {e}")
-
-        # Fallback to environment variable
+        """Get current Squad mode from config (production: always use config value)"""
+        # Production: Always use config.py value, no database override
         return self.default_mode
 
     async def _get_squad_credentials(self):
