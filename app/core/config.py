@@ -56,8 +56,8 @@ class Settings(BaseSettings):
     GOOGLE_CLIENT_SECRET: Optional[str] = None
 
     # SQUAD Payment Gateway (PRD Section 6.2: Payment Integration)
-    # Mode switching: Set SQUAD_MODE to "sandbox" or "live"
-    SQUAD_MODE: str = "sandbox"  # Options: "sandbox" or "live"
+    # Production: Always use live mode for real payments
+    SQUAD_MODE: str = "live"  # Options: "sandbox" or "live"
 
     # Sandbox credentials (for testing)
     SQUAD_SANDBOX_SECRET_KEY: Optional[str] = None
