@@ -22,6 +22,8 @@ from app.domain.models.billing_models import (
     InitializePaymentResponse
 )
 from app.services.SubscriptionService import subscription_service
+from app.services.TrialService import trial_service
+from app.services.CreditService import credit_service
 from app.core.config import settings
 
 
@@ -254,6 +256,8 @@ class PaymentService:
         """
         Complete payment and activate subscription
         PRD 6.3: On success: Assign credits, Activate subscription
+
+        IMPORTANT: Preserves trial credits as bonus credits when trial user subscribes
         """
         # Update payment status
         await self.payment_transactions_collection.update_one(
@@ -267,11 +271,28 @@ class PaymentService:
             }
         )
 
-        # Activate subscription (this allocates credits)
+        # Check if user has remaining trial credits - preserve them as bonus credits
+        trial_status = await trial_service.get_trial_status(user_id)
+        remaining_trial_credits = 0
+
+        if trial_status and trial_status.trial_active and trial_status.credits_remaining > 0:
+            remaining_trial_credits = trial_status.credits_remaining
+            print(f"💎 Preserving {remaining_trial_credits} trial credits as bonus for user {user_id}")
+
+        # Activate subscription (this allocates subscription credits)
         await subscription_service.create_subscription(
             user_id=user_id,
             tier_id=tier_id
         )
+
+        # Add trial credits as bonus credits after subscription is created
+        if remaining_trial_credits > 0:
+            await credit_service.add_bonus_credits(
+                user_id=user_id,
+                bonus_amount=remaining_trial_credits,
+                reason="trial_credits_preserved"
+            )
+            print(f"✅ Added {remaining_trial_credits} bonus credits from trial")
 
     async def _mark_payment_failed(
         self,
