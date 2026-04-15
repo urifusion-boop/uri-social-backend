@@ -11,6 +11,7 @@ Handles:
 """
 from typing import Optional
 from datetime import datetime, timedelta
+from math import ceil
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.database import get_db
 from app.domain.models.billing_models import (
@@ -122,7 +123,8 @@ class TrialService:
         time_remaining = end_date - now
         is_active = now < end_date and credits_remaining > 0
 
-        days_remaining = max(0, time_remaining.days)
+        total_seconds_remaining = max(0, time_remaining.total_seconds())
+        days_remaining = ceil(total_seconds_remaining / 86400) if total_seconds_remaining > 0 else 0
         hours_remaining = max(0, int(time_remaining.total_seconds() // 3600))
         trial_expired = not is_active and trial_doc.get("trial_used", False)
 
