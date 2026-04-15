@@ -421,34 +421,35 @@ async def initiate_social_connections(
 @router.get("/connect/instagram-direct/initiate")
 async def instagram_direct_initiate(source: Optional[str] = Query("settings")):
     """
-    Redirect the user's browser to Instagram's OAuth authorization page.
-    Uses Instagram Business Login (www.instagram.com) with the same Meta app credentials,
-    bypassing Outstand entirely. On completion, Instagram redirects to
-    /connect/instagram-direct/callback.
+    Redirect the user's browser to Facebook's OAuth page to connect Instagram
+    via the Instagram API with Facebook Login. On completion, Facebook redirects to
+    /connect/instagram-direct/callback where we retrieve the linked Instagram
+    Business Account from the user's Facebook Pages.
     """
     import urllib.parse
 
-    ig_app_id = settings.INSTAGRAM_APP_ID or settings.META_APP_ID
-    if not ig_app_id:
-        raise HTTPException(status_code=500, detail="INSTAGRAM_APP_ID not configured")
+    app_id = settings.META_APP_ID
+    if not app_id:
+        raise HTTPException(status_code=500, detail="META_APP_ID not configured")
 
     _base = (settings.PUBLIC_API_URL or settings.URI_GATEWAY_BASE_API_URL).rstrip("/")
     redirect_uri = f"{_base}/social-media/connect/instagram-direct/callback"
 
     scopes = [
-        "instagram_business_basic",
-        "instagram_business_content_publish",
-        "instagram_business_manage_messages",
-        "instagram_business_manage_comments",
+        "instagram_basic",
+        "pages_show_list",
+        "pages_read_engagement",
+        "instagram_manage_insights",
+        "instagram_content_publish",
     ]
     params = {
-        "client_id": ig_app_id,
+        "client_id": app_id,
         "redirect_uri": redirect_uri,
         "scope": ",".join(scopes),
         "response_type": "code",
         "state": source or "settings",
     }
-    auth_url = "https://www.instagram.com/oauth/authorize?" + urllib.parse.urlencode(params)
+    auth_url = "https://www.facebook.com/v20.0/dialog/oauth?" + urllib.parse.urlencode(params)
     return RedirectResponse(auth_url)
 
 
@@ -461,10 +462,11 @@ async def instagram_direct_callback(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """
-    Instagram OAuth callback. Exchanges the auth code for a short-lived token,
-    then exchanges for a long-lived token (60 days), fetches profile info,
-    and stores the connection in social_connections as connected_via=instagram_direct_oauth.
-    No JWT required — the user arrives here via browser redirect from Instagram.
+    Facebook OAuth callback for Instagram connection.
+    Exchanges the auth code for a Facebook user token, retrieves the user's
+    Facebook Pages, finds the Instagram Business Account linked to each page,
+    and stores the connection as connected_via=instagram_direct_oauth.
+    No JWT required — the user arrives here via browser redirect from Facebook.
     """
     import urllib.parse
     import httpx
@@ -488,68 +490,100 @@ async def instagram_direct_callback(
 
     _base = (settings.PUBLIC_API_URL or settings.URI_GATEWAY_BASE_API_URL).rstrip("/")
     redirect_uri = f"{_base}/social-media/connect/instagram-direct/callback"
+    app_id = settings.META_APP_ID
+    app_secret = settings.META_APP_SECRET
 
     try:
         async with httpx.AsyncClient(timeout=30) as client:
-            # Step 1: exchange code → short-lived user access token
-            ig_app_id = settings.INSTAGRAM_APP_ID or settings.META_APP_ID
-            ig_app_secret = settings.INSTAGRAM_APP_SECRET or settings.META_APP_SECRET
+            # Step 1: exchange code → short-lived Facebook user access token
             token_resp = await client.post(
-                "https://api.instagram.com/oauth/access_token",
+                "https://graph.facebook.com/v20.0/oauth/access_token",
                 data={
-                    "client_id": ig_app_id,
-                    "client_secret": ig_app_secret,
-                    "grant_type": "authorization_code",
+                    "client_id": app_id,
+                    "client_secret": app_secret,
                     "redirect_uri": redirect_uri,
                     "code": code,
                 },
             )
             token_data = token_resp.json()
             print(f"[IGDirectOAuth] short-lived token response: {token_data}")
-            short_token = token_data.get("access_token")
-            ig_user_id = str(token_data.get("user_id", ""))
-            if not short_token or not ig_user_id:
-                err = (token_data.get("error_message") or token_data.get("error", {}).get("message", "token exchange failed"))
+            if "error" in token_data:
+                err = token_data["error"].get("message", "token exchange failed")
                 return RedirectResponse(f"{base_redirect}?connected=false&error={urllib.parse.quote(err)}")
+            short_token = token_data.get("access_token")
 
-            # Step 2: exchange short-lived → long-lived token (60 days)
+            # Step 2: exchange short-lived → long-lived user token (60 days)
             ll_resp = await client.get(
-                "https://graph.instagram.com/access_token",
+                "https://graph.facebook.com/v20.0/oauth/access_token",
                 params={
-                    "grant_type": "ig_exchange_token",
-                    "client_secret": ig_app_secret,
-                    "access_token": short_token,
+                    "grant_type": "fb_exchange_token",
+                    "client_id": app_id,
+                    "client_secret": app_secret,
+                    "fb_exchange_token": short_token,
                 },
             )
             ll_data = ll_resp.json()
             print(f"[IGDirectOAuth] long-lived token response: {ll_data}")
             long_token = ll_data.get("access_token", short_token)
 
-            # Step 3: fetch profile
-            profile_resp = await client.get(
-                "https://graph.instagram.com/me",
-                params={
-                    "fields": "id,username,name,profile_picture_url",
-                    "access_token": long_token,
-                },
+            # Step 3: get the user's Facebook Pages (each has a page access token)
+            pages_resp = await client.get(
+                "https://graph.facebook.com/v20.0/me/accounts",
+                params={"access_token": long_token},
             )
-            profile = profile_resp.json()
-            print(f"[IGDirectOAuth] profile: {profile}")
-            username = profile.get("username", ig_user_id)
+            pages_data = pages_resp.json()
+            print(f"[IGDirectOAuth] pages: {pages_data}")
+            pages = pages_data.get("data", [])
+            if not pages:
+                err_msg = "No Facebook Pages found. Link your Instagram Business Account to a Facebook Page first."
+                return RedirectResponse(f"{base_redirect}?connected=false&error={urllib.parse.quote(err_msg)}")
 
-        # Step 4: store in social_connections
+            # Step 4: find Instagram Business Account linked to one of the pages
+            ig_user_id = None
+            username = None
+            profile_picture_url = None
+            page_token = None
+
+            for page in pages:
+                pid = page["id"]
+                ptok = page.get("access_token", long_token)
+                ig_resp = await client.get(
+                    f"https://graph.facebook.com/v20.0/{pid}",
+                    params={"fields": "instagram_business_account", "access_token": ptok},
+                )
+                ig_data = ig_resp.json()
+                ig_account = ig_data.get("instagram_business_account")
+                if ig_account:
+                    ig_user_id = str(ig_account["id"])
+                    page_token = ptok
+                    # Step 5: fetch Instagram profile
+                    profile_resp = await client.get(
+                        f"https://graph.facebook.com/v20.0/{ig_user_id}",
+                        params={"fields": "id,username,name,profile_picture_url", "access_token": ptok},
+                    )
+                    profile = profile_resp.json()
+                    print(f"[IGDirectOAuth] ig profile: {profile}")
+                    username = profile.get("username", ig_user_id)
+                    profile_picture_url = profile.get("profile_picture_url")
+                    break
+
+            if not ig_user_id:
+                err_msg = "No Instagram Business Account found linked to your Facebook Pages."
+                return RedirectResponse(f"{base_redirect}?connected=false&error={urllib.parse.quote(err_msg)}")
+
+        # Step 6: store in social_connections
         now = datetime.now(timezone.utc).isoformat()
         conn_doc = {
             "id": ig_user_id,
-            "user_id": None,  # unknown — user not authenticated here; matched on next /connections call
+            "user_id": None,  # matched when user calls /connections after redirect
             "platform": "instagram",
             "connected_via": "instagram_direct_oauth",
             "ig_user_id": ig_user_id,
-            "page_access_token": long_token,  # user access token (long-lived)
+            "page_access_token": page_token,
             "username": username,
             "account_name": username,
-            "profile_picture_url": profile.get("profile_picture_url"),
-            "connection_status": "pending_user_match",  # matched when user calls /connections
+            "profile_picture_url": profile_picture_url,
+            "connection_status": "pending_user_match",
             "connected_at": now,
             "updated_at": now,
         }
@@ -560,7 +594,6 @@ async def instagram_direct_callback(
         )
         print(f"[IGDirectOAuth] ✅ Stored @{username} (ig_user_id={ig_user_id}) pending user match")
 
-        # Redirect frontend with enough info to match the connection to the logged-in user
         params_out = (
             f"connected=instagram_direct"
             f"&ig_user_id={urllib.parse.quote(ig_user_id)}"
