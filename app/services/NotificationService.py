@@ -181,6 +181,47 @@ class NotificationService:
             {"$set": {"last_active_at": datetime.utcnow()}},
         )
 
+    # ==================== Admin: New Signup Alert ====================
+
+    async def notify_admin_new_signup(
+        self,
+        email: str,
+        first_name: str = "",
+        last_name: str = "",
+        auth_provider: str = "email",
+    ):
+        """Send admin notification email when a new user signs up."""
+        admin_email = settings.ADMIN_NOTIFICATION_EMAIL
+        if not admin_email:
+            print("⚠️ ADMIN_NOTIFICATION_EMAIL not set — skipping admin signup alert")
+            return
+
+        now = datetime.utcnow()
+        full_name = f"{first_name} {last_name}".strip() or "N/A"
+        subject = f"New Signup: {full_name} ({email})"
+
+        html = f"""
+        <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;">
+            <h2 style="color:#6366f1;">New User Signup</h2>
+            <table style="width:100%;border-collapse:collapse;">
+                <tr><td style="padding:8px;font-weight:bold;">Email</td><td style="padding:8px;">{email}</td></tr>
+                <tr><td style="padding:8px;font-weight:bold;">Name</td><td style="padding:8px;">{full_name}</td></tr>
+                <tr><td style="padding:8px;font-weight:bold;">Auth</td><td style="padding:8px;">{auth_provider}</td></tr>
+                <tr><td style="padding:8px;font-weight:bold;">Time (UTC)</td><td style="padding:8px;">{now.strftime("%Y-%m-%d %H:%M:%S")}</td></tr>
+            </table>
+        </div>
+        """
+
+        success = await email_service.send_raw_email(
+            to_email=admin_email,
+            subject=subject,
+            html_body=html,
+        )
+        if success:
+            print(f"📧 Admin notified of new signup: {email}")
+        else:
+            print(f"⚠️ Failed to send admin signup alert for {email}")
+
     # ==================== PRD 4.2: Content Created Notification ====================
 
     async def notify_content_created(
