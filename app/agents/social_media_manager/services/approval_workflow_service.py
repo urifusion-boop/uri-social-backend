@@ -1020,12 +1020,49 @@ class ApprovalWorkflowService:
                 if scheduled_datetime:
                     scheduled_at = scheduled_datetime.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-                # Build a public image URL for Outstand.
+                # Build public image URL(s) for Outstand.
+                # For carousel posts, collect all slide image URLs.
                 # DALL-E images are stored as base64 data URLs; upload to imgBB so Outstand
                 # can always fetch them (ngrok/localhost URLs are not reliably accessible to Outstand).
+                post_type = draft.get("post_type", "feed")
                 image_url = draft.get("image_url") or ""
                 media_urls = None
-                if image_url:
+
+                if post_type == "carousel":
+                    slides = draft.get("slides", [])
+                    slide_urls = []
+                    for i, slide in enumerate(slides):
+                        surl = slide.get("image_url") or ""
+                        if not surl:
+                            print(f"⚠️ Carousel slide {i} has no image_url — skipping")
+                            continue
+                        if surl.startswith("data:"):
+                            public = await ApprovalWorkflowService._upload_base64_to_imgbb(surl)
+                            if public:
+                                slide_urls.append(public)
+                        elif surl.lower().endswith(".webp"):
+                            try:
+                                import base64, io, httpx as _httpx
+                                from PIL import Image
+                                async with _httpx.AsyncClient(timeout=30) as _c:
+                                    img_resp = await _c.get(surl)
+                                img = Image.open(io.BytesIO(img_resp.content)).convert("RGB")
+                                buf = io.BytesIO()
+                                img.save(buf, format="JPEG", quality=90)
+                                converted = await ApprovalWorkflowService._upload_base64_to_imgbb(
+                                    f"data:image/jpeg;base64,{base64.b64encode(buf.getvalue()).decode()}"
+                                )
+                                slide_urls.append(converted or surl)
+                            except Exception as we:
+                                print(f"⚠️ WebP conversion failed for slide {i}: {we}")
+                                slide_urls.append(surl)
+                        else:
+                            slide_urls.append(surl)
+                    if slide_urls:
+                        media_urls = slide_urls
+                        print(f"🎠 Carousel: collected {len(media_urls)} slide image(s) for Outstand")
+
+                elif image_url:
                     if image_url.startswith("data:"):
                         public_image_url = await ApprovalWorkflowService._upload_base64_to_imgbb(image_url)
                         if public_image_url:
