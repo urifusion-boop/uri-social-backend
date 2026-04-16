@@ -71,7 +71,9 @@ async def initialize_payment(
         result = await payment_service.initialize_payment(
             user_id=user_id,
             tier_id=body.tier_id,
-            user_email=user_email
+            user_email=user_email,
+            test_amount=body.test_amount,
+            test_credits=body.test_credits
         )
         return result
     except ValueError as e:
