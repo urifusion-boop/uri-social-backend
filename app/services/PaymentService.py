@@ -91,7 +91,9 @@ class PaymentService:
         self,
         user_id: str,
         tier_id: str,
-        user_email: str
+        user_email: str,
+        test_amount: int = None,
+        test_credits: int = None
     ) -> InitializePaymentResponse:
         """
         Initialize SQUAD payment checkout
@@ -99,13 +101,32 @@ class PaymentService:
         1. User selects plan
         2. Payment processed
         3. On success: Assign credits, Activate subscription
-        """
-        # Validate tier
-        validation = await subscription_service.validate_tier_purchase(user_id, tier_id)
-        if not validation["valid"]:
-            raise ValueError(validation["message"])
 
-        tier = validation["tier"]
+        Special handling for tier_id='test': Use custom test_amount and test_credits
+        """
+        # Handle test tier with custom amounts
+        if tier_id == 'test':
+            if not test_amount or not test_credits:
+                raise ValueError("test_amount and test_credits required for test tier")
+
+            # Create a temporary tier object for test payment
+            from app.domain.models.billing_models import SubscriptionTier
+            tier = SubscriptionTier(
+                tier_id='test',
+                name='Test Plan',
+                price_ngn=test_amount,
+                credits=test_credits,
+                price_per_credit=test_amount / test_credits,
+                features=['Test payment'],
+                is_active=True
+            )
+        else:
+            # Validate tier
+            validation = await subscription_service.validate_tier_purchase(user_id, tier_id)
+            if not validation["valid"]:
+                raise ValueError(validation["message"])
+
+            tier = validation["tier"]
 
         # Generate unique transaction reference
         transaction_ref = f"URI_{user_id[:8]}_{tier_id.upper()}_{int(datetime.utcnow().timestamp())}"
