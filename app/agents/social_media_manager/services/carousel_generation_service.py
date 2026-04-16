@@ -168,6 +168,9 @@ class CarouselGenerationService:
         from datetime import datetime
         import uuid
 
+        # One request_id shared across all platform drafts in this generation
+        request_id = str(uuid.uuid4())
+
         drafts = []
         for platform in platforms:
             carousel_data = await CarouselGenerationService.generate(
@@ -189,6 +192,7 @@ class CarouselGenerationService:
 
             draft_doc = {
                 "id": draft_id,
+                "request_id": request_id,
                 "user_id": user_id,
                 "platform": platform,
                 "content": carousel_data["caption"],
@@ -198,7 +202,7 @@ class CarouselGenerationService:
                 "status": "draft",
                 "approval_status": "pending",
                 "has_image": False,
-                "image_retry_count": 0,  # PRD 4.3: Track image retry count
+                "image_retry_count": 0,
                 "created_at": datetime.utcnow(),
                 "updated_at": datetime.utcnow(),
             }
@@ -218,5 +222,5 @@ class CarouselGenerationService:
         return {
             "status": True,
             "responseMessage": f"Generated {len(drafts)} carousel draft(s)",
-            "responseData": {"drafts": drafts},
+            "responseData": {"drafts": drafts, "request_id": request_id},
         }
