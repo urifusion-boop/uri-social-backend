@@ -21,7 +21,9 @@ router = APIRouter(prefix="/notifications", tags=["Notifications"])
 
 
 def _get_user_id(token: dict) -> str:
-    return token.get("user_id", "")
+    """Extract user_id from JWT payload — matches JWT structure {claims: {userId: ...}}."""
+    claims = token.get("claims", {})
+    return claims.get("userId", "")
 
 
 @router.get("/")
