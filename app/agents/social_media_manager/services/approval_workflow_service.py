@@ -617,13 +617,12 @@ class ApprovalWorkflowService:
                         # Notification PRD 4.3: Content posted (scheduled publish)
                         try:
                             from app.services.NotificationService import notification_service
-                            import asyncio
-                            asyncio.ensure_future(notification_service.notify_content_posted(
+                            await notification_service.notify_content_posted(
                                 user_id=draft_user_id,
                                 platform=draft.get("platform", ""),
                                 content_preview=(draft.get("content") or "")[:120],
                                 campaign_id=draft.get("campaign_id", ""),
-                            ))
+                            )
                         except Exception as e:
                             print(f"⚠️ Content posted notification failed: {e}")
                     else:
@@ -767,13 +766,12 @@ class ApprovalWorkflowService:
                     if not is_scheduled:
                         try:
                             from app.services.NotificationService import notification_service
-                            import asyncio
-                            asyncio.ensure_future(notification_service.notify_content_posted(
+                            await notification_service.notify_content_posted(
                                 user_id=user_id,
                                 platform=platform,
                                 content_preview=(draft.get("content") or "")[:120],
                                 campaign_id=draft.get("campaign_id", ""),
-                            ))
+                            )
                         except Exception as e:
                             print(f"⚠️ Content posted notification failed: {e}")
 
