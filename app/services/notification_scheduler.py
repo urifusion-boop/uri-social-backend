@@ -12,20 +12,22 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 _scheduler: BackgroundScheduler = None
+_main_loop: asyncio.AbstractEventLoop = None
 
 
 def _run_async(coro_func):
-    """Helper to run an async coroutine from a sync APScheduler job."""
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            asyncio.ensure_future(coro_func())
-        else:
-            loop.run_until_complete(coro_func())
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(coro_func())
+    """Helper to run an async coroutine from a sync APScheduler job.
+    Schedules the coroutine on the main event loop so Motor cursors
+    (bound to that loop) work correctly.
+    """
+    if _main_loop is not None and _main_loop.is_running():
+        future = asyncio.run_coroutine_threadsafe(coro_func(), _main_loop)
+        try:
+            future.result(timeout=300)
+        except Exception as e:
+            print(f"⚠️ Scheduled job failed: {e}")
+    else:
+        print("⚠️ Main event loop not available — skipping scheduled job")
 
 
 def _job_daily_suggestions():
@@ -45,10 +47,16 @@ def _job_trial_check():
 
 def start_notification_scheduler():
     """Start the APScheduler with all notification batch jobs."""
-    global _scheduler
+    global _scheduler, _main_loop
 
     if _scheduler is not None:
         return
+
+    # Capture main event loop so scheduled jobs can use Motor (which is bound to it)
+    try:
+        _main_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        _main_loop = asyncio.get_event_loop()
 
     _scheduler = BackgroundScheduler(timezone="UTC")
 
