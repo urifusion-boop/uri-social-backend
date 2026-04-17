@@ -881,6 +881,19 @@ class ApprovalWorkflowService:
             return None
 
     @staticmethod
+    def _resolve_image_url(url: str) -> str:
+        """
+        Convert a relative /static/images/... path to a full public URL.
+        Absolute URLs (http/https) and data: URLs are returned unchanged.
+        """
+        if not url or url.startswith("http") or url.startswith("data:"):
+            return url
+        if url.startswith("/"):
+            base = (settings.PUBLIC_API_URL or "").rstrip("/")
+            return f"{base}{url}"
+        return url
+
+    @staticmethod
     async def _upload_base64_image_to_facebook(
         page_id: str,
         page_token: str,
@@ -1006,7 +1019,7 @@ class ApprovalWorkflowService:
                     page_id=page_id,
                 )
             elif post_type == "story":
-                image_url = draft.get("image_url") or ""
+                image_url = ApprovalWorkflowService._resolve_image_url(draft.get("image_url") or "")
                 if image_url and image_url.startswith("data:"):
                     image_url = await ApprovalWorkflowService._upload_base64_to_imgbb(image_url) or ""
                 return await InstagramDirectService.publish_story(
@@ -1016,7 +1029,7 @@ class ApprovalWorkflowService:
                     page_id=page_id,
                 )
             else:
-                image_url = draft.get("image_url") or ""
+                image_url = ApprovalWorkflowService._resolve_image_url(draft.get("image_url") or "")
                 if image_url and image_url.startswith("data:"):
                     image_url = await ApprovalWorkflowService._upload_base64_to_imgbb(image_url) or ""
                 return await InstagramDirectService.publish_post(
@@ -1048,7 +1061,7 @@ class ApprovalWorkflowService:
                     slides = draft.get("slides", [])
                     slide_urls = []
                     for i, slide in enumerate(slides):
-                        surl = slide.get("image_url") or ""
+                        surl = ApprovalWorkflowService._resolve_image_url(slide.get("image_url") or "")
                         if not surl:
                             print(f"⚠️ Carousel slide {i} has no image_url — skipping")
                             continue
@@ -1078,7 +1091,8 @@ class ApprovalWorkflowService:
                         media_urls = slide_urls
                         print(f"🎠 Carousel: collected {len(media_urls)} slide image(s) for Outstand")
 
-                elif image_url:
+                image_url = ApprovalWorkflowService._resolve_image_url(image_url)
+                if image_url:
                     if image_url.startswith("data:"):
                         public_image_url = await ApprovalWorkflowService._upload_base64_to_imgbb(image_url)
                         if public_image_url:
@@ -1239,7 +1253,7 @@ class ApprovalWorkflowService:
 
             # ── Facebook story ─────────────────────────────────────────────────
             elif post_type == "story":
-                story_image_url = draft.get("image_url") or ""
+                story_image_url = ApprovalWorkflowService._resolve_image_url(draft.get("image_url") or "")
                 if story_image_url.startswith("data:"):
                     story_image_url = await ApprovalWorkflowService._upload_base64_to_imgbb(story_image_url) or ""
                 if not story_image_url:
