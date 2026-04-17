@@ -71,12 +71,8 @@ async def whatsapp_webhook(
         _base = str(settings.PUBLIC_API_URL).rstrip("/")
         url = f"{_base}/whatsapp/webhook"
 
-        valid = validator.validate(url, params, twilio_sig)
-        print(f"[WhatsApp] sig_valid={valid} url={url} sig={twilio_sig[:20] if twilio_sig else 'MISSING'}... params_keys={list(params.keys())[:5]}")
-        if not valid:
-            print(f"[WhatsApp] FULL sig={twilio_sig} all_headers={dict(request.headers)}")
-            # NOTE: validation temporarily disabled to diagnose URL mismatch
-            pass
+        if not validator.validate(url, params, twilio_sig):
+            raise HTTPException(status_code=403, detail="Invalid Twilio signature.")
 
     raw_from: str = params.get("From", "")
     body: str = params.get("Body", "")
