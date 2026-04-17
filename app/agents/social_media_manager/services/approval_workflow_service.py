@@ -991,7 +991,7 @@ class ApprovalWorkflowService:
                     return {"success": False, "error": "X API credits depleted and no Outstand X account connected as fallback."}
 
         # ── Instagram direct (via Facebook Page Access Token) ────────────────
-        if platform == "instagram" and connection.get("connected_via") == "instagram_direct":
+        if platform == "instagram" and connection.get("connected_via") in ("instagram_direct", "instagram_direct_oauth"):
             # Instagram Graph API does not support native scheduling for standard feed posts.
             # When scheduled_datetime is set the draft is already stored with status="scheduled"
             # and the cron job (publish_scheduled_content) will call this again at the right
