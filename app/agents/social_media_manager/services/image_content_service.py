@@ -102,28 +102,23 @@ class ImageContentService:
                         draft['image_specs'] = image_result['responseData']['specs']
                         draft['has_image'] = True
 
-                        # Upload base64 image to imgBB so we always store a
-                        # public URL (avoids the internal-URL proxy problem).
+                        # Save base64 image to local static storage (served directly)
                         stored_url = raw_image_url
                         if raw_image_url and raw_image_url.startswith("data:"):
                             try:
-                                import base64 as _b64, re as _re, httpx as _httpx
-                                from app.core.config import settings as _cfg
+                                import base64 as _b64, re as _re, os as _os, uuid as _uuid
                                 _match = _re.match(r"data:[^;]+;base64,(.+)", raw_image_url, _re.DOTALL)
-                                if _match and _cfg.IMGBB_API_KEY:
-                                    async with _httpx.AsyncClient(timeout=120) as _c:
-                                        _r = await _c.post(
-                                            "https://api.imgbb.com/1/upload",
-                                            data={"key": _cfg.IMGBB_API_KEY, "image": _match.group(1)},
-                                        )
-                                        _rj = _r.json()
-                                    if _rj.get("success"):
-                                        stored_url = _rj["data"]["url"]
-                                        print(f"☁️  Image uploaded to imgBB: {stored_url}")
-                                    else:
-                                        print(f"⚠️  imgBB upload failed: {_rj.get('error')}, keeping base64")
-                            except Exception as _imgbb_err:
-                                print(f"⚠️  imgBB upload error: {_imgbb_err}, keeping base64")
+                                if _match:
+                                    _filename = f"{_uuid.uuid4().hex}.webp"
+                                    _static_dir = "/app/static/images"
+                                    _os.makedirs(_static_dir, exist_ok=True)
+                                    _img_bytes = _b64.b64decode(_match.group(1))
+                                    with open(f"{_static_dir}/{_filename}", "wb") as _f:
+                                        _f.write(_img_bytes)
+                                    stored_url = f"/static/images/{_filename}"
+                                    print(f"💾 Image saved locally: {stored_url}")
+                            except Exception as _save_err:
+                                print(f"⚠️  Local image save error: {_save_err}, keeping base64")
 
                         # Persist URL to DB
                         if db is not None:
@@ -176,8 +171,7 @@ class ImageContentService:
         Clears image_url first (frontend shows shimmer), then generates a new
         image incorporating the feedback and persists it to the draft.
         """
-        import re as _re, httpx as _httpx, base64 as _b64
-        from app.core.config import settings as _cfg
+        import re as _re, base64 as _b64, os as _os, uuid as _uuid
         from datetime import datetime
 
         try:
@@ -215,23 +209,22 @@ class ImageContentService:
             raw_url = image_result["responseData"]["image_url"]
             specs = image_result["responseData"]["specs"]
 
-            # Upload base64 to imgBB for a public URL
+            # Save base64 to local static storage (served directly by backend)
             stored_url = raw_url
             if raw_url and raw_url.startswith("data:"):
                 try:
                     _match = _re.match(r"data:[^;]+;base64,(.+)", raw_url, _re.DOTALL)
-                    if _match and _cfg.IMGBB_API_KEY:
-                        async with _httpx.AsyncClient(timeout=120) as _c:
-                            _r = await _c.post(
-                                "https://api.imgbb.com/1/upload",
-                                data={"key": _cfg.IMGBB_API_KEY, "image": _match.group(1)},
-                            )
-                        _rj = _r.json()
-                        if _rj.get("success"):
-                            stored_url = _rj["data"]["url"]
-                            print(f"☁️  Regenerated image uploaded to imgBB: {stored_url}")
+                    if _match:
+                        _filename = f"{_uuid.uuid4().hex}.webp"
+                        _static_dir = "/app/static/images"
+                        _os.makedirs(_static_dir, exist_ok=True)
+                        _img_bytes = _b64.b64decode(_match.group(1))
+                        with open(f"{_static_dir}/{_filename}", "wb") as _f:
+                            _f.write(_img_bytes)
+                        stored_url = f"/static/images/{_filename}"
+                        print(f"💾 Regenerated image saved locally: {stored_url}")
                 except Exception as _e:
-                    print(f"⚠️ imgBB upload error during regeneration: {_e}")
+                    print(f"⚠️ Local image save error during regeneration: {_e}")
 
             await db["content_drafts"].update_one(
                 {"$or": [{"id": draft_id}, {"draft_id": draft_id}]},

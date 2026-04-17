@@ -2284,9 +2284,8 @@ async def _generate_image_bg(
     For story posts, uses the story (9:16) image spec.
     """
     import re
+    import os
     import base64
-    import httpx
-    from app.core.config import settings as _cfg
 
     try:
         # For story posts pass image_type="story" so we get 1080x1920 dimensions
@@ -2308,24 +2307,22 @@ async def _generate_image_bg(
         raw_url = image_result["responseData"]["image_url"]
         stored_url = raw_url
 
-        # Upload base64 image to imgBB for a public URL
+        # Save base64 image to local static storage (served directly by this backend)
         if raw_url and raw_url.startswith("data:"):
             try:
                 match = re.match(r"data:[^;]+;base64,(.+)", raw_url, re.DOTALL)
-                if match and _cfg.IMGBB_API_KEY:
-                    async with httpx.AsyncClient(timeout=30) as client:
-                        resp = await client.post(
-                            "https://api.imgbb.com/1/upload",
-                            data={"key": _cfg.IMGBB_API_KEY, "image": match.group(1)},
-                        )
-                        rj = resp.json()
-                    if rj.get("success"):
-                        stored_url = rj["data"]["url"]
-                        print(f"☁️  BG image uploaded to imgBB: {stored_url}")
-                    else:
-                        print(f"⚠️  BG imgBB upload failed: {rj.get('error')}")
+                if match:
+                    import uuid as _uuid
+                    filename = f"{_uuid.uuid4().hex}.webp"
+                    static_dir = "/app/static/images"
+                    os.makedirs(static_dir, exist_ok=True)
+                    img_bytes = base64.b64decode(match.group(1))
+                    with open(f"{static_dir}/{filename}", "wb") as _f:
+                        _f.write(img_bytes)
+                    stored_url = f"/static/images/{filename}"
+                    print(f"💾 BG image saved locally: {stored_url}")
             except Exception as upload_err:
-                print(f"⚠️  BG imgBB upload error: {upload_err}")
+                print(f"⚠️  BG local image save error: {upload_err}")
 
         final_url = stored_url if not stored_url.startswith("data:") else None
         if final_url and db is not None:
