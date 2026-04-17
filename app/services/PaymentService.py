@@ -104,9 +104,9 @@ class PaymentService:
 
         Special handling for tier_id='test': Use custom test_amount and test_credits
         """
-        # Handle test tier with custom amounts
+        # Handle test tier with custom amounts (temporary testing feature)
         if tier_id == 'test':
-            print(f"🧪 Test payment requested: amount={test_amount}, credits={test_credits}")
+            print(f"🧪 TEST PAYMENT: amount={test_amount}, credits={test_credits}, user={user_id}")
             if not test_amount or not test_credits:
                 raise ValueError(f"test_amount and test_credits required for test tier (received: amount={test_amount}, credits={test_credits})")
 
