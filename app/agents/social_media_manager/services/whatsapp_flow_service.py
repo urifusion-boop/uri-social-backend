@@ -122,7 +122,8 @@ SCHEDULE_PROMPT = (
     "• *tomorrow 9am*\n"
     "• *Monday 3pm*\n"
     "• *18 April 10am*\n\n"
-    "_All times are WAT (West Africa Time)_"
+    "_All times are WAT (West Africa Time)_\n\n"
+    "Reply *back* to cancel."
 )
 
 NO_PLATFORMS = (
@@ -545,6 +546,14 @@ class WhatsAppFlowService:
 
         # ── State-specific routing ─────────────────────────────────────────
         if state == "awaiting_topic":
+            if body.strip().lower() in {"back", "cancel", "0", "stop"}:
+                if ctx.get("headline"):
+                    _send(phone, _format_content(ctx))
+                    await _safe_set_state(phone, "showing_content", ctx, db)
+                else:
+                    _send(phone, HELP_MESSAGE)
+                    await _safe_set_state(phone, "idle", ctx, db)
+                return
             await WhatsAppFlowService._create_and_show_content(phone, body.strip(), user_id, ctx, db)
             return
 
@@ -553,6 +562,10 @@ class WhatsAppFlowService:
             return
 
         if state == "awaiting_edit_value":
+            if body.strip().lower() in {"back", "cancel", "0", "stop"}:
+                _send(phone, _format_content(ctx))
+                await _safe_set_state(phone, "showing_content", ctx, db)
+                return
             await WhatsAppFlowService._apply_edit(phone, body.strip(), user_id, ctx, db)
             return
 
@@ -846,13 +859,20 @@ class WhatsAppFlowService:
         ctx: Dict[str, Any],
         db: AsyncIOMotorDatabase,
     ) -> None:
+        # Allow cancel/back at any point
+        if raw_body.strip().lower() in {"back", "cancel", "0", "stop", "go back"}:
+            _send(phone, _format_content(ctx))
+            await _safe_set_state(phone, "showing_content", ctx, db)
+            return
+
         scheduled_dt = _parse_schedule_time(raw_body)
 
         if not scheduled_dt:
             _send(
                 phone,
                 "I couldn't understand that time. Please try:\n\n"
-                "• *today 5pm*\n• *tomorrow 9am*\n• *Monday 3pm*\n• *18 April 10am*"
+                "• *today 5pm*\n• *tomorrow 9am*\n• *Monday 3pm*\n• *18 April 10am*\n\n"
+                "Or reply *back* to return to the menu."
             )
             return
 
