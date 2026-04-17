@@ -145,7 +145,7 @@ GREETING_KEYWORDS = {"hi", "hello", "hey", "start", "help", "get started", "menu
 POST_KEYWORDS = {"post", "post now", "publish", "share"}
 SCHEDULE_KEYWORDS = {"schedule", "schedule post", "schedule it", "set schedule"}
 
-_EMOJI_DIGITS = {"1️⃣": "1", "2️⃣": "2", "3️⃣": "3", "4️⃣": "4", "5️⃣": "5", "6️⃣": "6"}
+_EMOJI_DIGITS = {"0️⃣": "0", "1️⃣": "1", "2️⃣": "2", "3️⃣": "3", "4️⃣": "4", "5️⃣": "5", "6️⃣": "6"}
 
 # Network display names
 NETWORK_LABELS: Dict[str, str] = {
@@ -169,7 +169,7 @@ def _opt(text: str) -> Optional[str]:
     for emoji, digit in _EMOJI_DIGITS.items():
         if t.startswith(emoji):
             return digit
-    if t and t[0] in "123456":
+    if t and t[0] in "0123456":
         rest = t[1:].lstrip(" .")
         if not rest or not rest[0].isdigit():
             return t[0]
@@ -337,6 +337,7 @@ def _format_platform_menu(accounts: List[Dict[str, Any]], mode: str = "post") ->
         lines.append(f"{i}️⃣  {label} — {name}")
     if len(accounts) > 1:
         lines.append(f"{len(accounts) + 1}️⃣  All platforms")
+    lines.append(f"\n0️⃣  Back")
     lines.append("\nReply with the number.")
     return "\n".join(lines)
 
@@ -793,6 +794,11 @@ class WhatsAppFlowService:
 
         opt = _opt(text)
         all_opt = str(len(accounts) + 1)
+
+        if text in {"0", "back", "go back", "cancel"}:
+            _send(phone, _format_content(ctx))
+            await _safe_set_state(phone, "showing_content", ctx, db)
+            return
 
         if opt == all_opt:
             selected = accounts
