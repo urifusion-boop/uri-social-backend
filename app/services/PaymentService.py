@@ -106,8 +106,9 @@ class PaymentService:
         """
         # Handle test tier with custom amounts
         if tier_id == 'test':
+            print(f"🧪 Test payment requested: amount={test_amount}, credits={test_credits}")
             if not test_amount or not test_credits:
-                raise ValueError("test_amount and test_credits required for test tier")
+                raise ValueError(f"test_amount and test_credits required for test tier (received: amount={test_amount}, credits={test_credits})")
 
             # Create a temporary tier object for test payment
             from app.domain.models.billing_models import SubscriptionTier
