@@ -572,6 +572,8 @@ async def instagram_direct_callback(
                 return RedirectResponse(f"{base_redirect}?connected=false&error={urllib.parse.quote(err_msg)}")
 
         # Step 6: store in social_connections
+        # Use id (the unique indexed field) as the upsert key so reconnecting
+        # never hits a duplicate-key error regardless of how the old record was stored.
         now = datetime.now(timezone.utc).isoformat()
         conn_doc = {
             "id": ig_user_id,
@@ -588,7 +590,7 @@ async def instagram_direct_callback(
             "updated_at": now,
         }
         await db["social_connections"].update_one(
-            {"ig_user_id": ig_user_id, "connected_via": "instagram_direct_oauth"},
+            {"id": ig_user_id},
             {"$set": conn_doc},
             upsert=True,
         )
@@ -623,11 +625,11 @@ async def instagram_direct_finalize(
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
     result = await db["social_connections"].update_one(
-        {"ig_user_id": ig_user_id, "connected_via": "instagram_direct_oauth", "connection_status": "pending_user_match"},
+        {"ig_user_id": ig_user_id},
         {"$set": {"user_id": user_id, "connection_status": "active", "updated_at": datetime.utcnow().isoformat()}},
     )
     if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Pending Instagram connection not found")
+        raise HTTPException(status_code=404, detail="Instagram connection not found — try reconnecting")
 
     return UriResponse.get_single_data_response("instagram_connected", {"ig_user_id": ig_user_id})
 
