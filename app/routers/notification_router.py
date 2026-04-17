@@ -39,7 +39,7 @@ async def get_notifications(
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
-    query = {"user_id": user_id}
+    query = {"user_id": user_id, "archived": {"$ne": True}}
     if notification_type:
         query["type"] = notification_type
 
@@ -111,6 +111,57 @@ async def mark_as_read(
         "status": True,
         "responseCode": 200,
         "responseMessage": "Notification marked as read.",
+    }
+
+
+@router.put("/{notification_id}/archive")
+async def archive_notification(
+    notification_id: str,
+    token: dict = Depends(JWTBearer()),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """Archive a notification (soft delete - hidden from list but not deleted)."""
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    result = await db["notifications"].update_one(
+        {"notification_id": notification_id, "user_id": user_id},
+        {"$set": {"archived": True, "archived_at": datetime.utcnow()}},
+    )
+
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Notification not found")
+
+    return {
+        "status": True,
+        "responseCode": 200,
+        "responseMessage": "Notification archived.",
+    }
+
+
+@router.delete("/{notification_id}")
+async def delete_notification(
+    notification_id: str,
+    token: dict = Depends(JWTBearer()),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """Permanently delete a notification."""
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    result = await db["notifications"].delete_one(
+        {"notification_id": notification_id, "user_id": user_id}
+    )
+
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Notification not found")
+
+    return {
+        "status": True,
+        "responseCode": 200,
+        "responseMessage": "Notification deleted.",
     }
 
 
