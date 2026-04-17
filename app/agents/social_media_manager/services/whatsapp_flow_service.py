@@ -384,7 +384,7 @@ async def _do_publish(
                 urn = (conn or {}).get("person_urn") or (conn or {}).get("active_author_urn")
                 if conn and token and urn:
                     svc = LinkedInDirectService()
-                    await svc.create_post(access_token=token, person_urn=urn, text=caption)
+                    await svc.create_post(access_token=token, person_urn=urn, text=caption, image_url=media_url)
                 else:
                     success = False
             else:

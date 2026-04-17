@@ -111,30 +111,95 @@ class LinkedInDirectService:
                 })
         return pages
 
+    async def _register_image(self, access_token: str, author_urn: str) -> Dict[str, Any]:
+        """Register an image upload with LinkedIn. Returns upload URL and asset URN."""
+        payload = {
+            "registerUploadRequest": {
+                "recipes": ["urn:li:digitalmediaRecipe:feedshare-image"],
+                "owner": author_urn,
+                "serviceRelationships": [
+                    {"relationshipType": "OWNER", "identifier": "urn:li:userGeneratedContent"}
+                ],
+            }
+        }
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(
+                "https://api.linkedin.com/v2/assets?action=registerUpload",
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "X-Restli-Protocol-Version": "2.0.0",
+                    "Content-Type": "application/json",
+                },
+            )
+            r.raise_for_status()
+            data = r.json()
+            upload_url = data["value"]["uploadMechanism"]["com.linkedin.digitalmedia.uploading.MediaUploadHttpRequest"]["uploadUrl"]
+            asset = data["value"]["asset"]
+            return {"upload_url": upload_url, "asset": asset}
+
     async def create_post(
         self,
         access_token: str,
         person_urn: str,
         text: str,
+        image_url: str = None,
     ) -> Dict[str, Any]:
         """
-        Publish a text post to LinkedIn.
+        Publish a text (or image+text) post to LinkedIn.
         person_urn: e.g. "urn:li:person:abc123"
+        image_url: optional public URL of image to attach
         Returns {"post_id": ...}.
         """
+        media_category = "NONE"
+        media = []
+
+        if image_url:
+            try:
+                # 1. Register upload
+                reg = await self._register_image(access_token, person_urn)
+                upload_url = reg["upload_url"]
+                asset = reg["asset"]
+
+                # 2. Download image and upload to LinkedIn
+                async with httpx.AsyncClient(timeout=60) as client:
+                    img_resp = await client.get(image_url)
+                    img_resp.raise_for_status()
+                    await client.put(
+                        upload_url,
+                        content=img_resp.content,
+                        headers={
+                            "Authorization": f"Bearer {access_token}",
+                            "Content-Type": img_resp.headers.get("content-type", "image/jpeg"),
+                        },
+                    )
+
+                media_category = "IMAGE"
+                media = [{
+                    "status": "READY",
+                    "description": {"text": ""},
+                    "media": asset,
+                    "title": {"text": ""},
+                }]
+            except Exception as e:
+                print(f"[LinkedIn] image upload failed, posting text only: {e}")
+                media_category = "NONE"
+                media = []
+
+        share_content: Dict[str, Any] = {
+            "shareCommentary": {"text": text},
+            "shareMediaCategory": media_category,
+        }
+        if media:
+            share_content["media"] = media
+
         payload = {
             "author": person_urn,
             "lifecycleState": "PUBLISHED",
-            "specificContent": {
-                "com.linkedin.ugc.ShareContent": {
-                    "shareCommentary": {"text": text},
-                    "shareMediaCategory": "NONE",
-                }
-            },
-            "visibility": {
-                "com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC"
-            },
+            "specificContent": {"com.linkedin.ugc.ShareContent": share_content},
+            "visibility": {"com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC"},
         }
+
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.post(
                 UGC_POSTS_URL,
@@ -146,6 +211,5 @@ class LinkedInDirectService:
                 },
             )
             r.raise_for_status()
-            # LinkedIn returns 201 with the post URN in X-RestLi-Id header
             post_id = r.headers.get("x-restli-id") or r.headers.get("Location", "")
             return {"post_id": post_id}
