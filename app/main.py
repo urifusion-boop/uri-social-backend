@@ -63,6 +63,18 @@ async def startup_event():
 #     max_age=3600,
 # )
 
+# Respect X-Forwarded-For / X-Forwarded-Proto when behind a proxy/load-balancer.
+# Import inside a try/except so static analyzers or environments without the
+# module won't fail; if available, register the middleware so request.url is
+# reconstructed using X-Forwarded-* headers (what Twilio signs).
+try:
+    from starlette.middleware.proxy_headers import ProxyHeadersMiddleware  # type: ignore
+
+    app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
+except Exception:
+    # If the environment doesn't expose ProxyHeadersMiddleware, skip it.
+    ProxyHeadersMiddleware = None
+
 
 @app.exception_handler(HTTPException)
 def http_exception_handler(request, exc):

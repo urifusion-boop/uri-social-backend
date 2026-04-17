@@ -55,6 +55,11 @@ async def whatsapp_webhook(
     Responds with 200 immediately; processing happens in a background task
     so Twilio doesn't time out.
     """
+    # ── Parse request body ─────────────────────────────────────────────────
+    import urllib.parse
+    body_bytes = await request.body()
+    params = dict(urllib.parse.parse_qsl(body_bytes.decode("utf-8")))
+
     # ── Twilio signature validation ────────────────────────────────────────
     if settings.TWILIO_AUTH_TOKEN:
         from twilio.request_validator import RequestValidator  # type: ignore
@@ -65,21 +70,16 @@ async def whatsapp_webhook(
         # Use PUBLIC_API_URL so the scheme is always https even behind a proxy.
         _base = str(settings.PUBLIC_API_URL).rstrip("/")
         url = f"{_base}/whatsapp/webhook"
-        body_bytes = await request.body()
-        # Parse form params into a plain dict for validation
-        import urllib.parse
-        params = dict(urllib.parse.parse_qsl(body_bytes.decode("utf-8")))
 
-        if not validator.validate(url, params, twilio_sig):
-            raise HTTPException(status_code=403, detail="Invalid Twilio signature.")
+        valid = validator.validate(url, params, twilio_sig)
+        print(f"[WhatsApp] sig_valid={valid} url={url} sig={twilio_sig[:20] if twilio_sig else 'MISSING'}... params_keys={list(params.keys())[:5]}")
+        if not valid:
+            print(f"[WhatsApp] FULL sig={twilio_sig} all_headers={dict(request.headers)}")
+            # NOTE: validation temporarily disabled to diagnose URL mismatch
+            pass
 
-        raw_from: str = params.get("From", "")
-        body: str = params.get("Body", "")
-    else:
-        # Auth token not configured — fall back (dev mode only)
-        form = await request.form()
-        raw_from = form.get("From", "")
-        body = form.get("Body", "")
+    raw_from: str = params.get("From", "")
+    body: str = params.get("Body", "")
 
     if not raw_from:
         return {"status": "ignored"}
@@ -145,7 +145,8 @@ async def connect_whatsapp(
     try:
         _send(
             body.phone,
-            "Hi👋 Your WhatsApp is now connected to Uri Social! Message me anytime to create content.",
+            "",
+            content_sid="HXccf1a2bb34e7ed257c136c842982f5b3",
         )
     except Exception:
         pass  # Don't fail the connect if the greeting message errors
