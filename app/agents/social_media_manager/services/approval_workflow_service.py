@@ -486,7 +486,13 @@ class ApprovalWorkflowService:
 
             scheduled_content = await db["content_drafts"].find({
                 "$or": [
-                    {"status": "scheduled", "scheduled_date": {"$lte": current_time}},
+                    # Drafts due for publishing (no platform_post_id = not yet sent anywhere)
+                    {"status": "scheduled", "scheduled_date": {"$lte": current_time}, "platform_post_id": {"$exists": False}},
+                    # Drafts due for publishing with a null platform_post_id
+                    {"status": "scheduled", "scheduled_date": {"$lte": current_time}, "platform_post_id": None},
+                    # Outstand-scheduled drafts: poll for published status
+                    {"status": "scheduled", "platform_post_id": {"$exists": True, "$ne": None}},
+                    # Recover publish_failed drafts that Outstand may have published
                     {"status": "publish_failed", "platform_post_id": {"$exists": True, "$ne": None}},
                 ]
             }).to_list(length=100)
@@ -523,7 +529,19 @@ class ApprovalWorkflowService:
                                 print(f"⏳ Outstand post not yet published | draft_id={draft['id']} post_id={existing_post_id}")
                         except Exception as e:
                             print(f"⚠️ Could not poll Outstand for draft_id={draft['id']}: {e}")
-                        continue
+                            # If Outstand returns 404 the post no longer exists there.
+                            # Mark as published to stop infinite retry polling.
+                            if "404" in str(e):
+                                await db["content_drafts"].update_one(
+                                    {"id": draft["id"]},
+                                    {"$set": {
+                                        "status": "published",
+                                        "published_date": datetime.utcnow(),
+                                        "updated_at": datetime.utcnow(),
+                                    }},
+                                )
+                                print(f"🗑️ Marked stale Outstand draft as published (404) | draft_id={draft['id']}")
+                        continue  # Never re-publish a draft already handed to Outstand
 
                     # Use user_id stored directly on the draft
                     draft_user_id = draft.get("user_id")
