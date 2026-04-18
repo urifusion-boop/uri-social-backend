@@ -141,6 +141,7 @@ async def linkedin_oauth_callback(
         token_data = await svc.exchange_code(code, settings.LINKEDIN_OAUTH_CALLBACK_URL)
         access_token = token_data["access_token"]
         profile = await svc.get_profile(access_token)
+        pages = await svc.get_admin_pages(access_token)
     except Exception as e:
         return RedirectResponse(
             f"{web_app_url}/social-media/brand-setup"
@@ -166,6 +167,8 @@ async def linkedin_oauth_callback(
                 "account_name": name,
                 "network_unique_id": sub,
                 "person_urn": person_urn,
+                "active_author_urn": person_urn,  # default to personal profile
+                "pages": pages,  # list of admin company pages
                 "connection_status": "active",
                 "connected_via": "linkedin_direct",
                 "linkedin_access_token": access_token,
@@ -218,15 +221,25 @@ async def linkedin_status(
     user_id = _extract_user_id(token)
     conn = await _get_linkedin_connection(user_id, db)
 
-    linked = conn is not None
+    # Also check Outstand connection (supports company pages)
+    outstand_conn = await db["social_connections"].find_one(
+        {"user_id": user_id, "platform": "linkedin", "connected_via": "outstand", "connection_status": "active"}
+    )
+
+    linked = conn is not None or outstand_conn is not None
+    active = outstand_conn or conn  # prefer Outstand
+
     return {
         "status": True,
         "responseCode": 200,
         "responseData": {
             "linked": linked,
-            "username": conn.get("username") if linked else None,
-            "account_name": conn.get("account_name") if linked else None,
-            "connected_at": conn.get("connected_at") if linked else None,
+            "username": active.get("username") if active else None,
+            "account_name": active.get("account_name") if active else None,
+            "connected_at": active.get("connected_at") if active else None,
+            "connected_via": active.get("connected_via") if active else None,
+            "active_author_urn": conn.get("active_author_urn") if conn else None,
+            "pages": conn.get("pages", []) if conn else [],
         },
     }
 
@@ -245,20 +258,44 @@ async def publish_to_linkedin(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """
-    Publish a post directly to the authenticated user's LinkedIn profile.
+    Publish a post to LinkedIn.
+    Prefers Outstand connection (supports org/company pages) over direct connection.
     """
     user_id = _extract_user_id(token)
 
+    # ── Try Outstand connection first (supports company pages) ────────────────
+    outstand_conn = await db["social_connections"].find_one(
+        {"user_id": user_id, "platform": "linkedin", "connected_via": "outstand", "connection_status": "active"}
+    )
+    if outstand_conn:
+        from app.agents.social_media_manager.services.outstand_service import OutstandService
+        try:
+            outstand = OutstandService()
+            result = await outstand.publish_post(
+                outstand_account_ids=[outstand_conn["outstand_account_id"]],
+                content=body.content,
+            )
+            post_id = result.get("data", {}).get("id") or result.get("id", "")
+            return {
+                "status": True,
+                "responseCode": 200,
+                "responseMessage": "Post published to LinkedIn successfully.",
+                "responseData": {"post_id": post_id, "content": body.content},
+            }
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Failed to post to LinkedIn: {e}")
+
+    # ── Fall back to direct LinkedIn connection ────────────────────────────────
     conn = await _get_linkedin_connection(user_id, db)
     if not conn:
         raise HTTPException(
             status_code=400,
-            detail="No LinkedIn account connected. Call POST /linkedin/connect first.",
+            detail="No LinkedIn account connected. Use POST /social-media/connect with platform=linkedin (supports company pages) or POST /linkedin/connect.",
         )
 
     access_token = conn.get("linkedin_access_token")
-    person_urn = conn.get("person_urn")
-    if not access_token or not person_urn:
+    author_urn = conn.get("active_author_urn") or conn.get("person_urn")
+    if not access_token or not author_urn:
         raise HTTPException(
             status_code=400,
             detail="LinkedIn connection is missing tokens. Please reconnect your account.",
@@ -267,7 +304,7 @@ async def publish_to_linkedin(
     svc = _linkedin_service()
 
     try:
-        result = await svc.create_post(access_token, person_urn, body.content)
+        result = await svc.create_post(access_token, author_urn, body.content)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Failed to post to LinkedIn: {e}")
 
@@ -279,6 +316,74 @@ async def publish_to_linkedin(
             "post_id": result.get("post_id"),
             "content": body.content,
         },
+    }
+
+
+# ── Company pages ─────────────────────────────────────────────────────────────
+
+
+@router.get("/pages")
+async def get_linkedin_pages(
+    token: dict = Depends(JWTBearer()),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """
+    Returns the list of LinkedIn company pages the user admins,
+    plus the currently active posting target.
+    """
+    user_id = _extract_user_id(token)
+    conn = await _get_linkedin_connection(user_id, db)
+    if not conn:
+        raise HTTPException(status_code=400, detail="No LinkedIn account connected.")
+
+    return {
+        "status": True,
+        "responseCode": 200,
+        "responseData": {
+            "personal_profile": {
+                "urn": conn.get("person_urn"),
+                "name": conn.get("account_name"),
+                "type": "personal",
+            },
+            "pages": conn.get("pages", []),
+            "active_author_urn": conn.get("active_author_urn") or conn.get("person_urn"),
+        },
+    }
+
+
+class SelectPageRequest(BaseModel):
+    author_urn: str  # urn:li:person:xxx  or  urn:li:organization:xxx
+
+
+@router.post("/pages/select")
+async def select_linkedin_page(
+    body: SelectPageRequest,
+    token: dict = Depends(JWTBearer()),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """
+    Set the active posting target to either the personal profile or a company page.
+    author_urn must be the person_urn or one of the page URNs returned by GET /linkedin/pages.
+    """
+    user_id = _extract_user_id(token)
+    conn = await _get_linkedin_connection(user_id, db)
+    if not conn:
+        raise HTTPException(status_code=400, detail="No LinkedIn account connected.")
+
+    valid_urns = {conn.get("person_urn")} | {p["urn"] for p in conn.get("pages", [])}
+    if body.author_urn not in valid_urns:
+        raise HTTPException(status_code=400, detail="Invalid author_urn — not linked to this account.")
+
+    await db["social_connections"].update_one(
+        {"user_id": user_id, "platform": "linkedin"},
+        {"$set": {"active_author_urn": body.author_urn, "updated_at": datetime.utcnow()}},
+    )
+
+    return {
+        "status": True,
+        "responseCode": 200,
+        "responseMessage": "Active posting target updated.",
+        "responseData": {"active_author_urn": body.author_urn},
     }
 
 

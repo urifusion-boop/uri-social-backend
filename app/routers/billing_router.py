@@ -71,7 +71,9 @@ async def initialize_payment(
         result = await payment_service.initialize_payment(
             user_id=user_id,
             tier_id=body.tier_id,
-            user_email=user_email
+            user_email=user_email,
+            test_amount=body.test_amount,
+            test_credits=body.test_credits
         )
         return result
     except ValueError as e:
@@ -293,8 +295,23 @@ async def can_generate_content(user_id: str = Depends(get_user_id)):
     """
     Check if user can generate content (has credits)
     PRD 8: When credits = 0, block new campaign generation
+    Free trial users are allowed when their trial is still active.
     """
     try:
+        trial_status = await trial_service.get_trial_status(user_id)
+
+        if trial_status.trial_active:
+            return {
+                "status": True,
+                "responseCode": 200,
+                "responseMessage": "You can generate content",
+                "responseData": {
+                    "can_generate": True,
+                    "blocked": False,
+                    "credits_remaining": trial_status.credits_remaining
+                }
+            }
+
         is_blocked = await credit_service.is_blocked(user_id)
         has_credits = await credit_service.check_sufficient_credits(user_id)
 

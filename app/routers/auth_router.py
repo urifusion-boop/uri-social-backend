@@ -83,6 +83,12 @@ async def signup(body: SignupRequest, db: AsyncIOMotorDatabase = Depends(get_db_
             trial_days=trial_status.get("days_remaining", 3) if trial_status else 0,
             trial_credits=trial_status.get("trial_credits", 10) if trial_status else 0,
         ))
+        asyncio.ensure_future(notification_service.notify_admin_new_signup(
+            email=body.email,
+            first_name=body.first_name,
+            last_name=body.last_name,
+            auth_provider="email",
+        ))
     except Exception as e:
         print(f"⚠️ Signup notification failed for {user_id}: {e}")
 
@@ -192,6 +198,12 @@ async def google_auth(body: GoogleAuthRequest, db: AsyncIOMotorDatabase = Depend
                 first_name=first_name,
                 trial_days=trial_status.get("days_remaining", 3) if trial_status else 0,
                 trial_credits=trial_status.get("trial_credits", 10) if trial_status else 0,
+            ))
+            asyncio.ensure_future(notification_service.notify_admin_new_signup(
+                email=email,
+                first_name=first_name,
+                last_name=last_name,
+                auth_provider="google",
             ))
         except Exception as e:
             print(f"⚠️ Signup notification failed for {user_id}: {e}")

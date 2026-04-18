@@ -22,6 +22,8 @@ from app.domain.models.billing_models import (
     InitializePaymentResponse
 )
 from app.services.SubscriptionService import subscription_service
+from app.services.TrialService import trial_service
+from app.services.CreditService import credit_service
 from app.core.config import settings
 
 
@@ -47,7 +49,7 @@ class PaymentService:
 
         # User-facing callback URL (where users return after payment)
         web_app_url = getattr(settings, 'WEB_APP_URL', 'https://www.urisocial.com')
-        self.callback_url = f'{web_app_url}/dashboard/billing'
+        self.callback_url = f'{web_app_url}/workspace?tab=billing'
 
     async def _get_current_mode(self) -> str:
         """Get current Squad mode from config (production: always use config value)"""
@@ -89,7 +91,9 @@ class PaymentService:
         self,
         user_id: str,
         tier_id: str,
-        user_email: str
+        user_email: str,
+        test_amount: int = None,
+        test_credits: int = None
     ) -> InitializePaymentResponse:
         """
         Initialize SQUAD payment checkout
@@ -97,13 +101,33 @@ class PaymentService:
         1. User selects plan
         2. Payment processed
         3. On success: Assign credits, Activate subscription
-        """
-        # Validate tier
-        validation = await subscription_service.validate_tier_purchase(user_id, tier_id)
-        if not validation["valid"]:
-            raise ValueError(validation["message"])
 
-        tier = validation["tier"]
+        Special handling for tier_id='test': Use custom test_amount and test_credits
+        """
+        # Handle test tier with custom amounts (temporary testing feature)
+        if tier_id == 'test':
+            print(f"🧪 TEST PAYMENT: amount={test_amount}, credits={test_credits}, user={user_id}")
+            if not test_amount or not test_credits:
+                raise ValueError(f"test_amount and test_credits required for test tier (received: amount={test_amount}, credits={test_credits})")
+
+            # Create a temporary tier object for test payment
+            from app.domain.models.billing_models import SubscriptionTier
+            tier = SubscriptionTier(
+                tier_id='test',
+                name='Test Plan',
+                price_ngn=test_amount,
+                credits=test_credits,
+                price_per_credit=test_amount / test_credits,
+                features=['Test payment'],
+                is_active=True
+            )
+        else:
+            # Validate tier
+            validation = await subscription_service.validate_tier_purchase(user_id, tier_id)
+            if not validation["valid"]:
+                raise ValueError(validation["message"])
+
+            tier = validation["tier"]
 
         # Generate unique transaction reference
         transaction_ref = f"URI_{user_id[:8]}_{tier_id.upper()}_{int(datetime.utcnow().timestamp())}"
@@ -254,6 +278,8 @@ class PaymentService:
         """
         Complete payment and activate subscription
         PRD 6.3: On success: Assign credits, Activate subscription
+
+        IMPORTANT: Preserves trial credits as bonus credits when trial user subscribes
         """
         # Update payment status
         await self.payment_transactions_collection.update_one(
@@ -267,11 +293,28 @@ class PaymentService:
             }
         )
 
-        # Activate subscription (this allocates credits)
+        # Check if user has remaining trial credits - preserve them as bonus credits
+        trial_status = await trial_service.get_trial_status(user_id)
+        remaining_trial_credits = 0
+
+        if trial_status and trial_status.trial_active and trial_status.credits_remaining > 0:
+            remaining_trial_credits = trial_status.credits_remaining
+            print(f"💎 Preserving {remaining_trial_credits} trial credits as bonus for user {user_id}")
+
+        # Activate subscription (this allocates subscription credits)
         await subscription_service.create_subscription(
             user_id=user_id,
             tier_id=tier_id
         )
+
+        # Add trial credits as bonus credits after subscription is created
+        if remaining_trial_credits > 0:
+            await credit_service.add_bonus_credits(
+                user_id=user_id,
+                bonus_amount=remaining_trial_credits,
+                reason="trial_credits_preserved"
+            )
+            print(f"✅ Added {remaining_trial_credits} bonus credits from trial")
 
     async def _mark_payment_failed(
         self,
