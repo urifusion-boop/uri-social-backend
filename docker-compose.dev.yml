@@ -17,8 +17,13 @@ services:
     restart: always
     ports:
       - "9003:80"
+    volumes:
+      - uri_static_images:/app/static/images
     networks:
       - uritest-network
+
+volumes:
+  uri_static_images:
 
 networks:
   uritest-network:

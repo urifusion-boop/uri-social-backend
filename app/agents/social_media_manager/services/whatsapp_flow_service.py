@@ -88,14 +88,16 @@ GRAPHIC_ACTIONS = (
     "2️⃣  Schedule graphic\n"
     "3️⃣  Download link\n"
     "4️⃣  Edit text\n"
-    "5️⃣  Regenerate design"
+    "5️⃣  Regenerate design\n"
+    "0️⃣  Back"
 )
 
 EDIT_ACTIONS = (
     "What would you like to change?\n\n"
     "1️⃣  Headline\n"
     "2️⃣  Subheadline\n"
-    "3️⃣  Tone"
+    "3️⃣  Tone\n"
+    "0️⃣  Back"
 )
 
 RE_ENGAGEMENT = (
@@ -384,7 +386,7 @@ async def _do_publish(
                 urn = (conn or {}).get("person_urn") or (conn or {}).get("active_author_urn")
                 if conn and token and urn:
                     svc = LinkedInDirectService()
-                    await svc.create_post(access_token=token, person_urn=urn, text=caption)
+                    await svc.create_post(access_token=token, person_urn=urn, text=caption, image_url=media_url)
                 else:
                     success = False
             else:
@@ -979,6 +981,11 @@ class WhatsAppFlowService:
             "tone": "What tone would you like? (e.g. motivational, professional, funny, bold)",
         }
 
+        if text in {"0", "back", "cancel"}:
+            _send(phone, _format_content(ctx))
+            await _safe_set_state(phone, "showing_content", ctx, db)
+            return
+
         field = field_map.get(_opt(text) or text)
         if not field:
             _send(phone, EDIT_ACTIONS)
@@ -1104,7 +1111,11 @@ class WhatsAppFlowService:
     ) -> None:
         opt = _opt(text)
 
-        if opt == "1" or text in {"post graphic", "post graphic now", "post now"}:
+        if text in {"0", "back", "cancel", "go back"}:
+            _send(phone, _format_content(ctx))
+            await _safe_set_state(phone, "showing_content", ctx, db)
+
+        elif opt == "1" or text in {"post graphic", "post graphic now", "post now"}:
             await WhatsAppFlowService._initiate_post(phone, user_id, ctx, "now", db)
 
         elif opt == "2" or text in {"schedule graphic", "schedule"}:

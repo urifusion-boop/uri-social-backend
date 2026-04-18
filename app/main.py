@@ -1,7 +1,10 @@
+import os
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi import HTTPException
+from fastapi.staticfiles import StaticFiles
 
 from app.database import connect_to_mongo
 from app.core.config import settings
@@ -115,6 +118,12 @@ app.include_router(
 app.include_router(whatsapp_router)
 app.include_router(x_router)
 app.include_router(linkedin_router)
+
+
+# Serve generated images directly from backend (avoids third-party CDN like imgBB)
+_STATIC_IMAGES_DIR = "/app/static/images"
+os.makedirs(_STATIC_IMAGES_DIR, exist_ok=True)
+app.mount("/static", StaticFiles(directory="/app/static"), name="static")
 
 
 @app.get("/")
