@@ -258,6 +258,8 @@ class TrialStatusResponse(BaseModel):
 class InitializePaymentRequest(BaseModel):
     """Request to start payment flow"""
     tier_id: str = Field(..., description="Subscription tier to purchase")
+    test_amount: Optional[int] = Field(None, description="Custom test amount in NGN (only for tier_id='test')")
+    test_credits: Optional[int] = Field(None, description="Custom test credits (only for tier_id='test')")
 
     class Config:
         schema_extra = {

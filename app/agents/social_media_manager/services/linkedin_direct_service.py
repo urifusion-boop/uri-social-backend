@@ -5,7 +5,8 @@ Flow:
   1. get_authorization_url(state, callback_url)  → redirect user to LinkedIn
   2. User authorises → LinkedIn redirects to callback_url?code=...&state=...
   3. exchange_code(code, callback_url)            → returns access token + profile info
-  4. create_post(access_token, person_urn, text)  → publish to LinkedIn
+  4. get_admin_pages(access_token)               → returns company pages user admins
+  5. create_post(access_token, author_urn, text)  → publish to LinkedIn (person or org)
 """
 
 import urllib.parse
@@ -19,6 +20,7 @@ AUTHORIZATION_URL = "https://www.linkedin.com/oauth/v2/authorization"
 TOKEN_URL = "https://www.linkedin.com/oauth/v2/accessToken"
 USERINFO_URL = "https://api.linkedin.com/v2/userinfo"
 UGC_POSTS_URL = "https://api.linkedin.com/v2/ugcPosts"
+ORG_ACLS_URL = "https://api.linkedin.com/v2/organizationAcls"
 
 SCOPES = "openid profile email w_member_social"
 
@@ -72,6 +74,42 @@ class LinkedInDirectService:
             )
             r.raise_for_status()
             return r.json()
+
+    async def get_admin_pages(self, access_token: str) -> list:
+        """
+        Fetch all LinkedIn company pages where the authenticated user is an ADMINISTRATOR.
+        Returns a list of {"id": str, "name": str, "urn": str}.
+        """
+        params = {
+            "q": "roleAssignee",
+            "role": "ADMINISTRATOR",
+            "projection": "(elements*(organization~(id,localizedName)))",
+        }
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(
+                ORG_ACLS_URL,
+                params=params,
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "X-Restli-Protocol-Version": "2.0.0",
+                },
+            )
+            if r.status_code != 200:
+                return []
+            data = r.json()
+
+        pages = []
+        for element in data.get("elements", []):
+            org = element.get("organization~", {})
+            org_id = str(org.get("id", ""))
+            name = org.get("localizedName", "")
+            if org_id:
+                pages.append({
+                    "id": org_id,
+                    "name": name,
+                    "urn": f"urn:li:organization:{org_id}",
+                })
+        return pages
 
     async def create_post(
         self,

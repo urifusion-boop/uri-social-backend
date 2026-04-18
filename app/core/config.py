@@ -102,6 +102,7 @@ class Settings(BaseSettings):
     SMTP_FROM_EMAIL: str = "noreply@urisocial.com"
     SMTP_FROM_NAME: str = "URI Social"
     SMTP_USE_TLS: bool = True
+    ADMIN_NOTIFICATION_EMAIL: str = ""
 
     # Sentry (optional)
     SENTRY_DSN: Optional[str] = None

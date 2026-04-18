@@ -6,21 +6,23 @@ User opens WhatsApp → sees content → taps once → posts.
 
 States
 ------
-linked                → first-time user — immediately generate content
-idle                  → returning user waiting for a command
-showing_content       → headline + subheadline + caption displayed
-showing_ideas         → 3 quick ideas shown, awaiting choice 1/2/3
-awaiting_topic        → "create post" sent without a topic
-awaiting_edit_choice  → edit options shown (1=headline 2=subheadline 3=tone)
-awaiting_edit_value   → waiting for the new value to apply
-showing_graphic       → graphic ready, post actions displayed
-awaiting_re_engagement → re-engagement ping sent, waiting for yes/later
+linked                   → first-time user — immediately generate content
+idle                     → returning user waiting for a command
+showing_content          → headline + subheadline + caption displayed
+showing_ideas            → 3 quick ideas shown, awaiting choice 1/2/3
+awaiting_topic           → "create post" sent without a topic
+awaiting_edit_choice     → edit options shown (1=headline 2=subheadline 3=tone)
+awaiting_edit_value      → waiting for the new value to apply
+showing_graphic          → graphic ready, post actions displayed
+awaiting_re_engagement   → re-engagement ping sent, waiting for yes/later
+awaiting_platform_select → user chose post/schedule, picking platform
+awaiting_schedule_time   → user chose schedule, waiting for date/time
 """
 
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from motor.motor_asyncio import AsyncIOMotorDatabase
@@ -45,15 +47,18 @@ def _twilio_client():
 # ── Send helper ───────────────────────────────────────────────────────────────
 
 
-def _send(to: str, body: str, media_url: Optional[str] = None) -> None:
+def _send(to: str, body: str, media_url: Optional[str] = None, content_sid: Optional[str] = None) -> None:
     client = _twilio_client()
     kwargs: Dict[str, Any] = {
         "from_": settings.TWILIO_WHATSAPP_FROM,
         "to": f"whatsapp:{to}" if not to.startswith("whatsapp:") else to,
-        "body": body,
     }
-    if media_url:
-        kwargs["media_url"] = [media_url]
+    if content_sid:
+        kwargs["content_sid"] = content_sid
+    else:
+        kwargs["body"] = body
+        if media_url:
+            kwargs["media_url"] = [media_url]
     client.messages.create(**kwargs)
 
 
@@ -70,15 +75,20 @@ NO_BRAND = (
 )
 
 CONTENT_ACTIONS = (
-    "1️⃣  Generate graphic\n"
-    "2️⃣  View full caption\n"
-    "3️⃣  Change idea"
+    "What would you like to do?\n\n"
+    "1️⃣  Post now\n"
+    "2️⃣  Schedule post\n"
+    "3️⃣  Generate graphic\n"
+    "4️⃣  View full caption\n"
+    "5️⃣  New idea"
 )
 
 GRAPHIC_ACTIONS = (
-    "1️⃣  Download\n"
-    "2️⃣  Edit text\n"
-    "3️⃣  Regenerate design"
+    "1️⃣  Post graphic now\n"
+    "2️⃣  Schedule graphic\n"
+    "3️⃣  Download link\n"
+    "4️⃣  Edit text\n"
+    "5️⃣  Regenerate design"
 )
 
 EDIT_ACTIONS = (
@@ -95,6 +105,33 @@ RE_ENGAGEMENT = (
     "2️⃣  Later"
 )
 
+HELP_MESSAGE = (
+    "Here's what I can do for you:\n\n"
+    "✏️  *Create content* — just tell me what to post about\n"
+    "📤  *Post now* — publish to LinkedIn, Instagram, Facebook\n"
+    "🗓️  *Schedule post* — pick a date and time\n"
+    "💡  *Give me ideas* — 3 content ideas to choose from\n"
+    "🎨  *Generate graphic* — create a design for your post\n\n"
+    "Or just type a topic and I'll create content for you!"
+)
+
+SCHEDULE_PROMPT = (
+    "When do you want to post?\n\n"
+    "Examples:\n"
+    "• *today 5pm*\n"
+    "• *tomorrow 9am*\n"
+    "• *Monday 3pm*\n"
+    "• *18 April 10am*\n\n"
+    "_All times are WAT (West Africa Time)_\n\n"
+    "Reply *back* to cancel."
+)
+
+NO_PLATFORMS = (
+    "You don't have any social accounts connected yet.\n\n"
+    "Go to your Uri Social dashboard → Settings → Connected Accounts to link "
+    "LinkedIn, Instagram, Facebook, and more."
+)
+
 # ── Command patterns ──────────────────────────────────────────────────────────
 
 _CREATE_ABOUT = re.compile(
@@ -105,25 +142,35 @@ _CREATE_ABOUT = re.compile(
 IDEAS_KEYWORDS = {"give me ideas", "ideas", "idea", "suggestions"}
 GRAPHIC_KEYWORDS = {"generate graphic", "graphic", "image", "design"}
 CREATE_KEYWORDS = {"create", "create post", "create content", "new post"}
-GREETING_KEYWORDS = {"hi", "hello", "hey", "start", "help"}
+GREETING_KEYWORDS = {"hi", "hello", "hey", "start", "help", "get started", "menu"}
+POST_KEYWORDS = {"post", "post now", "publish", "share"}
+SCHEDULE_KEYWORDS = {"schedule", "schedule post", "schedule it", "set schedule"}
 
-_EMOJI_DIGITS = {"1️⃣": "1", "2️⃣": "2", "3️⃣": "3", "4️⃣": "4"}
+_EMOJI_DIGITS = {"0️⃣": "0", "1️⃣": "1", "2️⃣": "2", "3️⃣": "3", "4️⃣": "4", "5️⃣": "5", "6️⃣": "6"}
+
+# Network display names
+NETWORK_LABELS: Dict[str, str] = {
+    "linkedin": "LinkedIn",
+    "instagram": "Instagram",
+    "facebook": "Facebook",
+    "x": "X (Twitter)",
+    "twitter": "X (Twitter)",
+    "tiktok": "TikTok",
+    "youtube": "YouTube",
+    "pinterest": "Pinterest",
+    "threads": "Threads",
+}
 
 
 def _opt(text: str) -> Optional[str]:
-    """
-    Normalise a user reply to a plain digit string ("1"–"4") or None.
-    Handles: "1", "1.", "1️⃣", "1 generate graphic", "  2  ", etc.
-    """
+    """Normalise a user reply to a plain digit string ("1"–"6") or None."""
     t = text.strip()
     if t in _EMOJI_DIGITS:
         return _EMOJI_DIGITS[t]
-    # strip leading emoji digit
     for emoji, digit in _EMOJI_DIGITS.items():
         if t.startswith(emoji):
             return digit
-    # plain digit optionally followed by non-digit chars
-    if t and t[0] in "1234":
+    if t and t[0] in "0123456":
         rest = t[1:].lstrip(" .")
         if not rest or not rest[0].isdigit():
             return t[0]
@@ -159,9 +206,6 @@ async def _generate_content_structured(
     brand: Dict[str, Any],
     tone: Optional[str] = None,
 ) -> Optional[Dict[str, str]]:
-    """
-    Returns {"headline": str, "subheadline": str, "caption": str} or None on failure.
-    """
     from app.domain.models.chat_model import ChatMessage, ChatModel
     from app.services.AIService import AIService
 
@@ -182,10 +226,7 @@ async def _generate_content_structured(
     )
 
     messages = [
-        ChatMessage(
-            role="system",
-            content="You are a social media content creator. Return content in the exact format requested.",
-        ),
+        ChatMessage(role="system", content="You are a social media content creator. Return content in the exact format requested."),
         ChatMessage(role="user", content=prompt),
     ]
     req = ChatModel(model="gpt-5.4-mini", messages=messages, temperature=0.8)
@@ -209,7 +250,6 @@ async def _generate_content_structured(
 
 
 async def _generate_three_ideas(topic: str, brand: Dict[str, Any]) -> Optional[List[str]]:
-    """Returns 3 headline-only ideas for the user to pick from."""
     from app.domain.models.chat_model import ChatMessage, ChatModel
     from app.services.AIService import AIService
 
@@ -220,10 +260,7 @@ async def _generate_three_ideas(topic: str, brand: Dict[str, Any]) -> Optional[L
         f"Give me 3 punchy, quotable post headlines for {brand_name or 'a brand'}"
         f"{' in the ' + industry + ' space' if industry else ''}.\n"
         f"Topic: {topic or 'anything relevant to the brand'}\n\n"
-        "Return ONLY:\n"
-        "1. [headline]\n"
-        "2. [headline]\n"
-        "3. [headline]"
+        "Return ONLY:\n1. [headline]\n2. [headline]\n3. [headline]"
     )
 
     messages = [
@@ -245,7 +282,211 @@ async def _generate_three_ideas(topic: str, brand: Dict[str, Any]) -> Optional[L
     return ideas[:3] if ideas else None
 
 
-# ── Safe DB write (swallows MongoDB network timeouts) ─────────────────────────
+# ── Outstand helpers ──────────────────────────────────────────────────────────
+
+
+async def _get_connected_accounts(user_id: str, db: Optional[AsyncIOMotorDatabase] = None) -> List[Dict[str, Any]]:
+    """
+    Returns a unified list of connected accounts from both Outstand and direct DB connections.
+    Each item has: id, network, name, source ("outstand" | "direct")
+    """
+    accounts: List[Dict[str, Any]] = []
+
+    # 1. Outstand accounts
+    try:
+        from app.agents.social_media_manager.services.outstand_service import OutstandService
+        outstand = OutstandService()
+        result = await outstand.list_accounts(tenant_id=user_id)
+        for acc in result.get("data", []):
+            acc["source"] = "outstand"
+            accounts.append(acc)
+    except Exception as e:
+        print(f"[WhatsApp] outstand list_accounts error: {e}")
+
+    # 2. Direct DB connections
+    if db is not None:
+        try:
+            cursor = db["social_connections"].find(
+                {"user_id": user_id, "connection_status": "active"},
+                {"platform": 1, "connected_via": 1, "profile_name": 1, "username": 1}
+            )
+            async for conn in cursor:
+                platform = conn.get("platform", "")
+                # Avoid duplicates if already in Outstand list
+                already = any(a.get("network") == platform and a.get("source") == "outstand" for a in accounts)
+                if not already:
+                    accounts.append({
+                        "id": str(conn["_id"]),
+                        "network": platform,
+                        "name": conn.get("account_name") or conn.get("profile_name") or conn.get("username") or platform.title(),
+                        "source": "direct",
+                        "_user_id": user_id,
+                    })
+        except Exception as e:
+            print(f"[WhatsApp] db connections error: {e}")
+
+    return accounts
+
+
+def _format_platform_menu(accounts: List[Dict[str, Any]], mode: str = "post") -> str:
+    verb = "post to" if mode == "now" else "schedule on"
+    lines = [f"Where do you want to {verb}?\n"]
+    for i, acc in enumerate(accounts, 1):
+        network = acc.get("network", "")
+        name = acc.get("name") or acc.get("username") or network
+        label = NETWORK_LABELS.get(network, network.title())
+        lines.append(f"{i}️⃣  {label} — {name}")
+    if len(accounts) > 1:
+        lines.append(f"{len(accounts) + 1}️⃣  All platforms")
+    lines.append(f"\n0️⃣  Back")
+    lines.append("\nReply with the number.")
+    return "\n".join(lines)
+
+
+async def _do_publish(
+    accounts: List[Dict[str, Any]],
+    caption: str,
+    media_url: Optional[str],
+    scheduled_at: Optional[str],
+    db: Optional[AsyncIOMotorDatabase] = None,
+) -> bool:
+    """Publishes or schedules via Outstand or direct API. Returns True on success."""
+    outstand_ids = [a["id"] for a in accounts if a.get("source") == "outstand"]
+    direct_accounts = [a for a in accounts if a.get("source") == "direct"]
+
+    success = True
+
+    # Publish via Outstand
+    if outstand_ids:
+        try:
+            from app.agents.social_media_manager.services.outstand_service import OutstandService
+            outstand = OutstandService()
+            await outstand.publish_post(
+                outstand_account_ids=outstand_ids,
+                content=caption,
+                scheduled_at=scheduled_at,
+                media_urls=[media_url] if media_url else None,
+            )
+        except Exception as e:
+            print(f"[WhatsApp] outstand publish error: {e}")
+            success = False
+
+    # Publish via direct connections
+    for acc in direct_accounts:
+        platform = acc.get("network", "")
+        try:
+            if platform == "linkedin" and db is not None:
+                from app.agents.social_media_manager.services.linkedin_direct_service import LinkedInDirectService
+                conn = await db["social_connections"].find_one(
+                    {"user_id": acc.get("_user_id"), "platform": "linkedin", "connection_status": "active"}
+                )
+                token = (conn or {}).get("linkedin_access_token") or (conn or {}).get("access_token")
+                urn = (conn or {}).get("person_urn") or (conn or {}).get("active_author_urn")
+                if conn and token and urn:
+                    svc = LinkedInDirectService()
+                    await svc.create_post(access_token=token, person_urn=urn, text=caption)
+                else:
+                    success = False
+            else:
+                print(f"[WhatsApp] direct publish not implemented for {platform}")
+                success = False
+        except Exception as e:
+            print(f"[WhatsApp] direct publish error for {platform}: {e}")
+            success = False
+
+    return success
+
+
+# ── Schedule time parser ──────────────────────────────────────────────────────
+
+_MONTHS = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+    "january": 1, "february": 2, "march": 3, "april": 4, "june": 6,
+    "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12,
+}
+_WEEKDAYS = {
+    "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+    "friday": 4, "saturday": 5, "sunday": 6,
+}
+_WAT_OFFSET = timedelta(hours=1)  # UTC+1
+
+
+def _parse_schedule_time(text: str) -> Optional[datetime]:
+    """
+    Parse natural language datetime from user. Returns UTC datetime or None.
+    Handles: today/tomorrow/weekday + time, or DD Month + time.
+    """
+    t = text.strip().lower()
+
+    # Extract time component e.g. "3pm", "3:30pm", "15:00"
+    time_match = re.search(
+        r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?",
+        t,
+        re.IGNORECASE,
+    )
+    if not time_match:
+        return None
+
+    hour = int(time_match.group(1))
+    minute = int(time_match.group(2) or 0)
+    ampm = (time_match.group(3) or "").lower()
+
+    if ampm == "pm" and hour < 12:
+        hour += 12
+    elif ampm == "am" and hour == 12:
+        hour = 0
+
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+
+    # Determine the date portion
+    now_wat = datetime.now(timezone.utc) + _WAT_OFFSET
+    target_date = None
+
+    if "today" in t:
+        target_date = now_wat.date()
+    elif "tomorrow" in t:
+        target_date = (now_wat + timedelta(days=1)).date()
+    else:
+        # Check weekday names
+        for day_name, day_num in _WEEKDAYS.items():
+            if day_name in t:
+                days_ahead = (day_num - now_wat.weekday()) % 7
+                if days_ahead == 0:
+                    days_ahead = 7  # next occurrence
+                target_date = (now_wat + timedelta(days=days_ahead)).date()
+                break
+
+        if not target_date:
+            # Check "DD Month" or "Month DD"
+            for month_name, month_num in _MONTHS.items():
+                if month_name in t:
+                    day_match = re.search(r"\b(\d{1,2})\b", t)
+                    if day_match:
+                        day_num = int(day_match.group(1))
+                        year = now_wat.year
+                        try:
+                            from datetime import date
+                            target_date = date(year, month_num, day_num)
+                            if target_date < now_wat.date():
+                                target_date = date(year + 1, month_num, day_num)
+                        except ValueError:
+                            pass
+                    break
+
+    if not target_date:
+        return None
+
+    # Build WAT datetime then convert to UTC
+    wat_dt = datetime(
+        target_date.year, target_date.month, target_date.day,
+        hour, minute, 0, tzinfo=timezone.utc
+    ) - _WAT_OFFSET  # subtract offset to get UTC
+    return wat_dt
+
+
+# ── Safe DB write ─────────────────────────────────────────────────────────────
 
 
 async def _safe_set_state(
@@ -269,9 +510,9 @@ def _format_content(ctx: Dict[str, Any]) -> str:
     caption = ctx.get("caption", "")
     preview = caption[:120] + "…" if len(caption) > 120 else caption
     return (
-        f'Headline: "{headline}"\n'
-        f'Subheadline: "{subheadline}"\n\n'
-        f"Caption preview: {preview}\n\n"
+        f'*{headline}*\n'
+        f'_{subheadline}_\n\n'
+        f"{preview}\n\n"
         + CONTENT_ACTIONS
     )
 
@@ -305,6 +546,14 @@ class WhatsAppFlowService:
 
         # ── State-specific routing ─────────────────────────────────────────
         if state == "awaiting_topic":
+            if body.strip().lower() in {"back", "cancel", "0", "stop"}:
+                if ctx.get("headline"):
+                    _send(phone, _format_content(ctx))
+                    await _safe_set_state(phone, "showing_content", ctx, db)
+                else:
+                    _send(phone, HELP_MESSAGE)
+                    await _safe_set_state(phone, "idle", ctx, db)
+                return
             await WhatsAppFlowService._create_and_show_content(phone, body.strip(), user_id, ctx, db)
             return
 
@@ -313,6 +562,10 @@ class WhatsAppFlowService:
             return
 
         if state == "awaiting_edit_value":
+            if body.strip().lower() in {"back", "cancel", "0", "stop"}:
+                _send(phone, _format_content(ctx))
+                await _safe_set_state(phone, "showing_content", ctx, db)
+                return
             await WhatsAppFlowService._apply_edit(phone, body.strip(), user_id, ctx, db)
             return
 
@@ -332,7 +585,15 @@ class WhatsAppFlowService:
             await WhatsAppFlowService._handle_re_engagement(phone, text, user_id, ctx, db)
             return
 
-        # ── Idle / fallback — parse commands ───────────────────────────────
+        if state == "awaiting_platform_select":
+            await WhatsAppFlowService._handle_platform_select(phone, text, user_id, ctx, db)
+            return
+
+        if state == "awaiting_schedule_time":
+            await WhatsAppFlowService._handle_schedule_time(phone, body.strip(), user_id, ctx, db)
+            return
+
+        # ── Idle / fallback ────────────────────────────────────────────────
         await WhatsAppFlowService._handle_idle(phone, text, body.strip(), user_id, first_name, ctx, db)
 
     # ── First-time entry ───────────────────────────────────────────────────────
@@ -349,9 +610,10 @@ class WhatsAppFlowService:
 
         _send(
             phone,
-            f"Hi {first_name} 👋\n\nYour Uri Social account is ready.\n"
-            "I will help you create content daily based on your brand.\n\n"
-            "Here is a content idea for you today:",
+            f"Hi {first_name} 👋 Welcome to Uri Social!\n\n"
+            "I'm your AI content assistant. I'll help you create and publish content to "
+            "LinkedIn, Instagram, Facebook, and more — all from WhatsApp.\n\n"
+            "Let me create your first piece of content:",
         )
 
         industry = brand.get("industry", "your niche")
@@ -388,22 +650,44 @@ class WhatsAppFlowService:
             await WhatsAppFlowService._generate_graphic(phone, user_id, ctx, db)
             return
 
+        # "post now" / "publish" — post last content if available
+        if text in POST_KEYWORDS:
+            if ctx.get("caption"):
+                await WhatsAppFlowService._initiate_post(phone, user_id, ctx, "now", db)
+            else:
+                _send(phone, "No content to post yet. What do you want to post about?")
+                await _safe_set_state(phone, "awaiting_topic", ctx, db)
+            return
+
+        # "schedule post"
+        if text in SCHEDULE_KEYWORDS:
+            if ctx.get("caption"):
+                _send(phone, SCHEDULE_PROMPT)
+                await _safe_set_state(phone, "awaiting_schedule_time", ctx, db)
+            else:
+                _send(phone, "No content to schedule yet. What do you want to post about?")
+                await _safe_set_state(phone, "awaiting_topic", ctx, db)
+            return
+
         # "create post" without topic
         if text in CREATE_KEYWORDS:
             _send(phone, "What do you want to post about?")
             await _safe_set_state(phone, "awaiting_topic", ctx, db)
             return
 
-        # Greeting — re-show last content or prompt
+        # Greeting / help
         if text in GREETING_KEYWORDS:
-            if ctx.get("headline"):
+            if text == "help":
+                _send(phone, HELP_MESSAGE)
+                await _safe_set_state(phone, "idle", ctx, db)
+            elif ctx.get("headline"):
                 _send(phone, f"Welcome back {first_name} 👋\n\nHere's your last content:\n\n" + _format_content(ctx))
                 await _safe_set_state(phone, "showing_content", ctx, db)
             else:
-                _send(phone, f"Hi {first_name} 👋  What do you want to post about today?")
+                _send(phone, f"Hi {first_name} 👋\n\n{HELP_MESSAGE}")
             return
 
-        # Anything else — treat as topic
+        # Anything else — treat as a topic
         await WhatsAppFlowService._create_and_show_content(phone, raw_body, user_id, {}, db)
 
     # ── Content generation & display ──────────────────────────────────────────
@@ -454,23 +738,190 @@ class WhatsAppFlowService:
     ) -> None:
         opt = _opt(text)
 
-        if opt == "1" or text in {"generate graphic", "graphic"}:
+        if opt == "1" or text in POST_KEYWORDS | {"post now"}:
+            await WhatsAppFlowService._initiate_post(phone, user_id, ctx, "now", db)
+
+        elif opt == "2" or text in SCHEDULE_KEYWORDS:
+            _send(phone, SCHEDULE_PROMPT)
+            await _safe_set_state(phone, "awaiting_schedule_time", ctx, db)
+
+        elif opt == "3" or text in GRAPHIC_KEYWORDS:
             await WhatsAppFlowService._generate_graphic(phone, user_id, ctx, db)
 
-        elif opt == "2" or text in {"view full caption", "caption", "full caption"}:
+        elif opt == "4" or text in {"view full caption", "caption", "full caption"}:
             caption = ctx.get("caption", "No caption saved.")
             _send(phone, f"Full caption:\n\n{caption}\n\n" + CONTENT_ACTIONS)
 
-        elif opt == "3" or text in {"change idea", "change", "another"}:
+        elif opt == "5" or text in {"new idea", "change idea", "change", "another"}:
             topic = ctx.get("topic", "")
             await WhatsAppFlowService._create_and_show_content(phone, topic, user_id, ctx, db)
 
-        elif opt == "4" or text == "edit":
+        elif text == "edit":
             _send(phone, EDIT_ACTIONS)
             await _safe_set_state(phone, "awaiting_edit_choice", ctx, db)
 
         else:
             _send(phone, _format_content(ctx))
+
+    # ── Publish flow ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    async def _initiate_post(
+        phone: str,
+        user_id: str,
+        ctx: Dict[str, Any],
+        mode: str,  # "now" | "schedule"
+        db: AsyncIOMotorDatabase,
+    ) -> None:
+        """Fetch connected accounts and show platform selection menu."""
+        accounts = await _get_connected_accounts(user_id, db)
+        if not accounts:
+            _send(phone, NO_PLATFORMS)
+            await _safe_set_state(phone, "idle", ctx, db)
+            return
+
+        menu = _format_platform_menu(accounts, mode=mode)
+        _send(phone, menu)
+        await _safe_set_state(
+            phone,
+            "awaiting_platform_select",
+            {**ctx, "_accounts": accounts, "_publish_mode": mode},
+            db,
+        )
+
+    @staticmethod
+    async def _handle_platform_select(
+        phone: str,
+        text: str,
+        user_id: str,
+        ctx: Dict[str, Any],
+        db: AsyncIOMotorDatabase,
+    ) -> None:
+        accounts: List[Dict[str, Any]] = ctx.get("_accounts", [])
+        mode: str = ctx.get("_publish_mode", "now")
+
+        if not accounts:
+            _send(phone, "Something went wrong. Reply *post* to try again.")
+            await _safe_set_state(phone, "showing_content", ctx, db)
+            return
+
+        opt = _opt(text)
+        all_opt = str(len(accounts) + 1)
+
+        if text in {"0", "back", "go back", "cancel"}:
+            _send(phone, _format_content(ctx))
+            await _safe_set_state(phone, "showing_content", ctx, db)
+            return
+
+        if opt == all_opt:
+            selected = accounts
+        elif opt and opt.isdigit():
+            idx = int(opt) - 1
+            if 0 <= idx < len(accounts):
+                selected = [accounts[idx]]
+            else:
+                _send(phone, _format_platform_menu(accounts, mode=mode))
+                return
+        else:
+            _send(phone, _format_platform_menu(accounts, mode=mode))
+            return
+
+        caption = ctx.get("caption", "")
+        graphic_url = ctx.get("last_graphic_url")
+
+        if mode == "now":
+            _send(phone, "Publishing... 🚀")
+            success = await _do_publish(selected, caption, graphic_url, scheduled_at=None, db=db)
+            if success:
+                platform_names = ", ".join(
+                    NETWORK_LABELS.get(acc.get("network", ""), acc.get("network", "")) for acc in selected
+                )
+                _send(phone, f"✅ Posted to {platform_names}!\n\nWhat's next?\n\n" + CONTENT_ACTIONS)
+                await _safe_set_state(phone, "showing_content", ctx, db)
+            else:
+                _send(phone, "❌ Could not publish right now. Please try again.\n\n" + CONTENT_ACTIONS)
+                await _safe_set_state(phone, "showing_content", ctx, db)
+        else:
+            # Schedule mode — store selected accounts, ask for time
+            _send(phone, SCHEDULE_PROMPT)
+            await _safe_set_state(
+                phone,
+                "awaiting_schedule_time",
+                {**ctx, "_schedule_accounts": selected},
+                db,
+            )
+
+    @staticmethod
+    async def _handle_schedule_time(
+        phone: str,
+        raw_body: str,
+        user_id: str,
+        ctx: Dict[str, Any],
+        db: AsyncIOMotorDatabase,
+    ) -> None:
+        # Allow cancel/back at any point
+        if raw_body.strip().lower() in {"back", "cancel", "0", "stop", "go back"}:
+            _send(phone, _format_content(ctx))
+            await _safe_set_state(phone, "showing_content", ctx, db)
+            return
+
+        scheduled_dt = _parse_schedule_time(raw_body)
+
+        if not scheduled_dt:
+            _send(
+                phone,
+                "I couldn't understand that time. Please try:\n\n"
+                "• *today 5pm*\n• *tomorrow 9am*\n• *Monday 3pm*\n• *18 April 10am*\n\n"
+                "Or reply *back* to return to the menu."
+            )
+            return
+
+        # Check if we already have the platform selected
+        schedule_accounts: List[Dict[str, Any]] = ctx.get("_schedule_accounts", [])
+
+        if not schedule_accounts:
+            # Platform not yet selected — store time then ask for platform
+            await _safe_set_state(
+                phone,
+                "awaiting_platform_select",
+                {**ctx, "_scheduled_at": scheduled_dt.isoformat(), "_publish_mode": "schedule"},
+                db,
+            )
+            accounts = await _get_connected_accounts(user_id, db)
+            if not accounts:
+                _send(phone, NO_PLATFORMS)
+                await _safe_set_state(phone, "idle", ctx, db)
+                return
+            new_ctx = {**ctx, "_accounts": accounts, "_publish_mode": "schedule", "_scheduled_at": scheduled_dt.isoformat()}
+            await _safe_set_state(phone, "awaiting_platform_select", new_ctx, db)
+            _send(phone, _format_platform_menu(accounts, mode="schedule"))
+            return
+
+        # Platform already selected — schedule now
+        caption = ctx.get("caption", "")
+        graphic_url = ctx.get("last_graphic_url")
+        _send(phone, "Scheduling your post... 🗓️")
+
+        success = await _do_publish(schedule_accounts, caption, graphic_url, scheduled_at=scheduled_dt.isoformat(), db=db)
+
+        if success:
+            # Format time back in WAT for user display
+            wat_dt = scheduled_dt + _WAT_OFFSET
+            time_str = wat_dt.strftime("%A, %d %B at %-I:%M %p") + " WAT"
+            platform_names = ", ".join(
+                NETWORK_LABELS.get(acc.get("network", ""), acc.get("network", "")) for acc in schedule_accounts
+            )
+            _send(
+                phone,
+                f"✅ Scheduled for {time_str}\n"
+                f"Platform: {platform_names}\n\n"
+                "What would you like to do next?\n\n"
+                + CONTENT_ACTIONS,
+            )
+            await _safe_set_state(phone, "showing_content", ctx, db)
+        else:
+            _send(phone, "❌ Could not schedule right now. Please try again.\n\n" + CONTENT_ACTIONS)
+            await _safe_set_state(phone, "showing_content", ctx, db)
 
     # ── Ideas flow ────────────────────────────────────────────────────────────
 
@@ -491,9 +942,7 @@ class WhatsAppFlowService:
 
         lines = "\n".join(f"{i + 1}️⃣  {idea}" for i, idea in enumerate(ideas))
         _send(phone, f"Here are 3 ideas for you:\n\n{lines}\n\nReply 1, 2, or 3 to pick one.")
-        await _safe_set_state(
-            phone, "showing_ideas", {"ideas": ideas, "topic": topic}, db
-        )
+        await _safe_set_state(phone, "showing_ideas", {"ideas": ideas, "topic": topic}, db)
 
     @staticmethod
     async def _handle_ideas_pick(
@@ -536,9 +985,7 @@ class WhatsAppFlowService:
             return
 
         _send(phone, prompts[field])
-        await _safe_set_state(
-            phone, "awaiting_edit_value", {**ctx, "edit_field": field}, db
-        )
+        await _safe_set_state(phone, "awaiting_edit_value", {**ctx, "edit_field": field}, db)
 
     @staticmethod
     async def _apply_edit(
@@ -551,13 +998,11 @@ class WhatsAppFlowService:
         field = ctx.get("edit_field", "headline")
 
         if field == "tone":
-            # Re-generate with new tone
             new_ctx = {**ctx, "tone": value}
             await WhatsAppFlowService._create_and_show_content(
                 phone, ctx.get("topic", value), user_id, new_ctx, db
             )
         else:
-            # Direct field replacement
             new_ctx = {**ctx, field: value}
             _send(phone, _format_content(new_ctx))
             await _safe_set_state(phone, "showing_content", new_ctx, db)
@@ -611,7 +1056,6 @@ class WhatsAppFlowService:
                 match = _re.match(r"data:[^;]+;base64,(.+)", raw_url, _re.DOTALL)
                 if match:
                     b64_clean = match.group(1).strip().replace("\n", "").replace("\r", "")
-                    # Convert to JPEG — Twilio WhatsApp requires JPEG or PNG
                     raw_bytes = base64.b64decode(b64_clean)
                     img = PILImage.open(io.BytesIO(raw_bytes)).convert("RGB")
                     buf = io.BytesIO()
@@ -630,24 +1074,20 @@ class WhatsAppFlowService:
                         print(f"[WhatsApp] imgBB upload success: {public_url}")
                     else:
                         print(f"[WhatsApp] imgBB upload failed: {rj}")
-                else:
-                    print(f"[WhatsApp] could not parse data URL")
             except Exception as e:
                 print(f"[WhatsApp] imgBB upload error: {e}")
         elif raw_url.startswith("http"):
             public_url = raw_url
-            print(f"[WhatsApp] using direct image URL: {public_url}")
 
         if public_url:
             try:
                 _send(phone, "Your design is ready 👆", media_url=public_url)
-                print(f"[WhatsApp] image message sent: {public_url}")
             except Exception as e:
-                print(f"[WhatsApp] Twilio media send failed: {e} — falling back to link")
+                print(f"[WhatsApp] Twilio media send failed: {e}")
                 _send(phone, f"Your design is ready 👆\n\n🔗 {public_url}")
             _send(phone, GRAPHIC_ACTIONS)
         else:
-            _send(phone, "Your design is ready 👆\n\nImage preview unavailable. Check your Uri Social dashboard to download it.")
+            _send(phone, "Your design is ready 👆\n\nPreview unavailable. Check your Uri Social dashboard.")
             _send(phone, GRAPHIC_ACTIONS)
 
         await _safe_set_state(phone, "showing_graphic", {**ctx, "last_graphic_url": public_url}, db)
@@ -664,21 +1104,26 @@ class WhatsAppFlowService:
     ) -> None:
         opt = _opt(text)
 
-        if opt == "1" or text == "download":
+        if opt == "1" or text in {"post graphic", "post graphic now", "post now"}:
+            await WhatsAppFlowService._initiate_post(phone, user_id, ctx, "now", db)
+
+        elif opt == "2" or text in {"schedule graphic", "schedule"}:
+            _send(phone, SCHEDULE_PROMPT)
+            await _safe_set_state(phone, "awaiting_schedule_time", ctx, db)
+
+        elif opt == "3" or text == "download":
             url = ctx.get("last_graphic_url")
             if url:
-                _send(phone, f"🔗 Your graphic:\n{url}\n\nBest time to post: 7PM today.")
+                _send(phone, f"🔗 Download your graphic:\n{url}")
             else:
-                _send(phone, "Graphic link unavailable. Generate a new one below.")
-                _send(phone, GRAPHIC_ACTIONS)
-                return
-            await _safe_set_state(phone, "idle", ctx, db)
+                _send(phone, "Link unavailable. Generate a new graphic below.")
+            _send(phone, GRAPHIC_ACTIONS)
 
-        elif opt == "2" or text in {"edit text", "edit"}:
+        elif opt == "4" or text in {"edit text", "edit"}:
             _send(phone, EDIT_ACTIONS)
             await _safe_set_state(phone, "awaiting_edit_choice", ctx, db)
 
-        elif opt == "3" or text in {"regenerate", "regenerate design", "new design"}:
+        elif opt == "5" or text in {"regenerate", "regenerate design", "new design"}:
             await WhatsAppFlowService._generate_graphic(phone, user_id, ctx, db)
 
         else:
@@ -708,11 +1153,6 @@ class WhatsAppFlowService:
 
     @staticmethod
     async def send_daily_push(db: AsyncIOMotorDatabase) -> Dict[str, Any]:
-        """
-        Morning push to all WhatsApp-linked users.
-        Re-engagement ping for users inactive > 2 days.
-        Called from the /whatsapp/daily-push cron endpoint.
-        """
         users = await WhatsAppSessionService.get_all_linked_users(db)
         sent = 0
         failed = 0
@@ -729,9 +1169,8 @@ class WhatsAppFlowService:
                 last_updated = session.get("updated_at")
                 state = session.get("state", "idle")
 
-                # Re-engagement if inactive for > 2 days
                 if last_updated and state == "idle":
-                    delta = datetime.utcnow() - last_updated
+                    delta = datetime.now(timezone.utc).replace(tzinfo=None) - last_updated
                     if delta.days >= 2:
                         _send(phone, RE_ENGAGEMENT)
                         await _safe_set_state(
@@ -758,10 +1197,7 @@ class WhatsAppFlowService:
                     "caption": content["caption"],
                 }
 
-                _send(
-                    phone,
-                    f"Good morning {first_name} 👋\n\nYour content for today is ready.",
-                )
+                _send(phone, f"Good morning {first_name} 👋\n\nYour content for today is ready.")
                 _send(phone, _format_content(new_ctx))
                 await _safe_set_state(phone, "showing_content", new_ctx, db)
                 sent += 1
