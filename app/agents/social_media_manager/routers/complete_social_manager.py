@@ -572,6 +572,8 @@ async def instagram_direct_callback(
                 return RedirectResponse(f"{base_redirect}?connected=false&error={urllib.parse.quote(err_msg)}")
 
         # Step 6: store in social_connections
+        # Use id (the unique indexed field) as the upsert key so reconnecting
+        # never hits a duplicate-key error regardless of how the old record was stored.
         now = datetime.now(timezone.utc).isoformat()
         conn_doc = {
             "id": ig_user_id,
@@ -588,7 +590,7 @@ async def instagram_direct_callback(
             "updated_at": now,
         }
         await db["social_connections"].update_one(
-            {"ig_user_id": ig_user_id, "connected_via": "instagram_direct_oauth"},
+            {"id": ig_user_id},
             {"$set": conn_doc},
             upsert=True,
         )
@@ -623,11 +625,11 @@ async def instagram_direct_finalize(
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
     result = await db["social_connections"].update_one(
-        {"ig_user_id": ig_user_id, "connected_via": "instagram_direct_oauth", "connection_status": "pending_user_match"},
+        {"ig_user_id": ig_user_id},
         {"$set": {"user_id": user_id, "connection_status": "active", "updated_at": datetime.utcnow().isoformat()}},
     )
     if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Pending Instagram connection not found")
+        raise HTTPException(status_code=404, detail="Instagram connection not found — try reconnecting")
 
     return UriResponse.get_single_data_response("instagram_connected", {"ig_user_id": ig_user_id})
 
@@ -2284,9 +2286,8 @@ async def _generate_image_bg(
     For story posts, uses the story (9:16) image spec.
     """
     import re
+    import os
     import base64
-    import httpx
-    from app.core.config import settings as _cfg
 
     try:
         # For story posts pass image_type="story" so we get 1080x1920 dimensions
@@ -2308,24 +2309,22 @@ async def _generate_image_bg(
         raw_url = image_result["responseData"]["image_url"]
         stored_url = raw_url
 
-        # Upload base64 image to imgBB for a public URL
+        # Save base64 image to local static storage (served directly by this backend)
         if raw_url and raw_url.startswith("data:"):
             try:
                 match = re.match(r"data:[^;]+;base64,(.+)", raw_url, re.DOTALL)
-                if match and _cfg.IMGBB_API_KEY:
-                    async with httpx.AsyncClient(timeout=30) as client:
-                        resp = await client.post(
-                            "https://api.imgbb.com/1/upload",
-                            data={"key": _cfg.IMGBB_API_KEY, "image": match.group(1)},
-                        )
-                        rj = resp.json()
-                    if rj.get("success"):
-                        stored_url = rj["data"]["url"]
-                        print(f"☁️  BG image uploaded to imgBB: {stored_url}")
-                    else:
-                        print(f"⚠️  BG imgBB upload failed: {rj.get('error')}")
+                if match:
+                    import uuid as _uuid
+                    filename = f"{_uuid.uuid4().hex}.webp"
+                    static_dir = "/app/static/images"
+                    os.makedirs(static_dir, exist_ok=True)
+                    img_bytes = base64.b64decode(match.group(1))
+                    with open(f"{static_dir}/{filename}", "wb") as _f:
+                        _f.write(img_bytes)
+                    stored_url = f"/static/images/{filename}"
+                    print(f"💾 BG image saved locally: {stored_url}")
             except Exception as upload_err:
-                print(f"⚠️  BG imgBB upload error: {upload_err}")
+                print(f"⚠️  BG local image save error: {upload_err}")
 
         final_url = stored_url if not stored_url.startswith("data:") else None
         if final_url and db is not None:
