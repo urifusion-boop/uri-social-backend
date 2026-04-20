@@ -66,10 +66,14 @@ class NotificationService:
     async def _check_rate_limit(
         self, user_id: str, channel: NotificationChannel = "email"
     ) -> bool:
-        """Check if user has exceeded daily notification limit."""
+        """
+        Check if user has exceeded daily notification limit.
+        PRD Section 11: Max 2-3 emails/day, 1-2 WhatsApp/day TOTAL across all notification types.
+        """
         today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
         limit = MAX_EMAILS_PER_DAY if channel == "email" else MAX_WHATSAPP_PER_DAY
 
+        # Count ALL notifications sent today for this channel (not per-type)
         count = await self.notifications_collection.count_documents({
             "user_id": user_id,
             "channel": channel,
@@ -77,7 +81,11 @@ class NotificationService:
             "sent_at": {"$gte": today_start},
         })
 
-        return count < limit
+        if count >= limit:
+            print(f"⚠️ Rate limit reached for user {user_id}: {count}/{limit} {channel} notifications sent today")
+            return False
+
+        return True
 
     # ==================== PRD 9: Log Notification ====================
 

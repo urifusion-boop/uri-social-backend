@@ -31,8 +31,31 @@ def _run_async(coro_func):
 
 
 def _job_daily_suggestions():
+    """Daily suggestions job with duplicate prevention on container restart."""
     from app.services.NotificationService import notification_service
-    _run_async(notification_service.run_daily_suggestions)
+    from datetime import datetime, timedelta
+    from app.database import get_db
+
+    # Check if we already sent suggestions today (prevents duplicate on restart)
+    async def check_and_run():
+        db = get_db()
+        today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+
+        # Check if any daily_suggestion was sent today
+        recent_suggestion = await db["notifications"].find_one({
+            "type": "daily_suggestion",
+            "status": "sent",
+            "sent_at": {"$gte": today_start}
+        })
+
+        if recent_suggestion:
+            print("⏭️ Daily suggestions already sent today, skipping to prevent duplicates")
+            return
+
+        # Safe to send
+        await notification_service.run_daily_suggestions()
+
+    _run_async(check_and_run)
 
 
 def _job_inactivity_check():
