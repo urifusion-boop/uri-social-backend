@@ -23,6 +23,7 @@ NotificationType = Literal[
     "trial_start",         # Trial activated
     "trial_ending",        # Trial ending soon (24h before)
     "trial_expired",       # Trial ended
+    "payment_success",     # Payment completed successfully
 ]
 
 NotificationChannel = Literal["email", "whatsapp"]
@@ -66,6 +67,15 @@ class TrialMetadata(BaseModel):
     credits_remaining: Optional[int] = None
     message: Optional[str] = None
 
+class PaymentSuccessMetadata(BaseModel):
+    """Metadata for payment_success notifications"""
+    amount: Optional[float] = None
+    currency: Optional[str] = None
+    subscription_tier: Optional[str] = None
+    credits_added: Optional[int] = None
+    transaction_ref: Optional[str] = None
+    message: Optional[str] = None
+
 
 # ==================== PRD Section 9: Notification Object ====================
 
@@ -80,7 +90,7 @@ class Notification(BaseModel):
     channel: NotificationChannel = Field(default="email", description="Delivery channel")
     status: NotificationStatus = Field(default="pending", description="Delivery status")
     subject: str = Field(default="", description="Email subject line")
-    metadata: Union[SignupMetadata, ContentCreatedMetadata, ContentPostedMetadata, DailySuggestionMetadata, InactivityMetadata, TrialMetadata, dict] = Field(default_factory=dict, description="Extra context (content preview, CTA links)")
+    metadata: Union[SignupMetadata, ContentCreatedMetadata, ContentPostedMetadata, DailySuggestionMetadata, InactivityMetadata, TrialMetadata, PaymentSuccessMetadata, dict] = Field(default_factory=dict, description="Extra context (content preview, CTA links)")
     retry_count: int = Field(default=0, description="PRD Section 10: Retry attempts")
     read: bool = Field(default=False, description="Whether notification has been read")
     read_at: Optional[datetime] = None

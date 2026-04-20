@@ -670,6 +670,69 @@ class NotificationService:
         print(f"📬 Daily suggestions sent: {count}")
         return count
 
+    # ==================== Payment Success Notification ====================
+
+    async def notify_payment_success(
+        self,
+        user_id: str,
+        amount: float,
+        currency: str,
+        subscription_tier: str,
+        credits_added: int,
+        transaction_ref: str
+    ):
+        """
+        Send payment success confirmation email.
+        Called immediately after successful payment completion.
+        """
+        user = await self._get_user(user_id)
+        if not user:
+            print(f"⚠️ User {user_id} not found for payment success notification")
+            return
+
+        app_url = settings.WEB_APP_URL or "https://app.urisocial.com"
+        user_name = user.get("first_name") or user.get("email", "").split("@")[0]
+
+        subject = "Payment Successful - Your Credits Are Ready! 🎉"
+
+        success = await email_service.send_email(
+            to_email=user["email"],
+            subject=subject,
+            template_name="payment_success",
+            template_vars={
+                "user_name": user_name,
+                "amount": amount,
+                "currency": currency,
+                "subscription_tier": subscription_tier,
+                "credits_added": credits_added,
+                "transaction_ref": transaction_ref,
+                "app_url": app_url,
+                "year": str(datetime.utcnow().year),
+            },
+        )
+
+        # Log notification (payment confirmations don't count toward rate limit)
+        await self._log_notification(
+            user_id=user_id,
+            notification_type="payment_success",
+            channel="email",
+            subject=subject,
+            status="sent" if success else "failed",
+            metadata={
+                "amount": amount,
+                "currency": currency,
+                "subscription_tier": subscription_tier,
+                "credits_added": credits_added,
+                "transaction_ref": transaction_ref,
+                "message": f"Payment of {currency} {amount:,.2f} received. {credits_added} credits added to your account."
+            },
+        )
+
+        if success:
+            print(f"✅ Payment success email sent to {user['email']}")
+        else:
+            print(f"⚠️ Failed to send payment success email to {user['email']}")
+
 
 # Singleton
 notification_service = NotificationService()

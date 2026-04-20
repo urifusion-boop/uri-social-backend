@@ -24,6 +24,7 @@ from app.domain.models.billing_models import (
 from app.services.SubscriptionService import subscription_service
 from app.services.TrialService import trial_service
 from app.services.CreditService import credit_service
+from app.services.NotificationService import notification_service
 from app.core.config import settings
 
 
@@ -315,6 +316,29 @@ class PaymentService:
                 reason="trial_credits_preserved"
             )
             print(f"✅ Added {remaining_trial_credits} bonus credits from trial")
+
+        # Get tier information for email notification
+        from app.services.SubscriptionService import SUBSCRIPTION_TIERS
+        tier = next((t for t in SUBSCRIPTION_TIERS if t.tier_id == tier_id), None)
+
+        if tier:
+            # Send payment success email notification
+            try:
+                amount_paid = squad_response.get("data", {}).get("amount", 0) / 100  # Convert kobo to naira
+                if amount_paid == 0:  # Fallback to tier price
+                    amount_paid = tier.price_ngn
+
+                await notification_service.notify_payment_success(
+                    user_id=user_id,
+                    amount=amount_paid,
+                    currency="NGN",
+                    subscription_tier=tier.name,
+                    credits_added=tier.credits,
+                    transaction_ref=transaction_ref
+                )
+            except Exception as e:
+                print(f"⚠️ Failed to send payment success email: {e}")
+                # Don't fail the payment if email fails
 
     async def _mark_payment_failed(
         self,
