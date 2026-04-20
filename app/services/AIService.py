@@ -20,16 +20,24 @@ class AIService:
     @staticmethod
     def extract_ai_result(ai_response):
         try:
-            if isinstance(ai_response, dict):
-                return ai_response["choices"][0]["message"]["parsed"]
+            # Check if response is an error dict
+            if isinstance(ai_response, dict) and "error" in ai_response:
+                raise ValueError(ai_response["error"])
+
+            # Try object attribute access first
             if hasattr(ai_response, 'choices'):
                 return ai_response.choices[0].message.parsed
-            # Fallback: try dict access
-            return ai_response["choices"][0]["message"]["parsed"]
+
+            # Try dict access
+            if isinstance(ai_response, dict):
+                return ai_response["choices"][0]["message"]["parsed"]
+
+            # Last resort: convert to dict and try
+            return dict(ai_response)["choices"][0]["message"]["parsed"]
         except (AttributeError, KeyError, IndexError, TypeError) as e:
-            print(f"Error extracting AI result: {e}")
-            print(f"AI response type: {type(ai_response)}")
-            print(f"AI response: {ai_response}")
+            print(f"❌ Error extracting AI result: {e}")
+            print(f"📋 AI response type: {type(ai_response)}")
+            print(f"📋 AI response: {ai_response}")
             raise
 
     @staticmethod
