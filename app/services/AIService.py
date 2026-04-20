@@ -19,9 +19,18 @@ class AIService:
 
     @staticmethod
     def extract_ai_result(ai_response):
-        if isinstance(ai_response, dict):
+        try:
+            if isinstance(ai_response, dict):
+                return ai_response["choices"][0]["message"]["parsed"]
+            if hasattr(ai_response, 'choices'):
+                return ai_response.choices[0].message.parsed
+            # Fallback: try dict access
             return ai_response["choices"][0]["message"]["parsed"]
-        return ai_response.choices[0].message.parsed
+        except (AttributeError, KeyError, IndexError, TypeError) as e:
+            print(f"Error extracting AI result: {e}")
+            print(f"AI response type: {type(ai_response)}")
+            print(f"AI response: {ai_response}")
+            raise
 
     @staticmethod
     def build_ai_model(
