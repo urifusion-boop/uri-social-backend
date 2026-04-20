@@ -66,19 +66,19 @@ class AIService:
 
             if "RateLimitError" in str(type(e)) or "429" in error_message:
                 print("⚠️ OpenAI rate limit exceeded - quota exhausted")
-                return {"error": "AI service is temporarily unavailable. Please try again later or contact support."}
+                return {"error": "We're experiencing high demand right now. Please try again in a few moments."}
 
             if "insufficient_quota" in error_message:
                 print("⚠️ OpenAI quota insufficient - credits exhausted")
-                return {"error": "AI service is temporarily unavailable due to quota limits. Please contact support."}
+                return {"error": "Content generation is temporarily unavailable. Our team has been notified and will resolve this shortly."}
 
             if "authentication" in error_message.lower() or "401" in error_message:
                 print("⚠️ OpenAI authentication error - invalid API key")
-                return {"error": "AI service configuration error. Please contact support."}
+                return {"error": "Content generation is temporarily unavailable. Our team has been notified."}
 
             if "timeout" in error_message.lower() or "timed out" in error_message.lower():
                 print("⚠️ OpenAI request timed out")
-                return {"error": "AI service request timed out. Please try again."}
+                return {"error": "Request took too long. Please try again with a shorter prompt."}
 
             print(f"⚠️ Unexpected OpenAI error in chat_completion: {error_message}")
             raise e
