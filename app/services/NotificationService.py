@@ -266,7 +266,7 @@ class NotificationService:
             channel="email",
             subject=subject,
             status="sent" if success else "failed",
-            metadata={"campaign_id": campaign_id, "platforms": platforms},
+            metadata={"campaign_id": campaign_id, "platforms": platforms, "message": f"Your content for {platforms} is ready to review and publish!"},
         )
 
         # Update last_active_at
@@ -363,7 +363,7 @@ class NotificationService:
             channel="email",
             subject=subject,
             status="sent" if success else "failed",
-            metadata={"suggestion": suggestion, "topic": topic},
+            metadata={"suggestion": suggestion, "topic": topic, "message": suggestion},
         )
 
     # ==================== PRD 4.5: Inactivity Notification ====================
@@ -410,7 +410,7 @@ class NotificationService:
             channel="email",
             subject=subject,
             status="sent" if success else "failed",
-            metadata={"days_inactive": days_inactive},
+            metadata={"days_inactive": days_inactive, "message": f"It's been {days_inactive} days since your last post. Your audience is waiting to hear from you!"},
         )
 
     # ==================== PRD 4.6: Trial Notifications ====================
