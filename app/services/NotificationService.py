@@ -544,10 +544,14 @@ class NotificationService:
         cutoff = datetime.utcnow() - timedelta(days=INACTIVITY_THRESHOLD_DAYS)
 
         # Find users who haven't been active and haven't received an inactivity email recently
+        # Include users without last_active_at (use created_at as fallback)
         inactive_users = self.users_collection.find({
-            "last_active_at": {"$lt": cutoff, "$exists": True},
+            "$or": [
+                {"last_active_at": {"$lt": cutoff}},
+                {"last_active_at": {"$exists": False}, "created_at": {"$lt": cutoff}}
+            ],
             "notification_opt_out": {"$ne": True},
-        })
+        }).limit(1000)  # Process max 1000 users per run to avoid memory issues
 
         count = 0
         async for user in inactive_users:
