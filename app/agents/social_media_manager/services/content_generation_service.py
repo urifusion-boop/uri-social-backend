@@ -514,9 +514,18 @@ Write as if you're sharing hard-won business wisdom with fellow African entrepre
             print(f"✅ Generated {len(drafts)} drafts successfully")
             return UriResponse.get_single_data_response("content_generation", response_data)
         else:
-            return UriResponse.error_response(
-                f"Content generation failed for all platforms. Errors: {errors}",
-            )
+            # Extract user-friendly error messages from errors array
+            if errors and len(errors) > 0:
+                # Get the first error message (they're usually the same for all platforms)
+                first_error = errors[0].get('error', 'Content generation failed')
+                # Clean up any "Generation failed: " prefix if present
+                if first_error.startswith('Generation failed: '):
+                    first_error = first_error.replace('Generation failed: ', '')
+                user_message = first_error
+            else:
+                user_message = "Content generation failed. Please try again."
+
+            return UriResponse.error_response(user_message)
     
     @staticmethod
     async def _generate_platform_content(
