@@ -1254,16 +1254,42 @@ class ApprovalWorkflowService:
             # ── Facebook story ─────────────────────────────────────────────────
             elif post_type == "story":
                 story_image_url = ApprovalWorkflowService._resolve_image_url(draft.get("image_url") or "")
-                if story_image_url.startswith("data:"):
-                    story_image_url = await ApprovalWorkflowService._upload_base64_to_imgbb(story_image_url) or ""
                 if not story_image_url:
                     return {"success": False, "error": "Facebook stories require an image. Re-generate with 'include_images: true'."}
                 try:
                     import httpx as _httpx
+                    from PIL import Image as _PILImg
+                    import io as _io
+
+                    # Step 1: download image and upload as unpublished photo
                     async with _httpx.AsyncClient(timeout=30) as _c:
-                        story_resp = await _c.post(
+                        img_resp = await _c.get(story_image_url)
+                    img_resp.raise_for_status()
+                    _img = _PILImg.open(_io.BytesIO(img_resp.content)).convert("RGB")
+                    _buf = _io.BytesIO()
+                    _img.save(_buf, format="JPEG", quality=92)
+                    _jpeg_bytes = _buf.getvalue()
+
+                    async with _httpx.AsyncClient(timeout=60) as _c2:
+                        upload_resp = await _c2.post(
+                            f"https://graph.facebook.com/{settings.FACEBOOK_API_VERSION}/{page_id}/photos",
+                            data={"access_token": page_token, "published": "false"},
+                            files={"source": ("story.jpg", _jpeg_bytes, "image/jpeg")},
+                        )
+                    upload_data = upload_resp.json()
+                    photo_id = upload_data.get("id")
+                    if not photo_id:
+                        error_msg = (upload_data.get("error") or {}).get("message", str(upload_data))
+                        print(f"❌ FB story photo upload failed: {upload_data}")
+                        return {"success": False, "error": f"Failed to upload story image to Facebook. (Detail: {error_msg})"}
+
+                    print(f"✅ FB story photo uploaded: photo_id={photo_id}")
+
+                    # Step 2: publish as story using the photo_id
+                    async with _httpx.AsyncClient(timeout=30) as _c3:
+                        story_resp = await _c3.post(
                             f"https://graph.facebook.com/{settings.FACEBOOK_API_VERSION}/{page_id}/photo_stories",
-                            params={"url": story_image_url, "access_token": page_token},
+                            data={"access_token": page_token, "photo_ids": photo_id},
                         )
                     story_data = story_resp.json()
                     post_id = story_data.get("post_id") or story_data.get("id")
@@ -1273,15 +1299,10 @@ class ApprovalWorkflowService:
                     else:
                         error_msg = (story_data.get("error") or {}).get("message", str(story_data))
                         print(f"❌ FB story publish failed: {story_data}")
-                        return {
-                            "success": False,
-                            "error": f"Facebook stories require additional permissions. Try publishing as a feed post instead. (Detail: {error_msg})",
-                        }
+                        return {"success": False, "error": f"Facebook story publish failed. (Detail: {error_msg})"}
                 except Exception as story_err:
-                    return {
-                        "success": False,
-                        "error": f"Facebook stories require additional permissions. Try publishing as a feed post instead. (Detail: {story_err})",
-                    }
+                    print(f"❌ FB story exception: {story_err}")
+                    return {"success": False, "error": f"Facebook story publish failed. (Detail: {story_err})"}
 
             # ── Facebook feed (existing logic) ─────────────────────────────────
             else:
