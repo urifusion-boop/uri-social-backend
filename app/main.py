@@ -16,6 +16,7 @@ from app.agents.social_media_manager.routers.linkedin_router import router as li
 from app.routers.auth_router import router as auth_router
 from app.routers.billing_router import router as billing_router
 from app.routers.notification_router import router as notification_router
+from app.routers.bug_report_router import router as bug_report_router
 
 # Initialize Sentry
 initialize_sentry()
@@ -112,6 +113,13 @@ app.include_router(
     notification_router,
     prefix="/social-media",
     tags=["Notifications"],
+)
+
+# Include bug report router under /social-media prefix
+app.include_router(
+    bug_report_router,
+    prefix="/social-media",
+    tags=["Bug Reports"],
 )
 
 # Include additional social platform routers
