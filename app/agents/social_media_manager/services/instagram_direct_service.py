@@ -73,10 +73,26 @@ class InstagramDirectService:
         """Download any image URL and return JPEG bytes (converts WebP/PNG if needed)."""
         from PIL import Image
         try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                resp = await client.get(url)
-                resp.raise_for_status()
-            img = Image.open(io.BytesIO(resp.content)).convert("RGB")
+            # If the URL points to our own static files, read from disk directly
+            # to avoid Docker networking loops when the container calls itself.
+            local_path = None
+            if "/static/images/" in url:
+                filename = url.split("/static/images/")[-1].split("?")[0]
+                candidate = f"/app/static/images/{filename}"
+                import os as _os
+                if _os.path.exists(candidate):
+                    local_path = candidate
+
+            if local_path:
+                with open(local_path, "rb") as f:
+                    raw = f.read()
+            else:
+                async with httpx.AsyncClient(timeout=30) as client:
+                    resp = await client.get(url)
+                    resp.raise_for_status()
+                raw = resp.content
+
+            img = Image.open(io.BytesIO(raw)).convert("RGB")
             buf = io.BytesIO()
             img.save(buf, format="JPEG", quality=92)
             return buf.getvalue()
