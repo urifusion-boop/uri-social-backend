@@ -1260,12 +1260,25 @@ class ApprovalWorkflowService:
                     import httpx as _httpx
                     from PIL import Image as _PILImg
                     import io as _io
+                    import os as _os
+                    import json as _json
 
-                    # Step 1: download image and upload as unpublished photo
-                    async with _httpx.AsyncClient(timeout=30) as _c:
-                        img_resp = await _c.get(story_image_url)
-                    img_resp.raise_for_status()
-                    _img = _PILImg.open(_io.BytesIO(img_resp.content)).convert("RGB")
+                    # Step 1: download image — read from disk if it's a local static file
+                    # to avoid Docker networking loops when the container calls itself.
+                    _raw = None
+                    if "/static/images/" in story_image_url:
+                        _fname = story_image_url.split("/static/images/")[-1].split("?")[0]
+                        _local = f"/app/static/images/{_fname}"
+                        if _os.path.exists(_local):
+                            with open(_local, "rb") as _f:
+                                _raw = _f.read()
+                    if _raw is None:
+                        async with _httpx.AsyncClient(timeout=30) as _c:
+                            img_resp = await _c.get(story_image_url)
+                        img_resp.raise_for_status()
+                        _raw = img_resp.content
+
+                    _img = _PILImg.open(_io.BytesIO(_raw)).convert("RGB")
                     _buf = _io.BytesIO()
                     _img.save(_buf, format="JPEG", quality=92)
                     _jpeg_bytes = _buf.getvalue()
@@ -1285,11 +1298,11 @@ class ApprovalWorkflowService:
 
                     print(f"✅ FB story photo uploaded: photo_id={photo_id}")
 
-                    # Step 2: publish as story using the photo_id
+                    # Step 2: publish as story — photo_ids must be a JSON array string
                     async with _httpx.AsyncClient(timeout=30) as _c3:
                         story_resp = await _c3.post(
                             f"https://graph.facebook.com/{settings.FACEBOOK_API_VERSION}/{page_id}/photo_stories",
-                            data={"access_token": page_token, "photo_ids": photo_id},
+                            data={"access_token": page_token, "photo_ids": _json.dumps([photo_id])},
                         )
                     story_data = story_resp.json()
                     post_id = story_data.get("post_id") or story_data.get("id")
