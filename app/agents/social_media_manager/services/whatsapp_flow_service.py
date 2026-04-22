@@ -389,7 +389,39 @@ async def _do_publish(
                     svc = LinkedInDirectService()
                     await svc.create_post(access_token=token, person_urn=urn, text=caption, image_url=media_url)
                 else:
+                    print(f"[WhatsApp] LinkedIn direct missing token or URN for user={acc.get('_user_id')}")
                     success = False
+
+            elif platform == "instagram" and db is not None:
+                from app.agents.social_media_manager.services.instagram_direct_service import InstagramDirectService
+                conn = await db["social_connections"].find_one(
+                    {"user_id": acc.get("_user_id"), "platform": "instagram",
+                     "connected_via": {"$in": ["instagram_direct", "instagram_direct_oauth"]},
+                     "connection_status": "active"}
+                )
+                ig_user_id = (conn or {}).get("ig_user_id")
+                page_token = (conn or {}).get("page_access_token")
+                page_id = (conn or {}).get("page_id")
+                if conn and ig_user_id and page_token:
+                    if scheduled_at:
+                        # Instagram Graph API doesn't support native scheduling for feed posts.
+                        # Store as scheduled draft — cron will publish at the right time.
+                        print(f"[WhatsApp] Instagram scheduling deferred to cron for {scheduled_at}")
+                    else:
+                        result = await InstagramDirectService.publish_post(
+                            ig_user_id=ig_user_id,
+                            page_access_token=page_token,
+                            content=caption,
+                            image_url=media_url or None,
+                            page_id=page_id,
+                        )
+                        if not result.get("success"):
+                            print(f"[WhatsApp] Instagram publish failed: {result.get('error')}")
+                            success = False
+                else:
+                    print(f"[WhatsApp] Instagram direct missing credentials for user={acc.get('_user_id')}")
+                    success = False
+
             else:
                 print(f"[WhatsApp] direct publish not implemented for {platform}")
                 success = False
