@@ -249,6 +249,7 @@ class ImageContentService:
         reference_image: Optional[str] = None,
         feedback: Optional[str] = None,
         image_type: str = "post_image",
+        image_model: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Generate an AI image optimized for a specific platform.
@@ -292,6 +293,7 @@ class ImageContentService:
                 prompt=image_prompt,
                 size=f"{specs['width']}x{specs['height']}",
                 reference_image=reference_image,
+                image_model=image_model,
             )
 
             if image_response.get('success'):
@@ -1201,6 +1203,7 @@ class ImageContentService:
         prompt: str,
         size: str = "1024x1024",
         reference_image: Optional[str] = None,
+        image_model: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Generate an image using Nano Banana 2 (Google Imagen via Gemini API).
@@ -1292,6 +1295,75 @@ class ImageContentService:
                 except Exception as _edit_err:
                     print(f"⚠️ gpt-image-1 edit failed: {_edit_err} — falling back to standard generation")
                     # Fall through to standard generation below
+
+            # ── fal.ai path (model explicitly chosen from frontend) ────────────
+            _fal_model = image_model or ""
+            if _fal_model.startswith("fal-ai/") and _cfg.FAL_API_KEY:
+                try:
+                    import os as _os
+                    import httpx as _httpx
+                    import fal_client as _fal
+
+                    _os.environ.setdefault("FAL_KEY", _cfg.FAL_API_KEY)
+
+                    # Map pixel dimensions to fal.ai image_size strings
+                    def _fal_size(w: int, h: int) -> str:
+                        r = w / h
+                        if r >= 1.6:   return "landscape_16_9"
+                        if r >= 1.2:   return "landscape_4_3"
+                        if r <= 0.65:  return "portrait_16_9"
+                        if r <= 0.85:  return "portrait_4_3"
+                        return "square_hd"
+
+                    _fal_image_size = _fal_size(target_w, target_h)
+
+                    print(f"🎨 fal.ai [{_fal_model}] generating ({_fal_image_size})…")
+
+                    loop = asyncio.get_running_loop()
+                    _fal_result = await loop.run_in_executor(
+                        None,
+                        lambda: _fal.run(
+                            _fal_model,
+                            arguments={
+                                "prompt": prompt,
+                                "image_size": _fal_image_size,
+                                "num_images": 1,
+                                "output_format": "jpeg",
+                                "num_inference_steps": 28,
+                                "guidance_scale": 3.5,
+                            },
+                        ),
+                    )
+
+                    _fal_images = _fal_result.get("images") or []
+                    if not _fal_images:
+                        raise ValueError(f"fal.ai returned no images: {_fal_result}")
+
+                    _fal_url = _fal_images[0].get("url") or ""
+                    if not _fal_url:
+                        raise ValueError("fal.ai image url is empty")
+
+                    # Download and convert to WebP base64
+                    async with _httpx.AsyncClient(timeout=60) as _hc:
+                        _dl = await _hc.get(_fal_url)
+                        _dl.raise_for_status()
+                    import io as _io
+                    from PIL import Image as _PILImage
+                    _fal_img = _PILImage.open(_io.BytesIO(_dl.content)).convert("RGB")
+                    _fal_buf = _io.BytesIO()
+                    _fal_img.save(_fal_buf, format="WEBP", quality=97, method=6)
+                    import base64 as _b64
+                    _fal_b64 = _b64.b64encode(_fal_buf.getvalue()).decode()
+                    _fal_b64 = ImageContentService._crop_to_ratio(_fal_b64, target_w, target_h)
+
+                    print(f"✅ fal.ai [{_fal_model}] image ready")
+                    return {
+                        "success": True,
+                        "url": f"data:image/webp;base64,{_fal_b64}",
+                        "model": _fal_model,
+                    }
+                except Exception as _fal_err:
+                    print(f"⚠️ fal.ai [{_fal_model}] failed: {_fal_err} — falling back to Imagen/GPT")
 
             if _cfg.GOOGLE_GEMINI_API_KEY:
                 # ── Nano Banana 2 via Google GenAI SDK ────────────────────────
