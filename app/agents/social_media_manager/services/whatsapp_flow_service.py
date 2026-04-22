@@ -532,6 +532,7 @@ class WhatsAppFlowService:
 
         user = await WhatsAppSessionService.get_user_by_phone(phone, db)
         if not user:
+            print(f"[WhatsApp] no user found for phone={phone!r}")
             await _send(phone, NOT_LINKED)
             return
 
@@ -541,6 +542,13 @@ class WhatsAppFlowService:
         session = await WhatsAppSessionService.get_session(phone, db) or {}
         state: str = session.get("state", "linked")
         ctx: Dict[str, Any] = session.get("context", {})
+
+        # ── Global commands — work from any state ──────────────────────────
+        _RESET = {"restart", "reset", "menu", "home", "start over", "start fresh", "main menu"}
+        if text in _RESET:
+            await _send(phone, f"No problem {first_name}! Here's what I can do:\n\n" + HELP_MESSAGE)
+            await _safe_set_state(phone, "idle", ctx, db)
+            return
 
         # ── First-time user ────────────────────────────────────────────────
         if state == "linked":
@@ -680,14 +688,12 @@ class WhatsAppFlowService:
 
         # Greeting / help
         if text in GREETING_KEYWORDS:
-            if text == "help":
-                await _send(phone, HELP_MESSAGE)
-                await _safe_set_state(phone, "idle", ctx, db)
-            elif ctx.get("headline"):
+            if ctx.get("headline"):
                 await _send(phone, f"Welcome back {first_name} 👋\n\nHere's your last content:\n\n" + _format_content(ctx))
                 await _safe_set_state(phone, "showing_content", ctx, db)
             else:
                 await _send(phone, f"Hi {first_name} 👋\n\n{HELP_MESSAGE}")
+                await _safe_set_state(phone, "idle", ctx, db)
             return
 
         # Anything else — treat as a topic
@@ -833,17 +839,26 @@ class WhatsAppFlowService:
         graphic_url = ctx.get("last_graphic_url")
 
         if mode == "now":
-            await _send(phone, "Publishing... 🚀")
-            success = await _do_publish(selected, caption, graphic_url, scheduled_at=None, db=db)
-            if success:
-                platform_names = ", ".join(
-                    NETWORK_LABELS.get(acc.get("network", ""), acc.get("network", "")) for acc in selected
-                )
-                await _send(phone, f"✅ Posted to {platform_names}!\n\nWhat's next?\n\n" + CONTENT_ACTIONS)
-                await _safe_set_state(phone, "showing_content", ctx, db)
-            else:
-                await _send(phone, "❌ Could not publish right now. Please try again.\n\n" + CONTENT_ACTIONS)
-                await _safe_set_state(phone, "showing_content", ctx, db)
+            try:
+                await _send(phone, "Publishing... 🚀")
+            except Exception as e:
+                print(f"[WhatsApp] failed to send 'Publishing...' message: {e}")
+            try:
+                success = await _do_publish(selected, caption, graphic_url, scheduled_at=None, db=db)
+            except Exception as e:
+                print(f"[WhatsApp] _do_publish raised: {e}")
+                success = False
+            try:
+                if success:
+                    platform_names = ", ".join(
+                        NETWORK_LABELS.get(acc.get("network", ""), acc.get("network", "")) for acc in selected
+                    )
+                    await _send(phone, f"✅ Posted to {platform_names}!\n\nWhat's next?\n\n" + CONTENT_ACTIONS)
+                else:
+                    await _send(phone, "❌ Could not publish right now. Please try again.\n\n" + CONTENT_ACTIONS)
+            except Exception as e:
+                print(f"[WhatsApp] failed to send publish confirmation: {e}")
+            await _safe_set_state(phone, "showing_content", ctx, db)
         else:
             # Schedule mode — store selected accounts, ask for time
             await _send(phone, SCHEDULE_PROMPT)
