@@ -1103,6 +1103,35 @@ class ApprovalWorkflowService:
                     page_id=page_id,
                 )
 
+        # ── LinkedIn direct (OAuth 2.0) ───────────────────────────────────────
+        if platform == "linkedin" and connection.get("connected_via") == "linkedin_direct":
+            from app.agents.social_media_manager.services.linkedin_direct_service import LinkedInDirectService
+            token = connection.get("linkedin_access_token") or connection.get("access_token")
+            urn = connection.get("person_urn") or connection.get("active_author_urn")
+            if not token or not urn:
+                return {"success": False, "error": "LinkedIn connection is missing OAuth token or author URN. Please reconnect your account."}
+            # LinkedIn API does not support native scheduling — defer to cron
+            if scheduled_datetime:
+                print(f"⏰ LinkedIn direct — deferred to cron scheduler for {scheduled_datetime.isoformat()}")
+                return {"success": True, "scheduled": True, "post_id": None}
+            image_url = ApprovalWorkflowService._resolve_image_url(draft.get("image_url") or "")
+            if image_url and image_url.startswith("data:"):
+                image_url = await ApprovalWorkflowService._upload_base64_to_imgbb(image_url) or ""
+            try:
+                svc = LinkedInDirectService()
+                result = await svc.create_post(
+                    access_token=token,
+                    person_urn=urn,
+                    text=content,
+                    image_url=image_url or None,
+                )
+                post_id = result.get("post_id")
+                print(f"✅ LinkedIn direct publish: post_id={post_id}")
+                return {"success": bool(post_id), "post_id": post_id, "raw_response": result}
+            except Exception as e:
+                print(f"❌ LinkedIn direct publish failed: {e}")
+                return {"success": False, "error": f"LinkedIn direct publish failed: {str(e)}"}
+
         # ── Outstand-connected accounts ───────────────────────────────────────
         if connection.get("connected_via") == "outstand":
             try:
