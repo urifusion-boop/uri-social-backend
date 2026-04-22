@@ -21,6 +21,7 @@ awaiting_schedule_time   → user chose schedule, waiting for date/time
 
 from __future__ import annotations
 
+import asyncio
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
@@ -47,7 +48,7 @@ def _twilio_client():
 # ── Send helper ───────────────────────────────────────────────────────────────
 
 
-def _send(to: str, body: str, media_url: Optional[str] = None, content_sid: Optional[str] = None) -> None:
+async def _send(to: str, body: str, media_url: Optional[str] = None, content_sid: Optional[str] = None) -> None:
     client = _twilio_client()
     kwargs: Dict[str, Any] = {
         "from_": settings.TWILIO_WHATSAPP_FROM,
@@ -59,7 +60,7 @@ def _send(to: str, body: str, media_url: Optional[str] = None, content_sid: Opti
         kwargs["body"] = body
         if media_url:
             kwargs["media_url"] = [media_url]
-    client.messages.create(**kwargs)
+    await asyncio.to_thread(client.messages.create, **kwargs)
 
 
 # ── Static messages ───────────────────────────────────────────────────────────
@@ -231,7 +232,7 @@ async def _generate_content_structured(
         ChatMessage(role="system", content="You are a social media content creator. Return content in the exact format requested."),
         ChatMessage(role="user", content=prompt),
     ]
-    req = ChatModel(model="gpt-5.4-mini", messages=messages, temperature=0.8)
+    req = ChatModel(model="gpt-4o-mini", messages=messages, temperature=0.8)
     result = await AIService.chat_completion(req)
 
     if isinstance(result, dict) and result.get("error"):
@@ -269,7 +270,7 @@ async def _generate_three_ideas(topic: str, brand: Dict[str, Any]) -> Optional[L
         ChatMessage(role="system", content="You are a social media strategist."),
         ChatMessage(role="user", content=prompt),
     ]
-    req = ChatModel(model="gpt-5.4-mini", messages=messages, temperature=0.9)
+    req = ChatModel(model="gpt-4o-mini", messages=messages, temperature=0.9)
     result = await AIService.chat_completion(req)
 
     if isinstance(result, dict) and result.get("error"):
@@ -531,7 +532,7 @@ class WhatsAppFlowService:
 
         user = await WhatsAppSessionService.get_user_by_phone(phone, db)
         if not user:
-            _send(phone, NOT_LINKED)
+            await _send(phone, NOT_LINKED)
             return
 
         user_id: str = user["userId"]
@@ -550,10 +551,10 @@ class WhatsAppFlowService:
         if state == "awaiting_topic":
             if body.strip().lower() in {"back", "cancel", "0", "stop"}:
                 if ctx.get("headline"):
-                    _send(phone, _format_content(ctx))
+                    await _send(phone, _format_content(ctx))
                     await _safe_set_state(phone, "showing_content", ctx, db)
                 else:
-                    _send(phone, HELP_MESSAGE)
+                    await _send(phone, HELP_MESSAGE)
                     await _safe_set_state(phone, "idle", ctx, db)
                 return
             await WhatsAppFlowService._create_and_show_content(phone, body.strip(), user_id, ctx, db)
@@ -565,7 +566,7 @@ class WhatsAppFlowService:
 
         if state == "awaiting_edit_value":
             if body.strip().lower() in {"back", "cancel", "0", "stop"}:
-                _send(phone, _format_content(ctx))
+                await _send(phone, _format_content(ctx))
                 await _safe_set_state(phone, "showing_content", ctx, db)
                 return
             await WhatsAppFlowService._apply_edit(phone, body.strip(), user_id, ctx, db)
@@ -606,11 +607,11 @@ class WhatsAppFlowService:
     ) -> None:
         brand = await _brand_context(user_id, db)
         if not brand:
-            _send(phone, f"Hi {first_name} 👋\n\nYour Uri Social account is ready.\n\n" + NO_BRAND)
+            await _send(phone, f"Hi {first_name} 👋\n\nYour Uri Social account is ready.\n\n" + NO_BRAND)
             await _safe_set_state(phone, "idle", {}, db)
             return
 
-        _send(
+        await _send(
             phone,
             f"Hi {first_name} 👋 Welcome to Uri Social!\n\n"
             "I'm your AI content assistant. I'll help you create and publish content to "
@@ -657,36 +658,36 @@ class WhatsAppFlowService:
             if ctx.get("caption"):
                 await WhatsAppFlowService._initiate_post(phone, user_id, ctx, "now", db)
             else:
-                _send(phone, "No content to post yet. What do you want to post about?")
+                await _send(phone, "No content to post yet. What do you want to post about?")
                 await _safe_set_state(phone, "awaiting_topic", ctx, db)
             return
 
         # "schedule post"
         if text in SCHEDULE_KEYWORDS:
             if ctx.get("caption"):
-                _send(phone, SCHEDULE_PROMPT)
+                await _send(phone, SCHEDULE_PROMPT)
                 await _safe_set_state(phone, "awaiting_schedule_time", ctx, db)
             else:
-                _send(phone, "No content to schedule yet. What do you want to post about?")
+                await _send(phone, "No content to schedule yet. What do you want to post about?")
                 await _safe_set_state(phone, "awaiting_topic", ctx, db)
             return
 
         # "create post" without topic
         if text in CREATE_KEYWORDS:
-            _send(phone, "What do you want to post about?")
+            await _send(phone, "What do you want to post about?")
             await _safe_set_state(phone, "awaiting_topic", ctx, db)
             return
 
         # Greeting / help
         if text in GREETING_KEYWORDS:
             if text == "help":
-                _send(phone, HELP_MESSAGE)
+                await _send(phone, HELP_MESSAGE)
                 await _safe_set_state(phone, "idle", ctx, db)
             elif ctx.get("headline"):
-                _send(phone, f"Welcome back {first_name} 👋\n\nHere's your last content:\n\n" + _format_content(ctx))
+                await _send(phone, f"Welcome back {first_name} 👋\n\nHere's your last content:\n\n" + _format_content(ctx))
                 await _safe_set_state(phone, "showing_content", ctx, db)
             else:
-                _send(phone, f"Hi {first_name} 👋\n\n{HELP_MESSAGE}")
+                await _send(phone, f"Hi {first_name} 👋\n\n{HELP_MESSAGE}")
             return
 
         # Anything else — treat as a topic
@@ -704,16 +705,16 @@ class WhatsAppFlowService:
     ) -> None:
         brand = await _brand_context(user_id, db)
         if not brand:
-            _send(phone, NO_BRAND)
+            await _send(phone, NO_BRAND)
             await _safe_set_state(phone, "idle", {}, db)
             return
 
-        _send(phone, "Creating your content... ✍️")
+        await _send(phone, "Creating your content... ✍️")
 
         tone = ctx.get("tone")
         content = await _generate_content_structured(topic, brand, tone=tone)
         if not content:
-            _send(phone, "Could not generate content right now. Please try again.")
+            await _send(phone, "Could not generate content right now. Please try again.")
             await _safe_set_state(phone, "idle", {}, db)
             return
 
@@ -725,7 +726,7 @@ class WhatsAppFlowService:
             "tone": tone,
         }
 
-        _send(phone, _format_content(new_ctx))
+        await _send(phone, _format_content(new_ctx))
         await _safe_set_state(phone, "showing_content", new_ctx, db)
 
     # ── Content action handler (state: showing_content) ───────────────────────
@@ -744,7 +745,7 @@ class WhatsAppFlowService:
             await WhatsAppFlowService._initiate_post(phone, user_id, ctx, "now", db)
 
         elif opt == "2" or text in SCHEDULE_KEYWORDS:
-            _send(phone, SCHEDULE_PROMPT)
+            await _send(phone, SCHEDULE_PROMPT)
             await _safe_set_state(phone, "awaiting_schedule_time", ctx, db)
 
         elif opt == "3" or text in GRAPHIC_KEYWORDS:
@@ -752,18 +753,18 @@ class WhatsAppFlowService:
 
         elif opt == "4" or text in {"view full caption", "caption", "full caption"}:
             caption = ctx.get("caption", "No caption saved.")
-            _send(phone, f"Full caption:\n\n{caption}\n\n" + CONTENT_ACTIONS)
+            await _send(phone, f"Full caption:\n\n{caption}\n\n" + CONTENT_ACTIONS)
 
         elif opt == "5" or text in {"new idea", "change idea", "change", "another"}:
             topic = ctx.get("topic", "")
             await WhatsAppFlowService._create_and_show_content(phone, topic, user_id, ctx, db)
 
         elif text == "edit":
-            _send(phone, EDIT_ACTIONS)
+            await _send(phone, EDIT_ACTIONS)
             await _safe_set_state(phone, "awaiting_edit_choice", ctx, db)
 
         else:
-            _send(phone, _format_content(ctx))
+            await _send(phone, _format_content(ctx))
 
     # ── Publish flow ──────────────────────────────────────────────────────────
 
@@ -778,12 +779,12 @@ class WhatsAppFlowService:
         """Fetch connected accounts and show platform selection menu."""
         accounts = await _get_connected_accounts(user_id, db)
         if not accounts:
-            _send(phone, NO_PLATFORMS)
+            await _send(phone, NO_PLATFORMS)
             await _safe_set_state(phone, "idle", ctx, db)
             return
 
         menu = _format_platform_menu(accounts, mode=mode)
-        _send(phone, menu)
+        await _send(phone, menu)
         await _safe_set_state(
             phone,
             "awaiting_platform_select",
@@ -803,7 +804,7 @@ class WhatsAppFlowService:
         mode: str = ctx.get("_publish_mode", "now")
 
         if not accounts:
-            _send(phone, "Something went wrong. Reply *post* to try again.")
+            await _send(phone, "Something went wrong. Reply *post* to try again.")
             await _safe_set_state(phone, "showing_content", ctx, db)
             return
 
@@ -811,7 +812,7 @@ class WhatsAppFlowService:
         all_opt = str(len(accounts) + 1)
 
         if text in {"0", "back", "go back", "cancel"}:
-            _send(phone, _format_content(ctx))
+            await _send(phone, _format_content(ctx))
             await _safe_set_state(phone, "showing_content", ctx, db)
             return
 
@@ -822,30 +823,30 @@ class WhatsAppFlowService:
             if 0 <= idx < len(accounts):
                 selected = [accounts[idx]]
             else:
-                _send(phone, _format_platform_menu(accounts, mode=mode))
+                await _send(phone, _format_platform_menu(accounts, mode=mode))
                 return
         else:
-            _send(phone, _format_platform_menu(accounts, mode=mode))
+            await _send(phone, _format_platform_menu(accounts, mode=mode))
             return
 
         caption = ctx.get("caption", "")
         graphic_url = ctx.get("last_graphic_url")
 
         if mode == "now":
-            _send(phone, "Publishing... 🚀")
+            await _send(phone, "Publishing... 🚀")
             success = await _do_publish(selected, caption, graphic_url, scheduled_at=None, db=db)
             if success:
                 platform_names = ", ".join(
                     NETWORK_LABELS.get(acc.get("network", ""), acc.get("network", "")) for acc in selected
                 )
-                _send(phone, f"✅ Posted to {platform_names}!\n\nWhat's next?\n\n" + CONTENT_ACTIONS)
+                await _send(phone, f"✅ Posted to {platform_names}!\n\nWhat's next?\n\n" + CONTENT_ACTIONS)
                 await _safe_set_state(phone, "showing_content", ctx, db)
             else:
-                _send(phone, "❌ Could not publish right now. Please try again.\n\n" + CONTENT_ACTIONS)
+                await _send(phone, "❌ Could not publish right now. Please try again.\n\n" + CONTENT_ACTIONS)
                 await _safe_set_state(phone, "showing_content", ctx, db)
         else:
             # Schedule mode — store selected accounts, ask for time
-            _send(phone, SCHEDULE_PROMPT)
+            await _send(phone, SCHEDULE_PROMPT)
             await _safe_set_state(
                 phone,
                 "awaiting_schedule_time",
@@ -863,14 +864,14 @@ class WhatsAppFlowService:
     ) -> None:
         # Allow cancel/back at any point
         if raw_body.strip().lower() in {"back", "cancel", "0", "stop", "go back"}:
-            _send(phone, _format_content(ctx))
+            await _send(phone, _format_content(ctx))
             await _safe_set_state(phone, "showing_content", ctx, db)
             return
 
         scheduled_dt = _parse_schedule_time(raw_body)
 
         if not scheduled_dt:
-            _send(
+            await _send(
                 phone,
                 "I couldn't understand that time. Please try:\n\n"
                 "• *today 5pm*\n• *tomorrow 9am*\n• *Monday 3pm*\n• *18 April 10am*\n\n"
@@ -891,18 +892,18 @@ class WhatsAppFlowService:
             )
             accounts = await _get_connected_accounts(user_id, db)
             if not accounts:
-                _send(phone, NO_PLATFORMS)
+                await _send(phone, NO_PLATFORMS)
                 await _safe_set_state(phone, "idle", ctx, db)
                 return
             new_ctx = {**ctx, "_accounts": accounts, "_publish_mode": "schedule", "_scheduled_at": scheduled_dt.isoformat()}
             await _safe_set_state(phone, "awaiting_platform_select", new_ctx, db)
-            _send(phone, _format_platform_menu(accounts, mode="schedule"))
+            await _send(phone, _format_platform_menu(accounts, mode="schedule"))
             return
 
         # Platform already selected — schedule now
         caption = ctx.get("caption", "")
         graphic_url = ctx.get("last_graphic_url")
-        _send(phone, "Scheduling your post... 🗓️")
+        await _send(phone, "Scheduling your post... 🗓️")
 
         success = await _do_publish(schedule_accounts, caption, graphic_url, scheduled_at=scheduled_dt.isoformat(), db=db)
 
@@ -913,7 +914,7 @@ class WhatsAppFlowService:
             platform_names = ", ".join(
                 NETWORK_LABELS.get(acc.get("network", ""), acc.get("network", "")) for acc in schedule_accounts
             )
-            _send(
+            await _send(
                 phone,
                 f"✅ Scheduled for {time_str}\n"
                 f"Platform: {platform_names}\n\n"
@@ -922,7 +923,7 @@ class WhatsAppFlowService:
             )
             await _safe_set_state(phone, "showing_content", ctx, db)
         else:
-            _send(phone, "❌ Could not schedule right now. Please try again.\n\n" + CONTENT_ACTIONS)
+            await _send(phone, "❌ Could not schedule right now. Please try again.\n\n" + CONTENT_ACTIONS)
             await _safe_set_state(phone, "showing_content", ctx, db)
 
     # ── Ideas flow ────────────────────────────────────────────────────────────
@@ -933,17 +934,17 @@ class WhatsAppFlowService:
     ) -> None:
         brand = await _brand_context(user_id, db)
         if not brand:
-            _send(phone, NO_BRAND)
+            await _send(phone, NO_BRAND)
             await _safe_set_state(phone, "idle", {}, db)
             return
 
         ideas = await _generate_three_ideas(topic, brand)
         if not ideas:
-            _send(phone, "Could not generate ideas right now. Try again shortly.")
+            await _send(phone, "Could not generate ideas right now. Try again shortly.")
             return
 
         lines = "\n".join(f"{i + 1}️⃣  {idea}" for i, idea in enumerate(ideas))
-        _send(phone, f"Here are 3 ideas for you:\n\n{lines}\n\nReply 1, 2, or 3 to pick one.")
+        await _send(phone, f"Here are 3 ideas for you:\n\n{lines}\n\nReply 1, 2, or 3 to pick one.")
         await _safe_set_state(phone, "showing_ideas", {"ideas": ideas, "topic": topic}, db)
 
     @staticmethod
@@ -962,7 +963,7 @@ class WhatsAppFlowService:
             await WhatsAppFlowService._create_and_show_content(phone, chosen, user_id, {}, db)
         else:
             lines = "\n".join(f"{i + 1}️⃣  {idea}" for i, idea in enumerate(ideas))
-            _send(phone, f"Reply 1, 2, or 3:\n\n{lines}")
+            await _send(phone, f"Reply 1, 2, or 3:\n\n{lines}")
 
     # ── Edit flow ─────────────────────────────────────────────────────────────
 
@@ -982,16 +983,16 @@ class WhatsAppFlowService:
         }
 
         if text in {"0", "back", "cancel"}:
-            _send(phone, _format_content(ctx))
+            await _send(phone, _format_content(ctx))
             await _safe_set_state(phone, "showing_content", ctx, db)
             return
 
         field = field_map.get(_opt(text) or text)
         if not field:
-            _send(phone, EDIT_ACTIONS)
+            await _send(phone, EDIT_ACTIONS)
             return
 
-        _send(phone, prompts[field])
+        await _send(phone, prompts[field])
         await _safe_set_state(phone, "awaiting_edit_value", {**ctx, "edit_field": field}, db)
 
     @staticmethod
@@ -1011,7 +1012,7 @@ class WhatsAppFlowService:
             )
         else:
             new_ctx = {**ctx, field: value}
-            _send(phone, _format_content(new_ctx))
+            await _send(phone, _format_content(new_ctx))
             await _safe_set_state(phone, "showing_content", new_ctx, db)
 
     # ── Graphic generation ────────────────────────────────────────────────────
@@ -1023,7 +1024,7 @@ class WhatsAppFlowService:
         ctx: Dict[str, Any],
         db: AsyncIOMotorDatabase,
     ) -> None:
-        _send(phone, "Creating your design... 🎨")
+        await _send(phone, "Creating your design... 🎨")
 
         brand = await _brand_context(user_id, db)
         headline = ctx.get("headline", "")
@@ -1040,12 +1041,12 @@ class WhatsAppFlowService:
             )
         except Exception as exc:
             print(f"[WhatsApp] graphic generation error: {exc}")
-            _send(phone, "Could not generate the graphic right now. Please try again.")
+            await _send(phone, "Could not generate the graphic right now. Please try again.")
             await _safe_set_state(phone, "showing_content", ctx, db)
             return
 
         if not image_result.get("status"):
-            _send(phone, "Graphic generation failed. Please try again.")
+            await _send(phone, "Graphic generation failed. Please try again.")
             await _safe_set_state(phone, "showing_content", ctx, db)
             return
 
@@ -1088,14 +1089,14 @@ class WhatsAppFlowService:
 
         if public_url:
             try:
-                _send(phone, "Your design is ready 👆", media_url=public_url)
+                await _send(phone, "Your design is ready 👆", media_url=public_url)
             except Exception as e:
                 print(f"[WhatsApp] Twilio media send failed: {e}")
-                _send(phone, f"Your design is ready 👆\n\n🔗 {public_url}")
-            _send(phone, GRAPHIC_ACTIONS)
+                await _send(phone, f"Your design is ready 👆\n\n🔗 {public_url}")
+            await _send(phone, GRAPHIC_ACTIONS)
         else:
-            _send(phone, "Your design is ready 👆\n\nPreview unavailable. Check your Uri Social dashboard.")
-            _send(phone, GRAPHIC_ACTIONS)
+            await _send(phone, "Your design is ready 👆\n\nPreview unavailable. Check your Uri Social dashboard.")
+            await _send(phone, GRAPHIC_ACTIONS)
 
         await _safe_set_state(phone, "showing_graphic", {**ctx, "last_graphic_url": public_url}, db)
 
@@ -1112,33 +1113,33 @@ class WhatsAppFlowService:
         opt = _opt(text)
 
         if text in {"0", "back", "cancel", "go back"}:
-            _send(phone, _format_content(ctx))
+            await _send(phone, _format_content(ctx))
             await _safe_set_state(phone, "showing_content", ctx, db)
 
         elif opt == "1" or text in {"post graphic", "post graphic now", "post now"}:
             await WhatsAppFlowService._initiate_post(phone, user_id, ctx, "now", db)
 
         elif opt == "2" or text in {"schedule graphic", "schedule"}:
-            _send(phone, SCHEDULE_PROMPT)
+            await _send(phone, SCHEDULE_PROMPT)
             await _safe_set_state(phone, "awaiting_schedule_time", ctx, db)
 
         elif opt == "3" or text == "download":
             url = ctx.get("last_graphic_url")
             if url:
-                _send(phone, f"🔗 Download your graphic:\n{url}")
+                await _send(phone, f"🔗 Download your graphic:\n{url}")
             else:
-                _send(phone, "Link unavailable. Generate a new graphic below.")
-            _send(phone, GRAPHIC_ACTIONS)
+                await _send(phone, "Link unavailable. Generate a new graphic below.")
+            await _send(phone, GRAPHIC_ACTIONS)
 
         elif opt == "4" or text in {"edit text", "edit"}:
-            _send(phone, EDIT_ACTIONS)
+            await _send(phone, EDIT_ACTIONS)
             await _safe_set_state(phone, "awaiting_edit_choice", ctx, db)
 
         elif opt == "5" or text in {"regenerate", "regenerate design", "new design"}:
             await WhatsAppFlowService._generate_graphic(phone, user_id, ctx, db)
 
         else:
-            _send(phone, GRAPHIC_ACTIONS)
+            await _send(phone, GRAPHIC_ACTIONS)
 
     # ── Re-engagement handler ─────────────────────────────────────────────────
 
@@ -1157,7 +1158,7 @@ class WhatsAppFlowService:
                 phone, f"a powerful truth about {industry}", user_id, {}, db
             )
         else:
-            _send(phone, "No problem. Reply *create* anytime you're ready.")
+            await _send(phone, "No problem. Reply *create* anytime you're ready.")
             await _safe_set_state(phone, "idle", {}, db)
 
     # ── Daily push ────────────────────────────────────────────────────────────
@@ -1183,7 +1184,7 @@ class WhatsAppFlowService:
                 if last_updated and state == "idle":
                     delta = datetime.now(timezone.utc).replace(tzinfo=None) - last_updated
                     if delta.days >= 2:
-                        _send(phone, RE_ENGAGEMENT)
+                        await _send(phone, RE_ENGAGEMENT)
                         await _safe_set_state(
                             phone, "awaiting_re_engagement", session.get("context", {}), db
                         )
@@ -1208,8 +1209,8 @@ class WhatsAppFlowService:
                     "caption": content["caption"],
                 }
 
-                _send(phone, f"Good morning {first_name} 👋\n\nYour content for today is ready.")
-                _send(phone, _format_content(new_ctx))
+                await _send(phone, f"Good morning {first_name} 👋\n\nYour content for today is ready.")
+                await _send(phone, _format_content(new_ctx))
                 await _safe_set_state(phone, "showing_content", new_ctx, db)
                 sent += 1
 

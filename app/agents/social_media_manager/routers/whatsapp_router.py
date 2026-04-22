@@ -139,13 +139,13 @@ async def connect_whatsapp(
             )
 
     try:
-        _send(
+        await _send(
             body.phone,
             "",
             content_sid="HXccf1a2bb34e7ed257c136c842982f5b3",
         )
-    except Exception:
-        pass  # Don't fail the connect if the greeting message errors
+    except Exception as e:
+        print(f"[WhatsApp] connect greeting failed: {e}")
 
     return {
         "status": True,
