@@ -156,6 +156,8 @@ async def linkedin_oauth_callback(
     email = profile.get("email", "")
 
     now = datetime.utcnow()
+    expires_in_seconds = token_data.get("expires_in", 5184000)  # default 60 days
+    token_expires_at = now + timedelta(seconds=int(expires_in_seconds))
     await db["social_connections"].update_one(
         {"user_id": user_id, "platform": "linkedin"},
         {
@@ -172,6 +174,7 @@ async def linkedin_oauth_callback(
                 "connection_status": "active",
                 "connected_via": "linkedin_direct",
                 "linkedin_access_token": access_token,
+                "token_expires_at": token_expires_at,
                 "connected_at": now,
                 "updated_at": now,
             }
