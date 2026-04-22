@@ -560,6 +560,20 @@ class WhatsAppFlowService:
     @staticmethod
     async def handle(raw_from: str, body: str, db: AsyncIOMotorDatabase) -> None:
         phone = WhatsAppSessionService._normalize_phone(raw_from)
+        try:
+            await WhatsAppFlowService._handle_inner(phone, body, db)
+        except Exception as exc:
+            import traceback
+            print(f"[WhatsApp] ❌ UNHANDLED EXCEPTION for phone={phone!r}: {exc}\n{traceback.format_exc()}")
+            # Reset session so the user is never permanently stuck
+            try:
+                await _safe_set_state(phone, "idle", {}, db)
+                await _send(phone, "Something went wrong on our end. Reply *menu* to start fresh.")
+            except Exception:
+                pass
+
+    @staticmethod
+    async def _handle_inner(phone: str, body: str, db: AsyncIOMotorDatabase) -> None:
         text = body.strip().lower()
 
         user = await WhatsAppSessionService.get_user_by_phone(phone, db)
@@ -579,7 +593,7 @@ class WhatsAppFlowService:
         _RESET = {"restart", "reset", "menu", "home", "start over", "start fresh", "main menu"}
         if text in _RESET:
             await _send(phone, f"No problem {first_name}! Here's what I can do:\n\n" + HELP_MESSAGE)
-            await _safe_set_state(phone, "idle", ctx, db)
+            await _safe_set_state(phone, "idle", {}, db)
             return
 
         # ── First-time user ────────────────────────────────────────────────
