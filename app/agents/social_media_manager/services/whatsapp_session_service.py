@@ -61,11 +61,13 @@ class WhatsAppSessionService:
         phone: str, db: AsyncIOMotorDatabase
     ) -> Optional[Dict[str, Any]]:
         phone = WhatsAppSessionService._normalize_phone(phone)
-        # Try both +2348... and 2348... so old records without '+' still match
         without_plus = phone.lstrip("+")
-        return await db["users"].find_one(
+        result = await db["users"].find_one(
             {"whatsapp_phone": {"$in": [phone, without_plus]}}
         )
+        if result is None:
+            print(f"[WhatsApp] get_user_by_phone: no match for {phone!r} / {without_plus!r}")
+        return result
 
     @staticmethod
     async def link_phone_to_user(
