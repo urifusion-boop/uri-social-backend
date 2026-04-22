@@ -66,16 +66,17 @@ async def whatsapp_webhook(
 
         validator = RequestValidator(settings.TWILIO_AUTH_TOKEN)
         twilio_sig = request.headers.get("X-Twilio-Signature", "")
-        # Build the full URL Twilio signed (must match exactly).
-        # Use PUBLIC_API_URL so the scheme is always https even behind a proxy.
         _base = str(settings.PUBLIC_API_URL).rstrip("/")
         url = f"{_base}/whatsapp/webhook"
 
-        if not validator.validate(url, params, twilio_sig):
+        valid = validator.validate(url, params, twilio_sig)
+        print(f"[WhatsApp] webhook from={params.get('From')!r} body={params.get('Body')!r} button={params.get('ButtonText')!r} sig_valid={valid}")
+        if not valid:
             raise HTTPException(status_code=403, detail="Invalid Twilio signature.")
 
     raw_from: str = params.get("From", "")
-    body: str = params.get("Body", "")
+    # Button quick-reply taps may arrive with empty Body — fall back to ButtonText
+    body: str = params.get("Body", "") or params.get("ButtonText", "")
 
     if not raw_from:
         return {"status": "ignored"}
