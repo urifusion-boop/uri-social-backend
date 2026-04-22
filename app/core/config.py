@@ -51,6 +51,9 @@ class Settings(BaseSettings):
     # Google Gemini (Nano Banana 2 image generation)
     GOOGLE_GEMINI_API_KEY: Optional[str] = None
 
+    # fal.ai image generation (staging model testing)
+    FAL_API_KEY: Optional[str] = None
+
     # Google OAuth (Sign in with Google)
     GOOGLE_CLIENT_ID: Optional[str] = None
     GOOGLE_CLIENT_SECRET: Optional[str] = None

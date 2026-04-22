@@ -69,6 +69,7 @@ class ContentGenerationRequest(BaseModel):
     platforms: List[str] = Field(..., min_items=1, max_items=5)
     seed_type: str = "text"
     include_images: bool = False
+    image_model: Optional[str] = None  # e.g. "fal-ai/flux-pro/v1.1", "fal-ai/flux/dev", "fal-ai/ideogram/v3", or None (default Imagen)
     brand_context: Optional[BrandContextRequest] = None
     reference_image: Optional[str] = None  # base64 data URL uploaded by user for contextual reference
     post_type: str = "feed"   # feed | carousel | story
@@ -343,6 +344,7 @@ async def generate_content(
                             reference_image=request.reference_image,
                             post_type=post_type,
                             slide_index=slide_index,
+                            image_model=request.image_model,
                         )
                 else:
                     background_tasks.add_task(
@@ -355,6 +357,7 @@ async def generate_content(
                         db=db,
                         reference_image=request.reference_image,
                         post_type=post_type,
+                        image_model=request.image_model,
                     )
 
         return result
@@ -769,6 +772,29 @@ async def disconnect_social_account(
         user_id=user_id,
         outstand_account_id=outstand_account_id,
     )
+
+
+@router.delete("/connections/instagram-direct/{ig_user_id}")
+async def disconnect_instagram_direct(
+    ig_user_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Disconnect an Instagram account connected via direct OAuth (not Outstand).
+    """
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    result = await db["social_connections"].delete_one({
+        "ig_user_id": ig_user_id,
+        "user_id": user_id,
+    })
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Instagram connection not found")
+
+    return {"status": True, "responseMessage": "Instagram account disconnected"}
 
 
 # ==============================================================================
@@ -2278,6 +2304,7 @@ async def _generate_image_bg(
     reference_image: Optional[str] = None,
     post_type: str = "feed",
     slide_index: Optional[int] = None,
+    image_model: Optional[str] = None,
 ):
     """
     Background task: generate an image for an existing draft and save it to DB.
@@ -2300,6 +2327,7 @@ async def _generate_image_bg(
             brand_context=brand_context,
             reference_image=reference_image,
             image_type=image_type,
+            image_model=image_model,
         )
 
         if not image_result.get("status"):
