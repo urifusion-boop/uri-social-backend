@@ -540,6 +540,16 @@ Write as if you're sharing hard-won business wisdom with fellow African entrepre
             platform_prompt = prompt_template.format(seed_content=seed_content)
             # Brand instructions go first so they govern everything that follows
             prompt = brand_block + platform_prompt if brand_block else platform_prompt
+
+            # Prepend universal formatting rule — must override any model default toward markdown
+            formatting_rule = (
+                "ABSOLUTE FORMATTING RULE: Output plain text only. "
+                "Never use markdown syntax of any kind — no **bold**, no *italic*, no __underline__, "
+                "no # headings, no bullet hyphens (- or *), no numbered lists with dots, no backticks. "
+                "If you want emphasis, choose stronger words. If you want structure, use line breaks. "
+                "The output will be displayed directly on a social media platform exactly as you write it.\n\n"
+            )
+            prompt = formatting_rule + prompt
             
             # Use your existing AIService with optimized parameters
             ai_request = AIService.build_ai_model(
