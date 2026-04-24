@@ -261,7 +261,7 @@ class ImageContentService:
 
             # GPT-Image-2: use the user's seed content directly — no creative director rewriting,
             # no brand context injection, no cultural defaults. What they typed is what gets sent.
-            if image_model == "openai/gpt-image-2":
+            if (image_model or "") in ("openai/gpt-image-2", "fal-ai/openai/gpt-image-2"):
                 image_prompt = seed_content.strip()
             else:
                 # Try GPT-4 meta-prompting first — picks image type and generates brief
@@ -304,7 +304,7 @@ class ImageContentService:
             if image_response.get('success'):
                 # Composite brand logo onto generated image if available
                 # Skipped for GPT-Image-2 — user controls the output directly
-                logo_url = None if image_model == "openai/gpt-image-2" else (brand_context or {}).get('logo_url')
+                logo_url = None if (image_model or "") in ("openai/gpt-image-2", "fal-ai/openai/gpt-image-2") else (brand_context or {}).get('logo_url')
                 if logo_url:
                     import re as _re_logo
                     data_url = image_response['url']
@@ -1309,7 +1309,7 @@ class ImageContentService:
                     # Fall through to standard generation below
 
             # ── GPT-Image-2 direct OpenAI path ────────────────────────────────
-            if (image_model or "") == "openai/gpt-image-2":
+            if (image_model or "") in ("openai/gpt-image-2", "fal-ai/openai/gpt-image-2"):
                 try:
                     from app.services.AIService import client as _oai_client
                     import base64 as _b64
