@@ -259,26 +259,31 @@ class ImageContentService:
             # Get platform image specifications
             specs = ImageContentService._get_platform_image_specs(platform, image_type=image_type)
 
-            # Try GPT-5.4 meta-prompting first — picks image type and generates brief
-            image_prompt = await ImageContentService._generate_image_brief(
-                content=content,
-                seed_content=seed_content,
-                platform=platform,
-                brand_context=brand_context,
-                specs=specs,
-                reference_image=reference_image,
-                feedback=feedback,
-            )
-
-            # Fall back to static prompt if GPT-4.1 fails
-            if not image_prompt:
-                image_prompt = ImageContentService._create_image_prompt(
+            # GPT-Image-2: use the user's seed content directly — no creative director rewriting,
+            # no brand context injection, no cultural defaults. What they typed is what gets sent.
+            if image_model == "fal-ai/openai/gpt-image-2":
+                image_prompt = seed_content.strip()
+            else:
+                # Try GPT-4 meta-prompting first — picks image type and generates brief
+                image_prompt = await ImageContentService._generate_image_brief(
                     content=content,
                     seed_content=seed_content,
                     platform=platform,
                     brand_context=brand_context,
-                    specs=specs
+                    specs=specs,
+                    reference_image=reference_image,
+                    feedback=feedback,
                 )
+
+                # Fall back to static prompt if GPT-4 fails
+                if not image_prompt:
+                    image_prompt = ImageContentService._create_image_prompt(
+                        content=content,
+                        seed_content=seed_content,
+                        platform=platform,
+                        brand_context=brand_context,
+                        specs=specs
+                    )
 
             # When a reference image is provided, always append a hard no-crop directive
             # directly to the prompt so the image model cannot ignore it.
@@ -298,7 +303,8 @@ class ImageContentService:
 
             if image_response.get('success'):
                 # Composite brand logo onto generated image if available
-                logo_url = (brand_context or {}).get('logo_url')
+                # Skipped for GPT-Image-2 — user controls the output directly
+                logo_url = None if image_model == "fal-ai/openai/gpt-image-2" else (brand_context or {}).get('logo_url')
                 if logo_url:
                     import re as _re_logo
                     data_url = image_response['url']
