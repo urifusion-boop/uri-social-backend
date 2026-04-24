@@ -1026,7 +1026,7 @@ class SyncImageRequest(BaseModel):
     target_draft_ids: List[str]
 
 
-@router.post("/drafts/sync-image")
+@router.post("/image-sync")
 async def sync_image_across_drafts(
     request: SyncImageRequest,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
