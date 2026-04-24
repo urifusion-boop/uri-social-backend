@@ -261,7 +261,7 @@ class ImageContentService:
 
             # GPT-Image-2: use the user's seed content directly — no creative director rewriting,
             # no brand context injection, no cultural defaults. What they typed is what gets sent.
-            if image_model == "fal-ai/openai/gpt-image-2":
+            if image_model == "openai/gpt-image-2":
                 image_prompt = seed_content.strip()
             else:
                 # Try GPT-4 meta-prompting first — picks image type and generates brief
@@ -304,7 +304,7 @@ class ImageContentService:
             if image_response.get('success'):
                 # Composite brand logo onto generated image if available
                 # Skipped for GPT-Image-2 — user controls the output directly
-                logo_url = None if image_model == "fal-ai/openai/gpt-image-2" else (brand_context or {}).get('logo_url')
+                logo_url = None if image_model == "openai/gpt-image-2" else (brand_context or {}).get('logo_url')
                 if logo_url:
                     import re as _re_logo
                     data_url = image_response['url']
@@ -1308,6 +1308,46 @@ class ImageContentService:
                     print(f"⚠️ gpt-image-1 edit failed: {_edit_err} — falling back to standard generation")
                     # Fall through to standard generation below
 
+            # ── GPT-Image-2 direct OpenAI path ────────────────────────────────
+            if (image_model or "") == "openai/gpt-image-2":
+                try:
+                    from app.services.AIService import client as _oai_client
+                    import base64 as _b64
+                    from PIL import Image as _PILImage
+                    import io as _io
+
+                    if target_w > target_h:
+                        _gpt2_size = "1536x1024"
+                    elif target_h > target_w:
+                        _gpt2_size = "1024x1536"
+                    else:
+                        _gpt2_size = "1024x1024"
+
+                    loop = asyncio.get_running_loop()
+                    _gpt2_resp = await loop.run_in_executor(
+                        None,
+                        lambda: _oai_client.images.generate(
+                            model="gpt-image-2",
+                            prompt=prompt,
+                            n=1,
+                            size=_gpt2_size,
+                            quality="high",
+                            output_format="webp",
+                        ),
+                    )
+
+                    _gpt2_b64 = _gpt2_resp.data[0].b64_json
+                    _gpt2_b64 = ImageContentService._crop_to_ratio(_gpt2_b64, target_w, target_h)
+
+                    print(f"🎨 gpt-image-2 generated ({_gpt2_size})")
+                    return {
+                        "success": True,
+                        "url": f"data:image/webp;base64,{_gpt2_b64}",
+                        "model": "gpt-image-2",
+                    }
+                except Exception as _gpt2_err:
+                    print(f"⚠️ gpt-image-2 failed: {_gpt2_err} — falling back to Imagen/GPT")
+
             # ── fal.ai path (model explicitly chosen from frontend) ────────────
             _fal_model = image_model or ""
             if _fal_model.startswith("fal-ai/") and _cfg.FAL_API_KEY:
@@ -1331,23 +1371,14 @@ class ImageContentService:
 
                     print(f"🎨 fal.ai [{_fal_model}] generating ({_fal_image_size})…")
 
-                    # OpenAI models (gpt-image-2) don't accept diffusion params
-                    _is_openai_model = "openai" in _fal_model
-                    if _is_openai_model:
-                        _fal_args = {
-                            "prompt": prompt,
-                            "image_size": _fal_image_size,
-                            "n": 1,
-                        }
-                    else:
-                        _fal_args = {
-                            "prompt": prompt,
-                            "image_size": _fal_image_size,
-                            "num_images": 1,
-                            "output_format": "jpeg",
-                            "num_inference_steps": 28,
-                            "guidance_scale": 3.5,
-                        }
+                    _fal_args = {
+                        "prompt": prompt,
+                        "image_size": _fal_image_size,
+                        "num_images": 1,
+                        "output_format": "jpeg",
+                        "num_inference_steps": 28,
+                        "guidance_scale": 3.5,
+                    }
 
                     loop = asyncio.get_running_loop()
                     _fal_result = await loop.run_in_executor(
