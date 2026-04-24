@@ -1021,6 +1021,49 @@ async def delete_draft(
     return UriResponse.delete_response("draft", is_deleted=True)
 
 
+class SyncImageRequest(BaseModel):
+    source_draft_id: str
+    target_draft_ids: List[str]
+
+
+@router.patch("/drafts/sync-image")
+async def sync_image_across_drafts(
+    request: SyncImageRequest,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """Copy image_url from a source draft to one or more target drafts (same user only)."""
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    from app.domain.responses.uri_response import UriResponse
+
+    source = await db["content_drafts"].find_one(
+        {"id": request.source_draft_id, "user_id": user_id},
+        {"image_url": 1, "has_image": 1},
+    )
+    if not source:
+        raise HTTPException(status_code=404, detail="Source draft not found")
+
+    image_url = source.get("image_url")
+    if not image_url:
+        raise HTTPException(status_code=422, detail="Source draft has no image yet")
+
+    if not request.target_draft_ids:
+        raise HTTPException(status_code=422, detail="No target draft IDs provided")
+
+    result = await db["content_drafts"].update_many(
+        {"id": {"$in": request.target_draft_ids}, "user_id": user_id},
+        {"$set": {"image_url": image_url, "has_image": True}},
+    )
+
+    return UriResponse.get_single_data_response("sync_image", {
+        "updated_count": result.modified_count,
+        "source_draft_id": request.source_draft_id,
+    })
+
+
 @router.post("/deny")
 async def deny_content(
     request: DenialRequest,
