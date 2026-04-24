@@ -1325,20 +1325,28 @@ class ImageContentService:
 
                     print(f"🎨 fal.ai [{_fal_model}] generating ({_fal_image_size})…")
 
+                    # OpenAI models (gpt-image-2) don't accept diffusion params
+                    _is_openai_model = "openai" in _fal_model
+                    if _is_openai_model:
+                        _fal_args = {
+                            "prompt": prompt,
+                            "image_size": _fal_image_size,
+                            "n": 1,
+                        }
+                    else:
+                        _fal_args = {
+                            "prompt": prompt,
+                            "image_size": _fal_image_size,
+                            "num_images": 1,
+                            "output_format": "jpeg",
+                            "num_inference_steps": 28,
+                            "guidance_scale": 3.5,
+                        }
+
                     loop = asyncio.get_running_loop()
                     _fal_result = await loop.run_in_executor(
                         None,
-                        lambda: _fal.run(
-                            _fal_model,
-                            arguments={
-                                "prompt": prompt,
-                                "image_size": _fal_image_size,
-                                "num_images": 1,
-                                "output_format": "jpeg",
-                                "num_inference_steps": 28,
-                                "guidance_scale": 3.5,
-                            },
-                        ),
+                        lambda: _fal.run(_fal_model, arguments=_fal_args),
                     )
 
                     _fal_images = _fal_result.get("images") or []
