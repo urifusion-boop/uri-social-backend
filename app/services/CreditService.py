@@ -56,6 +56,16 @@ class CreditService:
             return None
 
         wallet_doc["_id"] = str(wallet_doc["_id"])
+
+        # Recalculate total_credits and credits_remaining from source fields
+        # This ensures correct values even if database has stale computed fields
+        bonus_credits = wallet_doc.get("bonus_credits", 0)
+        subscription_credits = wallet_doc.get("subscription_credits", 0)
+        credits_used = wallet_doc.get("credits_used", 0)
+
+        wallet_doc["total_credits"] = bonus_credits + subscription_credits
+        wallet_doc["credits_remaining"] = wallet_doc["total_credits"] - credits_used
+
         return UserCreditWallet(**wallet_doc)
 
     async def get_credit_balance(self, user_id: str) -> CreditBalanceResponse:
