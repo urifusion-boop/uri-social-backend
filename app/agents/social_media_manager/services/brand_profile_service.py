@@ -148,4 +148,6 @@ class BrandProfileService:
             "competitor_handles":   [h for h in (profile.get("competitor_handles") or []) if h],
             "key_dates":            key_dates_str,
             "posting_cadence":      profile.get("posting_cadence", ""),
+            "style_selections":     profile.get("style_selections") or [],
+            "style_rotation_index": int(profile.get("style_rotation_index") or 0),
         }
