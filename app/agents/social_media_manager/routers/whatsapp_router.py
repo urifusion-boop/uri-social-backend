@@ -10,6 +10,7 @@ POST /whatsapp/daily-push    — Trigger daily content push to all linked users 
 
 import pymongo.errors
 from fastapi import APIRouter, Depends, HTTPException, Request, BackgroundTasks
+from fastapi.responses import Response
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from pydantic import BaseModel
 
@@ -76,11 +77,16 @@ async def whatsapp_webhook(
     # Button quick-reply taps may arrive with empty Body — fall back to ButtonText
     body: str = params.get("Body", "") or params.get("ButtonText", "")
 
+    # Always return empty TwiML — Twilio requires XML Content-Type, not JSON.
+    # Returning application/json causes 12300 errors in the Twilio debugger.
+    _EMPTY_TWIML = Response(content="<?xml version='1.0' encoding='UTF-8'?><Response/>",
+                            media_type="text/xml")
+
     if not raw_from:
-        return {"status": "ignored"}
+        return _EMPTY_TWIML
 
     background_tasks.add_task(WhatsAppFlowService.handle, raw_from, body, db)
-    return {"status": "queued"}
+    return _EMPTY_TWIML
 
 
 # ── Connect / disconnect ───────────────────────────────────────────────────
