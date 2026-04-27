@@ -235,6 +235,8 @@ async def generate_content(
         profile_result = await BrandProfileService.get(user_id, db)
         profile_data = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
         brand_context_dict = BrandProfileService.to_brand_context(profile_data) if profile_data else {}
+        # Carry user_id so the style rotation logic in _generate_image_bg can update the index.
+        brand_context_dict["user_id"] = user_id
 
         # Allow explicit overrides from the request (legacy / power-user path)
         if request.brand_context:
@@ -2360,6 +2362,31 @@ async def _generate_image_bg(
     import base64
 
     try:
+        from app.agents.social_media_manager.services.style_library import pick_next_style
+
+        # ── Visual style rotation ─────────────────────────────────────────────
+        # Read the user's selected styles and rotation index from their brand profile.
+        # Pick the next style in the cycle, inject its prompt fragment into brand_context,
+        # then increment and persist the rotation index.
+        _bp = await db["brand_profiles"].find_one(
+            {"userId": brand_context.get("user_id", "")},
+            {"style_selections": 1, "style_rotation_index": 1, "industry": 1},
+        ) or {}
+        _style_selections = _bp.get("style_selections") or []
+        _rotation_index = int(_bp.get("style_rotation_index") or 0)
+        _industry = _bp.get("industry") or brand_context.get("industry", "")
+
+        _slug, _fragment, _next_index = pick_next_style(_style_selections, _rotation_index, _industry)
+
+        if _fragment:
+            brand_context = {**brand_context, "style_prompt_fragment": _fragment, "style_slug": _slug}
+            print(f"🎨 Style [{_slug}] applied for this image (next index: {_next_index})")
+            # Persist incremented rotation index
+            await db["brand_profiles"].update_one(
+                {"userId": brand_context.get("user_id", "")},
+                {"$set": {"style_rotation_index": _next_index}},
+            )
+
         # For story posts pass image_type="story" so we get 1080x1920 dimensions
         image_type = "story" if post_type == "story" else "post_image"
 

@@ -262,9 +262,15 @@ class ImageContentService:
             # Get platform image specifications
             specs = ImageContentService._get_platform_image_specs(platform, image_type=image_type)
 
-            # Use the user's seed content directly — no brand pipeline, no creative director brief.
-            # Logo overlay is applied after generation for all models.
-            image_prompt = seed_content.strip()
+            # Assemble prompt: style directive (if set) + user seed content.
+            # The style fragment is injected by _generate_image_bg from the brand's
+            # selected visual style, rotating through their 3 picks each campaign.
+            style_fragment = (brand_context or {}).get("style_prompt_fragment", "")
+            base_prompt = seed_content.strip()
+            if style_fragment:
+                image_prompt = f"=== VISUAL STYLE ===\n{style_fragment}\n\n=== CONTENT ===\n{base_prompt}"
+            else:
+                image_prompt = base_prompt
 
             # When a reference image is provided, always append a hard no-crop directive
             # directly to the prompt so the image model cannot ignore it.
