@@ -167,9 +167,12 @@ async def get_credit_balance(user_id: str = Depends(get_user_id)):
     PRD 7.3: Low Credit Warning when credits ≤ 3
     """
     try:
+        print(f"🔍 GET /credits/balance - user_id: {user_id}")
         balance = await credit_service.get_credit_balance(user_id)
+        print(f"💰 Balance for {user_id}: {balance.credits_remaining} credits remaining")
         return balance
     except Exception as e:
+        print(f"❌ Error getting balance for user {user_id}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to get balance: {str(e)}")
 
 
