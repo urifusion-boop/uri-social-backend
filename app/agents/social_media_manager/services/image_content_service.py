@@ -256,34 +256,15 @@ class ImageContentService:
         image_type: "post_image" (default), "story" (9:16), or any key in IMAGE_SPECS[platform].
         """
         try:
+            # GPT-Image-2 is the only image model — ignore whatever was passed in.
+            image_model = "openai/gpt-image-2"
+
             # Get platform image specifications
             specs = ImageContentService._get_platform_image_specs(platform, image_type=image_type)
 
-            # GPT-Image-2: use the user's seed content directly — no creative director rewriting,
-            # no brand context injection, no cultural defaults. What they typed is what gets sent.
-            if (image_model or "") in ("openai/gpt-image-2", "fal-ai/openai/gpt-image-2"):
-                image_prompt = seed_content.strip()
-            else:
-                # Try GPT-4 meta-prompting first — picks image type and generates brief
-                image_prompt = await ImageContentService._generate_image_brief(
-                    content=content,
-                    seed_content=seed_content,
-                    platform=platform,
-                    brand_context=brand_context,
-                    specs=specs,
-                    reference_image=reference_image,
-                    feedback=feedback,
-                )
-
-                # Fall back to static prompt if GPT-4 fails
-                if not image_prompt:
-                    image_prompt = ImageContentService._create_image_prompt(
-                        content=content,
-                        seed_content=seed_content,
-                        platform=platform,
-                        brand_context=brand_context,
-                        specs=specs
-                    )
+            # Use the user's seed content directly — no brand pipeline, no creative director brief.
+            # Logo overlay is applied after generation for all models.
+            image_prompt = seed_content.strip()
 
             # When a reference image is provided, always append a hard no-crop directive
             # directly to the prompt so the image model cannot ignore it.
@@ -302,9 +283,8 @@ class ImageContentService:
             )
 
             if image_response.get('success'):
-                # Composite brand logo onto generated image if available
-                # Skipped for GPT-Image-2 — user controls the output directly
-                logo_url = None if (image_model or "") in ("openai/gpt-image-2", "fal-ai/openai/gpt-image-2") else (brand_context or {}).get('logo_url')
+                # Composite brand logo onto generated image for all models.
+                logo_url = (brand_context or {}).get('logo_url')
                 if logo_url:
                     import re as _re_logo
                     data_url = image_response['url']
@@ -329,6 +309,61 @@ class ImageContentService:
 
         except Exception as e:
             return UriResponse.error_response(f"Platform image generation failed: {str(e)}")
+
+    @staticmethod
+    async def _enhance_prompt_for_gpt_image2(
+        seed_content: str,
+        platform: str,
+        specs: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """
+        GPT-4o-mini thinking layer: expands the user's casual request into a
+        detailed image spec before calling GPT-Image-2. Compensates for the
+        API's lack of built-in reasoning (the gap vs ChatGPT's thinking mode).
+        Falls back to raw seed_content if the call fails.
+        """
+        try:
+            from app.services.AIService import client as _oai_client
+
+            w = (specs or {}).get("width", 1024)
+            h = (specs or {}).get("height", 1024)
+            orientation = "landscape" if w > h else ("portrait" if h > w else "square")
+
+            system_prompt = (
+                "You are an expert art director and prompt engineer. "
+                "Your job is to take a user's casual image request and expand it into a rich, "
+                "detailed image generation prompt optimized for GPT-Image-2. "
+                "Output a single paragraph (3-5 sentences) describing the scene, subjects, "
+                "composition, lighting, color palette, mood, and visual style. "
+                "Be specific and vivid. Avoid vague adjectives like 'beautiful' or 'amazing'. "
+                "Output only the prompt text — no explanation, no preamble, no quotes."
+            )
+
+            user_message = (
+                f"Platform: {platform} ({orientation}, {w}x{h})\n"
+                f"User request: {seed_content}\n\n"
+                "Write a detailed image generation prompt:"
+            )
+
+            loop = asyncio.get_running_loop()
+            response = await loop.run_in_executor(
+                None,
+                lambda: _oai_client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_message},
+                    ],
+                    max_tokens=300,
+                    temperature=0.7,
+                ),
+            )
+            enhanced = response.choices[0].message.content.strip()
+            print(f"🧠 GPT-Image-2 prompt enhanced ({len(enhanced)} chars): {enhanced[:100]}…")
+            return enhanced
+        except Exception as _e:
+            print(f"⚠️ GPT-Image-2 prompt enhancer failed: {_e} — using raw seed content")
+            return seed_content.strip()
 
     @staticmethod
     async def _generate_image_brief(
@@ -1241,7 +1276,8 @@ class ImageContentService:
             # ── Image-edit path (reference image provided) ─────────────────────
             # Skip Imagen (text-to-image only) and use gpt-image-1 edit endpoint,
             # which takes the reference as a base and applies the prompt as overlays.
-            if reference_image:
+            # GPT-Image-2 handles its own reference image path below.
+            if reference_image and (image_model or "") not in ("openai/gpt-image-2", "fal-ai/openai/gpt-image-2"):
                 try:
                     from app.services.AIService import client as _ai_client
                     from PIL import Image as _PILImage
@@ -1323,30 +1359,72 @@ class ImageContentService:
                     else:
                         _gpt2_size = "1024x1024"
 
-                    loop = asyncio.get_running_loop()
-                    _gpt2_resp = await loop.run_in_executor(
-                        None,
-                        lambda: _oai_client.images.generate(
-                            model="gpt-image-2",
-                            prompt=prompt,
-                            n=1,
-                            size=_gpt2_size,
-                            quality="high",
-                            output_format="webp",
-                        ),
-                    )
+                    if reference_image:
+                        # Decode reference image to PNG bytes for the edit endpoint
+                        if reference_image.startswith("data:"):
+                            import re as _re_ref2
+                            _m2 = _re_ref2.match(r"data:[^;]+;base64,(.+)", reference_image, _re_ref2.DOTALL)
+                            _ref_bytes = _b64.b64decode(_m2.group(1)) if _m2 else None
+                        else:
+                            import httpx as _httpx2
+                            async with _httpx2.AsyncClient(timeout=20) as _c2:
+                                _r2 = await _c2.get(reference_image)
+                                _ref_bytes = _r2.content if _r2.status_code == 200 else None
+
+                        if not _ref_bytes:
+                            raise ValueError("Could not load reference image bytes for GPT-Image-2 edit")
+
+                        _ref_img = _PILImage.open(_io.BytesIO(_ref_bytes)).convert("RGBA")
+                        _tw2, _th2 = map(int, _gpt2_size.split("x"))
+                        _ref_img = _ref_img.resize((_tw2, _th2), _PILImage.LANCZOS)
+                        _ref_png_buf = _io.BytesIO()
+                        _ref_img.save(_ref_png_buf, format="PNG")
+                        _ref_png_buf.seek(0)
+
+                        print(f"🎨 GPT-Image-2 edit with reference ({_gpt2_size})…")
+                        loop = asyncio.get_running_loop()
+                        _gpt2_resp = await loop.run_in_executor(
+                            None,
+                            lambda: _oai_client.images.edit(
+                                model="gpt-image-2",
+                                image=("reference.png", _ref_png_buf, "image/png"),
+                                prompt=prompt,
+                                n=1,
+                                size=_gpt2_size,
+                            ),
+                        )
+                        _mode = "gpt-image-2-edit"
+                    else:
+                        print(f"🎨 GPT-Image-2 direct OpenAI ({_gpt2_size})…")
+                        loop = asyncio.get_running_loop()
+                        _gpt2_resp = await loop.run_in_executor(
+                            None,
+                            lambda: _oai_client.images.generate(
+                                model="gpt-image-2",
+                                prompt=prompt,
+                                n=1,
+                                size=_gpt2_size,
+                                quality="high",
+                                output_format="webp",
+                            ),
+                        )
+                        _mode = "gpt-image-2"
 
                     _gpt2_b64 = _gpt2_resp.data[0].b64_json
-                    _gpt2_b64 = ImageContentService._crop_to_ratio(_gpt2_b64, target_w, target_h)
 
-                    print(f"🎨 gpt-image-2 generated ({_gpt2_size})")
+                    _gpt2_img = _PILImage.open(_io.BytesIO(_b64.b64decode(_gpt2_b64))).convert("RGB")
+                    _gpt2_buf = _io.BytesIO()
+                    _gpt2_img.save(_gpt2_buf, format="WEBP", quality=97, method=6)
+                    _gpt2_b64 = _b64.b64encode(_gpt2_buf.getvalue()).decode()
+
+                    print(f"✅ GPT-Image-2 ready ({_gpt2_size}, {_mode})")
                     return {
                         "success": True,
                         "url": f"data:image/webp;base64,{_gpt2_b64}",
-                        "model": "gpt-image-2",
+                        "model": _mode,
                     }
                 except Exception as _gpt2_err:
-                    print(f"⚠️ gpt-image-2 failed: {_gpt2_err} — falling back to Imagen/GPT")
+                    print(f"⚠️ GPT-Image-2 failed: {_gpt2_err} — falling back to Imagen/GPT")
 
             # ── fal.ai path (model explicitly chosen from frontend) ────────────
             _fal_model = image_model or ""
