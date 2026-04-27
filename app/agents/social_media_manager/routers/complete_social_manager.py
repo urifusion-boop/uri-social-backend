@@ -2354,7 +2354,7 @@ async def _generate_image_bg(
         # Pick the next style in the cycle, inject its prompt fragment into brand_context,
         # then increment and persist the rotation index.
         _bp = await db["brand_profiles"].find_one(
-            {"userId": brand_context.get("user_id", "")},
+            {"user_id": brand_context.get("user_id", "")},
             {"style_selections": 1, "style_rotation_index": 1, "industry": 1},
         ) or {}
         _style_selections = _bp.get("style_selections") or []
@@ -2368,7 +2368,7 @@ async def _generate_image_bg(
             print(f"🎨 Style [{_slug}] applied for this image (next index: {_next_index})")
             # Persist incremented rotation index
             await db["brand_profiles"].update_one(
-                {"userId": brand_context.get("user_id", "")},
+                {"user_id": brand_context.get("user_id", "")},
                 {"$set": {"style_rotation_index": _next_index}},
             )
 
