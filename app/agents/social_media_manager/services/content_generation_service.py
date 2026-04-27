@@ -560,6 +560,11 @@ Write as if you're sharing hard-won business wisdom with fellow African entrepre
             
             # Generate content using your existing AI service
             ai_response = await AIService.chat_completion(ai_request)
+
+            # AIService returns a dict with "error" key on quota/rate limit failures
+            if isinstance(ai_response, dict) and "error" in ai_response:
+                raise Exception(ai_response["error"])
+
             raw_content = ai_response.choices[0].message.content.strip()
             
             # Post-process content based on platform
