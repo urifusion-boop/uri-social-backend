@@ -2192,11 +2192,10 @@ async def upload_brand_logo(
     token: dict = Depends(JWTBearer()),
 ):
     """
-    Upload a brand logo image. Stores it to imgBB and saves the public URL
-    to the user's brand profile. Accepted formats: PNG, JPG, WEBP, SVG.
+    Upload a brand logo image. Saves to local static storage and stores the URL
+    in the user's brand profile. Accepted formats: PNG, JPG, WEBP, SVG.
     """
-    import base64
-    import httpx
+    import os, uuid
 
     user_id = _get_user_id(token)
     if not user_id:
@@ -2208,22 +2207,17 @@ async def upload_brand_logo(
 
     try:
         contents = await file.read()
-        if len(contents) > 5 * 1024 * 1024:  # 5 MB limit
+        if len(contents) > 5 * 1024 * 1024:
             raise HTTPException(status_code=400, detail="Logo file must be under 5 MB.")
 
-        b64 = base64.b64encode(contents).decode()
+        ext = file.filename.rsplit(".", 1)[-1].lower() if file.filename and "." in file.filename else "png"
+        filename = f"logo_{uuid.uuid4().hex}.{ext}"
+        static_dir = "/app/static/images"
+        os.makedirs(static_dir, exist_ok=True)
+        with open(f"{static_dir}/{filename}", "wb") as f:
+            f.write(contents)
 
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                "https://api.imgbb.com/1/upload",
-                data={"key": settings.IMGBB_API_KEY, "image": b64},
-            )
-            resp_json = resp.json()
-
-        if not resp_json.get("success"):
-            raise HTTPException(status_code=502, detail=f"Image host upload failed: {resp_json.get('error', {}).get('message', 'unknown error')}")
-
-        logo_url = resp_json["data"]["url"]
+        logo_url = f"/static/images/{filename}"
 
         await db["brand_profiles"].update_one(
             {"user_id": user_id},
@@ -2246,12 +2240,11 @@ async def upload_sample_template(
     token: dict = Depends(JWTBearer()),
 ):
     """
-    Upload a sample design or content template. Stores it to imgBB and appends
-    the public URL to the user's brand profile sample_template_urls list.
+    Upload a sample design or content template. Saves to local static storage and
+    appends the URL to the user's brand profile sample_template_urls list.
     Accepted formats: PNG, JPG, WEBP, PDF. Max 10 MB per file.
     """
-    import base64
-    import httpx
+    import os, uuid
 
     user_id = _get_user_id(token)
     if not user_id:
@@ -2266,25 +2259,17 @@ async def upload_sample_template(
 
     try:
         contents = await file.read()
-        if len(contents) > 10 * 1024 * 1024:  # 10 MB limit
+        if len(contents) > 10 * 1024 * 1024:
             raise HTTPException(status_code=400, detail="File must be under 10 MB.")
 
-        b64 = base64.b64encode(contents).decode()
+        ext = file.filename.rsplit(".", 1)[-1].lower() if file.filename and "." in file.filename else "png"
+        filename = f"template_{uuid.uuid4().hex}.{ext}"
+        static_dir = "/app/static/images"
+        os.makedirs(static_dir, exist_ok=True)
+        with open(f"{static_dir}/{filename}", "wb") as f:
+            f.write(contents)
 
-        async with httpx.AsyncClient(timeout=120) as client:
-            resp = await client.post(
-                "https://api.imgbb.com/1/upload",
-                data={"key": settings.IMGBB_API_KEY, "image": b64, "name": file.filename},
-            )
-            resp_json = resp.json()
-
-        if not resp_json.get("success"):
-            raise HTTPException(
-                status_code=502,
-                detail=f"File host upload failed: {resp_json.get('error', {}).get('message', 'unknown error')}",
-            )
-
-        file_url = resp_json["data"]["url"]
+        file_url = f"/static/images/{filename}"
 
         await db["brand_profiles"].update_one(
             {"user_id": user_id},
