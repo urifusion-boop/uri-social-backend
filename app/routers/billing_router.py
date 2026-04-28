@@ -236,6 +236,12 @@ async def get_subscription_tiers():
     """
     try:
         tiers = await subscription_service.get_all_tiers(active_only=True)
+
+        # DEBUG: Log tier data being returned
+        print(f"🎯 [API] Returning {len(tiers)} tiers")
+        for tier in tiers:
+            print(f"🎯 [API] {tier.tier_id}: price_ngn={tier.price_ngn}, price_ngn_monthly={tier.price_ngn_monthly}, credits={tier.credits}, credits_monthly={tier.credits_monthly}")
+
         return tiers
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get tiers: {str(e)}")
