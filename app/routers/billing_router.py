@@ -61,10 +61,11 @@ async def initialize_payment(
     user_email: str = Depends(get_user_email)
 ):
     """
-    Initialize SQUAD payment checkout
-    PRD 6.3: Payment Flow
-    1. User selects plan
-    2. Payment processed via SQUAD
+    Initialize SQUAD payment checkout with billing cycle support
+    PRD: Subscription Plan Upgrade (Multi-Duration with 5% Bulk Discount)
+    Sections 6.3 & 8.1: Payment Flow + Billing Cycle Selection
+    1. User selects plan and billing cycle
+    2. Payment processed via SQUAD with correct multi-duration pricing
     3. Returns checkout URL
     """
     try:
@@ -72,6 +73,7 @@ async def initialize_payment(
             user_id=user_id,
             tier_id=body.tier_id,
             user_email=user_email,
+            billing_cycle=body.billing_cycle,  # PRD 8.1: Pass billing cycle
             test_amount=body.test_amount,
             test_credits=body.test_credits
         )
