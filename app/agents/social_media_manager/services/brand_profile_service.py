@@ -55,6 +55,14 @@ class BrandProfileService:
             "onboarding_completed": data.get("onboarding_completed", False),
             "updated_at": now,
         }
+        if "style_selections" in data:
+            doc["style_selections"] = data["style_selections"]
+        if "style_prompt_fragments" in data:
+            doc["style_prompt_fragments"] = data["style_prompt_fragments"]
+        if "font_style" in data:
+            doc["font_style"] = data["font_style"]
+        if "font_style_prompt" in data:
+            doc["font_style_prompt"] = data["font_style_prompt"]
 
         existing = await db[BrandProfileService.COLLECTION].find_one({"user_id": user_id})
         if existing:
@@ -150,4 +158,6 @@ class BrandProfileService:
             "posting_cadence":      profile.get("posting_cadence", ""),
             "style_selections":     profile.get("style_selections") or [],
             "style_rotation_index": int(profile.get("style_rotation_index") or 0),
+            "font_style":           profile.get("font_style", ""),
+            "font_style_prompt":    profile.get("font_style_prompt", ""),
         }
