@@ -479,7 +479,7 @@ async def instagram_direct_callback(
 
     source = state or "settings"
     is_settings = source == "settings"
-    web_app_url = settings.WEB_APP_URL
+    web_app_url = settings.WEB_APP_URL.strip("'\"")
     base_redirect = (
         f"{web_app_url}/settings/social-accounts"
         if is_settings
@@ -667,7 +667,7 @@ async def outstand_oauth_callback(
     """
     import urllib.parse
 
-    web_app_url = settings.WEB_APP_URL
+    web_app_url = settings.WEB_APP_URL.strip("'\"")
     is_settings = source == "settings"
     base_redirect = f"{web_app_url}/settings/social-accounts" if is_settings else f"{web_app_url}/social-media/brand-setup"
 
