@@ -116,22 +116,22 @@ async def linkedin_oauth_callback(
     No JWT — the user is identified by the state token stored during /connect.
     Stores per-user access token then redirects to the frontend.
     """
-    web_app_url = settings.WEB_APP_URL
+    web_app_url = settings.WEB_APP_URL.strip("'\"")
 
     if error or not code or not state:
         return RedirectResponse(
-            f"{web_app_url}/social-media/brand-setup?connected=false&platform=linkedin&error=access_denied"
+            f"{web_app_url}/settings/social-accounts?connected=false&platform=linkedin&error=access_denied"
         )
 
     pending = await db["linkedin_oauth_pending"].find_one({"state": state})
     if not pending:
         return RedirectResponse(
-            f"{web_app_url}/social-media/brand-setup?connected=false&platform=linkedin&error=session_expired"
+            f"{web_app_url}/settings/social-accounts?connected=false&platform=linkedin&error=session_expired"
         )
     if pending.get("expires_at") and datetime.utcnow() > pending["expires_at"]:
         await db["linkedin_oauth_pending"].delete_one({"state": state})
         return RedirectResponse(
-            f"{web_app_url}/social-media/brand-setup?connected=false&platform=linkedin&error=session_expired"
+            f"{web_app_url}/settings/social-accounts?connected=false&platform=linkedin&error=session_expired"
         )
 
     user_id = pending["user_id"]
@@ -144,7 +144,7 @@ async def linkedin_oauth_callback(
         pages = await svc.get_admin_pages(access_token)
     except Exception as e:
         return RedirectResponse(
-            f"{web_app_url}/social-media/brand-setup"
+            f"{web_app_url}/settings/social-accounts"
             f"?connected=false&platform=linkedin&error={urllib.parse.quote(str(e))}"
         )
     finally:
@@ -183,7 +183,7 @@ async def linkedin_oauth_callback(
     )
 
     return RedirectResponse(
-        f"{web_app_url}/social-media/brand-setup"
+        f"{web_app_url}/settings/social-accounts"
         f"?connected=true&platform=linkedin&username={urllib.parse.quote(name)}"
     )
 
@@ -436,7 +436,7 @@ async def _send_linkedin_daily_push(db: AsyncIOMotorDatabase) -> dict:
                     ),
                 )
             ]
-            request = ChatModel(model="gpt-5.4-mini", messages=messages, temperature=0.9)
+            request = ChatModel(model="gpt-4o-mini", messages=messages, temperature=0.9)
             result = await AIService.chat_completion(request)
 
             if isinstance(result, dict) and result.get("error"):

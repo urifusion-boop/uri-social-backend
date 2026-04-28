@@ -265,8 +265,10 @@ class ImageContentService:
             # Assemble prompt: style directive (if set) + brand colors + user seed content.
             # The style fragment is injected by _generate_image_bg from the brand's
             # selected visual style, rotating through their 3 picks each campaign.
-            style_fragment = (brand_context or {}).get("style_prompt_fragment", "")
-            brand_colors = [c for c in ((brand_context or {}).get("brand_colors") or []) if c]
+            bc = brand_context or {}
+            style_fragment = bc.get("style_prompt_fragment", "")
+            font_prompt = bc.get("font_style_prompt", "")
+            brand_colors = [c for c in (bc.get("brand_colors") or []) if c]
             base_prompt = seed_content.strip()
 
             color_block = ""
@@ -278,10 +280,12 @@ class ImageContentService:
                     f"clothing, or environmental details depending on the image type."
                 )
 
+            font_block = f"\n\n=== TYPOGRAPHY ===\n{font_prompt}" if font_prompt else ""
+
             if style_fragment:
-                image_prompt = f"=== VISUAL STYLE ===\n{style_fragment}\n\n=== CONTENT ===\n{base_prompt}{color_block}"
+                image_prompt = f"=== VISUAL STYLE ===\n{style_fragment}\n\n=== CONTENT ===\n{base_prompt}{color_block}{font_block}"
             else:
-                image_prompt = base_prompt + color_block
+                image_prompt = base_prompt + color_block + font_block
 
             # When a reference image is provided, always append a hard no-crop directive
             # directly to the prompt so the image model cannot ignore it.
