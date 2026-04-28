@@ -256,45 +256,54 @@ class ImageContentService:
         image_type: "post_image" (default), "story" (9:16), or any key in IMAGE_SPECS[platform].
         """
         try:
-            # GPT-Image-2 is the only image model — ignore whatever was passed in.
             image_model = "openai/gpt-image-2"
 
-            # Get platform image specifications
             specs = ImageContentService._get_platform_image_specs(platform, image_type=image_type)
 
-            # Assemble prompt: style directive (if set) + brand colors + user seed content.
-            # The style fragment is injected by _generate_image_bg from the brand's
-            # selected visual style, rotating through their 3 picks each campaign.
             bc = brand_context or {}
             style_fragment = bc.get("style_prompt_fragment", "")
             font_prompt = bc.get("font_style_prompt", "")
-            brand_colors = [c for c in (bc.get("brand_colors") or []) if c]
-            base_prompt = seed_content.strip()
 
-            color_block = ""
-            if brand_colors:
-                color_block = (
-                    f"\n\n=== BRAND COLORS ===\n"
-                    f"Dominant palette: {', '.join(brand_colors[:3])}. "
-                    f"These colors must appear prominently — use them for backgrounds, accents, graphic elements, "
-                    f"clothing, or environmental details depending on the image type."
-                )
+            # Look up the style description from the library using the slug
+            style_slug = bc.get("style_slug", "")
+            style_desc = ""
+            if style_slug:
+                from app.agents.social_media_manager.services.style_library import get_style
+                s = get_style(style_slug)
+                if s:
+                    style_desc = s.get("description", "")
 
-            font_block = f"\n\n=== TYPOGRAPHY ===\n{font_prompt}" if font_prompt else ""
-
+            # Build prompt directly: style fragment + description + content + font
+            parts = []
             if style_fragment:
-                image_prompt = f"=== VISUAL STYLE ===\n{style_fragment}\n\n=== CONTENT ===\n{base_prompt}{color_block}{font_block}"
-            else:
-                image_prompt = base_prompt + color_block + font_block
+                parts.append(style_fragment)
+            if style_desc:
+                parts.append(style_desc)
+            parts.append(seed_content.strip())
+            if font_prompt:
+                parts.append(font_prompt)
+            image_prompt = " ".join(p for p in parts if p)
 
-            # When a reference image is provided, always append a hard no-crop directive
-            # directly to the prompt so the image model cannot ignore it.
+            if not image_prompt:
+                image_prompt = seed_content.strip()
+
+            # When a reference image is provided, always append a hard no-crop directive.
             if reference_image:
                 image_prompt = (
                     image_prompt.rstrip()
                     + " Full body shown completely from head to toe. Entire garment/product fully visible in frame — "
                     "no cropping of any part of the clothing, subject, or object. Wide enough framing to show everything."
                 )
+
+            print(
+                f"\n{'━'*60}\n"
+                f"📤 FINAL PROMPT → GPT-Image-2 [{platform.upper()}] "
+                f"({'with style' if style_fragment else 'no style'}"
+                f"{' + font' if font_prompt else ''})\n"
+                f"{'━'*60}\n"
+                f"{image_prompt}\n"
+                f"{'━'*60}\n"
+            )
 
             image_response = await ImageContentService._call_dalle_api(
                 prompt=image_prompt,
@@ -395,10 +404,14 @@ class ImageContentService:
         specs: Optional[Dict[str, Any]] = None,
         reference_image: Optional[str] = None,
         feedback: Optional[str] = None,
+        style_fragment: str = "",
+        font_prompt: str = "",
     ) -> Optional[str]:
         """
-        Use GPT-4.1 to select the most appropriate image type for the content,
-        then write a detailed prompt for gpt-image-1.5.
+        Use GPT-5.4 to select the most appropriate image type for the content,
+        then write a detailed flowing prompt for GPT-Image-2.
+        style_fragment and font_prompt are injected as hard creative directives
+        so they are reliably woven into the final image prompt.
 
         Image types the AI can choose from:
           PHOTO          — Authentic photorealistic documentary photograph
@@ -556,13 +569,30 @@ class ImageContentService:
                 if brand_lines else ""
             )
 
+            # Hard style + font directives — these are non-negotiable constraints that
+            # must be woven into the FINAL_PROMPT, not overridden by creative choices.
+            style_directive_block = ""
+            if style_fragment:
+                style_directive_block += (
+                    f"\n\n🎨 MANDATORY VISUAL STYLE DIRECTIVE (non-negotiable — this overrides your default type choice):\n"
+                    f"{style_fragment}\n"
+                    f"Your FINAL_PROMPT MUST be written to produce an image that matches this exact visual style. "
+                    f"Every word of your prompt should serve this direction."
+                )
+            if font_prompt:
+                style_directive_block += (
+                    f"\n\n✏️ MANDATORY TYPOGRAPHY DIRECTIVE (non-negotiable):\n"
+                    f"{font_prompt}\n"
+                    f"If the image includes any text or typographic elements, they must follow this direction exactly."
+                )
+
             system_prompt = (
                 "You are a world-class creative director and AI image prompt engineer at a top African brand agency. "
                 "Your job is to commission visually stunning, commercially ready images for social media — "
                 "the kind that appear in real campaigns by Flutterwave, Paystack, Moniepoint, and MTN. "
-                "You brief Nano Banana 2 (Google Imagen 4 Ultra), a state-of-the-art photorealistic image model.\n\n"
+                "You brief GPT-Image-2, a state-of-the-art image generation model.\n\n"
 
-                "Nano Banana 2 performs best with flowing, scene-rich natural-language prompts — "
+                "GPT-Image-2 performs best with flowing, scene-rich natural-language prompts — "
                 "NOT structured notes or labeled sections. Your final deliverable is a single master prompt "
                 "that reads like a director's brief to a photographer and art director simultaneously.\n\n"
 
@@ -661,7 +691,7 @@ class ImageContentService:
                 f"{ref_instruction}"
                 f"POST CONTENT TO VISUALIZE:\n{content[:700]}\n\n"
                 f"Original business topic: {seed_content[:300]}\n\n"
-                f"{brand_block}{feedback_block}\n\n"
+                f"{brand_block}{style_directive_block}{feedback_block}\n\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 "YOUR TASK:\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -675,9 +705,14 @@ class ImageContentService:
                 f"4. Brand colors ({brand_colors_str if brand_colors_str else 'from brand identity'}) "
                 "must appear prominently — described in words only, no hex codes.\n"
                 "5. In FINAL_PROMPT: write a single flowing paragraph of cinematic richness. "
-                "This paragraph is fed DIRECTLY to Imagen 4 Ultra — it must be vivid, specific, "
+                "This paragraph is fed DIRECTLY to GPT-Image-2 — it must be vivid, specific, "
                 "and commercially ready. Every word counts. Describe things the camera would see, "
-                "not abstract concepts. No labels, no sections — pure prose only."
+                "not abstract concepts. No labels, no sections — pure prose only. "
+                + (
+                    "The MANDATORY VISUAL STYLE DIRECTIVE above must be the foundation of your FINAL_PROMPT — "
+                    "every scene, lighting, composition, and typography decision must serve that style. "
+                    if style_fragment else ""
+                )
             )
 
             logo_url = brand_context.get("logo_url") if brand_context else None
