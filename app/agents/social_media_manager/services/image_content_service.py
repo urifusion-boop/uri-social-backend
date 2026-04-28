@@ -302,6 +302,16 @@ class ImageContentService:
                     "no cropping of any part of the clothing, subject, or object. Wide enough framing to show everything."
                 )
 
+            print(
+                f"\n{'━'*60}\n"
+                f"📤 FINAL PROMPT → GPT-Image-2 [{platform.upper()}] "
+                f"({'with style' if style_fragment else 'no style'}"
+                f"{' + font' if font_prompt else ''})\n"
+                f"{'━'*60}\n"
+                f"{image_prompt}\n"
+                f"{'━'*60}\n"
+            )
+
             image_response = await ImageContentService._call_dalle_api(
                 prompt=image_prompt,
                 size=f"{specs['width']}x{specs['height']}",
