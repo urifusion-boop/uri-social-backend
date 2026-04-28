@@ -59,12 +59,13 @@ class CreditService:
 
         # Recalculate total_credits and credits_remaining from source fields
         # This ensures correct values even if database has stale computed fields
+        # NOTE: subscription_credits and bonus_credits already have deductions applied,
+        # so credits_remaining = bonus_credits + subscription_credits (no need to subtract credits_used)
         bonus_credits = wallet_doc.get("bonus_credits", 0)
         subscription_credits = wallet_doc.get("subscription_credits", 0)
-        credits_used = wallet_doc.get("credits_used", 0)
 
         wallet_doc["total_credits"] = bonus_credits + subscription_credits
-        wallet_doc["credits_remaining"] = wallet_doc["total_credits"] - credits_used
+        wallet_doc["credits_remaining"] = bonus_credits + subscription_credits
 
         return UserCreditWallet(**wallet_doc)
 
