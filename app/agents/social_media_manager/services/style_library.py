@@ -700,12 +700,19 @@ _INDUSTRY_ALIASES: Dict[str, str] = {
 
 
 def _canonical_industry(raw: str) -> str:
-    """Map a raw industry string to a canonical INDUSTRY_STYLE_MAP key."""
+    """Map a raw industry string to a canonical INDUSTRY_STYLE_MAP key.
+
+    Handles compound values like 'Tech & SaaS', 'Food & Beverage' via partial keyword match.
+    """
     key = raw.lower().strip()
     if key in INDUSTRY_STYLE_MAP:
         return key
     if key in _INDUSTRY_ALIASES:
         return _INDUSTRY_ALIASES[key]
+    # Partial keyword match — catches compound industry strings
+    for alias, canonical in _INDUSTRY_ALIASES.items():
+        if alias in key:
+            return canonical
     return "general_other"
 
 
@@ -729,10 +736,14 @@ def pick_next_style(
     style_selections: List[str],
     rotation_index: int,
     industry: str = "",
+    style_prompt_fragments: Optional[List[str]] = None,
 ) -> tuple[str, str, int]:
     """
     Select the next style in the rotation and return:
       (slug, prompt_fragment, next_rotation_index)
+
+    Uses stored prompt_fragments when available (PRD DEV NOTE: copy fragment at selection
+    time so library updates don't affect existing users). Falls back to live lookup.
 
     If the user has no selections yet, auto-assign the first style for their industry.
     """
@@ -744,6 +755,12 @@ def pick_next_style(
 
     idx = rotation_index % len(style_selections)
     slug = style_selections[idx]
-    fragment = get_prompt_fragment(slug)
+
+    # Prefer the fragment stored at selection time over a live library lookup
+    if style_prompt_fragments and idx < len(style_prompt_fragments) and style_prompt_fragments[idx]:
+        fragment = style_prompt_fragments[idx]
+    else:
+        fragment = get_prompt_fragment(slug)
+
     next_index = (idx + 1) % len(style_selections)
     return slug, fragment, next_index
