@@ -256,43 +256,36 @@ class ImageContentService:
         image_type: "post_image" (default), "story" (9:16), or any key in IMAGE_SPECS[platform].
         """
         try:
-            # GPT-Image-2 is the only image model — ignore whatever was passed in.
             image_model = "openai/gpt-image-2"
 
-            # Get platform image specifications
             specs = ImageContentService._get_platform_image_specs(platform, image_type=image_type)
 
             bc = brand_context or {}
             style_fragment = bc.get("style_prompt_fragment", "")
             font_prompt = bc.get("font_style_prompt", "")
 
-            # Route through GPT-5.4 prompt engineer (_generate_image_brief) so the
-            # visual style fragment and font directive are woven into natural flowing
-            # prose that GPT-Image-2 can follow reliably.  Falls back to raw assembly
-            # if the GPT call fails.
-            image_prompt = await ImageContentService._generate_image_brief(
-                content=content,
-                seed_content=seed_content,
-                platform=platform,
-                brand_context=brand_context,
-                specs=specs,
-                reference_image=reference_image,
-                feedback=feedback,
-                style_fragment=style_fragment,
-                font_prompt=font_prompt,
-            )
+            # Look up the style description from the library using the slug
+            style_slug = bc.get("style_slug", "")
+            style_desc = ""
+            if style_slug:
+                from app.agents.social_media_manager.services.style_library import get_style
+                s = get_style(style_slug)
+                if s:
+                    style_desc = s.get("description", "")
+
+            # Build prompt directly: style fragment + description + content + font
+            parts = []
+            if style_fragment:
+                parts.append(style_fragment)
+            if style_desc:
+                parts.append(style_desc)
+            parts.append(seed_content.strip())
+            if font_prompt:
+                parts.append(font_prompt)
+            image_prompt = " ".join(p for p in parts if p)
 
             if not image_prompt:
-                # Fallback: raw structured assembly
-                brand_colors = [c for c in (bc.get("brand_colors") or []) if c]
-                base_prompt = seed_content.strip()
-                color_block = (
-                    f"\n\nBrand colors (must appear prominently): {', '.join(brand_colors[:3])}."
-                    if brand_colors else ""
-                )
-                font_block = f"\n\nTypography direction: {font_prompt}" if font_prompt else ""
-                style_block = f"Visual style directive: {style_fragment}\n\n" if style_fragment else ""
-                image_prompt = f"{style_block}{base_prompt}{color_block}{font_block}"
+                image_prompt = seed_content.strip()
 
             # When a reference image is provided, always append a hard no-crop directive.
             if reference_image:
