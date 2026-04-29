@@ -936,6 +936,68 @@ class ApprovalWorkflowService:
             return None
 
     @staticmethod
+    async def _publish_facebook_story(
+        page_id: str,
+        page_token: str,
+        story_image_url: str,
+    ) -> Dict[str, Any]:
+        """Upload an image as an unpublished photo then publish it as a Facebook Story."""
+        import httpx as _httpx
+        from PIL import Image as _PILImg
+        import io as _io
+        import os as _os
+
+        _raw = None
+        if "/static/images/" in story_image_url:
+            _fname = story_image_url.split("/static/images/")[-1].split("?")[0]
+            _local = f"/app/static/images/{_fname}"
+            if _os.path.exists(_local):
+                with open(_local, "rb") as _f:
+                    _raw = _f.read()
+        if _raw is None:
+            async with _httpx.AsyncClient(timeout=30) as _c:
+                img_resp = await _c.get(story_image_url)
+            img_resp.raise_for_status()
+            _raw = img_resp.content
+
+        _img = _PILImg.open(_io.BytesIO(_raw)).convert("RGB")
+        _buf = _io.BytesIO()
+        _img.save(_buf, format="JPEG", quality=92)
+        _jpeg_bytes = _buf.getvalue()
+
+        # Step 1: upload as unpublished photo
+        async with _httpx.AsyncClient(timeout=60) as _c2:
+            upload_resp = await _c2.post(
+                f"https://graph.facebook.com/{settings.FACEBOOK_API_VERSION}/{page_id}/photos",
+                data={"access_token": page_token, "published": "false"},
+                files={"source": ("story.jpg", _jpeg_bytes, "image/jpeg")},
+            )
+        upload_data = upload_resp.json()
+        photo_id = upload_data.get("id")
+        if not photo_id:
+            error_msg = (upload_data.get("error") or {}).get("message", str(upload_data))
+            print(f"❌ FB story photo upload failed: {upload_data}")
+            return {"success": False, "error": f"Failed to upload story image to Facebook. (Detail: {error_msg})"}
+
+        print(f"✅ FB story photo uploaded: photo_id={photo_id}")
+
+        # Step 2: publish as story — send photo_ids as JSON body, not form-encoded string
+        async with _httpx.AsyncClient(timeout=30) as _c3:
+            story_resp = await _c3.post(
+                f"https://graph.facebook.com/{settings.FACEBOOK_API_VERSION}/{page_id}/photo_stories",
+                json={"access_token": page_token, "photo_ids": [photo_id]},
+            )
+        story_data = story_resp.json()
+        print(f"📋 FB photo_stories response: {story_data}")
+        post_id = story_data.get("post_id") or story_data.get("id")
+        if post_id:
+            print(f"✅ FB story publish success: post_id={post_id}")
+            return {"success": True, "post_id": post_id, "raw_response": story_data}
+        error_msg = (story_data.get("error") or {}).get("message", str(story_data))
+        print(f"❌ FB story publish failed: {story_data}")
+        return {"success": False, "error": f"Facebook story publish failed. (Detail: {error_msg})"}
+
+    @staticmethod
     async def _publish_to_platform(
         platform: str,
         draft: Dict[str, Any],
@@ -1041,6 +1103,35 @@ class ApprovalWorkflowService:
                     page_id=page_id,
                 )
 
+        # ── LinkedIn direct (OAuth 2.0) ───────────────────────────────────────
+        if platform == "linkedin" and connection.get("connected_via") == "linkedin_direct":
+            from app.agents.social_media_manager.services.linkedin_direct_service import LinkedInDirectService
+            token = connection.get("linkedin_access_token") or connection.get("access_token")
+            urn = connection.get("person_urn") or connection.get("active_author_urn")
+            if not token or not urn:
+                return {"success": False, "error": "LinkedIn connection is missing OAuth token or author URN. Please reconnect your account."}
+            # LinkedIn API does not support native scheduling — defer to cron
+            if scheduled_datetime:
+                print(f"⏰ LinkedIn direct — deferred to cron scheduler for {scheduled_datetime.isoformat()}")
+                return {"success": True, "scheduled": True, "post_id": None}
+            image_url = ApprovalWorkflowService._resolve_image_url(draft.get("image_url") or "")
+            if image_url and image_url.startswith("data:"):
+                image_url = await ApprovalWorkflowService._upload_base64_to_imgbb(image_url) or ""
+            try:
+                svc = LinkedInDirectService()
+                result = await svc.create_post(
+                    access_token=token,
+                    person_urn=urn,
+                    text=content,
+                    image_url=image_url or None,
+                )
+                post_id = result.get("post_id")
+                print(f"✅ LinkedIn direct publish: post_id={post_id}")
+                return {"success": bool(post_id), "post_id": post_id, "raw_response": result}
+            except Exception as e:
+                print(f"❌ LinkedIn direct publish failed: {e}")
+                return {"success": False, "error": f"LinkedIn direct publish failed: {str(e)}"}
+
         # ── Outstand-connected accounts ───────────────────────────────────────
         if connection.get("connected_via") == "outstand":
             try:
@@ -1056,6 +1147,32 @@ class ApprovalWorkflowService:
                 post_type = draft.get("post_type", "feed")
                 image_url = draft.get("image_url") or ""
                 media_urls = None
+
+                # Facebook stories cannot go through Outstand (no story API support).
+                # Look up page credentials from the linked instagram_direct connection
+                # for the same user and call the direct Graph API story flow.
+                if platform == "facebook" and post_type == "story":
+                    story_image_url = ApprovalWorkflowService._resolve_image_url(draft.get("image_url") or "")
+                    if not story_image_url:
+                        return {"success": False, "error": "Facebook stories require an image."}
+                    _page_id = connection.get("page_id")
+                    _page_token = connection.get("page_access_token")
+                    if (not _page_id or not _page_token) and db is not None:
+                        _ig_conn = await db["social_connections"].find_one({
+                            "user_id": connection.get("user_id"),
+                            "platform": "instagram",
+                            "connected_via": {"$in": ["instagram_direct", "instagram_direct_oauth"]},
+                        })
+                        if _ig_conn:
+                            _page_id = _ig_conn.get("page_id")
+                            _page_token = _ig_conn.get("page_access_token")
+                    if not _page_id or not _page_token:
+                        return {"success": False, "error": "Facebook stories require direct Page credentials. Reconnect your Facebook account."}
+                    try:
+                        return await ApprovalWorkflowService._publish_facebook_story(_page_id, _page_token, story_image_url)
+                    except Exception as _fb_story_err:
+                        print(f"❌ FB story via Outstand-connection exception: {_fb_story_err}")
+                        return {"success": False, "error": f"Facebook story publish failed. (Detail: {_fb_story_err})"}
 
                 if post_type == "carousel":
                     slides = draft.get("slides", [])
@@ -1254,34 +1371,13 @@ class ApprovalWorkflowService:
             # ── Facebook story ─────────────────────────────────────────────────
             elif post_type == "story":
                 story_image_url = ApprovalWorkflowService._resolve_image_url(draft.get("image_url") or "")
-                if story_image_url.startswith("data:"):
-                    story_image_url = await ApprovalWorkflowService._upload_base64_to_imgbb(story_image_url) or ""
                 if not story_image_url:
                     return {"success": False, "error": "Facebook stories require an image. Re-generate with 'include_images: true'."}
                 try:
-                    import httpx as _httpx
-                    async with _httpx.AsyncClient(timeout=30) as _c:
-                        story_resp = await _c.post(
-                            f"https://graph.facebook.com/{settings.FACEBOOK_API_VERSION}/{page_id}/photo_stories",
-                            params={"url": story_image_url, "access_token": page_token},
-                        )
-                    story_data = story_resp.json()
-                    post_id = story_data.get("post_id") or story_data.get("id")
-                    if post_id:
-                        print(f"✅ FB story publish success: post_id={post_id}")
-                        return {"success": True, "post_id": post_id, "raw_response": story_data}
-                    else:
-                        error_msg = (story_data.get("error") or {}).get("message", str(story_data))
-                        print(f"❌ FB story publish failed: {story_data}")
-                        return {
-                            "success": False,
-                            "error": f"Facebook stories require additional permissions. Try publishing as a feed post instead. (Detail: {error_msg})",
-                        }
+                    return await ApprovalWorkflowService._publish_facebook_story(page_id, page_token, story_image_url)
                 except Exception as story_err:
-                    return {
-                        "success": False,
-                        "error": f"Facebook stories require additional permissions. Try publishing as a feed post instead. (Detail: {story_err})",
-                    }
+                    print(f"❌ FB story exception: {story_err}")
+                    return {"success": False, "error": f"Facebook story publish failed. (Detail: {story_err})"}
 
             # ── Facebook feed (existing logic) ─────────────────────────────────
             else:

@@ -1,7 +1,7 @@
 version: "3.9"
 
 services:
-  uri-agent.api:
+  uri-agent.api.prod:
     image: uriteam/urisvc:uriagentprod
     container_name: uri-agent.api.prod
     build:

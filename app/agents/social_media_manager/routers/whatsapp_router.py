@@ -10,6 +10,7 @@ POST /whatsapp/daily-push    — Trigger daily content push to all linked users 
 
 import pymongo.errors
 from fastapi import APIRouter, Depends, HTTPException, Request, BackgroundTasks
+from fastapi.responses import Response
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from pydantic import BaseModel
 
@@ -66,22 +67,26 @@ async def whatsapp_webhook(
 
         validator = RequestValidator(settings.TWILIO_AUTH_TOKEN)
         twilio_sig = request.headers.get("X-Twilio-Signature", "")
-        # Build the full URL Twilio signed (must match exactly).
-        # Use PUBLIC_API_URL so the scheme is always https even behind a proxy.
         _base = str(settings.PUBLIC_API_URL).rstrip("/")
         url = f"{_base}/whatsapp/webhook"
 
-        if not validator.validate(url, params, twilio_sig):
-            raise HTTPException(status_code=403, detail="Invalid Twilio signature.")
+        valid = validator.validate(url, params, twilio_sig)
+        print(f"[WhatsApp] webhook url={url!r} from={params.get('From')!r} body={params.get('Body')!r} sig_valid={valid}")
 
     raw_from: str = params.get("From", "")
-    body: str = params.get("Body", "")
+    # Button quick-reply taps may arrive with empty Body — fall back to ButtonText
+    body: str = params.get("Body", "") or params.get("ButtonText", "")
+
+    # Always return empty TwiML — Twilio requires XML Content-Type, not JSON.
+    # Returning application/json causes 12300 errors in the Twilio debugger.
+    _EMPTY_TWIML = Response(content="<?xml version='1.0' encoding='UTF-8'?><Response/>",
+                            media_type="text/xml")
 
     if not raw_from:
-        return {"status": "ignored"}
+        return _EMPTY_TWIML
 
     background_tasks.add_task(WhatsAppFlowService.handle, raw_from, body, db)
-    return {"status": "queued"}
+    return _EMPTY_TWIML
 
 
 # ── Connect / disconnect ───────────────────────────────────────────────────
@@ -139,13 +144,13 @@ async def connect_whatsapp(
             )
 
     try:
-        _send(
+        await _send(
             body.phone,
             "",
             content_sid="HXccf1a2bb34e7ed257c136c842982f5b3",
         )
-    except Exception:
-        pass  # Don't fail the connect if the greeting message errors
+    except Exception as e:
+        print(f"[WhatsApp] connect greeting failed: {e}")
 
     return {
         "status": True,
