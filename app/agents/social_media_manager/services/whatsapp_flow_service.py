@@ -1280,14 +1280,32 @@ class WhatsAppFlowService:
     ) -> None:
         ideas: List[str] = ctx.get("ideas", [])
 
-        # Match ordinals — check longer phrases first to avoid "one" matching before "third one"
+        # ── Back / none — return to content or idle ───────────────────────────
+        _NONE_WORDS = {"none", "none of them", "neither", "not interested", "no thanks", "nope", "no"}
+        if any(w in text for w in _BACK_WORDS) or any(w in text for w in _NONE_WORDS):
+            if ctx.get("headline"):
+                await _send(phone, _format_content(ctx))
+                await _safe_set_state(phone, "showing_content", ctx, db)
+            else:
+                await _send(phone, HELP_MESSAGE)
+                await _safe_set_state(phone, "idle", {}, db)
+            return
+
+        # ── Request for fresh ideas ───────────────────────────────────────────
+        _MORE_WORDS = {"more ideas", "give more", "new ideas", "different ideas", "more",
+                       "refresh", "new ones", "other ideas", "give me more", "more options"}
+        if any(w in text for w in _MORE_WORDS):
+            await WhatsAppFlowService._send_ideas(phone, user_id, ctx.get("topic", ""), db)
+            return
+
+        # ── Ordinals — check longer phrases first ─────────────────────────────
         idx = None
         for phrase, i in sorted(_ORDINALS.items(), key=lambda kv: -len(kv[0])):
             if phrase in text:
                 idx = i
                 break
 
-        # Substring match against the idea text itself
+        # Substring match against the actual idea text
         if idx is None:
             for i, idea in enumerate(ideas):
                 if len(raw_body) > 5 and raw_body.lower() in idea.lower():
@@ -1298,20 +1316,37 @@ class WhatsAppFlowService:
             await WhatsAppFlowService._create_and_show_content(phone, ideas[idx], user_id, {}, db)
             return
 
-        # AI fallback
+        # ── AI fallback ───────────────────────────────────────────────────────
         if ideas:
             intent = await _ai_intent(
                 raw_body,
-                ["first", "second", "third", "unknown"],
-                f"The user was shown 3 ideas: 1) {ideas[0]} 2) {ideas[1] if len(ideas) > 1 else ''} 3) {ideas[2] if len(ideas) > 2 else ''}.",
+                ["first", "second", "third", "none", "more_ideas", "unknown"],
+                f"The user was shown 3 ideas: 1) {ideas[0]} 2) {ideas[1] if len(ideas) > 1 else ''} 3) {ideas[2] if len(ideas) > 2 else ''}. "
+                "They may pick one, ask for different ideas, or say none/back.",
             )
             pick = {"first": 0, "second": 1, "third": 2}.get(intent)
             if pick is not None and pick < len(ideas):
                 await WhatsAppFlowService._create_and_show_content(phone, ideas[pick], user_id, {}, db)
                 return
+            if intent == "none":
+                if ctx.get("headline"):
+                    await _send(phone, _format_content(ctx))
+                    await _safe_set_state(phone, "showing_content", ctx, db)
+                else:
+                    await _send(phone, HELP_MESSAGE)
+                    await _safe_set_state(phone, "idle", {}, db)
+                return
+            if intent == "more_ideas":
+                await WhatsAppFlowService._send_ideas(phone, user_id, ctx.get("topic", ""), db)
+                return
 
+        # ── Gentle re-prompt (last resort) ────────────────────────────────────
         lines = "\n".join(f"{i + 1}. {idea}" for i, idea in enumerate(ideas))
-        await _send(phone, f"Which one? Say *first*, *second*, or *third*:\n\n{lines}")
+        await _send(
+            phone,
+            f"Which idea would you like to use?\n\n{lines}\n\n"
+            "Say *first*, *second*, or *third* — or *more ideas* for new ones, *back* to return."
+        )
 
     # ── Edit flow ─────────────────────────────────────────────────────────────
 
