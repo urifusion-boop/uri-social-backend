@@ -79,6 +79,74 @@ class NotificationService:
 
         return count < limit
 
+    # ==================== Smart Reminder Deduplication ====================
+
+    async def _should_send_notification(
+        self,
+        user_id: str,
+        notification_type: NotificationType,
+        reminder_config: dict = None
+    ) -> bool:
+        """
+        Check if notification should be sent based on smart reminder rules.
+
+        Args:
+            user_id: User to notify
+            notification_type: Type of notification
+            reminder_config: Optional config with:
+                - first_only: Send only once, never remind (default: False)
+                - reminder_days: Days between reminders (default: 3)
+                - max_reminders: Max number of reminders (default: 3)
+
+        Returns:
+            True if should send, False if already sent recently
+        """
+        if reminder_config is None:
+            reminder_config = {}
+
+        first_only = reminder_config.get('first_only', False)
+        reminder_days = reminder_config.get('reminder_days', 3)
+        max_reminders = reminder_config.get('max_reminders', 3)
+
+        # Find last notification of this type for this user
+        last_notification = await self.notifications_collection.find_one(
+            {
+                "user_id": user_id,
+                "type": notification_type,
+                "status": "sent"
+            },
+            sort=[("created_at", -1)]
+        )
+
+        # No previous notification - send it
+        if not last_notification:
+            return True
+
+        # If first_only mode, don't send again
+        if first_only:
+            return False
+
+        # Check how many times we've sent this notification
+        total_sent = await self.notifications_collection.count_documents({
+            "user_id": user_id,
+            "type": notification_type,
+            "status": "sent"
+        })
+
+        # If reached max reminders, stop
+        if total_sent >= max_reminders + 1:  # +1 for initial notification
+            return False
+
+        # Check if enough time has passed for a reminder
+        last_sent_at = last_notification.get("created_at")
+        if last_sent_at:
+            days_since = (datetime.utcnow() - last_sent_at).days
+            if days_since >= reminder_days:
+                return True
+
+        # Too soon for a reminder
+        return False
+
     # ==================== PRD 9: Log Notification ====================
 
     async def _log_notification(
@@ -173,6 +241,7 @@ class NotificationService:
             subject=subject,
             status="sent" if success else "failed",
             metadata={"trial_days": trial_days, "trial_credits": trial_credits},
+            error="Email delivery failed" if not success else None,
         )
 
         # Update last_active_at (PRD 8)
@@ -539,17 +608,19 @@ class NotificationService:
     async def run_inactivity_check(self):
         """
         PRD 8.2: Check all users for inactivity and send reminders.
-        Called by the scheduler daily.
+        Called by the scheduler daily at 10:00 AM UTC.
+        Now with smart reminders: 3 days, 7 days, 14 days.
         """
         cutoff = datetime.utcnow() - timedelta(days=INACTIVITY_THRESHOLD_DAYS)
 
-        # Find users who haven't been active and haven't received an inactivity email recently
+        # Find users who haven't been active
         inactive_users = self.users_collection.find({
             "last_active_at": {"$lt": cutoff, "$exists": True},
             "notification_opt_out": {"$ne": True},
         })
 
         count = 0
+        skipped = 0
         async for user in inactive_users:
             user_id = user.get("userId")
             if not user_id:
@@ -557,6 +628,29 @@ class NotificationService:
 
             last_active = user.get("last_active_at")
             days_inactive = (datetime.utcnow() - last_active).days if last_active else INACTIVITY_THRESHOLD_DAYS
+
+            # Smart reminder: Send at 3 days, 7 days, 14 days
+            # Determine which reminder interval to use based on days_inactive
+            if days_inactive >= 14:
+                reminder_interval = 7  # After 14 days, remind every 7 days
+            elif days_inactive >= 7:
+                reminder_interval = 7  # Second reminder at 7 days
+            else:
+                reminder_interval = 3  # First reminder at 3 days
+
+            # Check if we should send based on smart reminders
+            should_send = await self._should_send_notification(
+                user_id=user_id,
+                notification_type="inactivity",
+                reminder_config={
+                    "reminder_days": reminder_interval,
+                    "max_reminders": 3  # Max 3 inactivity reminders (at 3d, 7d, 14d)
+                }
+            )
+
+            if not should_send:
+                skipped += 1
+                continue
 
             try:
                 await self.notify_inactivity(
@@ -567,18 +661,19 @@ class NotificationService:
             except Exception as e:
                 print(f"⚠️ Inactivity notification failed for {user_id}: {e}")
 
-        print(f"📬 Inactivity check complete: {count} reminders sent")
+        print(f"📬 Inactivity check: {count} sent, {skipped} skipped (too soon for reminder)")
         return count
 
     async def run_trial_check(self):
         """
         PRD 8.3: Check all trials for expiry and send notifications.
-        Called by the scheduler daily.
+        Called by the scheduler every 6 hours.
+        Now with smart deduplication to prevent spam.
         """
         now = datetime.utcnow()
         trials_collection = self.db["user_trials"]
 
-        # Trial ending (within 24 hours)
+        # Trial ending (within 24 hours) - Send ONCE only
         ending_cutoff = now + timedelta(hours=24)
         ending_trials = trials_collection.find({
             "trial_end_date": {"$gt": now, "$lte": ending_cutoff},
@@ -586,37 +681,69 @@ class NotificationService:
         })
 
         ending_count = 0
+        ending_skipped = 0
         async for trial in ending_trials:
             try:
-                await self.notify_trial_ending(
-                    user_id=trial["user_id"],
-                    credits_remaining=trial.get("credits_remaining", 0),
+                user_id = trial["user_id"]
+
+                # Check if we should send (first_only: only send once, never remind)
+                should_send = await self._should_send_notification(
+                    user_id=user_id,
+                    notification_type="trial_ending",
+                    reminder_config={"first_only": True}  # Never remind for trial ending
                 )
-                ending_count += 1
+
+                if should_send:
+                    await self.notify_trial_ending(
+                        user_id=user_id,
+                        credits_remaining=trial.get("credits_remaining", 0),
+                    )
+                    ending_count += 1
+                else:
+                    ending_skipped += 1
             except Exception as e:
                 print(f"⚠️ Trial ending notification failed: {e}")
 
-        # Trial expired (just expired, within last 24h)
-        expired_cutoff = now - timedelta(hours=24)
+        # Trial expired - Send with smart reminders (every 3 days, max 3 times)
+        expired_cutoff = now - timedelta(days=10)  # Check last 10 days
         expired_trials = trials_collection.find({
             "trial_end_date": {"$gt": expired_cutoff, "$lte": now},
         })
 
         expired_count = 0
+        expired_skipped = 0
         async for trial in expired_trials:
             try:
-                await self.notify_trial_expired(user_id=trial["user_id"])
-                expired_count += 1
+                user_id = trial["user_id"]
+
+                # Check if we should send (remind every 3 days, max 3 reminders)
+                should_send = await self._should_send_notification(
+                    user_id=user_id,
+                    notification_type="trial_expired",
+                    reminder_config={
+                        "reminder_days": 3,  # Remind every 3 days
+                        "max_reminders": 3   # Stop after 3 reminders (9 days total)
+                    }
+                )
+
+                if should_send:
+                    await self.notify_trial_expired(user_id=user_id)
+                    expired_count += 1
+                else:
+                    expired_skipped += 1
             except Exception as e:
                 print(f"⚠️ Trial expired notification failed: {e}")
 
-        print(f"📬 Trial check complete: {ending_count} ending, {expired_count} expired")
+        print(f"📬 Trial check complete:")
+        print(f"   Trial ending: {ending_count} sent, {ending_skipped} skipped (already notified)")
+        print(f"   Trial expired: {expired_count} sent, {expired_skipped} skipped (too soon for reminder)")
         return {"ending": ending_count, "expired": expired_count}
 
     async def run_daily_suggestions(self):
         """
         PRD 8.1: Send daily content suggestions to active users.
-        Called by the scheduler daily.
+        Called by the scheduler daily at 9:00 AM UTC.
+        Now with deduplication to ensure max 1 suggestion per day.
         """
         # Find active users who have been active in last 14 days (engaged users)
         cutoff = datetime.utcnow() - timedelta(days=14)
@@ -638,9 +765,24 @@ class NotificationService:
         ]
 
         count = 0
+        skipped = 0
         async for user in active_users:
             user_id = user.get("userId")
             if not user_id:
+                continue
+
+            # Check if we already sent a suggestion today (1 day interval)
+            should_send = await self._should_send_notification(
+                user_id=user_id,
+                notification_type="daily_suggestion",
+                reminder_config={
+                    "reminder_days": 1,  # Daily reminders
+                    "max_reminders": 365  # Essentially unlimited for daily suggestions
+                }
+            )
+
+            if not should_send:
+                skipped += 1
                 continue
 
             import random
@@ -655,7 +797,7 @@ class NotificationService:
             except Exception as e:
                 print(f"⚠️ Daily suggestion failed for {user_id}: {e}")
 
-        print(f"📬 Daily suggestions sent: {count}")
+        print(f"📬 Daily suggestions: {count} sent, {skipped} skipped (already sent today)")
         return count
 
 
