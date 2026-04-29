@@ -64,6 +64,50 @@ async def _send(to: str, body: str, media_url: Optional[str] = None, content_sid
     await asyncio.to_thread(client.messages.create, **kwargs)
 
 
+# ── Credit helper ─────────────────────────────────────────────────────────────
+
+
+async def _check_and_deduct_credit(user_id: str, reason: str) -> bool:
+    """
+    Check the user has at least 1 credit, then deduct it.
+    Mirrors the pattern used in complete_social_manager.py.
+    Returns True if the action is allowed (credit deducted or legacy user).
+    Returns False if the user has no credits remaining.
+    On any credit-system error, allows the action (fail open).
+    """
+    try:
+        import uuid
+        from app.services.CreditService import credit_service
+        from app.services.TrialService import trial_service
+
+        is_trial = await trial_service.has_active_trial(user_id)
+
+        if not is_trial:
+            has_credits = await credit_service.check_sufficient_credits(user_id)
+            if not has_credits:
+                return False
+
+        ref_id = str(uuid.uuid4())[:12]
+        if is_trial:
+            await trial_service.deduct_trial_credit(
+                user_id=user_id,
+                campaign_id=ref_id,
+                reason=reason,
+            )
+        else:
+            await credit_service.deduct_credit(
+                user_id=user_id,
+                campaign_id=ref_id,
+                reason=reason,
+                retry_count=0,
+            )
+        print(f"[WhatsApp] 1 credit deducted from user={user_id} reason={reason}")
+        return True
+    except Exception as e:
+        print(f"[WhatsApp] credit system error (allowing action): {e}")
+        return True  # fail open — never block user due to billing bugs
+
+
 # ── Static messages ───────────────────────────────────────────────────────────
 
 NOT_LINKED = (
@@ -838,6 +882,17 @@ class WhatsAppFlowService:
             await _safe_set_state(phone, "idle", {}, db)
             return
 
+        # Credit check — 1 credit per content generation
+        allowed = await _check_and_deduct_credit(user_id, reason="whatsapp_content_generation")
+        if not allowed:
+            await _send(
+                phone,
+                "⚠️ You've run out of credits.\n\n"
+                "Upgrade your plan on the Uri Social dashboard to keep creating content."
+            )
+            await _safe_set_state(phone, "idle", ctx, db)
+            return
+
         await _send(phone, "Creating your content... ✍️")
 
         tone = ctx.get("tone")
@@ -1367,6 +1422,17 @@ class WhatsAppFlowService:
         ctx: Dict[str, Any],
         db: AsyncIOMotorDatabase,
     ) -> None:
+        # Credit check — 1 credit per graphic generation
+        allowed = await _check_and_deduct_credit(user_id, reason="whatsapp_graphic_generation")
+        if not allowed:
+            await _send(
+                phone,
+                "⚠️ You've run out of credits.\n\n"
+                "Upgrade your plan on the Uri Social dashboard to generate graphics."
+            )
+            await _safe_set_state(phone, "showing_content", ctx, db)
+            return
+
         await _send(phone, "Creating your design... 🎨")
 
         brand = await _brand_context(user_id, db)
@@ -1567,6 +1633,19 @@ class WhatsAppFlowService:
 
                 brand = await _brand_context(user_id, db)
                 if not brand:
+                    continue
+
+                # Check and deduct 1 credit before generating daily content
+                allowed = await _check_and_deduct_credit(user_id, reason="whatsapp_content_generation")
+                if not allowed:
+                    # User is out of credits — notify them instead of generating
+                    await _send(
+                        phone,
+                        f"Good morning {first_name} 👋\n\n"
+                        "⚠️ You've run out of credits and can't receive today's content.\n\n"
+                        "Upgrade your plan at urisocial.com to keep getting daily content."
+                    )
+                    failed += 1
                     continue
 
                 industry = brand.get("industry", "your niche")
