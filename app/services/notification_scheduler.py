@@ -8,6 +8,7 @@ Runs daily batch jobs:
 - PRD 8.2: Inactivity reminders (10:00 UTC)
 - PRD 8.3: Trial expiry checks (every 6 hours)
 - PRD 8.3: Subscription expiry checks (daily at 00:00 UTC)
+- WhatsApp daily content push (08:00 UTC / 09:00 WAT)
 """
 import asyncio
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -51,6 +52,16 @@ def _job_subscription_expiry():
     """Check and expire subscriptions past their end_date"""
     from app.services.SubscriptionService import subscription_service
     _run_async(subscription_service.expire_subscriptions)
+
+
+def _job_whatsapp_daily_push():
+    async def _run():
+        from app.database import get_db
+        from app.agents.social_media_manager.services.whatsapp_flow_service import WhatsAppFlowService
+        db = get_db()
+        result = await WhatsAppFlowService.send_daily_push(db)
+        print(f"📱 WhatsApp daily push complete: {result}")
+    _run_async(_run)
 
 
 def start_notification_scheduler():
@@ -100,8 +111,16 @@ def start_notification_scheduler():
         replace_existing=True,
     )
 
+    # WhatsApp daily content push at 08:00 UTC (9am WAT)
+    _scheduler.add_job(
+        _job_whatsapp_daily_push,
+        CronTrigger(hour=8, minute=0),
+        id="whatsapp_daily_push",
+        replace_existing=True,
+    )
+
     _scheduler.start()
-    print("📅 Notification scheduler started with 4 jobs")
+    print("📅 Notification scheduler started with 5 jobs")
 
 
 def stop_notification_scheduler():
