@@ -263,6 +263,7 @@ class ImageContentService:
             bc = brand_context or {}
             style_fragment = bc.get("style_prompt_fragment", "")
             font_prompt = bc.get("font_style_prompt", "")
+            region = bc.get("region", "")
 
             # Look up the style description from the library using the slug
             style_slug = bc.get("style_slug", "")
@@ -273,13 +274,15 @@ class ImageContentService:
                 if s:
                     style_desc = s.get("description", "")
 
-            # Build prompt directly: style fragment + description + content + font
+            # Build prompt directly: style fragment + description + content + region + font
             parts = []
             if style_fragment:
                 parts.append(style_fragment)
             if style_desc:
                 parts.append(style_desc)
             parts.append(seed_content.strip())
+            if region:
+                parts.append(f"Market/region: {region}. Use settings, aesthetics, and cultural references specific to this market.")
             if font_prompt:
                 parts.append(font_prompt)
             image_prompt = " ".join(p for p in parts if p)
