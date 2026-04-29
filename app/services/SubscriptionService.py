@@ -375,7 +375,8 @@ class SubscriptionService:
             price_ngn=tier.price_ngn,
             credits=tier.credits,
             credits_remaining=wallet.credits_remaining,
-            next_renewal=wallet.next_renewal
+            next_renewal=wallet.next_renewal,
+            billing_cycle=wallet.billing_cycle  # PRD 8.1: Include billing cycle
         )
 
     async def cancel_subscription(self, user_id: str) -> bool:
