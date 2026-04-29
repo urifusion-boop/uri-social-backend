@@ -24,7 +24,6 @@ from app.domain.models.billing_models import (
 from app.services.SubscriptionService import subscription_service
 from app.services.TrialService import trial_service
 from app.services.CreditService import credit_service
-from app.services.NotificationService import notification_service
 from app.core.config import settings
 
 
@@ -93,17 +92,27 @@ class PaymentService:
         user_id: str,
         tier_id: str,
         user_email: str,
+        billing_cycle: str = "monthly",
         test_amount: int = None,
         test_credits: int = None
     ) -> InitializePaymentResponse:
         """
-        Initialize SQUAD payment checkout
-        PRD 6.3: Payment Flow
-        1. User selects plan
-        2. Payment processed
-        3. On success: Assign credits, Activate subscription
+        Initialize SQUAD payment checkout with billing cycle support
+        PRD: Subscription Plan Upgrade (Multi-Duration with 5% Bulk Discount)
+        Sections 6.3 & 8.2: Payment Flow + Payment Logic
 
-        Special handling for tier_id='test': Use custom test_amount and test_credits
+        1. User selects plan and billing cycle
+        2. Calculate price with 5% discount for multi-month
+        3. Payment processed via SQUAD
+        4. On success: Assign credits, Activate subscription
+
+        Args:
+            user_id: User making payment
+            tier_id: Subscription tier to purchase
+            user_email: User email for payment
+            billing_cycle: "monthly"|"3_months"|"6_months"|"12_months"
+            test_amount: Custom test amount (only for tier_id='test')
+            test_credits: Custom test credits (only for tier_id='test')
         """
         # Handle test tier with custom amounts (temporary testing feature)
         if tier_id == 'test':
@@ -111,17 +120,8 @@ class PaymentService:
             if not test_amount or not test_credits:
                 raise ValueError(f"test_amount and test_credits required for test tier (received: amount={test_amount}, credits={test_credits})")
 
-            # Create a temporary tier object for test payment
-            from app.domain.models.billing_models import SubscriptionTier
-            tier = SubscriptionTier(
-                tier_id='test',
-                name='Test Plan',
-                price_ngn=test_amount,
-                credits=test_credits,
-                price_per_credit=test_amount / test_credits,
-                features=['Test payment'],
-                is_active=True
-            )
+            amount = test_amount
+            credits = test_credits
         else:
             # Validate tier
             validation = await subscription_service.validate_tier_purchase(user_id, tier_id)
@@ -130,18 +130,26 @@ class PaymentService:
 
             tier = validation["tier"]
 
-        # Generate unique transaction reference
-        transaction_ref = f"URI_{user_id[:8]}_{tier_id.upper()}_{int(datetime.utcnow().timestamp())}"
+            # Calculate price and credits based on billing cycle (PRD Section 6 & 8.2)
+            amount = subscription_service.calculate_price(tier.price_ngn_monthly, billing_cycle)
+            credits = subscription_service.calculate_credits(tier.credits_monthly, billing_cycle)
 
-        # Create pending payment transaction
+            print(f"💰 Payment: {tier.name} - {billing_cycle} - ₦{amount:,} ({credits} credits)")
+
+        # Generate unique transaction reference
+        transaction_ref = f"URI_{user_id[:8]}_{tier_id.upper()}_{billing_cycle.upper()}_{int(datetime.utcnow().timestamp())}"
+
+        # Create pending payment transaction (PRD Section 8.1 & 8.2)
         payment = PaymentTransaction(
             user_id=user_id,
             transaction_ref=transaction_ref,
-            amount=tier.price_ngn,
+            amount=amount,
             currency="NGN",
             status="pending",
             gateway="squad",
             subscription_tier=tier_id,
+            billing_cycle=billing_cycle,
+            credits_allocated=credits,
             created_at=datetime.utcnow()
         )
 
@@ -167,7 +175,7 @@ class PaymentService:
                 # 1 Naira = 100 Kobo, so ₦15,000 = 1,500,000 kobo
                 payload = {
                     "email": user_email,
-                    "amount": tier.price_ngn * 100,  # Convert Naira to Kobo (multiply by 100)
+                    "amount": amount * 100,  # Convert Naira to Kobo (multiply by 100)
                     "currency": "NGN",
                     "initiate_type": "inline",  # Required: opens payment modal
                     "transaction_ref": transaction_ref,
@@ -195,7 +203,7 @@ class PaymentService:
                     return InitializePaymentResponse(
                         payment_url=checkout_url,
                         transaction_ref=transaction_ref,
-                        amount=tier.price_ngn,
+                        amount=amount,
                         email=user_email,
                         currency="NGN",
                         public_key=creds['public_key']
@@ -277,11 +285,23 @@ class PaymentService:
         squad_response: Dict
     ) -> None:
         """
-        Complete payment and activate subscription
-        PRD 6.3: On success: Assign credits, Activate subscription
+        Complete payment and activate subscription with billing cycle support
+        PRD: Subscription Plan Upgrade (Multi-Duration with 5% Bulk Discount)
+        Sections 6.3 & 8.2 & 8.3: Payment Flow + Payment Logic + Subscription Lifecycle
 
         IMPORTANT: Preserves trial credits as bonus credits when trial user subscribes
         """
+        # Get payment transaction to retrieve billing cycle and credits
+        payment_doc = await self.payment_transactions_collection.find_one(
+            {"transaction_ref": transaction_ref}
+        )
+
+        if not payment_doc:
+            raise ValueError(f"Payment transaction not found: {transaction_ref}")
+
+        billing_cycle = payment_doc.get("billing_cycle", "monthly")
+        credits_allocated = payment_doc.get("credits_allocated")
+
         # Update payment status
         await self.payment_transactions_collection.update_one(
             {"transaction_ref": transaction_ref},
@@ -302,11 +322,54 @@ class PaymentService:
             remaining_trial_credits = trial_status.credits_remaining
             print(f"💎 Preserving {remaining_trial_credits} trial credits as bonus for user {user_id}")
 
-        # Activate subscription (this allocates subscription credits)
-        await subscription_service.create_subscription(
-            user_id=user_id,
-            tier_id=tier_id
-        )
+        # Calculate subscription lifecycle dates (PRD 8.3)
+        start_date = datetime.utcnow()
+        end_date = subscription_service.calculate_end_date(start_date, billing_cycle)
+        next_renewal = end_date
+
+        print(f"🎯 Subscription: {tier_id} - {billing_cycle} - {credits_allocated} credits")
+        print(f"📅 Lifecycle: {start_date.date()} to {end_date.date()}")
+
+        # Get existing wallet or create new one
+        existing_wallet = await credit_service.get_user_wallet(user_id)
+
+        if existing_wallet:
+            # Update existing wallet with new subscription (PRD 8.4: Mid-cycle upgrade resets)
+            await credit_service.user_credits_collection.update_one(
+                {"user_id": user_id},
+                {
+                    "$set": {
+                        "subscription_credits": credits_allocated,
+                        "total_credits": credits_allocated + existing_wallet.bonus_credits,
+                        "credits_remaining": credits_allocated + existing_wallet.bonus_credits - existing_wallet.credits_used,
+                        "subscription_tier": tier_id,
+                        "billing_cycle": billing_cycle,
+                        "start_date": start_date,
+                        "end_date": end_date,
+                        "next_renewal": next_renewal,
+                        "updated_at": datetime.utcnow()
+                    }
+                }
+            )
+        else:
+            # Create new wallet
+            from app.domain.models.billing_models import UserCreditWallet
+            new_wallet = UserCreditWallet(
+                user_id=user_id,
+                subscription_credits=credits_allocated,
+                bonus_credits=0,
+                total_credits=credits_allocated,
+                credits_used=0,
+                credits_remaining=credits_allocated,
+                subscription_tier=tier_id,
+                billing_cycle=billing_cycle,
+                start_date=start_date,
+                end_date=end_date,
+                next_renewal=next_renewal,
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow()
+            )
+            await credit_service.user_credits_collection.insert_one(new_wallet.dict(exclude_none=True))
 
         # Add trial credits as bonus credits after subscription is created
         if remaining_trial_credits > 0:
@@ -317,28 +380,7 @@ class PaymentService:
             )
             print(f"✅ Added {remaining_trial_credits} bonus credits from trial")
 
-        # Get tier information for email notification
-        from app.services.SubscriptionService import SUBSCRIPTION_TIERS
-        tier = next((t for t in SUBSCRIPTION_TIERS if t.tier_id == tier_id), None)
-
-        if tier:
-            # Send payment success email notification
-            try:
-                amount_paid = squad_response.get("data", {}).get("amount", 0) / 100  # Convert kobo to naira
-                if amount_paid == 0:  # Fallback to tier price
-                    amount_paid = tier.price_ngn
-
-                await notification_service.notify_payment_success(
-                    user_id=user_id,
-                    amount=amount_paid,
-                    currency="NGN",
-                    subscription_tier=tier.name,
-                    credits_added=tier.credits,
-                    transaction_ref=transaction_ref
-                )
-            except Exception as e:
-                print(f"⚠️ Failed to send payment success email: {e}")
-                # Don't fail the payment if email fails
+        print(f"✅ Subscription activated successfully")
 
     async def _mark_payment_failed(
         self,

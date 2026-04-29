@@ -514,18 +514,9 @@ Write as if you're sharing hard-won business wisdom with fellow African entrepre
             print(f"✅ Generated {len(drafts)} drafts successfully")
             return UriResponse.get_single_data_response("content_generation", response_data)
         else:
-            # Extract user-friendly error messages from errors array
-            if errors and len(errors) > 0:
-                # Get the first error message (they're usually the same for all platforms)
-                first_error = errors[0].get('error', 'Content generation failed')
-                # Clean up any "Generation failed: " prefix if present
-                if first_error.startswith('Generation failed: '):
-                    first_error = first_error.replace('Generation failed: ', '')
-                user_message = first_error
-            else:
-                user_message = "Content generation failed. Please try again."
-
-            return UriResponse.error_response(user_message)
+            return UriResponse.error_response(
+                f"Content generation failed for all platforms. Errors: {errors}",
+            )
     
     @staticmethod
     async def _generate_platform_content(
@@ -549,6 +540,16 @@ Write as if you're sharing hard-won business wisdom with fellow African entrepre
             platform_prompt = prompt_template.format(seed_content=seed_content)
             # Brand instructions go first so they govern everything that follows
             prompt = brand_block + platform_prompt if brand_block else platform_prompt
+
+            # Prepend universal formatting rule — must override any model default toward markdown
+            formatting_rule = (
+                "ABSOLUTE FORMATTING RULE: Output plain text only. "
+                "Never use markdown syntax of any kind — no **bold**, no *italic*, no __underline__, "
+                "no # headings, no bullet hyphens (- or *), no numbered lists with dots, no backticks. "
+                "If you want emphasis, choose stronger words. If you want structure, use line breaks. "
+                "The output will be displayed directly on a social media platform exactly as you write it.\n\n"
+            )
+            prompt = formatting_rule + prompt
             
             # Use your existing AIService with optimized parameters
             ai_request = AIService.build_ai_model(
@@ -560,9 +561,9 @@ Write as if you're sharing hard-won business wisdom with fellow African entrepre
             # Generate content using your existing AI service
             ai_response = await AIService.chat_completion(ai_request)
 
-            # Check if response is an error dict
+            # AIService returns a dict with "error" key on quota/rate limit failures
             if isinstance(ai_response, dict) and "error" in ai_response:
-                return UriResponse.error_response(ai_response["error"])
+                raise Exception(ai_response["error"])
 
             raw_content = ai_response.choices[0].message.content.strip()
             
@@ -822,11 +823,6 @@ Write as if you're sharing hard-won business wisdom with fellow African entrepre
             )
             
             ai_response = await AIService.chat_completion(ai_request)
-
-            # Check if response is an error dict
-            if isinstance(ai_response, dict) and "error" in ai_response:
-                return UriResponse.error_response(ai_response["error"])
-
             analysis_text = ai_response.choices[0].message.content.strip()
             
             return UriResponse.get_single_data_response("content_analysis", {

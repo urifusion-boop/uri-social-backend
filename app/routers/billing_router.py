@@ -61,10 +61,11 @@ async def initialize_payment(
     user_email: str = Depends(get_user_email)
 ):
     """
-    Initialize SQUAD payment checkout
-    PRD 6.3: Payment Flow
-    1. User selects plan
-    2. Payment processed via SQUAD
+    Initialize SQUAD payment checkout with billing cycle support
+    PRD: Subscription Plan Upgrade (Multi-Duration with 5% Bulk Discount)
+    Sections 6.3 & 8.1: Payment Flow + Billing Cycle Selection
+    1. User selects plan and billing cycle
+    2. Payment processed via SQUAD with correct multi-duration pricing
     3. Returns checkout URL
     """
     try:
@@ -72,6 +73,7 @@ async def initialize_payment(
             user_id=user_id,
             tier_id=body.tier_id,
             user_email=user_email,
+            billing_cycle=body.billing_cycle,  # PRD 8.1: Pass billing cycle
             test_amount=body.test_amount,
             test_credits=body.test_credits
         )
@@ -167,9 +169,12 @@ async def get_credit_balance(user_id: str = Depends(get_user_id)):
     PRD 7.3: Low Credit Warning when credits ≤ 3
     """
     try:
+        print(f"🔍 GET /credits/balance - user_id: {user_id}")
         balance = await credit_service.get_credit_balance(user_id)
+        print(f"💰 Balance for {user_id}: {balance.credits_remaining} credits remaining")
         return balance
     except Exception as e:
+        print(f"❌ Error getting balance for user {user_id}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to get balance: {str(e)}")
 
 
@@ -231,6 +236,12 @@ async def get_subscription_tiers():
     """
     try:
         tiers = await subscription_service.get_all_tiers(active_only=True)
+
+        # DEBUG: Log tier data being returned
+        print(f"🎯 [API] Returning {len(tiers)} tiers")
+        for tier in tiers:
+            print(f"🎯 [API] {tier.tier_id}: price_ngn={tier.price_ngn}, price_ngn_monthly={tier.price_ngn_monthly}, credits={tier.credits}, credits_monthly={tier.credits_monthly}")
+
         return tiers
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get tiers: {str(e)}")

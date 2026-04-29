@@ -84,20 +84,29 @@ class EmailService:
         last_error = None
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                await aiosmtplib.send(
-                    msg,
+                # Create a new connection for each attempt to avoid stale connections
+                smtp = aiosmtplib.SMTP(
                     hostname=settings.SMTP_HOST,
                     port=settings.SMTP_PORT,
-                    username=settings.SMTP_USERNAME,
-                    password=settings.SMTP_PASSWORD,
-                    start_tls=settings.SMTP_USE_TLS,
+                    start_tls=True,  # Use STARTTLS for port 587 (not use_tls)
+                    timeout=30,  # 30 second timeout
                 )
+
+                async with smtp:
+                    await smtp.login(settings.SMTP_USERNAME, settings.SMTP_PASSWORD)
+                    await smtp.send_message(msg)
+
                 return True
-            except Exception as e:
+            except (aiosmtplib.SMTPException, ConnectionError, TimeoutError, OSError) as e:
                 last_error = e
                 print(f"⚠️ Email send attempt {attempt}/{MAX_RETRIES} failed: {e}")
                 if attempt < MAX_RETRIES:
                     await asyncio.sleep(2 ** attempt)  # Exponential backoff
+            except Exception as e:
+                last_error = e
+                print(f"⚠️ Email send attempt {attempt}/{MAX_RETRIES} failed (unexpected): {e}")
+                if attempt < MAX_RETRIES:
+                    await asyncio.sleep(2 ** attempt)
 
         print(f"❌ Email send failed after {MAX_RETRIES} attempts to {to_email}: {last_error}")
         return False
@@ -122,17 +131,27 @@ class EmailService:
         last_error = None
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                await aiosmtplib.send(
-                    msg,
+                # Create a new connection for each attempt to avoid stale connections
+                smtp = aiosmtplib.SMTP(
                     hostname=settings.SMTP_HOST,
                     port=settings.SMTP_PORT,
-                    username=settings.SMTP_USERNAME,
-                    password=settings.SMTP_PASSWORD,
-                    start_tls=settings.SMTP_USE_TLS,
+                    start_tls=True,  # Use STARTTLS for port 587 (not use_tls)
+                    timeout=30,  # 30 second timeout
                 )
+
+                async with smtp:
+                    await smtp.login(settings.SMTP_USERNAME, settings.SMTP_PASSWORD)
+                    await smtp.send_message(msg)
+
                 return True
+            except (aiosmtplib.SMTPException, ConnectionError, TimeoutError, OSError) as e:
+                last_error = e
+                print(f"⚠️ Raw email send attempt {attempt}/{MAX_RETRIES} failed: {e}")
+                if attempt < MAX_RETRIES:
+                    await asyncio.sleep(2 ** attempt)  # Exponential backoff
             except Exception as e:
                 last_error = e
+                print(f"⚠️ Raw email send attempt {attempt}/{MAX_RETRIES} failed (unexpected): {e}")
                 if attempt < MAX_RETRIES:
                     await asyncio.sleep(2 ** attempt)
 

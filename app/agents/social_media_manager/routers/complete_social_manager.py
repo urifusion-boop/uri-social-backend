@@ -69,6 +69,7 @@ class ContentGenerationRequest(BaseModel):
     platforms: List[str] = Field(..., min_items=1, max_items=5)
     seed_type: str = "text"
     include_images: bool = False
+    image_model: Optional[str] = None  # e.g. "fal-ai/flux-pro/v1.1", "fal-ai/flux/dev", "fal-ai/ideogram/v3", or None (default Imagen)
     brand_context: Optional[BrandContextRequest] = None
     reference_image: Optional[str] = None  # base64 data URL uploaded by user for contextual reference
     post_type: str = "feed"   # feed | carousel | story
@@ -177,6 +178,12 @@ class BrandProfileRequest(BaseModel):
     region: Optional[str] = None
     # Meta
     onboarding_completed: Optional[bool] = False
+    # Visual style
+    style_selections: Optional[List[str]] = None
+    style_prompt_fragments: Optional[List[str]] = None
+    # Typography
+    font_style: Optional[str] = None
+    font_style_prompt: Optional[str] = None
 
 # ==============================================================================
 # CONTENT GENERATION ENDPOINTS
@@ -234,6 +241,8 @@ async def generate_content(
         profile_result = await BrandProfileService.get(user_id, db)
         profile_data = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
         brand_context_dict = BrandProfileService.to_brand_context(profile_data) if profile_data else {}
+        # Carry user_id so the style rotation logic in _generate_image_bg can update the index.
+        brand_context_dict["user_id"] = user_id
 
         # Allow explicit overrides from the request (legacy / power-user path)
         if request.brand_context:
@@ -343,6 +352,7 @@ async def generate_content(
                             reference_image=request.reference_image,
                             post_type=post_type,
                             slide_index=slide_index,
+                            image_model=request.image_model,
                         )
                 else:
                     background_tasks.add_task(
@@ -355,6 +365,7 @@ async def generate_content(
                         db=db,
                         reference_image=request.reference_image,
                         post_type=post_type,
+                        image_model=request.image_model,
                     )
 
         return result
@@ -474,7 +485,7 @@ async def instagram_direct_callback(
 
     source = state or "settings"
     is_settings = source == "settings"
-    web_app_url = settings.WEB_APP_URL
+    web_app_url = settings.WEB_APP_URL.strip("'\"")
     base_redirect = (
         f"{web_app_url}/settings/social-accounts"
         if is_settings
@@ -662,7 +673,7 @@ async def outstand_oauth_callback(
     """
     import urllib.parse
 
-    web_app_url = settings.WEB_APP_URL
+    web_app_url = settings.WEB_APP_URL.strip("'\"")
     is_settings = source == "settings"
     base_redirect = f"{web_app_url}/settings/social-accounts" if is_settings else f"{web_app_url}/social-media/brand-setup"
 
@@ -769,6 +780,29 @@ async def disconnect_social_account(
         user_id=user_id,
         outstand_account_id=outstand_account_id,
     )
+
+
+@router.delete("/connections/instagram-direct/{ig_user_id}")
+async def disconnect_instagram_direct(
+    ig_user_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Disconnect an Instagram account connected via direct OAuth (not Outstand).
+    """
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    result = await db["social_connections"].delete_one({
+        "ig_user_id": ig_user_id,
+        "user_id": user_id,
+    })
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Instagram connection not found")
+
+    return {"status": True, "responseMessage": "Instagram account disconnected"}
 
 
 # ==============================================================================
@@ -993,6 +1027,49 @@ async def delete_draft(
 
     from app.domain.responses.uri_response import UriResponse
     return UriResponse.delete_response("draft", is_deleted=True)
+
+
+class SyncImageRequest(BaseModel):
+    source_draft_id: str
+    target_draft_ids: List[str]
+
+
+@router.post("/image-sync")
+async def sync_image_across_drafts(
+    request: SyncImageRequest,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """Copy image_url from a source draft to one or more target drafts (same user only)."""
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    from app.domain.responses.uri_response import UriResponse
+
+    source = await db["content_drafts"].find_one(
+        {"id": request.source_draft_id, "user_id": user_id},
+        {"image_url": 1, "has_image": 1},
+    )
+    if not source:
+        raise HTTPException(status_code=404, detail="Source draft not found")
+
+    image_url = source.get("image_url")
+    if not image_url:
+        raise HTTPException(status_code=422, detail="Source draft has no image yet")
+
+    if not request.target_draft_ids:
+        raise HTTPException(status_code=422, detail="No target draft IDs provided")
+
+    result = await db["content_drafts"].update_many(
+        {"id": {"$in": request.target_draft_ids}, "user_id": user_id},
+        {"$set": {"image_url": image_url, "has_image": True}},
+    )
+
+    return UriResponse.get_single_data_response("sync_image", {
+        "updated_count": result.modified_count,
+        "source_draft_id": request.source_draft_id,
+    })
 
 
 @router.post("/deny")
@@ -2121,11 +2198,10 @@ async def upload_brand_logo(
     token: dict = Depends(JWTBearer()),
 ):
     """
-    Upload a brand logo image. Stores it to imgBB and saves the public URL
-    to the user's brand profile. Accepted formats: PNG, JPG, WEBP, SVG.
+    Upload a brand logo image. Saves to local static storage and stores the URL
+    in the user's brand profile. Accepted formats: PNG, JPG, WEBP, SVG.
     """
-    import base64
-    import httpx
+    import os, uuid
 
     user_id = _get_user_id(token)
     if not user_id:
@@ -2137,22 +2213,11 @@ async def upload_brand_logo(
 
     try:
         contents = await file.read()
-        if len(contents) > 5 * 1024 * 1024:  # 5 MB limit
+        if len(contents) > 5 * 1024 * 1024:
             raise HTTPException(status_code=400, detail="Logo file must be under 5 MB.")
 
-        b64 = base64.b64encode(contents).decode()
-
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                "https://api.imgbb.com/1/upload",
-                data={"key": settings.IMGBB_API_KEY, "image": b64},
-            )
-            resp_json = resp.json()
-
-        if not resp_json.get("success"):
-            raise HTTPException(status_code=502, detail=f"Image host upload failed: {resp_json.get('error', {}).get('message', 'unknown error')}")
-
-        logo_url = resp_json["data"]["url"]
+        from app.utils.cloudinary_upload import upload_bytes
+        logo_url = await upload_bytes(contents, folder="uri-social/logos")
 
         await db["brand_profiles"].update_one(
             {"user_id": user_id},
@@ -2175,12 +2240,11 @@ async def upload_sample_template(
     token: dict = Depends(JWTBearer()),
 ):
     """
-    Upload a sample design or content template. Stores it to imgBB and appends
-    the public URL to the user's brand profile sample_template_urls list.
+    Upload a sample design or content template. Saves to local static storage and
+    appends the URL to the user's brand profile sample_template_urls list.
     Accepted formats: PNG, JPG, WEBP, PDF. Max 10 MB per file.
     """
-    import base64
-    import httpx
+    import os, uuid
 
     user_id = _get_user_id(token)
     if not user_id:
@@ -2195,25 +2259,12 @@ async def upload_sample_template(
 
     try:
         contents = await file.read()
-        if len(contents) > 10 * 1024 * 1024:  # 10 MB limit
+        if len(contents) > 10 * 1024 * 1024:
             raise HTTPException(status_code=400, detail="File must be under 10 MB.")
 
-        b64 = base64.b64encode(contents).decode()
-
-        async with httpx.AsyncClient(timeout=120) as client:
-            resp = await client.post(
-                "https://api.imgbb.com/1/upload",
-                data={"key": settings.IMGBB_API_KEY, "image": b64, "name": file.filename},
-            )
-            resp_json = resp.json()
-
-        if not resp_json.get("success"):
-            raise HTTPException(
-                status_code=502,
-                detail=f"File host upload failed: {resp_json.get('error', {}).get('message', 'unknown error')}",
-            )
-
-        file_url = resp_json["data"]["url"]
+        from app.utils.cloudinary_upload import upload_bytes
+        resource_type = "raw" if file.content_type == "application/pdf" else "image"
+        file_url = await upload_bytes(contents, folder="uri-social/templates", resource_type=resource_type)
 
         await db["brand_profiles"].update_one(
             {"user_id": user_id},
@@ -2229,7 +2280,6 @@ async def upload_sample_template(
     except HTTPException:
         raise
     except Exception as e:
-        import traceback
         print(f"❌ sample-template upload error: {e}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -2278,6 +2328,7 @@ async def _generate_image_bg(
     reference_image: Optional[str] = None,
     post_type: str = "feed",
     slide_index: Optional[int] = None,
+    image_model: Optional[str] = None,
 ):
     """
     Background task: generate an image for an existing draft and save it to DB.
@@ -2290,6 +2341,34 @@ async def _generate_image_bg(
     import base64
 
     try:
+        from app.agents.social_media_manager.services.style_library import pick_next_style
+
+        # ── Visual style rotation ─────────────────────────────────────────────
+        # Read the user's selected styles and rotation index from their brand profile.
+        # Pick the next style in the cycle, inject its prompt fragment into brand_context,
+        # then increment and persist the rotation index.
+        _bp = await db["brand_profiles"].find_one(
+            {"user_id": brand_context.get("user_id", "")},
+            {"style_selections": 1, "style_prompt_fragments": 1, "style_rotation_index": 1, "industry": 1},
+        ) or {}
+        _style_selections = _bp.get("style_selections") or []
+        _style_prompt_fragments = _bp.get("style_prompt_fragments") or []
+        _rotation_index = int(_bp.get("style_rotation_index") or 0)
+        _industry = _bp.get("industry") or brand_context.get("industry", "")
+
+        _slug, _fragment, _next_index = pick_next_style(
+            _style_selections, _rotation_index, _industry, _style_prompt_fragments
+        )
+
+        if _fragment:
+            brand_context = {**brand_context, "style_prompt_fragment": _fragment, "style_slug": _slug}
+            print(f"🎨 Style [{_slug}] applied for this image (next index: {_next_index})")
+            # Persist incremented rotation index
+            await db["brand_profiles"].update_one(
+                {"user_id": brand_context.get("user_id", "")},
+                {"$set": {"style_rotation_index": _next_index}},
+            )
+
         # For story posts pass image_type="story" so we get 1080x1920 dimensions
         image_type = "story" if post_type == "story" else "post_image"
 
@@ -2300,6 +2379,7 @@ async def _generate_image_bg(
             brand_context=brand_context,
             reference_image=reference_image,
             image_type=image_type,
+            image_model=image_model,
         )
 
         if not image_result.get("status"):
@@ -2309,22 +2389,14 @@ async def _generate_image_bg(
         raw_url = image_result["responseData"]["image_url"]
         stored_url = raw_url
 
-        # Save base64 image to local static storage (served directly by this backend)
+        # Upload base64 image to Cloudinary
         if raw_url and raw_url.startswith("data:"):
             try:
-                match = re.match(r"data:[^;]+;base64,(.+)", raw_url, re.DOTALL)
-                if match:
-                    import uuid as _uuid
-                    filename = f"{_uuid.uuid4().hex}.webp"
-                    static_dir = "/app/static/images"
-                    os.makedirs(static_dir, exist_ok=True)
-                    img_bytes = base64.b64decode(match.group(1))
-                    with open(f"{static_dir}/{filename}", "wb") as _f:
-                        _f.write(img_bytes)
-                    stored_url = f"/static/images/{filename}"
-                    print(f"💾 BG image saved locally: {stored_url}")
+                from app.utils.cloudinary_upload import upload_base64
+                stored_url = await upload_base64(raw_url, folder="uri-social/generated")
+                print(f"☁️  BG image uploaded to Cloudinary: {stored_url}")
             except Exception as upload_err:
-                print(f"⚠️  BG local image save error: {upload_err}")
+                print(f"⚠️  Cloudinary upload error: {upload_err}")
 
         final_url = stored_url if not stored_url.startswith("data:") else None
         if final_url and db is not None:

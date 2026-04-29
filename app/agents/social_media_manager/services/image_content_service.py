@@ -249,38 +249,48 @@ class ImageContentService:
         reference_image: Optional[str] = None,
         feedback: Optional[str] = None,
         image_type: str = "post_image",
+        image_model: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Generate an AI image optimized for a specific platform.
         image_type: "post_image" (default), "story" (9:16), or any key in IMAGE_SPECS[platform].
         """
         try:
-            # Get platform image specifications
+            image_model = "openai/gpt-image-2"
+
             specs = ImageContentService._get_platform_image_specs(platform, image_type=image_type)
 
-            # Try GPT-5.4 meta-prompting first — picks image type and generates brief
-            image_prompt = await ImageContentService._generate_image_brief(
-                content=content,
-                seed_content=seed_content,
-                platform=platform,
-                brand_context=brand_context,
-                specs=specs,
-                reference_image=reference_image,
-                feedback=feedback,
-            )
+            bc = brand_context or {}
+            style_fragment = bc.get("style_prompt_fragment", "")
+            font_prompt = bc.get("font_style_prompt", "")
+            region = bc.get("region", "")
 
-            # Fall back to static prompt if GPT-4.1 fails
+            # Look up the style description from the library using the slug
+            style_slug = bc.get("style_slug", "")
+            style_desc = ""
+            if style_slug:
+                from app.agents.social_media_manager.services.style_library import get_style
+                s = get_style(style_slug)
+                if s:
+                    style_desc = s.get("description", "")
+
+            # Build prompt directly: style fragment + description + content + region + font
+            parts = []
+            if style_fragment:
+                parts.append(style_fragment)
+            if style_desc:
+                parts.append(style_desc)
+            parts.append(seed_content.strip())
+            if region:
+                parts.append(f"Market/region: {region}. Use settings, aesthetics, and cultural references specific to this market.")
+            if font_prompt:
+                parts.append(font_prompt)
+            image_prompt = " ".join(p for p in parts if p)
+
             if not image_prompt:
-                image_prompt = ImageContentService._create_image_prompt(
-                    content=content,
-                    seed_content=seed_content,
-                    platform=platform,
-                    brand_context=brand_context,
-                    specs=specs
-                )
+                image_prompt = seed_content.strip()
 
-            # When a reference image is provided, always append a hard no-crop directive
-            # directly to the prompt so the image model cannot ignore it.
+            # When a reference image is provided, always append a hard no-crop directive.
             if reference_image:
                 image_prompt = (
                     image_prompt.rstrip()
@@ -288,14 +298,25 @@ class ImageContentService:
                     "no cropping of any part of the clothing, subject, or object. Wide enough framing to show everything."
                 )
 
+            print(
+                f"\n{'━'*60}\n"
+                f"📤 FINAL PROMPT → GPT-Image-2 [{platform.upper()}] "
+                f"({'with style' if style_fragment else 'no style'}"
+                f"{' + font' if font_prompt else ''})\n"
+                f"{'━'*60}\n"
+                f"{image_prompt}\n"
+                f"{'━'*60}\n"
+            )
+
             image_response = await ImageContentService._call_dalle_api(
                 prompt=image_prompt,
                 size=f"{specs['width']}x{specs['height']}",
                 reference_image=reference_image,
+                image_model=image_model,
             )
 
             if image_response.get('success'):
-                # Composite brand logo onto generated image if available
+                # Composite brand logo onto generated image for all models.
                 logo_url = (brand_context or {}).get('logo_url')
                 if logo_url:
                     import re as _re_logo
@@ -323,6 +344,61 @@ class ImageContentService:
             return UriResponse.error_response(f"Platform image generation failed: {str(e)}")
 
     @staticmethod
+    async def _enhance_prompt_for_gpt_image2(
+        seed_content: str,
+        platform: str,
+        specs: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """
+        GPT-4o-mini thinking layer: expands the user's casual request into a
+        detailed image spec before calling GPT-Image-2. Compensates for the
+        API's lack of built-in reasoning (the gap vs ChatGPT's thinking mode).
+        Falls back to raw seed_content if the call fails.
+        """
+        try:
+            from app.services.AIService import client as _oai_client
+
+            w = (specs or {}).get("width", 1024)
+            h = (specs or {}).get("height", 1024)
+            orientation = "landscape" if w > h else ("portrait" if h > w else "square")
+
+            system_prompt = (
+                "You are an expert art director and prompt engineer. "
+                "Your job is to take a user's casual image request and expand it into a rich, "
+                "detailed image generation prompt optimized for GPT-Image-2. "
+                "Output a single paragraph (3-5 sentences) describing the scene, subjects, "
+                "composition, lighting, color palette, mood, and visual style. "
+                "Be specific and vivid. Avoid vague adjectives like 'beautiful' or 'amazing'. "
+                "Output only the prompt text — no explanation, no preamble, no quotes."
+            )
+
+            user_message = (
+                f"Platform: {platform} ({orientation}, {w}x{h})\n"
+                f"User request: {seed_content}\n\n"
+                "Write a detailed image generation prompt:"
+            )
+
+            loop = asyncio.get_running_loop()
+            response = await loop.run_in_executor(
+                None,
+                lambda: _oai_client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_message},
+                    ],
+                    max_tokens=300,
+                    temperature=0.7,
+                ),
+            )
+            enhanced = response.choices[0].message.content.strip()
+            print(f"🧠 GPT-Image-2 prompt enhanced ({len(enhanced)} chars): {enhanced[:100]}…")
+            return enhanced
+        except Exception as _e:
+            print(f"⚠️ GPT-Image-2 prompt enhancer failed: {_e} — using raw seed content")
+            return seed_content.strip()
+
+    @staticmethod
     async def _generate_image_brief(
         content: str,
         seed_content: str,
@@ -331,10 +407,14 @@ class ImageContentService:
         specs: Optional[Dict[str, Any]] = None,
         reference_image: Optional[str] = None,
         feedback: Optional[str] = None,
+        style_fragment: str = "",
+        font_prompt: str = "",
     ) -> Optional[str]:
         """
-        Use GPT-4.1 to select the most appropriate image type for the content,
-        then write a detailed prompt for gpt-image-1.5.
+        Use GPT-5.4 to select the most appropriate image type for the content,
+        then write a detailed flowing prompt for GPT-Image-2.
+        style_fragment and font_prompt are injected as hard creative directives
+        so they are reliably woven into the final image prompt.
 
         Image types the AI can choose from:
           PHOTO          — Authentic photorealistic documentary photograph
@@ -492,13 +572,30 @@ class ImageContentService:
                 if brand_lines else ""
             )
 
+            # Hard style + font directives — these are non-negotiable constraints that
+            # must be woven into the FINAL_PROMPT, not overridden by creative choices.
+            style_directive_block = ""
+            if style_fragment:
+                style_directive_block += (
+                    f"\n\n🎨 MANDATORY VISUAL STYLE DIRECTIVE (non-negotiable — this overrides your default type choice):\n"
+                    f"{style_fragment}\n"
+                    f"Your FINAL_PROMPT MUST be written to produce an image that matches this exact visual style. "
+                    f"Every word of your prompt should serve this direction."
+                )
+            if font_prompt:
+                style_directive_block += (
+                    f"\n\n✏️ MANDATORY TYPOGRAPHY DIRECTIVE (non-negotiable):\n"
+                    f"{font_prompt}\n"
+                    f"If the image includes any text or typographic elements, they must follow this direction exactly."
+                )
+
             system_prompt = (
                 "You are a world-class creative director and AI image prompt engineer at a top African brand agency. "
                 "Your job is to commission visually stunning, commercially ready images for social media — "
                 "the kind that appear in real campaigns by Flutterwave, Paystack, Moniepoint, and MTN. "
-                "You brief Nano Banana 2 (Google Imagen 4 Ultra), a state-of-the-art photorealistic image model.\n\n"
+                "You brief GPT-Image-2, a state-of-the-art image generation model.\n\n"
 
-                "Nano Banana 2 performs best with flowing, scene-rich natural-language prompts — "
+                "GPT-Image-2 performs best with flowing, scene-rich natural-language prompts — "
                 "NOT structured notes or labeled sections. Your final deliverable is a single master prompt "
                 "that reads like a director's brief to a photographer and art director simultaneously.\n\n"
 
@@ -534,10 +631,13 @@ class ImageContentService:
                 "CRITICAL: NEVER write the business name or brand name as text on the image. "
                 "Logo overlays are handled separately in post-processing — do NOT add any logo or brand name text.\n\n"
 
-                "TEXT SAFE ZONE (critical): ALL text must sit in the middle 80% of the canvas. "
-                "The top 15% and bottom 10% must be completely free of text — "
-                "social platforms and display frames crop these margins. "
-                "Place headlines in the lower-centre or centre of the frame — NEVER at the top edge.\n\n"
+                "SAFE ZONE — ABSOLUTE RULE: The image will be center-cropped to fit the target aspect ratio. "
+                "The top 15% and bottom 15% of the canvas are the CROP DANGER ZONE — treat them as if they do not exist. "
+                "ALL important content — faces, eyes, the main subject, key objects, text overlays, logos — "
+                "must be fully contained within the center 70% of the canvas vertically. "
+                "Leave the top 15% and bottom 15% as plain background, gradient, texture, or sky. "
+                "This is not a suggestion — any subject or element that extends into these margins WILL be cut off. "
+                "Compose the shot so everything meaningful is in the middle vertical band.\n\n"
 
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 "STEP 3 — Write the reasoning sections (internal):\n"
@@ -557,6 +657,9 @@ class ImageContentService:
                 "FINAL_PROMPT: [A single flowing paragraph of 200-260 words that Imagen 4 Ultra will "
                 "render directly. Rules:\n"
                 "• Open with the image type and format (e.g. 'Premium editorial photograph,' or 'Bold graphic design poster,')\n"
+                "• COMPOSITION FIRST: explicitly state that the subject is centered vertically in the middle 70% of the frame, "
+                "with open sky/background/gradient filling the top and bottom 15% — e.g. 'Subject centered in the mid-frame, "
+                "upper and lower 15% of canvas left as open gradient background.'\n"
                 "• Describe the subject with cinematic specificity: person's age range, skin tone, hair, exact clothing, "
                 "expression, and precise action — never generic, always specific\n"
                 "• Describe the setting with architectural and environmental detail — specific city district, "
@@ -591,7 +694,7 @@ class ImageContentService:
                 f"{ref_instruction}"
                 f"POST CONTENT TO VISUALIZE:\n{content[:700]}\n\n"
                 f"Original business topic: {seed_content[:300]}\n\n"
-                f"{brand_block}{feedback_block}\n\n"
+                f"{brand_block}{style_directive_block}{feedback_block}\n\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 "YOUR TASK:\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -605,9 +708,14 @@ class ImageContentService:
                 f"4. Brand colors ({brand_colors_str if brand_colors_str else 'from brand identity'}) "
                 "must appear prominently — described in words only, no hex codes.\n"
                 "5. In FINAL_PROMPT: write a single flowing paragraph of cinematic richness. "
-                "This paragraph is fed DIRECTLY to Imagen 4 Ultra — it must be vivid, specific, "
+                "This paragraph is fed DIRECTLY to GPT-Image-2 — it must be vivid, specific, "
                 "and commercially ready. Every word counts. Describe things the camera would see, "
-                "not abstract concepts. No labels, no sections — pure prose only."
+                "not abstract concepts. No labels, no sections — pure prose only. "
+                + (
+                    "The MANDATORY VISUAL STYLE DIRECTIVE above must be the foundation of your FINAL_PROMPT — "
+                    "every scene, lighting, composition, and typography decision must serve that style. "
+                    if style_fragment else ""
+                )
             )
 
             logo_url = brand_context.get("logo_url") if brand_context else None
@@ -1201,6 +1309,7 @@ class ImageContentService:
         prompt: str,
         size: str = "1024x1024",
         reference_image: Optional[str] = None,
+        image_model: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Generate an image using Nano Banana 2 (Google Imagen via Gemini API).
@@ -1226,7 +1335,8 @@ class ImageContentService:
             # ── Image-edit path (reference image provided) ─────────────────────
             # Skip Imagen (text-to-image only) and use gpt-image-1 edit endpoint,
             # which takes the reference as a base and applies the prompt as overlays.
-            if reference_image:
+            # GPT-Image-2 handles its own reference image path below.
+            if reference_image and (image_model or "") not in ("openai/gpt-image-2", "fal-ai/openai/gpt-image-2"):
                 try:
                     from app.services.AIService import client as _ai_client
                     from PIL import Image as _PILImage
@@ -1292,6 +1402,156 @@ class ImageContentService:
                 except Exception as _edit_err:
                     print(f"⚠️ gpt-image-1 edit failed: {_edit_err} — falling back to standard generation")
                     # Fall through to standard generation below
+
+            # ── GPT-Image-2 direct OpenAI path ────────────────────────────────
+            if (image_model or "") in ("openai/gpt-image-2", "fal-ai/openai/gpt-image-2"):
+                try:
+                    from app.services.AIService import client as _oai_client
+                    import base64 as _b64
+                    from PIL import Image as _PILImage
+                    import io as _io
+
+                    if target_w > target_h:
+                        _gpt2_size = "1536x1024"
+                    elif target_h > target_w:
+                        _gpt2_size = "1024x1536"
+                    else:
+                        _gpt2_size = "1024x1024"
+
+                    if reference_image:
+                        # Decode reference image to PNG bytes for the edit endpoint
+                        if reference_image.startswith("data:"):
+                            import re as _re_ref2
+                            _m2 = _re_ref2.match(r"data:[^;]+;base64,(.+)", reference_image, _re_ref2.DOTALL)
+                            _ref_bytes = _b64.b64decode(_m2.group(1)) if _m2 else None
+                        else:
+                            import httpx as _httpx2
+                            async with _httpx2.AsyncClient(timeout=20) as _c2:
+                                _r2 = await _c2.get(reference_image)
+                                _ref_bytes = _r2.content if _r2.status_code == 200 else None
+
+                        if not _ref_bytes:
+                            raise ValueError("Could not load reference image bytes for GPT-Image-2 edit")
+
+                        _ref_img = _PILImage.open(_io.BytesIO(_ref_bytes)).convert("RGBA")
+                        _tw2, _th2 = map(int, _gpt2_size.split("x"))
+                        _ref_img = _ref_img.resize((_tw2, _th2), _PILImage.LANCZOS)
+                        _ref_png_buf = _io.BytesIO()
+                        _ref_img.save(_ref_png_buf, format="PNG")
+                        _ref_png_buf.seek(0)
+
+                        print(f"🎨 GPT-Image-2 edit with reference ({_gpt2_size})…")
+                        loop = asyncio.get_running_loop()
+                        _gpt2_resp = await loop.run_in_executor(
+                            None,
+                            lambda: _oai_client.images.edit(
+                                model="gpt-image-2",
+                                image=("reference.png", _ref_png_buf, "image/png"),
+                                prompt=prompt,
+                                n=1,
+                                size=_gpt2_size,
+                            ),
+                        )
+                        _mode = "gpt-image-2-edit"
+                    else:
+                        print(f"🎨 GPT-Image-2 direct OpenAI ({_gpt2_size})…")
+                        loop = asyncio.get_running_loop()
+                        _gpt2_resp = await loop.run_in_executor(
+                            None,
+                            lambda: _oai_client.images.generate(
+                                model="gpt-image-2",
+                                prompt=prompt,
+                                n=1,
+                                size=_gpt2_size,
+                                quality="high",
+                                output_format="webp",
+                            ),
+                        )
+                        _mode = "gpt-image-2"
+
+                    _gpt2_b64 = _gpt2_resp.data[0].b64_json
+
+                    _gpt2_img = _PILImage.open(_io.BytesIO(_b64.b64decode(_gpt2_b64))).convert("RGB")
+                    _gpt2_buf = _io.BytesIO()
+                    _gpt2_img.save(_gpt2_buf, format="WEBP", quality=97, method=6)
+                    _gpt2_b64 = _b64.b64encode(_gpt2_buf.getvalue()).decode()
+
+                    print(f"✅ GPT-Image-2 ready ({_gpt2_size}, {_mode})")
+                    return {
+                        "success": True,
+                        "url": f"data:image/webp;base64,{_gpt2_b64}",
+                        "model": _mode,
+                    }
+                except Exception as _gpt2_err:
+                    print(f"⚠️ GPT-Image-2 failed: {_gpt2_err} — falling back to Imagen/GPT")
+
+            # ── fal.ai path (model explicitly chosen from frontend) ────────────
+            _fal_model = image_model or ""
+            if _fal_model.startswith("fal-ai/") and _cfg.FAL_API_KEY:
+                try:
+                    import os as _os
+                    import httpx as _httpx
+                    import fal_client as _fal
+
+                    _os.environ.setdefault("FAL_KEY", _cfg.FAL_API_KEY)
+
+                    # Map pixel dimensions to fal.ai image_size strings
+                    def _fal_size(w: int, h: int) -> str:
+                        r = w / h
+                        if r >= 1.6:   return "landscape_16_9"
+                        if r >= 1.2:   return "landscape_4_3"
+                        if r <= 0.65:  return "portrait_16_9"
+                        if r <= 0.85:  return "portrait_4_3"
+                        return "square_hd"
+
+                    _fal_image_size = _fal_size(target_w, target_h)
+
+                    print(f"🎨 fal.ai [{_fal_model}] generating ({_fal_image_size})…")
+
+                    _fal_args = {
+                        "prompt": prompt,
+                        "image_size": _fal_image_size,
+                        "num_images": 1,
+                        "output_format": "jpeg",
+                        "num_inference_steps": 28,
+                        "guidance_scale": 3.5,
+                    }
+
+                    loop = asyncio.get_running_loop()
+                    _fal_result = await loop.run_in_executor(
+                        None,
+                        lambda: _fal.run(_fal_model, arguments=_fal_args),
+                    )
+
+                    _fal_images = _fal_result.get("images") or []
+                    if not _fal_images:
+                        raise ValueError(f"fal.ai returned no images: {_fal_result}")
+
+                    _fal_url = _fal_images[0].get("url") or ""
+                    if not _fal_url:
+                        raise ValueError("fal.ai image url is empty")
+
+                    # Download and convert to WebP base64
+                    async with _httpx.AsyncClient(timeout=60) as _hc:
+                        _dl = await _hc.get(_fal_url)
+                        _dl.raise_for_status()
+                    import io as _io
+                    from PIL import Image as _PILImage
+                    _fal_img = _PILImage.open(_io.BytesIO(_dl.content)).convert("RGB")
+                    _fal_buf = _io.BytesIO()
+                    _fal_img.save(_fal_buf, format="WEBP", quality=97, method=6)
+                    import base64 as _b64
+                    _fal_b64 = _b64.b64encode(_fal_buf.getvalue()).decode()
+                    _fal_b64 = ImageContentService._crop_to_ratio(_fal_b64, target_w, target_h)
+
+                    print(f"✅ fal.ai [{_fal_model}] image ready")
+                    return {
+                        "success": True,
+                        "url": f"data:image/webp;base64,{_fal_b64}",
+                        "model": _fal_model,
+                    }
+                except Exception as _fal_err:
+                    print(f"⚠️ fal.ai [{_fal_model}] failed: {_fal_err} — falling back to Imagen/GPT")
 
             if _cfg.GOOGLE_GEMINI_API_KEY:
                 # ── Nano Banana 2 via Google GenAI SDK ────────────────────────
