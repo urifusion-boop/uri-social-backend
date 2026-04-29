@@ -88,7 +88,7 @@ class EmailService:
                 smtp = aiosmtplib.SMTP(
                     hostname=settings.SMTP_HOST,
                     port=settings.SMTP_PORT,
-                    use_tls=settings.SMTP_USE_TLS,
+                    start_tls=True,  # Use STARTTLS for port 587 (not use_tls)
                     timeout=30,  # 30 second timeout
                 )
 
@@ -135,7 +135,7 @@ class EmailService:
                 smtp = aiosmtplib.SMTP(
                     hostname=settings.SMTP_HOST,
                     port=settings.SMTP_PORT,
-                    use_tls=settings.SMTP_USE_TLS,
+                    start_tls=True,  # Use STARTTLS for port 587 (not use_tls)
                     timeout=30,  # 30 second timeout
                 )
 
