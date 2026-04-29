@@ -336,6 +336,8 @@ class NotificationService:
             subject=subject,
             status="sent" if success else "failed",
             metadata={"campaign_id": campaign_id, "platforms": platforms},
+        ,
+            error="Email delivery failed" if not success else None,
         )
 
         # Update last_active_at
@@ -388,6 +390,8 @@ class NotificationService:
             subject=subject,
             status="sent" if success else "failed",
             metadata={"platform": platform, "campaign_id": campaign_id},
+        ,
+            error="Email delivery failed" if not success else None,
         )
 
     # ==================== PRD 4.4: Daily Suggestion ====================
@@ -433,6 +437,8 @@ class NotificationService:
             subject=subject,
             status="sent" if success else "failed",
             metadata={"suggestion": suggestion, "topic": topic},
+        ,
+            error="Email delivery failed" if not success else None,
         )
 
     # ==================== PRD 4.5: Inactivity Notification ====================
@@ -480,6 +486,8 @@ class NotificationService:
             subject=subject,
             status="sent" if success else "failed",
             metadata={"days_inactive": days_inactive},
+        ,
+            error="Email delivery failed" if not success else None,
         )
 
     # ==================== PRD 4.6: Trial Notifications ====================
@@ -522,6 +530,8 @@ class NotificationService:
             subject=subject,
             status="sent" if success else "failed",
             metadata={"trial_days": trial_days, "trial_credits": trial_credits},
+        ,
+            error="Email delivery failed" if not success else None,
         )
 
     async def notify_trial_ending(
@@ -560,6 +570,8 @@ class NotificationService:
             subject=subject,
             status="sent" if success else "failed",
             metadata={"credits_remaining": credits_remaining},
+        ,
+            error="Email delivery failed" if not success else None,
         )
 
     async def notify_trial_expired(self, user_id: str):
@@ -592,6 +604,8 @@ class NotificationService:
             channel="email",
             subject=subject,
             status="sent" if success else "failed",
+            metadata={},
+            error="Email delivery failed" if not success else None,
         )
 
     # ==================== PRD 8: Activity Tracking ====================
