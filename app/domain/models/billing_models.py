@@ -379,6 +379,7 @@ class SubscriptionResponse(BaseModel):
     credits: int
     credits_remaining: int
     next_renewal: Optional[datetime] = None
+    billing_cycle: str = "monthly"  # PRD 8.1: Current billing cycle
 
     class Config:
         schema_extra = {
