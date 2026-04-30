@@ -275,8 +275,20 @@ class ImageContentService:
                 if s:
                     style_desc = s.get("description", "")
 
-            # Build prompt directly: style fragment + description + content + region + brand colors + font
+            # Brand colors lead the prompt as a hard constraint so the model cannot ignore them
+            color_str = ", ".join(str(c) for c in brand_colors[:4]) if brand_colors else ""
+            color_block = (
+                f"STRICT COLOR RULE — this overrides everything else: "
+                f"The ONLY colors allowed in this image are {color_str}. "
+                f"Every background, surface, accent, shape, and graphic element must use ONLY these brand colors. "
+                f"No other colors are permitted. Do not introduce white, grey, beige, black, or any color not listed above "
+                f"unless it is one of the brand colors. The color palette is locked to: {color_str}. "
+            ) if color_str else ""
+
+            # Build prompt: color lock → style fragment → style description → content → region → font
             parts = []
+            if color_block:
+                parts.append(color_block)
             if style_fragment:
                 parts.append(style_fragment)
             if style_desc:
@@ -284,14 +296,11 @@ class ImageContentService:
             parts.append(seed_content.strip())
             if region:
                 parts.append(f"Market/region: {region}. Use settings, aesthetics, and cultural references specific to this market.")
-            if brand_colors:
-                color_str = ", ".join(str(c) for c in brand_colors[:4])
-                parts.append(
-                    f"Brand color palette: {color_str}. "
-                    f"These colors must be used as the dominant palette — backgrounds, accents, graphic elements, and key visual areas should reflect these exact brand colors."
-                )
             if font_prompt:
                 parts.append(font_prompt)
+            # Reinforce color lock at the end so it bookends the prompt
+            if color_block:
+                parts.append(f"REMINDER: use ONLY the brand colors {color_str} — reject any other color in the image.")
             image_prompt = " ".join(p for p in parts if p)
 
             if not image_prompt:
