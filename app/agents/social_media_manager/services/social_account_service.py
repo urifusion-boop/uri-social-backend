@@ -328,6 +328,7 @@ class SocialAccountService:
                     "is_active": True,
                     "connected_at": doc.get("connected_at"),
                     "page_name": doc.get("account_name"),
+                    "ig_user_id": doc.get("ig_user_id"),
                 })
 
             total = sum(len(v) for v in by_platform.values())
