@@ -712,6 +712,10 @@ class WhatsAppFlowService:
             await WhatsAppFlowService._handle_ideas_pick(phone, text, body.strip(), user_id, ctx, db)
             return
 
+        if state == "generating_graphic":
+            await _send(phone, "⏳ Still working on your graphic — it takes 2-3 minutes. I'll send it as soon as it's ready!")
+            return
+
         if state == "showing_graphic":
             await WhatsAppFlowService._handle_graphic_actions(phone, text, user_id, ctx, db)
             return
@@ -924,6 +928,12 @@ class WhatsAppFlowService:
         ctx: Dict[str, Any],
         db: AsyncIOMotorDatabase,
     ) -> None:
+        # If user sends a greeting in this state, re-show content + options
+        if text in _GREETING_WORDS:
+            await _send(phone, _format_content(ctx))
+            await _safe_set_state(phone, "showing_content", ctx, db)
+            return
+
         # Fast-path keyword matching
         # ⚠️ Check graphic FIRST — "generate a graphic for this post" contains "post"
         if any(w in text for w in _GRAPHIC_WORDS) or text == "3":
@@ -961,7 +971,7 @@ class WhatsAppFlowService:
         # AI intent fallback
         intent = await _ai_intent(
             raw_body,
-            ["post_now", "schedule", "graphic", "caption", "new_idea", "edit", "ideas", "unknown"],
+            ["post_now", "schedule", "graphic", "caption", "new_idea", "edit", "ideas", "greeting", "unknown"],
             "The user has just seen social media content (headline, subheadline, caption).",
         )
 
@@ -982,6 +992,10 @@ class WhatsAppFlowService:
             await WhatsAppFlowService._handle_edit_choice(phone, text, raw_body, user_id, ctx, db)
         elif intent == "ideas":
             await WhatsAppFlowService._send_ideas(phone, user_id, ctx.get("topic", ""), db)
+        elif intent == "greeting":
+            # Re-show the content so they can pick an action
+            await _send(phone, _format_content(ctx))
+            await _safe_set_state(phone, "showing_content", ctx, db)
         else:
             # Unknown — ask for clarification rather than taking an unsolicited action
             await _send(
@@ -1469,6 +1483,8 @@ class WhatsAppFlowService:
             return
 
         await _send(phone, "Creating your design... 🎨")
+        # Lock state so any messages during the 2-3 min generation get a friendly bounce
+        await _safe_set_state(phone, "generating_graphic", ctx, db)
 
         brand = await _brand_context(user_id, db)
         headline = ctx.get("headline", "")
