@@ -85,16 +85,18 @@ class EmailService:
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 # Create a new connection for each attempt to avoid stale connections
+                # Port 465 uses direct SSL/TLS connection (no STARTTLS needed)
                 smtp = aiosmtplib.SMTP(
                     hostname=settings.SMTP_HOST,
                     port=settings.SMTP_PORT,
-                    start_tls=True,  # Use STARTTLS for port 587 (not use_tls)
-                    timeout=30,  # 30 second timeout
+                    use_tls=True,  # Direct SSL/TLS for port 465
+                    timeout=30,
                 )
 
-                async with smtp:
-                    await smtp.login(settings.SMTP_USERNAME, settings.SMTP_PASSWORD)
-                    await smtp.send_message(msg)
+                await smtp.connect()
+                await smtp.login(settings.SMTP_USERNAME, settings.SMTP_PASSWORD)
+                await smtp.send_message(msg)
+                await smtp.quit()
 
                 return True
             except (aiosmtplib.SMTPException, ConnectionError, TimeoutError, OSError) as e:
@@ -132,16 +134,18 @@ class EmailService:
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 # Create a new connection for each attempt to avoid stale connections
+                # Port 465 uses direct SSL/TLS connection (no STARTTLS needed)
                 smtp = aiosmtplib.SMTP(
                     hostname=settings.SMTP_HOST,
                     port=settings.SMTP_PORT,
-                    start_tls=True,  # Use STARTTLS for port 587 (not use_tls)
-                    timeout=30,  # 30 second timeout
+                    use_tls=True,  # Direct SSL/TLS for port 465
+                    timeout=30,
                 )
 
-                async with smtp:
-                    await smtp.login(settings.SMTP_USERNAME, settings.SMTP_PASSWORD)
-                    await smtp.send_message(msg)
+                await smtp.connect()
+                await smtp.login(settings.SMTP_USERNAME, settings.SMTP_PASSWORD)
+                await smtp.send_message(msg)
+                await smtp.quit()
 
                 return True
             except (aiosmtplib.SMTPException, ConnectionError, TimeoutError, OSError) as e:
