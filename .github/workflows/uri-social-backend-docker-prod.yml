@@ -89,8 +89,8 @@ jobs:
             docker pull uriteam/urisvc:uriagentprod
 
             # Deploy container (will restart uri-agent.api.prod)
-            docker-compose -p uri-social-backend-prod -f docker-compose.prod.yml down
-            docker-compose -p uri-social-backend-prod -f docker-compose.prod.yml up -d
+            docker compose -f docker-compose.prod.yml down
+            docker compose -f docker-compose.prod.yml up -d
 
             # Cleanup redundant images
             docker image prune -f
