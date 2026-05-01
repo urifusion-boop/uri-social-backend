@@ -27,6 +27,52 @@ from ..services import content_calendar_service as cal_svc
 router = APIRouter(tags=["Social Media Manager"])
 
 
+def _apply_intelligent_fallbacks(profile_data: Dict[str, Any], missing_fields: List[str]) -> Dict[str, Any]:
+    """
+    Apply intelligent, brand-safe fallbacks for missing brand profile fields.
+    Uses URI Social's brand identity when user's brand is incomplete.
+
+    This prevents hallucinations while maintaining good UX.
+    """
+    profile = profile_data.copy()
+
+    # URI Social brand colors (sophisticated, professional palette)
+    URI_BRAND_COLORS = [
+        "#C41E3A",  # Deep magenta (primary)
+        "#FFFEF2",  # Ivory white (secondary)
+        "#8B1538",  # Darker magenta (accent)
+        "#FFE5EC",  # Soft blush (light accent)
+    ]
+
+    if "brand_colors" in missing_fields:
+        profile["brand_colors"] = URI_BRAND_COLORS
+        print(f"🎨 Fallback: Using URI Social brand colors {URI_BRAND_COLORS}")
+
+    if "brand_name" in missing_fields:
+        # Use a generic but professional placeholder
+        profile["brand_name"] = profile.get("business_name", "Your Brand")
+        print(f"📛 Fallback: Using placeholder brand name: {profile['brand_name']}")
+
+    if "industry" in missing_fields:
+        # Default to general_other which uses lifestyle_natural style (no text overlays)
+        profile["industry"] = "general_other"
+        print(f"🏭 Fallback: Using general industry category")
+
+    if "style_selections" not in profile or not profile.get("style_selections"):
+        # Default to lifestyle_natural - clean, no text overlays, safe
+        profile["style_selections"] = ["lifestyle_natural"]
+        profile["style_prompt_fragments"] = []
+        profile["style_rotation_index"] = 0
+        print(f"🎨 Fallback: Using lifestyle_natural style (no text overlays)")
+
+    if "region" not in profile or not profile.get("region"):
+        # Default to West Africa since most users are likely Nigerian
+        profile["region"] = "West Africa, Nigeria"
+        print(f"🌍 Fallback: Using West Africa, Nigeria as default region")
+
+    return profile
+
+
 def _get_user_id(token: dict) -> str | None:
     """
     Extract user_id from JWT payload.
@@ -74,6 +120,7 @@ class ContentGenerationRequest(BaseModel):
     reference_image: Optional[str] = None  # base64 data URL uploaded by user for contextual reference
     post_type: str = "feed"   # feed | carousel | story
     num_slides: int = 3        # carousel only (2–5)
+    acknowledged_incomplete_profile: bool = False  # OPTION 1: User acknowledged incomplete profile warning
 
 class SocialConnectionRequest(BaseModel):
     platforms: List[str] = Field(..., min_items=1, max_items=10)
@@ -237,12 +284,58 @@ async def generate_content(
                     }
                 )
 
+        # ========== OPTION 1: PROGRESSIVE ENFORCEMENT ==========
         # Load brand profile from onboarding (source of truth).
         profile_result = await BrandProfileService.get(user_id, db)
         profile_data = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
-        brand_context_dict = BrandProfileService.to_brand_context(profile_data) if profile_data else {}
-        # Carry user_id so the style rotation logic in _generate_image_bg can update the index.
+
+        if not profile_data:
+            return UriResponse.error_response(
+                f"No brand profile found for user {user_id}. Please complete onboarding first.",
+                status_code=400
+            )
+
+        # Check for critical missing fields
+        required_fields = {
+            "brand_name": profile_data.get("brand_name"),
+            "brand_colors": profile_data.get("brand_colors") and len(profile_data.get("brand_colors", [])) > 0,
+            "industry": profile_data.get("industry"),
+        }
+        missing_fields = [k for k, v in required_fields.items() if not v]
+
+        # PROGRESSIVE ENFORCEMENT: Warn but allow generation with intelligent fallbacks
+        if missing_fields:
+            # Check if user acknowledged incomplete profile
+            acknowledged = getattr(request, 'acknowledged_incomplete_profile', False)
+
+            if not acknowledged:
+                # Return warning response for frontend modal
+                implications = {}
+                if "brand_colors" in missing_fields:
+                    implications["brand_colors"] = "We'll use URI Social's brand colors (deep magenta #C41E3A and ivory #FFFEF2)"
+                if "industry" in missing_fields:
+                    implications["industry"] = "We'll use generic lifestyle styling"
+                if "brand_name" in missing_fields:
+                    implications["brand_name"] = "We'll use a placeholder brand name"
+
+                return {
+                    "status": False,
+                    "responseCode": "INCOMPLETE_PROFILE",
+                    "responseMessage": "Your brand profile is incomplete. Complete it for better brand consistency, or continue with safe defaults.",
+                    "responseData": {
+                        "missing_fields": missing_fields,
+                        "implications": implications,
+                        "can_proceed": True,
+                    }
+                }
+
+        # Apply intelligent fallbacks for missing fields
+        profile_data = _apply_intelligent_fallbacks(profile_data, missing_fields)
+
+        brand_context_dict = BrandProfileService.to_brand_context(profile_data)
         brand_context_dict["user_id"] = user_id
+        brand_context_dict["using_fallbacks"] = len(missing_fields) > 0
+        brand_context_dict["fallback_fields"] = missing_fields
 
         # Allow explicit overrides from the request (legacy / power-user path)
         if request.brand_context:

@@ -749,7 +749,10 @@ def pick_next_style(
     """
     if not style_selections:
         industry_styles = get_styles_for_industry(industry)
-        slug = industry_styles[0] if industry_styles else "bold_loud"
+        # CRITICAL FIX: Default to lifestyle_natural (no text) instead of bold_loud (massive text)
+        # bold_loud has "Massive typography filling 60%+ of frame" which causes unwanted text overlays
+        # lifestyle_natural has "No heavy text overlay" - better default for users without brand profiles
+        slug = "lifestyle_natural" if not industry_styles else industry_styles[0]
         fragment = get_prompt_fragment(slug)
         return slug, fragment, 0
 
