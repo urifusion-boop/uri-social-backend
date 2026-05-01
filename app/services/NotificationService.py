@@ -336,7 +336,6 @@ class NotificationService:
             subject=subject,
             status="sent" if success else "failed",
             metadata={"campaign_id": campaign_id, "platforms": platforms},
-        ,
             error="Email delivery failed" if not success else None,
         )
 
