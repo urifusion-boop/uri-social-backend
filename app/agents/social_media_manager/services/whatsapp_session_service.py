@@ -103,9 +103,18 @@ class WhatsAppSessionService:
 
     @staticmethod
     async def get_all_linked_users(db: AsyncIOMotorDatabase):
-        """Return all users who have a linked WhatsApp phone."""
+        """Return all users who have a linked WhatsApp phone, deduplicated by phone."""
         cursor = db["users"].find(
             {"whatsapp_phone": {"$exists": True, "$ne": None}},
             {"userId": 1, "first_name": 1, "whatsapp_phone": 1},
         )
-        return await cursor.to_list(length=None)
+        all_users = await cursor.to_list(length=None)
+        # Deduplicate — same phone number must not receive multiple pushes
+        seen_phones: set = set()
+        unique: list = []
+        for u in all_users:
+            phone = u.get("whatsapp_phone")
+            if phone and phone not in seen_phones:
+                seen_phones.add(phone)
+                unique.append(u)
+        return unique
