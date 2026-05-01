@@ -296,12 +296,25 @@ async def generate_content(
             )
 
         # Check for critical missing fields
+        # Empty strings should be treated as missing
+        brand_name_value = profile_data.get("brand_name")
+        brand_colors_value = profile_data.get("brand_colors")
+        industry_value = profile_data.get("industry")
+
+        print(f"\n🔍 BRAND PROFILE DEBUG for user {user_id}:")
+        print(f"  brand_name: {repr(brand_name_value)} (empty: {not brand_name_value})")
+        print(f"  brand_colors: {repr(brand_colors_value)} (empty: {not (brand_colors_value and len(brand_colors_value) > 0)})")
+        print(f"  industry: {repr(industry_value)} (empty: {not industry_value})")
+
         required_fields = {
-            "brand_name": profile_data.get("brand_name"),
-            "brand_colors": profile_data.get("brand_colors") and len(profile_data.get("brand_colors", [])) > 0,
-            "industry": profile_data.get("industry"),
+            "brand_name": brand_name_value and brand_name_value.strip(),
+            "brand_colors": brand_colors_value and len(brand_colors_value) > 0,
+            "industry": industry_value and industry_value.strip(),
         }
         missing_fields = [k for k, v in required_fields.items() if not v]
+
+        print(f"  missing_fields: {missing_fields}")
+        print(f"  acknowledged_incomplete_profile: {getattr(request, 'acknowledged_incomplete_profile', False)}\n")
 
         # PROGRESSIVE ENFORCEMENT: Warn but allow generation with intelligent fallbacks
         if missing_fields:
