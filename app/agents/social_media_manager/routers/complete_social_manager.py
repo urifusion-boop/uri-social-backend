@@ -325,7 +325,7 @@ async def generate_content(
                 # Return warning response for frontend modal
                 implications = {}
                 if "brand_colors" in missing_fields:
-                    implications["brand_colors"] = "We'll use URI Social's brand colors (deep magenta #C41E3A and ivory #FFFEF2)"
+                    implications["brand_colors"] = "We'll use URI Social's brand colors (Deep Magenta and Ivory)"
                 if "industry" in missing_fields:
                     implications["industry"] = "We'll use generic lifestyle styling"
                 if "brand_name" in missing_fields:
