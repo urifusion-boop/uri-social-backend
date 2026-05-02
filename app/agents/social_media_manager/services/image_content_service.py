@@ -290,10 +290,106 @@ Do NOT include any real-world company, product, or trademark other than "{brand_
 Do NOT draw from your training data to add elements not described in this prompt.
 Every element in the image must come from the instructions below. Nothing else."""
 
-            # SECTION 2: VISUAL STYLE
+            # SECTION 2: PROFESSIONAL OUTPUT RULES
+            # These rules make AI graphics look professionally designed (not AI-generated)
+            primary_color = brand_colors[0] if brand_colors else "#000000"
+            secondary_color = brand_colors[1] if len(brand_colors) > 1 else "#FFFFFF"
+            cta_text = bc.get("default_link", "Link in bio")
+
+            # Brand name display logic (PRD Section 4)
+            seed_lower = seed_content.lower()
+            show_brand_name = any([
+                "add our name" in seed_lower,
+                "add the name" in seed_lower,
+                "add our logo" in seed_lower,
+                "add the logo" in seed_lower,
+                "include the logo" in seed_lower,
+                "include our name" in seed_lower,
+                "include brand name" in seed_lower,
+                "put our name" in seed_lower,
+                "put the logo" in seed_lower,
+                "show our name" in seed_lower,
+                "show the logo" in seed_lower,
+                "with our logo" in seed_lower,
+                "with the logo" in seed_lower,
+                "with our name" in seed_lower,
+                "brand name on" in seed_lower,
+                "company name on" in seed_lower,
+                "add branding" in seed_lower,
+                "include branding" in seed_lower,
+                # Content types that traditionally include brand name
+                "event flyer" in seed_lower,
+                "event poster" in seed_lower,
+                "flyer" in seed_lower,
+                "business card" in seed_lower,
+                "banner" in seed_lower,
+                "announcement" in seed_lower,
+                "invitation" in seed_lower,
+                "menu" in seed_lower,
+            ])
+
+            brand_name_directive = ""
+            if show_brand_name:
+                brand_name_directive = f'Display the brand name "{brand_name}" prominently in the design. Spell it exactly as shown.'
+            else:
+                brand_name_directive = 'Do NOT display the brand name or logo anywhere. Brand identity is expressed through colours and visual treatment only.'
+
+            professional_rules = f"""=== PROFESSIONAL OUTPUT RULES ===
+Follow these rules precisely for every image. No exceptions.
+
+1. BRAND NAME: {brand_name_directive}
+
+2. CALL-TO-ACTION: Display the following CTA text at the bottom of the image
+   in small clean sans-serif text: "{cta_text}". Style it subtle but legible,
+   approximately 30% the size of the headline. Position: bottom-centre or
+   bottom-right within safe zone. Do NOT style it as a button or banner.
+
+3. FONTS: Maximum 2 font styles in the entire image. One bold/heavy weight
+   for headlines. One regular weight for body and CTA. Same family or
+   complementary pair. No decorative, script, or novelty fonts unless
+   specified in the VISUAL STYLE section.
+
+4. TEXT AREA: Text must occupy no more than 40% of total image area. The
+   visual element (photo, illustration, gradient, colour) dominates at 60%+.
+
+5. NO FILLER: Do NOT include generic phrases like "Elevate your experience",
+   "Discover the difference", "Quality you can trust", "Where excellence
+   meets innovation." Every word must be specific to the actual content
+   described below.
+
+6. NO HASHTAGS: Do NOT render any hashtags on the image. Hashtags go in
+   the caption text only.
+
+7. COLOUR LIMIT: Use only these colours: {primary_color}, {secondary_color},
+   and one neutral (black #000000, white #FFFFFF, or grey #888888). No other
+   colours unless specified in VISUAL STYLE.
+
+8. NO TEXT EFFECTS: No drop shadows, outer glows, bevels, neon effects, or
+   emboss on text. Flat clean text only. Exception: if text sits on a
+   photograph, use a subtle semi-transparent dark overlay (rgba(0,0,0,0.4))
+   behind the text for readability.
+
+9. MARGINS: Maintain at least 5% margin on all four edges. No element touches
+   the image border. Generous spacing between all text blocks and elements.
+   At least 15-20% of the image should be empty space.
+
+10. NO DECORATIONS: Do NOT add badges, stickers, watermarks, decorative
+    borders, corner ornaments, ribbon banners, starburst shapes, or
+    promotional labels unless explicitly described in the CONTENT section.
+
+11. FACES: If human faces appear, render with natural skin texture, slight
+    asymmetry, and realistic lighting. No overly smooth or symmetrical faces.
+    Hands must be hidden or in natural positions. Default to non-face visuals
+    when possible.
+
+12. OVERALL: The image must look like it was created by a professional human
+    graphic designer. Restraint over excess. Clean over busy. Intentional
+    over random. Every element earns its place."""
+
+            # SECTION 3: VISUAL STYLE
             visual_style = f"=== VISUAL STYLE ===\n{style_fragment}" if style_fragment else ""
 
-            # SECTION 3: BRAND IDENTITY
+            # SECTION 4: BRAND IDENTITY
             brand_identity_parts = [f"=== BRAND IDENTITY ==="]
             brand_identity_parts.append(f"Brand Name: {brand_name}")
             if color_str:
@@ -329,7 +425,7 @@ Every element in the image must come from the instructions below. Nothing else."
             ]
 
             # Add seasonal/contextual exclusions based on seed content
-            seed_lower = seed_content.lower()
+            # (seed_lower already defined above in brand name logic)
             if "mother" in seed_lower:
                 do_not_include_items.extend([
                     "No milk brands (Peak Milk, Dano, Cowbell, Three Crowns, etc.)",
@@ -349,6 +445,7 @@ Every element in the image must come from the instructions below. Nothing else."
             # ASSEMBLE FINAL PROMPT (Order matters - rules at top!)
             parts = [
                 absolute_rules,
+                professional_rules,
                 visual_style,
                 brand_identity,
                 content_section,
