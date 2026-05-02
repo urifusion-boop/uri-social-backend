@@ -389,7 +389,6 @@ class NotificationService:
             subject=subject,
             status="sent" if success else "failed",
             metadata={"platform": platform, "campaign_id": campaign_id},
-        ,
             error="Email delivery failed" if not success else None,
         )
 
@@ -436,7 +435,6 @@ class NotificationService:
             subject=subject,
             status="sent" if success else "failed",
             metadata={"suggestion": suggestion, "topic": topic},
-        ,
             error="Email delivery failed" if not success else None,
         )
 
@@ -485,7 +483,6 @@ class NotificationService:
             subject=subject,
             status="sent" if success else "failed",
             metadata={"days_inactive": days_inactive},
-        ,
             error="Email delivery failed" if not success else None,
         )
 
@@ -529,7 +526,6 @@ class NotificationService:
             subject=subject,
             status="sent" if success else "failed",
             metadata={"trial_days": trial_days, "trial_credits": trial_credits},
-        ,
             error="Email delivery failed" if not success else None,
         )
 
@@ -569,7 +565,6 @@ class NotificationService:
             subject=subject,
             status="sent" if success else "failed",
             metadata={"credits_remaining": credits_remaining},
-        ,
             error="Email delivery failed" if not success else None,
         )
 
