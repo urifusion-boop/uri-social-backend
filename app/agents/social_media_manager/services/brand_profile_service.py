@@ -80,7 +80,7 @@ class BrandProfileService:
                 doc["onboarding_completed"] = False
                 return UriResponse.error_response(
                     f"Cannot complete onboarding. Please provide: {', '.join(missing)}",
-                    status_code=400
+                    code=400
                 )
 
         existing = await db[BrandProfileService.COLLECTION].find_one({"user_id": user_id})

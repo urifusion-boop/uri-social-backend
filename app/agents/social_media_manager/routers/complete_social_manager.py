@@ -292,7 +292,7 @@ async def generate_content(
         if not profile_data:
             return UriResponse.error_response(
                 f"No brand profile found for user {user_id}. Please complete onboarding first.",
-                status_code=400
+                code=400
             )
 
         # Check for critical missing fields
