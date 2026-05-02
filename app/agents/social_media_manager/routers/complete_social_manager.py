@@ -1497,6 +1497,40 @@ async def get_today_suggestion(
     return UriResponse.get_single_data_response("today_suggestion", result)
 
 
+@router.get("/content-calendar/performance")
+async def get_calendar_performance(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """Return aggregated post performance data used for content scoring."""
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+    from app.services.PerformanceAnalyticsService import PerformanceAnalyticsService
+    data = await PerformanceAnalyticsService.get_user_performance(user_id, db)
+    return UriResponse.get_single_data_response("performance", data)
+
+
+@router.get("/content-calendar/trends")
+async def get_calendar_trends(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """Return trending keywords for the user's industry."""
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+    from app.services.TrendDataService import TrendDataService
+    brand = await BrandProfileService.get(user_id, db)
+    industry = (brand or {}).get("industry", "business")
+    keywords = await TrendDataService.get_trending_keywords(industry)
+    return UriResponse.get_single_data_response("trends", {
+        "industry": industry,
+        "keywords": keywords,
+        "count": len(keywords),
+    })
+
+
 # ==============================================================================
 # CONTENT MANAGEMENT ENDPOINTS
 # ==============================================================================
