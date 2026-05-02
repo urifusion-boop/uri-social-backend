@@ -1656,6 +1656,19 @@ class WhatsAppFlowService:
 
     @staticmethod
     async def send_daily_push(db: AsyncIOMotorDatabase) -> Dict[str, Any]:
+        # Atomic DB lock — only the first of the 4 uvicorn workers to insert wins.
+        # All others get DuplicateKeyError on the unique _id and skip immediately.
+        from pymongo.errors import DuplicateKeyError
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        lock_id = f"daily_whatsapp_push_{today}"
+        try:
+            await db["scheduler_locks"].insert_one(
+                {"_id": lock_id, "created_at": datetime.now(timezone.utc)}
+            )
+        except DuplicateKeyError:
+            print(f"[DailyPush] Lock already held by another worker ({today}), skipping.")
+            return {"sent": 0, "failed": 0, "total": 0, "skipped": True}
+
         users = await WhatsAppSessionService.get_all_linked_users(db)
         sent = 0
         failed = 0
