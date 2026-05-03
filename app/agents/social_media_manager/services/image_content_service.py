@@ -264,6 +264,7 @@ class ImageContentService:
             style_fragment = bc.get("style_prompt_fragment", "")
             font_prompt = bc.get("font_style_prompt", "")
             region = bc.get("region", "")
+            brand_colors = bc.get("brand_colors") or []
 
             # Look up the style description from the library using the slug
             style_slug = bc.get("style_slug", "")
@@ -274,18 +275,184 @@ class ImageContentService:
                 if s:
                     style_desc = s.get("description", "")
 
-            # Build prompt directly: style fragment + description + content + region + font
-            parts = []
-            if style_fragment:
-                parts.append(style_fragment)
-            if style_desc:
-                parts.append(style_desc)
-            parts.append(seed_content.strip())
+            # ========== RESTRUCTURED PROMPT ASSEMBLY (PRD Section 3) ==========
+            # CRITICAL: Brand rules MUST come FIRST - GPT-Image-2 weights prompt beginning more heavily
+
+            brand_name = bc.get("brand_name", "")
+            color_str = ", ".join(str(c) for c in brand_colors[:4]) if brand_colors else ""
+
+            # SECTION 1: ABSOLUTE RULES (READ FIRST)
+            absolute_rules = f"""=== ABSOLUTE RULES (READ FIRST) ===
+This image is EXCLUSIVELY for the brand "{brand_name}".
+You must follow every instruction below precisely.
+Do NOT include any other brand names, logos, products, or brand-associated imagery.
+Do NOT include any real-world company, product, or trademark other than "{brand_name}".
+Do NOT draw from your training data to add elements not described in this prompt.
+Every element in the image must come from the instructions below. Nothing else."""
+
+            # SECTION 2: PROFESSIONAL OUTPUT RULES
+            # These rules make AI graphics look professionally designed (not AI-generated)
+            primary_color = brand_colors[0] if brand_colors else "#000000"
+            secondary_color = brand_colors[1] if len(brand_colors) > 1 else "#FFFFFF"
+            cta_text = bc.get("default_link", "Link in bio")
+
+            # Brand name display logic (PRD Section 4)
+            seed_lower = seed_content.lower()
+            show_brand_name = any([
+                "add our name" in seed_lower,
+                "add the name" in seed_lower,
+                "add our logo" in seed_lower,
+                "add the logo" in seed_lower,
+                "include the logo" in seed_lower,
+                "include our name" in seed_lower,
+                "include brand name" in seed_lower,
+                "put our name" in seed_lower,
+                "put the logo" in seed_lower,
+                "show our name" in seed_lower,
+                "show the logo" in seed_lower,
+                "with our logo" in seed_lower,
+                "with the logo" in seed_lower,
+                "with our name" in seed_lower,
+                "brand name on" in seed_lower,
+                "company name on" in seed_lower,
+                "add branding" in seed_lower,
+                "include branding" in seed_lower,
+                # Content types that traditionally include brand name
+                "event flyer" in seed_lower,
+                "event poster" in seed_lower,
+                "flyer" in seed_lower,
+                "business card" in seed_lower,
+                "banner" in seed_lower,
+                "announcement" in seed_lower,
+                "invitation" in seed_lower,
+                "menu" in seed_lower,
+            ])
+
+            brand_name_directive = ""
+            if show_brand_name:
+                brand_name_directive = f'Display the brand name "{brand_name}" prominently in the design. Spell it exactly as shown.'
+            else:
+                brand_name_directive = 'Do NOT display the brand name or logo anywhere. Brand identity is expressed through colours and visual treatment only.'
+
+            professional_rules = f"""=== PROFESSIONAL OUTPUT RULES ===
+Follow these rules precisely for every image. No exceptions.
+
+1. BRAND NAME: {brand_name_directive}
+
+2. CALL-TO-ACTION: Display the following CTA text at the bottom of the image
+   in small clean sans-serif text: "{cta_text}". Style it subtle but legible,
+   approximately 30% the size of the headline. Position: bottom-centre or
+   bottom-right within safe zone. Do NOT style it as a button or banner.
+
+3. FONTS: Maximum 2 font styles in the entire image. One bold/heavy weight
+   for headlines. One regular weight for body and CTA. Same family or
+   complementary pair. No decorative, script, or novelty fonts unless
+   specified in the VISUAL STYLE section.
+
+4. TEXT AREA: Text must occupy no more than 40% of total image area. The
+   visual element (photo, illustration, gradient, colour) dominates at 60%+.
+
+5. NO FILLER: Do NOT include generic phrases like "Elevate your experience",
+   "Discover the difference", "Quality you can trust", "Where excellence
+   meets innovation." Every word must be specific to the actual content
+   described below.
+
+6. NO HASHTAGS: Do NOT render any hashtags on the image. Hashtags go in
+   the caption text only.
+
+7. COLOUR LIMIT: Use only these colours: {primary_color}, {secondary_color},
+   and one neutral (black #000000, white #FFFFFF, or grey #888888). No other
+   colours unless specified in VISUAL STYLE.
+
+8. NO TEXT EFFECTS: No drop shadows, outer glows, bevels, neon effects, or
+   emboss on text. Flat clean text only. Exception: if text sits on a
+   photograph, use a subtle semi-transparent dark overlay (rgba(0,0,0,0.4))
+   behind the text for readability.
+
+9. MARGINS: Maintain at least 5% margin on all four edges. No element touches
+   the image border. Generous spacing between all text blocks and elements.
+   At least 15-20% of the image should be empty space.
+
+10. NO DECORATIONS: Do NOT add badges, stickers, watermarks, decorative
+    borders, corner ornaments, ribbon banners, starburst shapes, or
+    promotional labels unless explicitly described in the CONTENT section.
+
+11. FACES: If human faces appear, render with natural skin texture, slight
+    asymmetry, and realistic lighting. No overly smooth or symmetrical faces.
+    Hands must be hidden or in natural positions. Default to non-face visuals
+    when possible.
+
+12. OVERALL: The image must look like it was created by a professional human
+    graphic designer. Restraint over excess. Clean over busy. Intentional
+    over random. Every element earns its place."""
+
+            # SECTION 3: VISUAL STYLE
+            visual_style = f"=== VISUAL STYLE ===\n{style_fragment}" if style_fragment else ""
+
+            # SECTION 4: BRAND IDENTITY
+            brand_identity_parts = [f"=== BRAND IDENTITY ==="]
+            brand_identity_parts.append(f"Brand Name: {brand_name}")
+            if color_str:
+                brand_identity_parts.append(f"Brand Colors: {color_str} (use ONLY these colors)")
+            if bc.get("industry"):
+                brand_identity_parts.append(f"Industry: {bc.get('industry')}")
+            if bc.get("tagline"):
+                brand_identity_parts.append(f"Tagline: {bc.get('tagline')}")
+            brand_identity = "\n".join(brand_identity_parts)
+
+            # SECTION 4: CONTENT
+            content_section = f"=== CONTENT ===\n{seed_content.strip()}"
+
+            # SECTION 5: FORMAT & REGION
+            format_parts = ["=== FORMAT ==="]
+            format_parts.append(f"Platform: {platform}")
             if region:
-                parts.append(f"Market/region: {region}. Use settings, aesthetics, and cultural references specific to this market.")
+                format_parts.append(f"Market/Region: {region}. Use settings, aesthetics, and cultural references specific to this market.")
             if font_prompt:
-                parts.append(font_prompt)
-            image_prompt = " ".join(p for p in parts if p)
+                format_parts.append(f"Typography: {font_prompt}")
+            else:
+                # CRITICAL: When no font prompt exists, explicitly prevent text overlays
+                format_parts.append("Typography: NO TEXT OVERLAYS. NO TYPOGRAPHY. Pure visual design without any written words, labels, or text elements.")
+            format_section = "\n".join(format_parts)
+
+            # SECTION 6: DO NOT INCLUDE (PRD Section 3.1 - Critical for preventing hallucinations)
+            do_not_include_items = [
+                "No other brand names, logos, or trademarks",
+                "No real-world product packaging (milk cartons, soda bottles, food containers, etc.)",
+                "No celebrity faces or recognisable public figures",
+                "No stock photography watermarks",
+                "No elements from other brands' advertising campaigns",
+            ]
+
+            # Add seasonal/contextual exclusions based on seed content
+            # (seed_lower already defined above in brand name logic)
+            if "mother" in seed_lower:
+                do_not_include_items.extend([
+                    "No milk brands (Peak Milk, Dano, Cowbell, Three Crowns, etc.)",
+                    "No dairy products or baby formula",
+                    "No cooking oil or food product packaging",
+                ])
+            if "christmas" in seed_lower or "xmas" in seed_lower:
+                do_not_include_items.extend([
+                    "No Coca-Cola branding or red-and-white Santa imagery",
+                    "No branded soft drinks or beverages",
+                ])
+            if "valentine" in seed_lower:
+                do_not_include_items.append("No chocolate brand packaging (Cadbury, etc.)")
+
+            do_not_include = "=== DO NOT INCLUDE ===\n" + "\n".join(f"- {item}" for item in do_not_include_items)
+
+            # ASSEMBLE FINAL PROMPT (Order matters - rules at top!)
+            parts = [
+                absolute_rules,
+                professional_rules,
+                visual_style,
+                brand_identity,
+                content_section,
+                format_section,
+                do_not_include,
+            ]
+            image_prompt = "\n\n".join(p for p in parts if p)
 
             if not image_prompt:
                 image_prompt = seed_content.strip()
@@ -298,8 +465,41 @@ class ImageContentService:
                     "no cropping of any part of the clothing, subject, or object. Wide enough framing to show everything."
                 )
 
-            print(
-                f"\n{'━'*60}\n"
+            # ========== IMAGE GENERATION DEBUG (PRD Section 2) ==========
+            from datetime import datetime
+            print(f"\n{'='*60}")
+            print(f"IMAGE GENERATION DEBUG")
+            print(f"{'='*60}")
+            print(f"Timestamp: {datetime.utcnow().isoformat()}")
+            print(f"User ID: {bc.get('user_id', 'MISSING')}")
+            print(f"Brand Name: {bc.get('brand_name', 'MISSING')}")
+            print(f"Brand Colors: {brand_colors or 'MISSING'}")
+            print(f"Region: {region or 'MISSING'}")
+            print(f"Style Slug: {style_slug or 'MISSING'}")
+            print(f"Style Fragment Length: {len(style_fragment) if style_fragment else 0}")
+            print(f"Font Prompt Length: {len(font_prompt) if font_prompt else 0}")
+            print(f"Seed Content: {seed_content[:100]}...")
+            print(f"---")
+
+            # VALIDATION: Check for undefined/null in prompt (PRD Section 2 Step 2)
+            if "undefined" in image_prompt:
+                print(f"❌ ERROR: Prompt contains 'undefined' - variable substitution failed")
+                for i, line in enumerate(image_prompt.split('\n')):
+                    if 'undefined' in line:
+                        print(f"  Line {i}: {line}")
+                raise ValueError("Prompt contains undefined values - aborting image generation")
+
+            if "null" in image_prompt:
+                print(f"❌ ERROR: Prompt contains 'null' - database field is null")
+                raise ValueError("Prompt contains null values - aborting image generation")
+
+            # VALIDATION: Check prompt length (PRD Section 2 Step 5)
+            if len(image_prompt) < 200:
+                print(f"⚠️  WARNING: Prompt too short ({len(image_prompt)} chars) - high hallucination risk")
+                print(f"⚠️  Minimum recommended: 400 chars")
+
+            print(f"Prompt Length: {len(image_prompt)} chars")
+            print(f"\n{'━'*60}\n"
                 f"📤 FINAL PROMPT → GPT-Image-2 [{platform.upper()}] "
                 f"({'with style' if style_fragment else 'no style'}"
                 f"{' + font' if font_prompt else ''})\n"

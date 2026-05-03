@@ -1,6 +1,13 @@
 """
 Content Calendar Service
-Generates and manages 7-day AI content plans based on brand profile data.
+Generates and manages 7-day data-driven content plans.
+
+Generation pipeline (PRD Phase 1):
+  1. Fetch user performance data  (PerformanceAnalyticsService)
+  2. Fetch industry trend keywords (TrendDataService)
+  3. Generate + score ideas        (IdeaScoringService)
+  4. Select top 7 with content mix
+  Falls back to pure AI generation when performance data is sparse (<5 posts).
 """
 
 import json
@@ -12,6 +19,9 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from app.services.AIService import AIService
 from app.domain.models.chat_model import ChatModel
+from app.services.TrendDataService import TrendDataService
+from app.services.PerformanceAnalyticsService import PerformanceAnalyticsService
+from app.services.IdeaScoringService import IdeaScoringService
 
 COLLECTION = "content_calendar_plans"
 
@@ -274,7 +284,6 @@ async def generate_plan(
     monday = _get_monday(now)
     week_start = monday.strftime("%Y-%m-%d")
 
-    # Archive existing active plan for this week if force=True
     if force:
         await db[COLLECTION].update_many(
             {"user_id": user_id, "week_start": week_start, "status": "active"},
@@ -288,7 +297,6 @@ async def generate_plan(
     industry = brand.get("industry", "")
     mix = _pick_mix(industry)
 
-    # Fetch last week's titles to avoid repeating topics
     last_monday = (monday - timedelta(days=7)).strftime("%Y-%m-%d")
     last_plan = await db[COLLECTION].find_one(
         {"user_id": user_id, "week_start": last_monday},
@@ -296,59 +304,131 @@ async def generate_plan(
     )
     previous_titles = [d.get("title", "") for d in (last_plan or {}).get("days", []) if d.get("title")]
 
-    ideas = await _generate_ideas(brand, mix, week_start, platforms, previous_titles=previous_titles)
+    # ── Data-driven pipeline ──────────────────────────────────────────────────
+    performance = await PerformanceAnalyticsService.get_user_performance(user_id, db)
+    trend_keywords = await TrendDataService.get_trending_keywords(industry)
 
-    days = []
-    for i, idea in enumerate(ideas):
-        day_date = (monday + timedelta(days=i)).strftime("%Y-%m-%d")
-        days.append({
-            "day_index": i,
-            "date": day_date,
-            "content_type": mix[i],
-            "title": idea.get("title", ""),
-            "description": idea.get("description", ""),
-            "platforms": platforms,
-            "acted_on": False,
-            "acted_on_draft_ids": [],
-            "regenerated_count": 0,
-            "last_regenerated_at": None,
-        })
+    generation_method = "ai"  # default fallback
+    days: List[Dict[str, Any]] = []
+
+    if trend_keywords:
+        try:
+            raw_ideas  = IdeaScoringService.generate_ideas(trend_keywords, industry, performance)
+            scored     = IdeaScoringService.score_ideas(raw_ideas, performance)
+            top_ideas  = IdeaScoringService.select_for_calendar(scored, n=7)
+
+            if len(top_ideas) == 7:
+                generation_method = "data_driven" if performance["has_data"] else "trend_driven"
+                for i, idea in enumerate(top_ideas):
+                    day_date = (monday + timedelta(days=i)).strftime("%Y-%m-%d")
+                    days.append({
+                        "day_index":           i,
+                        "date":                day_date,
+                        "content_type":        idea.get("content_type", mix[i]),
+                        "title":               idea["title"],
+                        "description":         _build_description(idea, brand),
+                        "keyword":             idea.get("keyword", ""),
+                        "trend_score":         idea.get("trend_score", 0),
+                        "performance_score":   idea.get("performance_score", 0),
+                        "format_score":        idea.get("format_score", 0),
+                        "final_score":         idea.get("final_score", 0),
+                        "reason":              idea.get("reason", ""),
+                        "format":              idea.get("format", "image"),
+                        "platforms":           platforms,
+                        "acted_on":            False,
+                        "acted_on_draft_ids":  [],
+                        "regenerated_count":   0,
+                        "last_regenerated_at": None,
+                    })
+        except Exception as exc:
+            print(f"[Calendar] data-driven pipeline failed: {exc} — falling back to AI")
+            days = []
+
+    # ── AI fallback ───────────────────────────────────────────────────────────
+    if not days:
+        generation_method = "ai"
+        ai_ideas = await _generate_ideas(brand, mix, week_start, platforms, previous_titles=previous_titles)
+        for i, idea in enumerate(ai_ideas):
+            day_date = (monday + timedelta(days=i)).strftime("%Y-%m-%d")
+            days.append({
+                "day_index":           i,
+                "date":                day_date,
+                "content_type":        mix[i],
+                "title":               idea.get("title", ""),
+                "description":         idea.get("description", ""),
+                "keyword":             "",
+                "trend_score":         0,
+                "performance_score":   0,
+                "format_score":        0,
+                "final_score":         0,
+                "reason":              "Generated by AI based on your brand profile",
+                "format":              "image",
+                "platforms":           platforms,
+                "acted_on":            False,
+                "acted_on_draft_ids":  [],
+                "regenerated_count":   0,
+                "last_regenerated_at": None,
+            })
 
     plan_id = str(uuid.uuid4())
     doc = {
-        "plan_id": plan_id,
-        "user_id": user_id,
-        "week_start": week_start,
-        "generated_at": now.isoformat(),
-        "status": "active",
-        "platforms": platforms,
-        "days": days,
-        "content_mix": _compute_mix_ratios(mix),
+        "plan_id":          plan_id,
+        "user_id":          user_id,
+        "week_start":       week_start,
+        "generated_at":     now.isoformat(),
+        "status":           "active",
+        "generation_method":generation_method,
+        "platforms":        platforms,
+        "days":             days,
+        "content_mix":      _compute_mix_ratios(mix),
+        "data_signals": {
+            "post_count":       performance.get("post_count", 0),
+            "top_topics":       performance.get("top_topics", []),
+            "top_formats":      performance.get("top_formats", []),
+            "trend_source":     trend_keywords[0].get("source", "none") if trend_keywords else "none",
+            "trend_kw_count":   len(trend_keywords),
+        },
         "brand_snapshot": {
-            "brand_name": brand.get("brand_name"),
-            "industry": brand.get("industry"),
-            "tagline": brand.get("tagline"),
-            "business_description": brand.get("business_description") or brand.get("product_description"),
-            "key_products_services": brand.get("key_products_services") or [],
-            "brand_voice": brand.get("brand_voice") or brand.get("derived_voice"),
-            "voice_sample": brand.get("voice_sample"),
-            "platform_tones": brand.get("platform_tones") or {},
-            "same_tone_everywhere": brand.get("same_tone_everywhere", True),
-            "target_audience": brand.get("target_audience"),
-            "audience_age_range": brand.get("audience_age_range"),
-            "primary_goal": brand.get("primary_goal"),
-            "region": brand.get("region"),
-            "content_pillars": brand.get("content_pillars") or [],
-            "preferred_formats": brand.get("preferred_formats") or [],
-            "cta_styles": brand.get("cta_styles") or [],
-            "guardrails": brand.get("guardrails") or {},
-            "key_dates": brand.get("key_dates"),
-            "posting_cadence": brand.get("posting_cadence"),
-            "website": brand.get("website"),
+            "brand_name":          brand.get("brand_name"),
+            "industry":            brand.get("industry"),
+            "tagline":             brand.get("tagline"),
+            "business_description":brand.get("business_description") or brand.get("product_description"),
+            "key_products_services":brand.get("key_products_services") or [],
+            "brand_voice":         brand.get("brand_voice") or brand.get("derived_voice"),
+            "voice_sample":        brand.get("voice_sample"),
+            "platform_tones":      brand.get("platform_tones") or {},
+            "same_tone_everywhere":brand.get("same_tone_everywhere", True),
+            "target_audience":     brand.get("target_audience"),
+            "audience_age_range":  brand.get("audience_age_range"),
+            "primary_goal":        brand.get("primary_goal"),
+            "region":              brand.get("region"),
+            "content_pillars":     brand.get("content_pillars") or [],
+            "preferred_formats":   brand.get("preferred_formats") or [],
+            "cta_styles":          brand.get("cta_styles") or [],
+            "guardrails":          brand.get("guardrails") or {},
+            "key_dates":           brand.get("key_dates"),
+            "posting_cadence":     brand.get("posting_cadence"),
+            "website":             brand.get("website"),
         },
     }
     await db[COLLECTION].insert_one({**doc, "_id": plan_id})
     return doc
+
+
+def _build_description(idea: Dict[str, Any], brand: Dict[str, Any]) -> str:
+    """Build a brief description for a data-driven idea."""
+    keyword  = idea.get("keyword", "")
+    industry = brand.get("industry", "business")
+    audience = brand.get("target_audience", "your audience")
+    reason   = idea.get("reason", "")
+    desc = (
+        f"A {idea.get('content_type', 'content').replace('_', ' ')} post around "
+        f'"{keyword}" — a trending topic in {industry} right now. '
+        f"Speak directly to {audience}."
+    )
+    if reason:
+        desc += f" Data signal: {reason}."
+    return desc
 
 
 async def regenerate_day(
