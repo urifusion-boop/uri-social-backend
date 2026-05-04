@@ -1116,6 +1116,85 @@ async def regenerate_draft_image(
     )
 
 
+@router.post("/drafts/{draft_id}/edit-image")
+async def edit_draft_image(
+    draft_id: str,
+    request: Request,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer())
+):
+    """
+    Edit image in-place using user feedback
+    PRD: URI-Social-Image-Editing-PRD.docx
+
+    In-place editing preserves everything the user likes about the current image
+    and only changes what they request. Unlike regeneration, this keeps the same
+    layout, composition, and style.
+
+    Edit categories:
+    - text_edit: Change text (price, dates, etc.) - FREE
+    - style_edit: Change colors, brightness, spacing - FREE
+    - content_edit: Add/remove elements - 1 free, then 1 credit
+    - full_redesign: Complete redo - 1 credit
+    """
+    from app.agents.social_media_manager.services.image_editing_service import ImageEditingService
+
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    body = await request.json()
+    feedback = (body.get("feedback") or "").strip()
+    if not feedback:
+        raise HTTPException(status_code=400, detail="feedback is required")
+
+    # Call the editing service
+    result = await ImageEditingService.edit_image_for_draft(
+        draft_id=draft_id,
+        user_id=user_id,
+        feedback=feedback,
+        db=db
+    )
+
+    # Return the result (could be success, credit warning, or error)
+    return JSONResponse(
+        status_code=200 if result.get("status") else 400,
+        content=result
+    )
+
+
+@router.post("/drafts/{draft_id}/undo-image")
+async def undo_draft_image_edit(
+    draft_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer())
+):
+    """
+    Undo last image edit and restore previous version
+    PRD Section 5.3: Undo Function
+
+    Restores the exact previous version from version history.
+    FREE - no API call, just database restore.
+    """
+    from app.agents.social_media_manager.services.image_editing_service import ImageEditingService
+
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    # Call undo service
+    result = await ImageEditingService.undo_image_edit(
+        db=db,
+        draft_id=draft_id,
+        user_id=user_id
+    )
+
+    return JSONResponse(
+        status_code=200 if result.get("status") else 400,
+        content=result
+    )
+
+
 @router.delete("/drafts/{draft_id}")
 async def delete_draft(
     draft_id: str,
