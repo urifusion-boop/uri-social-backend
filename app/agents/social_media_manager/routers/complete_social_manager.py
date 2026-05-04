@@ -1602,8 +1602,11 @@ async def get_calendar_trends(
         raise HTTPException(status_code=401, detail="User ID not found in token")
     from app.services.TrendDataService import TrendDataService
     brand = await BrandProfileService.get(user_id, db)
+    # BrandProfileService.get returns a response wrapper dict; unwrap responseData
+    if isinstance(brand, dict) and "responseData" in brand:
+        brand = brand["responseData"]
     industry = (brand or {}).get("industry", "business")
-    keywords = await TrendDataService.get_trending_keywords(industry)
+    keywords = await TrendDataService.get_trending_keywords(industry, db=db)
     return UriResponse.get_single_data_response("trends", {
         "industry": industry,
         "keywords": keywords,
