@@ -79,9 +79,10 @@ class BrandProfileService:
             if missing:
                 # Cannot complete onboarding without required fields
                 doc["onboarding_completed"] = False
-                return UriResponse.error_response(
-                    f"Cannot complete onboarding. Please provide: {', '.join(missing)}",
-                    code=400
+                from fastapi import HTTPException as _HTTPException
+                raise _HTTPException(
+                    status_code=400,
+                    detail=f"Cannot complete onboarding. Please provide: {', '.join(missing)}",
                 )
 
         existing = await db[BrandProfileService.COLLECTION].find_one({"user_id": user_id})
