@@ -110,6 +110,12 @@ class BrandContextRequest(BaseModel):
     industry: Optional[str] = None
     key_products_services: Optional[List[str]] = None
 
+class StoryboardRequest(BaseModel):
+    brand_images: List[str] = Field(..., min_items=1, max_items=5)
+    optional_text: Optional[str] = Field(None, max_length=1000)
+    target_platform: str = "instagram_reels"
+    target_duration_seconds: int = Field(15, ge=5, le=30)
+
 class ContentGenerationRequest(BaseModel):
     seed_content: str = Field(..., min_length=10, max_length=5000)
     platforms: List[str] = Field(..., min_items=1, max_items=5)
@@ -2786,3 +2792,47 @@ async def trigger_publish_scheduled(
 
     result = await ApprovalWorkflowService.publish_scheduled_content(db=db)
     return result
+
+
+@router.post("/generate-storyboard")
+async def generate_storyboard(
+    request: StoryboardRequest,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Generate a GPT-4o Vision video storyboard from brand images.
+
+    Accepts up to 5 base64 image data URLs plus optional creative direction text.
+    Returns a structured storyboard JSON with per-scene video prompts, motion
+    descriptions, reference image indices, and optional text overlays.
+    """
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    profile_result = await BrandProfileService.get(user_id, db)
+    profile_data = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
+
+    brand_context = {
+        "brand_name": profile_data.get("brand_name", ""),
+        "industry": profile_data.get("industry", "general_other"),
+        "brand_colors": profile_data.get("brand_colors", []),
+        "brand_voice": profile_data.get("derived_voice", ""),
+        "region": profile_data.get("region", ""),
+    }
+
+    from app.agents.social_media_manager.services.video_storyboard_service import VideoStoryboardService
+
+    result = await VideoStoryboardService.generate_storyboard(
+        brand_images=request.brand_images,
+        optional_text=request.optional_text,
+        brand_context=brand_context,
+        target_platform=request.target_platform,
+        target_duration_seconds=request.target_duration_seconds,
+    )
+
+    if not result.get("status"):
+        raise HTTPException(status_code=400, detail=result.get("error", "Storyboard generation failed"))
+
+    return UriResponse.get_single_data_response("storyboard", result["storyboard"])
