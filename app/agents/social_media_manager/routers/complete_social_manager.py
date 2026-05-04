@@ -188,6 +188,7 @@ class BrandProfileRequest(BaseModel):
     key_products_services: Optional[List[str]] = None
     # Identity
     logo_url: Optional[str] = None
+    logo_position: Optional[str] = None  # top_left | top_center | top_right | bottom_left | bottom_center | bottom_right | center
     brand_colors: Optional[List[str]] = None
     sample_template_urls: Optional[List[str]] = None
     # Personality
