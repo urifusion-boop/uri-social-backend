@@ -143,20 +143,44 @@ async def connect_whatsapp(
                 detail="Database is unavailable. Please try again in a moment.",
             )
 
+    # Best-effort: send the welcome template. This will deliver immediately if
+    # the user already has an active 24-hour session with our number (i.e. they
+    # messaged us recently). If not, Twilio will queue it and deliver as soon as
+    # the user sends their activation message.
+    greeting_sent = False
     try:
         await _send(
             body.phone,
             "",
             content_sid="HXccf1a2bb34e7ed257c136c842982f5b3",
         )
+        greeting_sent = True
     except Exception as e:
         print(f"[WhatsApp] connect greeting failed: {e}")
+
+    # Strip the "whatsapp:" prefix for the response so the frontend can build
+    # a wa.me deep-link without extra parsing.
+    twilio_number = settings.TWILIO_WHATSAPP_FROM
+    if twilio_number.startswith("whatsapp:"):
+        twilio_number = twilio_number[len("whatsapp:"):]
 
     return {
         "status": True,
         "responseCode": 200,
         "responseMessage": "WhatsApp linked successfully.",
-        "responseData": {"phone": body.phone},
+        "responseData": {
+            "phone": body.phone,
+            # Tells the frontend whether to show the "send a message to activate"
+            # instruction. We always set this to True because even when the
+            # template send succeeds it may be queued until the user opens a
+            # session. The activation message is a one-time step.
+            "needs_activation": True,
+            # The Uri Social WhatsApp number the user should message to activate.
+            "activation_number": twilio_number,
+            # Deep-link the frontend can use: opens WhatsApp with a pre-filled
+            # "Hi" message to our number.
+            "activation_link": f"https://wa.me/{twilio_number.lstrip('+').replace(' ', '')}?text=Hi",
+        },
     }
 
 
