@@ -89,6 +89,7 @@ class BrandProfileService:
             # Once onboarding_completed is True, never allow it to be reset to False
             if existing.get("onboarding_completed") and not doc.get("onboarding_completed"):
                 doc["onboarding_completed"] = True
+            print(f"🖼️  SAVE DEBUG user={user_id}: saving logo_position={repr(doc.get('logo_position'))}")
             await db[BrandProfileService.COLLECTION].update_one(
                 {"user_id": user_id}, {"$set": doc}
             )

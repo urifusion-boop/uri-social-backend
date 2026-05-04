@@ -356,6 +356,7 @@ async def generate_content(
         brand_context_dict["user_id"] = user_id
         brand_context_dict["using_fallbacks"] = len(missing_fields) > 0
         brand_context_dict["fallback_fields"] = missing_fields
+        print(f"🖼️  LOGO DEBUG user={user_id}: logo_url={repr(profile_data.get('logo_url'))}, logo_position={repr(profile_data.get('logo_position'))} → brand_context logo_position={repr(brand_context_dict.get('logo_position'))}")
 
         # Allow explicit overrides from the request (legacy / power-user path)
         if request.brand_context:
