@@ -195,10 +195,18 @@ class ImageContentService:
             if not seed_content:
                 seed_content = content  # last resort
 
+            # Load brand profile so logo (and its position) are applied during regeneration
+            from app.agents.social_media_manager.services.brand_profile_service import BrandProfileService as _BPS
+            _profile_doc = await db["brand_profiles"].find_one({"user_id": user_id})
+            if _profile_doc:
+                _profile_doc.pop("_id", None)
+            regen_brand_context = _BPS.to_brand_context(_profile_doc) if _profile_doc else {}
+
             image_result = await ImageContentService._generate_platform_image(
                 platform=platform,
                 content=content,
                 seed_content=seed_content,
+                brand_context=regen_brand_context,
                 feedback=feedback,
             )
 
@@ -520,13 +528,14 @@ Follow these rules precisely for every image. No exceptions.
                 logo_url = (brand_context or {}).get('logo_url')
                 if logo_url:
                     import re as _re_logo
+                    logo_position = (brand_context or {}).get('logo_position', 'bottom_right')
                     data_url = image_response['url']
                     _m = _re_logo.match(r"data:[^;]+;base64,(.+)", data_url, _re_logo.DOTALL)
                     if _m:
                         loop = asyncio.get_running_loop()
                         b64_final = await loop.run_in_executor(
                             None,
-                            lambda: ImageContentService._overlay_logo(_m.group(1), logo_url)
+                            lambda: ImageContentService._overlay_logo(_m.group(1), logo_url, logo_position)
                         )
                         image_response['url'] = f"data:image/webp;base64,{b64_final}"
 
@@ -1411,9 +1420,25 @@ Follow these rules precisely for every image. No exceptions.
 
             if position == "bottom_left":
                 bx = edge_pad
+                by = bh - badge_h - edge_pad
+            elif position == "top_left":
+                bx = edge_pad
+                by = edge_pad
+            elif position == "top_right":
+                bx = bw - badge_w - edge_pad
+                by = edge_pad
+            elif position == "top_center":
+                bx = (bw - badge_w) // 2
+                by = edge_pad
+            elif position == "bottom_center":
+                bx = (bw - badge_w) // 2
+                by = bh - badge_h - edge_pad
+            elif position == "center":
+                bx = (bw - badge_w) // 2
+                by = (bh - badge_h) // 2
             else:  # bottom_right (default)
                 bx = bw - badge_w - edge_pad
-            by = bh - badge_h - edge_pad
+                by = bh - badge_h - edge_pad
 
             # Draw semi-transparent white rounded-rectangle badge behind logo
             badge = Image.new("RGBA", (badge_w, badge_h), (0, 0, 0, 0))
