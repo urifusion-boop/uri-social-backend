@@ -2,9 +2,11 @@
 Trend Data Service — Data-Driven Content Calendar (Phase 1)
 Fetches Google Trends rising/top keywords for an industry using pytrends.
 Falls back to curated seed keywords when the API is unavailable.
+Results are cached in MongoDB for 6 hours to avoid Google rate-limits.
 """
 import asyncio
-from typing import Any, Dict, List
+from datetime import datetime, timezone, timedelta
+from typing import Any, Dict, List, Optional
 
 
 # Industry → seed terms to query Google Trends
@@ -18,6 +20,8 @@ _INDUSTRY_SEEDS: Dict[str, List[str]] = {
     "law":          ["legal advice", "law firm", "contracts", "legal services", "lawyer"],
     "education":    ["online learning", "skill development", "tutoring", "professional development"],
     "marketing":    ["digital marketing", "social media strategy", "content marketing", "SEO", "branding"],
+    "social media & marketing technology": ["social media marketing", "content creation", "AI content tools", "social media automation", "digital branding"],
+    "social media":  ["social media marketing", "content creation", "AI tools", "social media automation", "digital branding"],
     "ecommerce":    ["online store", "dropshipping", "ecommerce", "product sourcing", "online business"],
     "beauty":       ["skincare", "beauty tips", "makeup", "hair care", "cosmetics"],
     "logistics":    ["logistics", "supply chain", "delivery", "shipping", "freight"],
@@ -26,26 +30,58 @@ _INDUSTRY_SEEDS: Dict[str, List[str]] = {
 
 class TrendDataService:
 
+    CACHE_TTL_HOURS = 6  # How long to cache Google Trends results
+
     @staticmethod
     async def get_trending_keywords(
         industry: str,
         geo: str = "NG",
         timeframe: str = "today 1-m",
+        db=None,  # Optional AsyncIOMotorDatabase for caching
     ) -> List[Dict[str, Any]]:
         """
         Return up to 10 trending keyword dicts for the industry:
         {keyword, trend_score (0-100), growth_rate, source, type}
+        Caches results in MongoDB for CACHE_TTL_HOURS to avoid rate-limits.
         """
+        cache_key = f"{industry.lower()}:{geo}:{timeframe}"
+
+        # Try to read from cache first
+        if db is not None:
+            try:
+                cached = await db["trends_cache"].find_one({"_id": cache_key})
+                if cached:
+                    age = datetime.now(timezone.utc) - cached["cached_at"].replace(tzinfo=timezone.utc)
+                    if age < timedelta(hours=TrendDataService.CACHE_TTL_HOURS):
+                        print(f"[TrendData] cache hit for '{industry}' (age: {int(age.total_seconds()/60)}m)")
+                        return cached["keywords"]
+            except Exception as e:
+                print(f"[TrendData] cache read error: {e}")
+
+        # Fetch from Google Trends
         try:
             loop = asyncio.get_running_loop()
             results = await loop.run_in_executor(
                 None,
                 lambda: TrendDataService._fetch_pytrends(industry, geo, timeframe),
             )
-            return results
         except Exception as exc:
             print(f"[TrendData] pytrends fetch failed: {exc} — using fallback keywords")
-            return TrendDataService._fallback_keywords(industry)
+            results = TrendDataService._fallback_keywords(industry)
+
+        # Only cache real Google Trends results (not fallback)
+        if db is not None and any(r.get("source") == "google_trends" for r in results):
+            try:
+                await db["trends_cache"].replace_one(
+                    {"_id": cache_key},
+                    {"_id": cache_key, "keywords": results, "cached_at": datetime.now(timezone.utc)},
+                    upsert=True,
+                )
+                print(f"[TrendData] cached {len(results)} keywords for '{industry}'")
+            except Exception as e:
+                print(f"[TrendData] cache write error: {e}")
+
+        return results
 
     # ── Internal sync method (runs in thread executor) ────────────────────────
 
