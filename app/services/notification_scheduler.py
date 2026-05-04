@@ -79,12 +79,17 @@ def start_notification_scheduler():
 
     _scheduler = BackgroundScheduler(timezone="UTC")
 
+    # misfire_grace_time=None means: if the scheduled time was missed (e.g. server
+    # was down or just started after the scheduled hour), DO NOT run the job
+    # immediately — wait for the next scheduled occurrence.
+    _JOB_DEFAULTS = dict(replace_existing=True, misfire_grace_time=None, coalesce=True)
+
     # PRD 8.1: Daily content suggestions at 09:00 UTC
     _scheduler.add_job(
         _job_daily_suggestions,
         CronTrigger(hour=9, minute=0),
         id="daily_suggestions",
-        replace_existing=True,
+        **_JOB_DEFAULTS,
     )
 
     # PRD 8.2: Inactivity reminders at 10:00 UTC
@@ -92,7 +97,7 @@ def start_notification_scheduler():
         _job_inactivity_check,
         CronTrigger(hour=10, minute=0),
         id="inactivity_check",
-        replace_existing=True,
+        **_JOB_DEFAULTS,
     )
 
     # PRD 8.3: Trial expiry checks every 6 hours
@@ -100,7 +105,7 @@ def start_notification_scheduler():
         _job_trial_check,
         CronTrigger(hour="*/6", minute=15),
         id="trial_check",
-        replace_existing=True,
+        **_JOB_DEFAULTS,
     )
 
     # PRD 8.3: Subscription expiry check daily at midnight UTC
@@ -108,7 +113,7 @@ def start_notification_scheduler():
         _job_subscription_expiry,
         CronTrigger(hour=0, minute=0),
         id="subscription_expiry",
-        replace_existing=True,
+        **_JOB_DEFAULTS,
     )
 
     # WhatsApp daily content push at 08:00 UTC (9am WAT)
@@ -116,7 +121,7 @@ def start_notification_scheduler():
         _job_whatsapp_daily_push,
         CronTrigger(hour=8, minute=0),
         id="whatsapp_daily_push",
-        replace_existing=True,
+        **_JOB_DEFAULTS,
     )
 
     _scheduler.start()

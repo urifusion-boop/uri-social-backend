@@ -2020,17 +2020,106 @@ async def get_account_metrics(
                 print(f"⚠️ Instagram direct account metrics failed: {e}")
                 return None
 
+        # ── LinkedIn direct connections ───────────────────────────────────────
+        linkedin_conns = await db["social_connections"].find(
+            {"user_id": user_id, "platform": "linkedin", "connection_status": "active"},
+            {"_id": 0, "linkedin_access_token": 1, "person_urn": 1, "active_author_urn": 1,
+             "account_name": 1, "username": 1, "pages": 1},
+        ).to_list(length=5)
+
+        async def _fetch_linkedin_direct_metrics(conn):
+            access_token = conn.get("linkedin_access_token")
+            person_urn = conn.get("active_author_urn") or conn.get("person_urn")
+            if not access_token or not person_urn:
+                return None
+            try:
+                from app.agents.social_media_manager.services.linkedin_direct_service import LinkedInDirectService
+                svc = LinkedInDirectService()
+
+                # Fetch basic profile (name, email)
+                profile = await svc.get_profile(access_token)
+
+                # Fetch follower count from LinkedIn Community Management API
+                # Works for personal profiles; falls back to 0 if scope not granted
+                followers_count = 0
+                try:
+                    async with _httpx.AsyncClient(timeout=15) as _c:
+                        fol_resp = await _c.get(
+                            "https://api.linkedin.com/v2/networkSizes/urn:li:person:" + person_urn.split(":")[-1],
+                            params={"edgeType": "CompanyFollowedByMember"},
+                            headers={"Authorization": f"Bearer {access_token}",
+                                     "X-Restli-Protocol-Version": "2.0.0"},
+                        )
+                        if fol_resp.status_code == 200:
+                            followers_count = fol_resp.json().get("firstDegreeSize", 0)
+                except Exception:
+                    pass  # follower count is best-effort
+
+                # Count published posts from our DB in the period
+                from datetime import timezone as _tz
+                since_dt = datetime.utcfromtimestamp(since_ts).replace(tzinfo=_tz.utc)
+                post_count = await db["content_drafts"].count_documents({
+                    "user_id": user_id,
+                    "status": "published",
+                    "platforms": {"$in": ["linkedin"]},
+                })
+
+                # Aggregate likes + comments from content_analytics for LinkedIn posts
+                li_draft_ids = await db["content_drafts"].distinct(
+                    "id",
+                    {"user_id": user_id, "status": "published", "platforms": {"$in": ["linkedin"]}},
+                )
+                analytics_cursor = db["content_analytics"].find(
+                    {"draft_id": {"$in": li_draft_ids}},
+                    {"likes": 1, "comments": 1, "shares": 1, "impressions": 1},
+                )
+                total_likes = total_comments = total_shares = total_impressions = 0
+                async for ana in analytics_cursor:
+                    total_likes       += int(ana.get("likes", 0) or 0)
+                    total_comments    += int(ana.get("comments", 0) or 0)
+                    total_shares      += int(ana.get("shares", 0) or 0)
+                    total_impressions += int(ana.get("impressions", 0) or 0)
+
+                return {
+                    "account_id": person_urn,
+                    "network": "linkedin",
+                    "page_name": profile.get("name") or conn.get("account_name") or conn.get("username"),
+                    "category": None,
+                    "followers_count": followers_count,
+                    "following_count": None,
+                    "posts_count": post_count,
+                    "engagement": {
+                        "views": total_impressions,
+                        "likes": total_likes,
+                        "comments": total_comments,
+                        "shares": total_shares,
+                        "reposts": 0,
+                        "quotes": 0,
+                    },
+                    "engagement_note": f"From {post_count} LinkedIn posts published (all time)",
+                    "platform_specific": {
+                        "email": profile.get("email"),
+                        "person_urn": person_urn,
+                        "pages": conn.get("pages", []),
+                    },
+                    "period": {"since": since_ts, "until": until_ts},
+                }
+            except Exception as e:
+                print(f"⚠️ LinkedIn direct account metrics failed for {person_urn}: {e}")
+                return None
+
         async def _fetch_direct_metrics(conn):
             if conn.get("connected_via") in ("instagram_direct", "instagram_direct_oauth"):
                 return await _fetch_instagram_direct_metrics(conn)
             return None  # extend here for other direct platforms
 
-        outstand_results, direct_results = await _asyncio.gather(
+        outstand_results, direct_results, linkedin_results = await _asyncio.gather(
             _asyncio.gather(*[_fetch_outstand_metrics(a) for a in outstand_accounts]),
             _asyncio.gather(*[_fetch_direct_metrics(c) for c in direct_conns]),
+            _asyncio.gather(*[_fetch_linkedin_direct_metrics(c) for c in linkedin_conns]),
         )
 
-        account_metrics = [r for r in (*outstand_results, *direct_results) if r is not None]
+        account_metrics = [r for r in (*outstand_results, *direct_results, *linkedin_results) if r is not None]
 
         return UriResponse.get_single_data_response("account_metrics", {
             "has_data": len(account_metrics) > 0,
