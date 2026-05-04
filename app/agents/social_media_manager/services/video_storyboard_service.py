@@ -111,7 +111,7 @@ class VideoStoryboardService:
         response = await loop.run_in_executor(
             None,
             lambda: openai_client.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-5.4",
                 messages=messages,
                 temperature=0.7,
                 max_tokens=2000,
