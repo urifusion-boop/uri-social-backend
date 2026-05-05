@@ -73,6 +73,13 @@ async def whatsapp_webhook(
         valid = validator.validate(url, params, twilio_sig)
         print(f"[WhatsApp] webhook url={url!r} from={params.get('From')!r} body={params.get('Body')!r} sig_valid={valid}")
 
+        # Drop requests that fail signature validation — prevents the staging
+        # webhook URL from also triggering the prod container (and vice-versa),
+        # which causes every message to be processed twice and images to go missing.
+        if not valid:
+            print(f"[WhatsApp] ⛔ Rejected — signature mismatch (wrong environment). Ignoring.")
+            return _EMPTY_TWIML
+
     raw_from: str = params.get("From", "")
     # Button quick-reply taps may arrive with empty Body — fall back to ButtonText
     body: str = params.get("Body", "") or params.get("ButtonText", "")
