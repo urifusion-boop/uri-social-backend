@@ -18,7 +18,7 @@ _TOPIC_KEYWORDS: Dict[str, List[str]] = {
     "technology": ["tech", "software", "app", "digital", "automation", "AI", "platform", "tool"],
     "health":     ["health", "wellness", "fitness", "mental", "wellbeing", "nutrition"],
     "real estate":["property", "real estate", "house", "land", "rent", "buy", "mortgage"],
-    "fashion":    ["fashion", "style", "outfit", "clothing", "wear", "look", "trend"],
+    "fashion":    ["fashion", "style", "outfit", "clothing", "wear", "streetwear"],
     "food":       ["food", "meal", "recipe", "cook", "eat", "restaurant", "catering"],
     "offer":      ["discount", "promo", "offer", "sale", "deal", "combo", "price", "off"],
     "story":      ["behind", "story", "journey", "our team", "process", "how we"],
