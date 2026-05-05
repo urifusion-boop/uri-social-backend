@@ -1516,14 +1516,20 @@ class WhatsAppFlowService:
         headline = ctx.get("headline", "")
         subheadline = ctx.get("subheadline", "")
         caption = ctx.get("caption", "")
-        seed = f"{headline} — {subheadline} — {caption}".strip(" —") or ctx.get("topic", "content graphic")
+        # seed_content = the SHORT original topic (mirrors dashboard "seed_content" param)
+        seed_content = ctx.get("topic", "") or f"{headline} — {subheadline}".strip(" —") or "content graphic"
+        # content = the FULL rich caption text (mirrors dashboard "content" param)
+        # This is what the image generator uses to decide what text to render on the image.
+        full_caption = caption or f"{headline}\n{subheadline}".strip()
+        content = full_caption if full_caption else seed_content
 
         try:
             image_result = await ImageContentService._generate_platform_image(
                 platform="instagram",
-                content=seed,
-                seed_content=seed,
+                content=content,
+                seed_content=seed_content,
                 brand_context=brand,
+                image_type="post_image",
             )
         except Exception as exc:
             print(f"[WhatsApp] graphic generation error: {exc}")
@@ -1539,37 +1545,34 @@ class WhatsAppFlowService:
         raw_url: str = image_result["responseData"]["image_url"]
         public_url: Optional[str] = None
 
-        if raw_url.startswith("data:") and settings.IMGBB_API_KEY:
+        # Upload to Cloudinary (same as dashboard path) — gives a permanent CDN URL
+        if raw_url.startswith("data:"):
             try:
-                import base64
-                import io
-                import httpx
-                import re as _re
-                from PIL import Image as PILImage
-
-                match = _re.match(r"data:[^;]+;base64,(.+)", raw_url, _re.DOTALL)
-                if match:
-                    b64_clean = match.group(1).strip().replace("\n", "").replace("\r", "")
-                    raw_bytes = base64.b64decode(b64_clean)
-                    img = PILImage.open(io.BytesIO(raw_bytes)).convert("RGB")
-                    buf = io.BytesIO()
-                    img.save(buf, format="JPEG", quality=92)
-                    b64_jpeg = base64.b64encode(buf.getvalue()).decode("utf-8")
-
-                    print(f"[WhatsApp] uploading JPEG graphic to imgBB ({len(b64_jpeg)} chars)...")
-                    async with httpx.AsyncClient(timeout=60) as c:
-                        r = await c.post(
-                            "https://api.imgbb.com/1/upload",
-                            data={"key": settings.IMGBB_API_KEY, "image": b64_jpeg},
-                        )
-                        rj = r.json()
-                    if rj.get("success"):
-                        public_url = rj["data"]["url"]
-                        print(f"[WhatsApp] imgBB upload success: {public_url}")
-                    else:
-                        print(f"[WhatsApp] imgBB upload failed: {rj}")
+                from app.utils.cloudinary_upload import upload_base64
+                public_url = await upload_base64(raw_url, folder="uri-social/whatsapp")
+                print(f"[WhatsApp] Cloudinary upload success: {public_url}")
             except Exception as e:
-                print(f"[WhatsApp] imgBB upload error: {e}")
+                print(f"[WhatsApp] Cloudinary upload error: {e}")
+                # Fallback: imgBB if Cloudinary fails and key is available
+                if settings.IMGBB_API_KEY:
+                    try:
+                        import base64, io, httpx, re as _re
+                        from PIL import Image as PILImage
+                        match = _re.match(r"data:[^;]+;base64,(.+)", raw_url, _re.DOTALL)
+                        if match:
+                            b64_clean = match.group(1).strip().replace("\n", "").replace("\r", "")
+                            raw_bytes = base64.b64decode(b64_clean)
+                            img = PILImage.open(io.BytesIO(raw_bytes)).convert("RGB")
+                            buf = io.BytesIO()
+                            img.save(buf, format="JPEG", quality=92)
+                            b64_jpeg = base64.b64encode(buf.getvalue()).decode("utf-8")
+                            async with httpx.AsyncClient(timeout=60) as c:
+                                r = await c.post("https://api.imgbb.com/1/upload", data={"key": settings.IMGBB_API_KEY, "image": b64_jpeg})
+                                rj = r.json()
+                            if rj.get("success"):
+                                public_url = rj["data"]["url"]
+                    except Exception as e2:
+                        print(f"[WhatsApp] imgBB fallback error: {e2}")
         elif raw_url.startswith("http"):
             public_url = raw_url
 
