@@ -29,6 +29,9 @@ from typing import Any, Dict, List, Optional
 
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
+from app.agents.social_media_manager.services.brand_profile_service import (
+    BrandProfileService,
+)
 from app.agents.social_media_manager.services.image_content_service import (
     ImageContentService,
 )
@@ -1486,7 +1489,30 @@ class WhatsAppFlowService:
         # Lock state so any messages during the 2-3 min generation get a friendly bounce
         await _safe_set_state(phone, "generating_graphic", ctx, db)
 
-        brand = await _brand_context(user_id, db)
+        raw_profile = await WhatsAppSessionService.get_brand_profile(user_id, db)
+        brand = BrandProfileService.to_brand_context(raw_profile)
+        brand["user_id"] = user_id
+
+        # Apply the same visual style rotation used by the dashboard
+        from app.agents.social_media_manager.services.style_library import pick_next_style
+        _bp = await db["brand_profiles"].find_one(
+            {"user_id": user_id},
+            {"style_selections": 1, "style_prompt_fragments": 1, "style_rotation_index": 1, "industry": 1},
+        ) or {}
+        _slug, _fragment, _next_index = pick_next_style(
+            _bp.get("style_selections") or [],
+            int(_bp.get("style_rotation_index") or 0),
+            _bp.get("industry") or brand.get("industry", ""),
+            _bp.get("style_prompt_fragments") or [],
+        )
+        if _fragment:
+            brand["style_prompt_fragment"] = _fragment
+            brand["style_slug"] = _slug
+            await db["brand_profiles"].update_one(
+                {"user_id": user_id},
+                {"$set": {"style_rotation_index": _next_index}},
+            )
+
         headline = ctx.get("headline", "")
         subheadline = ctx.get("subheadline", "")
         caption = ctx.get("caption", "")
