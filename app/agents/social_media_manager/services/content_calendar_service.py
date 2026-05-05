@@ -306,7 +306,7 @@ async def generate_plan(
 
     # ── Data-driven pipeline ──────────────────────────────────────────────────
     performance = await PerformanceAnalyticsService.get_user_performance(user_id, db)
-    trend_keywords = await TrendDataService.get_trending_keywords(industry)
+    trend_keywords = await TrendDataService.get_trending_keywords(industry, db=db)
 
     generation_method = "ai"  # default fallback
     days: List[Dict[str, Any]] = []
