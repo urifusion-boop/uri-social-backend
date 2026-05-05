@@ -419,8 +419,7 @@ Follow these rules precisely for every image. No exceptions.
             if font_prompt:
                 format_parts.append(f"Typography: {font_prompt}")
             else:
-                # CRITICAL: When no font prompt exists, explicitly prevent text overlays
-                format_parts.append("Typography: NO TEXT OVERLAYS. NO TYPOGRAPHY. Pure visual design without any written words, labels, or text elements.")
+                format_parts.append("Typography: Clean, modern sans-serif typeface. Bold headline text with strong contrast, readable subheading, professional typographic hierarchy. Text must be clearly legible.")
             format_section = "\n".join(format_parts)
 
             # SECTION 6: DO NOT INCLUDE (PRD Section 3.1 - Critical for preventing hallucinations)
