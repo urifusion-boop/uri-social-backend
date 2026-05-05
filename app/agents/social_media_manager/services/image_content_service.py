@@ -1405,8 +1405,8 @@ Follow these rules precisely for every image. No exceptions.
             resp.raise_for_status()
             logo_img = Image.open(io.BytesIO(resp.content)).convert("RGBA")
 
-            # Resize logo to 7% of image width, preserve aspect ratio
-            target_w = max(40, int(bw * 0.07))
+            # Resize logo to 14% of image width, preserve aspect ratio
+            target_w = max(60, int(bw * 0.14))
             lw, lh = logo_img.size
             scale = target_w / lw
             logo_img = logo_img.resize((target_w, int(lh * scale)), Image.LANCZOS)
