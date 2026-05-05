@@ -116,6 +116,11 @@ class StoryboardRequest(BaseModel):
     target_platform: str = "instagram_reels"
     target_duration_seconds: int = Field(15, ge=5, le=30)
 
+class VideoFromStoryboardRequest(BaseModel):
+    storyboard: Dict[str, Any]
+    brand_images: List[str] = Field(default_factory=list, max_items=5)
+    model: str = "veo-3.1-fast-generate-preview"
+
 class ContentGenerationRequest(BaseModel):
     seed_content: str = Field(..., min_length=10, max_length=5000)
     platforms: List[str] = Field(..., min_items=1, max_items=5)
@@ -2841,3 +2846,55 @@ async def generate_storyboard(
         raise HTTPException(status_code=400, detail=result.get("error", "Storyboard generation failed"))
 
     return UriResponse.get_single_data_response("storyboard", result["storyboard"])
+
+
+@router.post("/generate-video-from-storyboard")
+async def generate_video_from_storyboard(
+    request: VideoFromStoryboardRequest,
+    background_tasks: BackgroundTasks,
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Start Veo 3.1 video generation for every scene in a storyboard.
+    Returns a job_id immediately. Poll GET /video-job/{job_id} for progress.
+    """
+    from app.agents.social_media_manager.services.video_generation_service import (
+        VideoGenerationService,
+    )
+
+    _get_user_id(token)  # auth check
+
+    job_id = VideoGenerationService.create_job(request.storyboard, request.model)
+    background_tasks.add_task(
+        VideoGenerationService.run_job,
+        job_id,
+        request.storyboard,
+        request.brand_images,
+        request.model,
+    )
+    return UriResponse.get_single_data_response(
+        "video_job",
+        {"job_id": job_id, "status": "queued", "total_scenes": len(request.storyboard.get("scenes", []))},
+    )
+
+
+@router.get("/video-job/{job_id}")
+async def get_video_job(
+    job_id: str,
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Poll for video generation progress.
+    status: queued | generating | complete | failed
+    current_scene: which scene is being generated right now (1-based)
+    clips: completed clips so far (grows as each scene finishes)
+    """
+    from app.agents.social_media_manager.services.video_generation_service import get_job
+
+    _get_user_id(token)  # auth check
+
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    return UriResponse.get_single_data_response("video_job", job)
