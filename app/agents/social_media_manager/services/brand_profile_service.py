@@ -65,9 +65,17 @@ class BrandProfileService:
         if "font_style_prompt" in data:
             doc["font_style_prompt"] = data["font_style_prompt"]
 
+        existing = await db[BrandProfileService.COLLECTION].find_one({"user_id": user_id})
+
         # OPTION 2: ONBOARDING VALIDATION - Enforce required fields
-        # When user tries to mark onboarding as complete, validate critical fields
-        if doc.get("onboarding_completed"):
+        # Only validate when user is ACTIVELY TRYING to complete onboarding (transition from False→True)
+        # Don't block subsequent saves after onboarding is already complete
+        is_completing_onboarding = (
+            doc.get("onboarding_completed") and
+            (not existing or not existing.get("onboarding_completed"))
+        )
+
+        if is_completing_onboarding:
             required_for_completion = {
                 "brand_name": doc.get("brand_name"),
                 "industry": doc.get("industry"),
@@ -85,7 +93,6 @@ class BrandProfileService:
                     detail=f"Cannot complete onboarding. Please provide: {', '.join(missing)}",
                 )
 
-        existing = await db[BrandProfileService.COLLECTION].find_one({"user_id": user_id})
         if existing:
             # Once onboarding_completed is True, never allow it to be reset to False
             if existing.get("onboarding_completed") and not doc.get("onboarding_completed"):

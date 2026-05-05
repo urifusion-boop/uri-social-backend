@@ -1156,12 +1156,16 @@ async def edit_draft_image(
     if not feedback:
         raise HTTPException(status_code=400, detail="feedback is required")
 
+    # Optional: force_category parameter from quick buttons (bypasses classifier)
+    force_category = body.get("force_category")
+
     # Call the editing service
     result = await ImageEditingService.edit_image_for_draft(
         draft_id=draft_id,
         user_id=user_id,
         feedback=feedback,
-        db=db
+        db=db,
+        force_category=force_category
     )
 
     # Return the result (could be success, credit warning, or error)

@@ -85,9 +85,11 @@ If you are uncertain whether something should change, DO NOT change it.
             Category: 'text_edit', 'style_edit', 'content_edit', or 'full_redesign'
         """
         try:
-            response = await AIService.chat_completion({
-                "model": "gpt-4o-mini",
-                "messages": [
+            from app.domain.requests.ai_request import AIRequest
+
+            ai_request = AIRequest(
+                model="gpt-4o-mini",
+                messages=[
                     {
                         "role": "system",
                         "content": """Classify this image edit request into exactly one category.
@@ -109,10 +111,11 @@ Categories:
                     },
                     {"role": "user", "content": user_feedback}
                 ],
-                "max_tokens": 10,
-                "temperature": 0,
-            })
+                max_tokens=10,
+                temperature=0,
+            )
 
+            response = await AIService.chat_completion(ai_request)
             category = response.choices[0].message.content.strip().lower()
 
             # Validate response
@@ -208,14 +211,58 @@ RULES FOR THIS EDIT:
         """
         Generate Jane's response message after successful edit
         PRD Section 8: Jane's Response Messages
+
+        Creates personalized messages that confirm what changed and reassure
+        that everything else was preserved.
         """
-        messages = {
-            "text_edit": f"Updated! I changed the text as requested. Everything else is exactly the same. Approve this version?",
-            "style_edit": f"Done! I adjusted the {user_feedback.lower()}. Layout, text, and everything else untouched. Look good?",
-            "content_edit": f"Added/modified as requested! I matched it to the existing style. Approve?",
-            "full_redesign": f"Here's a completely new design. Fresh concept, same brand. Approve?",
-        }
-        return messages.get(edit_category, "Edit complete! Approve?")
+        feedback_lower = user_feedback.lower()
+
+        if edit_category == "text_edit":
+            # Try to extract what text changed
+            if "price" in feedback_lower:
+                return "Updated! Only the price changed. Font, size, position, and everything else is exactly the same. Approve this version?"
+            elif "date" in feedback_lower or "time" in feedback_lower:
+                return "Updated! Only the date/time changed. Everything else is exactly the same. Approve this version?"
+            elif "phone" in feedback_lower or "number" in feedback_lower:
+                return "Updated! Only the phone number changed. Everything else is exactly the same. Approve this version?"
+            elif "typo" in feedback_lower or "spelling" in feedback_lower or "fix" in feedback_lower:
+                return "Fixed! Only the text correction was made. Everything else is exactly the same. Approve this version?"
+            else:
+                return "Updated! I changed the text as requested. Everything else is exactly the same. Approve this version?"
+
+        elif edit_category == "style_edit":
+            # Customize based on what style property changed
+            if "background" in feedback_lower:
+                if "darker" in feedback_lower or "dark" in feedback_lower:
+                    return "Done! Background is darker now. All text, layout, and elements untouched. Look good?"
+                elif "lighter" in feedback_lower or "light" in feedback_lower:
+                    return "Done! Background is lighter now. All text, layout, and elements untouched. Look good?"
+                else:
+                    return "Done! Background changed. All text, layout, and elements untouched. Look good?"
+            elif "colour" in feedback_lower or "color" in feedback_lower:
+                return "Done! Colours adjusted. Layout, text content, and everything else preserved. Look good?"
+            elif "bigger" in feedback_lower or "larger" in feedback_lower or "size" in feedback_lower:
+                return "Done! Resized as requested. Position, layout, and everything else untouched. Look good?"
+            elif "position" in feedback_lower or "move" in feedback_lower:
+                return "Done! Repositioned the element. Everything else stays in place. Look good?"
+            else:
+                return "Done! Visual style adjusted. Layout, text, and content preserved. Look good?"
+
+        elif edit_category == "content_edit":
+            # Customize based on add/remove action
+            if "add" in feedback_lower:
+                return "Added! I matched the new element to your existing style. All other elements preserved. Approve?"
+            elif "remove" in feedback_lower:
+                return "Removed! The space blends naturally with the rest of the design. All other elements preserved. Approve?"
+            elif "replace" in feedback_lower or "swap" in feedback_lower:
+                return "Replaced! The new element matches your existing style. All other elements preserved. Approve?"
+            else:
+                return "Modified as requested! I matched it to the existing style. All other elements preserved. Approve?"
+
+        elif edit_category == "full_redesign":
+            return "Here's a completely new design. Fresh concept, same brand. Approve?"
+
+        return "Edit complete! Approve?"
 
     @staticmethod
     async def save_image_version(
@@ -284,7 +331,22 @@ RULES FOR THIS EDIT:
             })
 
             if not previous_version:
-                return UriResponse.error_response("Previous version not found. Cannot undo.")
+                # Edge case: v1 was never saved (before the fix was deployed)
+                # Try to find ANY previous version, or inform user
+                all_versions = await db["image_versions"].find(
+                    {"draft_id": draft_id}
+                ).sort("version_number", -1).to_list(length=10)
+
+                if all_versions:
+                    # Use the oldest available version
+                    previous_version = all_versions[-1]
+                    print(f"[UNDO] Previous version {current_version - 1} not found, using oldest available: v{previous_version['version_number']}")
+                else:
+                    # No version history at all - this edit was made before version history was working
+                    return UriResponse.get_single_data_response("undo_error", {
+                        "message": "Version history is not available for this image. This edit was made before the undo feature was enabled. "
+                                   "Future edits will support undo."
+                    })
 
             # Restore previous version
             await db["content_drafts"].update_one(
@@ -324,6 +386,7 @@ RULES FOR THIS EDIT:
         user_id: str,
         feedback: str,
         db,
+        force_category: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Edit image in-place using user feedback
@@ -350,12 +413,19 @@ RULES FOR THIS EDIT:
             if not draft:
                 return UriResponse.error_response("Draft not found")
 
+            # Get the actual draft ID from the document (could be 'id', 'draft_id', or '_id')
+            actual_draft_id = draft.get("id") or draft.get("draft_id") or str(draft.get("_id"))
+
             # Step 2: Check if this is an undo request
             if ImageEditingService.is_undo_request(feedback):
-                return await ImageEditingService.undo_image_edit(db, draft_id, user_id)
+                return await ImageEditingService.undo_image_edit(db, actual_draft_id, user_id)
 
-            # Step 3: Classify the edit intent
-            edit_category = await ImageEditingService.classify_edit_intent(feedback)
+            # Step 3: Classify the edit intent (or use forced category from quick buttons)
+            if force_category and force_category in ['text_edit', 'style_edit', 'content_edit', 'full_redesign']:
+                edit_category = force_category
+                print(f"[EDIT] Using forced category: {force_category} (skipped classifier)")
+            else:
+                edit_category = await ImageEditingService.classify_edit_intent(feedback)
 
             # Step 4: Check credit implications
             current_version = draft.get("image_version", 1)
@@ -372,7 +442,18 @@ RULES FOR THIS EDIT:
                         "credits_required": 1
                     })
 
-                # Ask for confirmation before charging
+                # PRD Section 7.1: Suggest specific edits before redesigning (if not forced)
+                # Only suggest if this is NOT from the "Redesign" quick button
+                if not force_category:
+                    return UriResponse.get_single_data_response("suggest_edit_first", {
+                        "message": "Before I start over (which costs 1 credit), would you like me to try a specific change first? "
+                                   "For example, I can change the colours, adjust the text, or modify the layout — all free of charge. "
+                                   "What specifically don't you like about the current version?",
+                        "edit_category": edit_category,
+                        "credits_required": 1
+                    })
+
+                # Ask for confirmation before charging (when forced from quick button)
                 return UriResponse.get_single_data_response("confirm_redesign", {
                     "message": "Redesigning from scratch costs 1 additional campaign credit. "
                                "Want me to proceed, or would you like to try a specific edit instead?",
@@ -423,6 +504,27 @@ RULES FOR THIS EDIT:
             if not current_image_url:
                 return UriResponse.error_response("No current image found for this draft")
 
+            # Step 6.5: Save the CURRENT version to history (if this is the first edit)
+            # This ensures we can undo back to the original
+            if current_version == 1:
+                # Check if v1 already exists in history
+                existing_v1 = await db["image_versions"].find_one({
+                    "draft_id": actual_draft_id,
+                    "version_number": 1
+                })
+
+                if not existing_v1:
+                    # Save the original image as v1 before editing
+                    print(f"[EDIT] Saving original image as v1 before first edit")
+                    await ImageEditingService.save_image_version(
+                        db=db,
+                        draft_id=actual_draft_id,
+                        version_number=1,
+                        image_url=current_image_url,
+                        edit_category="initial",
+                        edit_feedback="Original generated image"
+                    )
+
             # Step 7: Download the current image
             print(f"[EDIT] Downloading image from: {current_image_url}")
             image_bytes = await ImageEditingService._download_image(current_image_url)
@@ -433,9 +535,9 @@ RULES FOR THIS EDIT:
             # Step 8: Call GPT-Image-2 Edit API
             print(f"[EDIT] Calling GPT-Image-2 edit API...")
             platform = draft.get("platform", "instagram")
-            size = "1024x1024"  # Default square
-            if platform == "instagram":
-                size = "1080x1080"
+            # GPT-Image-2 requires dimensions divisible by 16
+            # Valid sizes: 1024x1024, 1024x1536, 1536x1024
+            size = "1024x1024"  # Default square (divisible by 16)
 
             edited_image_url = await ImageEditingService._call_edit_api(
                 image_bytes=image_bytes,
@@ -446,11 +548,11 @@ RULES FOR THIS EDIT:
             if not edited_image_url:
                 return UriResponse.error_response("Image edit API call failed")
 
-            # Step 9: Save to version history
+            # Step 9: Save NEW version to history
             new_version = current_version + 1
             await ImageEditingService.save_image_version(
                 db=db,
-                draft_id=draft_id,
+                draft_id=actual_draft_id,
                 version_number=new_version,
                 image_url=edited_image_url,
                 edit_category=edit_category,
@@ -472,7 +574,7 @@ RULES FOR THIS EDIT:
                 if content_edit_count >= 1:
                     await credit_service.deduct_credit(
                         user_id=user_id,
-                        campaign_id=draft_id,
+                        campaign_id=actual_draft_id,
                         reason=f"image_edit_{edit_category}"
                     )
 
