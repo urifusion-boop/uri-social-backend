@@ -24,7 +24,7 @@ class TestContentGeneration:
         r = client.post("/social-media/generate-content", json=CONTENT_PAYLOAD)
         assert r.status_code in (401, 403), f"Expected auth error, got {r.status_code}"
 
-    def test_generate_content_success(self, client, auth_headers):
+    def test_generate_content_success(self, client, auth_headers, brand_profile):
         """Authenticated user can generate content."""
         r = client.post(
             "/social-media/generate-content",
@@ -36,7 +36,7 @@ class TestContentGeneration:
         data = r.json()
         assert data["status"] is True
 
-    def test_generated_content_has_drafts(self, client, auth_headers):
+    def test_generated_content_has_drafts(self, client, auth_headers, brand_profile):
         """Generated content response contains drafts."""
         r = client.post(
             "/social-media/generate-content",
