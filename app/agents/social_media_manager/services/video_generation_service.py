@@ -1,10 +1,9 @@
 import asyncio
-import base64
-import re
 import uuid
 from typing import Any, Dict, List, Optional
 
 from app.core.config import settings
+from app.database import get_db
 from app.utils.cloudinary_upload import upload_bytes
 
 try:
@@ -15,22 +14,24 @@ except Exception as _e:
     _gemini_client = None
     print(f"[VideoGenerationService] google-genai init failed: {_e}")
 
-# In-memory job store — survives the HTTP request, cleared on container restart
-_jobs: Dict[str, Dict[str, Any]] = {}
-
 DEFAULT_MODEL = "veo-3.1-generate-preview"
 
 
-def get_job(job_id: str) -> Optional[Dict[str, Any]]:
-    return _jobs.get(job_id)
+def _jobs_collection():
+    return get_db()["video_generation_jobs"]
+
+
+async def get_job(job_id: str) -> Optional[Dict[str, Any]]:
+    doc = await _jobs_collection().find_one({"job_id": job_id}, {"_id": 0})
+    return doc
 
 
 class VideoGenerationService:
 
     @staticmethod
-    def create_job(storyboard: dict, model: str) -> str:
+    async def create_job(storyboard: dict, model: str) -> str:
         job_id = uuid.uuid4().hex
-        _jobs[job_id] = {
+        await _jobs_collection().insert_one({
             "job_id": job_id,
             "status": "queued",
             "model": model,
@@ -38,7 +39,7 @@ class VideoGenerationService:
             "current_scene": 0,
             "clips": [],
             "error": None,
-        }
+        })
         return job_id
 
     @staticmethod
@@ -52,27 +53,27 @@ class VideoGenerationService:
         Background task: generate one Veo 3.1 video clip per storyboard scene,
         upload each to Cloudinary, and update the job record progressively.
         """
-        job = _jobs.get(job_id)
-        if not job:
-            return
+        col = _jobs_collection()
 
         if not _gemini_client:
-            job["status"] = "failed"
-            job["error"] = "Google Gemini client not initialised — check GOOGLE_GEMINI_API_KEY"
+            await col.update_one(
+                {"job_id": job_id},
+                {"$set": {"status": "failed", "error": "Google Gemini client not initialised — check GOOGLE_GEMINI_API_KEY"}},
+            )
             return
 
         scenes = storyboard.get("scenes", [])
-        job["status"] = "generating"
+        await col.update_one({"job_id": job_id}, {"$set": {"status": "generating"}})
 
         for scene in scenes:
             scene_num = scene.get("scene_number", 0)
-            job["current_scene"] = scene_num
+            await col.update_one({"job_id": job_id}, {"$set": {"current_scene": scene_num}})
 
             try:
                 video_url = await VideoGenerationService._generate_scene(
                     scene, brand_images, model
                 )
-                job["clips"].append({
+                clip = {
                     "scene_number": scene_num,
                     "shot_type": scene.get("shot_type", ""),
                     "duration_seconds": scene.get("duration_seconds", 5),
@@ -80,10 +81,10 @@ class VideoGenerationService:
                     "text_overlay": scene.get("text_overlay"),
                     "video_prompt": scene.get("video_prompt", ""),
                     "video_url": video_url,
-                })
+                }
             except Exception as e:
                 print(f"[VideoGenJob {job_id}] Scene {scene_num} failed: {e}")
-                job["clips"].append({
+                clip = {
                     "scene_number": scene_num,
                     "shot_type": scene.get("shot_type", ""),
                     "duration_seconds": scene.get("duration_seconds", 5),
@@ -92,10 +93,14 @@ class VideoGenerationService:
                     "video_prompt": scene.get("video_prompt", ""),
                     "video_url": None,
                     "error": str(e),
-                })
+                }
 
-        job["status"] = "complete"
-        job["current_scene"] = len(scenes)
+            await col.update_one({"job_id": job_id}, {"$push": {"clips": clip}})
+
+        await col.update_one(
+            {"job_id": job_id},
+            {"$set": {"status": "complete", "current_scene": len(scenes)}},
+        )
 
     @staticmethod
     async def _generate_scene(
@@ -106,22 +111,8 @@ class VideoGenerationService:
         """Generate one clip for a storyboard scene and return its Cloudinary URL."""
         prompt = scene.get("video_prompt", "")
         duration_req = scene.get("duration_seconds", 5)
-        # Veo 3.1 accepts 5 or 8 seconds
-        duration = 8 if duration_req >= 7 else 5
-        ref_idx = scene.get("reference_image_index", 0)
-
-        # Attach the reference brand image as the first frame
-        ref_image = None
-        if brand_images and ref_idx < len(brand_images):
-            img_data = brand_images[ref_idx]
-            match = re.match(r"data:([^;]+);base64,(.+)", img_data, re.DOTALL)
-            if match:
-                mime_type = match.group(1)
-                img_bytes = base64.b64decode(match.group(2))
-                ref_image = genai_types.Image(
-                    image_bytes=img_bytes,
-                    mime_type=mime_type,
-                )
+        # Veo 3.1 only accepts 4, 6, or 8 seconds
+        duration = 8 if duration_req >= 7 else (6 if duration_req >= 5 else 4)
 
         config = genai_types.GenerateVideosConfig(
             aspect_ratio="9:16",
@@ -131,14 +122,13 @@ class VideoGenerationService:
 
         loop = asyncio.get_running_loop()
 
-        # Submit — returns a long-running operation immediately
-        generate_kwargs = dict(model=model, prompt=prompt, config=config)
-        if ref_image:
-            generate_kwargs["image"] = ref_image
-
         operation = await loop.run_in_executor(
             None,
-            lambda: _gemini_client.models.generate_videos(**generate_kwargs),
+            lambda: _gemini_client.models.generate_videos(
+                model=model,
+                prompt=prompt,
+                config=config,
+            ),
         )
 
         # Poll every 10 s, max 10 minutes
@@ -158,7 +148,6 @@ class VideoGenerationService:
         if not generated:
             raise ValueError("Veo returned no generated videos")
 
-        # Download video bytes from Google, upload to Cloudinary
         video_file = generated[0].video
         video_bytes = await loop.run_in_executor(
             None,
