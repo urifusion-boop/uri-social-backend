@@ -18,7 +18,7 @@ except Exception as _e:
 # In-memory job store — survives the HTTP request, cleared on container restart
 _jobs: Dict[str, Dict[str, Any]] = {}
 
-DEFAULT_MODEL = "veo-3.1-fast-generate-preview"
+DEFAULT_MODEL = "veo-3.1-generate-preview"
 
 
 def get_job(job_id: str) -> Optional[Dict[str, Any]]:
@@ -106,45 +106,39 @@ class VideoGenerationService:
         """Generate one clip for a storyboard scene and return its Cloudinary URL."""
         prompt = scene.get("video_prompt", "")
         duration_req = scene.get("duration_seconds", 5)
-        # Veo 3.1 accepts 4, 6, or 8 seconds
-        duration = 8 if duration_req >= 7 else (6 if duration_req >= 5 else 4)
+        # Veo 3.1 accepts 5 or 8 seconds
+        duration = 8 if duration_req >= 7 else 5
         ref_idx = scene.get("reference_image_index", 0)
 
-        # Attach the reference brand image if available
-        ref_images = []
+        # Attach the reference brand image as the first frame
+        ref_image = None
         if brand_images and ref_idx < len(brand_images):
             img_data = brand_images[ref_idx]
             match = re.match(r"data:([^;]+);base64,(.+)", img_data, re.DOTALL)
             if match:
                 mime_type = match.group(1)
                 img_bytes = base64.b64decode(match.group(2))
-                ref_images = [
-                    genai_types.VideoGenerationReferenceImage(
-                        image=genai_types.Image(
-                            image_bytes=img_bytes,
-                            mime_type=mime_type,
-                        ),
-                        reference_type="asset",
-                    )
-                ]
+                ref_image = genai_types.Image(
+                    image_bytes=img_bytes,
+                    mime_type=mime_type,
+                )
 
         config = genai_types.GenerateVideosConfig(
             aspect_ratio="9:16",
             duration_seconds=duration,
             number_of_videos=1,
-            **({"reference_images": ref_images} if ref_images else {}),
         )
 
         loop = asyncio.get_running_loop()
 
         # Submit — returns a long-running operation immediately
+        generate_kwargs = dict(model=model, prompt=prompt, config=config)
+        if ref_image:
+            generate_kwargs["image"] = ref_image
+
         operation = await loop.run_in_executor(
             None,
-            lambda: _gemini_client.models.generate_videos(
-                model=model,
-                prompt=prompt,
-                config=config,
-            ),
+            lambda: _gemini_client.models.generate_videos(**generate_kwargs),
         )
 
         # Poll every 10 s, max 10 minutes
