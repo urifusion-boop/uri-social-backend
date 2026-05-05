@@ -313,7 +313,7 @@ async def generate_plan(
 
     if trend_keywords:
         try:
-            raw_ideas  = IdeaScoringService.generate_ideas(trend_keywords, industry, performance)
+            raw_ideas  = IdeaScoringService.generate_ideas(trend_keywords, industry, performance, brand_data=brand)
             scored     = IdeaScoringService.score_ideas(raw_ideas, performance)
             top_ideas  = IdeaScoringService.select_for_calendar(scored, n=7)
 
