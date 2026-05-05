@@ -347,7 +347,11 @@ async def generate_plan(
     # ── AI fallback ───────────────────────────────────────────────────────────
     if not days:
         generation_method = "ai"
-        ai_ideas = await _generate_ideas(brand, mix, week_start, platforms, previous_titles=previous_titles)
+        try:
+            ai_ideas = await _generate_ideas(brand, mix, week_start, platforms, previous_titles=previous_titles)
+        except Exception as exc:
+            print(f"[Calendar] AI fallback also failed: {exc}")
+            ai_ideas = []
         for i, idea in enumerate(ai_ideas):
             day_date = (monday + timedelta(days=i)).strftime("%Y-%m-%d")
             days.append({
@@ -369,6 +373,21 @@ async def generate_plan(
                 "regenerated_count":   0,
                 "last_regenerated_at": None,
             })
+
+    # Guard: if both pipelines failed, restore the archived plan rather than
+    # persisting an empty plan that would leave the user with a broken calendar.
+    if not days:
+        print(f"[Calendar] Both pipelines failed for user {user_id} — restoring previous plan")
+        restored = await db[COLLECTION].find_one_and_update(
+            {"user_id": user_id, "week_start": week_start, "status": "archived"},
+            {"$set": {"status": "active"}},
+            sort=[("generated_at", -1)],
+            return_document=True,
+        )
+        if restored:
+            restored.pop("_id", None)
+            return restored
+        raise RuntimeError("Content generation failed and no previous plan to restore. Please try again.")
 
     plan_id = str(uuid.uuid4())
     doc = {
