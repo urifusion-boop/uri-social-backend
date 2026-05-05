@@ -1478,7 +1478,11 @@ async def generate_calendar_plan(
             db=db,
             force=request.force_regenerate,
         )
-        return UriResponse.get_single_data_response("calendar_plan", plan)
+        print(f"[Calendar] plan returned plan_id={plan.get('plan_id')} generation_method={plan.get('generation_method')} force={request.force_regenerate}")
+        return UriResponse.get_single_data_response("calendar_plan", {
+            **plan,
+            "regenerated": request.force_regenerate,
+        })
     except Exception as e:
         import traceback as _tb
         print(_tb.format_exc())
