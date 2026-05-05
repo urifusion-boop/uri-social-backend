@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import subprocess
 import traceback
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query, Request, UploadFile, File
 from fastapi.responses import RedirectResponse, StreamingResponse, JSONResponse
@@ -2902,3 +2903,90 @@ async def get_video_job(
         raise HTTPException(status_code=404, detail="Job not found")
 
     return UriResponse.get_single_data_response("video_job", job)
+
+
+@router.post("/merge-video-job/{job_id}")
+async def merge_video_job(
+    job_id: str,
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Merge all completed clips from a finished video job into a single video.
+    Returns the merged Cloudinary video URL.
+    """
+    from app.agents.social_media_manager.services.video_generation_service import get_job
+    from app.agents.social_media_manager.services.video_merge_service import VideoMergeService
+
+    _get_user_id(token)  # auth check
+
+    job = await get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.get("status") != "complete":
+        raise HTTPException(status_code=400, detail="Job is not complete yet")
+
+    clip_urls = [c["video_url"] for c in job.get("clips", []) if c.get("video_url")]
+    if not clip_urls:
+        raise HTTPException(status_code=400, detail="No completed clips to merge")
+
+    try:
+        merged_url = await VideoMergeService.merge_clips(clip_urls)
+    except subprocess.CalledProcessError as e:
+        raise HTTPException(status_code=500, detail=f"ffmpeg merge failed: {e.stderr.decode()[:300]}")
+
+    return UriResponse.get_single_data_response("merged_video", {"merged_video_url": merged_url})
+
+
+class SaveVideoDraftRequest(BaseModel):
+    merged_video_url: str
+    caption: str = ""
+    platforms: List[str] = Field(default_factory=list)
+
+
+@router.post("/video-drafts")
+async def save_video_draft(
+    request: SaveVideoDraftRequest,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """Save a merged video as a draft for later posting."""
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    from datetime import datetime, timezone
+    import uuid as _uuid
+
+    draft_id = _uuid.uuid4().hex
+    doc = {
+        "id": draft_id,
+        "user_id": user_id,
+        "media_type": "video",
+        "video_url": request.merged_video_url,
+        "content": request.caption,
+        "platforms": request.platforms,
+        "status": "draft",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db["content_drafts"].insert_one(doc)
+
+    doc.pop("_id", None)
+    return UriResponse.get_single_data_response("video_draft", doc)
+
+
+@router.get("/video-drafts")
+async def list_video_drafts(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """List all saved video drafts for the current user."""
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    drafts = await db["content_drafts"].find(
+        {"user_id": user_id, "media_type": "video"},
+        {"_id": 0},
+    ).sort("created_at", -1).to_list(length=50)
+
+    return UriResponse.get_single_data_response("video_drafts", drafts)
