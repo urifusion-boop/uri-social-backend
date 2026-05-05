@@ -1546,10 +1546,15 @@ class WhatsAppFlowService:
         public_url: Optional[str] = None
 
         # Upload to Cloudinary (same as dashboard path) — gives a permanent CDN URL
+        # WhatsApp requires JPEG/PNG — convert .webp Cloudinary URLs to .jpg
         if raw_url.startswith("data:"):
             try:
                 from app.utils.cloudinary_upload import upload_base64
                 public_url = await upload_base64(raw_url, folder="uri-social/whatsapp")
+                # Cloudinary serves .webp by default but WhatsApp rejects it (Twilio error 63021)
+                # Force JPEG by swapping the extension
+                if public_url and public_url.endswith(".webp"):
+                    public_url = public_url[:-5] + ".jpg"
                 print(f"[WhatsApp] Cloudinary upload success: {public_url}")
             except Exception as e:
                 print(f"[WhatsApp] Cloudinary upload error: {e}")
