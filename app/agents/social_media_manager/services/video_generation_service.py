@@ -132,7 +132,6 @@ class VideoGenerationService:
             aspect_ratio="9:16",
             duration_seconds=duration,
             number_of_videos=1,
-            enhance_prompt=False,
             **({"reference_images": ref_images} if ref_images else {}),
         )
 
