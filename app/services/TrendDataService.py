@@ -140,9 +140,19 @@ class TrendDataService:
                 continue
 
         # Deduplicate by keyword text, keep highest score per keyword
+        # Also strip query-type phrases that produce bad template titles
+        _QUERY_PREFIXES = (
+            "how to ", "what is ", "what are ", "why is ", "why are ",
+            "can i ", "should i ", "where to ", "when to ", "is it ",
+            "does ", "will ", "can ", "are there ", "which ", "who ",
+        )
         deduped: Dict[str, Dict] = {}
         for kw in found:
             key = kw["keyword"].lower()
+            if any(key.startswith(p) for p in _QUERY_PREFIXES):
+                continue  # skip question-type queries — they make bad topic substitutions
+            if len(key.split()) > 5:
+                continue  # skip overly long phrases
             if key not in deduped or kw["trend_score"] > deduped[key]["trend_score"]:
                 deduped[key] = kw
 
@@ -153,7 +163,7 @@ class TrendDataService:
     def _fallback_keywords(industry: str) -> List[Dict[str, Any]]:
         seeds = _INDUSTRY_SEEDS.get(
             industry.lower(),
-            [f"{industry} tips", f"{industry} mistakes", f"how to {industry}", f"{industry} guide"],
+            [f"{industry} tips", f"{industry} growth", f"{industry} strategy", f"{industry} trends"],
         )
         return [
             {

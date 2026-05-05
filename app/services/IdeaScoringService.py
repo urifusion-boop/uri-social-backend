@@ -210,16 +210,30 @@ class IdeaScoringService:
         selected: List[Dict] = []
         used_ids: set = set()
         keyword_count: Dict[str, int] = {}
-        max_per_keyword = 2  # enforce diversity across 7 days
+        template_count: Dict[str, int] = {}
+        max_per_keyword  = 2  # max times same keyword used across 7 days
+        max_per_template = 2  # max times same template opening used across 7 days
+
+        def _template_key(title: str) -> str:
+            """Return the first 2 words of the title as a template fingerprint."""
+            return " ".join(title.lower().split()[:2])
 
         def _pick(pool: List[Dict]) -> Optional[Dict]:
             for idea in pool:
                 if idea["idea_id"] in used_ids:
                     continue
                 kw = idea["keyword"].lower()
+                tk = _template_key(idea["title"])
+                if keyword_count.get(kw, 0) < max_per_keyword and template_count.get(tk, 0) < max_per_template:
+                    return idea
+            # Relax template constraint, keep keyword constraint
+            for idea in pool:
+                if idea["idea_id"] in used_ids:
+                    continue
+                kw = idea["keyword"].lower()
                 if keyword_count.get(kw, 0) < max_per_keyword:
                     return idea
-            # All keywords saturated — relax limit and take any unused
+            # All constraints saturated — take any unused
             for idea in pool:
                 if idea["idea_id"] not in used_ids:
                     return idea
@@ -229,8 +243,10 @@ class IdeaScoringService:
             pick = _pick(pools[ct]) or _pick(scored_ideas)
             if pick:
                 kw = pick["keyword"].lower()
+                tk = _template_key(pick["title"])
                 selected.append({**pick, "content_type": ct})
                 used_ids.add(pick["idea_id"])
                 keyword_count[kw] = keyword_count.get(kw, 0) + 1
+                template_count[tk] = template_count.get(tk, 0) + 1
 
         return selected[:n]
