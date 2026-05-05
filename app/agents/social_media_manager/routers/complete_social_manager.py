@@ -2868,7 +2868,7 @@ async def generate_video_from_storyboard(
 
     _get_user_id(token)  # auth check
 
-    job_id = VideoGenerationService.create_job(request.storyboard, request.model)
+    job_id = await VideoGenerationService.create_job(request.storyboard, request.model)
     background_tasks.add_task(
         VideoGenerationService.run_job,
         job_id,
@@ -2897,7 +2897,7 @@ async def get_video_job(
 
     _get_user_id(token)  # auth check
 
-    job = get_job(job_id)
+    job = await get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
