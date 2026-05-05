@@ -114,7 +114,7 @@ class VideoStoryboardService:
                 model="gpt-5.4",
                 messages=messages,
                 temperature=0.7,
-                max_tokens=2000,
+                max_completion_tokens=2000,
             ),
         )
 
