@@ -116,8 +116,9 @@ class VideoGenerationService:
         # Veo 3.1 only accepts 4, 6, or 8 seconds
         duration = 8 if duration_req >= 7 else (6 if duration_req >= 5 else 4)
 
-        # Build reference images from the storyboard frame generated for this scene
-        reference_images = []
+        # Download the storyboard frame to use as the video's first frame.
+        # Veo animates forward from this image, so the video matches the storyboard exactly.
+        first_frame: Optional[genai_types.Image] = None
         frame_image_url = scene.get("frame_image_url")
         if frame_image_url:
             try:
@@ -125,24 +126,16 @@ class VideoGenerationService:
                     resp = await http.get(frame_image_url)
                     frame_bytes = resp.content
                 mime = "image/webp" if ".webp" in frame_image_url else "image/jpeg"
-                ref = genai_types.VideoGenerationReferenceImage(
-                    image=genai_types.Image(image_bytes=frame_bytes, mime_type=mime),
-                    reference_type="asset",
-                )
-                reference_images.append(ref)
-                print(f"[VideoGen] Scene {scene.get('scene_number')}: using storyboard frame as reference image")
+                first_frame = genai_types.Image(image_bytes=frame_bytes, mime_type=mime)
+                print(f"[VideoGen] Scene {scene.get('scene_number')}: animating from storyboard frame")
             except Exception as e:
-                print(f"[VideoGen] Scene {scene.get('scene_number')}: could not load reference frame: {e}")
+                print(f"[VideoGen] Scene {scene.get('scene_number')}: could not load frame image: {e}")
 
-        config_kwargs: Dict[str, Any] = {
-            "aspect_ratio": "9:16",
-            "duration_seconds": duration,
-            "number_of_videos": 1,
-        }
-        if reference_images:
-            config_kwargs["reference_images"] = reference_images
-
-        config = genai_types.GenerateVideosConfig(**config_kwargs)
+        config = genai_types.GenerateVideosConfig(
+            aspect_ratio="9:16",
+            duration_seconds=duration,
+            number_of_videos=1,
+        )
 
         loop = asyncio.get_running_loop()
 
@@ -151,6 +144,7 @@ class VideoGenerationService:
             lambda: _gemini_client.models.generate_videos(
                 model=model,
                 prompt=prompt,
+                image=first_frame,   # animates from the storyboard frame if available
                 config=config,
             ),
         )
