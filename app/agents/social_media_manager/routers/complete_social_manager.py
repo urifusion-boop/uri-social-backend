@@ -3003,6 +3003,8 @@ async def save_video_draft(
     draft_id = _uuid.uuid4().hex
     doc = {
         "id": draft_id,
+        "request_id": draft_id,      # satisfies unique index on content_drafts
+        "platform": "video",          # satisfies compound index (request_id, platform)
         "user_id": user_id,
         "media_type": "video",
         "video_url": request.merged_video_url,
