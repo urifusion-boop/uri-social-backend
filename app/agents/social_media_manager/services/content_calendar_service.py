@@ -320,11 +320,25 @@ async def generate_plan(
     monday = _get_monday(now)
     week_start = monday.strftime("%Y-%m-%d")
 
+    previous_titles: List[str] = []
+
     if force:
+        # Grab current week's titles so AI doesn't regenerate the same ideas
+        existing_active = await get_active_plan(user_id, db, week_start)
+        if existing_active:
+            previous_titles = [d.get("title", "") for d in existing_active.get("days", []) if d.get("title")]
         await db[COLLECTION].update_many(
             {"user_id": user_id, "week_start": week_start, "status": "active"},
             {"$set": {"status": "archived"}},
         )
+        # Bust trend cache so we get fresh keywords
+        industry_temp = brand.get("industry", "")
+        if industry_temp:
+            try:
+                await db["trends_cache"].delete_one({"_id": f"{industry_temp.lower()}:NG:today 1-m"})
+                print(f"[Calendar] Busted trend cache for '{industry_temp}' on force-regenerate")
+            except Exception:
+                pass
     else:
         existing = await get_active_plan(user_id, db, week_start)
         if existing:
@@ -333,12 +347,13 @@ async def generate_plan(
     industry = brand.get("industry", "")
     mix = _pick_mix(industry)
 
+    # Add last week's titles too (if we don't already have current week titles from force path)
     last_monday = (monday - timedelta(days=7)).strftime("%Y-%m-%d")
     last_plan = await db[COLLECTION].find_one(
         {"user_id": user_id, "week_start": last_monday},
         {"_id": 0, "days": 1},
     )
-    previous_titles = [d.get("title", "") for d in (last_plan or {}).get("days", []) if d.get("title")]
+    previous_titles += [d.get("title", "") for d in (last_plan or {}).get("days", []) if d.get("title")]
 
     # ── Data signals ──────────────────────────────────────────────────────────
     performance = await PerformanceAnalyticsService.get_user_performance(user_id, db)
