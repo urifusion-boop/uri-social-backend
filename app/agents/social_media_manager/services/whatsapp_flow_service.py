@@ -981,8 +981,9 @@ class WhatsAppFlowService:
             return
 
         if any(w in text for w in _NEW_IDEA_WORDS) or text == "5":
-            topic = ctx.get("topic", "")
-            await WhatsAppFlowService._create_and_show_content(phone, topic, user_id, ctx, db)
+            # Clear the old topic so the user gets a fresh start, not another variation
+            await _send(phone, "Sure! What do you want this one to be about?")
+            await _safe_set_state(phone, "awaiting_topic", {}, db)
             return
 
         if any(w in text for w in _EDIT_WORDS) or text == "edit":
@@ -1022,8 +1023,8 @@ class WhatsAppFlowService:
             caption = ctx.get("caption", "No caption saved.")
             await _send(phone, f"Full caption:\n\n{caption}\n\n" + CONTENT_ACTIONS)
         elif intent == "new_idea":
-            topic = ctx.get("topic", "")
-            await WhatsAppFlowService._create_and_show_content(phone, topic, user_id, ctx, db)
+            await _send(phone, "Sure! What do you want this one to be about?")
+            await _safe_set_state(phone, "awaiting_topic", {}, db)
         elif intent == "edit":
             await WhatsAppFlowService._handle_edit_choice(phone, text, raw_body, user_id, ctx, db)
         elif intent == "ideas":
