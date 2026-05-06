@@ -123,7 +123,7 @@ class StoryboardFramesRequest(BaseModel):
 class VideoFromStoryboardRequest(BaseModel):
     storyboard: Dict[str, Any]
     brand_images: List[str] = Field(default_factory=list, max_items=5)
-    model: str = "veo-3.1-fast-generate-preview"
+    model: str = "veo-3.1-generate-preview"
 
 class ContentGenerationRequest(BaseModel):
     seed_content: str = Field(..., min_length=10, max_length=5000)
