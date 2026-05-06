@@ -59,7 +59,12 @@ async def startup_event():
 # Locally (no nginx), we enable it directly on FastAPI so preflight OPTIONS
 # requests are not rejected with 405.
 import os as _os
-_ENV = _os.getenv("APP_ENV", "local").lower()
+_ENV = (
+    _os.getenv("APP_ENV")
+    or _os.getenv("ENV")
+    or _os.getenv("DEV_ENV")
+    or "local"
+).lower()
 if _ENV not in ("production", "prod", "staging"):
     app.add_middleware(
         CORSMiddleware,
