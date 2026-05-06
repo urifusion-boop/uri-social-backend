@@ -1542,10 +1542,14 @@ class WhatsAppFlowService:
         headline = ctx.get("headline", "")
         subheadline = ctx.get("subheadline", "")
         caption = ctx.get("caption", "")
-        # seed_content = the SHORT original topic (mirrors dashboard "seed_content" param)
-        seed_content = ctx.get("topic", "") or f"{headline} — {subheadline}".strip(" —") or "content graphic"
-        # content = the FULL rich caption text (mirrors dashboard "content" param)
-        # This is what the image generator uses to decide what text to render on the image.
+        # seed_content drives the TEXT rendered on the image (headline — subheadline).
+        # Use the AI-generated headline/subheadline so the graphic matches the content,
+        # not the raw user topic which may be a vague phrase like "make content".
+        if headline:
+            seed_content = f"{headline} — {subheadline}" if subheadline else headline
+        else:
+            seed_content = ctx.get("topic", "") or "content graphic"
+        # content = full caption text for additional context to the image model
         full_caption = caption or f"{headline}\n{subheadline}".strip()
         content = full_caption if full_caption else seed_content
 
