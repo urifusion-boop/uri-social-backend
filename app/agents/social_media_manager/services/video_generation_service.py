@@ -144,6 +144,9 @@ class VideoGenerationService:
         if not operation.done:
             raise TimeoutError("Veo generation timed out after 10 minutes")
 
+        if not operation.response:
+            raise ValueError("Veo operation completed with no response — prompt may have been rejected by content policy")
+
         generated = operation.response.generated_videos
         if not generated:
             raise ValueError("Veo returned no generated videos")
