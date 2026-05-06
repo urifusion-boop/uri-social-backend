@@ -1,9 +1,11 @@
 import asyncio
+import base64
 import json
 import re
 from typing import Any, Dict, List, Optional
 
 from app.services.AIService import client as openai_client
+from app.utils.cloudinary_upload import upload_bytes
 
 _SYSTEM_PROMPT = """You are a creative director specialising in short-form social video for brands.
 
@@ -44,6 +46,47 @@ Return ONLY valid JSON — no markdown fences, no explanation:
 class VideoStoryboardService:
 
     @staticmethod
+    async def _generate_scene_frame(scene: dict) -> Optional[str]:
+        """Generate a single storyboard frame image via gpt-image-2 and upload to Cloudinary."""
+        try:
+            shot = scene.get("shot_type", "").replace("_", " ")
+            video_prompt = scene.get("video_prompt", "")
+            motion = scene.get("motion", "")
+            text = scene.get("text_overlay") or ""
+
+            prompt = (
+                f"Cinematic storyboard frame, {shot} shot. "
+                f"{video_prompt} "
+                f"Camera movement: {motion}. "
+                + (f'On-screen text: "{text}". ' if text else "")
+                + "Photorealistic, high-end brand photography, dramatic lighting. "
+                "Vertical 9:16 composition."
+            )
+
+            loop = asyncio.get_running_loop()
+            resp = await loop.run_in_executor(
+                None,
+                lambda: openai_client.images.generate(
+                    model="gpt-image-2",
+                    prompt=prompt,
+                    n=1,
+                    size="1024x1024",
+                    quality="medium",
+                    output_format="webp",
+                ),
+            )
+            img_bytes = base64.b64decode(resp.data[0].b64_json)
+            url = await upload_bytes(
+                img_bytes,
+                folder="uri-social/storyboard-frames",
+                resource_type="image",
+            )
+            return url
+        except Exception as e:
+            print(f"[StoryboardFrame] Scene {scene.get('scene_number')} frame failed: {e}")
+            return None
+
+    @staticmethod
     async def generate_storyboard(
         brand_images: List[str],
         optional_text: Optional[str],
@@ -53,7 +96,7 @@ class VideoStoryboardService:
     ) -> Dict[str, Any]:
         """
         Send brand images + optional creative text to GPT-4o Vision.
-        Returns a structured storyboard JSON dict.
+        Returns a structured storyboard JSON dict with per-scene frame_image_url.
 
         brand_images: list of base64 data URLs (up to 5)
         optional_text: marketer's creative direction — may be None
@@ -127,5 +170,15 @@ class VideoStoryboardService:
         except json.JSONDecodeError as e:
             print(f"Storyboard JSON parse error: {e}\nRaw: {raw[:300]}")
             return {"status": False, "error": "Failed to parse storyboard from model response."}
+
+        # Generate a unique frame image per scene in parallel
+        scenes = storyboard.get("scenes", [])
+        frame_urls = await asyncio.gather(*[
+            VideoStoryboardService._generate_scene_frame(scene)
+            for scene in scenes
+        ])
+        for scene, url in zip(scenes, frame_urls):
+            if url:
+                scene["frame_image_url"] = url
 
         return {"status": True, "storyboard": storyboard}
