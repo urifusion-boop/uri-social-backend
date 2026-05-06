@@ -96,6 +96,97 @@ def _pick_mix(industry: str) -> List[str]:
     return DEFAULT_MIX
 
 
+# Topic label → content_type bucket
+_TOPIC_TO_CONTENT_TYPE: Dict[str, str] = {
+    "education":   "educational",
+    "finance":     "educational",
+    "technology":  "educational",
+    "health":      "educational",
+    "real estate": "educational",
+    "marketing":   "educational",
+    "business":    "educational",
+    "motivation":  "relatable",
+    "fashion":     "relatable",
+    "food":        "relatable",
+    "offer":       "promotional",
+    "story":       "behind_the_scenes",
+}
+
+
+def _pick_mix_from_performance(
+    performance: Dict[str, Any],
+    industry: str,
+    brand: Optional[Dict[str, Any]] = None,
+) -> List[str]:
+    """
+    Build a personalised 7-day content-type mix driven by this user's
+    performance data.  Falls back to the industry/default mix when there
+    is no historical data.
+    """
+    if not performance or not performance.get("has_data"):
+        return _pick_mix(industry)
+
+    avg_by_topic: Dict[str, float] = performance.get("avg_engagement_by_topic", {})
+    if not avg_by_topic:
+        return _pick_mix(industry)
+
+    # Map each measured topic → content_type and accumulate weighted scores
+    type_scores: Dict[str, float] = {t: 0.0 for t in CONTENT_TYPES}
+    for topic, eng in avg_by_topic.items():
+        ct = _TOPIC_TO_CONTENT_TYPE.get(topic.lower(), "relatable")
+        type_scores[ct] = max(type_scores[ct], eng)  # take the best topic score per type
+
+    # Boost based on brand primary_goal
+    primary_goal = ((brand or {}).get("primary_goal") or "").lower()
+    if "sales" in primary_goal or "revenue" in primary_goal or "convert" in primary_goal:
+        type_scores["promotional"] = type_scores["promotional"] * 1.5 + 0.1
+    elif "community" in primary_goal or "relationship" in primary_goal:
+        type_scores["relatable"] = type_scores["relatable"] * 1.4 + 0.1
+        type_scores["behind_the_scenes"] = type_scores["behind_the_scenes"] * 1.3 + 0.1
+    elif "awareness" in primary_goal or "audience" in primary_goal or "grow" in primary_goal:
+        type_scores["educational"] = type_scores["educational"] * 1.4 + 0.1
+        type_scores["engagement"] = type_scores["engagement"] * 1.2 + 0.1
+
+    # Always ensure every type has a non-zero floor so it can appear
+    for ct in CONTENT_TYPES:
+        if type_scores[ct] == 0.0:
+            type_scores[ct] = 0.5
+
+    # Distribute 7 slots proportionally to scores, minimum 1 slot per type
+    total_score = sum(type_scores.values()) or 1.0
+    raw_slots = {ct: max(1, round((s / total_score) * 7)) for ct, s in type_scores.items()}
+
+    # Adjust to exactly 7 slots
+    while sum(raw_slots.values()) > 7:
+        # Remove a slot from the lowest-scoring over-allocated type
+        excess = [(ct, raw_slots[ct]) for ct in raw_slots if raw_slots[ct] > 1]
+        excess.sort(key=lambda x: type_scores[x[0]])
+        raw_slots[excess[0][0]] -= 1
+    while sum(raw_slots.values()) < 7:
+        # Add a slot to the highest-scoring type
+        best = max(type_scores, key=type_scores.get)
+        raw_slots[best] += 1
+
+    # Build ordered 7-day list: spread types across the week sensibly
+    # Order: educational early week, promotional mid-week, engagement/relatable end
+    day_type_order = ["educational", "relatable", "educational", "promotional",
+                      "behind_the_scenes", "engagement", "relatable"]
+    mix: List[str] = []
+    remaining = dict(raw_slots)
+    for preferred in day_type_order:
+        if remaining.get(preferred, 0) > 0:
+            mix.append(preferred)
+            remaining[preferred] -= 1
+        else:
+            # Pick the type with most remaining slots
+            fallback = max(remaining, key=lambda k: remaining[k])
+            mix.append(fallback)
+            remaining[fallback] -= 1
+
+    print(f"[Calendar] Personalised mix from performance: {mix} (scores: {type_scores})")
+    return mix
+
+
 def _compute_mix_ratios(mix: List[str]) -> Dict[str, float]:
     counts: Dict[str, int] = {t: 0 for t in CONTENT_TYPES}
     for t in mix:
@@ -345,7 +436,6 @@ async def generate_plan(
             return existing
 
     industry = brand.get("industry", "")
-    mix = _pick_mix(industry)
 
     # Add last week's titles too (if we don't already have current week titles from force path)
     last_monday = (monday - timedelta(days=7)).strftime("%Y-%m-%d")
@@ -358,6 +448,9 @@ async def generate_plan(
     # ── Data signals ──────────────────────────────────────────────────────────
     performance = await PerformanceAnalyticsService.get_user_performance(user_id, db)
     trend_keywords = await TrendDataService.get_trending_keywords(industry, db=db)
+
+    # ── Personalised content mix from performance data ────────────────────────
+    mix = _pick_mix_from_performance(performance, industry, brand)
 
     generation_method = "ai"  # default fallback
     days: List[Dict[str, Any]] = []
