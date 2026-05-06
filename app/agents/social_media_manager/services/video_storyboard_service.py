@@ -2,8 +2,10 @@ import asyncio
 import base64
 import json
 import re
+import uuid
 from typing import Any, Dict, List, Optional
 
+from app.database import get_db
 from app.services.AIService import client as openai_client
 from app.utils.cloudinary_upload import upload_bytes
 
@@ -43,11 +45,15 @@ Return ONLY valid JSON — no markdown fences, no explanation:
 }"""
 
 
+def _frame_jobs_collection():
+    return get_db()["storyboard_frame_jobs"]
+
+
 class VideoStoryboardService:
 
     @staticmethod
     async def _generate_scene_frame(scene: dict) -> Optional[str]:
-        """Generate a single storyboard frame image via gpt-image-2 and upload to Cloudinary."""
+        """Generate a storyboard frame image for one scene via gpt-image-2 and upload to Cloudinary."""
         try:
             shot = scene.get("shot_type", "").replace("_", " ")
             video_prompt = scene.get("video_prompt", "")
@@ -87,6 +93,37 @@ class VideoStoryboardService:
             return None
 
     @staticmethod
+    async def create_frame_job(scenes: list) -> str:
+        job_id = uuid.uuid4().hex
+        await _frame_jobs_collection().insert_one({
+            "job_id": job_id,
+            "status": "generating",
+            "total_scenes": len(scenes),
+            "frames": [],
+        })
+        return job_id
+
+    @staticmethod
+    async def run_frame_job(job_id: str, scenes: list) -> None:
+        """Background task: generate one frame image per scene, store progressively."""
+        col = _frame_jobs_collection()
+        for scene in scenes:
+            url = await VideoStoryboardService._generate_scene_frame(scene)
+            if url:
+                await col.update_one(
+                    {"job_id": job_id},
+                    {"$push": {"frames": {
+                        "scene_number": scene.get("scene_number"),
+                        "frame_image_url": url,
+                    }}},
+                )
+        await col.update_one({"job_id": job_id}, {"$set": {"status": "complete"}})
+
+    @staticmethod
+    async def get_frame_job(job_id: str) -> Optional[Dict]:
+        return await _frame_jobs_collection().find_one({"job_id": job_id}, {"_id": 0})
+
+    @staticmethod
     async def generate_storyboard(
         brand_images: List[str],
         optional_text: Optional[str],
@@ -96,11 +133,8 @@ class VideoStoryboardService:
     ) -> Dict[str, Any]:
         """
         Send brand images + optional creative text to GPT-4o Vision.
-        Returns a structured storyboard JSON dict with per-scene frame_image_url.
-
-        brand_images: list of base64 data URLs (up to 5)
-        optional_text: marketer's creative direction — may be None
-        brand_context: {brand_name, industry, brand_colors, brand_voice, region}
+        Returns a structured storyboard JSON dict. Frame images are generated
+        separately via the /generate-storyboard-frames background job.
         """
         if not brand_images:
             return {"status": False, "error": "At least one brand image is required."}
@@ -170,15 +204,5 @@ class VideoStoryboardService:
         except json.JSONDecodeError as e:
             print(f"Storyboard JSON parse error: {e}\nRaw: {raw[:300]}")
             return {"status": False, "error": "Failed to parse storyboard from model response."}
-
-        # Generate a unique frame image per scene in parallel
-        scenes = storyboard.get("scenes", [])
-        frame_urls = await asyncio.gather(*[
-            VideoStoryboardService._generate_scene_frame(scene)
-            for scene in scenes
-        ])
-        for scene, url in zip(scenes, frame_urls):
-            if url:
-                scene["frame_image_url"] = url
 
         return {"status": True, "storyboard": storyboard}

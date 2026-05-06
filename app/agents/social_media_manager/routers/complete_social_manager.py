@@ -117,6 +117,9 @@ class StoryboardRequest(BaseModel):
     target_platform: str = "instagram_reels"
     target_duration_seconds: int = Field(15, ge=5, le=30)
 
+class StoryboardFramesRequest(BaseModel):
+    scenes: List[Dict[str, Any]]
+
 class VideoFromStoryboardRequest(BaseModel):
     storyboard: Dict[str, Any]
     brand_images: List[str] = Field(default_factory=list, max_items=5)
@@ -2903,6 +2906,46 @@ async def get_video_job(
         raise HTTPException(status_code=404, detail="Job not found")
 
     return UriResponse.get_single_data_response("video_job", job)
+
+
+@router.post("/generate-storyboard-frames")
+async def generate_storyboard_frames(
+    request: StoryboardFramesRequest,
+    background_tasks: BackgroundTasks,
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Start background generation of a unique frame image for each storyboard scene.
+    Returns a job_id immediately. Poll GET /storyboard-frame-job/{job_id} for progress.
+    """
+    from app.agents.social_media_manager.services.video_storyboard_service import VideoStoryboardService
+
+    _get_user_id(token)  # auth check
+
+    job_id = await VideoStoryboardService.create_frame_job(request.scenes)
+    background_tasks.add_task(VideoStoryboardService.run_frame_job, job_id, request.scenes)
+
+    return UriResponse.get_single_data_response(
+        "frame_job",
+        {"job_id": job_id, "status": "generating", "total_scenes": len(request.scenes)},
+    )
+
+
+@router.get("/storyboard-frame-job/{job_id}")
+async def get_storyboard_frame_job(
+    job_id: str,
+    token: dict = Depends(JWTBearer()),
+):
+    """Poll for storyboard frame image generation progress."""
+    from app.agents.social_media_manager.services.video_storyboard_service import VideoStoryboardService
+
+    _get_user_id(token)  # auth check
+
+    job = await VideoStoryboardService.get_frame_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Frame job not found")
+
+    return UriResponse.get_single_data_response("frame_job", job)
 
 
 @router.post("/merge-video-job/{job_id}")
