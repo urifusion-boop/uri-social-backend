@@ -2,6 +2,8 @@ import asyncio
 import uuid
 from typing import Any, Dict, List, Optional
 
+import httpx
+
 from app.core.config import settings
 from app.database import get_db
 from app.utils.cloudinary_upload import upload_bytes
@@ -114,11 +116,33 @@ class VideoGenerationService:
         # Veo 3.1 only accepts 4, 6, or 8 seconds
         duration = 8 if duration_req >= 7 else (6 if duration_req >= 5 else 4)
 
-        config = genai_types.GenerateVideosConfig(
-            aspect_ratio="9:16",
-            duration_seconds=duration,
-            number_of_videos=1,
-        )
+        # Build reference images from the storyboard frame generated for this scene
+        reference_images = []
+        frame_image_url = scene.get("frame_image_url")
+        if frame_image_url:
+            try:
+                async with httpx.AsyncClient(timeout=30) as http:
+                    resp = await http.get(frame_image_url)
+                    frame_bytes = resp.content
+                mime = "image/webp" if ".webp" in frame_image_url else "image/jpeg"
+                ref = genai_types.VideoGenerationReferenceImage(
+                    image=genai_types.Image(image_bytes=frame_bytes, mime_type=mime),
+                    reference_type="asset",
+                )
+                reference_images.append(ref)
+                print(f"[VideoGen] Scene {scene.get('scene_number')}: using storyboard frame as reference image")
+            except Exception as e:
+                print(f"[VideoGen] Scene {scene.get('scene_number')}: could not load reference frame: {e}")
+
+        config_kwargs: Dict[str, Any] = {
+            "aspect_ratio": "9:16",
+            "duration_seconds": duration,
+            "number_of_videos": 1,
+        }
+        if reference_images:
+            config_kwargs["reference_images"] = reference_images
+
+        config = genai_types.GenerateVideosConfig(**config_kwargs)
 
         loop = asyncio.get_running_loop()
 
