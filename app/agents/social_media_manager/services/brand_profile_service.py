@@ -79,7 +79,6 @@ class BrandProfileService:
             required_for_completion = {
                 "brand_name": doc.get("brand_name"),
                 "industry": doc.get("industry"),
-                "brand_colors": doc.get("brand_colors") and len(doc.get("brand_colors", [])) > 0,
             }
 
             missing = [field for field, value in required_for_completion.items() if not value]
