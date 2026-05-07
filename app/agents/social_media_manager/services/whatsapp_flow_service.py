@@ -98,47 +98,87 @@ async def _download_twilio_media(media_url: str, content_type: Optional[str] = N
             public_url = await upload_base64(data_url, folder="uri-social/whatsapp-uploads")
             if public_url and public_url.endswith(".webp"):
                 public_url = public_url[:-5] + ".jpg"
-            print(f"[WhatsApp] User media uploaded to Cloudinary: {public_url}")
+            print(f"[WhatsApp] User media uploaded to Cloudinary: {public_url}", flush=True)
             return public_url
         except Exception as e:
-            print(f"[WhatsApp] Cloudinary upload of user media failed: {e}")
+            print(f"[WhatsApp] Cloudinary upload of user media failed: {e}", flush=True)
             # Return the data URL as fallback so _generate_platform_image can still use it
             return data_url
 
     except Exception as e:
-        print(f"[WhatsApp] Failed to download Twilio media {media_url!r}: {e}")
+        print(f"[WhatsApp] Failed to download Twilio media {media_url!r}: {e}", flush=True)
         return None
 
 
 async def _analyze_product_image(image_url: str) -> str:
     """
-    Use GPT-4o-mini vision to get a brief product description from a user-uploaded image.
-    Returns a short phrase used as seed_content for the image generation prompt.
+    Use GPT-4o vision to produce a marketing-ready creative brief from a user-uploaded
+    reference image.  Returns a string formatted as:
+      "Catchy Marketing Headline — One-sentence visual description of the product/scene"
+    The headline becomes the bold text rendered on the graphic; the description tells
+    the image generator exactly what to illustrate as the hero visual element.
+    Handles Cloudinary URLs, raw Twilio URLs (fetched with Basic auth), and base64 data URLs.
     """
+    import base64 as _b64
+    import httpx as _httpx
     try:
         from app.services.AIService import client as _ai_client
+
+        # Build the image content item for GPT-4o
+        if image_url.startswith("data:"):
+            # Already base64 — pass directly
+            image_content = {"type": "image_url", "image_url": {"url": image_url}}
+            print(f"[WhatsApp] Analyzing product image from base64 data URL (len={len(image_url)})", flush=True)
+        elif "twilio" in image_url or "api.twilio.com" in image_url:
+            # Twilio URL requires Basic auth — download and convert to base64
+            print(f"[WhatsApp] Downloading Twilio media for analysis: {image_url}", flush=True)
+            async with _httpx.AsyncClient(timeout=30) as _c:
+                r = await _c.get(
+                    image_url,
+                    auth=(settings.TWILIO_ACCOUNT_SID, settings.TWILIO_AUTH_TOKEN),
+                    follow_redirects=True,
+                )
+                r.raise_for_status()
+                ct = r.headers.get("content-type", "image/jpeg").split(";")[0]
+                b64 = _b64.b64encode(r.content).decode()
+                data_url = f"data:{ct};base64,{b64}"
+            image_content = {"type": "image_url", "image_url": {"url": data_url}}
+            print(f"[WhatsApp] Twilio media downloaded for analysis ({len(r.content)} bytes)", flush=True)
+        else:
+            # Public Cloudinary URL — pass directly
+            image_content = {"type": "image_url", "image_url": {"url": image_url}}
+            print(f"[WhatsApp] Analyzing product image from public URL: {image_url}", flush=True)
+
         resp = await asyncio.to_thread(
             _ai_client.chat.completions.create,
-            model="gpt-4o-mini",
+            model="gpt-4o",
             messages=[{
                 "role": "user",
                 "content": [
-                    {"type": "image_url", "image_url": {"url": image_url}},
+                    image_content,
                     {"type": "text", "text": (
-                        "Describe the main product or subject in this image in 8-12 words, "
-                        "suitable as a social media graphic subject. "
-                        "Output only the description, nothing else. "
-                        "Example: 'Modern wooden desk setup with monitor, keyboard and plant'."
+                        "You are a creative director preparing a social media graphic brief.\n\n"
+                        "Look at this image and produce TWO things, separated by ' — ' (space-dash-space):\n"
+                        "1. A SHORT, PUNCHY MARKETING HEADLINE (4-7 words max) that would look great as bold "
+                        "text on a branded social media post featuring this product/subject. "
+                        "Make it benefit-driven or aspirational. NOT a visual description.\n"
+                        "2. A VISUAL COMPOSITION INSTRUCTION (15-25 words) telling the image generator "
+                        "exactly how to feature the product/subject as the HERO element of a professional "
+                        "social media graphic. Describe placement, style, and mood.\n\n"
+                        "Format: HEADLINE — Visual composition instruction\n"
+                        "Example output: 'Upgrade Your Workspace Today — Sleek modern desk setup centred "
+                        "in frame, warm studio lighting, clean white background, professional product photography style'\n\n"
+                        "Output ONLY the two parts separated by ' — '. Nothing else."
                     )},
                 ],
             }],
-            max_tokens=60,
+            max_tokens=120,
         )
-        desc = resp.choices[0].message.content.strip()
-        print(f"[WhatsApp] Product image analyzed: {desc!r}")
-        return desc
+        brief = resp.choices[0].message.content.strip()
+        print(f"[WhatsApp] Product image creative brief: {brief!r}", flush=True)
+        return brief
     except Exception as e:
-        print(f"[WhatsApp] Image analysis failed: {e}")
+        print(f"[WhatsApp] Image analysis failed: {e}", flush=True)
         return "product showcase"
 
 
@@ -752,11 +792,16 @@ class WhatsAppFlowService:
 
         # ── Handle incoming image attachment ──────────────────────────────
         if media_url and state != "generating_graphic":
-            print(f"[WhatsApp] Incoming media from {phone}: {media_url} ({media_content_type})")
+            print(f"[WhatsApp] Incoming media from {phone}: {media_url} ({media_content_type})", flush=True)
             product_image_url = await _download_twilio_media(media_url, media_content_type)
-            if product_image_url:
-                ctx = {**ctx, "product_image_url": product_image_url}
-                await _safe_set_state(phone, state, ctx, db)
+            print(f"[WhatsApp] _download_twilio_media result: {'data_url (len=' + str(len(product_image_url)) + ')' if product_image_url and product_image_url.startswith('data:') else product_image_url or 'NONE'}", flush=True)
+            if not product_image_url:
+                # Cloudinary + Twilio download both failed — store the raw Twilio URL anyway
+                # so _analyze_product_image can still try to fetch it with Basic auth
+                product_image_url = media_url
+                print(f"[WhatsApp] Falling back to raw Twilio URL for product_image_url", flush=True)
+            ctx = {**ctx, "product_image_url": product_image_url, "product_image_twilio_url": media_url}
+            await _safe_set_state(phone, state, ctx, db)
 
             # If text also says "design" / "graphic" / "poster" etc — jump straight to generation
             _GRAPHIC_TRIGGER_WORDS = (
@@ -1667,24 +1712,43 @@ class WhatsAppFlowService:
         subheadline = ctx.get("subheadline", "")
         caption = ctx.get("caption", "")
         reference_image: Optional[str] = ctx.get("product_image_url")
+        print(f"[WhatsApp] _generate_graphic: reference_image={'SET (len=' + str(len(reference_image)) + ')' if reference_image else 'NONE'} headline={headline!r} topic={ctx.get('topic', '')!r}", flush=True)
 
-        # seed_content drives the TEXT rendered on the image.
+        # seed_content drives the TEXT on the image.
+        # When a reference image is supplied, use the existing headline/topic from
+        # ctx so the text matches the content already generated — GPT-4o analysis
+        # is NOT used for the headline (it would replace the user's content).
+        # The reference image is passed through to the edit endpoint so the user's
+        # actual photo is used as the background with text overlaid professionally.
         if headline:
             seed_content = f"{headline} — {subheadline}" if subheadline else headline
-        elif reference_image:
-            # No AI headline yet — analyze the product photo so the prompt describes
-            # the actual subject rather than falling back to the useless "content graphic".
-            seed_content = await _analyze_product_image(reference_image)
         else:
             seed_content = ctx.get("topic", "") or "content graphic"
 
-        # content = full caption text for additional context to the image model
+        print(f"[WhatsApp] _generate_graphic seed_content={seed_content!r} reference_image={'SET' if reference_image else 'NONE'}", flush=True)
+
+        # content = full caption for additional context
         full_caption = caption or f"{headline}\n{subheadline}".strip()
-        if reference_image and not full_caption:
-            content = f"Product showcase design. Feature this product prominently: {seed_content}"
-        else:
-            content = full_caption if full_caption else seed_content
+        content = full_caption if full_caption else seed_content
+
+        # When a reference image is provided, inject a directive into the style
+        # fragment telling the model to overlay text on the user's photo without
+        # altering the photo itself.
+        if reference_image:
+            _existing_style = brand.get("style_prompt_fragment", "")
+            brand["style_prompt_fragment"] = (
+                "=== PHOTO OVERLAY DIRECTIVE ===\n"
+                "The background image is the user's own photograph — DO NOT alter, replace, or reimagine it.\n"
+                "Keep the photo exactly as-is. Your ONLY job is to overlay professional branded text on top.\n"
+                "Add a subtle semi-transparent dark overlay (rgba(0,0,0,0.45)) behind the text area only "
+                "so the headline is legible. Text should be in the upper-left or upper portion of the image.\n"
+                "The photo must remain the dominant visual — text occupies no more than 35% of the image area.\n\n"
+                + (_existing_style if _existing_style else
+                   "Clean bold sans-serif typography. Strong contrast. Professional layout.")
+            )
         try:
+            # Pass reference_image through so gpt-image-1 edit mode overlays the
+            # headline text on the user's actual photo without replacing it.
             image_result = await ImageContentService._generate_platform_image(
                 platform="instagram",
                 content=content,

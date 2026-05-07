@@ -491,12 +491,19 @@ Follow these rules precisely for every image. No exceptions.
             if not image_prompt:
                 image_prompt = seed_content.strip()
 
-            # When a reference image is provided, always append a hard no-crop directive.
+            # When a reference image is provided, replace the generic no-crop directive
+            # with instructions that preserve the photo and only add text overlays.
             if reference_image:
                 image_prompt = (
                     image_prompt.rstrip()
-                    + " Full body shown completely from head to toe. Entire garment/product fully visible in frame — "
-                    "no cropping of any part of the clothing, subject, or object. Wide enough framing to show everything."
+                    + "\n\n=== PHOTO PRESERVATION RULES ===\n"
+                    "The provided image is the user's own photo — preserve it EXACTLY. "
+                    "Do NOT alter, crop, recolour, or reimagine the photo in any way. "
+                    "Your ONLY task is to add professional branded text overlays on top of it. "
+                    "Keep the photo as the dominant visual (at least 65% of the image). "
+                    "Add a subtle semi-transparent dark panel (rgba(0,0,0,0.5)) behind text only for readability. "
+                    "Text must be crisp, bold, and positioned in the upper or left portion of the image. "
+                    "The result must look like a professional social media graphic created by a designer."
                 )
 
             # ========== IMAGE GENERATION DEBUG (PRD Section 2) ==========
@@ -1414,16 +1421,16 @@ Follow these rules precisely for every image. No exceptions.
             resp.raise_for_status()
             logo_img = Image.open(io.BytesIO(resp.content)).convert("RGBA")
 
-            # Resize logo to 14% of image width, preserve aspect ratio
-            target_w = max(60, int(bw * 0.14))
+            # Resize logo to 8% of image width, preserve aspect ratio
+            target_w = max(40, int(bw * 0.08))
             lw, lh = logo_img.size
             scale = target_w / lw
             logo_img = logo_img.resize((target_w, int(lh * scale)), Image.LANCZOS)
             lw, lh = logo_img.size
 
-            # Badge padding (inner: 8px each side, outer edge: 2.5% of width)
-            badge_pad_inner = max(8, int(bw * 0.008))
-            edge_pad = max(20, int(bw * 0.025))
+            # Badge padding (inner: 5px each side, outer edge: 1.5% of width)
+            badge_pad_inner = max(5, int(bw * 0.005))
+            edge_pad = max(12, int(bw * 0.015))
 
             badge_w = lw + badge_pad_inner * 2
             badge_h = lh + badge_pad_inner * 2
