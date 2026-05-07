@@ -9,11 +9,12 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from app.services.AIService import AIService
 from app.domain.responses.uri_response import UriResponse
-from app.agents.social_media_manager.services.caption_validator_service import CaptionValidatorService
-from app.agents.social_media_manager.services.caption_voice_system import (
-    BANNED_PATTERNS_RULES,
-    build_voice_profile_instructions,
-)
+# Caption Voice System imports (keeping code but disabling for now)
+# from app.agents.social_media_manager.services.caption_validator_service import CaptionValidatorService
+# from app.agents.social_media_manager.services.caption_voice_system import (
+#     BANNED_PATTERNS_RULES,
+#     build_voice_profile_instructions,
+# )
 
 
 class ContentGenerationService:
@@ -37,50 +38,7 @@ class ContentGenerationService:
     # Platform-specific prompts optimized for Nigerian business engagement
     PLATFORM_PROMPTS = {
         "linkedin": """
-You are a social media copywriter who writes like a REAL PERSON, not like an AI.
-
-=== ABSOLUTE WRITING RULES (NEVER VIOLATE THESE) ===
-
-PUNCTUATION:
-- NEVER use em dashes (—). Not once. Not ever. Use periods or commas instead.
-- NEVER use semicolons in captions. Break into separate sentences.
-- Maximum 1 exclamation mark per caption. Zero is fine.
-- Ellipsis (...) maximum once per caption, and only if the brand voice uses them.
-- Imperfect punctuation is okay in casual voices. Missing a comma reads as human.
-
-SENTENCE STRUCTURE:
-- Vary sentence length. Mix short (3-5 words) with medium (8-12 words).
-  Never write 5 sentences that are all the same length.
-- NEVER start with: "Introducing", "Featuring", "Celebrating", "We're excited",
-  "We're thrilled", "We're proud", "Say hello to", "Get ready for", "Meet our new",
-  "At [Brand] we believe", "In today's fast-paced world", "Let's talk about"
-- NEVER end with: "Stay tuned", "Don't miss out", "Trust the process",
-  "Drop a [emoji] if you agree", "Let us know in the comments", "What do you think?"
-- NEVER use "Not only X, but also Y" construction
-- NEVER use "Whether you're X or Y" construction
-- NEVER use "From X to Y, we've got" construction
-- NEVER use one-word sentences for emphasis ("Quality." "Period." "Always.")
-- NEVER use the pattern: question followed by immediate answer
-- NEVER use three-part parallel lists every time. Sometimes use 2 items. Sometimes 4.
-
-BANNED WORDS (never use these):
-elevate, curated, seamless, premium, bespoke, artisanal, handcrafted, meticulously,
-next-level, game-changer, must-have, cutting-edge, innovative, revolutionary,
-transformative, unparalleled, synergy, leverage, holistic, paradigm, drumroll,
-spoiler alert, plot twist, pro tip, here's the thing, here's why, let that sink in,
-read that again, can we talk about, let's normalize, understood the assignment, chef's kiss
-
-WHAT TO DO INSTEAD:
-- Write like you're texting a friend who asked about your product
-- Start with something that makes people stop scrolling
-- The first line must work completely on its own (platform truncates)
-- End with a specific CTA or a question that invites replies
-- Read the caption out loud. If it sounds like a press release, rewrite it.
-
----
-
-PLATFORM: LinkedIn
-AUDIENCE: CEOs, entrepreneurs, and professionals in Nigeria and across Africa
+You are a seasoned Nigerian business leader writing for LinkedIn. Your audience consists of CEOs, entrepreneurs, and professionals in Nigeria and across Africa.
 
 CONTENT TO TRANSFORM: {seed_content}
 
@@ -108,35 +66,7 @@ Write as if you're sharing hard-won business wisdom with fellow African entrepre
         """,
         
         "twitter": """
-You are a social media copywriter who writes like a REAL PERSON, not like an AI.
-
-=== ABSOLUTE WRITING RULES (NEVER VIOLATE THESE) ===
-
-PUNCTUATION:
-- NEVER use em dashes (—). Use periods or commas instead.
-- NEVER use semicolons. Break into separate sentences.
-- Maximum 1 exclamation mark per tweet. Zero is fine.
-- Imperfect punctuation reads as human.
-
-SENTENCE STRUCTURE:
-- Vary sentence length. Mix short with medium.
-- NEVER start with: "Introducing", "Featuring", "We're excited", "Let's talk about"
-- NEVER end with: "Stay tuned", "Don't miss out", "Drop a [emoji]"
-- NEVER use "Not only X, but also Y" or "Whether you're X or Y"
-- NEVER use three-part lists every time.
-
-BANNED WORDS:
-elevate, curated, seamless, premium, game-changer, revolutionary, innovative,
-next-level, cutting-edge, drumroll, spoiler alert, plot twist, pro tip
-
-WHAT TO DO:
-- Write like you're typing a thread people actually want to retweet
-- Start with a contrarian or surprising hook
-- Read it out loud. If it sounds like LinkedIn corporate speak, rewrite it.
-
----
-
-PLATFORM: Twitter/X (Nigerian business & tech audience)
+You are creating a viral Twitter thread optimized for Nigerian business and tech audiences. Think Jason Njoku, Tope Awotona, or Iyinoluwa Aboyeji sharing insights.
 
 CONTENT TO TRANSFORM: {seed_content}
 
@@ -165,41 +95,16 @@ Make people think "I never looked at it this way" and want to retweet.
         """,
         
         "facebook": """
-You are a social media copywriter who writes like a REAL PERSON, not like an AI.
-
-=== ABSOLUTE WRITING RULES (NEVER VIOLATE THESE) ===
-
-PUNCTUATION:
-- NEVER use em dashes (—). Use periods or commas instead.
-- NEVER use semicolons. Break into separate sentences.
-- Maximum 1 exclamation mark per post. Zero is fine.
-
-SENTENCE STRUCTURE:
-- Vary sentence length. Mix short with medium.
-- NEVER start with: "Hey", "Hi", "Introducing", "We're excited", "Let's talk about"
-- NEVER end with: "Stay tuned", "Don't miss out", "Let us know in the comments"
-- NEVER use "Not only X, but also Y" or "Whether you're X or Y"
-- NEVER use three-part lists every time.
-
-BANNED WORDS:
-elevate, curated, seamless, premium, game-changer, revolutionary, innovative,
-vibrant community, let's rise together, amazing, beyond excited, fellow entrepreneurs
-
-WHAT TO DO:
-- Write like a real person posting an update
-- Get to the point immediately, no warm-up
-- Read it out loud. If it sounds like a marketing template, rewrite it.
-
----
-
-PLATFORM: Facebook (Nigerian business page)
+You are writing a Facebook post for a Nigerian business page. The post must feel natural and human — NOT like a template.
 
 CONTENT TO TRANSFORM: {seed_content}
 
-REQUIREMENTS:
-- Opens with the most interesting fact, statement, or question
-- Gets to the point immediately, no filler
-- Reads like something a real person would post
+CRITICAL RULES:
+- NEVER start with "Hey", "Hi", or any greeting to the audience
+- NEVER use filler phrases like "I'm excited to share", "I hope this finds you well", "I'm beyond excited", "fellow entrepreneurs"
+- NO excessive emojis — maximum 2, and only if they genuinely add meaning
+- NO toxic positivity or hype language ("game-changer", "amazing", "vibrant community", "let's rise together")
+- DO NOT follow a rigid 3-part template — vary the structure based on what the content actually calls for
 
 WHAT MAKES A GREAT FACEBOOK POST:
 - Opens with the most interesting or surprising fact, statement, or question from the content
@@ -215,34 +120,7 @@ Write one post. No alternatives, no meta-commentary.
         """,
         
         "instagram": """
-You are a social media copywriter who writes like a REAL PERSON, not like an AI.
-
-=== ABSOLUTE WRITING RULES (NEVER VIOLATE THESE) ===
-
-PUNCTUATION:
-- NEVER use em dashes (—). Use periods or commas instead.
-- NEVER use semicolons. Break into separate sentences.
-- Maximum 1 exclamation mark per caption. Zero is fine.
-
-SENTENCE STRUCTURE:
-- Vary sentence length. Mix short with medium.
-- NEVER start with: "Introducing", "Featuring", "We're excited", "Say hello to", "Get ready for"
-- NEVER end with: "Stay tuned", "Don't miss out", "Drop a [emoji] if you agree"
-- NEVER use "Not only X, but also Y" or "Whether you're X or Y"
-- NEVER use three-part lists every time.
-
-BANNED WORDS:
-elevate, curated, seamless, premium, game-changer, revolutionary, innovative,
-artisanal, handcrafted, meticulously, next-level, cutting-edge
-
-WHAT TO DO:
-- Write like you're posting from your phone
-- First line must hook people (Instagram truncates)
-- Read it out loud. If it sounds like a press release, rewrite it.
-
----
-
-PLATFORM: Instagram (Nigerian business/SMEs)
+You are creating Instagram content for a Nigerian business account targeting entrepreneurs and SMEs across Africa.
 
 CONTENT TO TRANSFORM: {seed_content}
 
@@ -268,32 +146,7 @@ Write as if you're sharing behind-the-scenes insights from building a successful
         """,
 
         "x": """
-You are a social media copywriter who writes like a REAL PERSON, not like an AI.
-
-=== ABSOLUTE WRITING RULES (NEVER VIOLATE THESE) ===
-
-PUNCTUATION:
-- NEVER use em dashes (—). Use periods or commas instead.
-- NEVER use semicolons. Break into separate sentences.
-- Maximum 1 exclamation mark per tweet. Zero is fine.
-
-SENTENCE STRUCTURE:
-- Vary sentence length. Mix short with medium.
-- NEVER start with: "Introducing", "Featuring", "We're excited"
-- NEVER end with: "Stay tuned", "Don't miss out"
-- NEVER use "Not only X, but also Y" or "Whether you're X or Y"
-
-BANNED WORDS:
-elevate, curated, game-changer, revolutionary, innovative, next-level
-
-WHAT TO DO:
-- Write like you're typing a thread people want to retweet
-- Start with a contrarian or surprising hook
-- Sound human, not corporate
-
----
-
-PLATFORM: X/Twitter (Nigerian business & tech)
+You are creating a viral X (Twitter) thread optimized for Nigerian business and tech audiences. Think Jason Njoku, Tope Awotona, or Iyinoluwa Aboyeji sharing insights.
 
 CONTENT TO TRANSFORM: {seed_content}
 
@@ -528,16 +381,17 @@ Write as if you're sharing hard-won business wisdom with fellow African entrepre
             brand_block = "\n".join(parts) + "\n\n"
 
         # ── Voice Profile (Caption Voice System - PRD Section 3 & 6) ──────────
-        voice_profile = brand_context.get("voice_profile", {})
-        voice_sample_analysis = brand_context.get("voice_sample_analysis", {})
-
-        if voice_profile or voice_sample_analysis:
-            voice_instructions = build_voice_profile_instructions(
-                voice_profile,
-                voice_sample_analysis,
-                platform
-            )
-            brand_block += voice_instructions
+        # TEMPORARILY DISABLED - Testing if this breaks image generation
+        # voice_profile = brand_context.get("voice_profile", {})
+        # voice_sample_analysis = brand_context.get("voice_sample_analysis", {})
+        #
+        # if voice_profile or voice_sample_analysis:
+        #     voice_instructions = build_voice_profile_instructions(
+        #         voice_profile,
+        #         voice_sample_analysis,
+        #         platform
+        #     )
+        #     brand_block += voice_instructions
 
         return brand_block
 
@@ -744,45 +598,46 @@ Write as if you're sharing hard-won business wisdom with fellow African entrepre
             )
 
             # ── Caption Validation & Auto-Fix (PRD Section 7) ──────────────────────
-            # Extract custom banned words from voice profile
-            custom_banned_words = []
-            if brand_context and brand_context.get("voice_profile"):
-                custom_banned_words = brand_context["voice_profile"].get("banned_words", [])
-
-            # Validate the caption
-            validation_result = CaptionValidatorService.validate_caption(content, custom_banned_words)
-
-            # If validation fails, attempt auto-fix (one retry)
-            if not validation_result["passed"]:
-                print(f"[CAPTION] Validation failed for {platform}: {validation_result['issues']}")
-
-                # Generate fix prompt
-                fix_prompt = CaptionValidatorService.generate_fix_prompt(content, validation_result)
-
-                # Regenerate with fix instructions
-                fix_ai_request = AIService.build_ai_model(
-                    messages=[{"role": "user", "content": fix_prompt}],
-                    temperature=0.7,
-                )
-
-                fix_ai_response = await AIService.chat_completion(fix_ai_request)
-                if not (isinstance(fix_ai_response, dict) and "error" in fix_ai_response):
-                    fixed_content = fix_ai_response.choices[0].message.content.strip()
-
-                    # Re-extract hashtags from fixed content
-                    content, hashtags = ContentGenerationService._extract_and_clean_hashtags(
-                        fixed_content, platform
-                    )
-
-                    # Validate again
-                    revalidation = CaptionValidatorService.validate_caption(content, custom_banned_words)
-                    if revalidation["passed"]:
-                        print(f"[CAPTION] ✓ Fixed and validated for {platform}")
-                    else:
-                        print(f"[CAPTION] ⚠ Still has issues after fix: {revalidation['issues'][:3]}")
-                        # Proceed with content anyway, but flag it
-            else:
-                print(f"[CAPTION] ✓ Passed validation for {platform}")
+            # TEMPORARILY DISABLED - Testing if this breaks image generation
+            # # Extract custom banned words from voice profile
+            # custom_banned_words = []
+            # if brand_context and brand_context.get("voice_profile"):
+            #     custom_banned_words = brand_context["voice_profile"].get("banned_words", [])
+            #
+            # # Validate the caption
+            # validation_result = CaptionValidatorService.validate_caption(content, custom_banned_words)
+            #
+            # # If validation fails, attempt auto-fix (one retry)
+            # if not validation_result["passed"]:
+            #     print(f"[CAPTION] Validation failed for {platform}: {validation_result['issues']}")
+            #
+            #     # Generate fix prompt
+            #     fix_prompt = CaptionValidatorService.generate_fix_prompt(content, validation_result)
+            #
+            #     # Regenerate with fix instructions
+            #     fix_ai_request = AIService.build_ai_model(
+            #         messages=[{"role": "user", "content": fix_prompt}],
+            #         temperature=0.7,
+            #     )
+            #
+            #     fix_ai_response = await AIService.chat_completion(fix_ai_request)
+            #     if not (isinstance(fix_ai_response, dict) and "error" in fix_ai_response):
+            #         fixed_content = fix_ai_response.choices[0].message.content.strip()
+            #
+            #         # Re-extract hashtags from fixed content
+            #         content, hashtags = ContentGenerationService._extract_and_clean_hashtags(
+            #             fixed_content, platform
+            #         )
+            #
+            #         # Validate again
+            #         revalidation = CaptionValidatorService.validate_caption(content, custom_banned_words)
+            #         if revalidation["passed"]:
+            #             print(f"[CAPTION] ✓ Fixed and validated for {platform}")
+            #         else:
+            #             print(f"[CAPTION] ⚠ Still has issues after fix: {revalidation['issues'][:3]}")
+            #             # Proceed with content anyway, but flag it
+            # else:
+            #     print(f"[CAPTION] ✓ Passed validation for {platform}")
 
             # Generate a draft ID
             draft_id = str(ObjectId())
