@@ -586,12 +586,15 @@ RULES FOR THIS EDIT:
             # Step 11: Return success with confirmation message
             print(f"[EDIT] Success! Category: {edit_category}, Version: {new_version}")
 
+            credits_used = 1 if (edit_category == 'content_edit' and content_edit_count >= 1) or edit_category == 'full_redesign' else 0
+
             return UriResponse.get_single_data_response("edit_complete", {
                 "image_url": edited_image_url,
                 "version": new_version,
                 "edit_category": edit_category,
                 "message": ImageEditingService.get_edit_confirmation_message(edit_category, feedback),
-                "credit_charged": edit_category == 'content_edit' and content_edit_count >= 1
+                "credit_charged": credits_used > 0,
+                "credits_consumed": credits_used
             })
 
         except Exception as e:

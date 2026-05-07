@@ -454,19 +454,26 @@ async def generate_content(
             for draft in drafts:
                 if post_type == "carousel":
                     slides = draft.get("slides") or []
+                    # Pass total_slides and carousel_id for visual continuity
+                    total_slides = len(slides)
+                    carousel_id = draft["id"]  # All slides share same carousel_id
                     for slide_index, slide in enumerate(slides):
+                        # Use slide's headline + body as the main content (no seed duplication)
+                        slide_content = f"{slide.get('headline', '')} {slide.get('body', '')}".strip()
                         background_tasks.add_task(
                             _generate_image_bg,
                             draft_id=draft["id"],
                             platform=draft["platform"],
-                            content=f"{slide.get('headline', '')} {slide.get('body', '')}".strip() or draft["content"],
-                            seed_content=request.seed_content,
+                            content=slide_content or draft["content"],
+                            seed_content=slide_content,  # Use slide content instead of original seed to avoid duplication
                             brand_context=brand_context_dict,
                             db=db,
                             reference_image=request.reference_image,
                             post_type=post_type,
                             slide_index=slide_index,
                             image_model=request.image_model,
+                            total_slides=total_slides,
+                            carousel_id=carousel_id,
                         )
                 else:
                     background_tasks.add_task(
@@ -1204,6 +1211,329 @@ async def undo_draft_image_edit(
     return JSONResponse(
         status_code=200 if result.get("status") else 400,
         content=result
+    )
+
+
+# ==============================================================================
+# CAROUSEL EDITING ENDPOINTS
+# ==============================================================================
+
+@router.patch("/drafts/{draft_id}/slides/{slide_index}")
+async def update_carousel_slide(
+    draft_id: str,
+    slide_index: int,
+    request: Request,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer())
+):
+    """
+    Update text (headline/body) of a single carousel slide.
+    Does NOT regenerate the image - only updates text.
+    """
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    body = await request.json()
+    headline = body.get("headline")
+    body_text = body.get("body")
+
+    if not headline and not body_text:
+        raise HTTPException(status_code=400, detail="headline or body is required")
+
+    # Verify draft exists and belongs to user
+    draft = await db["content_drafts"].find_one(
+        {"$or": [{"id": draft_id}, {"draft_id": draft_id}], "user_id": user_id}
+    )
+    if not draft:
+        raise HTTPException(status_code=404, detail="Draft not found")
+
+    # Verify it's a carousel
+    if draft.get("post_type") != "carousel":
+        raise HTTPException(status_code=400, detail="This endpoint is only for carousel posts")
+
+    # Verify slide exists
+    slides = draft.get("slides", [])
+    if slide_index < 0 or slide_index >= len(slides):
+        raise HTTPException(status_code=400, detail=f"Slide index {slide_index} out of range (0-{len(slides)-1})")
+
+    # Build update fields
+    update_fields = {}
+    if headline:
+        update_fields[f"slides.{slide_index}.headline"] = headline.strip()
+    if body_text:
+        update_fields[f"slides.{slide_index}.body"] = body_text.strip()
+    update_fields["updated_at"] = datetime.utcnow()
+
+    # Update the slide
+    result = await db["content_drafts"].update_one(
+        {"id": draft_id},
+        {"$set": update_fields}
+    )
+
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Draft not found")
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "status": True,
+            "responseMessage": f"Slide {slide_index + 1} updated successfully",
+            "responseData": {
+                "slide_index": slide_index,
+                "updated_fields": list(update_fields.keys())
+            }
+        }
+    )
+
+
+@router.post("/drafts/{draft_id}/slides/{slide_index}/regenerate-image")
+async def regenerate_carousel_slide_image(
+    draft_id: str,
+    slide_index: int,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer())
+):
+    """
+    Regenerate the image for a single carousel slide.
+    Optionally accepts feedback for adjustments.
+    """
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    body = await request.json()
+    feedback = body.get("feedback", "").strip()
+
+    # Verify draft exists and belongs to user
+    draft = await db["content_drafts"].find_one(
+        {"$or": [{"id": draft_id}, {"draft_id": draft_id}], "user_id": user_id}
+    )
+    if not draft:
+        raise HTTPException(status_code=404, detail="Draft not found")
+
+    # Verify it's a carousel
+    if draft.get("post_type") != "carousel":
+        raise HTTPException(status_code=400, detail="This endpoint is only for carousel posts")
+
+    # Verify slide exists
+    slides = draft.get("slides", [])
+    if slide_index < 0 or slide_index >= len(slides):
+        raise HTTPException(status_code=400, detail=f"Slide index {slide_index} out of range (0-{len(slides)-1})")
+
+    slide = slides[slide_index]
+    retry_count = slide.get("image_retry_count", 0)
+
+    # Check retry limits (first retry free, subsequent cost credits)
+    if retry_count >= 1:
+        # Check if user has credits
+        from app.agents.social_media_manager.services.credit_service import CreditService
+        credit_service = CreditService(db)
+        has_credits = await credit_service.check_sufficient_credits(user_id, 1)
+
+        if not has_credits:
+            return JSONResponse(
+                status_code=402,
+                content={
+                    "status": False,
+                    "responseCode": "insufficient_credits",
+                    "responseMessage": "You need 1 credit to regenerate this slide again"
+                }
+            )
+
+        # Deduct credit
+        await credit_service.deduct_credit(
+            user_id=user_id,
+            campaign_id=draft_id,
+            reason=f"carousel_slide_{slide_index}_regenerate"
+        )
+
+    # Increment retry count
+    await db["content_drafts"].update_one(
+        {"id": draft_id},
+        {"$inc": {f"slides.{slide_index}.image_retry_count": 1}}
+    )
+
+    # Get brand context for regeneration
+    brand_profile = await db["brand_profiles"].find_one({"user_id": user_id})
+    brand_context = BrandProfileService.to_brand_context(brand_profile or {})
+
+    # Build slide content
+    slide_content = f"{slide.get('headline', '')} {slide.get('body', '')}".strip()
+
+    # Regenerate image in background
+    total_slides = len(slides)
+    carousel_id = draft.get("id")
+
+    background_tasks.add_task(
+        _generate_image_bg,
+        draft_id=draft_id,
+        platform=draft.get("platform", "instagram"),
+        content=slide_content,
+        seed_content=slide_content,
+        brand_context=brand_context,
+        db=db,
+        reference_image=None,
+        post_type="carousel",
+        slide_index=slide_index,
+        image_model=None,
+        total_slides=total_slides,
+        carousel_id=carousel_id,
+    )
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "status": True,
+            "responseMessage": f"Regenerating image for slide {slide_index + 1}...",
+            "responseData": {
+                "slide_index": slide_index,
+                "retry_count": retry_count + 1,
+                "credit_charged": retry_count >= 1
+            }
+        }
+    )
+
+
+@router.delete("/drafts/{draft_id}/slides/{slide_index}")
+async def delete_carousel_slide(
+    draft_id: str,
+    slide_index: int,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer())
+):
+    """
+    Delete a single slide from a carousel.
+    Minimum 2 slides required (can't delete if only 2 left).
+    """
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    # Verify draft exists and belongs to user
+    draft = await db["content_drafts"].find_one(
+        {"$or": [{"id": draft_id}, {"draft_id": draft_id}], "user_id": user_id}
+    )
+    if not draft:
+        raise HTTPException(status_code=404, detail="Draft not found")
+
+    # Verify it's a carousel
+    if draft.get("post_type") != "carousel":
+        raise HTTPException(status_code=400, detail="This endpoint is only for carousel posts")
+
+    # Verify slide exists
+    slides = draft.get("slides", [])
+    if slide_index < 0 or slide_index >= len(slides):
+        raise HTTPException(status_code=400, detail=f"Slide index {slide_index} out of range (0-{len(slides)-1})")
+
+    # Check minimum slides
+    if len(slides) <= 2:
+        raise HTTPException(status_code=400, detail="Cannot delete slide. Minimum 2 slides required.")
+
+    # Remove the slide and renumber remaining slides
+    slides.pop(slide_index)
+    for i, slide in enumerate(slides):
+        slide["slide_number"] = i + 1
+
+    # Update draft
+    await db["content_drafts"].update_one(
+        {"id": draft_id},
+        {"$set": {"slides": slides, "updated_at": datetime.utcnow()}}
+    )
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "status": True,
+            "responseMessage": f"Slide {slide_index + 1} deleted successfully",
+            "responseData": {
+                "deleted_slide_index": slide_index,
+                "remaining_slides": len(slides)
+            }
+        }
+    )
+
+
+@router.post("/drafts/{draft_id}/slides/reorder")
+async def reorder_carousel_slides(
+    draft_id: str,
+    request: Request,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer())
+):
+    """
+    Reorder carousel slides based on new index array.
+
+    Request body:
+    {
+        "new_order": [2, 0, 1, 3]  // New positions (0-indexed)
+    }
+    """
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    body = await request.json()
+    new_order = body.get("new_order", [])
+
+    if not new_order or not isinstance(new_order, list):
+        raise HTTPException(status_code=400, detail="new_order array is required")
+
+    # Verify draft exists and belongs to user
+    draft = await db["content_drafts"].find_one(
+        {"$or": [{"id": draft_id}, {"draft_id": draft_id}], "user_id": user_id}
+    )
+    if not draft:
+        raise HTTPException(status_code=404, detail="Draft not found")
+
+    # Verify it's a carousel
+    if draft.get("post_type") != "carousel":
+        raise HTTPException(status_code=400, detail="This endpoint is only for carousel posts")
+
+    slides = draft.get("slides", [])
+
+    # Validate new_order
+    if len(new_order) != len(slides):
+        raise HTTPException(
+            status_code=400,
+            detail=f"new_order length ({len(new_order)}) must match slides count ({len(slides)})"
+        )
+
+    if set(new_order) != set(range(len(slides))):
+        raise HTTPException(
+            status_code=400,
+            detail="new_order must contain each index exactly once (e.g., [2, 0, 1])"
+        )
+
+    # Reorder slides
+    try:
+        reordered_slides = [slides[i] for i in new_order]
+    except IndexError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid index in new_order: {e}")
+
+    # Update slide_number after reorder
+    for i, slide in enumerate(reordered_slides):
+        slide["slide_number"] = i + 1
+
+    # Update draft
+    await db["content_drafts"].update_one(
+        {"id": draft_id},
+        {"$set": {"slides": reordered_slides, "updated_at": datetime.utcnow()}}
+    )
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "status": True,
+            "responseMessage": "Slides reordered successfully",
+            "responseData": {
+                "old_order": list(range(len(slides))),
+                "new_order": new_order,
+                "total_slides": len(reordered_slides)
+            }
+        }
     )
 
 
@@ -2652,11 +2982,14 @@ async def _generate_image_bg(
     post_type: str = "feed",
     slide_index: Optional[int] = None,
     image_model: Optional[str] = None,
+    total_slides: Optional[int] = None,
+    carousel_id: Optional[str] = None,
 ):
     """
     Background task: generate an image for an existing draft and save it to DB.
     Runs after the text-only response has already been returned to the frontend.
-    For carousel posts, slide_index indicates which slide this image belongs to.
+    For carousel posts, slide_index indicates which slide this image belongs to,
+    and carousel_id ensures all slides share the same visual style.
     For story posts, uses the story (9:16) image spec.
     """
     import re
@@ -2667,30 +3000,77 @@ async def _generate_image_bg(
         from app.agents.social_media_manager.services.style_library import pick_next_style
 
         # ── Visual style rotation ─────────────────────────────────────────────
-        # Read the user's selected styles and rotation index from their brand profile.
-        # Pick the next style in the cycle, inject its prompt fragment into brand_context,
-        # then increment and persist the rotation index.
-        _bp = await db["brand_profiles"].find_one(
-            {"user_id": brand_context.get("user_id", "")},
-            {"style_selections": 1, "style_prompt_fragments": 1, "style_rotation_index": 1, "industry": 1},
-        ) or {}
-        _style_selections = _bp.get("style_selections") or []
-        _style_prompt_fragments = _bp.get("style_prompt_fragments") or []
-        _rotation_index = int(_bp.get("style_rotation_index") or 0)
-        _industry = _bp.get("industry") or brand_context.get("industry", "")
+        # For carousel posts: lock style to first slide, reuse for all subsequent slides
+        # For regular posts: rotate style normally
+        if post_type == "carousel" and carousel_id and slide_index is not None:
+            if slide_index == 0:
+                # First slide: pick style and cache it for this carousel
+                _bp = await db["brand_profiles"].find_one(
+                    {"user_id": brand_context.get("user_id", "")},
+                    {"style_selections": 1, "style_prompt_fragments": 1, "style_rotation_index": 1, "industry": 1},
+                ) or {}
+                _style_selections = _bp.get("style_selections") or []
+                _style_prompt_fragments = _bp.get("style_prompt_fragments") or []
+                _rotation_index = int(_bp.get("style_rotation_index") or 0)
+                _industry = _bp.get("industry") or brand_context.get("industry", "")
 
-        _slug, _fragment, _next_index = pick_next_style(
-            _style_selections, _rotation_index, _industry, _style_prompt_fragments
-        )
+                _slug, _fragment, _next_index = pick_next_style(
+                    _style_selections, _rotation_index, _industry, _style_prompt_fragments
+                )
 
-        if _fragment:
-            brand_context = {**brand_context, "style_prompt_fragment": _fragment, "style_slug": _slug}
-            print(f"🎨 Style [{_slug}] applied for this image (next index: {_next_index})")
-            # Persist incremented rotation index
-            await db["brand_profiles"].update_one(
+                if _fragment:
+                    brand_context = {**brand_context, "style_prompt_fragment": _fragment, "style_slug": _slug}
+                    print(f"🎨 Carousel style [{_slug}] applied for all {total_slides} slides (next index: {_next_index})")
+
+                    # Cache style in draft document for subsequent slides
+                    await db["content_drafts"].update_one(
+                        {"id": carousel_id},
+                        {"$set": {
+                            "carousel_style_slug": _slug,
+                            "carousel_style_fragment": _fragment
+                        }}
+                    )
+
+                    # Only increment rotation index ONCE per carousel (not per slide)
+                    await db["brand_profiles"].update_one(
+                        {"user_id": brand_context.get("user_id", "")},
+                        {"$set": {"style_rotation_index": _next_index}},
+                    )
+            else:
+                # Subsequent slides: reuse cached style from first slide
+                draft = await db["content_drafts"].find_one(
+                    {"id": carousel_id},
+                    {"carousel_style_slug": 1, "carousel_style_fragment": 1}
+                )
+                if draft:
+                    _slug = draft.get("carousel_style_slug")
+                    _fragment = draft.get("carousel_style_fragment")
+                    if _fragment:
+                        brand_context = {**brand_context, "style_prompt_fragment": _fragment, "style_slug": _slug}
+                        print(f"🎨 Reusing carousel style [{_slug}] for slide {slide_index + 1}/{total_slides}")
+        else:
+            # Regular post: normal style rotation
+            _bp = await db["brand_profiles"].find_one(
                 {"user_id": brand_context.get("user_id", "")},
-                {"$set": {"style_rotation_index": _next_index}},
+                {"style_selections": 1, "style_prompt_fragments": 1, "style_rotation_index": 1, "industry": 1},
+            ) or {}
+            _style_selections = _bp.get("style_selections") or []
+            _style_prompt_fragments = _bp.get("style_prompt_fragments") or []
+            _rotation_index = int(_bp.get("style_rotation_index") or 0)
+            _industry = _bp.get("industry") or brand_context.get("industry", "")
+
+            _slug, _fragment, _next_index = pick_next_style(
+                _style_selections, _rotation_index, _industry, _style_prompt_fragments
             )
+
+            if _fragment:
+                brand_context = {**brand_context, "style_prompt_fragment": _fragment, "style_slug": _slug}
+                print(f"🎨 Style [{_slug}] applied for this image (next index: {_next_index})")
+                # Persist incremented rotation index
+                await db["brand_profiles"].update_one(
+                    {"user_id": brand_context.get("user_id", "")},
+                    {"$set": {"style_rotation_index": _next_index}},
+                )
 
         # For story posts pass image_type="story" so we get 1080x1920 dimensions
         image_type = "story" if post_type == "story" else "post_image"
@@ -2703,6 +3083,8 @@ async def _generate_image_bg(
             reference_image=reference_image,
             image_type=image_type,
             image_model=image_model,
+            slide_index=slide_index,
+            total_slides=total_slides,
         )
 
         if not image_result.get("status"):
@@ -2729,6 +3111,7 @@ async def _generate_image_bg(
                     {"id": draft_id},
                     {"$set": {
                         f"slides.{slide_index}.image_url": final_url,
+                        f"slides.{slide_index}.image_failed": False,
                         "has_image": True,
                     }},
                 )
@@ -2740,9 +3123,24 @@ async def _generate_image_bg(
                 )
                 print(f"✅ BG image saved for draft {draft_id}: matched={result.matched_count}")
         else:
+            if post_type == "carousel" and slide_index is not None:
+                # Mark slide as failed
+                await db["content_drafts"].update_one(
+                    {"id": draft_id},
+                    {"$set": {f"slides.{slide_index}.image_failed": True}},
+                )
             print(f"⚠️  BG image not saved for draft {draft_id} (no public URL)")
 
     except Exception as e:
+        # Mark slide as failed on exception
+        if db and post_type == "carousel" and slide_index is not None:
+            try:
+                await db["content_drafts"].update_one(
+                    {"id": draft_id},
+                    {"$set": {f"slides.{slide_index}.image_failed": True}},
+                )
+            except:
+                pass
         print(f"❌ BG image task error for draft {draft_id}: {e}\n{traceback.format_exc()}")
 
 
