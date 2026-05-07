@@ -210,29 +210,27 @@ class VideoGenerationService:
             print(f"[VideoGen] Scene {scene.get('scene_number')}: Seedance 2.0, {duration}s")
 
         fal_key = settings.FAL_API_KEY
-        headers = {
-            "Authorization": f"Key {fal_key}",
-            "Content-Type": "application/json",
-        }
+        auth_headers = {"Authorization": f"Key {fal_key}"}
+        post_headers = {**auth_headers, "Content-Type": "application/json"}
 
-        # Submit job to fal queue
+        # fal.ai queue API wraps input in {"input": {...}}
         async with httpx.AsyncClient(timeout=30) as client:
             submit = await client.post(
                 f"https://queue.fal.run/{model}",
-                json=payload,
-                headers=headers,
+                json={"input": payload},
+                headers=post_headers,
             )
             submit.raise_for_status()
-            request_id = submit.json()["request_id"]
-
-        status_url = f"https://queue.fal.run/{model}/requests/{request_id}/status"
-        result_url = f"https://queue.fal.run/{model}/requests/{request_id}"
+            submit_data = submit.json()
+            request_id = submit_data["request_id"]
+            status_url = submit_data.get("status_url") or f"https://queue.fal.run/{model}/requests/{request_id}/status"
+            result_url = submit_data.get("response_url") or f"https://queue.fal.run/{model}/requests/{request_id}/response"
 
         # Poll every 10 s, max 10 minutes
         for _ in range(60):
             await asyncio.sleep(10)
             async with httpx.AsyncClient(timeout=30) as client:
-                status_resp = await client.get(status_url, headers=headers)
+                status_resp = await client.get(status_url, headers=auth_headers)
                 status_resp.raise_for_status()
                 status = status_resp.json().get("status")
 
@@ -245,9 +243,10 @@ class VideoGenerationService:
 
         # Fetch result
         async with httpx.AsyncClient(timeout=30) as client:
-            result_resp = await client.get(result_url, headers=headers)
+            result_resp = await client.get(result_url, headers=auth_headers)
             result_resp.raise_for_status()
-            video_url = result_resp.json()["video"]["url"]
+            result_data = result_resp.json()
+            video_url = (result_data.get("data") or result_data)["video"]["url"]
 
         # Download and store in Cloudinary
         async with httpx.AsyncClient(timeout=120) as client:
