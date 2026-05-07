@@ -18,6 +18,10 @@ except Exception as _e:
 
 DEFAULT_MODEL = "veo-3.1-generate-preview"
 
+# fal.ai model IDs
+KLING_MODEL = "fal-ai/kling-video/v3/pro/image-to-video"
+SEEDANCE_MODEL = "bytedance/seedance-2.0/image-to-video"
+
 
 def _jobs_collection():
     return get_db()["video_generation_jobs"]
@@ -51,16 +55,12 @@ class VideoGenerationService:
         brand_images: List[str],
         model: str,
     ) -> None:
-        """
-        Background task: generate one Veo 3.1 video clip per storyboard scene,
-        upload each to Cloudinary, and update the job record progressively.
-        """
         col = _jobs_collection()
 
-        if not _gemini_client:
+        if model == DEFAULT_MODEL and not _gemini_client:
             await col.update_one(
                 {"job_id": job_id},
-                {"$set": {"status": "failed", "error": "Google Gemini client not initialised — check GOOGLE_GEMINI_API_KEY"}},
+                {"$set": {"status": "failed", "error": "Google Gemini client not initialised"}},
             )
             return
 
@@ -72,9 +72,7 @@ class VideoGenerationService:
             await col.update_one({"job_id": job_id}, {"$set": {"current_scene": scene_num}})
 
             try:
-                video_url = await VideoGenerationService._generate_scene(
-                    scene, brand_images, model
-                )
+                video_url = await VideoGenerationService._generate_scene(scene, brand_images, model)
                 clip = {
                     "scene_number": scene_num,
                     "shot_type": scene.get("shot_type", ""),
@@ -105,19 +103,20 @@ class VideoGenerationService:
         )
 
     @staticmethod
-    async def _generate_scene(
-        scene: dict,
-        brand_images: List[str],
-        model: str,
-    ) -> str:
-        """Generate one clip for a storyboard scene and return its Cloudinary URL."""
+    async def _generate_scene(scene: dict, brand_images: List[str], model: str) -> str:
+        if "kling" in model or "seedance" in model:
+            return await VideoGenerationService._generate_scene_fal(scene, model)
+        return await VideoGenerationService._generate_scene_veo(scene, brand_images, model)
+
+    # ── Veo 3.1 ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    async def _generate_scene_veo(scene: dict, brand_images: List[str], model: str) -> str:
         prompt = scene.get("video_prompt", "")
         duration_req = scene.get("duration_seconds", 5)
-        # Veo 3.1 only accepts 4, 6, or 8 seconds
+        # Veo only accepts 4, 6, or 8 seconds
         duration = 8 if duration_req >= 7 else (6 if duration_req >= 5 else 4)
 
-        # Download the storyboard frame to use as the video's first frame.
-        # Veo animates forward from this image, so the video matches the storyboard exactly.
         first_frame: Optional[genai_types.Image] = None
         frame_image_url = scene.get("frame_image_url")
         if frame_image_url:
@@ -127,9 +126,9 @@ class VideoGenerationService:
                     frame_bytes = resp.content
                 mime = "image/webp" if ".webp" in frame_image_url else "image/jpeg"
                 first_frame = genai_types.Image(image_bytes=frame_bytes, mime_type=mime)
-                print(f"[VideoGen] Scene {scene.get('scene_number')}: animating from storyboard frame")
+                print(f"[VideoGen] Scene {scene.get('scene_number')}: animating from storyboard frame (Veo)")
             except Exception as e:
-                print(f"[VideoGen] Scene {scene.get('scene_number')}: could not load frame image: {e}")
+                print(f"[VideoGen] Scene {scene.get('scene_number')}: could not load frame: {e}")
 
         config = genai_types.GenerateVideosConfig(
             aspect_ratio="9:16",
@@ -138,18 +137,16 @@ class VideoGenerationService:
         )
 
         loop = asyncio.get_running_loop()
-
         operation = await loop.run_in_executor(
             None,
             lambda: _gemini_client.models.generate_videos(
                 model=model,
                 prompt=prompt,
-                image=first_frame,   # animates from the storyboard frame if available
+                image=first_frame,
                 config=config,
             ),
         )
 
-        # Poll every 10 s, max 10 minutes
         for _ in range(60):
             if operation.done:
                 break
@@ -161,9 +158,8 @@ class VideoGenerationService:
 
         if not operation.done:
             raise TimeoutError("Veo generation timed out after 10 minutes")
-
         if not operation.response:
-            raise ValueError("Veo operation completed with no response — prompt may have been rejected by content policy")
+            raise ValueError("Veo returned no response — prompt may have been rejected by content policy")
 
         generated = operation.response.generated_videos
         if not generated:
@@ -175,9 +171,92 @@ class VideoGenerationService:
             lambda: _gemini_client.files.download(file=video_file),
         )
 
-        cloudinary_url = await upload_bytes(
+        return await upload_bytes(
             bytes(video_bytes),
             folder="uri-social/generated-videos",
             resource_type="video",
         )
-        return cloudinary_url
+
+    # ── fal.ai (Kling 3.0 Pro + Seedance 2.0) ────────────────────────────────
+
+    @staticmethod
+    async def _generate_scene_fal(scene: dict, model: str) -> str:
+        frame_image_url = scene.get("frame_image_url")
+        if not frame_image_url:
+            raise ValueError(f"{model} requires a storyboard frame image — generate the storyboard frames first")
+
+        prompt = scene.get("video_prompt", "")
+        duration_req = scene.get("duration_seconds", 5)
+
+        if "kling" in model:
+            duration = str(max(3, min(15, duration_req)))
+            payload: Dict[str, Any] = {
+                "start_image_url": frame_image_url,
+                "prompt": prompt,
+                "duration": duration,
+                "generate_audio": True,
+            }
+            print(f"[VideoGen] Scene {scene.get('scene_number')}: Kling 3.0 Pro, {duration}s")
+        else:  # seedance
+            duration = str(max(4, min(15, duration_req)))
+            payload = {
+                "image_url": frame_image_url,
+                "prompt": prompt,
+                "duration": duration,
+                "aspect_ratio": "9:16",
+                "resolution": "720p",
+                "generate_audio": True,
+            }
+            print(f"[VideoGen] Scene {scene.get('scene_number')}: Seedance 2.0, {duration}s")
+
+        fal_key = settings.FAL_API_KEY
+        headers = {
+            "Authorization": f"Key {fal_key}",
+            "Content-Type": "application/json",
+        }
+
+        # Submit job to fal queue
+        async with httpx.AsyncClient(timeout=30) as client:
+            submit = await client.post(
+                f"https://queue.fal.run/{model}",
+                json=payload,
+                headers=headers,
+            )
+            submit.raise_for_status()
+            request_id = submit.json()["request_id"]
+
+        status_url = f"https://queue.fal.run/{model}/requests/{request_id}/status"
+        result_url = f"https://queue.fal.run/{model}/requests/{request_id}"
+
+        # Poll every 10 s, max 10 minutes
+        for _ in range(60):
+            await asyncio.sleep(10)
+            async with httpx.AsyncClient(timeout=30) as client:
+                status_resp = await client.get(status_url, headers=headers)
+                status_resp.raise_for_status()
+                status = status_resp.json().get("status")
+
+            if status == "COMPLETED":
+                break
+            if status == "FAILED":
+                raise RuntimeError(f"fal.ai job failed (model={model}, request={request_id})")
+        else:
+            raise TimeoutError(f"fal.ai {model} timed out after 10 minutes")
+
+        # Fetch result
+        async with httpx.AsyncClient(timeout=30) as client:
+            result_resp = await client.get(result_url, headers=headers)
+            result_resp.raise_for_status()
+            video_url = result_resp.json()["video"]["url"]
+
+        # Download and store in Cloudinary
+        async with httpx.AsyncClient(timeout=120) as client:
+            video_resp = await client.get(video_url)
+            video_resp.raise_for_status()
+            video_bytes = video_resp.content
+
+        return await upload_bytes(
+            video_bytes,
+            folder="uri-social/generated-videos",
+            resource_type="video",
+        )
