@@ -67,6 +67,81 @@ async def _send(to: str, body: str, media_url: Optional[str] = None, content_sid
     await asyncio.to_thread(client.messages.create, **kwargs)
 
 
+# ── Incoming media helper ─────────────────────────────────────────────────────
+
+
+async def _download_twilio_media(media_url: str, content_type: Optional[str] = None) -> Optional[str]:
+    """
+    Download an image from Twilio's media endpoint (requires HTTP Basic auth)
+    and re-upload it to Cloudinary so we have a permanent public CDN URL.
+    Returns the public URL, or None on failure.
+    """
+    import base64
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.get(
+                media_url,
+                auth=(settings.TWILIO_ACCOUNT_SID, settings.TWILIO_AUTH_TOKEN),
+                follow_redirects=True,
+            )
+            r.raise_for_status()
+            raw_bytes = r.content
+            ct = content_type or r.headers.get("content-type", "image/jpeg")
+
+        b64 = base64.b64encode(raw_bytes).decode()
+        data_url = f"data:{ct};base64,{b64}"
+
+        try:
+            from app.utils.cloudinary_upload import upload_base64
+            public_url = await upload_base64(data_url, folder="uri-social/whatsapp-uploads")
+            if public_url and public_url.endswith(".webp"):
+                public_url = public_url[:-5] + ".jpg"
+            print(f"[WhatsApp] User media uploaded to Cloudinary: {public_url}")
+            return public_url
+        except Exception as e:
+            print(f"[WhatsApp] Cloudinary upload of user media failed: {e}")
+            # Return the data URL as fallback so _generate_platform_image can still use it
+            return data_url
+
+    except Exception as e:
+        print(f"[WhatsApp] Failed to download Twilio media {media_url!r}: {e}")
+        return None
+
+
+async def _analyze_product_image(image_url: str) -> str:
+    """
+    Use GPT-4o-mini vision to get a brief product description from a user-uploaded image.
+    Returns a short phrase used as seed_content for the image generation prompt.
+    """
+    try:
+        from app.services.AIService import client as _ai_client
+        resp = await asyncio.to_thread(
+            _ai_client.chat.completions.create,
+            model="gpt-4o-mini",
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                    {"type": "text", "text": (
+                        "Describe the main product or subject in this image in 8-12 words, "
+                        "suitable as a social media graphic subject. "
+                        "Output only the description, nothing else. "
+                        "Example: 'Modern wooden desk setup with monitor, keyboard and plant'."
+                    )},
+                ],
+            }],
+            max_tokens=60,
+        )
+        desc = resp.choices[0].message.content.strip()
+        print(f"[WhatsApp] Product image analyzed: {desc!r}")
+        return desc
+    except Exception as e:
+        print(f"[WhatsApp] Image analysis failed: {e}")
+        return "product showcase"
+
+
 # ── Credit helper ─────────────────────────────────────────────────────────────
 
 
@@ -633,10 +708,16 @@ def _format_content(ctx: Dict[str, Any]) -> str:
 class WhatsAppFlowService:
 
     @staticmethod
-    async def handle(raw_from: str, body: str, db: AsyncIOMotorDatabase) -> None:
+    async def handle(
+        raw_from: str,
+        body: str,
+        db: AsyncIOMotorDatabase,
+        media_url: Optional[str] = None,
+        media_content_type: Optional[str] = None,
+    ) -> None:
         phone = WhatsAppSessionService._normalize_phone(raw_from)
         try:
-            await WhatsAppFlowService._handle_inner(phone, body, db)
+            await WhatsAppFlowService._handle_inner(phone, body, db, media_url, media_content_type)
         except Exception as exc:
             import traceback
             print(f"[WhatsApp] ❌ UNHANDLED EXCEPTION for phone={phone!r}: {exc}\n{traceback.format_exc()}")
@@ -647,7 +728,13 @@ class WhatsAppFlowService:
                 pass
 
     @staticmethod
-    async def _handle_inner(phone: str, body: str, db: AsyncIOMotorDatabase) -> None:
+    async def _handle_inner(
+        phone: str,
+        body: str,
+        db: AsyncIOMotorDatabase,
+        media_url: Optional[str] = None,
+        media_content_type: Optional[str] = None,
+    ) -> None:
         text = body.strip().lower()
 
         user = await WhatsAppSessionService.get_user_by_phone(phone, db)
@@ -662,6 +749,24 @@ class WhatsAppFlowService:
         session = await WhatsAppSessionService.get_session(phone, db) or {}
         state: str = session.get("state", "linked")
         ctx: Dict[str, Any] = session.get("context", {})
+
+        # ── Handle incoming image attachment ──────────────────────────────
+        if media_url and state != "generating_graphic":
+            print(f"[WhatsApp] Incoming media from {phone}: {media_url} ({media_content_type})")
+            product_image_url = await _download_twilio_media(media_url, media_content_type)
+            if product_image_url:
+                ctx = {**ctx, "product_image_url": product_image_url}
+                await _safe_set_state(phone, state, ctx, db)
+
+            # Image with no accompanying text → ask what to create
+            if not text:
+                await _send(
+                    phone,
+                    "Got your image! 📸 What do you want me to create with it?\n\n"
+                    "Try: *poster*, *product graphic*, *ad*, or just describe it."
+                )
+                await _safe_set_state(phone, "idle", ctx, db)
+                return
 
         # ── Global reset — works from any state ───────────────────────────
         _RESET = {"restart", "reset", "menu", "home", "start over", "start fresh", "main menu"}
@@ -798,7 +903,7 @@ class WhatsAppFlowService:
             await WhatsAppFlowService._send_ideas(phone, user_id, "", db)
             return
 
-        if any(w in text for w in _GRAPHIC_WORDS) and ctx.get("headline"):
+        if any(w in text for w in _GRAPHIC_WORDS) and (ctx.get("headline") or ctx.get("product_image_url")):
             await WhatsAppFlowService._generate_graphic(phone, user_id, ctx, db)
             return
 
@@ -857,7 +962,7 @@ class WhatsAppFlowService:
                 await _send(phone, "What's the topic? I'll write it and then we can schedule it.")
                 await _safe_set_state(phone, "awaiting_topic", ctx, db)
         elif intent == "graphic":
-            if ctx.get("headline"):
+            if ctx.get("headline") or ctx.get("product_image_url"):
                 await WhatsAppFlowService._generate_graphic(phone, user_id, ctx, db)
             else:
                 await _send(phone, "I'll need to write some content first — what do you want the post to be about?")
@@ -1543,17 +1648,24 @@ class WhatsAppFlowService:
         headline = ctx.get("headline", "")
         subheadline = ctx.get("subheadline", "")
         caption = ctx.get("caption", "")
-        # seed_content drives the TEXT rendered on the image (headline — subheadline).
-        # Use the AI-generated headline/subheadline so the graphic matches the content,
-        # not the raw user topic which may be a vague phrase like "make content".
+        reference_image: Optional[str] = ctx.get("product_image_url")
+
+        # seed_content drives the TEXT rendered on the image.
         if headline:
             seed_content = f"{headline} — {subheadline}" if subheadline else headline
+        elif reference_image:
+            # No AI headline yet — analyze the product photo so the prompt describes
+            # the actual subject rather than falling back to the useless "content graphic".
+            seed_content = await _analyze_product_image(reference_image)
         else:
             seed_content = ctx.get("topic", "") or "content graphic"
+
         # content = full caption text for additional context to the image model
         full_caption = caption or f"{headline}\n{subheadline}".strip()
-        content = full_caption if full_caption else seed_content
-
+        if reference_image and not full_caption:
+            content = f"Product showcase design. Feature this product prominently: {seed_content}"
+        else:
+            content = full_caption if full_caption else seed_content
         try:
             image_result = await ImageContentService._generate_platform_image(
                 platform="instagram",
@@ -1561,6 +1673,7 @@ class WhatsAppFlowService:
                 seed_content=seed_content,
                 brand_context=brand,
                 image_type="post_image",
+                reference_image=reference_image,
             )
         except Exception as exc:
             print(f"[WhatsApp] graphic generation error: {exc}")

@@ -267,7 +267,10 @@ class ImageContentService:
         For carousel slides: slide_index and total_slides provide context for slide numbering.
         """
         try:
-            image_model = "openai/gpt-image-2"
+            # gpt-image-2 does not support the edit endpoint, so when a reference image
+            # is provided we leave image_model unset — _call_dalle_api will use the
+            # gpt-image-1 edit path which preserves the reference image faithfully.
+            image_model = "openai/gpt-image-2" if not reference_image else None
 
             specs = ImageContentService._get_platform_image_specs(platform, image_type=image_type)
 
