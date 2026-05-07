@@ -412,7 +412,14 @@ Follow these rules precisely for every image. No exceptions.
     over random. Every element earns its place."""
 
             # SECTION 3: VISUAL STYLE
-            visual_style = f"=== VISUAL STYLE ===\n{style_fragment}" if style_fragment else ""
+            _default_style = (
+                "Clean, modern typographic social media post. Bold headline text is the dominant visual element. "
+                "Solid colour or subtle gradient background using brand colours. "
+                "Professional flat design — NO 3D renders, NO clipart, NO generic stock illustrations. "
+                "Strong visual hierarchy: large headline, smaller subheading, clean layout with generous whitespace. "
+                "Text overlays must be crisp and legible at a glance."
+            )
+            visual_style = f"=== VISUAL STYLE ===\n{style_fragment if style_fragment else _default_style}"
 
             # SECTION 4: BRAND IDENTITY
             brand_identity_parts = [f"=== BRAND IDENTITY ==="]
@@ -425,8 +432,17 @@ Follow these rules precisely for every image. No exceptions.
                 brand_identity_parts.append(f"Tagline: {bc.get('tagline')}")
             brand_identity = "\n".join(brand_identity_parts)
 
-            # SECTION 4: CONTENT
-            content_section = f"=== CONTENT ===\n{seed_content.strip()}"
+            # SECTION 4: CONTENT — split into headline + subheading so the model
+            # knows exactly what text to render on the image
+            _parts = [p.strip() for p in seed_content.split("—") if p.strip()]
+            _headline = _parts[0] if _parts else seed_content.strip()
+            _subhead  = _parts[1] if len(_parts) > 1 else ""
+            content_section = (
+                f"=== CONTENT ===\n"
+                f"HEADLINE (render as large bold text on image): \"{_headline}\"\n"
+                + (f"SUBHEADING (render as smaller text below headline): \"{_subhead}\"\n" if _subhead else "")
+                + f"Topic context: {seed_content.strip()}"
+            )
 
             # SECTION 5: FORMAT & REGION
             format_parts = ["=== FORMAT ==="]
@@ -436,8 +452,7 @@ Follow these rules precisely for every image. No exceptions.
             if font_prompt:
                 format_parts.append(f"Typography: {font_prompt}")
             else:
-                # CRITICAL: When no font prompt exists, explicitly prevent text overlays
-                format_parts.append("Typography: NO TEXT OVERLAYS. NO TYPOGRAPHY. Pure visual design without any written words, labels, or text elements.")
+                format_parts.append("Typography: Clean, modern sans-serif typeface. Bold headline text with strong contrast, readable subheading, professional typographic hierarchy. Text must be clearly legible.")
             format_section = "\n".join(format_parts)
 
             # SECTION 6: DO NOT INCLUDE (PRD Section 3.1 - Critical for preventing hallucinations)

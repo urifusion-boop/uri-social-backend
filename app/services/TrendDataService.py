@@ -30,7 +30,8 @@ _INDUSTRY_SEEDS: Dict[str, List[str]] = {
 
 class TrendDataService:
 
-    CACHE_TTL_HOURS = 6  # How long to cache Google Trends results
+    CACHE_TTL_HOURS_REAL     = 24  # Cache real Google Trends data for 24h
+    CACHE_TTL_HOURS_FALLBACK = 1   # Cache fallback data for 1h, then retry Google
 
     @staticmethod
     async def get_trending_keywords(
@@ -42,7 +43,8 @@ class TrendDataService:
         """
         Return up to 10 trending keyword dicts for the industry:
         {keyword, trend_score (0-100), growth_rate, source, type}
-        Caches results in MongoDB for CACHE_TTL_HOURS to avoid rate-limits.
+        Caches real Trends data for 24h and fallback data for 1h to avoid
+        hammering Google's rate limits on every page load.
         """
         cache_key = f"{industry.lower()}:{geo}:{timeframe}"
 
@@ -51,9 +53,11 @@ class TrendDataService:
             try:
                 cached = await db["trends_cache"].find_one({"_id": cache_key})
                 if cached:
+                    is_fallback = cached.get("is_fallback", False)
+                    ttl = TrendDataService.CACHE_TTL_HOURS_FALLBACK if is_fallback else TrendDataService.CACHE_TTL_HOURS_REAL
                     age = datetime.now(timezone.utc) - cached["cached_at"].replace(tzinfo=timezone.utc)
-                    if age < timedelta(hours=TrendDataService.CACHE_TTL_HOURS):
-                        print(f"[TrendData] cache hit for '{industry}' (age: {int(age.total_seconds()/60)}m)")
+                    if age < timedelta(hours=ttl):
+                        print(f"[TrendData] cache hit for '{industry}' (age: {int(age.total_seconds()/60)}m, fallback={is_fallback})")
                         return cached["keywords"]
             except Exception as e:
                 print(f"[TrendData] cache read error: {e}")
@@ -69,15 +73,21 @@ class TrendDataService:
             print(f"[TrendData] pytrends fetch failed: {exc} — using fallback keywords")
             results = TrendDataService._fallback_keywords(industry)
 
-        # Only cache real Google Trends results (not fallback)
-        if db is not None and any(r.get("source") == "google_trends" for r in results):
+        # Cache all results — real data for 24h, fallback for 1h
+        if db is not None:
+            is_fallback = not any(r.get("source") == "google_trends" for r in results)
             try:
                 await db["trends_cache"].replace_one(
                     {"_id": cache_key},
-                    {"_id": cache_key, "keywords": results, "cached_at": datetime.now(timezone.utc)},
+                    {
+                        "_id": cache_key,
+                        "keywords": results,
+                        "cached_at": datetime.now(timezone.utc),
+                        "is_fallback": is_fallback,
+                    },
                     upsert=True,
                 )
-                print(f"[TrendData] cached {len(results)} keywords for '{industry}'")
+                print(f"[TrendData] cached {len(results)} keywords for '{industry}' (fallback={is_fallback})")
             except Exception as e:
                 print(f"[TrendData] cache write error: {e}")
 
@@ -130,9 +140,19 @@ class TrendDataService:
                 continue
 
         # Deduplicate by keyword text, keep highest score per keyword
+        # Also strip query-type phrases that produce bad template titles
+        _QUERY_PREFIXES = (
+            "how to ", "what is ", "what are ", "why is ", "why are ",
+            "can i ", "should i ", "where to ", "when to ", "is it ",
+            "does ", "will ", "can ", "are there ", "which ", "who ",
+        )
         deduped: Dict[str, Dict] = {}
         for kw in found:
             key = kw["keyword"].lower()
+            if any(key.startswith(p) for p in _QUERY_PREFIXES):
+                continue  # skip question-type queries — they make bad topic substitutions
+            if len(key.split()) > 5:
+                continue  # skip overly long phrases
             if key not in deduped or kw["trend_score"] > deduped[key]["trend_score"]:
                 deduped[key] = kw
 
@@ -143,7 +163,7 @@ class TrendDataService:
     def _fallback_keywords(industry: str) -> List[Dict[str, Any]]:
         seeds = _INDUSTRY_SEEDS.get(
             industry.lower(),
-            [f"{industry} tips", f"{industry} mistakes", f"how to {industry}", f"{industry} guide"],
+            [f"{industry} tips", f"{industry} growth", f"{industry} strategy", f"{industry} trends"],
         )
         return [
             {

@@ -1,9 +1,13 @@
 import asyncio
+import base64
 import json
 import re
+import uuid
 from typing import Any, Dict, List, Optional
 
+from app.database import get_db
 from app.services.AIService import client as openai_client
+from app.utils.cloudinary_upload import upload_bytes
 
 _SYSTEM_PROMPT = """You are a creative director specialising in short-form social video for brands.
 
@@ -41,7 +45,83 @@ Return ONLY valid JSON — no markdown fences, no explanation:
 }"""
 
 
+def _frame_jobs_collection():
+    return get_db()["storyboard_frame_jobs"]
+
+
 class VideoStoryboardService:
+
+    @staticmethod
+    async def _generate_scene_frame(scene: dict) -> Optional[str]:
+        """Generate a storyboard frame image for one scene via gpt-image-2 and upload to Cloudinary."""
+        try:
+            shot = scene.get("shot_type", "").replace("_", " ")
+            video_prompt = scene.get("video_prompt", "")
+            motion = scene.get("motion", "")
+            text = scene.get("text_overlay") or ""
+
+            prompt = (
+                f"Cinematic storyboard frame, {shot} shot. "
+                f"{video_prompt} "
+                f"Camera movement: {motion}. "
+                + (f'On-screen text: "{text}". ' if text else "")
+                + "Photorealistic, high-end brand photography, dramatic lighting. "
+                "Vertical 9:16 composition."
+            )
+
+            loop = asyncio.get_running_loop()
+            resp = await loop.run_in_executor(
+                None,
+                lambda: openai_client.images.generate(
+                    model="gpt-image-2",
+                    prompt=prompt,
+                    n=1,
+                    size="1024x1024",
+                    quality="medium",
+                    output_format="webp",
+                ),
+            )
+            img_bytes = base64.b64decode(resp.data[0].b64_json)
+            url = await upload_bytes(
+                img_bytes,
+                folder="uri-social/storyboard-frames",
+                resource_type="image",
+            )
+            return url
+        except Exception as e:
+            print(f"[StoryboardFrame] Scene {scene.get('scene_number')} frame failed: {e}")
+            return None
+
+    @staticmethod
+    async def create_frame_job(scenes: list) -> str:
+        job_id = uuid.uuid4().hex
+        await _frame_jobs_collection().insert_one({
+            "job_id": job_id,
+            "status": "generating",
+            "total_scenes": len(scenes),
+            "frames": [],
+        })
+        return job_id
+
+    @staticmethod
+    async def run_frame_job(job_id: str, scenes: list) -> None:
+        """Background task: generate one frame image per scene, store progressively."""
+        col = _frame_jobs_collection()
+        for scene in scenes:
+            url = await VideoStoryboardService._generate_scene_frame(scene)
+            if url:
+                await col.update_one(
+                    {"job_id": job_id},
+                    {"$push": {"frames": {
+                        "scene_number": scene.get("scene_number"),
+                        "frame_image_url": url,
+                    }}},
+                )
+        await col.update_one({"job_id": job_id}, {"$set": {"status": "complete"}})
+
+    @staticmethod
+    async def get_frame_job(job_id: str) -> Optional[Dict]:
+        return await _frame_jobs_collection().find_one({"job_id": job_id}, {"_id": 0})
 
     @staticmethod
     async def generate_storyboard(
@@ -53,11 +133,8 @@ class VideoStoryboardService:
     ) -> Dict[str, Any]:
         """
         Send brand images + optional creative text to GPT-4o Vision.
-        Returns a structured storyboard JSON dict.
-
-        brand_images: list of base64 data URLs (up to 5)
-        optional_text: marketer's creative direction — may be None
-        brand_context: {brand_name, industry, brand_colors, brand_voice, region}
+        Returns a structured storyboard JSON dict. Frame images are generated
+        separately via the /generate-storyboard-frames background job.
         """
         if not brand_images:
             return {"status": False, "error": "At least one brand image is required."}
@@ -114,7 +191,7 @@ class VideoStoryboardService:
                 model="gpt-5.4",
                 messages=messages,
                 temperature=0.7,
-                max_tokens=2000,
+                max_completion_tokens=2000,
             ),
         )
 

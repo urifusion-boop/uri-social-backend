@@ -96,6 +96,97 @@ def _pick_mix(industry: str) -> List[str]:
     return DEFAULT_MIX
 
 
+# Topic label → content_type bucket
+_TOPIC_TO_CONTENT_TYPE: Dict[str, str] = {
+    "education":   "educational",
+    "finance":     "educational",
+    "technology":  "educational",
+    "health":      "educational",
+    "real estate": "educational",
+    "marketing":   "educational",
+    "business":    "educational",
+    "motivation":  "relatable",
+    "fashion":     "relatable",
+    "food":        "relatable",
+    "offer":       "promotional",
+    "story":       "behind_the_scenes",
+}
+
+
+def _pick_mix_from_performance(
+    performance: Dict[str, Any],
+    industry: str,
+    brand: Optional[Dict[str, Any]] = None,
+) -> List[str]:
+    """
+    Build a personalised 7-day content-type mix driven by this user's
+    performance data.  Falls back to the industry/default mix when there
+    is no historical data.
+    """
+    if not performance or not performance.get("has_data"):
+        return _pick_mix(industry)
+
+    avg_by_topic: Dict[str, float] = performance.get("avg_engagement_by_topic", {})
+    if not avg_by_topic:
+        return _pick_mix(industry)
+
+    # Map each measured topic → content_type and accumulate weighted scores
+    type_scores: Dict[str, float] = {t: 0.0 for t in CONTENT_TYPES}
+    for topic, eng in avg_by_topic.items():
+        ct = _TOPIC_TO_CONTENT_TYPE.get(topic.lower(), "relatable")
+        type_scores[ct] = max(type_scores[ct], eng)  # take the best topic score per type
+
+    # Boost based on brand primary_goal
+    primary_goal = ((brand or {}).get("primary_goal") or "").lower()
+    if "sales" in primary_goal or "revenue" in primary_goal or "convert" in primary_goal:
+        type_scores["promotional"] = type_scores["promotional"] * 1.5 + 0.1
+    elif "community" in primary_goal or "relationship" in primary_goal:
+        type_scores["relatable"] = type_scores["relatable"] * 1.4 + 0.1
+        type_scores["behind_the_scenes"] = type_scores["behind_the_scenes"] * 1.3 + 0.1
+    elif "awareness" in primary_goal or "audience" in primary_goal or "grow" in primary_goal:
+        type_scores["educational"] = type_scores["educational"] * 1.4 + 0.1
+        type_scores["engagement"] = type_scores["engagement"] * 1.2 + 0.1
+
+    # Always ensure every type has a non-zero floor so it can appear
+    for ct in CONTENT_TYPES:
+        if type_scores[ct] == 0.0:
+            type_scores[ct] = 0.5
+
+    # Distribute 7 slots proportionally to scores, minimum 1 slot per type
+    total_score = sum(type_scores.values()) or 1.0
+    raw_slots = {ct: max(1, round((s / total_score) * 7)) for ct, s in type_scores.items()}
+
+    # Adjust to exactly 7 slots
+    while sum(raw_slots.values()) > 7:
+        # Remove a slot from the lowest-scoring over-allocated type
+        excess = [(ct, raw_slots[ct]) for ct in raw_slots if raw_slots[ct] > 1]
+        excess.sort(key=lambda x: type_scores[x[0]])
+        raw_slots[excess[0][0]] -= 1
+    while sum(raw_slots.values()) < 7:
+        # Add a slot to the highest-scoring type
+        best = max(type_scores, key=type_scores.get)
+        raw_slots[best] += 1
+
+    # Build ordered 7-day list: spread types across the week sensibly
+    # Order: educational early week, promotional mid-week, engagement/relatable end
+    day_type_order = ["educational", "relatable", "educational", "promotional",
+                      "behind_the_scenes", "engagement", "relatable"]
+    mix: List[str] = []
+    remaining = dict(raw_slots)
+    for preferred in day_type_order:
+        if remaining.get(preferred, 0) > 0:
+            mix.append(preferred)
+            remaining[preferred] -= 1
+        else:
+            # Pick the type with most remaining slots
+            fallback = max(remaining, key=lambda k: remaining[k])
+            mix.append(fallback)
+            remaining[fallback] -= 1
+
+    print(f"[Calendar] Personalised mix from performance: {mix} (scores: {type_scores})")
+    return mix
+
+
 def _compute_mix_ratios(mix: List[str]) -> Dict[str, float]:
     counts: Dict[str, int] = {t: 0 for t in CONTENT_TYPES}
     for t in mix:
@@ -110,6 +201,8 @@ async def _generate_ideas(
     week_start: str,
     platforms: List[str],
     previous_titles: Optional[List[str]] = None,
+    trend_keywords: Optional[List[Dict[str, Any]]] = None,
+    performance: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Call AI once for all 7 day ideas. Returns list of 7 dicts."""
     brand_name = brand.get("brand_name") or "the brand"
@@ -157,6 +250,35 @@ async def _generate_ideas(
     avoid_repeat_block = ""
     if previous_titles:
         avoid_repeat_block = f"\nTopics used last week (do NOT repeat these):\n" + "\n".join(f"- {t}" for t in previous_titles[:14])
+
+    # ── Market Intel block (Google Trends) ────────────────────────────────────
+    market_intel_block = ""
+    if trend_keywords:
+        top_trends = trend_keywords[:6]
+        trend_lines = []
+        for kw in top_trends:
+            score = kw.get("trend_score", 0)
+            kw_type = kw.get("type", "trending")
+            growth = kw.get("growth_rate", 0)
+            suffix = f" (+{growth:.0f}% on Google)" if kw_type == "rising" and growth else f" (score: {score})"
+            trend_lines.append(f"  - {kw['keyword']}{suffix}")
+        market_intel_block = "Current trending topics in this industry (Market Intel — prioritise these):\n" + "\n".join(trend_lines)
+
+    # ── Performance Intelligence block ────────────────────────────────────────
+    performance_block = ""
+    if performance and performance.get("has_data"):
+        perf_lines = []
+        top_topics = performance.get("top_topics", [])
+        if top_topics:
+            perf_lines.append(f"Top performing topics for this account: {', '.join(top_topics[:5])}")
+        top_formats = performance.get("top_formats", [])
+        if top_formats:
+            perf_lines.append(f"Best performing format: {top_formats[0]}")
+        best_hour = performance.get("best_posting_hour")
+        if best_hour is not None:
+            perf_lines.append(f"Best posting time: {best_hour}:00")
+        if perf_lines:
+            performance_block = "Account performance signals (use these to inform content angles):\n" + "\n".join(f"  - {l}" for l in perf_lines)
 
     brand_block = f"Brand: {brand_name}"
     if tagline:
@@ -209,6 +331,8 @@ Content pillars: {pillars_str}
 Platforms: {platforms_str}
 Week starting: {week_start}
 {extras_block}
+{market_intel_block}
+{performance_block}
 {avoid_repeat_block}
 
 Generate a 7-day content plan. For each day produce:
@@ -227,6 +351,9 @@ Return ONLY a valid JSON array of exactly 7 objects:
 ]
 
 Rules:
+- GROUND each idea in the trending topics and performance signals provided above — these are real signals, not generic suggestions
+- Every day must have a DIFFERENT angle, format feel, and hook — no two titles should start with the same phrase
+- Never use list-post titles like "5 ways to..." or "5 mistakes..." more than once across the 7 days
 - Be SPECIFIC to this brand — use real product/service names, real audience pain points, real industry context
 - Promotional: highlight a genuine product/service benefit with a clear value statement
 - Educational: share an insight directly relevant to this brand's industry and audience
@@ -284,91 +411,113 @@ async def generate_plan(
     monday = _get_monday(now)
     week_start = monday.strftime("%Y-%m-%d")
 
+    previous_titles: List[str] = []
+
     if force:
+        # Grab current week's titles so AI doesn't regenerate the same ideas
+        existing_active = await get_active_plan(user_id, db, week_start)
+        if existing_active:
+            previous_titles = [d.get("title", "") for d in existing_active.get("days", []) if d.get("title")]
         await db[COLLECTION].update_many(
             {"user_id": user_id, "week_start": week_start, "status": "active"},
             {"$set": {"status": "archived"}},
         )
+        # Bust trend cache so we get fresh keywords
+        industry_temp = brand.get("industry", "")
+        if industry_temp:
+            try:
+                await db["trends_cache"].delete_one({"_id": f"{industry_temp.lower()}:NG:today 1-m"})
+                print(f"[Calendar] Busted trend cache for '{industry_temp}' on force-regenerate")
+            except Exception:
+                pass
     else:
         existing = await get_active_plan(user_id, db, week_start)
         if existing:
             return existing
 
     industry = brand.get("industry", "")
-    mix = _pick_mix(industry)
 
+    # Add last week's titles too (if we don't already have current week titles from force path)
     last_monday = (monday - timedelta(days=7)).strftime("%Y-%m-%d")
     last_plan = await db[COLLECTION].find_one(
         {"user_id": user_id, "week_start": last_monday},
         {"_id": 0, "days": 1},
     )
-    previous_titles = [d.get("title", "") for d in (last_plan or {}).get("days", []) if d.get("title")]
+    previous_titles += [d.get("title", "") for d in (last_plan or {}).get("days", []) if d.get("title")]
 
-    # ── Data-driven pipeline ──────────────────────────────────────────────────
+    # ── Data signals ──────────────────────────────────────────────────────────
     performance = await PerformanceAnalyticsService.get_user_performance(user_id, db)
-    trend_keywords = await TrendDataService.get_trending_keywords(industry)
+    trend_keywords = await TrendDataService.get_trending_keywords(industry, db=db)
+
+    # ── Personalised content mix from performance data ────────────────────────
+    mix = _pick_mix_from_performance(performance, industry, brand)
 
     generation_method = "ai"  # default fallback
     days: List[Dict[str, Any]] = []
 
-    if trend_keywords:
-        try:
-            raw_ideas  = IdeaScoringService.generate_ideas(trend_keywords, industry, performance)
-            scored     = IdeaScoringService.score_ideas(raw_ideas, performance)
-            top_ideas  = IdeaScoringService.select_for_calendar(scored, n=7)
+    # ── AI generation (always used — grounded in trend + performance signals) ─
+    try:
+        if trend_keywords or performance.get("has_data"):
+            generation_method = "data_driven" if performance.get("has_data") else "trend_driven"
+        ai_ideas = await _generate_ideas(
+            brand, mix, week_start, platforms,
+            previous_titles=previous_titles,
+            trend_keywords=trend_keywords or [],
+            performance=performance,
+        )
+    except Exception as exc:
+        print(f"[Calendar] AI generation failed: {exc}")
+        ai_ideas = []
 
-            if len(top_ideas) == 7:
-                generation_method = "data_driven" if performance["has_data"] else "trend_driven"
-                for i, idea in enumerate(top_ideas):
-                    day_date = (monday + timedelta(days=i)).strftime("%Y-%m-%d")
-                    days.append({
-                        "day_index":           i,
-                        "date":                day_date,
-                        "content_type":        idea.get("content_type", mix[i]),
-                        "title":               idea["title"],
-                        "description":         _build_description(idea, brand),
-                        "keyword":             idea.get("keyword", ""),
-                        "trend_score":         idea.get("trend_score", 0),
-                        "performance_score":   idea.get("performance_score", 0),
-                        "format_score":        idea.get("format_score", 0),
-                        "final_score":         idea.get("final_score", 0),
-                        "reason":              idea.get("reason", ""),
-                        "format":              idea.get("format", "image"),
-                        "platforms":           platforms,
-                        "acted_on":            False,
-                        "acted_on_draft_ids":  [],
-                        "regenerated_count":   0,
-                        "last_regenerated_at": None,
-                    })
-        except Exception as exc:
-            print(f"[Calendar] data-driven pipeline failed: {exc} — falling back to AI")
-            days = []
+    for i, idea in enumerate(ai_ideas):
+        day_date = (monday + timedelta(days=i)).strftime("%Y-%m-%d")
+        # Score against real signals for transparency
+        kw = idea.get("keyword", "")
+        trend_score = 0
+        perf_score = 0
+        if trend_keywords:
+            match = next((t for t in trend_keywords if t["keyword"].lower() in idea.get("title", "").lower()), None)
+            if match:
+                trend_score = match.get("trend_score", 0)
+        if performance.get("has_data"):
+            top_topics = performance.get("top_topics", [])
+            title_lower = idea.get("title", "").lower()
+            if any(t.lower() in title_lower for t in top_topics):
+                perf_score = 75
+        days.append({
+            "day_index":           i,
+            "date":                day_date,
+            "content_type":        mix[i],
+            "title":               idea.get("title", ""),
+            "description":         idea.get("description", ""),
+            "keyword":             kw,
+            "trend_score":         trend_score,
+            "performance_score":   perf_score,
+            "format_score":        0,
+            "final_score":         round((trend_score * 0.4) + (perf_score * 0.4), 1),
+            "reason":              idea.get("reason", "Generated using Market Intel + performance data"),
+            "format":              (performance.get("top_formats") or ["image"])[0],
+            "platforms":           platforms,
+            "acted_on":            False,
+            "acted_on_draft_ids":  [],
+            "regenerated_count":   0,
+            "last_regenerated_at": None,
+        })
 
-    # ── AI fallback ───────────────────────────────────────────────────────────
+    # Guard: if both pipelines failed, restore the archived plan rather than
+    # persisting an empty plan that would leave the user with a broken calendar.
     if not days:
-        generation_method = "ai"
-        ai_ideas = await _generate_ideas(brand, mix, week_start, platforms, previous_titles=previous_titles)
-        for i, idea in enumerate(ai_ideas):
-            day_date = (monday + timedelta(days=i)).strftime("%Y-%m-%d")
-            days.append({
-                "day_index":           i,
-                "date":                day_date,
-                "content_type":        mix[i],
-                "title":               idea.get("title", ""),
-                "description":         idea.get("description", ""),
-                "keyword":             "",
-                "trend_score":         0,
-                "performance_score":   0,
-                "format_score":        0,
-                "final_score":         0,
-                "reason":              "Generated by AI based on your brand profile",
-                "format":              "image",
-                "platforms":           platforms,
-                "acted_on":            False,
-                "acted_on_draft_ids":  [],
-                "regenerated_count":   0,
-                "last_regenerated_at": None,
-            })
+        print(f"[Calendar] Both pipelines failed for user {user_id} — restoring previous plan")
+        restored = await db[COLLECTION].find_one_and_update(
+            {"user_id": user_id, "week_start": week_start, "status": "archived"},
+            {"$set": {"status": "active"}},
+            sort=[("generated_at", -1)],
+            return_document=True,
+        )
+        if restored:
+            restored.pop("_id", None)
+            return restored
+        raise RuntimeError("Content generation failed and no previous plan to restore. Please try again.")
 
     plan_id = str(uuid.uuid4())
     doc = {
