@@ -76,7 +76,7 @@ class VideoStoryboardService:
                     model="gpt-image-2",
                     prompt=prompt,
                     n=1,
-                    size="1024x1024",
+                    size="1024x1536",
                     quality="medium",
                     output_format="webp",
                 ),
