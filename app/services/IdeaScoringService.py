@@ -12,20 +12,25 @@ from typing import Any, Dict, List, Optional
 
 
 # Content idea templates — {topic} is replaced by the trend keyword
-_TEMPLATES = [
-    "5 mistakes {audience} make with {topic}",
-    "How to {action} using {topic}",
-    "Beginner's guide to {topic}",
-    "What nobody tells you about {topic}",
-    "The truth about {topic} in {year}",
-    "5 things every {audience} should know about {topic}",
-    "Why {topic} matters for your business",
-    "5 ways to improve your {topic} strategy",
-    "The biggest {topic} trends this year",
-    "Is {topic} worth the investment? Here's what we found",
-    "{topic}: common myths debunked",
-    "How {topic} is changing the {industry} industry",
+# Each entry is (template_string, pillar_tags)
+_TEMPLATES_WITH_TAGS = [
+    ("5 mistakes {audience} make with {topic}",                    ["tips & education", "education"]),
+    ("How to {action} using {topic}",                             ["tips & education", "education", "how-to"]),
+    ("Beginner's guide to {topic}",                               ["tips & education", "education"]),
+    ("What nobody tells you about {topic}",                       ["industry news", "insight"]),
+    ("The truth about {topic} in {year}",                         ["industry news", "insight"]),
+    ("5 things every {audience} should know about {topic}",       ["tips & education", "education"]),
+    ("Why {topic} matters for your {industry} business",          ["engagement", "community"]),
+    ("5 ways to improve your {topic} strategy",                   ["tips & education", "education"]),
+    ("The biggest {topic} trends this year",                      ["industry news", "trends"]),
+    ("Is {topic} worth the investment? Here's what we found",     ["promotional", "sales"]),
+    ("{topic}: common myths debunked",                            ["tips & education", "education"]),
+    ("How {topic} is changing the {industry} industry",           ["industry news", "trends"]),
+    ("Behind the scenes: how we use {topic} to grow",             ["behind the scenes", "community"]),
+    ("Your audience asked: everything about {topic} answered",    ["engagement", "community", "tips & education"]),
 ]
+
+_TEMPLATES = [t for t, _ in _TEMPLATES_WITH_TAGS]
 
 _AUDIENCE_BY_INDUSTRY: Dict[str, str] = {
     "real estate": "first-time homebuyer",
@@ -40,11 +45,26 @@ _AUDIENCE_BY_INDUSTRY: Dict[str, str] = {
     "education":   "student or professional",
     "beauty":      "beauty entrepreneur",
     "logistics":   "logistics manager",
+    "social media & marketing technology": "content creator",
 }
 
 # Maps idea title patterns → content_type label
-_EDUCATIONAL_MARKERS = ["guide", "how to", "mistakes", "tips", "things", "truth", "myths", "know", "what nobody"]
+_EDUCATIONAL_MARKERS = ["guide", "how to", "mistakes", "tips", "things", "truth", "myths", "know", "what nobody", "answered"]
 _PROMOTIONAL_MARKERS = ["worth", "investment", "improve", "strategy", "changing"]
+
+
+def _templates_for_pillars(pillars: List[str]) -> List[str]:
+    """Return templates ordered so pillar-matching ones come first."""
+    if not pillars:
+        return _TEMPLATES
+    pillar_lower = [p.lower() for p in pillars]
+    priority, rest = [], []
+    for tmpl, tags in _TEMPLATES_WITH_TAGS:
+        if any(tag in pillar_lower for tag in tags):
+            priority.append(tmpl)
+        else:
+            rest.append(tmpl)
+    return priority + rest
 
 
 class IdeaScoringService:
@@ -54,17 +74,35 @@ class IdeaScoringService:
         trend_keywords: List[Dict[str, Any]],
         industry: str,
         performance_data: Dict[str, Any],
+        brand_data: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """Generate raw ideas by combining trend keywords with templates."""
-        audience  = _AUDIENCE_BY_INDUSTRY.get(industry.lower(), "business owner")
-        top_fmts  = performance_data.get("top_formats", ["image"])
-        best_fmt  = top_fmts[0] if top_fmts else "image"
-        year      = str(datetime.utcnow().year)
+        brand        = brand_data or {}
+        pillars      = brand.get("content_pillars") or []
+        pref_formats = brand.get("preferred_formats") or []
+        primary_goal = (brand.get("primary_goal") or "").lower()
+        brand_audience = brand.get("target_audience") or brand.get("audience_age_range") or ""
+
+        # Actual brand audience > generic industry fallback
+        audience = brand_audience or _AUDIENCE_BY_INDUSTRY.get(industry.lower(), "business owner")
+
+        # Use preferred formats when available, else fall back to performance data
+        if pref_formats:
+            fmt_map = {"single image": "image", "carousel": "image", "short video": "long_form",
+                       "reel": "long_form", "infographic": "image", "long-form": "long_form"}
+            best_fmt = fmt_map.get(pref_formats[0].lower(), "image")
+        else:
+            top_fmts = performance_data.get("top_formats", ["image"])
+            best_fmt = top_fmts[0] if top_fmts else "image"
+
+        # Order templates so pillar-matching ones are generated first (more slots)
+        templates = _templates_for_pillars(pillars)
+        year = str(datetime.utcnow().year)
 
         ideas = []
         for kw_data in trend_keywords[:8]:
             keyword = kw_data["keyword"]
-            for template in _TEMPLATES:
+            for template in templates:
                 title = (
                     template
                     .replace("{topic}",    keyword)
@@ -210,16 +248,30 @@ class IdeaScoringService:
         selected: List[Dict] = []
         used_ids: set = set()
         keyword_count: Dict[str, int] = {}
-        max_per_keyword = 2  # enforce diversity across 7 days
+        template_count: Dict[str, int] = {}
+        max_per_keyword  = 2  # max times same keyword used across 7 days
+        max_per_template = 2  # max times same template opening used across 7 days
+
+        def _template_key(title: str) -> str:
+            """Return the first 2 words of the title as a template fingerprint."""
+            return " ".join(title.lower().split()[:2])
 
         def _pick(pool: List[Dict]) -> Optional[Dict]:
             for idea in pool:
                 if idea["idea_id"] in used_ids:
                     continue
                 kw = idea["keyword"].lower()
+                tk = _template_key(idea["title"])
+                if keyword_count.get(kw, 0) < max_per_keyword and template_count.get(tk, 0) < max_per_template:
+                    return idea
+            # Relax template constraint, keep keyword constraint
+            for idea in pool:
+                if idea["idea_id"] in used_ids:
+                    continue
+                kw = idea["keyword"].lower()
                 if keyword_count.get(kw, 0) < max_per_keyword:
                     return idea
-            # All keywords saturated — relax limit and take any unused
+            # All constraints saturated — take any unused
             for idea in pool:
                 if idea["idea_id"] not in used_ids:
                     return idea
@@ -229,8 +281,10 @@ class IdeaScoringService:
             pick = _pick(pools[ct]) or _pick(scored_ideas)
             if pick:
                 kw = pick["keyword"].lower()
+                tk = _template_key(pick["title"])
                 selected.append({**pick, "content_type": ct})
                 used_ids.add(pick["idea_id"])
                 keyword_count[kw] = keyword_count.get(kw, 0) + 1
+                template_count[tk] = template_count.get(tk, 0) + 1
 
         return selected[:n]

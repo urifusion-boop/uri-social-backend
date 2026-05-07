@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import subprocess
 import traceback
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query, Request, UploadFile, File
 from fastapi.responses import RedirectResponse, StreamingResponse, JSONResponse
@@ -115,6 +116,14 @@ class StoryboardRequest(BaseModel):
     optional_text: Optional[str] = Field(None, max_length=1000)
     target_platform: str = "instagram_reels"
     target_duration_seconds: int = Field(15, ge=5, le=30)
+
+class StoryboardFramesRequest(BaseModel):
+    scenes: List[Dict[str, Any]]
+
+class VideoFromStoryboardRequest(BaseModel):
+    storyboard: Dict[str, Any]
+    brand_images: List[str] = Field(default_factory=list, max_items=5)
+    model: str = "veo-3.1-generate-preview"
 
 class ContentGenerationRequest(BaseModel):
     seed_content: str = Field(..., min_length=10, max_length=5000)
@@ -1803,7 +1812,11 @@ async def generate_calendar_plan(
             db=db,
             force=request.force_regenerate,
         )
-        return UriResponse.get_single_data_response("calendar_plan", plan)
+        print(f"[Calendar] plan returned plan_id={plan.get('plan_id')} generation_method={plan.get('generation_method')} force={request.force_regenerate}")
+        return UriResponse.get_single_data_response("calendar_plan", {
+            **plan,
+            "regenerated": request.force_regenerate,
+        })
     except Exception as e:
         import traceback as _tb
         print(_tb.format_exc())
@@ -3239,3 +3252,184 @@ async def generate_storyboard(
         raise HTTPException(status_code=400, detail=result.get("error", "Storyboard generation failed"))
 
     return UriResponse.get_single_data_response("storyboard", result["storyboard"])
+
+
+@router.post("/generate-video-from-storyboard")
+async def generate_video_from_storyboard(
+    request: VideoFromStoryboardRequest,
+    background_tasks: BackgroundTasks,
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Start Veo 3.1 video generation for every scene in a storyboard.
+    Returns a job_id immediately. Poll GET /video-job/{job_id} for progress.
+    """
+    from app.agents.social_media_manager.services.video_generation_service import (
+        VideoGenerationService,
+    )
+
+    _get_user_id(token)  # auth check
+
+    job_id = await VideoGenerationService.create_job(request.storyboard, request.model)
+    background_tasks.add_task(
+        VideoGenerationService.run_job,
+        job_id,
+        request.storyboard,
+        request.brand_images,
+        request.model,
+    )
+    return UriResponse.get_single_data_response(
+        "video_job",
+        {"job_id": job_id, "status": "queued", "total_scenes": len(request.storyboard.get("scenes", []))},
+    )
+
+
+@router.get("/video-job/{job_id}")
+async def get_video_job(
+    job_id: str,
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Poll for video generation progress.
+    status: queued | generating | complete | failed
+    current_scene: which scene is being generated right now (1-based)
+    clips: completed clips so far (grows as each scene finishes)
+    """
+    from app.agents.social_media_manager.services.video_generation_service import get_job
+
+    _get_user_id(token)  # auth check
+
+    job = await get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    return UriResponse.get_single_data_response("video_job", job)
+
+
+@router.post("/generate-storyboard-frames")
+async def generate_storyboard_frames(
+    request: StoryboardFramesRequest,
+    background_tasks: BackgroundTasks,
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Start background generation of a unique frame image for each storyboard scene.
+    Returns a job_id immediately. Poll GET /storyboard-frame-job/{job_id} for progress.
+    """
+    from app.agents.social_media_manager.services.video_storyboard_service import VideoStoryboardService
+
+    _get_user_id(token)  # auth check
+
+    job_id = await VideoStoryboardService.create_frame_job(request.scenes)
+    background_tasks.add_task(VideoStoryboardService.run_frame_job, job_id, request.scenes)
+
+    return UriResponse.get_single_data_response(
+        "frame_job",
+        {"job_id": job_id, "status": "generating", "total_scenes": len(request.scenes)},
+    )
+
+
+@router.get("/storyboard-frame-job/{job_id}")
+async def get_storyboard_frame_job(
+    job_id: str,
+    token: dict = Depends(JWTBearer()),
+):
+    """Poll for storyboard frame image generation progress."""
+    from app.agents.social_media_manager.services.video_storyboard_service import VideoStoryboardService
+
+    _get_user_id(token)  # auth check
+
+    job = await VideoStoryboardService.get_frame_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Frame job not found")
+
+    return UriResponse.get_single_data_response("frame_job", job)
+
+
+@router.post("/merge-video-job/{job_id}")
+async def merge_video_job(
+    job_id: str,
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Merge all completed clips from a finished video job into a single video.
+    Returns the merged Cloudinary video URL.
+    """
+    from app.agents.social_media_manager.services.video_generation_service import get_job
+    from app.agents.social_media_manager.services.video_merge_service import VideoMergeService
+
+    _get_user_id(token)  # auth check
+
+    job = await get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.get("status") != "complete":
+        raise HTTPException(status_code=400, detail="Job is not complete yet")
+
+    clip_urls = [c["video_url"] for c in job.get("clips", []) if c.get("video_url")]
+    if not clip_urls:
+        raise HTTPException(status_code=400, detail="No completed clips to merge")
+
+    try:
+        merged_url = await VideoMergeService.merge_clips(clip_urls)
+    except subprocess.CalledProcessError as e:
+        raise HTTPException(status_code=500, detail=f"ffmpeg merge failed: {e.stderr.decode()[:300]}")
+
+    return UriResponse.get_single_data_response("merged_video", {"merged_video_url": merged_url})
+
+
+class SaveVideoDraftRequest(BaseModel):
+    merged_video_url: str
+    caption: str = ""
+    platforms: List[str] = Field(default_factory=list)
+
+
+@router.post("/video-drafts")
+async def save_video_draft(
+    request: SaveVideoDraftRequest,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """Save a merged video as a draft for later posting."""
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    from datetime import datetime, timezone
+    import uuid as _uuid
+
+    draft_id = _uuid.uuid4().hex
+    doc = {
+        "id": draft_id,
+        "request_id": draft_id,      # satisfies unique index on content_drafts
+        "platform": "video",          # satisfies compound index (request_id, platform)
+        "user_id": user_id,
+        "media_type": "video",
+        "video_url": request.merged_video_url,
+        "content": request.caption,
+        "platforms": request.platforms,
+        "status": "draft",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db["content_drafts"].insert_one(doc)
+
+    doc.pop("_id", None)
+    return UriResponse.get_single_data_response("video_draft", doc)
+
+
+@router.get("/video-drafts")
+async def list_video_drafts(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """List all saved video drafts for the current user."""
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    drafts = await db["content_drafts"].find(
+        {"user_id": user_id, "media_type": "video"},
+        {"_id": 0},
+    ).sort("created_at", -1).to_list(length=50)
+
+    return UriResponse.get_single_data_response("video_drafts", drafts)
