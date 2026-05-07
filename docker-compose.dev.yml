@@ -32,7 +32,7 @@ services:
       - /home/uridev/uri-static-images:/app/static/images
     networks:
       uritest-network:
-        ipv4_address: 172.22.0.3
+        ipv4_address: 172.22.0.16
 
 networks:
   uritest-network:
