@@ -31,7 +31,8 @@ services:
     volumes:
       - /home/uridev/uri-static-images:/app/static/images
     networks:
-      - uritest-network
+      uritest-network:
+        ipv4_address: 172.22.0.3
 
 networks:
   uritest-network:
