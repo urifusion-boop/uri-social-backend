@@ -1216,11 +1216,6 @@ Follow these rules precisely for every image. No exceptions.
 
         if image_type == 'poster':
             brand_ref = f"{brand_name}" if brand_name else industry
-            # Extract a short headline from seed content
-            words = seed_content.split()
-            headline_words = words[:6] if len(words) >= 6 else words
-            headline = ' '.join(headline_words).rstrip('.,!?')
-            brand_name_line = f'Render brand name "{brand_name}" in smaller text below the headline. ' if brand_name else ''
             return (
                 f"COLOR_PALETTE: {color_list if color_list else 'deep navy, warm amber, white'} — "
                 f"these colors are the dominant palette, filling backgrounds and accents. "
@@ -1230,35 +1225,23 @@ Follow these rules precisely for every image. No exceptions.
                 f"or a stylised icon representing {industry} — placed in the upper two-thirds. "
                 f"{product_note}"
                 f"LAYOUT: {aspect} format, bold asymmetric layout, strong visual hierarchy, "
-                f"clear negative space for text. "
-                f"TYPOGRAPHY: Render the headline '{headline}' as large bold clean sans-serif white "
-                f"typography in the lower third. Maximum legibility, high contrast against background. "
-                f"{brand_name_line}"
+                f"clear negative space in the lower third. "
                 f"{voice_note}"
-                f"No watermarks, no logos. Professional quality, publishable brand asset."
+                f"No watermarks, no logos, no text overlays. Professional quality, publishable brand asset."
             )
 
         if image_type == 'stat_card':
             brand_ref = f"{brand_name}" if brand_name else industry
-            # Try to pull a number from content, fallback to generic
-            import re as _re_fb
-            nums = _re_fb.findall(r'\b\d+[%+x]?\b', seed_content)
-            key_stat = nums[0] if nums else "1"
-            stat_label = seed_content[:40].rstrip('.,!?') if seed_content else industry
-            stat_brand_line = f'Below the label render brand name "{brand_name}" in small caps. ' if brand_name else ''
             return (
                 f"COLOR_PALETTE: {color_list if color_list else 'bold single brand color with white accents'} — "
                 f"dominant background and accent colors. "
-                f"BACKGROUND: Clean minimal flat design card. "
+                f"BACKGROUND: Clean minimal flat design card for {brand_ref}. "
                 f"{color_list if color_list else 'Deep brand color'} solid or subtle gradient background. "
-                f"TYPOGRAPHY: Render '{key_stat}' as a massive bold centred number/stat in white "
-                f"or maximum-contrast color — it must dominate the card visually. "
-                f"Below it render '{stat_label}' in clean smaller sans-serif text. "
-                f"{stat_brand_line}"
+                f"FOCAL_ELEMENT: Abstract geometric shapes or minimal icons representing {industry}. "
                 f"ACCENT_ELEMENTS: Thin geometric lines or minimal icons in a lighter shade of "
                 f"brand color, subtle texture or grid in background for depth. "
                 f"QUALITY: Flat design only, pixel-perfect, publishable brand asset. "
-                f"No watermarks, no logos, not photographic."
+                f"No watermarks, no logos, no text overlays, not photographic."
             )
 
         if image_type == 'brand_illustration':
