@@ -1275,11 +1275,10 @@ def pick_next_style(
     If the user has no selections yet, auto-assign the first style for their industry.
     """
     if not style_selections:
-        industry_styles = get_styles_for_industry(industry)
-        # CRITICAL FIX: Default to lifestyle_natural (no text) instead of bold_loud (massive text)
-        # bold_loud has "Massive typography filling 60%+ of frame" which causes unwanted text overlays
-        # lifestyle_natural has "No heavy text overlay" - better default for users without brand profiles
-        slug = "lifestyle_natural" if not industry_styles else industry_styles[0]
+        # Default to trust_builder for all users without style selections —
+        # produces professional photography with branded text overlay, works
+        # well across all industries and is the highest-quality general default.
+        slug = "trust_builder"
         fragment = get_prompt_fragment(slug)
         return slug, fragment, 0
 
