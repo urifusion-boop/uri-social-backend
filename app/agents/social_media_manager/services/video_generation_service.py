@@ -224,7 +224,9 @@ class VideoGenerationService:
             submit_data = submit.json()
             request_id = submit_data["request_id"]
             status_url = submit_data.get("status_url") or f"https://queue.fal.run/{model}/requests/{request_id}/status"
-            result_url = submit_data.get("response_url") or f"https://queue.fal.run/{model}/requests/{request_id}/response"
+            # response_url from fal is the bare request URL; result lives at /response
+            _response_base = submit_data.get("response_url") or f"https://queue.fal.run/{model}/requests/{request_id}"
+            result_url = _response_base if _response_base.endswith("/response") else _response_base + "/response"
 
         # Poll every 10 s, max 10 minutes
         for _ in range(60):
