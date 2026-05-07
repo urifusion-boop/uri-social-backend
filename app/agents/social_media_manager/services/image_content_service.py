@@ -258,10 +258,13 @@ class ImageContentService:
         feedback: Optional[str] = None,
         image_type: str = "post_image",
         image_model: Optional[str] = None,
+        slide_index: Optional[int] = None,
+        total_slides: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Generate an AI image optimized for a specific platform.
         image_type: "post_image" (default), "story" (9:16), or any key in IMAGE_SPECS[platform].
+        For carousel slides: slide_index and total_slides provide context for slide numbering.
         """
         try:
             image_model = "openai/gpt-image-2"
@@ -342,7 +345,21 @@ Every element in the image must come from the instructions below. Nothing else."
             else:
                 brand_name_directive = 'Do NOT display the brand name or logo anywhere. Brand identity is expressed through colours and visual treatment only.'
 
-            professional_rules = f"""=== PROFESSIONAL OUTPUT RULES ===
+            # Add slide number context for carousel slides
+            slide_context = ""
+            if slide_index is not None and total_slides is not None:
+                slide_num = slide_index + 1  # Convert 0-indexed to 1-indexed
+                slide_context = f"""
+=== CAROUSEL SLIDE CONTEXT ===
+This is slide {slide_num} of {total_slides} in a carousel post.
+- Add a small, subtle slide indicator "({slide_num}/{total_slides})" in the bottom-right corner
+- Use very small text (20-25% of CTA text size), light grey or semi-transparent white
+- Position it within safe margins, not overlapping other elements
+- The slide indicator helps users track their progress through the carousel
+- Maintain consistent visual style across all {total_slides} slides (same colors, fonts, layout approach)
+"""
+
+            professional_rules = f"""{slide_context}=== PROFESSIONAL OUTPUT RULES ===
 Follow these rules precisely for every image. No exceptions.
 
 1. BRAND NAME: {brand_name_directive}
