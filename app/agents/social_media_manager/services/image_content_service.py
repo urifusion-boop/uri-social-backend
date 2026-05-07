@@ -45,7 +45,207 @@ class ImageContentService:
             "profile_image": {"width": 320, "height": 320, "format": "square"}
         }
     }
-    
+
+    @staticmethod
+    async def check_reference_image_quality(image_url: str) -> Dict[str, Any]:
+        """
+        Quality gate for reference images (PRD Section 3: Quality Gate).
+        Checks resolution, blur, and exposure before processing.
+
+        Returns:
+            {
+                "passed": bool,
+                "message": str (only if failed),
+                "width": int,
+                "height": int
+            }
+        """
+        try:
+            import io
+            import requests
+            from PIL import Image
+            import numpy as np
+
+            # Fetch the image
+            response = requests.get(image_url, timeout=10)
+            response.raise_for_status()
+            img = Image.open(io.BytesIO(response.content))
+
+            width, height = img.size
+
+            # Check 1: Minimum resolution (500x500)
+            if width < 500 or height < 500:
+                return {
+                    "passed": False,
+                    "message": "This photo is a bit small. Can you send a higher quality version? It'll make your product look much better.",
+                    "width": width,
+                    "height": height
+                }
+
+            # Check 2: Blur detection using Laplacian variance
+            # Convert to grayscale and check sharpness
+            gray = img.convert('L')
+            np_img = np.array(gray)
+
+            # Calculate Laplacian variance (measure of sharpness)
+            from scipy import ndimage
+            laplacian = ndimage.laplace(np_img)
+            variance = laplacian.var()
+
+            # Threshold for blur detection (empirically determined)
+            if variance < 100:
+                return {
+                    "passed": False,
+                    "message": "This photo is a bit blurry. A clearer shot will give you a much better result.",
+                    "width": width,
+                    "height": height
+                }
+
+            # Check 3: Exposure check (too dark or too bright)
+            # Calculate mean brightness
+            brightness = np.array(gray).mean()
+
+            if brightness < 40:
+                return {
+                    "passed": False,
+                    "message": "The lighting on this photo is a bit dark. Can you retake in better lighting, or want me to work with it?",
+                    "width": width,
+                    "height": height
+                }
+            elif brightness > 220:
+                return {
+                    "passed": False,
+                    "message": "The lighting on this photo is a bit bright. Can you retake in better lighting, or want me to work with it?",
+                    "width": width,
+                    "height": height
+                }
+
+            # All checks passed
+            return {
+                "passed": True,
+                "width": width,
+                "height": height
+            }
+
+        except Exception as e:
+            # If quality check fails, allow the image to proceed
+            # (don't block generation due to quality check errors)
+            print(f"⚠️ Quality check error: {str(e)}")
+            return {
+                "passed": True,
+                "width": 0,
+                "height": 0
+            }
+
+    @staticmethod
+    async def detect_product_category(image_url: str) -> Dict[str, Any]:
+        """
+        Product detection using GPT-4o-mini vision (PRD Section 3: Product Detection).
+        Identifies product category and suggests styling elements.
+
+        Returns:
+            {
+                "category": str,  # e.g., "perfume", "skincare", "food"
+                "subcategory": str,  # e.g., "oriental", "moisturizer", "beverage"
+                "suggested_props": str,  # e.g., "amber resin, cinnamon sticks"
+                "suggested_surface": str,  # e.g., "dark wood or ornate metal tray"
+                "suggested_mood": str,  # e.g., "warm, smoky, luxurious"
+                "color_notes": str  # e.g., "bottle is dark amber glass with gold cap"
+            }
+        """
+        try:
+            from app.services.AIService import client as openai_client
+
+            prompt = """What product is in this image? Return JSON with these fields:
+{
+  "category": "product category (perfume/skincare/food/fashion/electronics/jewellery/other)",
+  "subcategory": "more specific type",
+  "suggested_props": "2-4 styling props that would complement this product in a photo shoot",
+  "suggested_surface": "ideal surface for product photography",
+  "suggested_mood": "3-4 adjectives describing the mood",
+  "color_notes": "describe the product's colors and materials"
+}"""
+
+            response = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: openai_client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": image_url}},
+                            {"type": "text", "text": prompt}
+                        ]
+                    }],
+                    max_tokens=200,
+                    temperature=0.3
+                )
+            )
+
+            import json
+            result = json.loads(response.choices[0].message.content.strip())
+
+            print(f"🔍 Product detection: {result.get('category')} - {result.get('subcategory')}")
+
+            return result
+
+        except Exception as e:
+            print(f"⚠️ Product detection error: {str(e)}")
+            # Return generic fallback
+            return {
+                "category": "product",
+                "subcategory": "general",
+                "suggested_props": "complementary items",
+                "suggested_surface": "clean neutral surface",
+                "suggested_mood": "professional, clean, minimal",
+                "color_notes": "brand colors"
+            }
+
+    @staticmethod
+    async def remove_background(image_url: str) -> Optional[str]:
+        """
+        Background removal (PRD Section 3: Step 4 - Background Removal).
+        Extracts the product as a clean cutout on transparent background.
+
+        NOTE: This uses GPT-Image-2 edit mode ONLY for background removal,
+        NOT for the final graphic generation.
+
+        Returns:
+            URL of the product cutout with transparent background, or None if failed
+        """
+        try:
+            from app.services.AIService import client as openai_client
+            import requests
+            import io
+
+            # Download the image
+            response = requests.get(image_url, timeout=10)
+            response.raise_for_status()
+            image_bytes = io.BytesIO(response.content)
+
+            # Use GPT-Image-2 edit mode for background removal ONLY
+            result = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: openai_client.images.edit(
+                    model="dall-e-2",  # edit mode only available in dall-e-2
+                    image=image_bytes,
+                    prompt="Remove the background completely. Keep only the product on a transparent background. Do not modify the product in any way — preserve exact colours, details, and proportions.",
+                    n=1,
+                    size="1024x1024"
+                )
+            )
+
+            cutout_url = result.data[0].url
+            print(f"✂️ Background removed: {cutout_url}")
+
+            return cutout_url
+
+        except Exception as e:
+            print(f"⚠️ Background removal error: {str(e)}")
+            # If background removal fails, return original image
+            # The generation will still work, just without clean cutout
+            return image_url
+
     @staticmethod
     async def generate_content_with_images(
         user_id: str,
@@ -267,10 +467,9 @@ class ImageContentService:
         For carousel slides: slide_index and total_slides provide context for slide numbering.
         """
         try:
-            # gpt-image-2 does not support the edit endpoint, so when a reference image
-            # is provided we leave image_model unset — _call_dalle_api will use the
-            # gpt-image-1 edit path which preserves the reference image faithfully.
-            image_model = "openai/gpt-image-2" if not reference_image else None
+            # ALWAYS use GPT-Image-2 generation mode for final graphics (PRD Section 8)
+            # Background removal uses edit mode, but final generation uses generation mode
+            image_model = "openai/gpt-image-2"
 
             specs = ImageContentService._get_platform_image_specs(platform, image_type=image_type)
 
@@ -491,19 +690,31 @@ Follow these rules precisely for every image. No exceptions.
             if not image_prompt:
                 image_prompt = seed_content.strip()
 
-            # When a reference image is provided, replace the generic no-crop directive
-            # with instructions that preserve the photo and only add text overlays.
+            # When a reference image is provided, use two-zone product composition (PRD Section 5)
+            # The product is sacred - never modify it. Everything around it is AI-generated.
             if reference_image:
                 image_prompt = (
                     image_prompt.rstrip()
-                    + "\n\n=== PHOTO PRESERVATION RULES ===\n"
-                    "The provided image is the user's own photo — preserve it EXACTLY. "
-                    "Do NOT alter, crop, recolour, or reimagine the photo in any way. "
-                    "Your ONLY task is to add professional branded text overlays on top of it. "
-                    "Keep the photo as the dominant visual (at least 65% of the image). "
-                    "Add a subtle semi-transparent dark panel (rgba(0,0,0,0.5)) behind text only for readability. "
-                    "Text must be crisp, bold, and positioned in the upper or left portion of the image. "
-                    "The result must look like a professional social media graphic created by a designer."
+                    + "\n\n=== TWO-ZONE PRODUCT COMPOSITION ===\n"
+                    "Create a professional social media product graphic with TWO distinct zones:\n\n"
+                    "PRODUCT ZONE (55% of frame, positioned left or right):\n"
+                    "- The product from the reference image, placed slightly off-center\n"
+                    "- The product must appear EXACTLY as it looks in the reference photo\n"
+                    "- Same shape, same colours, same label, same proportions\n"
+                    "- Professional background, surface, and optional styling props AROUND the product\n"
+                    "- Background can be: solid colour, gradient, textured surface, or styled scene\n\n"
+                    "TEXT ZONE (45% of frame, opposite side of product):\n"
+                    "- Clean background (solid colour, gradient, or subtle texture)\n"
+                    "- All text placed in this zone: headline, subtext, CTA\n"
+                    "- Text must be in the NEGATIVE SPACE beside the product\n"
+                    "- NO text overlapping or on top of the product\n"
+                    "- 20px minimum gap between any text and the product\n\n"
+                    "CRITICAL RULES:\n"
+                    "- The product itself is SACRED - never distort, never regenerate, never modify\n"
+                    "- Everything AROUND the product is AI-generated professional styling\n"
+                    "- Text lives BESIDE the product in negative space, never on top of it\n"
+                    "- The two zones must not overlap\n"
+                    "- Product label/branding on the actual product must be clearly visible"
                 )
 
             # ========== IMAGE GENERATION DEBUG (PRD Section 2) ==========
