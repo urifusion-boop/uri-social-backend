@@ -758,6 +758,15 @@ class WhatsAppFlowService:
                 ctx = {**ctx, "product_image_url": product_image_url}
                 await _safe_set_state(phone, state, ctx, db)
 
+            # If text also says "design" / "graphic" / "poster" etc — jump straight to generation
+            _GRAPHIC_TRIGGER_WORDS = (
+                "design", "graphic", "poster", "image", "visual", "ad", "banner",
+                "new design", "make a", "create a", "generate",
+            )
+            if text and any(w in text for w in _GRAPHIC_TRIGGER_WORDS):
+                await WhatsAppFlowService._generate_graphic(phone, user_id, ctx, db)
+                return
+
             # Image with no accompanying text → ask what to create
             if not text:
                 await _send(
@@ -1257,6 +1266,15 @@ class WhatsAppFlowService:
         if text in _BACK_WORDS or text == "cancel":
             await _send(phone, _format_content(ctx))
             await _safe_set_state(phone, "showing_content", ctx, db)
+            return
+
+        # "new design" / "make a graphic" / "generate graphic from this" — jump into graphic generation
+        _GRAPHIC_TRIGGER = (
+            "graphic", "design", "image", "poster", "visual", "picture",
+            "new design", "make graphic", "generate graphic", "create graphic",
+        )
+        if any(w in text for w in _GRAPHIC_TRIGGER):
+            await WhatsAppFlowService._generate_graphic(phone, user_id, ctx, db)
             return
 
         # Anything else — remind them what they need to confirm
