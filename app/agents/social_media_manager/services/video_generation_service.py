@@ -181,6 +181,9 @@ class VideoGenerationService:
 
     @staticmethod
     async def _generate_scene_fal(scene: dict, model: str) -> str:
+        import os
+        import fal_client
+
         frame_image_url = scene.get("frame_image_url")
         if not frame_image_url:
             raise ValueError(f"{model} requires a storyboard frame image — generate the storyboard frames first")
@@ -190,7 +193,7 @@ class VideoGenerationService:
 
         if "kling" in model:
             duration = str(max(3, min(15, duration_req)))
-            payload: Dict[str, Any] = {
+            arguments: Dict[str, Any] = {
                 "start_image_url": frame_image_url,
                 "prompt": prompt,
                 "duration": duration,
@@ -199,7 +202,7 @@ class VideoGenerationService:
             print(f"[VideoGen] Scene {scene.get('scene_number')}: Kling 3.0 Pro, {duration}s")
         else:  # seedance
             duration = str(max(4, min(15, duration_req)))
-            payload = {
+            arguments = {
                 "image_url": frame_image_url,
                 "prompt": prompt,
                 "duration": duration,
@@ -209,46 +212,13 @@ class VideoGenerationService:
             }
             print(f"[VideoGen] Scene {scene.get('scene_number')}: Seedance 2.0, {duration}s")
 
+        # fal_client reads FAL_KEY; map our FAL_API_KEY if needed
         fal_key = settings.FAL_API_KEY
-        auth_headers = {"Authorization": f"Key {fal_key}"}
-        post_headers = {**auth_headers, "Content-Type": "application/json"}
+        if fal_key:
+            os.environ["FAL_KEY"] = fal_key
 
-        # fal.ai queue API wraps input in {"input": {...}}
-        async with httpx.AsyncClient(timeout=30) as client:
-            submit = await client.post(
-                f"https://queue.fal.run/{model}",
-                json={"input": payload},
-                headers=post_headers,
-            )
-            submit.raise_for_status()
-            submit_data = submit.json()
-            request_id = submit_data["request_id"]
-            status_url = submit_data.get("status_url") or f"https://queue.fal.run/{model}/requests/{request_id}/status"
-            # response_url from fal is the bare request URL; result lives at /response
-            _response_base = submit_data.get("response_url") or f"https://queue.fal.run/{model}/requests/{request_id}"
-            result_url = _response_base if _response_base.endswith("/response") else _response_base + "/response"
-
-        # Poll every 10 s, max 10 minutes
-        for _ in range(60):
-            await asyncio.sleep(10)
-            async with httpx.AsyncClient(timeout=30) as client:
-                status_resp = await client.get(status_url, headers=auth_headers)
-                status_resp.raise_for_status()
-                status = status_resp.json().get("status")
-
-            if status == "COMPLETED":
-                break
-            if status == "FAILED":
-                raise RuntimeError(f"fal.ai job failed (model={model}, request={request_id})")
-        else:
-            raise TimeoutError(f"fal.ai {model} timed out after 10 minutes")
-
-        # Fetch result
-        async with httpx.AsyncClient(timeout=30) as client:
-            result_resp = await client.get(result_url, headers=auth_headers)
-            result_resp.raise_for_status()
-            result_data = result_resp.json()
-            video_url = (result_data.get("data") or result_data)["video"]["url"]
+        result = await fal_client.subscribe_async(model, arguments)
+        video_url = result["video"]["url"]
 
         # Download and store in Cloudinary
         async with httpx.AsyncClient(timeout=120) as client:
