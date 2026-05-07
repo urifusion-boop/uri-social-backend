@@ -3,6 +3,7 @@ import base64
 import json
 import re
 import uuid
+from io import BytesIO
 from typing import Any, Dict, List, Optional
 
 from app.database import get_db
@@ -52,9 +53,28 @@ def _frame_jobs_collection():
 class VideoStoryboardService:
 
     @staticmethod
-    async def _generate_scene_frame(scene: dict) -> Optional[str]:
-        """Generate a storyboard frame image for one scene via gpt-image-2 and upload to Cloudinary."""
+    def _decode_brand_image(img_data: str) -> bytes:
+        """Extract raw bytes from a base64 data URL or plain base64 string."""
+        if img_data.startswith("data:"):
+            _, encoded = img_data.split(",", 1)
+        else:
+            encoded = img_data
+        return base64.b64decode(encoded)
+
+    @staticmethod
+    async def _generate_scene_frame(scene: dict, brand_images: List[str]) -> Optional[str]:
+        """
+        Edit the reference brand image for this scene using gpt-image-2 so the frame
+        is faithfully grounded in the real brand visual rather than hallucinated.
+        """
         try:
+            ref_idx = scene.get("reference_image_index", 0)
+            if not brand_images:
+                return None
+
+            ref_idx = max(0, min(ref_idx, len(brand_images) - 1))
+            img_bytes = VideoStoryboardService._decode_brand_image(brand_images[ref_idx])
+
             shot = scene.get("shot_type", "").replace("_", " ")
             video_prompt = scene.get("video_prompt", "")
             motion = scene.get("motion", "")
@@ -65,25 +85,28 @@ class VideoStoryboardService:
                 f"{video_prompt} "
                 f"Camera movement: {motion}. "
                 + (f'On-screen text: "{text}". ' if text else "")
-                + "Photorealistic, high-end brand photography, dramatic lighting. "
-                "Vertical 9:16 composition."
+                + "Keep the brand product, colors, and visual identity exactly as shown. "
+                "Photorealistic, dramatic lighting. Vertical 9:16 composition."
             )
+
+            img_file = BytesIO(img_bytes)
+            img_file.name = "reference.png"
 
             loop = asyncio.get_running_loop()
             resp = await loop.run_in_executor(
                 None,
-                lambda: openai_client.images.generate(
+                lambda: openai_client.images.edit(
+                    image=img_file,
                     model="gpt-image-2",
                     prompt=prompt,
                     n=1,
                     size="1024x1536",
                     quality="medium",
-                    output_format="webp",
                 ),
             )
-            img_bytes = base64.b64decode(resp.data[0].b64_json)
+            out_bytes = base64.b64decode(resp.data[0].b64_json)
             url = await upload_bytes(
-                img_bytes,
+                out_bytes,
                 folder="uri-social/storyboard-frames",
                 resource_type="image",
             )
@@ -104,11 +127,12 @@ class VideoStoryboardService:
         return job_id
 
     @staticmethod
-    async def run_frame_job(job_id: str, scenes: list) -> None:
+    async def run_frame_job(job_id: str, scenes: list, brand_images: List[str] = None) -> None:
         """Background task: generate one frame image per scene, store progressively."""
         col = _frame_jobs_collection()
+        brand_images = brand_images or []
         for scene in scenes:
-            url = await VideoStoryboardService._generate_scene_frame(scene)
+            url = await VideoStoryboardService._generate_scene_frame(scene, brand_images)
             if url:
                 await col.update_one(
                     {"job_id": job_id},
