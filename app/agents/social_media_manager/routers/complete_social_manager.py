@@ -119,6 +119,7 @@ class StoryboardRequest(BaseModel):
 
 class StoryboardFramesRequest(BaseModel):
     scenes: List[Dict[str, Any]]
+    brand_images: List[str] = Field(default_factory=list, max_items=5)
 
 class VideoFromStoryboardRequest(BaseModel):
     storyboard: Dict[str, Any]
@@ -3321,7 +3322,7 @@ async def generate_storyboard_frames(
     _get_user_id(token)  # auth check
 
     job_id = await VideoStoryboardService.create_frame_job(request.scenes)
-    background_tasks.add_task(VideoStoryboardService.run_frame_job, job_id, request.scenes)
+    background_tasks.add_task(VideoStoryboardService.run_frame_job, job_id, request.scenes, request.brand_images)
 
     return UriResponse.get_single_data_response(
         "frame_job",
