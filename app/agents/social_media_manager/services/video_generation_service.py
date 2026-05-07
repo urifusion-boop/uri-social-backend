@@ -217,7 +217,17 @@ class VideoGenerationService:
         if fal_key:
             os.environ["FAL_KEY"] = fal_key
 
-        result = await fal_client.subscribe_async(model, arguments)
+        try:
+            result = await fal_client.subscribe_async(model, arguments)
+        except Exception as e:
+            err_str = str(e)
+            if "content_policy_violation" in err_str or "sensitive content" in err_str.lower():
+                print(f"[VideoGen] Scene {scene.get('scene_number')}: audio flagged, retrying without audio")
+                arguments = {**arguments, "generate_audio": False}
+                result = await fal_client.subscribe_async(model, arguments)
+            else:
+                raise
+
         video_url = result["video"]["url"]
 
         # Download and store in Cloudinary
