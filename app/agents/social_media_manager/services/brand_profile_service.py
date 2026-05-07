@@ -54,6 +54,26 @@ class BrandProfileService:
             "languages": data.get("languages", []),
             "region": data.get("region", ""),
             "onboarding_completed": data.get("onboarding_completed", False),
+            # Caption Voice System fields (PRD Section 3.1)
+            "voice_profile": {
+                "formality": data.get("voice_profile", {}).get("formality", "casual"),
+                "sentence_style": data.get("voice_profile", {}).get("sentence_style", "mixed_rhythm"),
+                "emoji_usage": data.get("voice_profile", {}).get("emoji_usage", "light"),
+                "emoji_placement": data.get("voice_profile", {}).get("emoji_placement", "end_of_lines"),
+                "slang_level": data.get("voice_profile", {}).get("slang_level", "pure_english"),
+                "cta_style": data.get("voice_profile", {}).get("cta_style", "direct"),
+                "caption_length": data.get("voice_profile", {}).get("caption_length", "short"),
+                "hook_style": data.get("voice_profile", {}).get("hook_style", "bold_statement"),
+                "hashtag_style": data.get("voice_profile", {}).get("hashtag_style", "minimal"),
+                "hashtag_placement": data.get("voice_profile", {}).get("hashtag_placement", "end"),
+                "humor_level": data.get("voice_profile", {}).get("humor_level", "none"),
+                "nigerian_expressions": data.get("voice_profile", {}).get("nigerian_expressions", []),
+                "banned_words": data.get("voice_profile", {}).get("banned_words", []),
+                "sample_captions": data.get("voice_profile", {}).get("sample_captions", []),
+                "platform_overrides": data.get("voice_profile", {}).get("platform_overrides", {}),
+            },
+            # Voice sample analysis (PRD Section 6.1)
+            "voice_sample_analysis": data.get("voice_sample_analysis", {}),
             "updated_at": now,
         }
         if "style_selections" in data:
@@ -189,4 +209,7 @@ class BrandProfileService:
             "style_rotation_index": int(profile.get("style_rotation_index") or 0),
             "font_style":           profile.get("font_style", ""),
             "font_style_prompt":    profile.get("font_style_prompt", ""),
+            # Caption Voice System fields
+            "voice_profile":        profile.get("voice_profile") or {},
+            "voice_sample_analysis": profile.get("voice_sample_analysis") or {},
         }

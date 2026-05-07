@@ -24,6 +24,7 @@ from ..services.auto_content_service import AutoContentService
 from ..services.brand_profile_service import BrandProfileService
 from ..services.outstand_service import OutstandService
 from ..services import content_calendar_service as cal_svc
+from ..services.voice_sample_analyzer_service import VoiceSampleAnalyzerService
 
 router = APIRouter(tags=["Social Media Manager"])
 
@@ -2979,6 +2980,86 @@ async def save_brand_profile(
         return await BrandProfileService.save(user_id, payload, db)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/brand-profile/analyze-voice-samples")
+async def analyze_voice_samples(
+    request: Dict[str, Any],
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Analyze sample captions to extract voice patterns.
+
+    Caption Voice System (PRD Section 6) - Voice Sample Analysis
+
+    Request body:
+    {
+        "sample_captions": ["caption 1", "caption 2", "caption 3"],
+        "merge_with_profile": true  // optional, default true
+    }
+
+    Returns the analysis and optionally updates the user's brand profile
+    with merged voice settings.
+    """
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    try:
+        sample_captions = request.get("sample_captions", [])
+        merge_with_profile = request.get("merge_with_profile", True)
+
+        if not sample_captions or len(sample_captions) == 0:
+            raise HTTPException(status_code=400, detail="sample_captions is required and must not be empty")
+
+        if len(sample_captions) > 5:
+            raise HTTPException(status_code=400, detail="Maximum 5 sample captions allowed")
+
+        # Analyze the samples
+        analysis = await VoiceSampleAnalyzerService.analyze_voice_samples(sample_captions)
+
+        # If merge_with_profile is true, update the brand profile
+        if merge_with_profile:
+            # Get current profile
+            profile_result = await BrandProfileService.get(user_id, db)
+            if profile_result.get("status"):
+                profile_data = profile_result.get("responseData") or {}
+                current_voice_profile = profile_data.get("voice_profile") or {}
+
+                # Merge analysis with current profile
+                updated_voice_profile = VoiceSampleAnalyzerService.merge_analysis_with_profile(
+                    current_voice_profile,
+                    analysis
+                )
+
+                # Save updated profile
+                await BrandProfileService.save(
+                    user_id,
+                    {
+                        "voice_profile": updated_voice_profile,
+                        "voice_sample_analysis": analysis,
+                    },
+                    db
+                )
+
+                return UriResponse.get_single_data_response("voice_analysis", {
+                    "analysis": analysis,
+                    "updated_voice_profile": updated_voice_profile,
+                    "merged": True,
+                })
+
+        # Return analysis only
+        return UriResponse.get_single_data_response("voice_analysis", {
+            "analysis": analysis,
+            "merged": False,
+        })
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error analyzing voice samples: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to analyze voice samples: {str(e)}")
 
 
 # ==============================================================================
