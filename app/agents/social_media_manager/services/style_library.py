@@ -1093,6 +1093,272 @@ STYLES: Dict[str, Dict[str, Any]] = {
             "gradient or solid colour. The energy is 'we're growing fast and we want great people.' Startup hiring aesthetic meets LinkedIn job post."
         ),
     },
+
+    # ── Perfume & Fragrance (2026 Visual Style Guide) ────────────────────────
+
+    "perf_editorial_ingredient": {
+        "name": "Editorial Ingredient",
+        "description": "Clean, premium, ingredient-forward. For hero shots and launches.",
+        "industry_tags": ["perfume_fragrance"],
+        "prompt_fragment": (
+            "Create a premium minimalist product poster. Vertical 4:5 format, ultra-realistic product photography. "
+            "Main composition: the perfume bottle is placed slightly off-center (left or right), standing upright on the surface. "
+            "The product label and brand name on the bottle must be clearly visible and readable. The bottle is the hero element occupying 40-50% of the frame. "
+            "Foreground styling: surround the bottle with raw fragrance ingredients that reflect its scent notes. "
+            "Arrange them in a clean, intentional, editorial style — not cluttered. Examples: rose petals scattered, vanilla pods, citrus slices, coffee beans, "
+            "sandalwood pieces, oud chips, lavender sprigs. Each ingredient should be identifiable and beautifully lit. "
+            "Surface: natural premium surface — marble slab, raw stone, light wood tray, or linen cloth. The surface grounds the product and adds tactile texture. "
+            "Background: clean minimal background with generous negative space on one side for text placement. Neutral tone: warm cream, soft grey, or brand-complementary colour. "
+            "No distracting patterns. Lighting: soft diffused studio lighting. Natural highlights on the glass bottle showing transparency and liquid colour. "
+            "Gentle shadows beneath the bottle and ingredients. Clean commercial fragrance aesthetic. "
+            "Typography layout (placed in the negative space, not over the product): large headline text in elegant serif or thin sans-serif font, smaller subtext below, "
+            "CTA line at the bottom with arrow. Colour palette: neutral base (cream/grey/stone) with accent colours drawn from the ingredients and the liquid colour inside the bottle. "
+            "Mood: fresh, premium, editorial, clean, brand-focused. Quality: 4K, ultra-detailed, sharp focus on product, soft background, commercial-ready."
+        ),
+    },
+
+    "perf_noir_luxe": {
+        "name": "Noir Luxe",
+        "description": "Dark, seductive, mysterious. For evening fragrances.",
+        "industry_tags": ["perfume_fragrance"],
+        "prompt_fragment": (
+            "Ultra-luxurious dark fragrance photography. Near-black background (#0A0A0A) with dramatic chiaroscuro lighting. "
+            "Single strong directional light source from the upper left, creating deep shadows and brilliant highlights on the glass bottle surface. "
+            "The perfume bottle is centered or slightly left, standing on a reflective black surface that creates a mirror reflection beneath it. "
+            "The glass catches light like jewellery — sharp reflections, visible liquid inside with a warm amber or deep ruby tone. "
+            "Brand name on the bottle is illuminated by the directional light and clearly legible. "
+            "Atmosphere: wisps of dark smoke or mist curling behind and around the bottle at low opacity. The smoke adds mystery without obscuring the product. "
+            "Optional: a few dark rose petals, black orchid, or gold leaf flakes scattered on the reflective surface. "
+            "No bright colours. The entire palette is: black, deep gold, warm amber, and one accent from the fragrance notes (burgundy for oud, deep purple for iris, warm bronze for vanilla). "
+            "The bottle is the only illuminated element — everything else falls into shadow. Typography: thin elegant serif font in gold or warm white. "
+            "Positioned in the dark negative space. Minimal text — the fragrance name and one evocative word or phrase. No busy layouts. "
+            "Mood: seductive, mysterious, nocturnal, exclusive, high-end. The viewer should feel like they're looking at a fragrance that costs more than they think. "
+            "Quality: 4K, cinematic lighting, editorial perfumery photography, luxury magazine advertisement quality."
+        ),
+    },
+
+    "perf_golden_hour_romance": {
+        "name": "Golden Hour Romance",
+        "description": "Warm, romantic, dreamy. Golden light and soft petals.",
+        "industry_tags": ["perfume_fragrance"],
+        "prompt_fragment": (
+            "Romantic fragrance photography bathed in golden hour sunlight. Warm amber and honey-toned colour grading throughout the entire image. "
+            "The light comes from behind and to the side of the bottle, creating a warm backlit glow through the glass and illuminating the liquid inside. "
+            "The perfume bottle sits on a soft surface — rumpled silk fabric in blush pink, champagne gold, or ivory. "
+            "Scattered around the bottle: fresh flower petals (rose, peony, or jasmine) in soft focus, some catching the golden light. A few petals appear to be floating or just fallen. "
+            "Background: soft, warm, out-of-focus bokeh in golden tones. Could suggest a sunset garden, a bedroom window at golden hour, or a sunlit vanity. "
+            "The background is never sharp — always dreamy and blurred. The bottle is the only element in sharp focus. "
+            "The bottle's glass catches and refracts the warm light, creating small rainbow prisms on the silk surface. The liquid inside glows amber or rose-gold. "
+            "Typography: elegant script or thin serif font in warm white or soft gold. Positioned in the upper portion of the image or to the side. Romantic, not corporate. "
+            "No cool tones. No blue. No harsh lighting. Everything is warm, soft, and glowing. "
+            "Mood: romantic, intimate, feminine, golden, dreamy. The viewer should feel warmth and desire. "
+            "Quality: 4K, shallow depth of field, cinematic golden hour lighting, luxury perfume editorial."
+        ),
+    },
+
+    "perf_wet_glass_drama": {
+        "name": "Wet Glass Drama",
+        "description": "Fresh, clean, water-inspired. Droplets and cool tones.",
+        "industry_tags": ["perfume_fragrance"],
+        "prompt_fragment": (
+            "Fresh aquatic fragrance photography. The perfume bottle is covered in realistic water droplets — beaded condensation on the glass surface "
+            "as if it was just pulled from cold water. Each droplet catches light individually, creating micro-reflections. "
+            "The bottle stands on a wet surface — either a shallow pool of water (1-2mm deep) creating perfect reflections, or a wet stone/marble slab with visible water sheen. "
+            "Small water splashes frozen in mid-air around the base of the bottle add dynamic energy. "
+            "Background: gradient from cool aqua blue at the top to near-white at the bottom. Clean, fresh, minimal. "
+            "Optional: a single green leaf or citrus slice partially submerged in the water at the base, suggesting freshness. "
+            "Lighting: bright, clean, high-key with a slight cool tone. Strong specular highlights on the water droplets and the wet glass surface. "
+            "The bottle is brilliantly lit — the liquid inside is visible and appears fresh, possibly light blue, green, or crystal clear. "
+            "Colour palette: cool blues, aqua, silver, white, crystal clear. One warm accent only if the fragrance has a warm note (bergamot gold, grapefruit pink). "
+            "Typography: clean modern sans-serif in white or silver. Crisp, precise, minimal. Positioned in the clean upper portion of the image. "
+            "Mood: fresh, clean, invigorating, aquatic, crisp, modern. Like the first breath of cold air. "
+            "Quality: 4K, ultra-sharp focus on water droplets, macro-photography detail on the glass surface."
+        ),
+    },
+
+    "perf_smoke_amber": {
+        "name": "Smoke & Amber",
+        "description": "Smoky, warm, oriental. Incense and richness.",
+        "industry_tags": ["perfume_fragrance"],
+        "prompt_fragment": (
+            "Warm smoky fragrance photography inspired by Arabian perfumery and oriental scent traditions. "
+            "The perfume bottle is placed on a dark wooden surface or ornate metal tray with Middle Eastern-inspired geometric patterns. "
+            "Visible incense smoke rising behind and around the bottle — thick enough to create atmosphere but not obscure the product. "
+            "The smoke catches warm side-lighting, creating golden-amber streaks through the air. The smoke is the key atmospheric element. "
+            "Surrounding the bottle: raw amber resin chunks, cinnamon sticks, star anise, dried dark roses, oud wood chips, and/or saffron threads. "
+            "Arranged intentionally, not scattered randomly. Each ingredient is a deliberate styling choice that tells the scent story. "
+            "Lighting: warm amber/golden directional light from one side. The opposite side falls into rich shadow. The glass bottle catches warm reflections. "
+            "The liquid inside appears deep amber, dark gold, or rich mahogany. "
+            "Background: deep charcoal or dark burgundy with subtle texture (could suggest dark fabric, aged leather, or ornate wall). Not pure black — there should be warmth even in the shadows. "
+            "Typography: gold serif or Arabic-inspired display font. Positioned in the darker areas. Minimal text. The atmosphere does the selling. "
+            "Colour palette: deep amber, warm gold, dark burgundy, charcoal, cinnamon brown. No cool tones. "
+            "Mood: warm, exotic, rich, ceremonial, ancient luxury. The viewer should almost smell the incense. "
+            "Quality: 4K, atmospheric lighting, visible smoke particles, luxury oriental perfumery aesthetic."
+        ),
+    },
+
+    "perf_botanical_garden": {
+        "name": "Botanical Garden",
+        "description": "Natural, green, organic. Garden-fresh and alive.",
+        "industry_tags": ["perfume_fragrance"],
+        "prompt_fragment": (
+            "Natural botanical fragrance photography. The perfume bottle is placed among fresh, living greenery — as if discovered in a garden. "
+            "Surrounding elements: fresh leaves (monstera, fern fronds, eucalyptus), small wildflowers, herb sprigs (rosemary, mint, thyme), moss, and small stones. "
+            "The arrangement feels organic and slightly wild — not a sterile studio flat-lay but a curated-natural composition. "
+            "Some leaves overlap the base of the bottle naturally. A sprig of herb might lean against the glass. "
+            "Surface: natural earth-toned surface — raw terracotta, weathered wood, natural stone, or actual garden soil with moss. Textured and organic. "
+            "Lighting: dappled natural sunlight, as if filtering through tree canopy. Warm but not hot — fresh morning light quality. "
+            "Soft leaf shadows falling across the surface and the bottle. The glass bottle catches green reflections from surrounding foliage. "
+            "Background: soft out-of-focus greenery (bokeh) suggesting a garden environment. Greens range from deep forest to bright lime, with occasional flower colour accents (white, pale purple, soft yellow). "
+            "Typography: clean sans-serif or gentle serif in dark green or earthy brown. Positioned in a naturally clear area of the composition. Organic feel. "
+            "Colour palette: greens (multiple shades), earth browns, cream, white flower accents. Natural and unprocessed. "
+            "Mood: fresh, natural, alive, botanical, organic, garden-morning. The viewer should feel outdoors. "
+            "Quality: 4K, natural daylight photography, sharp focus on bottle with soft bokeh background, editorial nature photography aesthetic."
+        ),
+    },
+
+    "perf_street_luxe": {
+        "name": "Street Luxe",
+        "description": "Urban, bold, youthful. Concrete and confidence.",
+        "industry_tags": ["perfume_fragrance"],
+        "prompt_fragment": (
+            "Urban street-style fragrance photography. The perfume bottle sits on raw concrete, asphalt, or a graffiti-tagged surface. "
+            "The environment is urban: think rooftop, parking garage, wet city street at night, or a brutalist concrete wall as background. "
+            "The bottle is shot at a low angle (looking slightly upward) giving it a heroic, dominant presence. It owns the space. "
+            "The brand label faces the camera directly and is fully legible. "
+            "Atmosphere: urban night or blue-hour lighting. Neon colour accents reflecting off the concrete and the glass bottle — electric blue, hot pink, or acid green "
+            "from nearby signage (implied, not directly visible). Rain-wet surfaces reflecting the neon glow. "
+            "No flowers. No silk. No softness. Props (if any) are urban: a chrome chain, a matte black lighter, a pair of dark sunglasses, or nothing at all — just the bottle against the city. "
+            "Typography: bold condensed sans-serif or block capitals. White or neon accent colour. Positioned with intentional grit — slight rotation, tight kerning, urban poster energy. "
+            "Not centred and polite — slightly aggressive and confident. "
+            "Colour palette: concrete grey, wet black, neon accent (one colour only), chrome/silver from the bottle cap. "
+            "Mood: confident, urban, young, unisex, nightlife, streetwear. The viewer should feel the city and the attitude. "
+            "Quality: 4K, cinematic urban photography, shallow depth of field, neon reflections on wet surfaces."
+        ),
+    },
+
+    "perf_crystal_minimal": {
+        "name": "Crystal Minimal",
+        "description": "Ultra-clean, transparent, modern. Nothing unnecessary.",
+        "industry_tags": ["perfume_fragrance"],
+        "prompt_fragment": (
+            "Ultra-minimalist fragrance photography on a pure white or very light grey background. "
+            "The perfume bottle is perfectly centred with extreme negative space on all sides — at least 40% of the image is empty space. "
+            "The bottle is the only element in the frame. No props. No ingredients. No styling. Just the bottle, the light, and the space. "
+            "The liquid inside the bottle is visible and its colour is the only colour accent in the entire image. "
+            "Lighting: perfectly even, soft, shadowless illumination. The bottle appears to float — either on an invisible white surface with no visible shadow, "
+            "or with only the faintest shadow directly beneath it. Studio infinity cove lighting quality. "
+            "Every detail of the bottle design is visible: the cap texture, the label typography, the glass thickness, the liquid level. "
+            "The bottle's transparency is the visual story. Light passes through the glass and liquid, creating subtle colour refractions on the white surface. "
+            "If the liquid is amber, there's a faint amber glow beneath. If it's clear, the refraction is prismatic. "
+            "Typography: extremely thin, light-weight sans-serif. Small. Precise. Positioned with mathematical precision in the negative space. "
+            "The text whispers — it doesn't shout. Maximum 10 words total. "
+            "Colour palette: white, off-white, and the single colour of the liquid inside the bottle. That's it. "
+            "Mood: clean, modern, precise, transparent, honest, Scandinavian-minimalist. The viewer should feel clarity and intention. "
+            "Quality: 4K, studio product photography, absolutely sharp focus, zero distraction, Glossier/Aesop/Byredo energy."
+        ),
+    },
+
+    "perf_velvet_night": {
+        "name": "Velvet Night",
+        "description": "Rich, textured, intimate. Fabric and depth.",
+        "industry_tags": ["perfume_fragrance"],
+        "prompt_fragment": (
+            "Intimate textured fragrance photography. The perfume bottle rests on crushed velvet fabric — deep burgundy, midnight blue, or forest green. "
+            "The velvet's texture is visible and tactile, with folds and light catching the nap of the fabric. "
+            "The bottle sits in a slight depression in the velvet, as if just placed there. Soft warm side-lighting creates rich shadows in the fabric folds "
+            "and warm highlights on the glass. The liquid inside the bottle glows with warm ambient light. "
+            "Surrounding elements (minimal): a single dark jewel-toned flower (dark red rose, deep purple iris, or black dahlia), a small piece of raw amber or a vanilla pod. "
+            "Maximum 2 props. The velvet and the bottle do most of the work. "
+            "Background: soft gradient from the velvet colour into deeper darkness. Intimate, close, like a private vanity or jewellery box. "
+            "Lighting: warm, intimate, slightly low-key. One soft light source from the side. The glass bottle's edges catch rim light, defining its silhouette against the dark background. "
+            "The velvet absorbs light beautifully, creating rich depth. "
+            "Typography: elegant serif with slight warmth. Gold, cream, or the accent colour of the velvet. Small, refined, positioned in the darker upper portion. "
+            "Colour palette: deep jewel tones (burgundy, navy, emerald), warm gold highlights, cream for text. Rich and saturated. "
+            "Mood: intimate, luxurious, tactile, close, evening, indulgent. The viewer should want to touch the velvet and the bottle. "
+            "Quality: 4K, close-up textured photography, visible fabric grain, warm intimate lighting, luxury editorial."
+        ),
+    },
+
+    "perf_citrus_burst": {
+        "name": "Citrus Burst",
+        "description": "Bright, energetic, explosive. Summer in a bottle.",
+        "industry_tags": ["perfume_fragrance"],
+        "prompt_fragment": (
+            "High-energy citrus fragrance photography. Bright, saturated, dynamic. The perfume bottle is surrounded by an explosion of fresh citrus: "
+            "lemon slices, orange wedges, lime halves, grapefruit segments, bergamot — arranged in a dynamic arc or scattered with intentional energy, as if just sliced and tossed. "
+            "Juice droplets and citrus spray visible in the air around the bottle, frozen mid-splash. Small water droplets on the citrus surfaces and the glass bottle. "
+            "The liquid inside the bottle is visible — bright yellow, golden, or pale green. "
+            "Surface: wet white marble or glossy white surface with citrus juice pooling slightly. Clean and bright. "
+            "Lighting: bright, high-key, slightly warm. Strong highlights on the wet surfaces and the citrus flesh. The colours are saturated and punchy — vivid yellows, bright oranges, electric greens. "
+            "The bottle gleams. Background: clean gradient from bright white to very pale citrus tone (lemon yellow or lime green at 5% opacity). Bright and airy. No darkness anywhere. "
+            "Typography: bold modern sans-serif in white, bright yellow, or vivid orange. Energetic positioning — can be slightly angled for dynamism. Fun but not childish. "
+            "Colour palette: vivid citrus colours (yellow, orange, lime green, grapefruit pink), bright white, glass transparency. "
+            "Mood: fresh, energetic, joyful, summer, daytime, alive. The viewer should feel refreshed and awake. "
+            "Quality: 4K, high-speed photography feel (frozen droplets), ultra-saturated colour, commercial beverage/fragrance hybrid energy."
+        ),
+    },
+
+    "perf_heritage_editorial": {
+        "name": "Heritage Editorial",
+        "description": "Classic, timeless, sophisticated. Old-world luxury.",
+        "industry_tags": ["perfume_fragrance"],
+        "prompt_fragment": (
+            "Classic editorial fragrance photography inspired by vintage luxury advertising. The perfume bottle sits on an antique surface: "
+            "aged mahogany desk, vintage leather-bound book, ornate silver tray, or an old marble mantelpiece. "
+            "The composition references old-world luxury: a vintage mirror reflecting the bottle, an antique clock or compass nearby, aged parchment paper, "
+            "a silk pocket square, or a single long-stemmed flower in a small crystal vase. Every prop feels like it belongs in a 1940s Parisian apartment. "
+            "Lighting: warm, painterly, Rembrandt-inspired. Dominant warm light from one side with the other falling into rich shadow. "
+            "The lighting feels old-world — like candlelight or soft lamp light, not modern studio. The glass bottle glows warmly. "
+            "Colour grading: warm sepia undertone across the entire image. Slightly desaturated but rich. Aged, golden, warm. The image could almost be a painting. "
+            "Typography: classic serif with small caps and generous letter-spacing. Gold, cream, or deep burgundy. Positioned with classical balance — centred or symmetrical. "
+            "Timeless, not trendy. Colour palette: aged gold, warm mahogany, cream, burgundy, antique silver. Warm and rich throughout. No cool or modern tones. "
+            "Mood: timeless, sophisticated, established, heritage, old-money luxury. The viewer should feel that this fragrance has existed for generations, even if it launched yesterday. "
+            "Quality: 4K, painterly lighting, art-directed still-life photography, Vogue editorial from the golden era."
+        ),
+    },
+
+    "perf_floating_surreal": {
+        "name": "Floating Surreal",
+        "description": "Artistic, dreamlike, gravity-defying. The scent visualised.",
+        "industry_tags": ["perfume_fragrance"],
+        "prompt_fragment": (
+            "Surrealist art-directed fragrance photography. The perfume bottle floats in mid-air — no visible surface, no support. It hovers in a dreamlike environment "
+            "where the fragrance notes are visualised as floating elements around it. "
+            "Surrounding the floating bottle: the scent notes materialised as physical objects suspended in zero gravity. Rose petals drifting upward. Vanilla pods tumbling slowly. "
+            "Wisps of golden smoke curling in impossible directions. Water droplets frozen mid-air. Spice particles catching light. Each element represents a fragrance note. "
+            "Background: soft gradient or atmospheric colour that represents the fragrance's mood. Warm amber gradient for oriental scents. Cool blue mist for fresh scents. "
+            "Deep purple nebula for evening scents. The background is the scent's emotional colour made visible. "
+            "Lighting: dramatic and directional. The bottle is the brightest element — lit as if from within or with a strong spotlight. "
+            "Floating ingredients are lit to varying degrees, some catching bright light, others in softer illumination. Light rays or god-rays optional for added drama. "
+            "The composition breaks physical rules intentionally. Nothing touches the ground. Shadows fall upward or in unexpected directions. The image feels like a dream or a moment frozen in time. "
+            "Typography: modern display font with character. Can be bold or delicate depending on the fragrance. Positioned floating within the composition, not anchored to top or bottom. "
+            "The text is part of the surreal scene. Colour palette: determined by the fragrance's emotional colour. Monochromatic with one or two accent colours from the floating ingredients. "
+            "Mood: dreamlike, artistic, surreal, otherworldly, conceptual. The viewer should feel transported. This is perfume as art, not commerce. "
+            "Quality: 4K, CGI-quality photography, gravity-defying composition, high-fashion editorial, avant-garde commercial."
+        ),
+    },
+
+    "perf_floating_surreal_2": {
+        "name": "Floating Surreal",
+        "description": "Artistic, dreamlike, gravity-defying. The scent visualised.",
+        "industry_tags": ["perfume_fragrance"],
+        "prompt_fragment": (
+            "Surrealist art-directed fragrance photography. The perfume bottle floats in mid-air — no visible surface, no support. It hovers in a dreamlike environment "
+            "where the fragrance notes are visualised as floating elements around it. "
+            "Surrounding the floating bottle: the scent notes materialised as physical objects suspended in zero gravity. Rose petals drifting upward. Vanilla pods tumbling slowly. "
+            "Wisps of golden smoke curling in impossible directions. Water droplets frozen mid-air. Spice particles catching light. Each element represents a fragrance note. "
+            "Background: soft gradient or atmospheric colour that represents the fragrance's mood. Warm amber gradient for oriental scents. Cool blue mist for fresh scents. "
+            "Deep purple nebula for evening scents. The background is the scent's emotional colour made visible. "
+            "Lighting: dramatic and directional. The bottle is the brightest element — lit as if from within or with a strong spotlight. "
+            "Floating ingredients are lit to varying degrees, some catching bright light, others in softer illumination. Light rays or god-rays optional for added drama. "
+            "The composition breaks physical rules intentionally. Nothing touches the ground. Shadows fall upward or in unexpected directions. The image feels like a dream or a moment frozen in time. "
+            "Typography: modern display font with character. Can be bold or delicate depending on the fragrance. Positioned floating within the composition, not anchored to top or bottom. "
+            "The text is part of the surreal scene. Colour palette: determined by the fragrance's emotional colour. Monochromatic with one or two accent colours from the floating ingredients. "
+            "Mood: dreamlike, artistic, surreal, otherworldly, conceptual. The viewer should feel transported. This is perfume as art, not commerce. "
+            "Quality: 4K, CGI-quality photography, gravity-defying composition, high-fashion editorial, avant-garde commercial."
+        ),
+    },
 }
 
 
@@ -1194,6 +1460,12 @@ INDUSTRY_STYLE_MAP: Dict[str, List[str]] = {
         "svc_event_speaker", "svc_newsletter_teaser", "svc_checklist_graphic",
         "svc_before_after_text", "svc_question_hook", "svc_client_logo_showcase", "svc_hiring_card",
     ],
+    "perfume_fragrance": [
+        "perf_editorial_ingredient", "perf_noir_luxe", "perf_golden_hour_romance",
+        "perf_wet_glass_drama", "perf_smoke_amber", "perf_botanical_garden",
+        "perf_street_luxe", "perf_crystal_minimal", "perf_velvet_night",
+        "perf_citrus_burst", "perf_heritage_editorial", "perf_floating_surreal",
+    ],
 }
 
 # Normalise common industry string variants to our canonical slugs
@@ -1223,6 +1495,11 @@ _INDUSTRY_ALIASES: Dict[str, str] = {
     "events": "events_entertainment",
     "entertainment": "events_entertainment",
     "event": "events_entertainment",
+    "perfume": "perfume_fragrance",
+    "fragrance": "perfume_fragrance",
+    "cologne": "perfume_fragrance",
+    "scent": "perfume_fragrance",
+    "perfumery": "perfume_fragrance",
 }
 
 
