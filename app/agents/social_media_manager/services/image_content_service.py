@@ -546,6 +546,45 @@ class ImageContentService:
             print(f"❌ regenerate_image error for {draft_id}: {e}")
 
     @staticmethod
+    def _get_dynamic_motion_detail(industry: str) -> str:
+        """
+        Returns dynamic motion instructions based on product category (PRD Section 3).
+        Every immersive image includes at least ONE element suggesting frozen motion.
+        """
+        motion_map = {
+            "perfume_fragrance": "Smoke wisps, floating petals drifting upward. Gold dust particles catching light.",
+            "beauty_wellness": "Gentle splash of liquid. Petals or ingredients drifting. Dewy droplets forming on surface. Light catching moisture.",
+            "water_beverage": "Explosive water splash around bottle. Droplets frozen mid-air. Ice crystals, condensation, ripple patterns.",
+            "juice_smoothie": "Fruit pieces exploding outward. Juice splashing in arcs. Scattered berries, citrus slices, leaves flying.",
+            "dairy_milk": "Milk/cream splash erupting around product. Creamy swirls. Dripping cream, poured liquid, splatter patterns.",
+            "food_beverage": "Ingredient explosion: crumbs, herbs, spices mid-air. Steam rising. Sauce drizzle, cheese pull, crunch particles.",
+            "fashion_ecommerce": "Fabric in motion: flowing, catching wind, dynamic drape. Lens flare, urban particles, motion blur in background.",
+            "shoes_accessories": "Ground particle kick-up. Lace or strap in motion. Water splash on wet surface. Dust in light beam.",
+            "fintech_saas_tech": "Light trails, data particles, holographic glow effects. Reflections on glossy surfaces. Cool atmospheric haze.",
+            "jewellery_watches": "Sparkle particles. Light caustics from gems. Velvet ripple. Metallic reflection patterns.",
+            "home_candles": "Flame flicker. Wax melt. Smoke curl. Warm bokeh. Dust in sunbeam. Soft focus.",
+        }
+        return motion_map.get(industry, "Floating dust, light motes, atmospheric haze. Micro-splashes, surface texture, soft motion.")
+
+    @staticmethod
+    def _get_text_styling_detail(industry: str) -> str:
+        """
+        Returns text styling instructions based on product category (PRD Section 4.2).
+        Text has material properties that match the product world.
+        """
+        text_style_map = {
+            "perfume_fragrance": "Elegant serif or script in gold/cream/white. Subtle glow or shadow for readability.",
+            "beauty_wellness": "Script or serif in warm palette. Slight glossy or dewy sheen effect.",
+            "water_beverage": "Bold sans-serif. Water droplet texture or translucent quality.",
+            "juice_smoothie": "Bold, chunky, playful. Gradient colours matching fruit palette.",
+            "dairy_milk": "Flowing script in white with liquid/cream texture. Letters appear made of milk.",
+            "food_beverage": "Bold, warm-toned. Slight texture matching food surface (crispy, glazed).",
+            "fashion_ecommerce": "Clean condensed sans-serif. White or metallic against atmosphere.",
+            "fintech_saas_tech": "Thin geometric sans-serif. Subtle neon glow or holographic shimmer.",
+        }
+        return text_style_map.get(industry, "Clean sans-serif. Subtle shadow for readability. No heavy effects.")
+
+    @staticmethod
     async def _generate_platform_image(
         platform: str,
         content: str,
@@ -576,14 +615,16 @@ class ImageContentService:
             region = bc.get("region", "")
             brand_colors = bc.get("brand_colors") or []
 
-            # Look up the style description from the library using the slug
+            # Look up the style description and composition mode from the library using the slug
             style_slug = bc.get("style_slug", "")
             style_desc = ""
+            composition_mode = "immersive"  # default to immersive (PRD Section 1)
             if style_slug:
                 from app.agents.social_media_manager.services.style_library import get_style
                 s = get_style(style_slug)
                 if s:
                     style_desc = s.get("description", "")
+                    composition_mode = s.get("composition_mode", "immersive")
 
             # ========== RESTRUCTURED PROMPT ASSEMBLY (PRD Section 3) ==========
             # CRITICAL: Brand rules MUST come FIRST - GPT-Image-2 weights prompt beginning more heavily
@@ -787,32 +828,85 @@ Follow these rules precisely for every image. No exceptions.
             if not image_prompt:
                 image_prompt = seed_content.strip()
 
-            # When a reference image is provided, use two-zone product composition (PRD Section 5)
-            # The product is sacred - never modify it. Everything around it is AI-generated.
+            # Add composition block based on style's composition_mode (Immersive Composition System PRD)
+            # When a reference image is provided, choose composition style based on the visual style
             if reference_image:
-                image_prompt = (
-                    image_prompt.rstrip()
-                    + "\n\n=== TWO-ZONE PRODUCT COMPOSITION ===\n"
-                    "Create a professional social media product graphic with TWO distinct zones:\n\n"
-                    "PRODUCT ZONE (55% of frame, positioned left or right):\n"
-                    "- The product from the reference image, placed slightly off-center\n"
-                    "- The product must appear EXACTLY as it looks in the reference photo\n"
-                    "- Same shape, same colours, same label, same proportions\n"
-                    "- Professional background, surface, and optional styling props AROUND the product\n"
-                    "- Background can be: solid colour, gradient, textured surface, or styled scene\n\n"
-                    "TEXT ZONE (45% of frame, opposite side of product):\n"
-                    "- Clean background (solid colour, gradient, or subtle texture)\n"
-                    "- All text placed in this zone: headline, subtext, CTA\n"
-                    "- Text must be in the NEGATIVE SPACE beside the product\n"
-                    "- NO text overlapping or on top of the product\n"
-                    "- 20px minimum gap between any text and the product\n\n"
-                    "CRITICAL RULES:\n"
-                    "- The product itself is SACRED - never distort, never regenerate, never modify\n"
-                    "- Everything AROUND the product is AI-generated professional styling\n"
-                    "- Text lives BESIDE the product in negative space, never on top of it\n"
-                    "- The two zones must not overlap\n"
-                    "- Product label/branding on the actual product must be clearly visible"
-                )
+                # Get industry and dynamic details for immersive mode
+                industry = bc.get("industry", "general_other")
+                dynamic_motion = ImageContentService._get_dynamic_motion_detail(industry)
+                text_styling = ImageContentService._get_text_styling_detail(industry)
+
+                if composition_mode == "editorial":
+                    # Editorial/Two-Zone mode for minimal/clean styles
+                    composition_block = """
+=== EDITORIAL COMPOSITION ===
+Create a professional social media product graphic with TWO distinct zones:
+
+PRODUCT ZONE (55% of frame, positioned left or right):
+- The product from the reference image, placed slightly off-center
+- The product must appear EXACTLY as it looks in the reference photo
+- Same shape, same colours, same label, same proportions
+- Professional background, surface, and optional styling props AROUND the product
+- Background can be: solid colour, gradient, textured surface, or styled scene
+
+TEXT ZONE (45% of frame, opposite side of product):
+- Clean background (solid colour, gradient, or subtle texture)
+- All text placed in this zone: headline, subtext, CTA
+- Text must be in the NEGATIVE SPACE beside the product
+- NO text overlapping or on top of the product
+- 20px minimum gap between any text and the product
+
+CRITICAL RULES:
+- The product itself is SACRED - never distort, never regenerate, never modify
+- Everything AROUND the product is AI-generated professional styling
+- Text lives BESIDE the product in negative space, never on top of it
+- The two zones must not overlap
+- Product label/branding on the actual product must be clearly visible"""
+                else:
+                    # Immersive mode (default) - product exists INSIDE a 360° environment
+                    composition_block = f"""
+=== IMMERSIVE COMPOSITION ===
+Create a professional social media product graphic where the product
+exists INSIDE a three-dimensional environment.
+
+PRODUCT:
+- Gravitational centre of the image, slightly off-centre (40/60 split)
+- SHARPEST element in the image. Everything else can be softer.
+- Appears EXACTLY as in the reference photo. NOT regenerated.
+- Can be slightly angled for dynamic energy.
+
+ENVIRONMENT (wraps around product from ALL directions):
+- BEHIND: Atmospheric depth - light falloff, haze, bokeh, context
+- BELOW: Grounded - natural surface, liquid, ingredients
+- SIDES: Context elements at varying distances for depth layers
+- ABOVE: Atmospheric space where text lives. Sky, light, particles.
+- IN FRONT: Subtle foreground blur at bottom/edges of frame
+
+DYNAMIC MOTION:
+{dynamic_motion}
+- High-speed photography feel: sharp, detailed, frozen at 1/2000th
+
+TEXT:
+- Floats in natural pockets of atmospheric space
+- Part of the scene, not pasted on top
+- {text_styling}
+- NEVER overlaps product label
+- Max 3 elements: headline (5 words), subtext (optional), CTA
+- CTA at the bottom, integrated into the scene
+
+DEPTH AND ATMOSPHERE:
+- THREE depth layers: soft foreground, sharp product, atmospheric bg
+- ONE clear directional light source with highlights and shadows
+- Rich tonal range: no pure black, no pure white
+- Micro-details: particles, condensation, texture, reflections
+- ONE unified colour temperature throughout
+
+OVERALL:
+- Frozen moment in a living world, not a composited product photo
+- The viewer should FEEL something: desire, freshness, energy, warmth
+- Should stop a scroll and make someone look closer"""
+
+                image_prompt = image_prompt.rstrip() + "\n" + composition_block
 
             # ========== IMAGE GENERATION DEBUG (PRD Section 2) ==========
             from datetime import datetime

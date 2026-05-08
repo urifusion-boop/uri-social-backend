@@ -39,6 +39,7 @@ STYLES: Dict[str, Dict[str, Any]] = {
         "name": "Clean Luxe",
         "description": "Minimalist, premium, lots of breathing room. For high-end brands.",
         "industry_tags": ["fashion_ecommerce", "beauty_wellness", "real_estate", "general_other"],
+        "composition_mode": "editorial",
         "prompt_fragment": (
             "Luxury minimalist product photography. Pure white or soft cream background with subtle shadow. "
             "Product centered with generous negative space on all sides. Soft even lighting with no harsh shadows. "
@@ -76,6 +77,7 @@ STYLES: Dict[str, Dict[str, Any]] = {
         "name": "Minimal Studio",
         "description": "Product-first. Solid backgrounds. No distractions.",
         "industry_tags": ["fashion_ecommerce", "beauty_wellness", "food_beverage", "general_other"],
+        "composition_mode": "editorial",
         "prompt_fragment": (
             "Professional product photography on solid colour backdrop. "
             "Colours: soft grey, muted blush, sage green, or cream. "
@@ -117,6 +119,7 @@ STYLES: Dict[str, Dict[str, Any]] = {
         "name": "Catalogue Clean",
         "description": "Structured, grid-ready, professional. For brands with multiple products.",
         "industry_tags": ["fashion_ecommerce", "food_beverage", "general_other"],
+        "composition_mode": "editorial",
         "prompt_fragment": (
             "Clean catalogue-style product layout. White or light grey background. "
             "Product arranged in a structured grid or neatly laid out flat-lay composition. "
@@ -292,6 +295,7 @@ STYLES: Dict[str, Dict[str, Any]] = {
         "name": "Minimal Tech",
         "description": "Apple-inspired. Whitespace. Precision.",
         "industry_tags": ["fintech_saas_tech", "education_consulting"],
+        "composition_mode": "editorial",
         "prompt_fragment": (
             "Ultra-minimal tech aesthetic inspired by Apple design language. Vast white or very light grey space. "
             "Thin light-weight sans-serif typography. Single product or concept as the focal point with extreme negative space. "
@@ -1241,6 +1245,7 @@ STYLES: Dict[str, Dict[str, Any]] = {
         "name": "Crystal Minimal",
         "description": "Ultra-clean, transparent, modern. Nothing unnecessary.",
         "industry_tags": ["perfume_fragrance"],
+        "composition_mode": "editorial",
         "prompt_fragment": (
             "Ultra-minimalist fragrance photography on a pure white or very light grey background. "
             "The perfume bottle is perfectly centred with extreme negative space on all sides — at least 40% of the image is empty space. "
@@ -1303,6 +1308,7 @@ STYLES: Dict[str, Dict[str, Any]] = {
         "name": "Heritage Editorial",
         "description": "Classic, timeless, sophisticated. Old-world luxury.",
         "industry_tags": ["perfume_fragrance"],
+        "composition_mode": "editorial",
         "prompt_fragment": (
             "Classic editorial fragrance photography inspired by vintage luxury advertising. The perfume bottle sits on an antique surface: "
             "aged mahogany desk, vintage leather-bound book, ornate silver tray, or an old marble mantelpiece. "
