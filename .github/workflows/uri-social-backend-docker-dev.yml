@@ -88,8 +88,10 @@ jobs:
             # Pull the latest image from Docker Hub (built in the previous job)
             docker pull uriteam/urisvc:uriagentdev
 
-            # Stop and remove old containers
-            docker compose -f docker-compose.dev.yml down
+            # Stop and remove old containers (both via compose and explicit name)
+            docker compose -f docker-compose.dev.yml down || true
+            docker stop uri-agent.api || true
+            docker rm uri-agent.api || true
 
             # Start containers with the new image
             docker compose -f docker-compose.dev.yml up -d

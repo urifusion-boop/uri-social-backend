@@ -21,6 +21,10 @@ FROM python:3.13.0-bullseye AS production
 
 WORKDIR /app
 
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
 RUN pip install uvicorn
 
 COPY --from=build /usr/local/lib/python3.13 /usr/local/lib/python3.13

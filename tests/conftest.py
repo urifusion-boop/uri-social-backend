@@ -34,3 +34,21 @@ def auth_token(client):
 @pytest.fixture(scope="session")
 def auth_headers(auth_token):
     return {"Authorization": f"Bearer {auth_token}"}
+
+
+@pytest.fixture(scope="session")
+def brand_profile(client, auth_headers):
+    """Seed a minimal brand profile for the test user so content generation works."""
+    r = client.post(
+        "/social-media/brand-profile",
+        json={
+            "brand_name": "QA Test Brand",
+            "industry": "technology",
+            "brand_colors": ["#C2185B", "#F5F5F0"],
+            "brand_voice": "professional",
+            "tagline": "QA test tagline",
+        },
+        headers=auth_headers,
+    )
+    assert r.status_code == 200, f"Brand profile setup failed: {r.text}"
+    return r.json()

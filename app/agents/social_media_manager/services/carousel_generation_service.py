@@ -9,6 +9,7 @@ For story posts, generates a short punchy caption (max 125 chars).
 """
 
 import json
+import re
 from typing import Any, Dict, List, Optional
 
 from openai import AsyncOpenAI
@@ -19,6 +20,75 @@ _client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
 
 
 class CarouselGenerationService:
+
+    @staticmethod
+    def analyze_content_type(seed_content: str) -> Dict[str, Any]:
+        """
+        Analyze seed content to determine optimal carousel structure.
+
+        Detects:
+        - List-based content ("5 mistakes", "10 tips") → extract number
+        - Short content (< 15 words) → use minimum slides
+        - Story/narrative content → standard slide count
+
+        Returns:
+            {
+                "type": "list" | "story" | "short",
+                "optimal_slides": int,
+                "numbered": bool,
+                "detected_count": int | None
+            }
+        """
+        seed_lower = seed_content.lower().strip()
+        word_count = len(seed_content.split())
+
+        # Detect list-based content with numbers
+        # Match patterns like "5 mistakes", "10 tips", "3 ways", etc.
+        list_patterns = [
+            r'\b(\d+)\s+(ways?|tips?|mistakes?|reasons?|steps?|secrets?|strategies|tactics|methods?|ideas?|hacks?)\b',
+            r'\b(top|best)\s+(\d+)\b',
+        ]
+
+        for pattern in list_patterns:
+            match = re.search(pattern, seed_lower)
+            if match:
+                # Extract the number
+                if match.group(0).startswith(('top', 'best')):
+                    count = int(match.group(2))
+                else:
+                    count = int(match.group(1))
+
+                # Optimal slides = Hook + Count + CTA
+                return {
+                    "type": "list",
+                    "optimal_slides": min(count + 2, 10),  # Cap at 10 slides max
+                    "numbered": True,
+                    "detected_count": count
+                }
+
+        # Short content - use minimum slides
+        if word_count < 15:
+            return {
+                "type": "short",
+                "optimal_slides": 3,
+                "numbered": False,
+                "detected_count": None
+            }
+
+        # Default: story/narrative format
+        # Medium content (15-50 words) → 5 slides
+        # Long content (50+ words) → 7 slides
+        if word_count < 50:
+            optimal = 5
+        else:
+            optimal = 7
+
+        return {
+            "type": "story",
+            "optimal_slides": optimal,
+            "numbered": False,
+            "detected_count": None
+        }
 
     @staticmethod
     async def generate(
@@ -33,7 +103,8 @@ class CarouselGenerationService:
         Returns:
             {
                 "caption": str,
-                "slides": [{"headline": str, "body": str}, ...]
+                "slides": [{"slide_number": int, "headline": str, "body": str}, ...],
+                "content_analysis": {...}
             }
         """
         bc = brand_context or {}
@@ -41,7 +112,19 @@ class CarouselGenerationService:
         brand_voice = bc.get("brand_voice", "")
         industry = bc.get("industry", "")
         target_audience = bc.get("target_audience", "")
-        num_slides = max(2, min(5, num_slides))
+
+        # Analyze content to determine optimal slide count
+        content_analysis = CarouselGenerationService.analyze_content_type(seed_content)
+
+        # Override num_slides with intelligent detection (unless explicitly forced)
+        # If user explicitly requested a count, respect it. Otherwise use detected optimal.
+        if num_slides == 3:  # Default value, use intelligent detection
+            num_slides = content_analysis["optimal_slides"]
+        else:
+            # User specified custom count, but cap it
+            num_slides = max(2, min(10, num_slides))
+
+        print(f"📊 Carousel analysis: type={content_analysis['type']}, optimal_slides={content_analysis['optimal_slides']}, using={num_slides}")
 
         brand_block = ""
         if brand_name:
@@ -53,17 +136,35 @@ class CarouselGenerationService:
         if target_audience:
             brand_block += f"Target audience: {target_audience}\n"
 
+        # Build content-type-specific structure instructions
+        if content_analysis["type"] == "list" and content_analysis["numbered"]:
+            structure_note = f"""
+STRICT STRUCTURE FOR {num_slides} SLIDES:
+- Slide 1: Hook (attention-grabbing headline that creates curiosity)
+- Slides 2-{num_slides - 1}: Value slides (one clear point per slide, use numbered format: 1., 2., 3., etc.)
+- Slide {num_slides}: CTA (call to action with clear next step)
+
+This is a LIST-BASED carousel with {content_analysis['detected_count']} points.
+Each value slide should deliver ONE complete idea."""
+        else:
+            structure_note = f"""
+STRICT STRUCTURE FOR {num_slides} SLIDES:
+- Slide 1: Hook (attention-grabbing headline that makes people want to swipe)
+- Slides 2-{num_slides - 1}: Value slides (each slide builds on the previous, delivering clear value)
+- Slide {num_slides}: CTA (strong call to action with next step)
+
+This is a {content_analysis['type'].upper()} carousel. Build a cohesive narrative."""
+
         system_prompt = (
             "You are an expert social media copywriter specialising in carousel posts "
             f"for {platform}. Your job is to create engaging, scroll-stopping carousel content.\n\n"
-            "Carousel structure:\n"
-            "- Slide 1 (Hook): attention-grabbing question or surprising stat that makes people swipe\n"
-            "- Middle slides (Value): practical tips, facts, or numbered steps that deliver real value\n"
-            "- Last slide (CTA): clear call-to-action that tells the audience what to do next\n\n"
+            f"{structure_note}\n\n"
             "Rules:\n"
             "- Each headline: ≤8 words, punchy and bold\n"
             "- Each body: ≤25 words, clear and scannable\n"
             "- Overall caption: engaging hook + relevant hashtags, suitable for the platform\n"
+            "- The carousel must tell a complete, cohesive story from slide 1 to slide N\n"
+            "- Each slide must build on the previous slide\n"
             "- Return ONLY valid JSON — no markdown, no extra text\n\n"
             "JSON schema:\n"
             '{"caption": "string", "slides": [{"headline": "string", "body": "string"}]}'
@@ -72,7 +173,7 @@ class CarouselGenerationService:
         user_prompt = (
             f"{brand_block}\n"
             f"Topic / seed content:\n{seed_content}\n\n"
-            f"Generate a {num_slides}-slide carousel post."
+            f"Generate exactly {num_slides} slides following the structure above."
         ).strip()
 
         try:
@@ -92,28 +193,45 @@ class CarouselGenerationService:
             caption = data.get("caption", "")
             slides_raw = data.get("slides", [])
 
-            # Normalise slides
+            # Normalise slides and add slide_number
             slides: List[Dict[str, str]] = []
-            for s in slides_raw[:num_slides]:
+            for idx, s in enumerate(slides_raw[:num_slides]):
                 slides.append({
+                    "slide_number": idx + 1,  # 1-indexed for display
                     "headline": str(s.get("headline", "")).strip(),
                     "body": str(s.get("body", "")).strip(),
                 })
 
             # Pad if GPT returned fewer slides than requested
             while len(slides) < num_slides:
-                slides.append({"headline": "Key Insight", "body": "Stay tuned for more details."})
+                slides.append({
+                    "slide_number": len(slides) + 1,
+                    "headline": "Key Insight",
+                    "body": "Stay tuned for more details."
+                })
 
-            return {"caption": caption, "slides": slides}
+            return {
+                "caption": caption,
+                "slides": slides,
+                "content_analysis": content_analysis
+            }
 
         except Exception as e:
             print(f"⚠️ CarouselGenerationService.generate error: {e}")
             # Graceful fallback
             slides = [
-                {"headline": f"Slide {i + 1}", "body": seed_content[:50]}
+                {
+                    "slide_number": i + 1,
+                    "headline": f"Slide {i + 1}",
+                    "body": seed_content[:50]
+                }
                 for i in range(num_slides)
             ]
-            return {"caption": seed_content[:200], "slides": slides}
+            return {
+                "caption": seed_content[:200],
+                "slides": slides,
+                "content_analysis": content_analysis
+            }
 
     @staticmethod
     async def generate_story_caption(
@@ -184,10 +302,13 @@ class CarouselGenerationService:
             slides_with_specs = []
             for slide in carousel_data["slides"]:
                 slides_with_specs.append({
+                    "slide_number": slide.get("slide_number", len(slides_with_specs) + 1),
                     "headline": slide["headline"],
                     "body": slide["body"],
                     "image_url": None,
                     "image_specs": {"width": 1080, "height": 1080},
+                    "image_retry_count": 0,  # Track retries per slide
+                    "image_failed": False,  # Track if image generation failed
                 })
 
             draft_doc = {

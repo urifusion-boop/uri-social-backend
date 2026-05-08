@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import subprocess
 import traceback
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query, Request, UploadFile, File
 from fastapi.responses import RedirectResponse, StreamingResponse, JSONResponse
@@ -23,6 +24,7 @@ from ..services.auto_content_service import AutoContentService
 from ..services.brand_profile_service import BrandProfileService
 from ..services.outstand_service import OutstandService
 from ..services import content_calendar_service as cal_svc
+from ..services.voice_sample_analyzer_service import VoiceSampleAnalyzerService
 
 router = APIRouter(tags=["Social Media Manager"])
 
@@ -110,6 +112,21 @@ class BrandContextRequest(BaseModel):
     industry: Optional[str] = None
     key_products_services: Optional[List[str]] = None
 
+class StoryboardRequest(BaseModel):
+    brand_images: List[str] = Field(..., min_items=1, max_items=5)
+    optional_text: Optional[str] = Field(None, max_length=1000)
+    target_platform: str = "instagram_reels"
+    target_duration_seconds: int = Field(15, ge=5, le=30)
+
+class StoryboardFramesRequest(BaseModel):
+    scenes: List[Dict[str, Any]]
+    brand_images: List[str] = Field(default_factory=list, max_items=5)
+
+class VideoFromStoryboardRequest(BaseModel):
+    storyboard: Dict[str, Any]
+    brand_images: List[str] = Field(default_factory=list, max_items=5)
+    model: str = "veo-3.1-generate-preview"
+
 class ContentGenerationRequest(BaseModel):
     seed_content: str = Field(..., min_length=10, max_length=5000)
     platforms: List[str] = Field(..., min_items=1, max_items=5)
@@ -188,6 +205,7 @@ class BrandProfileRequest(BaseModel):
     key_products_services: Optional[List[str]] = None
     # Identity
     logo_url: Optional[str] = None
+    logo_position: Optional[str] = None  # top_left | top_center | top_right | bottom_left | bottom_center | bottom_right | center
     brand_colors: Optional[List[str]] = None
     sample_template_urls: Optional[List[str]] = None
     # Personality
@@ -349,6 +367,7 @@ async def generate_content(
         brand_context_dict["user_id"] = user_id
         brand_context_dict["using_fallbacks"] = len(missing_fields) > 0
         brand_context_dict["fallback_fields"] = missing_fields
+        print(f"🖼️  LOGO DEBUG user={user_id}: logo_url={repr(profile_data.get('logo_url'))}, logo_position={repr(profile_data.get('logo_position'))} → brand_context logo_position={repr(brand_context_dict.get('logo_position'))}")
 
         # Allow explicit overrides from the request (legacy / power-user path)
         if request.brand_context:
@@ -446,19 +465,26 @@ async def generate_content(
             for draft in drafts:
                 if post_type == "carousel":
                     slides = draft.get("slides") or []
+                    # Pass total_slides and carousel_id for visual continuity
+                    total_slides = len(slides)
+                    carousel_id = draft["id"]  # All slides share same carousel_id
                     for slide_index, slide in enumerate(slides):
+                        # Use slide's headline + body as the main content (no seed duplication)
+                        slide_content = f"{slide.get('headline', '')} {slide.get('body', '')}".strip()
                         background_tasks.add_task(
                             _generate_image_bg,
                             draft_id=draft["id"],
                             platform=draft["platform"],
-                            content=f"{slide.get('headline', '')} {slide.get('body', '')}".strip() or draft["content"],
-                            seed_content=request.seed_content,
+                            content=slide_content or draft["content"],
+                            seed_content=slide_content,  # Use slide content instead of original seed to avoid duplication
                             brand_context=brand_context_dict,
                             db=db,
                             reference_image=request.reference_image,
                             post_type=post_type,
                             slide_index=slide_index,
                             image_model=request.image_model,
+                            total_slides=total_slides,
+                            carousel_id=carousel_id,
                         )
                 else:
                     background_tasks.add_task(
@@ -1116,6 +1142,412 @@ async def regenerate_draft_image(
     )
 
 
+@router.post("/drafts/{draft_id}/edit-image")
+async def edit_draft_image(
+    draft_id: str,
+    request: Request,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer())
+):
+    """
+    Edit image in-place using user feedback
+    PRD: URI-Social-Image-Editing-PRD.docx
+
+    In-place editing preserves everything the user likes about the current image
+    and only changes what they request. Unlike regeneration, this keeps the same
+    layout, composition, and style.
+
+    Edit categories:
+    - text_edit: Change text (price, dates, etc.) - FREE
+    - style_edit: Change colors, brightness, spacing - FREE
+    - content_edit: Add/remove elements - 1 free, then 1 credit
+    - full_redesign: Complete redo - 1 credit
+    """
+    from app.agents.social_media_manager.services.image_editing_service import ImageEditingService
+
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    body = await request.json()
+    feedback = (body.get("feedback") or "").strip()
+    if not feedback:
+        raise HTTPException(status_code=400, detail="feedback is required")
+
+    # Optional: force_category parameter from quick buttons (bypasses classifier)
+    force_category = body.get("force_category")
+
+    # Call the editing service
+    result = await ImageEditingService.edit_image_for_draft(
+        draft_id=draft_id,
+        user_id=user_id,
+        feedback=feedback,
+        db=db,
+        force_category=force_category
+    )
+
+    # Return the result (could be success, credit warning, or error)
+    return JSONResponse(
+        status_code=200 if result.get("status") else 400,
+        content=result
+    )
+
+
+@router.post("/drafts/{draft_id}/undo-image")
+async def undo_draft_image_edit(
+    draft_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer())
+):
+    """
+    Undo last image edit and restore previous version
+    PRD Section 5.3: Undo Function
+
+    Restores the exact previous version from version history.
+    FREE - no API call, just database restore.
+    """
+    from app.agents.social_media_manager.services.image_editing_service import ImageEditingService
+
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    # Call undo service
+    result = await ImageEditingService.undo_image_edit(
+        db=db,
+        draft_id=draft_id,
+        user_id=user_id
+    )
+
+    return JSONResponse(
+        status_code=200 if result.get("status") else 400,
+        content=result
+    )
+
+
+# ==============================================================================
+# CAROUSEL EDITING ENDPOINTS
+# ==============================================================================
+
+@router.patch("/drafts/{draft_id}/slides/{slide_index}")
+async def update_carousel_slide(
+    draft_id: str,
+    slide_index: int,
+    request: Request,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer())
+):
+    """
+    Update text (headline/body) of a single carousel slide.
+    Does NOT regenerate the image - only updates text.
+    """
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    body = await request.json()
+    headline = body.get("headline")
+    body_text = body.get("body")
+
+    if not headline and not body_text:
+        raise HTTPException(status_code=400, detail="headline or body is required")
+
+    # Verify draft exists and belongs to user
+    draft = await db["content_drafts"].find_one(
+        {"$or": [{"id": draft_id}, {"draft_id": draft_id}], "user_id": user_id}
+    )
+    if not draft:
+        raise HTTPException(status_code=404, detail="Draft not found")
+
+    # Verify it's a carousel
+    if draft.get("post_type") != "carousel":
+        raise HTTPException(status_code=400, detail="This endpoint is only for carousel posts")
+
+    # Verify slide exists
+    slides = draft.get("slides", [])
+    if slide_index < 0 or slide_index >= len(slides):
+        raise HTTPException(status_code=400, detail=f"Slide index {slide_index} out of range (0-{len(slides)-1})")
+
+    # Build update fields
+    update_fields = {}
+    if headline:
+        update_fields[f"slides.{slide_index}.headline"] = headline.strip()
+    if body_text:
+        update_fields[f"slides.{slide_index}.body"] = body_text.strip()
+    update_fields["updated_at"] = datetime.utcnow()
+
+    # Update the slide
+    result = await db["content_drafts"].update_one(
+        {"id": draft_id},
+        {"$set": update_fields}
+    )
+
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Draft not found")
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "status": True,
+            "responseMessage": f"Slide {slide_index + 1} updated successfully",
+            "responseData": {
+                "slide_index": slide_index,
+                "updated_fields": list(update_fields.keys())
+            }
+        }
+    )
+
+
+@router.post("/drafts/{draft_id}/slides/{slide_index}/regenerate-image")
+async def regenerate_carousel_slide_image(
+    draft_id: str,
+    slide_index: int,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer())
+):
+    """
+    Regenerate the image for a single carousel slide.
+    Optionally accepts feedback for adjustments.
+    """
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    body = await request.json()
+    feedback = body.get("feedback", "").strip()
+
+    # Verify draft exists and belongs to user
+    draft = await db["content_drafts"].find_one(
+        {"$or": [{"id": draft_id}, {"draft_id": draft_id}], "user_id": user_id}
+    )
+    if not draft:
+        raise HTTPException(status_code=404, detail="Draft not found")
+
+    # Verify it's a carousel
+    if draft.get("post_type") != "carousel":
+        raise HTTPException(status_code=400, detail="This endpoint is only for carousel posts")
+
+    # Verify slide exists
+    slides = draft.get("slides", [])
+    if slide_index < 0 or slide_index >= len(slides):
+        raise HTTPException(status_code=400, detail=f"Slide index {slide_index} out of range (0-{len(slides)-1})")
+
+    slide = slides[slide_index]
+    retry_count = slide.get("image_retry_count", 0)
+
+    # Check retry limits (first retry free, subsequent cost credits)
+    if retry_count >= 1:
+        # Check if user has credits
+        from app.agents.social_media_manager.services.credit_service import CreditService
+        credit_service = CreditService(db)
+        has_credits = await credit_service.check_sufficient_credits(user_id, 1)
+
+        if not has_credits:
+            return JSONResponse(
+                status_code=402,
+                content={
+                    "status": False,
+                    "responseCode": "insufficient_credits",
+                    "responseMessage": "You need 1 credit to regenerate this slide again"
+                }
+            )
+
+        # Deduct credit
+        await credit_service.deduct_credit(
+            user_id=user_id,
+            campaign_id=draft_id,
+            reason=f"carousel_slide_{slide_index}_regenerate"
+        )
+
+    # Increment retry count
+    await db["content_drafts"].update_one(
+        {"id": draft_id},
+        {"$inc": {f"slides.{slide_index}.image_retry_count": 1}}
+    )
+
+    # Get brand context for regeneration
+    brand_profile = await db["brand_profiles"].find_one({"user_id": user_id})
+    brand_context = BrandProfileService.to_brand_context(brand_profile or {})
+
+    # Build slide content
+    slide_content = f"{slide.get('headline', '')} {slide.get('body', '')}".strip()
+
+    # Regenerate image in background
+    total_slides = len(slides)
+    carousel_id = draft.get("id")
+
+    background_tasks.add_task(
+        _generate_image_bg,
+        draft_id=draft_id,
+        platform=draft.get("platform", "instagram"),
+        content=slide_content,
+        seed_content=slide_content,
+        brand_context=brand_context,
+        db=db,
+        reference_image=None,
+        post_type="carousel",
+        slide_index=slide_index,
+        image_model=None,
+        total_slides=total_slides,
+        carousel_id=carousel_id,
+    )
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "status": True,
+            "responseMessage": f"Regenerating image for slide {slide_index + 1}...",
+            "responseData": {
+                "slide_index": slide_index,
+                "retry_count": retry_count + 1,
+                "credit_charged": retry_count >= 1
+            }
+        }
+    )
+
+
+@router.delete("/drafts/{draft_id}/slides/{slide_index}")
+async def delete_carousel_slide(
+    draft_id: str,
+    slide_index: int,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer())
+):
+    """
+    Delete a single slide from a carousel.
+    Minimum 2 slides required (can't delete if only 2 left).
+    """
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    # Verify draft exists and belongs to user
+    draft = await db["content_drafts"].find_one(
+        {"$or": [{"id": draft_id}, {"draft_id": draft_id}], "user_id": user_id}
+    )
+    if not draft:
+        raise HTTPException(status_code=404, detail="Draft not found")
+
+    # Verify it's a carousel
+    if draft.get("post_type") != "carousel":
+        raise HTTPException(status_code=400, detail="This endpoint is only for carousel posts")
+
+    # Verify slide exists
+    slides = draft.get("slides", [])
+    if slide_index < 0 or slide_index >= len(slides):
+        raise HTTPException(status_code=400, detail=f"Slide index {slide_index} out of range (0-{len(slides)-1})")
+
+    # Check minimum slides
+    if len(slides) <= 2:
+        raise HTTPException(status_code=400, detail="Cannot delete slide. Minimum 2 slides required.")
+
+    # Remove the slide and renumber remaining slides
+    slides.pop(slide_index)
+    for i, slide in enumerate(slides):
+        slide["slide_number"] = i + 1
+
+    # Update draft
+    await db["content_drafts"].update_one(
+        {"id": draft_id},
+        {"$set": {"slides": slides, "updated_at": datetime.utcnow()}}
+    )
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "status": True,
+            "responseMessage": f"Slide {slide_index + 1} deleted successfully",
+            "responseData": {
+                "deleted_slide_index": slide_index,
+                "remaining_slides": len(slides)
+            }
+        }
+    )
+
+
+@router.post("/drafts/{draft_id}/slides/reorder")
+async def reorder_carousel_slides(
+    draft_id: str,
+    request: Request,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer())
+):
+    """
+    Reorder carousel slides based on new index array.
+
+    Request body:
+    {
+        "new_order": [2, 0, 1, 3]  // New positions (0-indexed)
+    }
+    """
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    body = await request.json()
+    new_order = body.get("new_order", [])
+
+    if not new_order or not isinstance(new_order, list):
+        raise HTTPException(status_code=400, detail="new_order array is required")
+
+    # Verify draft exists and belongs to user
+    draft = await db["content_drafts"].find_one(
+        {"$or": [{"id": draft_id}, {"draft_id": draft_id}], "user_id": user_id}
+    )
+    if not draft:
+        raise HTTPException(status_code=404, detail="Draft not found")
+
+    # Verify it's a carousel
+    if draft.get("post_type") != "carousel":
+        raise HTTPException(status_code=400, detail="This endpoint is only for carousel posts")
+
+    slides = draft.get("slides", [])
+
+    # Validate new_order
+    if len(new_order) != len(slides):
+        raise HTTPException(
+            status_code=400,
+            detail=f"new_order length ({len(new_order)}) must match slides count ({len(slides)})"
+        )
+
+    if set(new_order) != set(range(len(slides))):
+        raise HTTPException(
+            status_code=400,
+            detail="new_order must contain each index exactly once (e.g., [2, 0, 1])"
+        )
+
+    # Reorder slides
+    try:
+        reordered_slides = [slides[i] for i in new_order]
+    except IndexError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid index in new_order: {e}")
+
+    # Update slide_number after reorder
+    for i, slide in enumerate(reordered_slides):
+        slide["slide_number"] = i + 1
+
+    # Update draft
+    await db["content_drafts"].update_one(
+        {"id": draft_id},
+        {"$set": {"slides": reordered_slides, "updated_at": datetime.utcnow()}}
+    )
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "status": True,
+            "responseMessage": "Slides reordered successfully",
+            "responseData": {
+                "old_order": list(range(len(slides))),
+                "new_order": new_order,
+                "total_slides": len(reordered_slides)
+            }
+        }
+    )
+
+
 @router.delete("/drafts/{draft_id}")
 async def delete_draft(
     draft_id: str,
@@ -1382,7 +1814,11 @@ async def generate_calendar_plan(
             db=db,
             force=request.force_regenerate,
         )
-        return UriResponse.get_single_data_response("calendar_plan", plan)
+        print(f"[Calendar] plan returned plan_id={plan.get('plan_id')} generation_method={plan.get('generation_method')} force={request.force_regenerate}")
+        return UriResponse.get_single_data_response("calendar_plan", {
+            **plan,
+            "regenerated": request.force_regenerate,
+        })
     except Exception as e:
         import traceback as _tb
         print(_tb.format_exc())
@@ -1522,8 +1958,11 @@ async def get_calendar_trends(
         raise HTTPException(status_code=401, detail="User ID not found in token")
     from app.services.TrendDataService import TrendDataService
     brand = await BrandProfileService.get(user_id, db)
+    # BrandProfileService.get returns a response wrapper dict; unwrap responseData
+    if isinstance(brand, dict) and "responseData" in brand:
+        brand = brand["responseData"]
     industry = (brand or {}).get("industry", "business")
-    keywords = await TrendDataService.get_trending_keywords(industry)
+    keywords = await TrendDataService.get_trending_keywords(industry, db=db)
     return UriResponse.get_single_data_response("trends", {
         "industry": industry,
         "keywords": keywords,
@@ -2020,17 +2459,106 @@ async def get_account_metrics(
                 print(f"⚠️ Instagram direct account metrics failed: {e}")
                 return None
 
+        # ── LinkedIn direct connections ───────────────────────────────────────
+        linkedin_conns = await db["social_connections"].find(
+            {"user_id": user_id, "platform": "linkedin", "connection_status": "active"},
+            {"_id": 0, "linkedin_access_token": 1, "person_urn": 1, "active_author_urn": 1,
+             "account_name": 1, "username": 1, "pages": 1},
+        ).to_list(length=5)
+
+        async def _fetch_linkedin_direct_metrics(conn):
+            access_token = conn.get("linkedin_access_token")
+            person_urn = conn.get("active_author_urn") or conn.get("person_urn")
+            if not access_token or not person_urn:
+                return None
+            try:
+                from app.agents.social_media_manager.services.linkedin_direct_service import LinkedInDirectService
+                svc = LinkedInDirectService()
+
+                # Fetch basic profile (name, email)
+                profile = await svc.get_profile(access_token)
+
+                # Fetch follower count from LinkedIn Community Management API
+                # Works for personal profiles; falls back to 0 if scope not granted
+                followers_count = 0
+                try:
+                    async with _httpx.AsyncClient(timeout=15) as _c:
+                        fol_resp = await _c.get(
+                            "https://api.linkedin.com/v2/networkSizes/urn:li:person:" + person_urn.split(":")[-1],
+                            params={"edgeType": "CompanyFollowedByMember"},
+                            headers={"Authorization": f"Bearer {access_token}",
+                                     "X-Restli-Protocol-Version": "2.0.0"},
+                        )
+                        if fol_resp.status_code == 200:
+                            followers_count = fol_resp.json().get("firstDegreeSize", 0)
+                except Exception:
+                    pass  # follower count is best-effort
+
+                # Count published posts from our DB in the period
+                from datetime import timezone as _tz
+                since_dt = datetime.utcfromtimestamp(since_ts).replace(tzinfo=_tz.utc)
+                post_count = await db["content_drafts"].count_documents({
+                    "user_id": user_id,
+                    "status": "published",
+                    "platforms": {"$in": ["linkedin"]},
+                })
+
+                # Aggregate likes + comments from content_analytics for LinkedIn posts
+                li_draft_ids = await db["content_drafts"].distinct(
+                    "id",
+                    {"user_id": user_id, "status": "published", "platforms": {"$in": ["linkedin"]}},
+                )
+                analytics_cursor = db["content_analytics"].find(
+                    {"draft_id": {"$in": li_draft_ids}},
+                    {"likes": 1, "comments": 1, "shares": 1, "impressions": 1},
+                )
+                total_likes = total_comments = total_shares = total_impressions = 0
+                async for ana in analytics_cursor:
+                    total_likes       += int(ana.get("likes", 0) or 0)
+                    total_comments    += int(ana.get("comments", 0) or 0)
+                    total_shares      += int(ana.get("shares", 0) or 0)
+                    total_impressions += int(ana.get("impressions", 0) or 0)
+
+                return {
+                    "account_id": person_urn,
+                    "network": "linkedin",
+                    "page_name": profile.get("name") or conn.get("account_name") or conn.get("username"),
+                    "category": None,
+                    "followers_count": followers_count,
+                    "following_count": None,
+                    "posts_count": post_count,
+                    "engagement": {
+                        "views": total_impressions,
+                        "likes": total_likes,
+                        "comments": total_comments,
+                        "shares": total_shares,
+                        "reposts": 0,
+                        "quotes": 0,
+                    },
+                    "engagement_note": f"From {post_count} LinkedIn posts published (all time)",
+                    "platform_specific": {
+                        "email": profile.get("email"),
+                        "person_urn": person_urn,
+                        "pages": conn.get("pages", []),
+                    },
+                    "period": {"since": since_ts, "until": until_ts},
+                }
+            except Exception as e:
+                print(f"⚠️ LinkedIn direct account metrics failed for {person_urn}: {e}")
+                return None
+
         async def _fetch_direct_metrics(conn):
             if conn.get("connected_via") in ("instagram_direct", "instagram_direct_oauth"):
                 return await _fetch_instagram_direct_metrics(conn)
             return None  # extend here for other direct platforms
 
-        outstand_results, direct_results = await _asyncio.gather(
+        outstand_results, direct_results, linkedin_results = await _asyncio.gather(
             _asyncio.gather(*[_fetch_outstand_metrics(a) for a in outstand_accounts]),
             _asyncio.gather(*[_fetch_direct_metrics(c) for c in direct_conns]),
+            _asyncio.gather(*[_fetch_linkedin_direct_metrics(c) for c in linkedin_conns]),
         )
 
-        account_metrics = [r for r in (*outstand_results, *direct_results) if r is not None]
+        account_metrics = [r for r in (*outstand_results, *direct_results, *linkedin_results) if r is not None]
 
         return UriResponse.get_single_data_response("account_metrics", {
             "has_data": len(account_metrics) > 0,
@@ -2454,6 +2982,86 @@ async def save_brand_profile(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.post("/brand-profile/analyze-voice-samples")
+async def analyze_voice_samples(
+    request: Dict[str, Any],
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Analyze sample captions to extract voice patterns.
+
+    Caption Voice System (PRD Section 6) - Voice Sample Analysis
+
+    Request body:
+    {
+        "sample_captions": ["caption 1", "caption 2", "caption 3"],
+        "merge_with_profile": true  // optional, default true
+    }
+
+    Returns the analysis and optionally updates the user's brand profile
+    with merged voice settings.
+    """
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    try:
+        sample_captions = request.get("sample_captions", [])
+        merge_with_profile = request.get("merge_with_profile", True)
+
+        if not sample_captions or len(sample_captions) == 0:
+            raise HTTPException(status_code=400, detail="sample_captions is required and must not be empty")
+
+        if len(sample_captions) > 5:
+            raise HTTPException(status_code=400, detail="Maximum 5 sample captions allowed")
+
+        # Analyze the samples
+        analysis = await VoiceSampleAnalyzerService.analyze_voice_samples(sample_captions)
+
+        # If merge_with_profile is true, update the brand profile
+        if merge_with_profile:
+            # Get current profile
+            profile_result = await BrandProfileService.get(user_id, db)
+            if profile_result.get("status"):
+                profile_data = profile_result.get("responseData") or {}
+                current_voice_profile = profile_data.get("voice_profile") or {}
+
+                # Merge analysis with current profile
+                updated_voice_profile = VoiceSampleAnalyzerService.merge_analysis_with_profile(
+                    current_voice_profile,
+                    analysis
+                )
+
+                # Save updated profile
+                await BrandProfileService.save(
+                    user_id,
+                    {
+                        "voice_profile": updated_voice_profile,
+                        "voice_sample_analysis": analysis,
+                    },
+                    db
+                )
+
+                return UriResponse.get_single_data_response("voice_analysis", {
+                    "analysis": analysis,
+                    "updated_voice_profile": updated_voice_profile,
+                    "merged": True,
+                })
+
+        # Return analysis only
+        return UriResponse.get_single_data_response("voice_analysis", {
+            "analysis": analysis,
+            "merged": False,
+        })
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error analyzing voice samples: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to analyze voice samples: {str(e)}")
+
+
 # ==============================================================================
 # BACKGROUND TASKS
 # ==============================================================================
@@ -2469,11 +3077,14 @@ async def _generate_image_bg(
     post_type: str = "feed",
     slide_index: Optional[int] = None,
     image_model: Optional[str] = None,
+    total_slides: Optional[int] = None,
+    carousel_id: Optional[str] = None,
 ):
     """
     Background task: generate an image for an existing draft and save it to DB.
     Runs after the text-only response has already been returned to the frontend.
-    For carousel posts, slide_index indicates which slide this image belongs to.
+    For carousel posts, slide_index indicates which slide this image belongs to,
+    and carousel_id ensures all slides share the same visual style.
     For story posts, uses the story (9:16) image spec.
     """
     import re
@@ -2484,30 +3095,77 @@ async def _generate_image_bg(
         from app.agents.social_media_manager.services.style_library import pick_next_style
 
         # ── Visual style rotation ─────────────────────────────────────────────
-        # Read the user's selected styles and rotation index from their brand profile.
-        # Pick the next style in the cycle, inject its prompt fragment into brand_context,
-        # then increment and persist the rotation index.
-        _bp = await db["brand_profiles"].find_one(
-            {"user_id": brand_context.get("user_id", "")},
-            {"style_selections": 1, "style_prompt_fragments": 1, "style_rotation_index": 1, "industry": 1},
-        ) or {}
-        _style_selections = _bp.get("style_selections") or []
-        _style_prompt_fragments = _bp.get("style_prompt_fragments") or []
-        _rotation_index = int(_bp.get("style_rotation_index") or 0)
-        _industry = _bp.get("industry") or brand_context.get("industry", "")
+        # For carousel posts: lock style to first slide, reuse for all subsequent slides
+        # For regular posts: rotate style normally
+        if post_type == "carousel" and carousel_id and slide_index is not None:
+            if slide_index == 0:
+                # First slide: pick style and cache it for this carousel
+                _bp = await db["brand_profiles"].find_one(
+                    {"user_id": brand_context.get("user_id", "")},
+                    {"style_selections": 1, "style_prompt_fragments": 1, "style_rotation_index": 1, "industry": 1},
+                ) or {}
+                _style_selections = _bp.get("style_selections") or []
+                _style_prompt_fragments = _bp.get("style_prompt_fragments") or []
+                _rotation_index = int(_bp.get("style_rotation_index") or 0)
+                _industry = _bp.get("industry") or brand_context.get("industry", "")
 
-        _slug, _fragment, _next_index = pick_next_style(
-            _style_selections, _rotation_index, _industry, _style_prompt_fragments
-        )
+                _slug, _fragment, _next_index = pick_next_style(
+                    _style_selections, _rotation_index, _industry, _style_prompt_fragments
+                )
 
-        if _fragment:
-            brand_context = {**brand_context, "style_prompt_fragment": _fragment, "style_slug": _slug}
-            print(f"🎨 Style [{_slug}] applied for this image (next index: {_next_index})")
-            # Persist incremented rotation index
-            await db["brand_profiles"].update_one(
+                if _fragment:
+                    brand_context = {**brand_context, "style_prompt_fragment": _fragment, "style_slug": _slug}
+                    print(f"🎨 Carousel style [{_slug}] applied for all {total_slides} slides (next index: {_next_index})")
+
+                    # Cache style in draft document for subsequent slides
+                    await db["content_drafts"].update_one(
+                        {"id": carousel_id},
+                        {"$set": {
+                            "carousel_style_slug": _slug,
+                            "carousel_style_fragment": _fragment
+                        }}
+                    )
+
+                    # Only increment rotation index ONCE per carousel (not per slide)
+                    await db["brand_profiles"].update_one(
+                        {"user_id": brand_context.get("user_id", "")},
+                        {"$set": {"style_rotation_index": _next_index}},
+                    )
+            else:
+                # Subsequent slides: reuse cached style from first slide
+                draft = await db["content_drafts"].find_one(
+                    {"id": carousel_id},
+                    {"carousel_style_slug": 1, "carousel_style_fragment": 1}
+                )
+                if draft:
+                    _slug = draft.get("carousel_style_slug")
+                    _fragment = draft.get("carousel_style_fragment")
+                    if _fragment:
+                        brand_context = {**brand_context, "style_prompt_fragment": _fragment, "style_slug": _slug}
+                        print(f"🎨 Reusing carousel style [{_slug}] for slide {slide_index + 1}/{total_slides}")
+        else:
+            # Regular post: normal style rotation
+            _bp = await db["brand_profiles"].find_one(
                 {"user_id": brand_context.get("user_id", "")},
-                {"$set": {"style_rotation_index": _next_index}},
+                {"style_selections": 1, "style_prompt_fragments": 1, "style_rotation_index": 1, "industry": 1},
+            ) or {}
+            _style_selections = _bp.get("style_selections") or []
+            _style_prompt_fragments = _bp.get("style_prompt_fragments") or []
+            _rotation_index = int(_bp.get("style_rotation_index") or 0)
+            _industry = _bp.get("industry") or brand_context.get("industry", "")
+
+            _slug, _fragment, _next_index = pick_next_style(
+                _style_selections, _rotation_index, _industry, _style_prompt_fragments
             )
+
+            if _fragment:
+                brand_context = {**brand_context, "style_prompt_fragment": _fragment, "style_slug": _slug}
+                print(f"🎨 Style [{_slug}] applied for this image (next index: {_next_index})")
+                # Persist incremented rotation index
+                await db["brand_profiles"].update_one(
+                    {"user_id": brand_context.get("user_id", "")},
+                    {"$set": {"style_rotation_index": _next_index}},
+                )
 
         # For story posts pass image_type="story" so we get 1080x1920 dimensions
         image_type = "story" if post_type == "story" else "post_image"
@@ -2520,6 +3178,8 @@ async def _generate_image_bg(
             reference_image=reference_image,
             image_type=image_type,
             image_model=image_model,
+            slide_index=slide_index,
+            total_slides=total_slides,
         )
 
         if not image_result.get("status"):
@@ -2546,6 +3206,7 @@ async def _generate_image_bg(
                     {"id": draft_id},
                     {"$set": {
                         f"slides.{slide_index}.image_url": final_url,
+                        f"slides.{slide_index}.image_failed": False,
                         "has_image": True,
                     }},
                 )
@@ -2557,9 +3218,24 @@ async def _generate_image_bg(
                 )
                 print(f"✅ BG image saved for draft {draft_id}: matched={result.matched_count}")
         else:
+            if post_type == "carousel" and slide_index is not None:
+                # Mark slide as failed
+                await db["content_drafts"].update_one(
+                    {"id": draft_id},
+                    {"$set": {f"slides.{slide_index}.image_failed": True}},
+                )
             print(f"⚠️  BG image not saved for draft {draft_id} (no public URL)")
 
     except Exception as e:
+        # Mark slide as failed on exception
+        if db and post_type == "carousel" and slide_index is not None:
+            try:
+                await db["content_drafts"].update_one(
+                    {"id": draft_id},
+                    {"$set": {f"slides.{slide_index}.image_failed": True}},
+                )
+            except:
+                pass
         print(f"❌ BG image task error for draft {draft_id}: {e}\n{traceback.format_exc()}")
 
 
@@ -2614,3 +3290,228 @@ async def trigger_publish_scheduled(
 
     result = await ApprovalWorkflowService.publish_scheduled_content(db=db)
     return result
+
+
+@router.post("/generate-storyboard")
+async def generate_storyboard(
+    request: StoryboardRequest,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Generate a GPT-4o Vision video storyboard from brand images.
+
+    Accepts up to 5 base64 image data URLs plus optional creative direction text.
+    Returns a structured storyboard JSON with per-scene video prompts, motion
+    descriptions, reference image indices, and optional text overlays.
+    """
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    profile_result = await BrandProfileService.get(user_id, db)
+    profile_data = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
+
+    brand_context = {
+        "brand_name": profile_data.get("brand_name", ""),
+        "industry": profile_data.get("industry", "general_other"),
+        "brand_colors": profile_data.get("brand_colors", []),
+        "brand_voice": profile_data.get("derived_voice", ""),
+        "region": profile_data.get("region", ""),
+    }
+
+    from app.agents.social_media_manager.services.video_storyboard_service import VideoStoryboardService
+
+    result = await VideoStoryboardService.generate_storyboard(
+        brand_images=request.brand_images,
+        optional_text=request.optional_text,
+        brand_context=brand_context,
+        target_platform=request.target_platform,
+        target_duration_seconds=request.target_duration_seconds,
+    )
+
+    if not result.get("status"):
+        raise HTTPException(status_code=400, detail=result.get("error", "Storyboard generation failed"))
+
+    return UriResponse.get_single_data_response("storyboard", result["storyboard"])
+
+
+@router.post("/generate-video-from-storyboard")
+async def generate_video_from_storyboard(
+    request: VideoFromStoryboardRequest,
+    background_tasks: BackgroundTasks,
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Start Veo 3.1 video generation for every scene in a storyboard.
+    Returns a job_id immediately. Poll GET /video-job/{job_id} for progress.
+    """
+    from app.agents.social_media_manager.services.video_generation_service import (
+        VideoGenerationService,
+    )
+
+    _get_user_id(token)  # auth check
+
+    job_id = await VideoGenerationService.create_job(request.storyboard, request.model)
+    background_tasks.add_task(
+        VideoGenerationService.run_job,
+        job_id,
+        request.storyboard,
+        request.brand_images,
+        request.model,
+    )
+    return UriResponse.get_single_data_response(
+        "video_job",
+        {"job_id": job_id, "status": "queued", "total_scenes": len(request.storyboard.get("scenes", []))},
+    )
+
+
+@router.get("/video-job/{job_id}")
+async def get_video_job(
+    job_id: str,
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Poll for video generation progress.
+    status: queued | generating | complete | failed
+    current_scene: which scene is being generated right now (1-based)
+    clips: completed clips so far (grows as each scene finishes)
+    """
+    from app.agents.social_media_manager.services.video_generation_service import get_job
+
+    _get_user_id(token)  # auth check
+
+    job = await get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    return UriResponse.get_single_data_response("video_job", job)
+
+
+@router.post("/generate-storyboard-frames")
+async def generate_storyboard_frames(
+    request: StoryboardFramesRequest,
+    background_tasks: BackgroundTasks,
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Start background generation of a unique frame image for each storyboard scene.
+    Returns a job_id immediately. Poll GET /storyboard-frame-job/{job_id} for progress.
+    """
+    from app.agents.social_media_manager.services.video_storyboard_service import VideoStoryboardService
+
+    _get_user_id(token)  # auth check
+
+    job_id = await VideoStoryboardService.create_frame_job(request.scenes)
+    background_tasks.add_task(VideoStoryboardService.run_frame_job, job_id, request.scenes, request.brand_images)
+
+    return UriResponse.get_single_data_response(
+        "frame_job",
+        {"job_id": job_id, "status": "generating", "total_scenes": len(request.scenes)},
+    )
+
+
+@router.get("/storyboard-frame-job/{job_id}")
+async def get_storyboard_frame_job(
+    job_id: str,
+    token: dict = Depends(JWTBearer()),
+):
+    """Poll for storyboard frame image generation progress."""
+    from app.agents.social_media_manager.services.video_storyboard_service import VideoStoryboardService
+
+    _get_user_id(token)  # auth check
+
+    job = await VideoStoryboardService.get_frame_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Frame job not found")
+
+    return UriResponse.get_single_data_response("frame_job", job)
+
+
+@router.post("/merge-video-job/{job_id}")
+async def merge_video_job(
+    job_id: str,
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Merge all completed clips from a finished video job into a single video.
+    Returns the merged Cloudinary video URL.
+    """
+    from app.agents.social_media_manager.services.video_generation_service import get_job
+    from app.agents.social_media_manager.services.video_merge_service import VideoMergeService
+
+    _get_user_id(token)  # auth check
+
+    job = await get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.get("status") != "complete":
+        raise HTTPException(status_code=400, detail="Job is not complete yet")
+
+    clip_urls = [c["video_url"] for c in job.get("clips", []) if c.get("video_url")]
+    if not clip_urls:
+        raise HTTPException(status_code=400, detail="No completed clips to merge")
+
+    try:
+        merged_url = await VideoMergeService.merge_clips(clip_urls)
+    except subprocess.CalledProcessError as e:
+        raise HTTPException(status_code=500, detail=f"ffmpeg merge failed: {e.stderr.decode()[:300]}")
+
+    return UriResponse.get_single_data_response("merged_video", {"merged_video_url": merged_url})
+
+
+class SaveVideoDraftRequest(BaseModel):
+    merged_video_url: str
+    caption: str = ""
+    platforms: List[str] = Field(default_factory=list)
+
+
+@router.post("/video-drafts")
+async def save_video_draft(
+    request: SaveVideoDraftRequest,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """Save a merged video as a draft for later posting."""
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    from datetime import datetime, timezone
+    import uuid as _uuid
+
+    draft_id = _uuid.uuid4().hex
+    doc = {
+        "id": draft_id,
+        "request_id": draft_id,      # satisfies unique index on content_drafts
+        "platform": "video",          # satisfies compound index (request_id, platform)
+        "user_id": user_id,
+        "media_type": "video",
+        "video_url": request.merged_video_url,
+        "content": request.caption,
+        "platforms": request.platforms,
+        "status": "draft",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db["content_drafts"].insert_one(doc)
+
+    doc.pop("_id", None)
+    return UriResponse.get_single_data_response("video_draft", doc)
+
+
+@router.get("/video-drafts")
+async def list_video_drafts(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """List all saved video drafts for the current user."""
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    drafts = await db["content_drafts"].find(
+        {"user_id": user_id, "media_type": "video"},
+        {"_id": 0},
+    ).sort("created_at", -1).to_list(length=50)
+
+    return UriResponse.get_single_data_response("video_drafts", drafts)

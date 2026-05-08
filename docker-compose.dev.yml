@@ -1,25 +1,38 @@
-version: "3.9"
+version: '3.9'
 
 services:
   uri-agent.api:
     image: uriteam/urisvc:uriagentdev
+    container_name: uri-agent.api
     build:
       context: .
       dockerfile: Dockerfile
-    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "80", "--workers", "4"]
+    command:
+      [
+        'uvicorn',
+        'app.main:app',
+        '--host',
+        '0.0.0.0',
+        '--port',
+        '80',
+        '--workers',
+        '4',
+      ]
     env_file:
       - .env.staging
     environment:
       - ENV=Development
+      - APP_ENV=staging
       - URI_GATEWAY_BASE_API_URL=http://uri-gateway.api
       - PUBLIC_API_URL=https://api-staging.urisocial.com
     restart: always
     ports:
-      - "9003:80"
+      - '9003:80'
     volumes:
       - /home/uridev/uri-static-images:/app/static/images
     networks:
-      - uritest-network
+      uritest-network:
+        ipv4_address: 172.22.0.16
 
 networks:
   uritest-network:

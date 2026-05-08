@@ -25,6 +25,7 @@ class BrandProfileService:
             "product_description": data.get("product_description", ""),
             "key_products_services": data.get("key_products_services", []),
             "logo_url": data.get("logo_url"),
+            "logo_position": data.get("logo_position", "bottom_right"),
             "sample_template_urls": data.get("sample_template_urls", []),
             "brand_colors": data.get("brand_colors", []),
             "personality_quiz": data.get("personality_quiz", {}),
@@ -53,6 +54,26 @@ class BrandProfileService:
             "languages": data.get("languages", []),
             "region": data.get("region", ""),
             "onboarding_completed": data.get("onboarding_completed", False),
+            # Caption Voice System fields (PRD Section 3.1)
+            "voice_profile": {
+                "formality": data.get("voice_profile", {}).get("formality", "casual"),
+                "sentence_style": data.get("voice_profile", {}).get("sentence_style", "mixed_rhythm"),
+                "emoji_usage": data.get("voice_profile", {}).get("emoji_usage", "light"),
+                "emoji_placement": data.get("voice_profile", {}).get("emoji_placement", "end_of_lines"),
+                "slang_level": data.get("voice_profile", {}).get("slang_level", "pure_english"),
+                "cta_style": data.get("voice_profile", {}).get("cta_style", "direct"),
+                "caption_length": data.get("voice_profile", {}).get("caption_length", "short"),
+                "hook_style": data.get("voice_profile", {}).get("hook_style", "bold_statement"),
+                "hashtag_style": data.get("voice_profile", {}).get("hashtag_style", "minimal"),
+                "hashtag_placement": data.get("voice_profile", {}).get("hashtag_placement", "end"),
+                "humor_level": data.get("voice_profile", {}).get("humor_level", "none"),
+                "nigerian_expressions": data.get("voice_profile", {}).get("nigerian_expressions", []),
+                "banned_words": data.get("voice_profile", {}).get("banned_words", []),
+                "sample_captions": data.get("voice_profile", {}).get("sample_captions", []),
+                "platform_overrides": data.get("voice_profile", {}).get("platform_overrides", {}),
+            },
+            # Voice sample analysis (PRD Section 6.1)
+            "voice_sample_analysis": data.get("voice_sample_analysis", {}),
             "updated_at": now,
         }
         if "style_selections" in data:
@@ -64,9 +85,17 @@ class BrandProfileService:
         if "font_style_prompt" in data:
             doc["font_style_prompt"] = data["font_style_prompt"]
 
+        existing = await db[BrandProfileService.COLLECTION].find_one({"user_id": user_id})
+
         # OPTION 2: ONBOARDING VALIDATION - Enforce required fields
-        # When user tries to mark onboarding as complete, validate critical fields
-        if doc.get("onboarding_completed"):
+        # Only validate when user is ACTIVELY TRYING to complete onboarding (transition from False→True)
+        # Don't block subsequent saves after onboarding is already complete
+        is_completing_onboarding = (
+            doc.get("onboarding_completed") and
+            (not existing or not existing.get("onboarding_completed"))
+        )
+
+        if is_completing_onboarding:
             required_for_completion = {
                 "brand_name": doc.get("brand_name"),
                 "industry": doc.get("industry"),
@@ -77,16 +106,17 @@ class BrandProfileService:
             if missing:
                 # Cannot complete onboarding without required fields
                 doc["onboarding_completed"] = False
-                return UriResponse.error_response(
-                    f"Cannot complete onboarding. Please provide: {', '.join(missing)}",
-                    code=400
+                from fastapi import HTTPException as _HTTPException
+                raise _HTTPException(
+                    status_code=400,
+                    detail=f"Cannot complete onboarding. Please provide: {', '.join(missing)}",
                 )
 
-        existing = await db[BrandProfileService.COLLECTION].find_one({"user_id": user_id})
         if existing:
             # Once onboarding_completed is True, never allow it to be reset to False
             if existing.get("onboarding_completed") and not doc.get("onboarding_completed"):
                 doc["onboarding_completed"] = True
+            print(f"🖼️  SAVE DEBUG user={user_id}: saving logo_position={repr(doc.get('logo_position'))}")
             await db[BrandProfileService.COLLECTION].update_one(
                 {"user_id": user_id}, {"$set": doc}
             )
@@ -154,6 +184,7 @@ class BrandProfileService:
             "business_description": profile.get("product_description", ""),
             "key_products_services": [p for p in (profile.get("key_products_services") or []) if p],
             "logo_url":             profile.get("logo_url"),
+            "logo_position":        profile.get("logo_position", "bottom_right"),
             "sample_template_urls": [u for u in (profile.get("sample_template_urls") or []) if u],
             "brand_colors":         profile.get("brand_colors") or [],
             "brand_voice":          brand_voice,
@@ -178,4 +209,7 @@ class BrandProfileService:
             "style_rotation_index": int(profile.get("style_rotation_index") or 0),
             "font_style":           profile.get("font_style", ""),
             "font_style_prompt":    profile.get("font_style_prompt", ""),
+            # Caption Voice System fields
+            "voice_profile":        profile.get("voice_profile") or {},
+            "voice_sample_analysis": profile.get("voice_sample_analysis") or {},
         }
