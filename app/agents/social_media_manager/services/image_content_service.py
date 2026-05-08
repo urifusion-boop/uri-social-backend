@@ -787,45 +787,31 @@ Follow these rules precisely for every image. No exceptions.
             if not image_prompt:
                 image_prompt = seed_content.strip()
 
-            # When a reference image is provided, use product photography composition (PRD Section 5)
-            # This is PROFESSIONAL PRODUCT PHOTOGRAPHY, not graphic design with split panels
+            # When a reference image is provided, use two-zone product composition (PRD Section 5)
             # The product is sacred - never modify it. Everything around it is AI-generated.
             if reference_image:
                 image_prompt = (
                     image_prompt.rstrip()
-                    + "\n\n=== PRODUCT PHOTOGRAPHY COMPOSITION ===\n"
-                    "This is PROFESSIONAL PRODUCT PHOTOGRAPHY for editorial/luxury quality.\n\n"
-
-                    "COMPOSITION RULES:\n"
-                    "- Product positioned using golden ratio (slightly off-center, NOT dead center)\n"
-                    "- Product occupies 40-60% of frame\n"
-                    "- Generous negative space on one side for visual breathing room\n"
-                    "- This is NOT a split-screen graphic design layout\n"
-                    "- Think: Tom Ford perfume ad, Jo Malone product shot, luxury editorial photography\n\n"
-
-                    "REFERENCE IMAGE HANDLING:\n"
-                    "- The reference image shows the ACTUAL product to photograph\n"
-                    "- Place this EXACT product into a professionally styled scene\n"
-                    "- Product must appear IDENTICAL: same shape, label, cap, colors, proportions\n"
-                    "- DO NOT recreate or regenerate the product - preserve it exactly\n\n"
-
-                    "WHAT TO GENERATE (around the product):\n"
-                    "- Professional surface: marble, dark wood, velvet platform\n"
-                    "- Styling props: complementary items arranged artistically (NOT covering product)\n"
-                    "- Studio lighting: soft directional creating elegant shadows\n"
-                    "- Background: solid color, gradient, or atmospheric (soft smoke, bokeh)\n\n"
-
-                    "TEXT RULES FOR PRODUCT PHOTOGRAPHY:\n"
-                    "- The product's own label/branding is the ONLY descriptive text visible\n"
-                    "- DO NOT generate headline text, taglines, or product descriptions\n"
-                    "- DO NOT add ingredient lists, fragrance notes, or marketing copy\n"
-                    "- The CTA text (already specified above) MAY appear small at the bottom\n"
-                    "- This is pure product photography - marketing copy belongs in the caption\n\n"
-
-                    "WHAT NOT TO CHANGE:\n"
-                    "- The product itself (bottle, packaging, label, cap, liquid color)\n"
-                    "- Product shape or proportions\n"
-                    "- Product branding or text on the product"
+                    + "\n\n=== TWO-ZONE PRODUCT COMPOSITION ===\n"
+                    "Create a professional social media product graphic with TWO distinct zones:\n\n"
+                    "PRODUCT ZONE (55% of frame, positioned left or right):\n"
+                    "- The product from the reference image, placed slightly off-center\n"
+                    "- The product must appear EXACTLY as it looks in the reference photo\n"
+                    "- Same shape, same colours, same label, same proportions\n"
+                    "- Professional background, surface, and optional styling props AROUND the product\n"
+                    "- Background can be: solid colour, gradient, textured surface, or styled scene\n\n"
+                    "TEXT ZONE (45% of frame, opposite side of product):\n"
+                    "- Clean background (solid colour, gradient, or subtle texture)\n"
+                    "- All text placed in this zone: headline, subtext, CTA\n"
+                    "- Text must be in the NEGATIVE SPACE beside the product\n"
+                    "- NO text overlapping or on top of the product\n"
+                    "- 20px minimum gap between any text and the product\n\n"
+                    "CRITICAL RULES:\n"
+                    "- The product itself is SACRED - never distort, never regenerate, never modify\n"
+                    "- Everything AROUND the product is AI-generated professional styling\n"
+                    "- Text lives BESIDE the product in negative space, never on top of it\n"
+                    "- The two zones must not overlap\n"
+                    "- Product label/branding on the actual product must be clearly visible"
                 )
 
             # ========== IMAGE GENERATION DEBUG (PRD Section 2) ==========
