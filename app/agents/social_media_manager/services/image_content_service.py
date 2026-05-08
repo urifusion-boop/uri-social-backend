@@ -247,6 +247,103 @@ class ImageContentService:
             return image_url
 
     @staticmethod
+    def get_product_composition_guidelines(product_category: str) -> Dict[str, str]:
+        """
+        Product-specific composition guidelines (PRD Section 5.2).
+        Returns styling rules based on product category.
+
+        Returns:
+            {
+                "angle": str,  # Ideal camera angle
+                "surface": str,  # Recommended surface
+                "props": str,  # Typical props
+                "background": str  # Background style
+            }
+        """
+        guidelines = {
+            "perfume": {
+                "angle": "Front-facing, slight 15° angle to show label and depth",
+                "surface": "Marble, stone, dark wood, or silk fabric",
+                "props": "Fragrance ingredients: petals, vanilla pods, citrus slices, spices, oud chips",
+                "background": "Solid colour, gradient, or atmospheric (smoke, bokeh)"
+            },
+            "fragrance": {
+                "angle": "Front-facing, slight 15° angle to show label and depth",
+                "surface": "Marble, stone, dark wood, or silk fabric",
+                "props": "Fragrance ingredients: petals, vanilla pods, citrus slices, spices, oud chips",
+                "background": "Solid colour, gradient, or atmospheric (smoke, bokeh)"
+            },
+            "skincare": {
+                "angle": "Front-facing, upright, label readable",
+                "surface": "Marble, glass shelf, bathroom surface",
+                "props": "Raw ingredients: aloe, honey, citrus, herbs",
+                "background": "Clean minimal or botanical"
+            },
+            "beauty": {
+                "angle": "Front-facing, upright, label readable",
+                "surface": "Marble, glass shelf, vanity surface",
+                "props": "Raw ingredients: aloe, honey, citrus, botanicals",
+                "background": "Clean minimal or botanical"
+            },
+            "food": {
+                "angle": "45° overhead or front-facing for bottles",
+                "surface": "Wood board, marble, rustic surface",
+                "props": "Raw ingredients of the dish/drink",
+                "background": "Warm, natural, kitchen-adjacent"
+            },
+            "beverage": {
+                "angle": "45° overhead or front-facing",
+                "surface": "Wood board, marble, bar surface",
+                "props": "Ingredients, garnishes, ice",
+                "background": "Warm, inviting, bar or kitchen setting"
+            },
+            "fashion": {
+                "angle": "Flat-lay (overhead) or on-figure if full outfit",
+                "surface": "Clean white, linen, wood plank",
+                "props": "Complementary accessories: sunglasses, bag, shoes",
+                "background": "Clean white/cream or lifestyle context"
+            },
+            "clothing": {
+                "angle": "Flat-lay (overhead)",
+                "surface": "Clean white or neutral fabric",
+                "props": "Accessories that complement the garment",
+                "background": "Clean minimal"
+            },
+            "electronics": {
+                "angle": "Front-facing or 3/4 angle",
+                "surface": "Clean surface, desk, or floating",
+                "props": "Minimal: maybe a cable or accessory",
+                "background": "Gradient, dark, or clean white"
+            },
+            "gadget": {
+                "angle": "Front-facing or 3/4 angle",
+                "surface": "Modern desk or tech surface",
+                "props": "Related accessories only",
+                "background": "Tech-themed gradient or dark"
+            },
+            "jewellery": {
+                "angle": "Close-up, detail-forward",
+                "surface": "Velvet, marble, mirror surface",
+                "props": "Minimal: maybe a single flower or fabric swatch",
+                "background": "Dark for gold/diamonds, light for silver/pearls"
+            },
+            "jewelry": {
+                "angle": "Close-up, detail-forward",
+                "surface": "Velvet, marble, mirror surface",
+                "props": "Minimal: single flower or elegant fabric",
+                "background": "Dark for gold/diamonds, light for silver/pearls"
+            }
+        }
+
+        # Return product-specific guidelines or generic fallback
+        return guidelines.get(product_category.lower(), {
+            "angle": "Front-facing, label visible",
+            "surface": "Clean neutral surface",
+            "props": "Contextual items that relate to the product's use",
+            "background": "Brand colour-matched gradient or solid"
+        })
+
+    @staticmethod
     async def generate_content_with_images(
         user_id: str,
         seed_content: str,
