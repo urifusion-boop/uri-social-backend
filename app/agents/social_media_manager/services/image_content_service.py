@@ -45,7 +45,304 @@ class ImageContentService:
             "profile_image": {"width": 320, "height": 320, "format": "square"}
         }
     }
-    
+
+    @staticmethod
+    async def check_reference_image_quality(image_url: str) -> Dict[str, Any]:
+        """
+        Quality gate for reference images (PRD Section 3: Quality Gate).
+        Checks resolution, blur, and exposure before processing.
+
+        Returns:
+            {
+                "passed": bool,
+                "message": str (only if failed),
+                "width": int,
+                "height": int
+            }
+        """
+        try:
+            import io
+            import requests
+            from PIL import Image
+            import numpy as np
+
+            # Fetch the image
+            response = requests.get(image_url, timeout=10)
+            response.raise_for_status()
+            img = Image.open(io.BytesIO(response.content))
+
+            width, height = img.size
+
+            # Check 1: Minimum resolution (500x500)
+            if width < 500 or height < 500:
+                return {
+                    "passed": False,
+                    "message": "This photo is a bit small. Can you send a higher quality version? It'll make your product look much better.",
+                    "width": width,
+                    "height": height
+                }
+
+            # Check 2: Blur detection using Laplacian variance
+            # Convert to grayscale and check sharpness
+            gray = img.convert('L')
+            np_img = np.array(gray)
+
+            # Calculate Laplacian variance (measure of sharpness)
+            from scipy import ndimage
+            laplacian = ndimage.laplace(np_img)
+            variance = laplacian.var()
+
+            # Threshold for blur detection (empirically determined)
+            if variance < 100:
+                return {
+                    "passed": False,
+                    "message": "This photo is a bit blurry. A clearer shot will give you a much better result.",
+                    "width": width,
+                    "height": height
+                }
+
+            # Check 3: Exposure check (too dark or too bright)
+            # Calculate mean brightness
+            brightness = np.array(gray).mean()
+
+            if brightness < 40:
+                return {
+                    "passed": False,
+                    "message": "The lighting on this photo is a bit dark. Can you retake in better lighting, or want me to work with it?",
+                    "width": width,
+                    "height": height
+                }
+            elif brightness > 220:
+                return {
+                    "passed": False,
+                    "message": "The lighting on this photo is a bit bright. Can you retake in better lighting, or want me to work with it?",
+                    "width": width,
+                    "height": height
+                }
+
+            # All checks passed
+            return {
+                "passed": True,
+                "width": width,
+                "height": height
+            }
+
+        except Exception as e:
+            # If quality check fails, allow the image to proceed
+            # (don't block generation due to quality check errors)
+            print(f"⚠️ Quality check error: {str(e)}")
+            return {
+                "passed": True,
+                "width": 0,
+                "height": 0
+            }
+
+    @staticmethod
+    async def detect_product_category(image_url: str) -> Dict[str, Any]:
+        """
+        Product detection using GPT-4o-mini vision (PRD Section 3: Product Detection).
+        Identifies product category and suggests styling elements.
+
+        Returns:
+            {
+                "category": str,  # e.g., "perfume", "skincare", "food"
+                "subcategory": str,  # e.g., "oriental", "moisturizer", "beverage"
+                "suggested_props": str,  # e.g., "amber resin, cinnamon sticks"
+                "suggested_surface": str,  # e.g., "dark wood or ornate metal tray"
+                "suggested_mood": str,  # e.g., "warm, smoky, luxurious"
+                "color_notes": str  # e.g., "bottle is dark amber glass with gold cap"
+            }
+        """
+        try:
+            from app.services.AIService import client as openai_client
+
+            prompt = """What product is in this image? Return JSON with these fields:
+{
+  "category": "product category (perfume/skincare/food/fashion/electronics/jewellery/other)",
+  "subcategory": "more specific type",
+  "suggested_props": "2-4 styling props that would complement this product in a photo shoot",
+  "suggested_surface": "ideal surface for product photography",
+  "suggested_mood": "3-4 adjectives describing the mood",
+  "color_notes": "describe the product's colors and materials"
+}"""
+
+            response = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: openai_client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": image_url}},
+                            {"type": "text", "text": prompt}
+                        ]
+                    }],
+                    max_tokens=200,
+                    temperature=0.3
+                )
+            )
+
+            import json
+            result = json.loads(response.choices[0].message.content.strip())
+
+            print(f"🔍 Product detection: {result.get('category')} - {result.get('subcategory')}")
+
+            return result
+
+        except Exception as e:
+            print(f"⚠️ Product detection error: {str(e)}")
+            # Return generic fallback
+            return {
+                "category": "product",
+                "subcategory": "general",
+                "suggested_props": "complementary items",
+                "suggested_surface": "clean neutral surface",
+                "suggested_mood": "professional, clean, minimal",
+                "color_notes": "brand colors"
+            }
+
+    @staticmethod
+    async def remove_background(image_url: str) -> Optional[str]:
+        """
+        Background removal (PRD Section 3: Step 4 - Background Removal).
+        Extracts the product as a clean cutout on transparent background.
+
+        NOTE: This uses GPT-Image-2 edit mode ONLY for background removal,
+        NOT for the final graphic generation.
+
+        Returns:
+            URL of the product cutout with transparent background, or None if failed
+        """
+        try:
+            from app.services.AIService import client as openai_client
+            import requests
+            import io
+
+            # Download the image
+            response = requests.get(image_url, timeout=10)
+            response.raise_for_status()
+            image_bytes = io.BytesIO(response.content)
+
+            # Use GPT-Image-2 edit mode for background removal ONLY
+            result = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: openai_client.images.edit(
+                    model="dall-e-2",  # edit mode only available in dall-e-2
+                    image=image_bytes,
+                    prompt="Remove the background completely. Keep only the product on a transparent background. Do not modify the product in any way — preserve exact colours, details, and proportions.",
+                    n=1,
+                    size="1024x1024"
+                )
+            )
+
+            cutout_url = result.data[0].url
+            print(f"✂️ Background removed: {cutout_url}")
+
+            return cutout_url
+
+        except Exception as e:
+            print(f"⚠️ Background removal error: {str(e)}")
+            # If background removal fails, return original image
+            # The generation will still work, just without clean cutout
+            return image_url
+
+    @staticmethod
+    def get_product_composition_guidelines(product_category: str) -> Dict[str, str]:
+        """
+        Product-specific composition guidelines (PRD Section 5.2).
+        Returns styling rules based on product category.
+
+        Returns:
+            {
+                "angle": str,  # Ideal camera angle
+                "surface": str,  # Recommended surface
+                "props": str,  # Typical props
+                "background": str  # Background style
+            }
+        """
+        guidelines = {
+            "perfume": {
+                "angle": "Front-facing, slight 15° angle to show label and depth",
+                "surface": "Marble, stone, dark wood, or silk fabric",
+                "props": "Fragrance ingredients: petals, vanilla pods, citrus slices, spices, oud chips",
+                "background": "Solid colour, gradient, or atmospheric (smoke, bokeh)"
+            },
+            "fragrance": {
+                "angle": "Front-facing, slight 15° angle to show label and depth",
+                "surface": "Marble, stone, dark wood, or silk fabric",
+                "props": "Fragrance ingredients: petals, vanilla pods, citrus slices, spices, oud chips",
+                "background": "Solid colour, gradient, or atmospheric (smoke, bokeh)"
+            },
+            "skincare": {
+                "angle": "Front-facing, upright, label readable",
+                "surface": "Marble, glass shelf, bathroom surface",
+                "props": "Raw ingredients: aloe, honey, citrus, herbs",
+                "background": "Clean minimal or botanical"
+            },
+            "beauty": {
+                "angle": "Front-facing, upright, label readable",
+                "surface": "Marble, glass shelf, vanity surface",
+                "props": "Raw ingredients: aloe, honey, citrus, botanicals",
+                "background": "Clean minimal or botanical"
+            },
+            "food": {
+                "angle": "45° overhead or front-facing for bottles",
+                "surface": "Wood board, marble, rustic surface",
+                "props": "Raw ingredients of the dish/drink",
+                "background": "Warm, natural, kitchen-adjacent"
+            },
+            "beverage": {
+                "angle": "45° overhead or front-facing",
+                "surface": "Wood board, marble, bar surface",
+                "props": "Ingredients, garnishes, ice",
+                "background": "Warm, inviting, bar or kitchen setting"
+            },
+            "fashion": {
+                "angle": "Flat-lay (overhead) or on-figure if full outfit",
+                "surface": "Clean white, linen, wood plank",
+                "props": "Complementary accessories: sunglasses, bag, shoes",
+                "background": "Clean white/cream or lifestyle context"
+            },
+            "clothing": {
+                "angle": "Flat-lay (overhead)",
+                "surface": "Clean white or neutral fabric",
+                "props": "Accessories that complement the garment",
+                "background": "Clean minimal"
+            },
+            "electronics": {
+                "angle": "Front-facing or 3/4 angle",
+                "surface": "Clean surface, desk, or floating",
+                "props": "Minimal: maybe a cable or accessory",
+                "background": "Gradient, dark, or clean white"
+            },
+            "gadget": {
+                "angle": "Front-facing or 3/4 angle",
+                "surface": "Modern desk or tech surface",
+                "props": "Related accessories only",
+                "background": "Tech-themed gradient or dark"
+            },
+            "jewellery": {
+                "angle": "Close-up, detail-forward",
+                "surface": "Velvet, marble, mirror surface",
+                "props": "Minimal: maybe a single flower or fabric swatch",
+                "background": "Dark for gold/diamonds, light for silver/pearls"
+            },
+            "jewelry": {
+                "angle": "Close-up, detail-forward",
+                "surface": "Velvet, marble, mirror surface",
+                "props": "Minimal: single flower or elegant fabric",
+                "background": "Dark for gold/diamonds, light for silver/pearls"
+            }
+        }
+
+        # Return product-specific guidelines or generic fallback
+        return guidelines.get(product_category.lower(), {
+            "angle": "Front-facing, label visible",
+            "surface": "Clean neutral surface",
+            "props": "Contextual items that relate to the product's use",
+            "background": "Brand colour-matched gradient or solid"
+        })
+
     @staticmethod
     async def generate_content_with_images(
         user_id: str,
@@ -195,10 +492,18 @@ class ImageContentService:
             if not seed_content:
                 seed_content = content  # last resort
 
+            # Load brand profile so logo (and its position) are applied during regeneration
+            from app.agents.social_media_manager.services.brand_profile_service import BrandProfileService as _BPS
+            _profile_doc = await db["brand_profiles"].find_one({"user_id": user_id})
+            if _profile_doc:
+                _profile_doc.pop("_id", None)
+            regen_brand_context = _BPS.to_brand_context(_profile_doc) if _profile_doc else {}
+
             image_result = await ImageContentService._generate_platform_image(
                 platform=platform,
                 content=content,
                 seed_content=seed_content,
+                brand_context=regen_brand_context,
                 feedback=feedback,
             )
 
@@ -241,6 +546,45 @@ class ImageContentService:
             print(f"❌ regenerate_image error for {draft_id}: {e}")
 
     @staticmethod
+    def _get_dynamic_motion_detail(industry: str) -> str:
+        """
+        Returns dynamic motion instructions based on product category (PRD Section 3).
+        Every immersive image includes at least ONE element suggesting frozen motion.
+        """
+        motion_map = {
+            "perfume_fragrance": "Smoke wisps, floating petals drifting upward. Gold dust particles catching light.",
+            "beauty_wellness": "Gentle splash of liquid. Petals or ingredients drifting. Dewy droplets forming on surface. Light catching moisture.",
+            "water_beverage": "Explosive water splash around bottle. Droplets frozen mid-air. Ice crystals, condensation, ripple patterns.",
+            "juice_smoothie": "Fruit pieces exploding outward. Juice splashing in arcs. Scattered berries, citrus slices, leaves flying.",
+            "dairy_milk": "Milk/cream splash erupting around product. Creamy swirls. Dripping cream, poured liquid, splatter patterns.",
+            "food_beverage": "Ingredient explosion: crumbs, herbs, spices mid-air. Steam rising. Sauce drizzle, cheese pull, crunch particles.",
+            "fashion_ecommerce": "Fabric in motion: flowing, catching wind, dynamic drape. Lens flare, urban particles, motion blur in background.",
+            "shoes_accessories": "Ground particle kick-up. Lace or strap in motion. Water splash on wet surface. Dust in light beam.",
+            "fintech_saas_tech": "Light trails, data particles, holographic glow effects. Reflections on glossy surfaces. Cool atmospheric haze.",
+            "jewellery_watches": "Sparkle particles. Light caustics from gems. Velvet ripple. Metallic reflection patterns.",
+            "home_candles": "Flame flicker. Wax melt. Smoke curl. Warm bokeh. Dust in sunbeam. Soft focus.",
+        }
+        return motion_map.get(industry, "Floating dust, light motes, atmospheric haze. Micro-splashes, surface texture, soft motion.")
+
+    @staticmethod
+    def _get_text_styling_detail(industry: str) -> str:
+        """
+        Returns text styling instructions based on product category (PRD Section 4.2).
+        Text has material properties that match the product world.
+        """
+        text_style_map = {
+            "perfume_fragrance": "Elegant serif or script in gold/cream/white. Subtle glow or shadow for readability.",
+            "beauty_wellness": "Script or serif in warm palette. Slight glossy or dewy sheen effect.",
+            "water_beverage": "Bold sans-serif. Water droplet texture or translucent quality.",
+            "juice_smoothie": "Bold, chunky, playful. Gradient colours matching fruit palette.",
+            "dairy_milk": "Flowing script in white with liquid/cream texture. Letters appear made of milk.",
+            "food_beverage": "Bold, warm-toned. Slight texture matching food surface (crispy, glazed).",
+            "fashion_ecommerce": "Clean condensed sans-serif. White or metallic against atmosphere.",
+            "fintech_saas_tech": "Thin geometric sans-serif. Subtle neon glow or holographic shimmer.",
+        }
+        return text_style_map.get(industry, "Clean sans-serif. Subtle shadow for readability. No heavy effects.")
+
+    @staticmethod
     async def _generate_platform_image(
         platform: str,
         content: str,
@@ -250,12 +594,17 @@ class ImageContentService:
         feedback: Optional[str] = None,
         image_type: str = "post_image",
         image_model: Optional[str] = None,
+        slide_index: Optional[int] = None,
+        total_slides: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Generate an AI image optimized for a specific platform.
         image_type: "post_image" (default), "story" (9:16), or any key in IMAGE_SPECS[platform].
+        For carousel slides: slide_index and total_slides provide context for slide numbering.
         """
         try:
+            # ALWAYS use GPT-Image-2 generation mode for final graphics (PRD Section 8)
+            # Background removal uses edit mode, but final generation uses generation mode
             image_model = "openai/gpt-image-2"
 
             specs = ImageContentService._get_platform_image_specs(platform, image_type=image_type)
@@ -266,14 +615,16 @@ class ImageContentService:
             region = bc.get("region", "")
             brand_colors = bc.get("brand_colors") or []
 
-            # Look up the style description from the library using the slug
+            # Look up the style description and composition mode from the library using the slug
             style_slug = bc.get("style_slug", "")
             style_desc = ""
+            composition_mode = "immersive"  # default to immersive (PRD Section 1)
             if style_slug:
                 from app.agents.social_media_manager.services.style_library import get_style
                 s = get_style(style_slug)
                 if s:
                     style_desc = s.get("description", "")
+                    composition_mode = s.get("composition_mode", "immersive")
 
             # ========== RESTRUCTURED PROMPT ASSEMBLY (PRD Section 3) ==========
             # CRITICAL: Brand rules MUST come FIRST - GPT-Image-2 weights prompt beginning more heavily
@@ -334,7 +685,21 @@ Every element in the image must come from the instructions below. Nothing else."
             else:
                 brand_name_directive = 'Do NOT display the brand name or logo anywhere. Brand identity is expressed through colours and visual treatment only.'
 
-            professional_rules = f"""=== PROFESSIONAL OUTPUT RULES ===
+            # Add slide number context for carousel slides
+            slide_context = ""
+            if slide_index is not None and total_slides is not None:
+                slide_num = slide_index + 1  # Convert 0-indexed to 1-indexed
+                slide_context = f"""
+=== CAROUSEL SLIDE CONTEXT ===
+This is slide {slide_num} of {total_slides} in a carousel post.
+- Add a small, subtle slide indicator "({slide_num}/{total_slides})" in the bottom-right corner
+- Use very small text (20-25% of CTA text size), light grey or semi-transparent white
+- Position it within safe margins, not overlapping other elements
+- The slide indicator helps users track their progress through the carousel
+- Maintain consistent visual style across all {total_slides} slides (same colors, fonts, layout approach)
+"""
+
+            professional_rules = f"""{slide_context}=== PROFESSIONAL OUTPUT RULES ===
 Follow these rules precisely for every image. No exceptions.
 
 1. BRAND NAME: {brand_name_directive}
@@ -387,7 +752,14 @@ Follow these rules precisely for every image. No exceptions.
     over random. Every element earns its place."""
 
             # SECTION 3: VISUAL STYLE
-            visual_style = f"=== VISUAL STYLE ===\n{style_fragment}" if style_fragment else ""
+            _default_style = (
+                "Clean, modern typographic social media post. Bold headline text is the dominant visual element. "
+                "Solid colour or subtle gradient background using brand colours. "
+                "Professional flat design — NO 3D renders, NO clipart, NO generic stock illustrations. "
+                "Strong visual hierarchy: large headline, smaller subheading, clean layout with generous whitespace. "
+                "Text overlays must be crisp and legible at a glance."
+            )
+            visual_style = f"=== VISUAL STYLE ===\n{style_fragment if style_fragment else _default_style}"
 
             # SECTION 4: BRAND IDENTITY
             brand_identity_parts = [f"=== BRAND IDENTITY ==="]
@@ -411,8 +783,7 @@ Follow these rules precisely for every image. No exceptions.
             if font_prompt:
                 format_parts.append(f"Typography: {font_prompt}")
             else:
-                # CRITICAL: When no font prompt exists, explicitly prevent text overlays
-                format_parts.append("Typography: NO TEXT OVERLAYS. NO TYPOGRAPHY. Pure visual design without any written words, labels, or text elements.")
+                format_parts.append("Typography: Clean, modern sans-serif typeface. Bold headline text with strong contrast, readable subheading, professional typographic hierarchy. Text must be clearly legible.")
             format_section = "\n".join(format_parts)
 
             # SECTION 6: DO NOT INCLUDE (PRD Section 3.1 - Critical for preventing hallucinations)
@@ -457,13 +828,85 @@ Follow these rules precisely for every image. No exceptions.
             if not image_prompt:
                 image_prompt = seed_content.strip()
 
-            # When a reference image is provided, always append a hard no-crop directive.
+            # Add composition block based on style's composition_mode (Immersive Composition System PRD)
+            # When a reference image is provided, choose composition style based on the visual style
             if reference_image:
-                image_prompt = (
-                    image_prompt.rstrip()
-                    + " Full body shown completely from head to toe. Entire garment/product fully visible in frame — "
-                    "no cropping of any part of the clothing, subject, or object. Wide enough framing to show everything."
-                )
+                # Get industry and dynamic details for immersive mode
+                industry = bc.get("industry", "general_other")
+                dynamic_motion = ImageContentService._get_dynamic_motion_detail(industry)
+                text_styling = ImageContentService._get_text_styling_detail(industry)
+
+                if composition_mode == "editorial":
+                    # Editorial/Two-Zone mode for minimal/clean styles
+                    composition_block = """
+=== EDITORIAL COMPOSITION ===
+Create a professional social media product graphic with TWO distinct zones:
+
+PRODUCT ZONE (55% of frame, positioned left or right):
+- The product from the reference image, placed slightly off-center
+- The product must appear EXACTLY as it looks in the reference photo
+- Same shape, same colours, same label, same proportions
+- Professional background, surface, and optional styling props AROUND the product
+- Background can be: solid colour, gradient, textured surface, or styled scene
+
+TEXT ZONE (45% of frame, opposite side of product):
+- Clean background (solid colour, gradient, or subtle texture)
+- All text placed in this zone: headline, subtext, CTA
+- Text must be in the NEGATIVE SPACE beside the product
+- NO text overlapping or on top of the product
+- 20px minimum gap between any text and the product
+
+CRITICAL RULES:
+- The product itself is SACRED - never distort, never regenerate, never modify
+- Everything AROUND the product is AI-generated professional styling
+- Text lives BESIDE the product in negative space, never on top of it
+- The two zones must not overlap
+- Product label/branding on the actual product must be clearly visible"""
+                else:
+                    # Immersive mode (default) - product exists INSIDE a 360° environment
+                    composition_block = f"""
+=== IMMERSIVE COMPOSITION ===
+Create a professional social media product graphic where the product
+exists INSIDE a three-dimensional environment.
+
+PRODUCT:
+- Gravitational centre of the image, slightly off-centre (40/60 split)
+- SHARPEST element in the image. Everything else can be softer.
+- Appears EXACTLY as in the reference photo. NOT regenerated.
+- Can be slightly angled for dynamic energy.
+
+ENVIRONMENT (wraps around product from ALL directions):
+- BEHIND: Atmospheric depth - light falloff, haze, bokeh, context
+- BELOW: Grounded - natural surface, liquid, ingredients
+- SIDES: Context elements at varying distances for depth layers
+- ABOVE: Atmospheric space where text lives. Sky, light, particles.
+- IN FRONT: Subtle foreground blur at bottom/edges of frame
+
+DYNAMIC MOTION:
+{dynamic_motion}
+- High-speed photography feel: sharp, detailed, frozen at 1/2000th
+
+TEXT:
+- Floats in natural pockets of atmospheric space
+- Part of the scene, not pasted on top
+- {text_styling}
+- NEVER overlaps product label
+- Max 3 elements: headline (5 words), subtext (optional), CTA
+- CTA at the bottom, integrated into the scene
+
+DEPTH AND ATMOSPHERE:
+- THREE depth layers: soft foreground, sharp product, atmospheric bg
+- ONE clear directional light source with highlights and shadows
+- Rich tonal range: no pure black, no pure white
+- Micro-details: particles, condensation, texture, reflections
+- ONE unified colour temperature throughout
+
+OVERALL:
+- Frozen moment in a living world, not a composited product photo
+- The viewer should FEEL something: desire, freshness, energy, warmth
+- Should stop a scroll and make someone look closer"""
+
+                image_prompt = image_prompt.rstrip() + "\n" + composition_block
 
             # ========== IMAGE GENERATION DEBUG (PRD Section 2) ==========
             from datetime import datetime
@@ -520,13 +963,15 @@ Follow these rules precisely for every image. No exceptions.
                 logo_url = (brand_context or {}).get('logo_url')
                 if logo_url:
                     import re as _re_logo
+                    logo_position = (brand_context or {}).get('logo_position', 'bottom_right')
+                    print(f"🖼️  OVERLAY DEBUG: logo_position={repr(logo_position)}, brand_context_keys={list((brand_context or {}).keys())}")
                     data_url = image_response['url']
                     _m = _re_logo.match(r"data:[^;]+;base64,(.+)", data_url, _re_logo.DOTALL)
                     if _m:
                         loop = asyncio.get_running_loop()
                         b64_final = await loop.run_in_executor(
                             None,
-                            lambda: ImageContentService._overlay_logo(_m.group(1), logo_url)
+                            lambda: ImageContentService._overlay_logo(_m.group(1), logo_url, logo_position)
                         )
                         image_response['url'] = f"data:image/webp;base64,{b64_final}"
 
@@ -1180,11 +1625,6 @@ Follow these rules precisely for every image. No exceptions.
 
         if image_type == 'poster':
             brand_ref = f"{brand_name}" if brand_name else industry
-            # Extract a short headline from seed content
-            words = seed_content.split()
-            headline_words = words[:6] if len(words) >= 6 else words
-            headline = ' '.join(headline_words).rstrip('.,!?')
-            brand_name_line = f'Render brand name "{brand_name}" in smaller text below the headline. ' if brand_name else ''
             return (
                 f"COLOR_PALETTE: {color_list if color_list else 'deep navy, warm amber, white'} — "
                 f"these colors are the dominant palette, filling backgrounds and accents. "
@@ -1194,35 +1634,23 @@ Follow these rules precisely for every image. No exceptions.
                 f"or a stylised icon representing {industry} — placed in the upper two-thirds. "
                 f"{product_note}"
                 f"LAYOUT: {aspect} format, bold asymmetric layout, strong visual hierarchy, "
-                f"clear negative space for text. "
-                f"TYPOGRAPHY: Render the headline '{headline}' as large bold clean sans-serif white "
-                f"typography in the lower third. Maximum legibility, high contrast against background. "
-                f"{brand_name_line}"
+                f"clear negative space in the lower third. "
                 f"{voice_note}"
-                f"No watermarks, no logos. Professional quality, publishable brand asset."
+                f"No watermarks, no logos, no text overlays. Professional quality, publishable brand asset."
             )
 
         if image_type == 'stat_card':
             brand_ref = f"{brand_name}" if brand_name else industry
-            # Try to pull a number from content, fallback to generic
-            import re as _re_fb
-            nums = _re_fb.findall(r'\b\d+[%+x]?\b', seed_content)
-            key_stat = nums[0] if nums else "1"
-            stat_label = seed_content[:40].rstrip('.,!?') if seed_content else industry
-            stat_brand_line = f'Below the label render brand name "{brand_name}" in small caps. ' if brand_name else ''
             return (
                 f"COLOR_PALETTE: {color_list if color_list else 'bold single brand color with white accents'} — "
                 f"dominant background and accent colors. "
-                f"BACKGROUND: Clean minimal flat design card. "
+                f"BACKGROUND: Clean minimal flat design card for {brand_ref}. "
                 f"{color_list if color_list else 'Deep brand color'} solid or subtle gradient background. "
-                f"TYPOGRAPHY: Render '{key_stat}' as a massive bold centred number/stat in white "
-                f"or maximum-contrast color — it must dominate the card visually. "
-                f"Below it render '{stat_label}' in clean smaller sans-serif text. "
-                f"{stat_brand_line}"
+                f"FOCAL_ELEMENT: Abstract geometric shapes or minimal icons representing {industry}. "
                 f"ACCENT_ELEMENTS: Thin geometric lines or minimal icons in a lighter shade of "
                 f"brand color, subtle texture or grid in background for depth. "
                 f"QUALITY: Flat design only, pixel-perfect, publishable brand asset. "
-                f"No watermarks, no logos, not photographic."
+                f"No watermarks, no logos, no text overlays, not photographic."
             )
 
         if image_type == 'brand_illustration':
@@ -1395,25 +1823,41 @@ Follow these rules precisely for every image. No exceptions.
             resp.raise_for_status()
             logo_img = Image.open(io.BytesIO(resp.content)).convert("RGBA")
 
-            # Resize logo to 7% of image width, preserve aspect ratio
-            target_w = max(40, int(bw * 0.07))
+            # Resize logo to 8% of image width, preserve aspect ratio
+            target_w = max(40, int(bw * 0.08))
             lw, lh = logo_img.size
             scale = target_w / lw
             logo_img = logo_img.resize((target_w, int(lh * scale)), Image.LANCZOS)
             lw, lh = logo_img.size
 
-            # Badge padding (inner: 8px each side, outer edge: 2.5% of width)
-            badge_pad_inner = max(8, int(bw * 0.008))
-            edge_pad = max(20, int(bw * 0.025))
+            # Badge padding (inner: 5px each side, outer edge: 1.5% of width)
+            badge_pad_inner = max(5, int(bw * 0.005))
+            edge_pad = max(12, int(bw * 0.015))
 
             badge_w = lw + badge_pad_inner * 2
             badge_h = lh + badge_pad_inner * 2
 
             if position == "bottom_left":
                 bx = edge_pad
+                by = bh - badge_h - edge_pad
+            elif position == "top_left":
+                bx = edge_pad
+                by = edge_pad
+            elif position == "top_right":
+                bx = bw - badge_w - edge_pad
+                by = edge_pad
+            elif position == "top_center":
+                bx = (bw - badge_w) // 2
+                by = edge_pad
+            elif position == "bottom_center":
+                bx = (bw - badge_w) // 2
+                by = bh - badge_h - edge_pad
+            elif position == "center":
+                bx = (bw - badge_w) // 2
+                by = (bh - badge_h) // 2
             else:  # bottom_right (default)
                 bx = bw - badge_w - edge_pad
-            by = bh - badge_h - edge_pad
+                by = bh - badge_h - edge_pad
 
             # Draw semi-transparent white rounded-rectangle badge behind logo
             badge = Image.new("RGBA", (badge_w, badge_h), (0, 0, 0, 0))

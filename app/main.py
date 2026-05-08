@@ -55,17 +55,26 @@ async def startup_event():
         print(f"⚠️  Warning: Failed to start notification scheduler: {e}")
 
 # CORS
-# CORS is now handled at nginx level to avoid duplicate headers
-# Commenting out FastAPI CORS middleware
-# app.add_middleware(
-#     CORSMiddleware,
-#     allow_origins=["*"],
-#     allow_credentials=False,
-#     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-#     allow_headers=["*"],
-#     expose_headers=["*"],
-#     max_age=3600,
-# )
+# In production, CORS is handled at the nginx level to avoid duplicate headers.
+# Locally (no nginx), we enable it directly on FastAPI so preflight OPTIONS
+# requests are not rejected with 405.
+import os as _os
+_ENV = (
+    _os.getenv("APP_ENV")
+    or _os.getenv("ENV")
+    or _os.getenv("DEV_ENV")
+    or "local"
+).lower()
+if _ENV not in ("production", "prod", "staging"):
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=["*"],
+        expose_headers=["*"],
+        max_age=3600,
+    )
 
 # Respect X-Forwarded-For / X-Forwarded-Proto when behind a proxy/load-balancer.
 # Import inside a try/except so static analyzers or environments without the
@@ -129,9 +138,10 @@ app.include_router(linkedin_router)
 
 
 # Serve generated images directly from backend (avoids third-party CDN like imgBB)
-_STATIC_IMAGES_DIR = "/app/static/images"
+_BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_STATIC_IMAGES_DIR = os.path.join(_BASE_DIR, "static", "images")
 os.makedirs(_STATIC_IMAGES_DIR, exist_ok=True)
-app.mount("/static", StaticFiles(directory="/app/static"), name="static")
+app.mount("/static", StaticFiles(directory=os.path.join(_BASE_DIR, "static")), name="static")
 
 
 @app.get("/")

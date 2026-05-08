@@ -9,6 +9,7 @@ POST /whatsapp/daily-push    — Trigger daily content push to all linked users 
 """
 
 import pymongo.errors
+from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Request, BackgroundTasks
 from fastapi.responses import Response
 from motor.motor_asyncio import AsyncIOMotorDatabase
@@ -73,9 +74,21 @@ async def whatsapp_webhook(
         valid = validator.validate(url, params, twilio_sig)
         print(f"[WhatsApp] webhook url={url!r} from={params.get('From')!r} body={params.get('Body')!r} sig_valid={valid}")
 
+        # Drop requests that fail signature validation — prevents the staging
+        # webhook URL from also triggering the prod container (and vice-versa),
+        # which causes every message to be processed twice and images to go missing.
+        if not valid:
+            print(f"[WhatsApp] ⛔ Rejected — signature mismatch (wrong environment). Ignoring.")
+            return _EMPTY_TWIML
+
     raw_from: str = params.get("From", "")
     # Button quick-reply taps may arrive with empty Body — fall back to ButtonText
     body: str = params.get("Body", "") or params.get("ButtonText", "")
+
+    # Extract media attachments (images the user sends)
+    num_media = int(params.get("NumMedia", "0") or "0")
+    twilio_media_url: Optional[str] = params.get("MediaUrl0") if num_media > 0 else None
+    twilio_media_type: Optional[str] = params.get("MediaContentType0") if num_media > 0 else None
 
     # Always return empty TwiML — Twilio requires XML Content-Type, not JSON.
     # Returning application/json causes 12300 errors in the Twilio debugger.
@@ -85,7 +98,7 @@ async def whatsapp_webhook(
     if not raw_from:
         return _EMPTY_TWIML
 
-    background_tasks.add_task(WhatsAppFlowService.handle, raw_from, body, db)
+    background_tasks.add_task(WhatsAppFlowService.handle, raw_from, body, db, twilio_media_url, twilio_media_type)
     return _EMPTY_TWIML
 
 
@@ -143,20 +156,44 @@ async def connect_whatsapp(
                 detail="Database is unavailable. Please try again in a moment.",
             )
 
+    # Best-effort: send the welcome template. This will deliver immediately if
+    # the user already has an active 24-hour session with our number (i.e. they
+    # messaged us recently). If not, Twilio will queue it and deliver as soon as
+    # the user sends their activation message.
+    greeting_sent = False
     try:
         await _send(
             body.phone,
             "",
             content_sid="HXccf1a2bb34e7ed257c136c842982f5b3",
         )
+        greeting_sent = True
     except Exception as e:
         print(f"[WhatsApp] connect greeting failed: {e}")
+
+    # Strip the "whatsapp:" prefix for the response so the frontend can build
+    # a wa.me deep-link without extra parsing.
+    twilio_number = settings.TWILIO_WHATSAPP_FROM
+    if twilio_number.startswith("whatsapp:"):
+        twilio_number = twilio_number[len("whatsapp:"):]
 
     return {
         "status": True,
         "responseCode": 200,
         "responseMessage": "WhatsApp linked successfully.",
-        "responseData": {"phone": body.phone},
+        "responseData": {
+            "phone": body.phone,
+            # Tells the frontend whether to show the "send a message to activate"
+            # instruction. We always set this to True because even when the
+            # template send succeeds it may be queued until the user opens a
+            # session. The activation message is a one-time step.
+            "needs_activation": True,
+            # The Uri Social WhatsApp number the user should message to activate.
+            "activation_number": twilio_number,
+            # Deep-link the frontend can use: opens WhatsApp with a pre-filled
+            # "Hi" message to our number.
+            "activation_link": f"https://wa.me/{twilio_number.lstrip('+').replace(' ', '')}?text=Hi",
+        },
     }
 
 

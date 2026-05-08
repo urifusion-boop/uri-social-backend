@@ -9,6 +9,12 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from app.services.AIService import AIService
 from app.domain.responses.uri_response import UriResponse
+# Caption Voice System imports (keeping code but disabling for now)
+# from app.agents.social_media_manager.services.caption_validator_service import CaptionValidatorService
+# from app.agents.social_media_manager.services.caption_voice_system import (
+#     BANNED_PATTERNS_RULES,
+#     build_voice_profile_instructions,
+# )
 
 
 class ContentGenerationService:
@@ -369,9 +375,25 @@ Write as if you're sharing hard-won business wisdom with fellow African entrepre
             )
 
         if len(parts) == 1:
-            return ""
+            # No brand instructions, but still check for voice profile
+            brand_block = ""
+        else:
+            brand_block = "\n".join(parts) + "\n\n"
 
-        return "\n".join(parts) + "\n\n"
+        # ── Voice Profile (Caption Voice System - PRD Section 3 & 6) ──────────
+        # TEMPORARILY DISABLED - Testing if this breaks image generation
+        # voice_profile = brand_context.get("voice_profile", {})
+        # voice_sample_analysis = brand_context.get("voice_sample_analysis", {})
+        #
+        # if voice_profile or voice_sample_analysis:
+        #     voice_instructions = build_voice_profile_instructions(
+        #         voice_profile,
+        #         voice_sample_analysis,
+        #         platform
+        #     )
+        #     brand_block += voice_instructions
+
+        return brand_block
 
     @staticmethod
     async def generate_multi_platform_content(
@@ -574,7 +596,49 @@ Write as if you're sharing hard-won business wisdom with fellow African entrepre
             content, hashtags = ContentGenerationService._extract_and_clean_hashtags(
                 processed_content['content'], platform
             )
-            
+
+            # ── Caption Validation & Auto-Fix (PRD Section 7) ──────────────────────
+            # TEMPORARILY DISABLED - Testing if this breaks image generation
+            # # Extract custom banned words from voice profile
+            # custom_banned_words = []
+            # if brand_context and brand_context.get("voice_profile"):
+            #     custom_banned_words = brand_context["voice_profile"].get("banned_words", [])
+            #
+            # # Validate the caption
+            # validation_result = CaptionValidatorService.validate_caption(content, custom_banned_words)
+            #
+            # # If validation fails, attempt auto-fix (one retry)
+            # if not validation_result["passed"]:
+            #     print(f"[CAPTION] Validation failed for {platform}: {validation_result['issues']}")
+            #
+            #     # Generate fix prompt
+            #     fix_prompt = CaptionValidatorService.generate_fix_prompt(content, validation_result)
+            #
+            #     # Regenerate with fix instructions
+            #     fix_ai_request = AIService.build_ai_model(
+            #         messages=[{"role": "user", "content": fix_prompt}],
+            #         temperature=0.7,
+            #     )
+            #
+            #     fix_ai_response = await AIService.chat_completion(fix_ai_request)
+            #     if not (isinstance(fix_ai_response, dict) and "error" in fix_ai_response):
+            #         fixed_content = fix_ai_response.choices[0].message.content.strip()
+            #
+            #         # Re-extract hashtags from fixed content
+            #         content, hashtags = ContentGenerationService._extract_and_clean_hashtags(
+            #             fixed_content, platform
+            #         )
+            #
+            #         # Validate again
+            #         revalidation = CaptionValidatorService.validate_caption(content, custom_banned_words)
+            #         if revalidation["passed"]:
+            #             print(f"[CAPTION] ✓ Fixed and validated for {platform}")
+            #         else:
+            #             print(f"[CAPTION] ⚠ Still has issues after fix: {revalidation['issues'][:3]}")
+            #             # Proceed with content anyway, but flag it
+            # else:
+            #     print(f"[CAPTION] ✓ Passed validation for {platform}")
+
             # Generate a draft ID
             draft_id = str(ObjectId())
             
