@@ -399,23 +399,15 @@ class ImageContentService:
                         draft['image_specs'] = image_result['responseData']['specs']
                         draft['has_image'] = True
 
-                        # Save base64 image to local static storage (served directly)
+                        # Upload base64 image to Cloudinary for permanent CDN storage
                         stored_url = raw_image_url
                         if raw_image_url and raw_image_url.startswith("data:"):
                             try:
-                                import base64 as _b64, re as _re, os as _os, uuid as _uuid
-                                _match = _re.match(r"data:[^;]+;base64,(.+)", raw_image_url, _re.DOTALL)
-                                if _match:
-                                    _filename = f"{_uuid.uuid4().hex}.webp"
-                                    _static_dir = "/app/static/images"
-                                    _os.makedirs(_static_dir, exist_ok=True)
-                                    _img_bytes = _b64.b64decode(_match.group(1))
-                                    with open(f"{_static_dir}/{_filename}", "wb") as _f:
-                                        _f.write(_img_bytes)
-                                    stored_url = f"/static/images/{_filename}"
-                                    print(f"💾 Image saved locally: {stored_url}")
+                                from app.utils.cloudinary_upload import upload_base64
+                                stored_url = await upload_base64(raw_image_url, folder="uri-social/content-drafts")
+                                print(f"☁️  Image uploaded to Cloudinary: {stored_url}")
                             except Exception as _save_err:
-                                print(f"⚠️  Local image save error: {_save_err}, keeping base64")
+                                print(f"⚠️  Cloudinary upload error: {_save_err}, keeping base64")
 
                         # Persist URL to DB
                         if db is not None:
@@ -514,22 +506,15 @@ class ImageContentService:
             raw_url = image_result["responseData"]["image_url"]
             specs = image_result["responseData"]["specs"]
 
-            # Save base64 to local static storage (served directly by backend)
+            # Upload base64 to Cloudinary for permanent CDN storage
             stored_url = raw_url
             if raw_url and raw_url.startswith("data:"):
                 try:
-                    _match = _re.match(r"data:[^;]+;base64,(.+)", raw_url, _re.DOTALL)
-                    if _match:
-                        _filename = f"{_uuid.uuid4().hex}.webp"
-                        _static_dir = "/app/static/images"
-                        _os.makedirs(_static_dir, exist_ok=True)
-                        _img_bytes = _b64.b64decode(_match.group(1))
-                        with open(f"{_static_dir}/{_filename}", "wb") as _f:
-                            _f.write(_img_bytes)
-                        stored_url = f"/static/images/{_filename}"
-                        print(f"💾 Regenerated image saved locally: {stored_url}")
+                    from app.utils.cloudinary_upload import upload_base64
+                    stored_url = await upload_base64(raw_url, folder="uri-social/content-drafts")
+                    print(f"☁️  Regenerated image uploaded to Cloudinary: {stored_url}")
                 except Exception as _e:
-                    print(f"⚠️ Local image save error during regeneration: {_e}")
+                    print(f"⚠️ Cloudinary upload error during regeneration: {_e}")
 
             await db["content_drafts"].update_one(
                 {"$or": [{"id": draft_id}, {"draft_id": draft_id}]},

@@ -688,21 +688,18 @@ RULES FOR THIS EDIT:
             else:
                 return None
 
-            # Save to local storage
-            import uuid
-            import os
+            # Upload to Cloudinary for permanent CDN storage
+            import io
+            from app.utils.cloudinary_upload import upload_bytes
 
-            filename = f"{uuid.uuid4().hex}.webp"
-            static_dir = "/app/static/images"
-            os.makedirs(static_dir, exist_ok=True)
-
-            # Convert to WebP for efficient storage
+            # Convert to WebP bytes for efficient storage
             edited_image = Image.open(io.BytesIO(base64.b64decode(b64_data))).convert("RGB")
-            webp_path = f"{static_dir}/{filename}"
-            edited_image.save(webp_path, format="WEBP", quality=95, method=6)
+            webp_buffer = io.BytesIO()
+            edited_image.save(webp_buffer, format="WEBP", quality=95, method=6)
+            webp_bytes = webp_buffer.getvalue()
 
-            stored_url = f"/static/images/{filename}"
-            print(f"[EDIT] Image saved to: {stored_url}")
+            stored_url = await upload_bytes(webp_bytes, folder="uri-social/content-drafts", resource_type="image")
+            print(f"☁️  [EDIT] Image uploaded to Cloudinary: {stored_url}")
 
             return stored_url
 
