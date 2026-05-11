@@ -402,12 +402,20 @@ class ImageContentService:
                         # Upload base64 image to Cloudinary for permanent CDN storage
                         stored_url = raw_image_url
                         if raw_image_url and raw_image_url.startswith("data:"):
+                            print(f"🔄 Uploading image to Cloudinary for draft {draft['id']} ({draft['platform']})...")
                             try:
                                 from app.utils.cloudinary_upload import upload_base64
                                 stored_url = await upload_base64(raw_image_url, folder="uri-social/content-drafts")
-                                print(f"☁️  Image uploaded to Cloudinary: {stored_url}")
+                                print(f"☁️  ✅ CLOUDINARY UPLOAD SUCCESS!")
+                                print(f"   📍 Draft ID: {draft['id']}")
+                                print(f"   🌐 Platform: {draft['platform']}")
+                                print(f"   🔗 URL: {stored_url}")
                             except Exception as _save_err:
-                                print(f"⚠️  Cloudinary upload error: {_save_err}, keeping base64")
+                                print(f"⚠️  ❌ CLOUDINARY UPLOAD FAILED!")
+                                print(f"   📍 Draft ID: {draft['id']}")
+                                print(f"   🌐 Platform: {draft['platform']}")
+                                print(f"   ❌ Error: {_save_err}")
+                                print(f"   ⚠️  Keeping base64 data URL as fallback")
 
                         # Persist URL to DB
                         if db is not None:
@@ -509,12 +517,17 @@ class ImageContentService:
             # Upload base64 to Cloudinary for permanent CDN storage
             stored_url = raw_url
             if raw_url and raw_url.startswith("data:"):
+                print(f"🔄 Uploading REGENERATED image to Cloudinary for draft {draft_id}...")
                 try:
                     from app.utils.cloudinary_upload import upload_base64
                     stored_url = await upload_base64(raw_url, folder="uri-social/content-drafts")
-                    print(f"☁️  Regenerated image uploaded to Cloudinary: {stored_url}")
+                    print(f"☁️  ✅ CLOUDINARY REGENERATION UPLOAD SUCCESS!")
+                    print(f"   📍 Draft ID: {draft_id}")
+                    print(f"   🔗 URL: {stored_url}")
                 except Exception as _e:
-                    print(f"⚠️ Cloudinary upload error during regeneration: {_e}")
+                    print(f"⚠️  ❌ CLOUDINARY REGENERATION UPLOAD FAILED!")
+                    print(f"   📍 Draft ID: {draft_id}")
+                    print(f"   ❌ Error: {_e}")
 
             await db["content_drafts"].update_one(
                 {"$or": [{"id": draft_id}, {"draft_id": draft_id}]},
