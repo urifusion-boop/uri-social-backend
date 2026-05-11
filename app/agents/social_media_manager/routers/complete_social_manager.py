@@ -123,6 +123,11 @@ class StoryboardFramesRequest(BaseModel):
     scenes: List[Dict[str, Any]]
     brand_images: List[str] = Field(default_factory=list, max_items=5)
 
+class PublishVideoDraftRequest(BaseModel):
+    draft_id: str
+    platform: str   # "instagram_reels" | "facebook_reels"
+    caption: Optional[str] = None
+
 class VideoFromStoryboardRequest(BaseModel):
     storyboard: Dict[str, Any]
     brand_images: List[str] = Field(default_factory=list, max_items=5)
@@ -3523,3 +3528,83 @@ async def list_video_drafts(
     ).sort("created_at", -1).to_list(length=50)
 
     return UriResponse.get_single_data_response("video_drafts", drafts)
+
+
+@router.post("/publish-video-draft")
+async def publish_video_draft(
+    request: PublishVideoDraftRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Start async publishing of a saved video draft to Instagram Reels or Facebook.
+    Returns a job_id immediately. Poll GET /video-publish-job/{job_id} for status.
+    """
+    from app.agents.social_media_manager.services.video_publish_service import VideoPublishService
+
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    # Only Instagram and Facebook supported
+    SUPPORTED = {"instagram_reels", "facebook_reels"}
+    if request.platform not in SUPPORTED:
+        raise HTTPException(status_code=400, detail=f"Platform '{request.platform}' is not yet supported. Supported: {', '.join(SUPPORTED)}")
+
+    # Load the draft
+    draft = await db["content_drafts"].find_one(
+        {"id": request.draft_id, "user_id": user_id, "media_type": "video"},
+        {"_id": 0},
+    )
+    if not draft:
+        raise HTTPException(status_code=404, detail="Video draft not found")
+
+    video_url = draft.get("video_url")
+    if not video_url:
+        raise HTTPException(status_code=400, detail="Draft has no video URL")
+
+    caption = request.caption if request.caption is not None else (draft.get("content") or "")
+
+    # Resolve connection — instagram_reels → platform "instagram"; facebook_reels → "facebook"
+    platform_key = "instagram" if request.platform == "instagram_reels" else "facebook"
+    conn = await db["social_connections"].find_one(
+        {"user_id": user_id, "platform": platform_key},
+        {"_id": 0, "page_access_token": 1, "ig_user_id": 1},
+    )
+    if not conn or not conn.get("page_access_token"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"No connected {platform_key} account found. Please connect your account first.",
+        )
+    if request.platform == "instagram_reels" and not conn.get("ig_user_id"):
+        raise HTTPException(status_code=400, detail="Instagram account missing ig_user_id. Please reconnect.")
+
+    job_id = await VideoPublishService.create_job(request.draft_id, request.platform, user_id)
+    background_tasks.add_task(
+        VideoPublishService.run_job,
+        job_id,
+        request.draft_id,
+        request.platform,
+        video_url,
+        caption,
+        conn,
+        db,
+    )
+
+    return UriResponse.get_single_data_response("publish_job", {"job_id": job_id})
+
+
+@router.get("/video-publish-job/{job_id}")
+async def get_video_publish_job(
+    job_id: str,
+    token: dict = Depends(JWTBearer()),
+):
+    """Poll the status of a video publish job."""
+    from app.agents.social_media_manager.services.video_publish_service import get_publish_job
+
+    _get_user_id(token)  # auth check
+    job = await get_publish_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Publish job not found")
+    return UriResponse.get_single_data_response("publish_job", job)
