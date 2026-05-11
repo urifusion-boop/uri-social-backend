@@ -117,6 +117,7 @@ class StoryboardRequest(BaseModel):
     optional_text: Optional[str] = Field(None, max_length=1000)
     target_platform: str = "instagram_reels"
     target_duration_seconds: int = Field(15, ge=5, le=30)
+    video_style: Optional[str] = "clean_commercial"
 
 class StoryboardFramesRequest(BaseModel):
     scenes: List[Dict[str, Any]]
@@ -3334,6 +3335,7 @@ async def generate_storyboard(
         brand_context=brand_context,
         target_platform=request.target_platform,
         target_duration_seconds=request.target_duration_seconds,
+        video_style=request.video_style,
     )
 
     if not result.get("status"):
