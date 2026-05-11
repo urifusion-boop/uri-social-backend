@@ -404,28 +404,80 @@ Write as if you're sharing hard-won business wisdom with fellow African entrepre
         request_id: Optional[str] = None,
         brand_context: Optional[Dict[str, Any]] = None,
         db: Optional[AsyncIOMotorDatabase] = None,
+        reference_image: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Generate platform-native content simultaneously for all requested platforms
-        
+
         Integrates with your existing URI user system and follows established patterns.
-        
+
         Args:
             user_id: ID of the URI user requesting content
             seed_content: Original content to transform
             platforms: List of platforms to generate content for
             seed_type: Type of seed content (text, url, mention_response, etc.)
             request_id: Optional existing request ID (for regeneration)
-        
+            reference_image: Optional base64 data URL for product/context analysis
+
         Returns:
             Dictionary containing request_id, generated drafts, and status
         """
-        
+
         # Create or use existing request ID
         if not request_id:
             request_id = str(ObjectId())
-        
+
         print(f"🤖 Generating content for {len(platforms)} platforms: {platforms}")
+
+        # ── VISION ANALYSIS: If reference_image provided, analyze it first ──────
+        enriched_seed_content = seed_content
+        if reference_image:
+            print(f"🔍 Reference image detected, analyzing product/context...")
+            try:
+                vision_prompt = f"""Analyze this product image and extract key details to help write engaging social media content.
+
+USER'S REQUEST: {seed_content}
+
+Provide a detailed description including:
+1. Product name/type (what is it?)
+2. Visual appearance (colors, materials, design style, packaging)
+3. Key features or benefits visible in the image
+4. Target audience (who would buy this?)
+5. Emotional appeal (what feeling does it evoke?)
+6. Any text/branding visible on the product
+
+Be specific and descriptive. This analysis will be used to generate authentic product content."""
+
+                vision_request = AIService.build_ai_model(
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": vision_prompt},
+                            {"type": "image_url", "image_url": {"url": reference_image}}
+                        ]
+                    }],
+                    temperature=0.5,
+                )
+
+                vision_response = await AIService.chat_completion(vision_request)
+
+                if isinstance(vision_response, dict) and "error" in vision_response:
+                    print(f"⚠️ Vision analysis failed: {vision_response['error']}")
+                else:
+                    product_analysis = vision_response.choices[0].message.content.strip()
+                    print(f"✅ Product analysis complete: {product_analysis[:150]}...")
+
+                    # Enrich seed_content with product analysis
+                    enriched_seed_content = f"""USER REQUEST: {seed_content}
+
+PRODUCT ANALYSIS FROM IMAGE:
+{product_analysis}
+
+Create social media content about THIS SPECIFIC PRODUCT based on the image analysis above. Do NOT write about Uri Social or content creation services - write about the PRODUCT shown in the image."""
+
+            except Exception as e:
+                print(f"⚠️ Vision analysis error: {e}")
+                # Continue with original seed_content if vision fails
         
         # Validate platforms
         supported_platforms = list(ContentGenerationService.PLATFORM_PROMPTS.keys())
@@ -440,7 +492,7 @@ Write as if you're sharing hard-won business wisdom with fellow African entrepre
         generation_tasks = []
         for platform in valid_platforms:
             task = ContentGenerationService._generate_platform_content(
-                platform, seed_content, request_id, user_id, brand_context
+                platform, enriched_seed_content, request_id, user_id, brand_context
             )
             generation_tasks.append(task)
         

@@ -396,6 +396,7 @@ async def generate_content(
                 seed_type=request.seed_type,
                 brand_context=brand_context_dict,
                 db=db,
+                reference_image=request.reference_image,
             )
 
         # Tag post_type on all resulting drafts in DB
@@ -3191,12 +3192,17 @@ async def _generate_image_bg(
 
         # Upload base64 image to Cloudinary
         if raw_url and raw_url.startswith("data:"):
+            print(f"🔄 Uploading image to Cloudinary for draft {draft_id}...")
             try:
                 from app.utils.cloudinary_upload import upload_base64
-                stored_url = await upload_base64(raw_url, folder="uri-social/generated")
-                print(f"☁️  BG image uploaded to Cloudinary: {stored_url}")
+                stored_url = await upload_base64(raw_url, folder="uri-social/content-drafts")
+                print(f"☁️  ✅ CLOUDINARY UPLOAD SUCCESS!")
+                print(f"   📍 Draft ID: {draft_id}")
+                print(f"   🔗 URL: {stored_url}")
             except Exception as upload_err:
-                print(f"⚠️  Cloudinary upload error: {upload_err}")
+                print(f"⚠️  ❌ CLOUDINARY UPLOAD FAILED!")
+                print(f"   📍 Draft ID: {draft_id}")
+                print(f"   ❌ Error: {upload_err}")
 
         final_url = stored_url if not stored_url.startswith("data:") else None
         if final_url and db is not None:
