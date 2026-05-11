@@ -826,6 +826,38 @@ Follow these rules precisely for every image. No exceptions.
             if not image_prompt:
                 image_prompt = seed_content.strip()
 
+            # ========== PRODUCT PRESERVATION PIPELINE (PRD: Product-Preservation-Pipeline) ==========
+            # When reference_image provided: forensic analysis + preservation block
+            # This is the KEY innovation that prevents product distortion
+            product_preservation_block = ""
+            cutout_url = reference_image  # Default to original if background removal fails
+
+            if reference_image:
+                try:
+                    print(f"\n{'='*60}")
+                    print(f"🔬 PRODUCT PRESERVATION PIPELINE ACTIVATED")
+                    print(f"{'='*60}")
+
+                    # Step 1: Background removal (get clean product cutout)
+                    from app.utils.background_removal import remove_background
+                    cutout_url = await remove_background(reference_image, method="auto")
+                    print(f"✂️  Background removed: {cutout_url[:80]}...")
+
+                    # Step 2: Forensic product analysis (the key innovation)
+                    from app.agents.social_media_manager.services.product_analysis_service import ProductAnalysisService
+                    product_spec = await ProductAnalysisService.analyze_product_forensically(cutout_url)
+
+                    # Step 3: Build preservation block
+                    product_preservation_block = ProductAnalysisService.build_preservation_block(product_spec)
+
+                    print(f"✅ Product preservation block generated ({len(product_preservation_block)} chars)")
+                    print(f"{'='*60}\n")
+
+                except Exception as e:
+                    print(f"⚠️ Product preservation pipeline error: {str(e)}")
+                    print(f"   Falling back to standard reference image handling")
+                    # Continue with original reference_image, no preservation block
+
             # Add composition block based on style's composition_mode (Immersive Composition System PRD)
             # When a reference image is provided, choose composition style based on the visual style
             if reference_image:
@@ -906,6 +938,12 @@ OVERALL:
 
                 image_prompt = image_prompt.rstrip() + "\n" + composition_block
 
+            # ========== PREPEND PRESERVATION BLOCK (CRITICAL: Must come first) ==========
+            # The preservation block must be at the BEGINNING so GPT-Image-2 weights it heavily
+            if product_preservation_block:
+                image_prompt = product_preservation_block + "\n\n" + image_prompt
+                print(f"📌 Preservation block prepended to prompt (total: {len(image_prompt)} chars)")
+
             # ========== IMAGE GENERATION DEBUG (PRD Section 2) ==========
             from datetime import datetime
             print(f"\n{'='*60}")
@@ -949,10 +987,13 @@ OVERALL:
                 f"{'━'*60}\n"
             )
 
+            # Use cutout_url (background-removed) if preservation pipeline ran, otherwise original
+            final_reference_image = cutout_url if (reference_image and cutout_url != reference_image) else reference_image
+
             image_response = await ImageContentService._call_dalle_api(
                 prompt=image_prompt,
                 size=f"{specs['width']}x{specs['height']}",
-                reference_image=reference_image,
+                reference_image=final_reference_image,
                 image_model=image_model,
             )
 
