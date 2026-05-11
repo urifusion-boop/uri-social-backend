@@ -692,6 +692,7 @@ RULES FOR THIS EDIT:
             import io
             from app.utils.cloudinary_upload import upload_bytes
 
+            print(f"🔄 Uploading EDITED image to Cloudinary...")
             # Convert to WebP bytes for efficient storage
             edited_image = Image.open(io.BytesIO(base64.b64decode(b64_data))).convert("RGB")
             webp_buffer = io.BytesIO()
@@ -699,7 +700,8 @@ RULES FOR THIS EDIT:
             webp_bytes = webp_buffer.getvalue()
 
             stored_url = await upload_bytes(webp_bytes, folder="uri-social/content-drafts", resource_type="image")
-            print(f"☁️  [EDIT] Image uploaded to Cloudinary: {stored_url}")
+            print(f"☁️  ✅ CLOUDINARY EDIT UPLOAD SUCCESS!")
+            print(f"   🔗 URL: {stored_url}")
 
             return stored_url
 
