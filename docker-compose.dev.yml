@@ -2,7 +2,7 @@ version: '3.9'
 
 services:
   uri-agent.api:
-    image: uriteam/urisvc:uriagentdev
+    image: uri-agent-local:dev
     container_name: uri-agent.api
     build:
       context: .
@@ -22,14 +22,14 @@ services:
       - .env.staging
     environment:
       - ENV=Development
-      - APP_ENV=staging
+      - APP_ENV=development
       - URI_GATEWAY_BASE_API_URL=http://uri-gateway.api
       - PUBLIC_API_URL=https://api-staging.urisocial.com
     restart: always
     ports:
       - '9003:80'
     volumes:
-      - /home/uridev/uri-static-images:/app/static/images
+      - ./static/images:/app/static/images
     networks:
       uritest-network:
         ipv4_address: 172.22.0.16
