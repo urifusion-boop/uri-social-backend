@@ -41,9 +41,9 @@ jobs:
       # Build and push production Docker image
       - name: Build and push Docker image
         run: |
-          docker build -t urisocial/backend:production -t urisocial/backend:latest .
-          docker push urisocial/backend:production
-          docker push urisocial/backend:latest
+          docker build -t uriteam/urisvc:production -t uriteam/urisvc:latest .
+          docker push uriteam/urisvc:production
+          docker push uriteam/urisvc:latest
 
   deploy:
     runs-on: ubuntu-latest
@@ -88,7 +88,7 @@ jobs:
 
             # Pull latest production image
             echo "📦 Pulling latest Docker image..."
-            docker pull urisocial/backend:production
+            docker pull uriteam/urisvc:production
 
             # Stop and remove existing container
             echo "🛑 Stopping existing container..."
@@ -130,4 +130,4 @@ jobs:
           echo "✅ Production deployment completed successfully!"
           echo "🌐 API should be available at: https://api.urisocial.com"
           echo "📝 Container: urisocial-backend-prod"
-          echo "🏷️  Image: urisocial/backend:production"
+          echo "🏷️  Image: uriteam/urisvc:production"
