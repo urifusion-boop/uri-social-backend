@@ -331,6 +331,13 @@ class SocialAccountService:
                     "ig_user_id": doc.get("ig_user_id"),
                 })
 
+            # If Instagram is connected via direct OAuth, the stored page_access_token
+            # is a Facebook Page token — treat it as also covering "facebook" for publishing.
+            if "instagram" in by_platform and "facebook" not in by_platform:
+                ig_conn = by_platform["instagram"][0] if by_platform["instagram"] else {}
+                if ig_conn.get("connected_via", "").startswith("instagram_direct"):
+                    by_platform.setdefault("facebook", [ig_conn])
+
             total = sum(len(v) for v in by_platform.values())
             return UriResponse.get_single_data_response("user_connections", {
                 "user_id": user_id,
