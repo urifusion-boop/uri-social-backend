@@ -818,9 +818,15 @@ class WhatsAppFlowService:
             ctx = {**ctx, "product_image_url": product_image_url, "product_image_twilio_url": media_url}
             await _safe_set_state(phone, state, ctx, db)
 
-            # If text also says "design" / "graphic" / "poster" etc — jump straight to generation
+            # If text looks like a specific image manipulation instruction, edit directly
+            if text and WhatsAppFlowService._is_direct_image_edit(text):
+                await WhatsAppFlowService._edit_image_with_prompt(phone, user_id, body.strip(), ctx, db)
+                return
+
+            # If text also says "design" / "graphic" / "poster" etc — jump to branded generation
+            # Note: "image" and "ad" removed — too short, match "Edit this image..." and "can you add..."
             _GRAPHIC_TRIGGER_WORDS = (
-                "design", "graphic", "poster", "image", "visual", "ad", "banner",
+                "design", "graphic", "poster", "visual", "banner",
                 "new design", "make a", "create a", "generate",
             )
             if text and any(w in text for w in _GRAPHIC_TRIGGER_WORDS):
@@ -1675,6 +1681,94 @@ class WhatsAppFlowService:
             await _send(phone, _format_content(new_ctx))
             await _safe_set_state(phone, "showing_content", new_ctx, db)
 
+    # ── Direct image editing (user-supplied prompt, no brand overlays) ────────
+
+    @staticmethod
+    def _is_direct_image_edit(text: str) -> bool:
+        """
+        Return True when the user's message is a specific image manipulation
+        instruction rather than a generic "make me a graphic" request.
+        These should bypass _generate_graphic (branded post creator) and go
+        straight to the OpenAI image edit API with the user's exact prompt.
+        """
+        _EDIT_PHRASES = (
+            "edit this image", "edit the image", "edit this photo", "edit the photo",
+            "edit this picture", "edit the picture", "with this prompt",
+            "can you add", "can you put", "can you place", "can you remove",
+            "can you change the background", "can you make it",
+            "add the ", "add a ", "remove the ", "remove a ",
+            "put the ", "put a ", "place the ", "place a ",
+            "combine ", "merge ", "blend ",
+            "replace the background", "change the background",
+            "make it look", "make the background",
+            "beside the ", "next to the ", "behind the ",
+            "3d render", "neon light", "minimalist ", "ultra-modern",
+            "cyber aesthetic", "photorealistic", "hyper realistic", "high resolution",
+            "sharp focus", "4k", "8k", "studio lighting", "bokeh",
+            "render of ", "render this", "reimagine", "transform this",
+        )
+        t = text.lower()
+        return any(phrase in t for phrase in _EDIT_PHRASES)
+
+    @staticmethod
+    async def _edit_image_with_prompt(
+        phone: str,
+        user_id: str,
+        edit_prompt: str,
+        ctx: Dict[str, Any],
+        db: AsyncIOMotorDatabase,
+    ) -> None:
+        """
+        Edit the user-supplied image using their exact prompt via OpenAI image
+        edit API.  No brand overlays, headlines, or text are added — the prompt
+        drives everything.
+        """
+        image_url = ctx.get("product_image_url") or ctx.get("last_graphic_url")
+        if not image_url:
+            await _send(phone, "I don't have an image to edit. Please send me the image again.")
+            return
+
+        allowed = await _check_and_deduct_credit(user_id, reason="whatsapp_image_edit")
+        if not allowed:
+            await _send(
+                phone,
+                "⚠️ You've run out of credits.\n\n"
+                "Upgrade your plan on the Uri Social dashboard to edit images.",
+            )
+            return
+
+        await _send(phone, "Editing your image... 🎨 Give me a moment.")
+        await _safe_set_state(phone, "generating_graphic", ctx, db)
+
+        edited_url: Optional[str] = None
+        try:
+            from app.agents.social_media_manager.services.image_editing_service import ImageEditingService
+
+            image_bytes = await ImageEditingService._download_image(image_url)
+            if not image_bytes:
+                await _send(phone, "⚠️ Couldn't load your image. Please send it again.")
+                await _safe_set_state(phone, "idle", ctx, db)
+                return
+
+            edited_url = await ImageEditingService._call_edit_api(
+                image_bytes=image_bytes,
+                prompt=edit_prompt,
+                size="1024x1024",
+            )
+
+            if not edited_url:
+                await _send(phone, "⚠️ Image edit failed. Please try again or describe what you want differently.")
+                await _safe_set_state(phone, "showing_graphic", ctx, db)
+                return
+
+            await _send(phone, "Here's your edited image 👆", media_url=edited_url)
+            await _send(phone, GRAPHIC_ACTIONS)
+        except Exception as exc:
+            print(f"[WhatsApp] _edit_image_with_prompt error: {exc}", flush=True)
+            await _send(phone, "⚠️ Something went wrong editing the image. Please try again.")
+
+        await _safe_set_state(phone, "showing_graphic", {**ctx, "last_graphic_url": edited_url or ctx.get("last_graphic_url")}, db)
+
     # ── Graphic generation ────────────────────────────────────────────────────
 
     @staticmethod
@@ -1874,6 +1968,13 @@ class WhatsAppFlowService:
             await _send(phone, GRAPHIC_ACTIONS)
             return
 
+        # Specific image manipulation prompt (e.g. "make the background darker", "add a logo")
+        # — route directly to image edit API with the user's exact prompt, before generic edit/regen handlers
+        if WhatsAppFlowService._is_direct_image_edit(text):
+            edit_ctx = {**ctx, "product_image_url": ctx.get("last_graphic_url") or ctx.get("product_image_url")}
+            await WhatsAppFlowService._edit_image_with_prompt(phone, user_id, raw_body.strip(), edit_ctx, db)
+            return
+
         if any(w in text for w in _EDIT_WORDS) or text == "4":
             await WhatsAppFlowService._handle_edit_choice(phone, text, text, user_id, ctx, db)
             return
@@ -1926,7 +2027,11 @@ class WhatsAppFlowService:
             await _send(phone, f"🔗 Download your graphic:\n{url}" if url else "Link unavailable.")
             await _send(phone, GRAPHIC_ACTIONS)
         elif intent == "edit":
-            await WhatsAppFlowService._handle_edit_choice(phone, text, text, user_id, ctx, db)
+            if WhatsAppFlowService._is_direct_image_edit(text):
+                edit_ctx = {**ctx, "product_image_url": ctx.get("last_graphic_url") or ctx.get("product_image_url")}
+                await WhatsAppFlowService._edit_image_with_prompt(phone, user_id, raw_body.strip(), edit_ctx, db)
+            else:
+                await WhatsAppFlowService._handle_edit_choice(phone, text, text, user_id, ctx, db)
         elif intent == "regenerate":
             await WhatsAppFlowService._generate_graphic(phone, user_id, ctx, db)
         elif intent == "back":

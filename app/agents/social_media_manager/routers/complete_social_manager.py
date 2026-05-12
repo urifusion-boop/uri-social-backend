@@ -1965,13 +1965,21 @@ async def get_calendar_trends(
         raise HTTPException(status_code=401, detail="User ID not found in token")
     from app.services.TrendDataService import TrendDataService
     brand = await BrandProfileService.get(user_id, db)
-    # BrandProfileService.get returns a response wrapper dict; unwrap responseData
     if isinstance(brand, dict) and "responseData" in brand:
         brand = brand["responseData"]
-    industry = (brand or {}).get("industry", "business")
-    keywords = await TrendDataService.get_trending_keywords(industry, db=db)
+    brand = brand or {}
+
+    industry = brand.get("industry", "business")
+    region = brand.get("region", "")
+    # Build brand-specific seeds from content pillars and key products
+    brand_seeds = (brand.get("content_pillars") or [])[:2] + (brand.get("key_products_services") or [])[:2]
+
+    keywords = await TrendDataService.get_trending_keywords(
+        industry, region=region, brand_seeds=brand_seeds, db=db
+    )
     return UriResponse.get_single_data_response("trends", {
         "industry": industry,
+        "region": region,
         "keywords": keywords,
         "count": len(keywords),
     })
@@ -2284,6 +2292,31 @@ async def get_performance(
 
         results = await _asyncio.gather(*[_fetch(d) for d in published])
         posts = [r for r in results if r is not None]
+
+        # Persist fetched analytics so PerformanceAnalyticsService has real data
+        if posts:
+            import asyncio as _aio
+            async def _persist(post):
+                try:
+                    await db["content_analytics"].update_one(
+                        {"draft_id": post["draft_id"]},
+                        {"$set": {
+                            "draft_id": post["draft_id"],
+                            "likes": post.get("likes", 0),
+                            "comments": post.get("comments", 0),
+                            "shares": post.get("shares", 0),
+                            "views": post.get("views", 0),
+                            "impressions": post.get("impressions", 0),
+                            "reach": post.get("reach", 0),
+                            "engagement_rate": post.get("engagement_rate", 0),
+                            "platform": post.get("platform", ""),
+                            "updated_at": datetime.utcnow(),
+                        }},
+                        upsert=True,
+                    )
+                except Exception:
+                    pass
+            _aio.ensure_future(_aio.gather(*[_persist(p) for p in posts]))
 
         # Aggregate summary
         def _sum(key): return sum(p.get(key, 0) or 0 for p in posts)
