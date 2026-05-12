@@ -55,10 +55,10 @@ async def startup_event():
         print(f"⚠️  Warning: Failed to start notification scheduler: {e}")
 
 # CORS
-# Always apply CORS middleware — nginx on prod/staging strips duplicate headers
-# so there's no risk of double CORS headers in those environments.
-# Explicit origins are listed; "*" is also included so curl/Postman/mobile work.
-import os as _os
+# Use explicit origins only (no allow_origin_regex) — Starlette's elif chain
+# guarantees exactly one Access-Control-Allow-Origin header per response.
+# allow_credentials=False because auth uses tokens in the Authorization header;
+# no cookies are sent cross-origin, so wildcard-incompatibility is irrelevant.
 _ALLOWED_ORIGINS = [
     # Local development
     "http://localhost:3000",
@@ -69,19 +69,19 @@ _ALLOWED_ORIGINS = [
     # Staging
     "https://staging.urisocial.com",
     "https://app-staging.urisocial.com",
+    "https://api-staging.urisocial.com",
     # Production
     "https://urisocial.com",
     "https://www.urisocial.com",
     "https://app.urisocial.com",
+    "https://api.urisocial.com",
 ]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_ALLOWED_ORIGINS,
-    allow_origin_regex=r"https://.*\.urisocial\.com",
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
-    expose_headers=["*"],
     max_age=3600,
 )
 
