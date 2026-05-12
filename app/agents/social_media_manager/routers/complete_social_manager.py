@@ -568,6 +568,180 @@ async def initiate_social_connections(
     )
 
 
+@router.get("/connect/facebook-direct/initiate")
+async def facebook_direct_initiate(source: Optional[str] = Query("settings")):
+    """
+    Redirect the user's browser to Facebook's OAuth page to connect a Facebook Page
+    directly (without Outstand). On completion, Facebook redirects to
+    /connect/facebook-direct/callback.
+    """
+    import urllib.parse
+
+    app_id = settings.META_APP_ID
+    if not app_id:
+        raise HTTPException(status_code=500, detail="META_APP_ID not configured")
+
+    _base = (settings.PUBLIC_API_URL or settings.URI_GATEWAY_BASE_API_URL).rstrip("/")
+    redirect_uri = f"{_base}/social-media/connect/facebook-direct/callback"
+
+    scopes = [
+        "pages_show_list",
+        "pages_read_engagement",
+        "pages_manage_posts",
+        "pages_manage_metadata",
+    ]
+    params = {
+        "client_id": app_id,
+        "redirect_uri": redirect_uri,
+        "scope": ",".join(scopes),
+        "response_type": "code",
+        "state": source or "settings",
+    }
+    auth_url = f"https://www.facebook.com/{settings.FACEBOOK_API_VERSION}/dialog/oauth?" + urllib.parse.urlencode(params)
+    return RedirectResponse(auth_url)
+
+
+@router.get("/connect/facebook-direct/callback")
+async def facebook_direct_callback(
+    code: Optional[str] = Query(None),
+    state: Optional[str] = Query(None),
+    error: Optional[str] = Query(None),
+    error_reason: Optional[str] = Query(None),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """
+    Facebook OAuth callback for direct Facebook Page connection.
+    Exchanges the auth code for a Page access token, picks the first page,
+    stores a pending connection, and redirects back to the workspace.
+    """
+    import urllib.parse
+    import httpx
+    from datetime import timezone
+
+    web_app_url = settings.WEB_APP_URL.strip("'\"")
+    base_redirect = f"{web_app_url}/workspace?tab=connections"
+
+    if error:
+        msg = urllib.parse.quote(error_reason or error)
+        return RedirectResponse(f"{base_redirect}&connected=false&error={msg}")
+
+    if not code:
+        return RedirectResponse(f"{base_redirect}&connected=false&error=missing_code")
+
+    _base = (settings.PUBLIC_API_URL or settings.URI_GATEWAY_BASE_API_URL).rstrip("/")
+    redirect_uri = f"{_base}/social-media/connect/facebook-direct/callback"
+    app_id = settings.META_APP_ID
+    app_secret = settings.META_APP_SECRET
+    graph_base = f"https://graph.facebook.com/{settings.FACEBOOK_API_VERSION}"
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            # Step 1: exchange code → short-lived user token
+            token_resp = await client.get(
+                f"{graph_base}/oauth/access_token",
+                params={
+                    "client_id": app_id,
+                    "client_secret": app_secret,
+                    "redirect_uri": redirect_uri,
+                    "code": code,
+                },
+            )
+            token_data = token_resp.json()
+            if "error" in token_data:
+                raise ValueError(f"Token exchange error: {token_data['error'].get('message')}")
+            short_token = token_data["access_token"]
+
+            # Step 2: exchange → long-lived user token
+            ll_resp = await client.get(
+                f"{graph_base}/oauth/access_token",
+                params={
+                    "grant_type": "fb_exchange_token",
+                    "client_id": app_id,
+                    "client_secret": app_secret,
+                    "fb_exchange_token": short_token,
+                },
+            )
+            ll_data = ll_resp.json()
+            long_token = ll_data.get("access_token", short_token)
+
+            # Step 3: get the user's Facebook Pages
+            pages_resp = await client.get(
+                f"{graph_base}/me/accounts",
+                params={"access_token": long_token, "fields": "id,name,access_token,picture"},
+            )
+            pages_data = pages_resp.json()
+            pages = pages_data.get("data", [])
+
+            if not pages:
+                err_msg = urllib.parse.quote("No Facebook Pages found. You need a Facebook Page to connect.")
+                return RedirectResponse(f"{base_redirect}&connected=false&error={err_msg}")
+
+            # Use the first page (most users have one main page)
+            page = pages[0]
+            page_id = page["id"]
+            page_name = page["name"]
+            page_token = page["access_token"]
+            profile_pic = page.get("picture", {}).get("data", {}).get("url", "") if isinstance(page.get("picture"), dict) else ""
+
+            now = datetime.now(timezone.utc).isoformat()
+            conn_doc = {
+                "id": f"fb_{page_id}",
+                "user_id": None,               # set by finalize
+                "platform": "facebook",
+                "connected_via": "facebook_direct_oauth",
+                "page_id": page_id,
+                "page_access_token": page_token,
+                "account_name": page_name,
+                "profile_picture_url": profile_pic,
+                "connection_status": "pending_user_match",
+                "connected_at": now,
+                "updated_at": now,
+            }
+            await db["social_connections"].update_one(
+                {"id": f"fb_{page_id}"},
+                {"$set": conn_doc},
+                upsert=True,
+            )
+            print(f"[FBDirectOAuth] ✅ Stored page '{page_name}' (page_id={page_id}) pending user match")
+
+            params_out = (
+                f"connected=facebook_direct"
+                f"&fb_page_id={urllib.parse.quote(page_id)}"
+                f"&page_name={urllib.parse.quote(page_name)}"
+            )
+            return RedirectResponse(f"{base_redirect}&{params_out}")
+
+    except Exception as e:
+        print(f"[FBDirectOAuth] ❌ Error: {e}")
+        return RedirectResponse(
+            f"{base_redirect}&connected=false&error={urllib.parse.quote(str(e))}"
+        )
+
+
+@router.post("/connect/facebook-direct/finalize")
+async def facebook_direct_finalize(
+    fb_page_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Called by the frontend after the Facebook direct OAuth callback to
+    associate the pending connection with the authenticated user.
+    """
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    result = await db["social_connections"].update_one(
+        {"id": f"fb_{fb_page_id}"},
+        {"$set": {"user_id": user_id, "connection_status": "active", "updated_at": datetime.utcnow().isoformat()}},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Facebook connection not found — try reconnecting")
+
+    return UriResponse.get_single_data_response("facebook_connected", {"fb_page_id": fb_page_id})
+
+
 @router.get("/connect/instagram-direct/initiate")
 async def instagram_direct_initiate(source: Optional[str] = Query("settings")):
     """
