@@ -1116,6 +1116,29 @@ async def disconnect_instagram_direct(
     return {"status": True, "responseMessage": "Instagram account disconnected"}
 
 
+@router.delete("/connections/facebook-direct")
+async def disconnect_facebook_direct(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Disconnect a Facebook Page connected via direct OAuth (not Outstand).
+    """
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    result = await db["social_connections"].delete_one({
+        "user_id": user_id,
+        "platform": "facebook",
+        "connected_via": "facebook_direct_oauth",
+    })
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Facebook connection not found")
+
+    return {"status": True, "responseMessage": "Facebook page disconnected"}
+
+
 # ==============================================================================
 # ONBOARDING ENDPOINTS
 # ==============================================================================
