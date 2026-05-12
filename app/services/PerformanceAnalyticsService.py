@@ -42,6 +42,13 @@ class PerformanceAnalyticsService:
         }
         """
         try:
+            # Load brand content pillars for brand-specific topic matching
+            brand_doc = await db["brand_profiles"].find_one(
+                {"user_id": user_id},
+                {"content_pillars": 1, "_id": 0},
+            )
+            brand_pillars: List[str] = (brand_doc or {}).get("content_pillars") or []
+
             # Fetch published drafts (last 90 days worth, capped at 200)
             drafts_cursor = db["content_drafts"].find(
                 {"user_id": user_id, "status": "published"},
@@ -80,7 +87,7 @@ class PerformanceAnalyticsService:
                 fmt = PerformanceAnalyticsService._classify_format(draft)
                 format_eng[fmt].append(eng_rate)
 
-                for topic in PerformanceAnalyticsService._extract_topics(draft.get("content", "")):
+                for topic in PerformanceAnalyticsService._extract_topics(draft.get("content", ""), brand_pillars):
                     topic_eng[topic].append(eng_rate)
 
                 pub_date = draft.get("published_date")
@@ -137,12 +144,18 @@ class PerformanceAnalyticsService:
         return "long_form" if content_len > 500 else "text"
 
     @staticmethod
-    def _extract_topics(content: str) -> List[str]:
+    def _extract_topics(content: str, brand_pillars: List[str] = None) -> List[str]:
         text = content.lower()
-        return [
+        found = [
             topic for topic, keywords in _TOPIC_KEYWORDS.items()
             if any(k in text for k in keywords)
-        ][:3]
+        ]
+        # Also match brand-specific content pillars directly
+        for pillar in (brand_pillars or []):
+            pillar_lower = pillar.lower().strip()
+            if pillar_lower and pillar_lower not in found and pillar_lower in text:
+                found.append(pillar_lower)
+        return found[:3]
 
     @staticmethod
     def _empty() -> Dict[str, Any]:
