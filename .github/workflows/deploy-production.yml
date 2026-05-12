@@ -62,7 +62,7 @@ jobs:
           host: ${{ secrets.PRODUCTION_VM_IP }}
           username: ${{ secrets.PRODUCTION_VM_USERNAME }}
           key: ${{ secrets.PRODUCTION_SSH_KEY }}
-          source: "./app/,./docker-compose.prod.yml,./.env.production,./.env.example,./Dockerfile,./requirements.txt"
+          source: "./app/,./docker-compose.newprod.yml,./.env.production,./.env.example,./Dockerfile,./requirements.txt"
           target: "/home/${{ secrets.PRODUCTION_VM_USERNAME }}/uri-social-backend/"
           strip_components: 0
           rm: false
@@ -92,11 +92,11 @@ jobs:
 
             # Stop and remove existing container
             echo "🛑 Stopping existing container..."
-            docker compose -f docker-compose.prod.yml down
+            docker compose -f docker-compose.newprod.yml down
 
             # Start new container
             echo "▶️  Starting new container..."
-            docker compose -f docker-compose.prod.yml up -d
+            docker compose -f docker-compose.newprod.yml up -d
 
             # Wait for container to be healthy
             echo "⏳ Waiting for container to start..."

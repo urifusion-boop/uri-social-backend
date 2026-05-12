@@ -1,0 +1,23 @@
+version: "3.9"
+
+services:
+  urisocial-backend-prod:
+    image: urisocial/backend:production
+    container_name: urisocial-backend-prod
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "80", "--workers", "4"]
+    env_file:
+      - .env.production
+    environment:
+      - ENV=Production
+      - URI_GATEWAY_BASE_API_URL=http://uri-gateway.api
+      - PUBLIC_API_URL=https://api.urisocial.com
+    restart: always
+    networks:
+      - urisocial-production-network
+
+networks:
+  urisocial-production-network:
+    external: true
