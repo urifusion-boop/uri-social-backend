@@ -617,12 +617,38 @@ class ImageContentService:
             style_slug = bc.get("style_slug", "")
             style_desc = ""
             composition_mode = "immersive"  # default to immersive (PRD Section 1)
+            style_type = None
             if style_slug:
                 from app.agents.social_media_manager.services.style_library import get_style
                 s = get_style(style_slug)
                 if s:
                     style_desc = s.get("description", "")
                     composition_mode = s.get("composition_mode", "immersive")
+                    style_type = s.get("style_type")  # Can be "art_piece" for 9:16 posters
+
+            # ========== ART-PIECE POSTER DETECTION (9:16 Mobile Wallpaper Format) ==========
+            # Check if this is an art-piece poster based on:
+            # 1. Style type is "art_piece" OR
+            # 2. Trigger words in seed content (wallpaper, poster, art piece, full-page promo)
+            seed_lower = seed_content.lower()
+            art_piece_trigger_words = [
+                "wallpaper", "poster", "art piece", "art-piece", "artpiece",
+                "full-page promo", "full page promo", "mobile wallpaper",
+                "phone wallpaper", "vertical poster", "9:16 poster"
+            ]
+            is_art_piece = (
+                style_type == "art_piece" or
+                any(trigger in seed_lower for trigger in art_piece_trigger_words)
+            )
+
+            # Override specs for art-piece posters (9:16 format = 1024x1792)
+            if is_art_piece:
+                specs = {
+                    "width": 1024,
+                    "height": 1792,
+                    "aspect_ratio": "9:16",
+                }
+                print(f"🎨 Art-Piece Poster Mode Activated: 9:16 format (1024x1792)")
 
             # ========== RESTRUCTURED PROMPT ASSEMBLY (PRD Section 3) ==========
             # CRITICAL: Brand rules MUST come FIRST - GPT-Image-2 weights prompt beginning more heavily
@@ -646,8 +672,8 @@ Every element in the image must come from the instructions below. Nothing else."
             cta_text = bc.get("default_link", "Link in bio")
 
             # Brand name display logic (PRD Section 4)
-            seed_lower = seed_content.lower()
-            show_brand_name = any([
+            # Art-piece posters ALWAYS include brand logo + tagline + badges
+            show_brand_name = is_art_piece or any([
                 "add our name" in seed_lower,
                 "add the name" in seed_lower,
                 "add our logo" in seed_lower,
@@ -678,7 +704,13 @@ Every element in the image must come from the instructions below. Nothing else."
             ])
 
             brand_name_directive = ""
-            if show_brand_name:
+            if is_art_piece:
+                # Art-piece posters have special branding requirements
+                tagline = bc.get("tagline", "")
+                tagline_text = f'\nTagline: Display "{tagline}" below the logo in complementary font.' if tagline else ""
+                brand_name_directive = f'''Display the brand name "{brand_name}" prominently at the top third or top centre of the poster. Logo size: large and clear.{tagline_text}
+Feature badges: Add 2-3 feature badges (e.g., "Premium Quality", "Limited Edition", "Handcrafted") near the bottom or flanking the product in elegant frames.'''
+            elif show_brand_name:
                 brand_name_directive = f'Display the brand name "{brand_name}" prominently in the design. Spell it exactly as shown.'
             else:
                 brand_name_directive = 'Do NOT display the brand name or logo anywhere. Brand identity is expressed through colours and visual treatment only.'
