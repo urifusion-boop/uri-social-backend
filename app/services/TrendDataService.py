@@ -74,7 +74,8 @@ class TrendDataService:
         """
         resolved_geo = geo or _region_to_geo(region)
         brand_seeds = [s for s in (brand_seeds or []) if s and len(s.strip()) > 2]
-        cache_key = f"{industry.lower()}:{resolved_geo}:{timeframe}:{','.join(sorted(brand_seeds))}"
+        # v2 prefix in cache key forces a miss when upgrading from pre-brand-seed code
+        cache_key = f"v2:{industry.lower()}:{resolved_geo}:{timeframe}:{','.join(sorted(brand_seeds))}"
 
         # Try to read from cache first
         if db is not None:
@@ -189,7 +190,7 @@ class TrendDataService:
                 deduped[key] = kw
 
         ranked = sorted(deduped.values(), key=lambda x: x["trend_score"], reverse=True)
-        return ranked[:10] if ranked else TrendDataService._fallback_keywords(industry)
+        return ranked[:10] if ranked else TrendDataService._fallback_keywords(industry, brand_seeds)
 
     @staticmethod
     def _fallback_keywords(industry: str, brand_seeds: List[str] = None) -> List[Dict[str, Any]]:
