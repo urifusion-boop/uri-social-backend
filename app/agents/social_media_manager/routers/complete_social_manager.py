@@ -622,21 +622,18 @@ async def instagram_direct_callback(
     import httpx
     from datetime import timezone
 
-    source = state or "settings"
-    is_settings = source == "settings"
     web_app_url = settings.WEB_APP_URL.strip("'\"")
-    base_redirect = (
-        f"{web_app_url}/settings/social-accounts"
-        if is_settings
-        else f"{web_app_url}/social-media/brand-setup"
-    )
+    # Always redirect to the workspace connections tab — that is where
+    # the finalizeInstagramDirect handler lives. /settings/social-accounts
+    # does not exist as a route so the finalize call would never fire there.
+    base_redirect = f"{web_app_url}/workspace?tab=connections"
 
     if error:
         msg = urllib.parse.quote(error_reason or error)
-        return RedirectResponse(f"{base_redirect}?connected=false&error={msg}")
+        return RedirectResponse(f"{base_redirect}&connected=false&error={msg}")
 
     if not code:
-        return RedirectResponse(f"{base_redirect}?connected=false&error=missing_code")
+        return RedirectResponse(f"{base_redirect}&connected=false&error=missing_code")
 
     _base = (settings.PUBLIC_API_URL or settings.URI_GATEWAY_BASE_API_URL).rstrip("/")
     redirect_uri = f"{_base}/social-media/connect/instagram-direct/callback"
@@ -751,12 +748,13 @@ async def instagram_direct_callback(
             f"&ig_user_id={urllib.parse.quote(ig_user_id)}"
             f"&username={urllib.parse.quote(username)}"
         )
-        return RedirectResponse(f"{base_redirect}?{params_out}")
+        # base_redirect already has ?tab=connections so append with &
+        return RedirectResponse(f"{base_redirect}&{params_out}")
 
     except Exception as e:
         print(f"[IGDirectOAuth] ❌ Error: {e}")
         return RedirectResponse(
-            f"{base_redirect}?connected=false&error={urllib.parse.quote(str(e))}"
+            f"{base_redirect}&connected=false&error={urllib.parse.quote(str(e))}"
         )
 
 
@@ -3599,19 +3597,33 @@ async def publish_video_draft(
 
     caption = request.caption if request.caption is not None else (draft.get("content") or "")
 
-    # Resolve connection — instagram_reels → platform "instagram"; facebook_reels → "facebook"
-    platform_key = "instagram" if request.platform == "instagram_reels" else "facebook"
-    conn = await db["social_connections"].find_one(
-        {"user_id": user_id, "platform": platform_key},
-        {"_id": 0, "page_access_token": 1, "ig_user_id": 1},
-    )
-    if not conn or not conn.get("page_access_token"):
-        raise HTTPException(
-            status_code=400,
-            detail=f"No connected {platform_key} account found. Please connect your account first.",
+    # Resolve connection.
+    # instagram_reels → look for "instagram" direct connection
+    # facebook_reels  → look for "facebook" first; fall back to "instagram" because the
+    #                   Instagram OAuth flow stores a Facebook Page access token that can
+    #                   also be used to post videos to the Facebook Page.
+    if request.platform == "instagram_reels":
+        conn = await db["social_connections"].find_one(
+            {"user_id": user_id, "platform": "instagram"},
+            {"_id": 0, "page_access_token": 1, "ig_user_id": 1},
         )
-    if request.platform == "instagram_reels" and not conn.get("ig_user_id"):
-        raise HTTPException(status_code=400, detail="Instagram account missing ig_user_id. Please reconnect.")
+        if not conn or not conn.get("page_access_token"):
+            raise HTTPException(status_code=400, detail="No connected Instagram account found. Please connect your account first.")
+        if not conn.get("ig_user_id"):
+            raise HTTPException(status_code=400, detail="Instagram account missing ig_user_id. Please reconnect.")
+    else:  # facebook_reels
+        conn = await db["social_connections"].find_one(
+            {"user_id": user_id, "platform": "facebook"},
+            {"_id": 0, "page_access_token": 1},
+        )
+        if not conn or not conn.get("page_access_token"):
+            # Fall back to Instagram connection — its page_access_token is a Facebook Page token
+            conn = await db["social_connections"].find_one(
+                {"user_id": user_id, "platform": "instagram"},
+                {"_id": 0, "page_access_token": 1},
+            )
+        if not conn or not conn.get("page_access_token"):
+            raise HTTPException(status_code=400, detail="No connected Facebook or Instagram account found. Connect Instagram to enable Facebook posting.")
 
     job_id = await VideoPublishService.create_job(request.draft_id, request.platform, user_id)
     background_tasks.add_task(
