@@ -252,9 +252,24 @@ GRAPHIC_ACTIONS = (
     "Want to post it, schedule it, or try a different design? Say *back* to return to your content."
 )
 
-RE_ENGAGEMENT = (
-    "Hey! Got some fresh content ideas for you 🎉 Want to see them?"
-)
+def _daily_morning_greeting(first_name: str) -> str:
+    return (
+        f"Hey {first_name}! ☀️ Good morning!\n\n"
+        "What are we working on today?\n\n"
+        "✍️ *Write a post* — give me a topic and I'll draft something\n"
+        "🎨 *Make a graphic* — I'll design a visual for your brand\n"
+        "💡 *Give me ideas* — I'll brainstorm content for you\n"
+        "📅 *Check my schedule* — see what's coming up\n\n"
+        "Just reply with what you'd like, or describe what you want to post about! 😊"
+    )
+
+
+def _re_engagement_msg(first_name: str) -> str:
+    return (
+        f"Hey {first_name}! 👋 It's been a little while — hope you're doing great!\n\n"
+        "Whenever you're ready, I'm here to help. I can write a post, make a graphic, "
+        "or just brainstorm ideas with you. What would you like to work on? 😊"
+    )
 
 HELP_MESSAGE = CAPABILITIES
 
@@ -1981,7 +1996,7 @@ class WhatsAppFlowService:
                 if last_updated and state == "idle":
                     delta = datetime.now(timezone.utc).replace(tzinfo=None) - last_updated
                     if delta.days >= 2:
-                        await _send(phone, RE_ENGAGEMENT)
+                        await _send(phone, _re_engagement_msg(first_name))
                         await _safe_set_state(
                             phone, "awaiting_re_engagement", session.get("context", {}), db
                         )
@@ -1992,37 +2007,8 @@ class WhatsAppFlowService:
                 if not brand:
                     continue
 
-                # Check and deduct 1 credit before generating daily content
-                allowed = await _check_and_deduct_credit(user_id, reason="whatsapp_content_generation")
-                if not allowed:
-                    # User is out of credits — notify them instead of generating
-                    await _send(
-                        phone,
-                        f"Good morning {first_name} 👋\n\n"
-                        "⚠️ You've run out of credits and can't receive today's content.\n\n"
-                        "Upgrade your plan at urisocial.com to keep getting daily content."
-                    )
-                    failed += 1
-                    continue
-
-                industry = brand.get("industry", "your niche")
-                topic = f"a powerful truth about {industry}"
-                content = await _generate_content_structured(topic, brand)
-                if not content:
-                    print(f"[DailyPush] Content generation returned None for user={user_id} phone={phone}")
-                    failed += 1
-                    continue
-
-                new_ctx = {
-                    "topic": topic,
-                    "headline": content["headline"],
-                    "subheadline": content["subheadline"],
-                    "caption": content["caption"],
-                }
-
-                await _send(phone, f"Good morning {first_name} 👋\n\nYour content for today is ready.")
-                await _send(phone, _format_content(new_ctx))
-                await _safe_set_state(phone, "showing_content", new_ctx, db)
+                await _send(phone, _daily_morning_greeting(first_name))
+                await _safe_set_state(phone, "idle", {}, db)
                 sent += 1
 
             except Exception as e:
