@@ -2009,6 +2009,7 @@ class WhatsAppFlowService:
                 topic = f"a powerful truth about {industry}"
                 content = await _generate_content_structured(topic, brand)
                 if not content:
+                    print(f"[DailyPush] Content generation returned None for user={user_id} phone={phone}")
                     failed += 1
                     continue
 

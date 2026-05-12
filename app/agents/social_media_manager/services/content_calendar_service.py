@@ -12,6 +12,7 @@ Generation pipeline (PRD Phase 1):
 
 import json
 import uuid
+import secrets
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -203,6 +204,7 @@ async def _generate_ideas(
     previous_titles: Optional[List[str]] = None,
     trend_keywords: Optional[List[Dict[str, Any]]] = None,
     performance: Optional[Dict[str, Any]] = None,
+    force: bool = False,
 ) -> List[Dict[str, Any]]:
     """Call AI once for all 7 day ideas. Returns list of 7 dicts."""
     brand_name = brand.get("brand_name") or "the brand"
@@ -250,6 +252,13 @@ async def _generate_ideas(
     avoid_repeat_block = ""
     if previous_titles:
         avoid_repeat_block = f"\nTopics used last week (do NOT repeat these):\n" + "\n".join(f"- {t}" for t in previous_titles[:14])
+
+    # When force-regenerating, inject a random token so the model cannot return
+    # a cached/memorised response identical to the previous generation.
+    force_token_block = ""
+    if force:
+        token = secrets.token_hex(6)
+        force_token_block = f"\n[Regeneration token: {token}] This is a fresh regeneration — produce completely different ideas from any previous plan.\n"
 
     # ── Market Intel block (Google Trends) ────────────────────────────────────
     market_intel_block = ""
@@ -334,7 +343,7 @@ Week starting: {week_start}
 {market_intel_block}
 {performance_block}
 {avoid_repeat_block}
-
+{force_token_block}
 Generate a 7-day content plan. For each day produce:
 - title: a short, punchy content idea title (max 10 words) — make it feel native to the platform and brand
 - description: 2-3 sentences with a concrete, specific angle. Include what to say, who it speaks to, and why it matters for this brand right now.
@@ -366,8 +375,10 @@ Rules:
 
     ai_request = AIService.build_ai_model(
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.8,
+        model="gpt-4o" if force else "gpt-4o-mini",
+        temperature=0.95 if force else 0.8,
     )
+    print(f"[Calendar] _generate_ideas model={'gpt-4o' if force else 'gpt-4o-mini'} temperature={0.95 if force else 0.8} force={force}", flush=True)
     response = await AIService.chat_completion(ai_request)
     if isinstance(response, dict) and response.get("error"):
         raise ValueError(response["error"])
@@ -464,6 +475,7 @@ async def generate_plan(
             previous_titles=previous_titles,
             trend_keywords=trend_keywords or [],
             performance=performance,
+            force=force,
         )
     except Exception as exc:
         print(f"[Calendar] AI generation failed: {exc}")

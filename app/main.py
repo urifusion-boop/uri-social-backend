@@ -55,26 +55,35 @@ async def startup_event():
         print(f"⚠️  Warning: Failed to start notification scheduler: {e}")
 
 # CORS
-# In production, CORS is handled at the nginx level to avoid duplicate headers.
-# Locally (no nginx), we enable it directly on FastAPI so preflight OPTIONS
-# requests are not rejected with 405.
+# Always apply CORS middleware — nginx on prod/staging strips duplicate headers
+# so there's no risk of double CORS headers in those environments.
+# Explicit origins are listed; "*" is also included so curl/Postman/mobile work.
 import os as _os
-_ENV = (
-    _os.getenv("APP_ENV")
-    or _os.getenv("ENV")
-    or _os.getenv("DEV_ENV")
-    or "local"
-).lower()
-if _ENV not in ("production", "prod", "staging"):
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=False,
-        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-        allow_headers=["*"],
-        expose_headers=["*"],
-        max_age=3600,
-    )
+_ALLOWED_ORIGINS = [
+    # Local development
+    "http://localhost:3000",
+    "http://localhost:3001",
+    "http://localhost:8080",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:3001",
+    # Staging
+    "https://staging.urisocial.com",
+    "https://app-staging.urisocial.com",
+    # Production
+    "https://urisocial.com",
+    "https://www.urisocial.com",
+    "https://app.urisocial.com",
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_ALLOWED_ORIGINS,
+    allow_origin_regex=r"https://.*\.urisocial\.com",
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=3600,
+)
 
 # Respect X-Forwarded-For / X-Forwarded-Proto when behind a proxy/load-balancer.
 # Import inside a try/except so static analyzers or environments without the
