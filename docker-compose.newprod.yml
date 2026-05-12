@@ -2,7 +2,7 @@ version: "3.9"
 
 services:
   urisocial-backend-prod:
-    image: urisocial/backend:production
+    image: uriteam/urisvc:production
     container_name: urisocial-backend-prod
     build:
       context: .
