@@ -1597,6 +1597,25 @@ class WhatsAppFlowService:
             await _safe_set_state(phone, "showing_content", ctx, db)
             return
 
+        # User wants a fresh topic / new idea — escape the edit loop
+        _ESCAPE_PHRASES = (
+            "new idea", "give me a new idea", "new content", "new content idea",
+            "something else", "different topic", "different idea", "fresh idea",
+            "new post", "another topic", "change topic", "new topic",
+            "start over", "restart",
+        )
+        if any(p in text for p in _ESCAPE_PHRASES) or text in _NEW_IDEA_WORDS:
+            await _send(phone, "Sure! What topic should this post be about?")
+            await _safe_set_state(phone, "awaiting_topic", ctx, db)
+            return
+
+        # User wants a visual/color image edit — route to direct image editing
+        if WhatsAppFlowService._is_direct_image_edit(text):
+            image_url = ctx.get("last_graphic_url") or ctx.get("product_image_url")
+            edit_ctx = {**ctx, "product_image_url": image_url}
+            await WhatsAppFlowService._edit_image_with_prompt(phone, user_id, raw_body.strip(), edit_ctx, db)
+            return
+
         # Detect "change X to Y" or "set X to Y" patterns — apply directly
         inline = re.match(
             r"(?:change|set|update|rewrite|make)\s+(?:the\s+)?(headline|subheadline|sub.headline|tone|caption)\s+(?:to|as)\s+(.+)",
@@ -1706,8 +1725,22 @@ class WhatsAppFlowService:
             "cyber aesthetic", "photorealistic", "hyper realistic", "high resolution",
             "sharp focus", "4k", "8k", "studio lighting", "bokeh",
             "render of ", "render this", "reimagine", "transform this",
+            # Color / visual property changes
+            "colour to", "color to",
+            "colour of", "color of",
+            "change the colour", "change the color",
+            "change the suit", "change the tie", "change the shirt",
+            "change the dress", "change the jacket", "change the pants",
+            "change the font", "change the text color", "change the text colour",
+            "make it darker", "make it lighter", "make it brighter",
+            "make the suit", "make the tie", "make the background",
+            "turn the ", "swap the color", "swap the colour",
+            "remove the background", "white background", "transparent background",
         )
         t = text.lower()
+        # Catch "X colour to Y" / "X color to Y" patterns (e.g. "suit colour to lemon")
+        if ("colour" in t or "color" in t) and (" to " in t or " into " in t):
+            return True
         return any(phrase in t for phrase in _EDIT_PHRASES)
 
     @staticmethod
