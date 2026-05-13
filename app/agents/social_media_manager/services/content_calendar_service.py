@@ -486,8 +486,17 @@ async def generate_plan(
 
     # ── Personalised content mix from performance data ────────────────────────
     week_number = monday.isocalendar()[1]
-    mix = _pick_mix_from_performance(performance, industry, brand, week_number=week_number)
-    print(f"[Calendar] Week {week_number} → mix={mix}")
+    if force:
+        # On regenerate, pick a random variant + rotation so the type layout
+        # genuinely changes (same week → same week_number, so we must randomise)
+        variant_idx = secrets.randbelow(len(DEFAULT_MIX_VARIANTS))
+        base = DEFAULT_MIX_VARIANTS[variant_idx][:]
+        rotation = secrets.randbelow(6) + 1  # always rotate at least 1 slot
+        mix = base[rotation:] + base[:rotation]
+        print(f"[Calendar] Force-regen: variant={variant_idx} rotation={rotation} → mix={mix}")
+    else:
+        mix = _pick_mix_from_performance(performance, industry, brand, week_number=week_number)
+        print(f"[Calendar] Week {week_number} → mix={mix}")
 
     generation_method = "ai"  # default fallback
     days: List[Dict[str, Any]] = []
