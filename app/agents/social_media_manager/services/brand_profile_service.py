@@ -95,22 +95,12 @@ class BrandProfileService:
             (not existing or not existing.get("onboarding_completed"))
         )
 
+        # Allow completing onboarding even without required fields
+        # Users can skip all onboarding steps and go directly to dashboard
+        # They can fill in brand profile details later
         if is_completing_onboarding:
-            required_for_completion = {
-                "brand_name": doc.get("brand_name"),
-                "industry": doc.get("industry"),
-            }
-
-            missing = [field for field, value in required_for_completion.items() if not value]
-
-            if missing:
-                # Cannot complete onboarding without required fields
-                doc["onboarding_completed"] = False
-                from fastapi import HTTPException as _HTTPException
-                raise _HTTPException(
-                    status_code=400,
-                    detail=f"Cannot complete onboarding. Please provide: {', '.join(missing)}",
-                )
+            # No validation - all fields are optional
+            pass
 
         if existing:
             # Once onboarding_completed is True, never allow it to be reset to False
