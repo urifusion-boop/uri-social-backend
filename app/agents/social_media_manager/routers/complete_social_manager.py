@@ -902,6 +902,7 @@ async def instagram_direct_callback(
             "platform": "instagram",
             "connected_via": "instagram_direct_oauth",
             "ig_user_id": ig_user_id,
+            "page_id": pid,  # Facebook Page ID linked to this Instagram account
             "page_access_token": page_token,
             "username": username,
             "account_name": username,
