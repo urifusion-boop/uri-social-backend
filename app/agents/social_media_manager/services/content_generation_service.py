@@ -9,12 +9,13 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from app.services.AIService import AIService
 from app.domain.responses.uri_response import UriResponse
-# Caption Voice System imports (keeping code but disabling for now)
-# from app.agents.social_media_manager.services.caption_validator_service import CaptionValidatorService
-# from app.agents.social_media_manager.services.caption_voice_system import (
-#     BANNED_PATTERNS_RULES,
-#     build_voice_profile_instructions,
-# )
+# Caption Voice System imports
+from app.agents.social_media_manager.services.caption_validator_service import CaptionValidatorService
+from app.agents.social_media_manager.services.caption_voice_system import (
+    BANNED_PATTERNS_RULES,
+    build_voice_profile_instructions,
+    get_platform_formatting_rules,
+)
 
 
 class ContentGenerationService:
@@ -612,18 +613,34 @@ Create social media content about THIS SPECIFIC PRODUCT based on the image analy
             prompt_template = ContentGenerationService.PLATFORM_PROMPTS[platform]
             brand_block = ContentGenerationService._build_brand_block(brand_context, platform=platform)
             platform_prompt = prompt_template.format(seed_content=seed_content)
-            # Brand instructions go first so they govern everything that follows
-            prompt = brand_block + platform_prompt if brand_block else platform_prompt
 
-            # Prepend universal formatting rule — must override any model default toward markdown
-            formatting_rule = (
-                "ABSOLUTE FORMATTING RULE: Output plain text only. "
-                "Never use markdown syntax of any kind — no **bold**, no *italic*, no __underline__, "
-                "no # headings, no bullet hyphens (- or *), no numbered lists with dots, no backticks. "
-                "If you want emphasis, choose stronger words. If you want structure, use line breaks. "
-                "The output will be displayed directly on a social media platform exactly as you write it.\n\n"
-            )
-            prompt = formatting_rule + prompt
+            # Build voice profile instructions if available
+            voice_instructions = ""
+            if brand_context and brand_context.get("voice_profile"):
+                voice_instructions = build_voice_profile_instructions(
+                    brand_context["voice_profile"],
+                    brand_context.get("voice_sample_analysis"),
+                    platform
+                )
+
+            # Get platform-specific formatting rules
+            platform_formatting = get_platform_formatting_rules(platform)
+
+            # Assemble the complete prompt with proper order:
+            # 1. Banned patterns rules (universal)
+            # 2. Formatting rules (universal + platform-specific)
+            # 3. Voice profile (brand-specific)
+            # 4. Brand context
+            # 5. Platform prompt
+            prompt_parts = [
+                BANNED_PATTERNS_RULES,
+                platform_formatting,
+                voice_instructions,
+                brand_block if brand_block else "",
+                platform_prompt
+            ]
+
+            prompt = "\n".join([p for p in prompt_parts if p])
             
             # Use your existing AIService with optimized parameters
             ai_request = AIService.build_ai_model(
@@ -650,46 +667,45 @@ Create social media content about THIS SPECIFIC PRODUCT based on the image analy
             )
 
             # ── Caption Validation & Auto-Fix (PRD Section 7) ──────────────────────
-            # TEMPORARILY DISABLED - Testing if this breaks image generation
-            # # Extract custom banned words from voice profile
-            # custom_banned_words = []
-            # if brand_context and brand_context.get("voice_profile"):
-            #     custom_banned_words = brand_context["voice_profile"].get("banned_words", [])
-            #
-            # # Validate the caption
-            # validation_result = CaptionValidatorService.validate_caption(content, custom_banned_words)
-            #
-            # # If validation fails, attempt auto-fix (one retry)
-            # if not validation_result["passed"]:
-            #     print(f"[CAPTION] Validation failed for {platform}: {validation_result['issues']}")
-            #
-            #     # Generate fix prompt
-            #     fix_prompt = CaptionValidatorService.generate_fix_prompt(content, validation_result)
-            #
-            #     # Regenerate with fix instructions
-            #     fix_ai_request = AIService.build_ai_model(
-            #         messages=[{"role": "user", "content": fix_prompt}],
-            #         temperature=0.7,
-            #     )
-            #
-            #     fix_ai_response = await AIService.chat_completion(fix_ai_request)
-            #     if not (isinstance(fix_ai_response, dict) and "error" in fix_ai_response):
-            #         fixed_content = fix_ai_response.choices[0].message.content.strip()
-            #
-            #         # Re-extract hashtags from fixed content
-            #         content, hashtags = ContentGenerationService._extract_and_clean_hashtags(
-            #             fixed_content, platform
-            #         )
-            #
-            #         # Validate again
-            #         revalidation = CaptionValidatorService.validate_caption(content, custom_banned_words)
-            #         if revalidation["passed"]:
-            #             print(f"[CAPTION] ✓ Fixed and validated for {platform}")
-            #         else:
-            #             print(f"[CAPTION] ⚠ Still has issues after fix: {revalidation['issues'][:3]}")
-            #             # Proceed with content anyway, but flag it
-            # else:
-            #     print(f"[CAPTION] ✓ Passed validation for {platform}")
+            # Extract custom banned words from voice profile
+            custom_banned_words = []
+            if brand_context and brand_context.get("voice_profile"):
+                custom_banned_words = brand_context["voice_profile"].get("banned_words", [])
+
+            # Validate the caption
+            validation_result = CaptionValidatorService.validate_caption(content, custom_banned_words)
+
+            # If validation fails, attempt auto-fix (one retry)
+            if not validation_result["passed"]:
+                print(f"[CAPTION] Validation failed for {platform}: {validation_result['issues']}")
+
+                # Generate fix prompt
+                fix_prompt = CaptionValidatorService.generate_fix_prompt(content, validation_result)
+
+                # Regenerate with fix instructions
+                fix_ai_request = AIService.build_ai_model(
+                    messages=[{"role": "user", "content": fix_prompt}],
+                    temperature=0.7,
+                )
+
+                fix_ai_response = await AIService.chat_completion(fix_ai_request)
+                if not (isinstance(fix_ai_response, dict) and "error" in fix_ai_response):
+                    fixed_content = fix_ai_response.choices[0].message.content.strip()
+
+                    # Re-extract hashtags from fixed content
+                    content, hashtags = ContentGenerationService._extract_and_clean_hashtags(
+                        fixed_content, platform
+                    )
+
+                    # Validate again
+                    revalidation = CaptionValidatorService.validate_caption(content, custom_banned_words)
+                    if revalidation["passed"]:
+                        print(f"[CAPTION] ✓ Fixed and validated for {platform}")
+                    else:
+                        print(f"[CAPTION] ⚠ Still has issues after fix: {revalidation['issues'][:3]}")
+                        # Proceed with content anyway, but flag it
+            else:
+                print(f"[CAPTION] ✓ Passed validation for {platform}")
 
             # Generate a draft ID
             draft_id = str(ObjectId())
