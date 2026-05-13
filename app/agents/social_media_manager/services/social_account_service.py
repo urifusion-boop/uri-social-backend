@@ -335,12 +335,6 @@ class SocialAccountService:
                     "ig_user_id": doc.get("ig_user_id"),
                 })
 
-            # 3. Instagram direct OAuth gives a Facebook Page token — expose facebook too
-            if "instagram" in by_platform and "facebook" not in by_platform:
-                ig_conn = by_platform["instagram"][0] if by_platform["instagram"] else {}
-                if ig_conn.get("connected_via", "").startswith("instagram_direct"):
-                    by_platform["facebook"] = [ig_conn]
-
             total = sum(len(v) for v in by_platform.values())
             return UriResponse.get_single_data_response("user_connections", {
                 "user_id": user_id,
