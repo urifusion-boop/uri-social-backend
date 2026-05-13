@@ -3850,3 +3850,51 @@ async def get_video_publish_job(
     if not job:
         raise HTTPException(status_code=404, detail="Publish job not found")
     return UriResponse.get_single_data_response("publish_job", job)
+
+
+@router.post("/extract-image-text")
+async def extract_image_text(
+    image_url: str = Query(..., description="URL of the image to extract text from"),
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Extract text overlaid on an image using OpenAI Vision API.
+    Used when user clicks 'Text' edit button to pre-fill with actual image text.
+    """
+    try:
+        from app.services.AIService import client as ai_client
+
+        prompt = (
+            "Extract ALL text that is overlaid or written on this image. "
+            "Return ONLY the exact text you see - no descriptions, no analysis. "
+            "If there are multiple text elements, list them separated by line breaks. "
+            "If there is no text on the image, return 'No text found'."
+        )
+
+        response = await asyncio.get_running_loop().run_in_executor(
+            None,
+            lambda: ai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": image_url}}
+                        ]
+                    }
+                ],
+                max_tokens=300
+            )
+        )
+
+        extracted_text = response.choices[0].message.content.strip()
+
+        return UriResponse.get_single_data_response("image_text", {
+            "text": extracted_text,
+            "image_url": image_url
+        })
+
+    except Exception as e:
+        print(f"⚠️ Error extracting text from image: {e}")
+        return UriResponse.error_response(f"Failed to extract text: {str(e)}")
