@@ -689,7 +689,6 @@ RULES FOR THIS EDIT:
                 return None
 
             # Upload to Cloudinary for permanent CDN storage
-            import io
             from app.utils.cloudinary_upload import upload_bytes
 
             print(f"🔄 Uploading EDITED image to Cloudinary...")
