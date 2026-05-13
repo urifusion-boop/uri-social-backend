@@ -252,9 +252,24 @@ GRAPHIC_ACTIONS = (
     "Want to post it, schedule it, or try a different design? Say *back* to return to your content."
 )
 
-RE_ENGAGEMENT = (
-    "Hey! Got some fresh content ideas for you 🎉 Want to see them?"
-)
+def _daily_morning_greeting(first_name: str) -> str:
+    return (
+        f"Hey {first_name}! ☀️ Good morning!\n\n"
+        "What are we working on today?\n\n"
+        "✍️ *Write a post* — give me a topic and I'll draft something\n"
+        "🎨 *Make a graphic* — I'll design a visual for your brand\n"
+        "💡 *Give me ideas* — I'll brainstorm content for you\n"
+        "📅 *Check my schedule* — see what's coming up\n\n"
+        "Just reply with what you'd like, or describe what you want to post about! 😊"
+    )
+
+
+def _re_engagement_msg(first_name: str) -> str:
+    return (
+        f"Hey {first_name}! 👋 It's been a little while — hope you're doing great!\n\n"
+        "Whenever you're ready, I'm here to help. I can write a post, make a graphic, "
+        "or just brainstorm ideas with you. What would you like to work on? 😊"
+    )
 
 HELP_MESSAGE = CAPABILITIES
 
@@ -803,9 +818,16 @@ class WhatsAppFlowService:
             ctx = {**ctx, "product_image_url": product_image_url, "product_image_twilio_url": media_url}
             await _safe_set_state(phone, state, ctx, db)
 
-            # If text also says "design" / "graphic" / "poster" etc — jump straight to generation
+            # Specific image manipulation prompt (e.g. "3D render of a mug", "add the logo") —
+            # pass the user's exact prompt to OpenAI image edit, no brand overlays
+            if text and WhatsAppFlowService._is_direct_image_edit(text):
+                await WhatsAppFlowService._edit_image_with_prompt(phone, user_id, body.strip(), ctx, db)
+                return
+
+            # Generic "design" / "graphic" / "poster" request — jump to branded generation
+            # Note: "image" and "ad" removed — too short, match "Edit this image..." and "can you add..."
             _GRAPHIC_TRIGGER_WORDS = (
-                "design", "graphic", "poster", "image", "visual", "ad", "banner",
+                "design", "graphic", "poster", "visual", "banner",
                 "new design", "make a", "create a", "generate",
             )
             if text and any(w in text for w in _GRAPHIC_TRIGGER_WORDS):
@@ -1576,6 +1598,25 @@ class WhatsAppFlowService:
             await _safe_set_state(phone, "showing_content", ctx, db)
             return
 
+        # User wants to escape edit mode: new idea, fresh content, etc.
+        _ESCAPE_PHRASES = (
+            "new idea", "give me a new idea", "new content", "new content idea",
+            "something else", "different topic", "different idea", "fresh idea",
+            "new post", "another topic", "change topic", "new topic",
+            "start over", "restart",
+        )
+        if any(p in text for p in _ESCAPE_PHRASES) or text in _NEW_IDEA_WORDS:
+            await _send(phone, "Sure! What topic should this post be about?")
+            await _safe_set_state(phone, "awaiting_topic", ctx, db)
+            return
+
+        # User wants to do a visual/image edit — route to direct image editing
+        if WhatsAppFlowService._is_direct_image_edit(text):
+            image_url = ctx.get("last_graphic_url") or ctx.get("product_image_url")
+            edit_ctx = {**ctx, "product_image_url": image_url}
+            await WhatsAppFlowService._edit_image_with_prompt(phone, user_id, raw_body.strip(), edit_ctx, db)
+            return
+
         # Detect "change X to Y" or "set X to Y" patterns — apply directly
         inline = re.match(
             r"(?:change|set|update|rewrite|make)\s+(?:the\s+)?(headline|subheadline|sub.headline|tone|caption)\s+(?:to|as)\s+(.+)",
@@ -1659,6 +1700,107 @@ class WhatsAppFlowService:
             new_ctx = {**ctx, field: value}
             await _send(phone, _format_content(new_ctx))
             await _safe_set_state(phone, "showing_content", new_ctx, db)
+
+    # ── Direct image editing (user-supplied prompt, no brand overlays) ────────
+
+    @staticmethod
+    def _is_direct_image_edit(text: str) -> bool:
+        """
+        Return True when the user wants to manipulate a specific image rather
+        than generate a new branded social post. These bypass _generate_graphic
+        and go straight to OpenAI image edit with the user's exact prompt.
+        """
+        _EDIT_PHRASES = (
+            "edit this image", "edit the image", "edit this photo", "edit the photo",
+            "edit this picture", "edit the picture", "with this prompt",
+            "can you add", "can you put", "can you place", "can you remove",
+            "can you change the background", "can you make it",
+            "add the ", "add a ", "remove the ", "remove a ",
+            "put the ", "put a ", "place the ", "place a ",
+            "combine ", "merge ", "blend ",
+            "replace the background", "change the background",
+            "make it look", "make the background",
+            "beside the ", "next to the ", "behind the ",
+            "3d render", "neon light", "minimalist ", "ultra-modern",
+            "cyber aesthetic", "photorealistic", "hyper realistic", "high resolution",
+            "sharp focus", "4k", "8k", "studio lighting", "bokeh",
+            "render of ", "render this", "reimagine", "transform this",
+            # Color / visual property changes
+            "colour to", "color to",
+            "colour of", "color of",
+            "change the colour", "change the color",
+            "change the suit", "change the tie", "change the shirt",
+            "change the dress", "change the jacket", "change the pants",
+            "change the font", "change the text color", "change the text colour",
+            "make it darker", "make it lighter", "make it brighter",
+            "make the suit", "make the tie", "make the background",
+            "turn the ", "swap the color", "swap the colour",
+            "remove the background", "white background", "transparent background",
+        )
+        t = text.lower()
+        # Also catch any message that contains colour/color with a "to" (e.g. "suit colour to lemon")
+        if ("colour" in t or "color" in t) and (" to " in t or " into " in t):
+            return True
+        return any(phrase in t for phrase in _EDIT_PHRASES)
+
+    @staticmethod
+    async def _edit_image_with_prompt(
+        phone: str,
+        user_id: str,
+        edit_prompt: str,
+        ctx: Dict[str, Any],
+        db: AsyncIOMotorDatabase,
+    ) -> None:
+        """
+        Edit the user-supplied image with their exact prompt via OpenAI image
+        edit API. No brand overlays, headlines, or text added — the prompt
+        drives everything.
+        """
+        image_url = ctx.get("product_image_url") or ctx.get("last_graphic_url")
+        if not image_url:
+            await _send(phone, "I don't have an image to edit. Please send me the image again.")
+            return
+
+        allowed = await _check_and_deduct_credit(user_id, reason="whatsapp_image_edit")
+        if not allowed:
+            await _send(
+                phone,
+                "⚠️ You've run out of credits.\n\n"
+                "Upgrade your plan on the Uri Social dashboard to edit images.",
+            )
+            return
+
+        await _send(phone, "Editing your image... 🎨 Give me a moment.")
+        await _safe_set_state(phone, "generating_graphic", ctx, db)
+
+        edited_url: Optional[str] = None
+        try:
+            from app.agents.social_media_manager.services.image_editing_service import ImageEditingService
+
+            image_bytes = await ImageEditingService._download_image(image_url)
+            if not image_bytes:
+                await _send(phone, "⚠️ Couldn't load your image. Please send it again.")
+                await _safe_set_state(phone, "idle", ctx, db)
+                return
+
+            edited_url = await ImageEditingService._call_edit_api(
+                image_bytes=image_bytes,
+                prompt=edit_prompt,
+                size="1024x1024",
+            )
+
+            if not edited_url:
+                await _send(phone, "⚠️ Image edit failed. Please try again or describe what you want differently.")
+                await _safe_set_state(phone, "showing_graphic", ctx, db)
+                return
+
+            await _send(phone, "Here's your edited image 👆", media_url=edited_url)
+            await _send(phone, GRAPHIC_ACTIONS)
+        except Exception as exc:
+            print(f"[WhatsApp] _edit_image_with_prompt error: {exc}", flush=True)
+            await _send(phone, "⚠️ Something went wrong editing the image. Please try again.")
+
+        await _safe_set_state(phone, "showing_graphic", {**ctx, "last_graphic_url": edited_url or ctx.get("last_graphic_url")}, db)
 
     # ── Graphic generation ────────────────────────────────────────────────────
 
@@ -1859,6 +2001,12 @@ class WhatsAppFlowService:
             await _send(phone, GRAPHIC_ACTIONS)
             return
 
+        # Specific image manipulation prompt — route directly to image edit API
+        if WhatsAppFlowService._is_direct_image_edit(text):
+            edit_ctx = {**ctx, "product_image_url": ctx.get("last_graphic_url") or ctx.get("product_image_url")}
+            await WhatsAppFlowService._edit_image_with_prompt(phone, user_id, raw_body.strip(), edit_ctx, db)
+            return
+
         if any(w in text for w in _EDIT_WORDS) or text == "4":
             await WhatsAppFlowService._handle_edit_choice(phone, text, text, user_id, ctx, db)
             return
@@ -1911,7 +2059,11 @@ class WhatsAppFlowService:
             await _send(phone, f"🔗 Download your graphic:\n{url}" if url else "Link unavailable.")
             await _send(phone, GRAPHIC_ACTIONS)
         elif intent == "edit":
-            await WhatsAppFlowService._handle_edit_choice(phone, text, text, user_id, ctx, db)
+            if WhatsAppFlowService._is_direct_image_edit(text):
+                edit_ctx = {**ctx, "product_image_url": ctx.get("last_graphic_url") or ctx.get("product_image_url")}
+                await WhatsAppFlowService._edit_image_with_prompt(phone, user_id, raw_body.strip(), edit_ctx, db)
+            else:
+                await WhatsAppFlowService._handle_edit_choice(phone, text, text, user_id, ctx, db)
         elif intent == "regenerate":
             await WhatsAppFlowService._generate_graphic(phone, user_id, ctx, db)
         elif intent == "back":
@@ -1981,7 +2133,7 @@ class WhatsAppFlowService:
                 if last_updated and state == "idle":
                     delta = datetime.now(timezone.utc).replace(tzinfo=None) - last_updated
                     if delta.days >= 2:
-                        await _send(phone, RE_ENGAGEMENT)
+                        await _send(phone, _re_engagement_msg(first_name))
                         await _safe_set_state(
                             phone, "awaiting_re_engagement", session.get("context", {}), db
                         )
@@ -1992,36 +2144,8 @@ class WhatsAppFlowService:
                 if not brand:
                     continue
 
-                # Check and deduct 1 credit before generating daily content
-                allowed = await _check_and_deduct_credit(user_id, reason="whatsapp_content_generation")
-                if not allowed:
-                    # User is out of credits — notify them instead of generating
-                    await _send(
-                        phone,
-                        f"Good morning {first_name} 👋\n\n"
-                        "⚠️ You've run out of credits and can't receive today's content.\n\n"
-                        "Upgrade your plan at urisocial.com to keep getting daily content."
-                    )
-                    failed += 1
-                    continue
-
-                industry = brand.get("industry", "your niche")
-                topic = f"a powerful truth about {industry}"
-                content = await _generate_content_structured(topic, brand)
-                if not content:
-                    failed += 1
-                    continue
-
-                new_ctx = {
-                    "topic": topic,
-                    "headline": content["headline"],
-                    "subheadline": content["subheadline"],
-                    "caption": content["caption"],
-                }
-
-                await _send(phone, f"Good morning {first_name} 👋\n\nYour content for today is ready.")
-                await _send(phone, _format_content(new_ctx))
-                await _safe_set_state(phone, "showing_content", new_ctx, db)
+                await _send(phone, _daily_morning_greeting(first_name))
+                await _safe_set_state(phone, "idle", {}, db)
                 sent += 1
 
             except Exception as e:
