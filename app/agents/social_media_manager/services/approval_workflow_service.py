@@ -1132,6 +1132,17 @@ class ApprovalWorkflowService:
                 print(f"❌ LinkedIn direct publish failed: {e}")
                 return {"success": False, "error": f"LinkedIn direct publish failed: {str(e)}"}
 
+        # ── Facebook direct OAuth — defer scheduled posts to cron ────────────
+        # Facebook's native scheduled_publish_time API has restrictive requirements
+        # (page must have ≥2000 likes, time must be >10 min in the future, etc.).
+        # Instead we mirror the Instagram/LinkedIn pattern: store as scheduled and
+        # let the cron job call _publish_to_platform again with scheduled_datetime=None.
+        if platform == "facebook" and connection.get("connected_via") == "facebook_direct_oauth":
+            if scheduled_datetime:
+                print(f"⏰ Facebook direct OAuth — deferred to cron scheduler for {scheduled_datetime.isoformat()}")
+                return {"success": True, "scheduled": True, "post_id": None}
+            # immediate publish — fall through to the legacy Facebook block below
+
         # ── Outstand-connected accounts ───────────────────────────────────────
         if connection.get("connected_via") == "outstand":
             try:
@@ -1397,7 +1408,22 @@ class ApprovalWorkflowService:
                         if media_fbid:
                             post_data["attached_media"] = [{"media_fbid": media_fbid}]
                     else:
-                        post_data["media"] = [{"url": image_url, "media_type": "IMAGE"}]
+                        # Upload public URL image to Facebook as unpublished photo to get a media_fbid
+                        try:
+                            import httpx as _httpx
+                            async with _httpx.AsyncClient(timeout=30) as _fc:
+                                _upload = await _fc.post(
+                                    f"https://graph.facebook.com/{settings.FACEBOOK_API_VERSION}/{page_id}/photos",
+                                    data={"url": image_url, "published": "false", "access_token": page_token},
+                                )
+                            _fbid = _upload.json().get("id")
+                            if _fbid:
+                                post_data["attached_media"] = [{"media_fbid": _fbid}]
+                                print(f"📸 FB image uploaded by URL: media_fbid={_fbid}")
+                            else:
+                                print(f"⚠️ FB image URL upload failed: {_upload.json()} — posting without image")
+                        except Exception as _img_err:
+                            print(f"⚠️ FB image URL upload error: {_img_err} — posting without image")
 
                 if scheduled_datetime:
                     import calendar
