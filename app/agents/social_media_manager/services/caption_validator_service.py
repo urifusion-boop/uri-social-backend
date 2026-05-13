@@ -180,7 +180,7 @@ class CaptionValidatorService:
             issues.append('pipe_divider')
 
         # Check for numbered lists
-        if re.search(r'^\s*\d+[.)]s', caption, re.MULTILINE):
+        if re.search(r'^\s*\d+[.)]\s', caption, re.MULTILINE):
             issues.append('numbered_list')
 
         # Check for parenthetical explanations (longer than 10 chars)
