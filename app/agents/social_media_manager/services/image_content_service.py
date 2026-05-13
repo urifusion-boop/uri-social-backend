@@ -1597,16 +1597,46 @@ OVERALL:
                 vision_refs.append(f"{tmpl_count} template(s)")
             vision_ref_note = f" | vision refs: {', '.join(vision_refs)}" if vision_refs else ""
 
+            # Extract TEXT_LEVEL to know what text is overlaid on the image
+            text_level = 'NONE'
+            text_level_match = _re_hex.search(r'TEXT_LEVEL:\s*([A-Z_]+)', brief_no_hex)
+            if text_level_match:
+                text_level = text_level_match.group(1).strip()
+
+            # Extract the actual text from the FINAL_PROMPT for prefilling
+            image_text_overlay = None
+            if text_level not in ('NONE', 'N/A'):
+                # Try to extract quoted text from the prompt (headline, stat, etc.)
+                text_patterns = [
+                    r'"([^"]{4,100})"',  # Text in quotes
+                    r'text reads[:\s]+"([^"]+)"',  # "text reads: ..."
+                    r'headline[:\s]+"([^"]+)"',  # "headline: ..."
+                    r'stat[:\s]+"([^"]+)"',  # "stat: ..."
+                ]
+                for pattern in text_patterns:
+                    text_match = _re_hex.search(pattern, brief_clean, _re_hex.IGNORECASE)
+                    if text_match:
+                        image_text_overlay = text_match.group(1).strip()
+                        break
+
             print(f"\n{'━'*60}")
-            print(f"🎨 IMAGEN PROMPT — {platform.upper()} | type: {chosen_type}{vision_ref_note}")
+            print(f"🎨 IMAGEN PROMPT — {platform.upper()} | type: {chosen_type} | text: {text_level}{vision_ref_note}")
             print(f"   ✅ fields used ({len(filled)}): {', '.join(filled)}")
             if missing:
                 print(f"   ⚠️  fields missing ({len(missing)}): {', '.join(missing)}")
             print(f"   📝 prompt length: {len(brief_clean)} chars")
+            if image_text_overlay:
+                print(f"   📝 text overlay: {image_text_overlay}")
             print(f"{'━'*60}")
             print(brief_clean)
             print(f"{'━'*60}\n")
-            return brief_clean
+
+            return {
+                "prompt": brief_clean,
+                "image_type": chosen_type,
+                "text_level": text_level,
+                "text_overlay": image_text_overlay
+            }
 
         except Exception as e:
             print(f"⚠️ Image brief generation failed, using static prompt: {e}")
