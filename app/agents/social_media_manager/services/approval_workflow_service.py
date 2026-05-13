@@ -489,6 +489,21 @@ class ApprovalWorkflowService:
                 {"$set": {"status": "scheduled", "updated_at": current_time}},
             )
 
+            # Only pick up drafts scheduled within the last 24 hours.
+            # Anything older is stale test data or a genuine missed publish —
+            # expire it so it doesn't flood the social accounts on re-deploy.
+            earliest_allowed = current_time - timedelta(hours=24)
+            expired_result = await db["content_drafts"].update_many(
+                {
+                    "status": "scheduled",
+                    "scheduled_date": {"$lte": earliest_allowed},
+                    "platform_post_id": None,
+                },
+                {"$set": {"status": "publish_failed", "error_message": "Scheduled time expired (>24h overdue). Re-schedule to publish.", "updated_at": current_time}},
+            )
+            if expired_result.modified_count:
+                print(f"⏰ Expired {expired_result.modified_count} overdue scheduled drafts (>24h past due)")
+
             scheduled_content = await db["content_drafts"].find({
                 "$or": [
                     # Drafts due for publishing (no platform_post_id = not yet sent anywhere)
@@ -858,56 +873,17 @@ class ApprovalWorkflowService:
     @staticmethod
     async def _upload_base64_to_imgbb(data_url: str) -> Optional[str]:
         """
-        Upload a base64 data URL image to imgBB and return a permanent public URL.
-        This is needed because Outstand must fetch the image from a public URL,
-        and our ngrok/local URLs are not reliably accessible to Outstand's servers.
-        Returns the public URL string or None on failure.
+        Upload a base64 data URL image to Cloudinary and return a permanent public URL.
+        Used everywhere we need a public HTTPS URL for Outstand, Instagram, or Facebook.
+        Returns the Cloudinary secure_url string or None on failure.
         """
-        import httpx as _httpx
-        api_key = settings.IMGBB_API_KEY
-        if not api_key:
-            print("⚠️ IMGBB_API_KEY not set — cannot upload image for Outstand")
-            return None
-
         try:
-            match = re.match(r'data:([^;]+);base64,(.+)', data_url, re.DOTALL)
-            if not match:
-                print("⚠️ imgBB upload: invalid data URL format")
-                return None
-            mime_type = match.group(1)
-            b64_data = match.group(2)
-
-            # Convert to JPEG if the image is WebP or any format unsupported by social platforms
-            if mime_type in ("image/webp", "image/gif") or not mime_type.startswith("image/jpeg"):
-                try:
-                    import base64
-                    import io
-                    from PIL import Image
-                    img_bytes = base64.b64decode(b64_data)
-                    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-                    out = io.BytesIO()
-                    img.save(out, format="JPEG", quality=90)
-                    b64_data = base64.b64encode(out.getvalue()).decode()
-                    print(f"🔄 Converted image from {mime_type} to JPEG for social platform compatibility")
-                except Exception as conv_err:
-                    print(f"⚠️ Image conversion to JPEG failed, uploading original: {conv_err}")
-
-            async with _httpx.AsyncClient(timeout=120) as client:
-                resp = await client.post(
-                    "https://api.imgbb.com/1/upload",
-                    data={"key": api_key, "image": b64_data},
-                )
-                resp_json = resp.json()
-
-            if resp_json.get("success"):
-                url = resp_json["data"]["url"]
-                print(f"📸 Image uploaded to imgBB: {url}")
-                return url
-            else:
-                print(f"⚠️ imgBB upload failed: {resp_json}")
-                return None
+            from app.utils.cloudinary_upload import upload_base64 as _cld_upload
+            url = await _cld_upload(data_url, folder="uri-social/drafts")
+            print(f"📸 Image uploaded to Cloudinary: {url}")
+            return url
         except Exception as e:
-            print(f"⚠️ imgBB upload exception: {e}")
+            print(f"⚠️ Cloudinary upload exception: {e}")
             return None
 
     @staticmethod
