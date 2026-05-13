@@ -480,9 +480,14 @@ class ApprovalWorkflowService:
         This should be run periodically (e.g., every 5 minutes)
         """
         try:
-            # Find content scheduled for now or past, plus publish_failed drafts
-            # that may have been incorrectly failed (Outstand-handled posts).
             current_time = datetime.utcnow()
+
+            # Clean up stale "publishing" drafts (process crashed mid-publish > 10 min ago)
+            stale_cutoff = current_time - timedelta(minutes=10)
+            await db["content_drafts"].update_many(
+                {"status": "publishing", "updated_at": {"$lte": stale_cutoff}},
+                {"$set": {"status": "scheduled", "updated_at": current_time}},
+            )
 
             scheduled_content = await db["content_drafts"].find({
                 "$or": [
@@ -499,10 +504,10 @@ class ApprovalWorkflowService:
 
             if not scheduled_content:
                 return {"message": "No scheduled content to publish", "published": 0}
-            
+
             published_count = 0
             errors = []
-            
+
             for draft in scheduled_content:
                 try:
                     # If this draft was already submitted to Outstand (has platform_post_id),
@@ -542,6 +547,17 @@ class ApprovalWorkflowService:
                                 )
                                 print(f"🗑️ Marked stale Outstand draft as published (404) | draft_id={draft['id']}")
                         continue  # Never re-publish a draft already handed to Outstand
+
+                    # Atomically claim this draft before publishing to prevent concurrent cron
+                    # runs from double-publishing the same post.  If another worker already
+                    # claimed it (status changed to "publishing"), skip and move on.
+                    claimed = await db["content_drafts"].find_one_and_update(
+                        {"id": draft["id"], "status": "scheduled"},
+                        {"$set": {"status": "publishing", "updated_at": datetime.utcnow()}},
+                    )
+                    if not claimed:
+                        print(f"⏭️ Draft {draft['id']} already claimed by another cron run — skipping")
+                        continue
 
                     # Use user_id stored directly on the draft
                     draft_user_id = draft.get("user_id")
@@ -604,7 +620,7 @@ class ApprovalWorkflowService:
                         })
                         continue
 
-                    print(f"🕐 Publishing scheduled post | draft_id={draft['id']} platform={draft['platform']} user_id={draft_user_id}")
+                    print(f"🕐 Publishing scheduled post | draft_id={draft['id']} platform={draft['platform']} connected_via={connection.get('connected_via')} user_id={draft_user_id}")
                     publish_result = await ApprovalWorkflowService._publish_to_platform(
                         platform=draft["platform"],
                         draft=draft,
@@ -612,6 +628,9 @@ class ApprovalWorkflowService:
                         scheduled_datetime=None,  # We publish immediately when the time arrives
                         db=db,
                     )
+                    if publish_result is None:
+                        publish_result = {"success": False, "error": f"_publish_to_platform returned None for platform={draft['platform']} connected_via={connection.get('connected_via')} — unhandled publish path"}
+                    print(f"📊 Scheduled publish result | draft_id={draft['id']}: {publish_result}")
 
                     conn_filter = (
                         {"id": connection["id"]} if connection.get("id")
@@ -656,14 +675,25 @@ class ApprovalWorkflowService:
                         errors.append({"draft_id": draft["id"], "error": publish_result.get("error")})
 
                 except Exception as e:
-                    errors.append({"draft_id": draft.get("id", "unknown"), "error": str(e)})
-            
+                    draft_id_for_error = draft.get("id", "unknown")
+                    errors.append({"draft_id": draft_id_for_error, "error": str(e)})
+                    print(f"❌ Exception during scheduled publish for draft_id={draft_id_for_error}: {e}")
+                    # Reset "publishing" back to "publish_failed" so the draft doesn't get stuck
+                    if draft_id_for_error != "unknown":
+                        try:
+                            await db["content_drafts"].update_one(
+                                {"id": draft_id_for_error, "status": "publishing"},
+                                {"$set": {"status": "publish_failed", "error_message": str(e), "updated_at": datetime.utcnow()}},
+                            )
+                        except Exception:
+                            pass
+
             return {
                 "published_count": published_count,
                 "errors": errors,
                 "processed_at": datetime.utcnow().isoformat()
             }
-            
+
         except Exception as e:
             return {"error": f"Scheduled publishing failed: {str(e)}"}
     
