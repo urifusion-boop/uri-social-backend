@@ -534,10 +534,23 @@ RULES FOR THIS EDIT:
 
             # Step 8: Call GPT-Image-2 Edit API
             print(f"[EDIT] Calling GPT-Image-2 edit API...")
-            platform = draft.get("platform", "instagram")
+
+            # Get original image dimensions from draft specs
+            image_specs = draft.get("image_specs", {})
+            original_width = image_specs.get("width", 1024)
+            original_height = image_specs.get("height", 1024)
+
             # GPT-Image-2 requires dimensions divisible by 16
-            # Valid sizes: 1024x1024, 1024x1536, 1536x1024
-            size = "1024x1024"  # Default square (divisible by 16)
+            # Round to nearest multiple of 16 to maintain aspect ratio
+            def round_to_16(n):
+                return ((n + 15) // 16) * 16
+
+            target_width = round_to_16(original_width)
+            target_height = round_to_16(original_height)
+            size = f"{target_width}x{target_height}"
+
+            print(f"[EDIT] Original size: {original_width}x{original_height}")
+            print(f"[EDIT] Target size (rounded to 16): {size}")
 
             edited_image_url = await ImageEditingService._call_edit_api(
                 image_bytes=image_bytes,
