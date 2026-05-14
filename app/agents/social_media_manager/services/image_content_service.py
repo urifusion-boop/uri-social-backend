@@ -609,7 +609,15 @@ class ImageContentService:
 
             bc = brand_context or {}
             style_fragment = bc.get("style_prompt_fragment", "")
-            font_prompt = bc.get("font_style_prompt", "")
+
+            # Typography System: Prioritize custom font over library font
+            if bc.get("custom_font_enabled"):
+                font_prompt = bc.get("custom_font_directive", "")
+                print(f"[TYPOGRAPHY] Using custom font directive")
+            else:
+                font_prompt = bc.get("font_style_prompt", "")
+                print(f"[TYPOGRAPHY] Using library font: {bc.get('font_style', 'default')}")
+
             region = bc.get("region", "")
             brand_colors = bc.get("brand_colors") or []
 
