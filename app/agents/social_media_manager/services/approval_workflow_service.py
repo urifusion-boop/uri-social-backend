@@ -126,19 +126,19 @@ class ApprovalWorkflowService:
                                 errors.append({"draft_id": draft_id, "error": "Instagram requires an image. Add one to this post before scheduling."})
                                 continue
 
-                        # Cancel any OTHER scheduled drafts for this user+platform so the
-                        # cron never publishes stale/accumulated test posts alongside this one.
+                        # Cancel any OTHER scheduled/failed drafts for this user+platform so the
+                        # cron never publishes stale/accumulated posts alongside this one.
                         cancel_result = await db["content_drafts"].update_many(
                             {
                                 "user_id": user_id,
                                 "platform": draft["platform"],
-                                "status": "scheduled",
+                                "status": {"$in": ["scheduled", "publish_failed"]},
                                 "id": {"$ne": draft_id},
                             },
                             {"$set": {"status": "replaced", "error_message": "Superseded by a newer scheduled post.", "updated_at": datetime.utcnow()}},
                         )
                         if cancel_result.modified_count:
-                            print(f"🗑️ Cancelled {cancel_result.modified_count} old {draft['platform']} drafts for user {user_id}")
+                            print(f"🗑️ Cancelled {cancel_result.modified_count} old {draft['platform']} drafts (scheduled+failed) for user {user_id}")
 
                         update_data["scheduled_date"] = scheduled_datetime or (datetime.utcnow() + timedelta(hours=1))
                         update_data["status"] = "scheduled"
@@ -1111,12 +1111,19 @@ class ApprovalWorkflowService:
                     return {"success": False, "error": "X API credits depleted and no Outstand X account connected as fallback."}
 
         # ── Instagram direct (via Facebook Page Access Token) ────────────────
-        if platform == "instagram" and connection.get("connected_via") in ("instagram_direct", "instagram_direct_oauth"):
+        # Match on connected_via OR on presence of ig_user_id credentials (defensive: covers
+        # connections stored with an unexpected connected_via value but valid credentials).
+        _ig_cv = connection.get("connected_via")
+        print(f"🔀 _publish_to_platform routing | platform={platform} connected_via={_ig_cv} ig_user_id={connection.get('ig_user_id')} has_page_token={'yes' if connection.get('page_access_token') else 'NO'}")
+        if platform == "instagram" and (
+            _ig_cv in ("instagram_direct", "instagram_direct_oauth")
+            or (connection.get("ig_user_id") and connection.get("page_access_token"))
+        ):
             from app.agents.social_media_manager.services.instagram_direct_service import InstagramDirectService
             ig_user_id = connection.get("ig_user_id")
             page_token = connection.get("page_access_token")
             page_id = connection.get("page_id")
-            print(f"🔗 Instagram connection details | ig_user_id={ig_user_id} page_id={page_id} connected_via={connection.get('connected_via')} token_present={'yes' if page_token else 'NO'}")
+            print(f"🔗 Instagram connection details | ig_user_id={ig_user_id} page_id={page_id} connected_via={_ig_cv} token_present={'yes' if page_token else 'NO'}")
             if not ig_user_id or not page_token:
                 return {"success": False, "error": "Instagram direct connection is missing credentials. Please reconnect Facebook."}
 
