@@ -3899,3 +3899,80 @@ async def extract_image_text(
     except Exception as e:
         print(f"⚠️ Error extracting text from image: {e}")
         return UriResponse.error_response(f"Failed to extract text: {str(e)}")
+
+
+@router.post("/upload-custom-font")
+async def upload_custom_font(
+    file: UploadFile = File(...),
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Upload a custom font file (.ttf or .otf) for the user's brand.
+    Typography System PRD - Phase 1: Custom Font Upload
+    """
+    try:
+        user_id = token.get("user_id")
+
+        # Validate file type
+        filename = file.filename.lower()
+        if not (filename.endswith('.ttf') or filename.endswith('.otf')):
+            return UriResponse.error_response("Invalid file type. Please upload .ttf or .otf font files only.")
+
+        # Validate file size (max 5MB)
+        file_bytes = await file.read()
+        file_size_mb = len(file_bytes) / (1024 * 1024)
+        if file_size_mb > 5:
+            return UriResponse.error_response(f"File too large ({file_size_mb:.1f}MB). Maximum size is 5MB.")
+
+        print(f"[CUSTOM_FONT] Uploading font: {file.filename} ({file_size_mb:.2f}MB)")
+
+        # Upload to Cloudinary
+        from app.utils.cloudinary_upload import upload_bytes
+
+        font_url = await upload_bytes(
+            file_bytes,
+            folder=f"uri-social/custom-fonts/{user_id}",
+            resource_type="raw",  # Non-image file
+            public_id=file.filename.rsplit('.', 1)[0]  # Use original filename
+        )
+
+        print(f"[CUSTOM_FONT] ✅ Font uploaded: {font_url}")
+
+        return UriResponse.get_single_data_response("font_uploaded", {
+            "font_url": font_url,
+            "filename": file.filename,
+            "size_mb": round(file_size_mb, 2)
+        })
+
+    except Exception as e:
+        print(f"⚠️ Error uploading custom font: {e}")
+        return UriResponse.error_response(f"Failed to upload font: {str(e)}")
+
+
+@router.post("/analyze-custom-font")
+async def analyze_custom_font(
+    font_url: str = Query(..., description="Cloudinary URL of the uploaded font file"),
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Analyze a custom font using GPT-4o-mini Vision API.
+    Returns font characteristics and a prompt directive for AI image generation.
+    Typography System PRD - Phase 1: Custom Font Analysis
+    """
+    try:
+        from app.agents.social_media_manager.services.custom_font_service import CustomFontService
+
+        print(f"[CUSTOM_FONT] Analyzing font: {font_url}")
+
+        # Analyze the font
+        analysis_result = await CustomFontService.analyze_font(font_url)
+
+        return UriResponse.get_single_data_response("font_analyzed", {
+            "font_url": font_url,
+            "analysis": analysis_result["analysis"],
+            "prompt_directive": analysis_result["prompt_directive"]
+        })
+
+    except Exception as e:
+        print(f"⚠️ Error analyzing custom font: {e}")
+        return UriResponse.error_response(f"Failed to analyze font: {str(e)}")
