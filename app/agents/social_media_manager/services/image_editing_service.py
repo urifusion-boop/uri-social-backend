@@ -534,10 +534,23 @@ RULES FOR THIS EDIT:
 
             # Step 8: Call GPT-Image-2 Edit API
             print(f"[EDIT] Calling GPT-Image-2 edit API...")
-            platform = draft.get("platform", "instagram")
+
+            # Get original image dimensions from draft specs
+            image_specs = draft.get("image_specs", {})
+            original_width = image_specs.get("width", 1024)
+            original_height = image_specs.get("height", 1024)
+
             # GPT-Image-2 requires dimensions divisible by 16
-            # Valid sizes: 1024x1024, 1024x1536, 1536x1024
-            size = "1024x1024"  # Default square (divisible by 16)
+            # Round to nearest multiple of 16 to maintain aspect ratio
+            def round_to_16(n):
+                return ((n + 15) // 16) * 16
+
+            target_width = round_to_16(original_width)
+            target_height = round_to_16(original_height)
+            size = f"{target_width}x{target_height}"
+
+            print(f"[EDIT] Original size: {original_width}x{original_height}")
+            print(f"[EDIT] Target size (rounded to 16): {size}")
 
             edited_image_url = await ImageEditingService._call_edit_api(
                 image_bytes=image_bytes,
@@ -688,21 +701,19 @@ RULES FOR THIS EDIT:
             else:
                 return None
 
-            # Save to local storage
-            import uuid
-            import os
+            # Upload to Cloudinary for permanent CDN storage
+            from app.utils.cloudinary_upload import upload_bytes
 
-            filename = f"{uuid.uuid4().hex}.webp"
-            static_dir = "/app/static/images"
-            os.makedirs(static_dir, exist_ok=True)
-
-            # Convert to WebP for efficient storage
+            print(f"🔄 Uploading EDITED image to Cloudinary...")
+            # Convert to WebP bytes for efficient storage
             edited_image = Image.open(io.BytesIO(base64.b64decode(b64_data))).convert("RGB")
-            webp_path = f"{static_dir}/{filename}"
-            edited_image.save(webp_path, format="WEBP", quality=95, method=6)
+            webp_buffer = io.BytesIO()
+            edited_image.save(webp_buffer, format="WEBP", quality=95, method=6)
+            webp_bytes = webp_buffer.getvalue()
 
-            stored_url = f"/static/images/{filename}"
-            print(f"[EDIT] Image saved to: {stored_url}")
+            stored_url = await upload_bytes(webp_bytes, folder="uri-social/content-drafts", resource_type="image")
+            print(f"☁️  ✅ CLOUDINARY EDIT UPLOAD SUCCESS!")
+            print(f"   🔗 URL: {stored_url}")
 
             return stored_url
 

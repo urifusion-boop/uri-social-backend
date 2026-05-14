@@ -818,13 +818,12 @@ class WhatsAppFlowService:
             ctx = {**ctx, "product_image_url": product_image_url, "product_image_twilio_url": media_url}
             await _safe_set_state(phone, state, ctx, db)
 
-            # Specific image manipulation prompt (e.g. "3D render of a mug", "add the logo") —
-            # pass the user's exact prompt to OpenAI image edit, no brand overlays
+            # If text looks like a specific image manipulation instruction, edit directly
             if text and WhatsAppFlowService._is_direct_image_edit(text):
                 await WhatsAppFlowService._edit_image_with_prompt(phone, user_id, body.strip(), ctx, db)
                 return
 
-            # Generic "design" / "graphic" / "poster" request — jump to branded generation
+            # If text also says "design" / "graphic" / "poster" etc — jump to branded generation
             # Note: "image" and "ad" removed — too short, match "Edit this image..." and "can you add..."
             _GRAPHIC_TRIGGER_WORDS = (
                 "design", "graphic", "poster", "visual", "banner",
@@ -1598,7 +1597,7 @@ class WhatsAppFlowService:
             await _safe_set_state(phone, "showing_content", ctx, db)
             return
 
-        # User wants to escape edit mode: new idea, fresh content, etc.
+        # User wants a fresh topic / new idea — escape the edit loop
         _ESCAPE_PHRASES = (
             "new idea", "give me a new idea", "new content", "new content idea",
             "something else", "different topic", "different idea", "fresh idea",
@@ -1610,7 +1609,7 @@ class WhatsAppFlowService:
             await _safe_set_state(phone, "awaiting_topic", ctx, db)
             return
 
-        # User wants to do a visual/image edit — route to direct image editing
+        # User wants a visual/color image edit — route to direct image editing
         if WhatsAppFlowService._is_direct_image_edit(text):
             image_url = ctx.get("last_graphic_url") or ctx.get("product_image_url")
             edit_ctx = {**ctx, "product_image_url": image_url}
@@ -1706,9 +1705,10 @@ class WhatsAppFlowService:
     @staticmethod
     def _is_direct_image_edit(text: str) -> bool:
         """
-        Return True when the user wants to manipulate a specific image rather
-        than generate a new branded social post. These bypass _generate_graphic
-        and go straight to OpenAI image edit with the user's exact prompt.
+        Return True when the user's message is a specific image manipulation
+        instruction rather than a generic "make me a graphic" request.
+        These should bypass _generate_graphic (branded post creator) and go
+        straight to the OpenAI image edit API with the user's exact prompt.
         """
         _EDIT_PHRASES = (
             "edit this image", "edit the image", "edit this photo", "edit the photo",
@@ -1738,7 +1738,7 @@ class WhatsAppFlowService:
             "remove the background", "white background", "transparent background",
         )
         t = text.lower()
-        # Also catch any message that contains colour/color with a "to" (e.g. "suit colour to lemon")
+        # Catch "X colour to Y" / "X color to Y" patterns (e.g. "suit colour to lemon")
         if ("colour" in t or "color" in t) and (" to " in t or " into " in t):
             return True
         return any(phrase in t for phrase in _EDIT_PHRASES)
@@ -1752,8 +1752,8 @@ class WhatsAppFlowService:
         db: AsyncIOMotorDatabase,
     ) -> None:
         """
-        Edit the user-supplied image with their exact prompt via OpenAI image
-        edit API. No brand overlays, headlines, or text added — the prompt
+        Edit the user-supplied image using their exact prompt via OpenAI image
+        edit API.  No brand overlays, headlines, or text are added — the prompt
         drives everything.
         """
         image_url = ctx.get("product_image_url") or ctx.get("last_graphic_url")
@@ -2001,7 +2001,8 @@ class WhatsAppFlowService:
             await _send(phone, GRAPHIC_ACTIONS)
             return
 
-        # Specific image manipulation prompt — route directly to image edit API
+        # Specific image manipulation prompt (e.g. "make the background darker", "add a logo")
+        # — route directly to image edit API with the user's exact prompt, before generic edit/regen handlers
         if WhatsAppFlowService._is_direct_image_edit(text):
             edit_ctx = {**ctx, "product_image_url": ctx.get("last_graphic_url") or ctx.get("product_image_url")}
             await WhatsAppFlowService._edit_image_with_prompt(phone, user_id, raw_body.strip(), edit_ctx, db)

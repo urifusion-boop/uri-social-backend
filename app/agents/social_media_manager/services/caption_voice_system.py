@@ -51,6 +51,47 @@ WHAT TO DO INSTEAD:
 
 ---
 
+=== FORMATTING RULES (ALL PLATFORMS) ===
+
+OUTPUT FORMAT:
+- Break after every 1-2 sentences. Maximum 2 sentences per visual block.
+- Use blank lines (double line break) between sections. Every caption
+  needs at least 2-3 blank line separators.
+- Short thoughts, breathing room, short thoughts, breathing room.
+
+BANNED FORMATTING CHARACTERS (NEVER USE):
+- No hyphens as bullets: never write "- item"
+- No asterisks: never write *text* or **text**
+- No underscores: never write _text_ or __text__
+- No em dashes: never write —
+- No pipe dividers: never write " | "
+- No numbered lists: never write "1. item 2. item"
+- No parenthetical explanations: never write "(explanation)"
+- No quotation marks around product names
+- No slash constructions: never write "this/that"
+- No colon introductions: never write "Label: text"
+- No HTML entities: never write &amp; or &gt;
+- No arrow characters: never write "->" or "-->"
+
+HASHTAG PLACEMENT:
+- Hashtags go at the VERY END of the caption
+- Separated from the main text by blank lines
+- Never inline with the caption content
+- Number of hashtags depends on platform (specified separately)
+
+VISUAL RHYTHM:
+- The caption should look good as a block of text on a phone screen
+- Mix line lengths: some short (3-5 words), some medium (8-12 words)
+- The reader's eye should flow naturally down the caption
+- Every section (hook, body, CTA) is visually distinct
+
+THE TEST:
+- Read the caption on a phone screen mentally
+- If it looks like an email or document: add more line breaks
+- If it looks like a text message from a friend who runs a business: correct
+
+---
+
 """
 
 
@@ -218,3 +259,205 @@ def build_voice_profile_instructions(voice_profile: dict, voice_sample_analysis:
             instructions.append(f'- Typical ending: "{voice_sample_analysis["typical_closers"][0]}"')
 
     return "\n".join(instructions) + "\n\n---\n"
+
+
+def get_platform_formatting_rules(platform: str) -> str:
+    """
+    Get platform-specific formatting rules from Caption Formatting Rules PRD.
+
+    Args:
+        platform: The target platform (instagram, facebook, linkedin, x, tiktok, whatsapp)
+
+    Returns:
+        Platform-specific formatting instructions
+    """
+    platform = platform.lower()
+
+    if platform == "instagram":
+        return """
+=== INSTAGRAM FORMATTING ===
+
+HASHTAG PLACEMENT:
+- Separate hashtags from caption with 5 blank lines (the dot method: . . . . .)
+- OR post hashtags as the first comment (preferred)
+- Use 5-10 hashtags for reach
+
+FIRST LINE CRITICAL:
+- Instagram truncates after ~125 characters
+- First line MUST work standalone and be compelling
+- No dependent clauses that need the second line
+
+EXAMPLE STRUCTURE:
+Hook (1-2 lines)
+
+Body section (2-3 lines)
+
+CTA (1 line)
+Link in bio
+
+.
+.
+.
+.
+.
+#hashtag1 #hashtag2 #hashtag3
+"""
+
+    elif platform == "facebook":
+        return """
+=== FACEBOOK FORMATTING ===
+
+HASHTAG USAGE:
+- Minimal hashtags (1-3 max) or none
+- Facebook hashtags have low value
+- If used, separate from caption with 1 blank line
+
+LONGER CAPTIONS OK:
+- Facebook shows ~2 lines before truncation
+- Can use 8-15 lines for storytelling
+- Still need blank lines between sections
+
+ENGAGEMENT QUESTIONS:
+- End with a question to encourage comments
+- Facebook algorithm favors comment engagement
+
+EXAMPLE STRUCTURE:
+Hook (2-3 lines)
+
+Story/body (4-8 lines)
+
+CTA or question (1-2 lines)
+URL if needed
+
+Optional: #hashtag1 #hashtag2
+"""
+
+    elif platform == "linkedin":
+        return """
+=== LINKEDIN FORMATTING ===
+
+PROFESSIONAL TONE:
+- Less casual than Instagram/Facebook
+- But still conversational, not corporate
+- Share insights, lessons, wins, challenges
+
+HASHTAG PLACEMENT:
+- 3-5 hashtags at the very end
+- One blank line after CTA, then hashtags
+- Use industry-relevant hashtags
+
+HOOK IS CRITICAL:
+- LinkedIn shows ~3 lines before "see more"
+- Hook must be compelling standalone
+- Use numbers, questions, bold statements
+
+EXAMPLE STRUCTURE:
+Hook with context (2-3 lines)
+
+Story or insight (5-10 lines with blank line breaks)
+
+Lesson or takeaway (2-3 lines)
+
+Question to audience (1-2 lines)
+
+#hashtag1 #hashtag2 #hashtag3
+"""
+
+    elif platform == "x" or platform == "twitter":
+        return """
+=== X (TWITTER) FORMATTING ===
+
+CHARACTER LIMIT:
+- 280 characters total (or 4000 for Premium)
+- Every word counts
+- Short, punchy, direct
+
+HASHTAGS:
+- 1-2 hashtags maximum at end
+- Or zero hashtags (often better)
+- Hashtags take valuable space
+
+STRUCTURE:
+- One thought, clearly expressed
+- Or hook + punchline structure
+- Line breaks for emphasis
+
+EXAMPLE STRUCTURES:
+1. Single statement (1-3 lines)
+
+2. Hook question
+   Answer/insight (separated by line break)
+
+3. Bold claim
+   Evidence/context
+
+   Optional: #hashtag
+"""
+
+    elif platform == "tiktok":
+        return """
+=== TIKTOK FORMATTING ===
+
+CAPTION LENGTH:
+- Very short (1-3 lines)
+- Caption supports the video, doesn't replace it
+- TikTok shows ~1 line before truncation
+
+HASHTAGS:
+- In the caption field, not in main text
+- 3-5 hashtags for discoverability
+- Mix trending + niche hashtags
+
+TONE:
+- Ultra-casual
+- Meme-friendly
+- Gen Z language patterns
+
+EXAMPLE STRUCTURES:
+POV: [relatable situation] 😭
+
+[Controversial take] and I said it
+
+[Simple product description]
+Link in bio 👆
+
+#hashtag1 #hashtag2 #fyp
+"""
+
+    elif platform == "whatsapp" or platform == "whatsapp_status":
+        return """
+=== WHATSAPP STATUS FORMATTING ===
+
+ULTRA SHORT:
+- 1-3 lines maximum
+- People glance at status quickly
+- Direct and clear
+
+NO HASHTAGS:
+- WhatsApp doesn't use hashtags
+- Focus on the message
+
+CTA:
+- "Chat us to order"
+- "DM for details"
+- Direct action
+
+EXAMPLE STRUCTURE:
+Product/announcement (1 line)
+
+Key detail (1 line)
+
+CTA (1 line)
+"""
+
+    else:
+        # Default/generic platform
+        return """
+=== PLATFORM FORMATTING ===
+
+Follow universal formatting rules:
+- Break after every 1-2 sentences
+- Blank lines between sections
+- No Markdown characters
+- Hashtags separated from main text
+"""
