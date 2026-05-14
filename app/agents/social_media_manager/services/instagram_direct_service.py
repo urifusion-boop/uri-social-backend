@@ -195,17 +195,16 @@ class InstagramDirectService:
                     page_id, page_access_token, jpeg_bytes
                 )
             else:
-                # Fallback: imgBB (may not always work with Instagram)
-                b64 = base64.b64encode(jpeg_bytes).decode()
-                api_key = getattr(settings, "IMGBB_API_KEY", None)
                 rehosted = None
-                if api_key:
-                    async with httpx.AsyncClient(timeout=30) as _c:
-                        r = await _c.post(
-                            "https://api.imgbb.com/1/upload",
-                            data={"key": api_key, "image": b64},
-                        )
-                        rehosted = r.json().get("data", {}).get("url")
+
+            if not rehosted:
+                # Fallback: Cloudinary (always configured, guaranteed HTTPS)
+                try:
+                    import io as _io, base64 as _b64
+                    from app.utils.cloudinary_upload import upload_bytes as _cld_bytes
+                    rehosted = await _cld_bytes(jpeg_bytes, folder="uri-social/instagram")
+                except Exception as _cld_err:
+                    print(f"⚠️ Cloudinary fallback upload failed: {_cld_err}")
             if not rehosted:
                 return {
                     "success": False,

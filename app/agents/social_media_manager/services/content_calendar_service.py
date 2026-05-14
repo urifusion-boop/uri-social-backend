@@ -11,7 +11,9 @@ Generation pipeline (PRD Phase 1):
 """
 
 import json
+import re
 import uuid
+import secrets
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -27,18 +29,23 @@ COLLECTION = "content_calendar_plans"
 
 CONTENT_TYPES = ["educational", "relatable", "promotional", "behind_the_scenes", "engagement"]
 
-# Default 7-day content mix (index = day_index 0-6, Mon-Sun)
-DEFAULT_MIX = [
-    "educational",
-    "relatable",
-    "promotional",
-    "educational",
-    "behind_the_scenes",
-    "relatable",
-    "engagement",
+# Four default mix variants — different type distributions so the shown
+# percentages rotate each week rather than always reading the same numbers.
+DEFAULT_MIX_VARIANTS: List[List[str]] = [
+    # Variant 0 — Educational + relatable focus (edu 29%, rel 29%)
+    ["educational", "relatable", "promotional", "educational", "behind_the_scenes", "relatable", "engagement"],
+    # Variant 1 — Promotional + community push (pro 29%, rel 29%)
+    ["promotional", "relatable", "educational", "engagement", "relatable", "promotional", "behind_the_scenes"],
+    # Variant 2 — Educational-heavy week (edu 43%)
+    ["educational", "promotional", "educational", "relatable", "engagement", "educational", "behind_the_scenes"],
+    # Variant 3 — Community + engagement focus (rel 29%, eng 29%)
+    ["relatable", "engagement", "educational", "promotional", "relatable", "behind_the_scenes", "engagement"],
 ]
 
-# Industry-specific mix overrides
+# Keep the original as the default for backward-compat references
+DEFAULT_MIX = DEFAULT_MIX_VARIANTS[0]
+
+# Industry-specific mix overrides — also have 4 variants per industry
 INDUSTRY_MIX: Dict[str, List[str]] = {
     "e-commerce": [
         "promotional", "educational", "relatable", "promotional",
@@ -88,12 +95,19 @@ def _get_monday(ref: datetime) -> datetime:
     return monday.replace(hour=0, minute=0, second=0, microsecond=0)
 
 
-def _pick_mix(industry: str) -> List[str]:
+def _pick_mix(industry: str, week_number: int = 0) -> List[str]:
     industry_lower = (industry or "").lower()
     for key, mix in INDUSTRY_MIX.items():
         if key in industry_lower:
-            return mix
-    return DEFAULT_MIX
+            # Rotate the industry mix by week so day assignments change,
+            # then swap one type slot so the ratios shift slightly
+            rotation = week_number % 7
+            return mix[rotation:] + mix[:rotation]
+    # Use one of the 4 variants so the reported percentages change each week
+    variant_idx = week_number % len(DEFAULT_MIX_VARIANTS)
+    base = DEFAULT_MIX_VARIANTS[variant_idx]
+    rotation = week_number % 7
+    return base[rotation:] + base[:rotation]
 
 
 # Topic label → content_type bucket
@@ -117,6 +131,7 @@ def _pick_mix_from_performance(
     performance: Dict[str, Any],
     industry: str,
     brand: Optional[Dict[str, Any]] = None,
+    week_number: int = 0,
 ) -> List[str]:
     """
     Build a personalised 7-day content-type mix driven by this user's
@@ -124,11 +139,11 @@ def _pick_mix_from_performance(
     is no historical data.
     """
     if not performance or not performance.get("has_data"):
-        return _pick_mix(industry)
+        return _pick_mix(industry, week_number)
 
     avg_by_topic: Dict[str, float] = performance.get("avg_engagement_by_topic", {})
     if not avg_by_topic:
-        return _pick_mix(industry)
+        return _pick_mix(industry, week_number)
 
     # Map each measured topic → content_type and accumulate weighted scores
     type_scores: Dict[str, float] = {t: 0.0 for t in CONTENT_TYPES}
@@ -203,6 +218,7 @@ async def _generate_ideas(
     previous_titles: Optional[List[str]] = None,
     trend_keywords: Optional[List[Dict[str, Any]]] = None,
     performance: Optional[Dict[str, Any]] = None,
+    force: bool = False,
 ) -> List[Dict[str, Any]]:
     """Call AI once for all 7 day ideas. Returns list of 7 dicts."""
     brand_name = brand.get("brand_name") or "the brand"
@@ -249,7 +265,20 @@ async def _generate_ideas(
 
     avoid_repeat_block = ""
     if previous_titles:
-        avoid_repeat_block = f"\nTopics used last week (do NOT repeat these):\n" + "\n".join(f"- {t}" for t in previous_titles[:14])
+        non_empty = [t for t in previous_titles if t.strip()]
+        if non_empty:
+            avoid_repeat_block = (
+                "\nRecent content titles (do NOT repeat these ideas or similar angles — "
+                "every idea must feel genuinely fresh and distinct from all of these):\n"
+                + "\n".join(f"- {t}" for t in non_empty[:28])
+            )
+
+    # When force-regenerating, inject a random token so the model cannot return
+    # a cached/memorised response identical to the previous generation.
+    force_token_block = ""
+    if force:
+        token = secrets.token_hex(6)
+        force_token_block = f"\n[Regeneration token: {token}] This is a fresh regeneration — produce completely different ideas from any previous plan.\n"
 
     # ── Market Intel block (Google Trends) ────────────────────────────────────
     market_intel_block = ""
@@ -334,7 +363,7 @@ Week starting: {week_start}
 {market_intel_block}
 {performance_block}
 {avoid_repeat_block}
-
+{force_token_block}
 Generate a 7-day content plan. For each day produce:
 - title: a short, punchy content idea title (max 10 words) — make it feel native to the platform and brand
 - description: 2-3 sentences with a concrete, specific angle. Include what to say, who it speaks to, and why it matters for this brand right now.
@@ -358,16 +387,18 @@ Rules:
 - Promotional: highlight a genuine product/service benefit with a clear value statement
 - Educational: share an insight directly relevant to this brand's industry and audience
 - Relatable: tap into a real emotion or experience the target audience would recognise
-- Engagement: pose a specific question or poll that this brand's followers would genuinely answer
-- Behind the scenes: show real work, process, or people behind THIS brand specifically
+- Engagement: pose a specific question or poll that this brand's followers would genuinely answer — vary the question style (poll, fill-in-the-blank, debate, personal story prompt)
+- Behind the scenes: ROTATE each week between these distinct angles — workspace setup, product/service creation process, team doing actual work (NOT "Meet the team" introductions), packaging/delivery moment, before-and-after of a real project, client prep or discovery call, tool/workflow walkthrough. Do NOT default to team introduction posts.
 - Match the brand voice exactly — if casual, be casual; if bold, be bold
 - Never be generic — every idea should be impossible to copy-paste to a different brand
 """
 
     ai_request = AIService.build_ai_model(
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.8,
+        model="gpt-4o" if force else "gpt-4o-mini",
+        temperature=0.95 if force else 0.88,
     )
+    print(f"[Calendar] _generate_ideas model={'gpt-4o' if force else 'gpt-4o-mini'} temperature={0.95 if force else 0.8} force={force}", flush=True)
     response = await AIService.chat_completion(ai_request)
     if isinstance(response, dict) and response.get("error"):
         raise ValueError(response["error"])
@@ -422,11 +453,13 @@ async def generate_plan(
             {"user_id": user_id, "week_start": week_start, "status": "active"},
             {"$set": {"status": "archived"}},
         )
-        # Bust trend cache so we get fresh keywords
+        # Bust all v2 trend cache entries for this industry so we get fresh keywords
         industry_temp = brand.get("industry", "")
         if industry_temp:
             try:
-                await db["trends_cache"].delete_one({"_id": f"{industry_temp.lower()}:NG:today 1-m"})
+                await db["trends_cache"].delete_many(
+                    {"_id": {"$regex": f"^v2:{re.escape(industry_temp.lower())}:"}}
+                )
                 print(f"[Calendar] Busted trend cache for '{industry_temp}' on force-regenerate")
             except Exception:
                 pass
@@ -437,20 +470,33 @@ async def generate_plan(
 
     industry = brand.get("industry", "")
 
-    # Add last week's titles too (if we don't already have current week titles from force path)
-    last_monday = (monday - timedelta(days=7)).strftime("%Y-%m-%d")
-    last_plan = await db[COLLECTION].find_one(
-        {"user_id": user_id, "week_start": last_monday},
-        {"_id": 0, "days": 1},
-    )
-    previous_titles += [d.get("title", "") for d in (last_plan or {}).get("days", []) if d.get("title")]
+    # Collect titles from last 4 weeks to prevent idea repetition
+    for weeks_ago in range(1, 5):
+        past_monday = (monday - timedelta(days=7 * weeks_ago)).strftime("%Y-%m-%d")
+        past_plan = await db[COLLECTION].find_one(
+            {"user_id": user_id, "week_start": past_monday},
+            {"_id": 0, "days": 1},
+        )
+        if past_plan:
+            previous_titles += [d.get("title", "") for d in past_plan.get("days", []) if d.get("title")]
 
     # ── Data signals ──────────────────────────────────────────────────────────
     performance = await PerformanceAnalyticsService.get_user_performance(user_id, db)
     trend_keywords = await TrendDataService.get_trending_keywords(industry, db=db)
 
     # ── Personalised content mix from performance data ────────────────────────
-    mix = _pick_mix_from_performance(performance, industry, brand)
+    week_number = monday.isocalendar()[1]
+    if force:
+        # On regenerate, pick a random variant + rotation so the type layout
+        # genuinely changes (same week → same week_number, so we must randomise)
+        variant_idx = secrets.randbelow(len(DEFAULT_MIX_VARIANTS))
+        base = DEFAULT_MIX_VARIANTS[variant_idx][:]
+        rotation = secrets.randbelow(6) + 1  # always rotate at least 1 slot
+        mix = base[rotation:] + base[:rotation]
+        print(f"[Calendar] Force-regen: variant={variant_idx} rotation={rotation} → mix={mix}")
+    else:
+        mix = _pick_mix_from_performance(performance, industry, brand, week_number=week_number)
+        print(f"[Calendar] Week {week_number} → mix={mix}")
 
     generation_method = "ai"  # default fallback
     days: List[Dict[str, Any]] = []
@@ -464,6 +510,7 @@ async def generate_plan(
             previous_titles=previous_titles,
             trend_keywords=trend_keywords or [],
             performance=performance,
+            force=force,
         )
     except Exception as exc:
         print(f"[Calendar] AI generation failed: {exc}")

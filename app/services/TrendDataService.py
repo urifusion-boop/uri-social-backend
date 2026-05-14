@@ -9,6 +9,28 @@ from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
 
+# Region name → Google Trends geo code
+_REGION_GEO: Dict[str, str] = {
+    "nigeria": "NG", "lagos": "NG", "abuja": "NG", "port harcourt": "NG",
+    "ghana": "GH", "accra": "GH", "kumasi": "GH",
+    "kenya": "KE", "nairobi": "KE", "mombasa": "KE",
+    "south africa": "ZA", "johannesburg": "ZA", "cape town": "ZA", "durban": "ZA",
+    "united kingdom": "GB", "uk": "GB", "england": "GB", "london": "GB",
+    "united states": "US", "usa": "US", "america": "US",
+    "canada": "CA", "australia": "AU",
+    "egypt": "EG", "cairo": "EG",
+    "ethiopia": "ET", "senegal": "SN", "tanzania": "TZ", "uganda": "UG",
+    "rwanda": "RW", "cameroon": "CM", "ivory coast": "CI", "cote d'ivoire": "CI",
+}
+
+
+def _region_to_geo(region: str) -> str:
+    """Map a free-text region/country name to a Google Trends geo code."""
+    if not region:
+        return "NG"
+    return _REGION_GEO.get(region.lower().strip(), "NG")
+
+
 # Industry → seed terms to query Google Trends
 _INDUSTRY_SEEDS: Dict[str, List[str]] = {
     "real estate":  ["real estate", "buy property", "first time home buyer", "land investment"],
@@ -36,8 +58,10 @@ class TrendDataService:
     @staticmethod
     async def get_trending_keywords(
         industry: str,
-        geo: str = "NG",
+        region: str = "",
+        geo: str = "",
         timeframe: str = "today 1-m",
+        brand_seeds: List[str] = None,
         db=None,  # Optional AsyncIOMotorDatabase for caching
     ) -> List[Dict[str, Any]]:
         """
@@ -45,8 +69,13 @@ class TrendDataService:
         {keyword, trend_score (0-100), growth_rate, source, type}
         Caches real Trends data for 24h and fallback data for 1h to avoid
         hammering Google's rate limits on every page load.
+        brand_seeds: additional topic seeds from the brand's content pillars
+        and key products, used alongside industry seeds.
         """
-        cache_key = f"{industry.lower()}:{geo}:{timeframe}"
+        resolved_geo = geo or _region_to_geo(region)
+        brand_seeds = [s for s in (brand_seeds or []) if s and len(s.strip()) > 2]
+        # v2 prefix in cache key forces a miss when upgrading from pre-brand-seed code
+        cache_key = f"v2:{industry.lower()}:{resolved_geo}:{timeframe}:{','.join(sorted(brand_seeds))}"
 
         # Try to read from cache first
         if db is not None:
@@ -67,11 +96,11 @@ class TrendDataService:
             loop = asyncio.get_running_loop()
             results = await loop.run_in_executor(
                 None,
-                lambda: TrendDataService._fetch_pytrends(industry, geo, timeframe),
+                lambda: TrendDataService._fetch_pytrends(industry, resolved_geo, timeframe, brand_seeds),
             )
         except Exception as exc:
             print(f"[TrendData] pytrends fetch failed: {exc} — using fallback keywords")
-            results = TrendDataService._fallback_keywords(industry)
+            results = TrendDataService._fallback_keywords(industry, brand_seeds)
 
         # Cache all results — real data for 24h, fallback for 1h
         if db is not None:
@@ -87,7 +116,7 @@ class TrendDataService:
                     },
                     upsert=True,
                 )
-                print(f"[TrendData] cached {len(results)} keywords for '{industry}' (fallback={is_fallback})")
+                print(f"[TrendData] cached {len(results)} keywords for '{industry}' geo={resolved_geo} (fallback={is_fallback})")
             except Exception as e:
                 print(f"[TrendData] cache write error: {e}")
 
@@ -96,18 +125,22 @@ class TrendDataService:
     # ── Internal sync method (runs in thread executor) ────────────────────────
 
     @staticmethod
-    def _fetch_pytrends(industry: str, geo: str, timeframe: str) -> List[Dict[str, Any]]:
+    def _fetch_pytrends(industry: str, geo: str, timeframe: str, brand_seeds: List[str] = None) -> List[Dict[str, Any]]:
         from pytrends.request import TrendReq
 
-        seeds = _INDUSTRY_SEEDS.get(
+        industry_seeds = _INDUSTRY_SEEDS.get(
             industry.lower(),
             [industry, f"{industry} tips", f"{industry} mistakes", f"{industry} guide"],
         )
+        # Merge brand-specific seeds first so they get priority query slots
+        extra = [s.strip() for s in (brand_seeds or []) if s and len(s.strip()) > 2]
+        seeds = extra[:2] + industry_seeds  # brand seeds get first 2 slots
 
-        pytrend = TrendReq(hl="en-NG", tz=60, timeout=(10, 25), retries=1, backoff_factor=0.5)
+        hl = "en-NG" if geo == "NG" else "en-US"
+        pytrend = TrendReq(hl=hl, tz=60, timeout=(10, 25), retries=1, backoff_factor=0.5)
         found: List[Dict[str, Any]] = []
 
-        for seed in seeds[:2]:  # max 2 seeds to avoid rate-limit
+        for seed in seeds[:3]:  # max 3 seeds (2 brand + 1 industry)
             try:
                 pytrend.build_payload([seed], cat=0, timeframe=timeframe, geo=geo)
                 related = pytrend.related_queries()
@@ -157,14 +190,17 @@ class TrendDataService:
                 deduped[key] = kw
 
         ranked = sorted(deduped.values(), key=lambda x: x["trend_score"], reverse=True)
-        return ranked[:10] if ranked else TrendDataService._fallback_keywords(industry)
+        return ranked[:10] if ranked else TrendDataService._fallback_keywords(industry, brand_seeds)
 
     @staticmethod
-    def _fallback_keywords(industry: str) -> List[Dict[str, Any]]:
-        seeds = _INDUSTRY_SEEDS.get(
+    def _fallback_keywords(industry: str, brand_seeds: List[str] = None) -> List[Dict[str, Any]]:
+        industry_seeds = _INDUSTRY_SEEDS.get(
             industry.lower(),
             [f"{industry} tips", f"{industry} growth", f"{industry} strategy", f"{industry} trends"],
         )
+        extra = [s.strip() for s in (brand_seeds or []) if s and len(s.strip()) > 2]
+        # Brand-specific seeds first, then industry defaults
+        seeds = extra + [s for s in industry_seeds if s not in extra]
         return [
             {
                 "keyword": kw,
@@ -173,5 +209,5 @@ class TrendDataService:
                 "source": "fallback",
                 "type": "seed",
             }
-            for kw in seeds[:6]
+            for kw in seeds[:8]
         ]

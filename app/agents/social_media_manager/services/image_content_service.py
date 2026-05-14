@@ -399,23 +399,23 @@ class ImageContentService:
                         draft['image_specs'] = image_result['responseData']['specs']
                         draft['has_image'] = True
 
-                        # Save base64 image to local static storage (served directly)
+                        # Upload base64 image to Cloudinary for permanent CDN storage
                         stored_url = raw_image_url
                         if raw_image_url and raw_image_url.startswith("data:"):
+                            print(f"🔄 Uploading image to Cloudinary for draft {draft['id']} ({draft['platform']})...")
                             try:
-                                import base64 as _b64, re as _re, os as _os, uuid as _uuid
-                                _match = _re.match(r"data:[^;]+;base64,(.+)", raw_image_url, _re.DOTALL)
-                                if _match:
-                                    _filename = f"{_uuid.uuid4().hex}.webp"
-                                    _static_dir = "/app/static/images"
-                                    _os.makedirs(_static_dir, exist_ok=True)
-                                    _img_bytes = _b64.b64decode(_match.group(1))
-                                    with open(f"{_static_dir}/{_filename}", "wb") as _f:
-                                        _f.write(_img_bytes)
-                                    stored_url = f"/static/images/{_filename}"
-                                    print(f"💾 Image saved locally: {stored_url}")
+                                from app.utils.cloudinary_upload import upload_base64
+                                stored_url = await upload_base64(raw_image_url, folder="uri-social/content-drafts")
+                                print(f"☁️  ✅ CLOUDINARY UPLOAD SUCCESS!")
+                                print(f"   📍 Draft ID: {draft['id']}")
+                                print(f"   🌐 Platform: {draft['platform']}")
+                                print(f"   🔗 URL: {stored_url}")
                             except Exception as _save_err:
-                                print(f"⚠️  Local image save error: {_save_err}, keeping base64")
+                                print(f"⚠️  ❌ CLOUDINARY UPLOAD FAILED!")
+                                print(f"   📍 Draft ID: {draft['id']}")
+                                print(f"   🌐 Platform: {draft['platform']}")
+                                print(f"   ❌ Error: {_save_err}")
+                                print(f"   ⚠️  Keeping base64 data URL as fallback")
 
                         # Persist URL to DB
                         if db is not None:
@@ -514,22 +514,20 @@ class ImageContentService:
             raw_url = image_result["responseData"]["image_url"]
             specs = image_result["responseData"]["specs"]
 
-            # Save base64 to local static storage (served directly by backend)
+            # Upload base64 to Cloudinary for permanent CDN storage
             stored_url = raw_url
             if raw_url and raw_url.startswith("data:"):
+                print(f"🔄 Uploading REGENERATED image to Cloudinary for draft {draft_id}...")
                 try:
-                    _match = _re.match(r"data:[^;]+;base64,(.+)", raw_url, _re.DOTALL)
-                    if _match:
-                        _filename = f"{_uuid.uuid4().hex}.webp"
-                        _static_dir = "/app/static/images"
-                        _os.makedirs(_static_dir, exist_ok=True)
-                        _img_bytes = _b64.b64decode(_match.group(1))
-                        with open(f"{_static_dir}/{_filename}", "wb") as _f:
-                            _f.write(_img_bytes)
-                        stored_url = f"/static/images/{_filename}"
-                        print(f"💾 Regenerated image saved locally: {stored_url}")
+                    from app.utils.cloudinary_upload import upload_base64
+                    stored_url = await upload_base64(raw_url, folder="uri-social/content-drafts")
+                    print(f"☁️  ✅ CLOUDINARY REGENERATION UPLOAD SUCCESS!")
+                    print(f"   📍 Draft ID: {draft_id}")
+                    print(f"   🔗 URL: {stored_url}")
                 except Exception as _e:
-                    print(f"⚠️ Local image save error during regeneration: {_e}")
+                    print(f"⚠️  ❌ CLOUDINARY REGENERATION UPLOAD FAILED!")
+                    print(f"   📍 Draft ID: {draft_id}")
+                    print(f"   ❌ Error: {_e}")
 
             await db["content_drafts"].update_one(
                 {"$or": [{"id": draft_id}, {"draft_id": draft_id}]},
@@ -619,12 +617,38 @@ class ImageContentService:
             style_slug = bc.get("style_slug", "")
             style_desc = ""
             composition_mode = "immersive"  # default to immersive (PRD Section 1)
+            style_type = None
             if style_slug:
                 from app.agents.social_media_manager.services.style_library import get_style
                 s = get_style(style_slug)
                 if s:
                     style_desc = s.get("description", "")
                     composition_mode = s.get("composition_mode", "immersive")
+                    style_type = s.get("style_type")  # Can be "art_piece" for 9:16 posters
+
+            # ========== ART-PIECE POSTER DETECTION (9:16 Mobile Wallpaper Format) ==========
+            # Check if this is an art-piece poster based on:
+            # 1. Style type is "art_piece" OR
+            # 2. Trigger words in seed content (wallpaper, poster, art piece, full-page promo)
+            seed_lower = seed_content.lower()
+            art_piece_trigger_words = [
+                "wallpaper", "poster", "art piece", "art-piece", "artpiece",
+                "full-page promo", "full page promo", "mobile wallpaper",
+                "phone wallpaper", "vertical poster", "9:16 poster"
+            ]
+            is_art_piece = (
+                style_type == "art_piece" or
+                any(trigger in seed_lower for trigger in art_piece_trigger_words)
+            )
+
+            # Override specs for art-piece posters (9:16 format = 1024x1792)
+            if is_art_piece:
+                specs = {
+                    "width": 1024,
+                    "height": 1792,
+                    "aspect_ratio": "9:16",
+                }
+                print(f"🎨 Art-Piece Poster Mode Activated: 9:16 format (1024x1792)")
 
             # ========== RESTRUCTURED PROMPT ASSEMBLY (PRD Section 3) ==========
             # CRITICAL: Brand rules MUST come FIRST - GPT-Image-2 weights prompt beginning more heavily
@@ -645,11 +669,20 @@ Every element in the image must come from the instructions below. Nothing else."
             # These rules make AI graphics look professionally designed (not AI-generated)
             primary_color = brand_colors[0] if brand_colors else "#000000"
             secondary_color = brand_colors[1] if len(brand_colors) > 1 else "#FFFFFF"
-            cta_text = bc.get("default_link", "Link in bio")
+
+            # Use CTA from brand playbook's cta_styles
+            # If user has multiple CTAs, vary them randomly for diversity
+            cta_styles_list = bc.get("cta_styles", [])
+            if isinstance(cta_styles_list, list) and cta_styles_list:
+                import random
+                cta_text = random.choice(cta_styles_list)
+            else:
+                # Fallback to default_link if cta_styles is empty
+                cta_text = bc.get("default_link", "Link in bio")
 
             # Brand name display logic (PRD Section 4)
-            seed_lower = seed_content.lower()
-            show_brand_name = any([
+            # Art-piece posters ALWAYS include brand logo + tagline + badges
+            show_brand_name = is_art_piece or any([
                 "add our name" in seed_lower,
                 "add the name" in seed_lower,
                 "add our logo" in seed_lower,
@@ -680,7 +713,13 @@ Every element in the image must come from the instructions below. Nothing else."
             ])
 
             brand_name_directive = ""
-            if show_brand_name:
+            if is_art_piece:
+                # Art-piece posters have special branding requirements
+                tagline = bc.get("tagline", "")
+                tagline_text = f'\nTagline: Display "{tagline}" below the logo in complementary font.' if tagline else ""
+                brand_name_directive = f'''Display the brand name "{brand_name}" prominently at the top third or top centre of the poster. Logo size: large and clear.{tagline_text}
+Feature badges: Add 2-3 feature badges (e.g., "Premium Quality", "Limited Edition", "Handcrafted") near the bottom or flanking the product in elegant frames.'''
+            elif show_brand_name:
                 brand_name_directive = f'Display the brand name "{brand_name}" prominently in the design. Spell it exactly as shown.'
             else:
                 brand_name_directive = 'Do NOT display the brand name or logo anywhere. Brand identity is expressed through colours and visual treatment only.'
@@ -828,6 +867,38 @@ Follow these rules precisely for every image. No exceptions.
             if not image_prompt:
                 image_prompt = seed_content.strip()
 
+            # ========== PRODUCT PRESERVATION PIPELINE (PRD: Product-Preservation-Pipeline) ==========
+            # When reference_image provided: forensic analysis + preservation block
+            # This is the KEY innovation that prevents product distortion
+            product_preservation_block = ""
+            cutout_url = reference_image  # Default to original if background removal fails
+
+            if reference_image:
+                try:
+                    print(f"\n{'='*60}")
+                    print(f"🔬 PRODUCT PRESERVATION PIPELINE ACTIVATED")
+                    print(f"{'='*60}")
+
+                    # Step 1: Background removal (get clean product cutout)
+                    from app.utils.background_removal import remove_background
+                    cutout_url = await remove_background(reference_image, method="auto")
+                    print(f"✂️  Background removed: {cutout_url[:80]}...")
+
+                    # Step 2: Forensic product analysis (the key innovation)
+                    from app.agents.social_media_manager.services.product_analysis_service import ProductAnalysisService
+                    product_spec = await ProductAnalysisService.analyze_product_forensically(cutout_url)
+
+                    # Step 3: Build preservation block
+                    product_preservation_block = ProductAnalysisService.build_preservation_block(product_spec)
+
+                    print(f"✅ Product preservation block generated ({len(product_preservation_block)} chars)")
+                    print(f"{'='*60}\n")
+
+                except Exception as e:
+                    print(f"⚠️ Product preservation pipeline error: {str(e)}")
+                    print(f"   Falling back to standard reference image handling")
+                    # Continue with original reference_image, no preservation block
+
             # Add composition block based on style's composition_mode (Immersive Composition System PRD)
             # When a reference image is provided, choose composition style based on the visual style
             if reference_image:
@@ -908,6 +979,12 @@ OVERALL:
 
                 image_prompt = image_prompt.rstrip() + "\n" + composition_block
 
+            # ========== PREPEND PRESERVATION BLOCK (CRITICAL: Must come first) ==========
+            # The preservation block must be at the BEGINNING so GPT-Image-2 weights it heavily
+            if product_preservation_block:
+                image_prompt = product_preservation_block + "\n\n" + image_prompt
+                print(f"📌 Preservation block prepended to prompt (total: {len(image_prompt)} chars)")
+
             # ========== IMAGE GENERATION DEBUG (PRD Section 2) ==========
             from datetime import datetime
             print(f"\n{'='*60}")
@@ -951,10 +1028,13 @@ OVERALL:
                 f"{'━'*60}\n"
             )
 
+            # Use cutout_url (background-removed) if preservation pipeline ran, otherwise original
+            final_reference_image = cutout_url if (reference_image and cutout_url != reference_image) else reference_image
+
             image_response = await ImageContentService._call_dalle_api(
                 prompt=image_prompt,
                 size=f"{specs['width']}x{specs['height']}",
-                reference_image=reference_image,
+                reference_image=final_reference_image,
                 image_model=image_model,
             )
 
@@ -1526,16 +1606,46 @@ OVERALL:
                 vision_refs.append(f"{tmpl_count} template(s)")
             vision_ref_note = f" | vision refs: {', '.join(vision_refs)}" if vision_refs else ""
 
+            # Extract TEXT_LEVEL to know what text is overlaid on the image
+            text_level = 'NONE'
+            text_level_match = _re_hex.search(r'TEXT_LEVEL:\s*([A-Z_]+)', brief_no_hex)
+            if text_level_match:
+                text_level = text_level_match.group(1).strip()
+
+            # Extract the actual text from the FINAL_PROMPT for prefilling
+            image_text_overlay = None
+            if text_level not in ('NONE', 'N/A'):
+                # Try to extract quoted text from the prompt (headline, stat, etc.)
+                text_patterns = [
+                    r'"([^"]{4,100})"',  # Text in quotes
+                    r'text reads[:\s]+"([^"]+)"',  # "text reads: ..."
+                    r'headline[:\s]+"([^"]+)"',  # "headline: ..."
+                    r'stat[:\s]+"([^"]+)"',  # "stat: ..."
+                ]
+                for pattern in text_patterns:
+                    text_match = _re_hex.search(pattern, brief_clean, _re_hex.IGNORECASE)
+                    if text_match:
+                        image_text_overlay = text_match.group(1).strip()
+                        break
+
             print(f"\n{'━'*60}")
-            print(f"🎨 IMAGEN PROMPT — {platform.upper()} | type: {chosen_type}{vision_ref_note}")
+            print(f"🎨 IMAGEN PROMPT — {platform.upper()} | type: {chosen_type} | text: {text_level}{vision_ref_note}")
             print(f"   ✅ fields used ({len(filled)}): {', '.join(filled)}")
             if missing:
                 print(f"   ⚠️  fields missing ({len(missing)}): {', '.join(missing)}")
             print(f"   📝 prompt length: {len(brief_clean)} chars")
+            if image_text_overlay:
+                print(f"   📝 text overlay: {image_text_overlay}")
             print(f"{'━'*60}")
             print(brief_clean)
             print(f"{'━'*60}\n")
-            return brief_clean
+
+            return {
+                "prompt": brief_clean,
+                "image_type": chosen_type,
+                "text_level": text_level,
+                "text_overlay": image_text_overlay
+            }
 
         except Exception as e:
             print(f"⚠️ Image brief generation failed, using static prompt: {e}")
@@ -2031,13 +2141,20 @@ OVERALL:
                     b64 = response.data[0].b64_json
                     b64 = ImageContentService._crop_to_ratio(b64, target_w, target_h)
 
-                    # Convert to WebP
+                    # Convert to WebP and resize to exact target dimensions
                     out_img = _PILImage.open(io.BytesIO(_b64.b64decode(b64))).convert("RGB")
+
+                    # Resize to exact platform dimensions
+                    gen_w, gen_h = out_img.size
+                    if (gen_w, gen_h) != (target_w, target_h):
+                        print(f"🔄 Resizing from {gen_w}×{gen_h} to {target_w}×{target_h} (exact platform dimensions)")
+                        out_img = out_img.resize((target_w, target_h), _PILImage.LANCZOS)
+
                     webp_buf = io.BytesIO()
                     out_img.save(webp_buf, format="WEBP", quality=97, method=6)
                     b64_webp = _b64.b64encode(webp_buf.getvalue()).decode()
 
-                    print(f"🎨 gpt-image-1 edit generated (reference image preserved, {edit_size})")
+                    print(f"🎨 gpt-image-1 edit generated (reference image preserved, {target_w}×{target_h})")
                     return {
                         "success": True,
                         "url": f"data:image/webp;base64,{b64_webp}",
@@ -2116,11 +2233,19 @@ OVERALL:
                     _gpt2_b64 = _gpt2_resp.data[0].b64_json
 
                     _gpt2_img = _PILImage.open(_io.BytesIO(_b64.b64decode(_gpt2_b64))).convert("RGB")
+
+                    # Resize to exact target dimensions (e.g., 1080×1350 for Instagram)
+                    # OpenAI generates at 1024×1536, we resize to match platform specs exactly
+                    gen_w, gen_h = _gpt2_img.size
+                    if (gen_w, gen_h) != (target_w, target_h):
+                        print(f"🔄 Resizing from {gen_w}×{gen_h} to {target_w}×{target_h} (exact platform dimensions)")
+                        _gpt2_img = _gpt2_img.resize((target_w, target_h), _PILImage.LANCZOS)
+
                     _gpt2_buf = _io.BytesIO()
                     _gpt2_img.save(_gpt2_buf, format="WEBP", quality=97, method=6)
                     _gpt2_b64 = _b64.b64encode(_gpt2_buf.getvalue()).decode()
 
-                    print(f"✅ GPT-Image-2 ready ({_gpt2_size}, {_mode})")
+                    print(f"✅ GPT-Image-2 ready ({target_w}×{target_h}, {_mode})")
                     return {
                         "success": True,
                         "url": f"data:image/webp;base64,{_gpt2_b64}",

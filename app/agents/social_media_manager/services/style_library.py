@@ -1365,6 +1365,334 @@ STYLES: Dict[str, Dict[str, Any]] = {
             "Quality: 4K, CGI-quality photography, gravity-defying composition, high-fashion editorial, avant-garde commercial."
         ),
     },
+    # ---------------------------------------------------------------------------
+    # ART-PIECE POSTER STYLES (9:16 Mobile Wallpaper Format)
+    # Trigger words: wallpaper, poster, art piece, full-page promo
+    # Includes brand logo + tagline + badges in generated image
+    # ---------------------------------------------------------------------------
+    "art_luxury_showroom": {
+        "name": "Luxury Showroom",
+        "description": "Premium interior. Architectural, warm, aspirational.",
+        "style_type": "art_piece",
+        "industry_tags": ["real_estate", "home_garden", "fashion_ecommerce", "general_other"],
+        "prompt_fragment": (
+            "Create a premium art-piece product poster in 9:16 mobile wallpaper format (1080x1920). Advanced design level. Ultra-realistic.\n\n"
+            "ENVIRONMENT: The product is displayed in a luxury architectural interior. Premium materials surround it — polished marble, warm wood panelling, soft leather, brass fixtures. "
+            "The setting feels like a high-end boutique, a luxury home, or an upscale gallery. Natural light streams through tall windows or skylights. The space is minimal but rich.\n\n"
+            "PRODUCT PLACEMENT: The product is the central hero. It sits on a pedestal, a surface, or floats slightly above the ground (levitation effect). "
+            "It is lit beautifully — warm spotlighting or natural sunlight highlighting its details. The product takes up 20-30% of the frame.\n\n"
+            "BRANDING INTEGRATION: Brand logo is placed prominently at the top third or top centre of the poster. Logo size: large and clear. "
+            "Tagline is positioned just below the logo or near the product in elegant serif or sans-serif font. "
+            "Feature badges (e.g., 'Premium Quality', 'Limited Edition', 'Handcrafted') are placed near the bottom or flanking the product in gold or white frames.\n\n"
+            "LAYOUT & COMPOSITION: 9:16 vertical format. Product in lower-middle area. Logo at top. Tagline and badges integrated naturally into the scene. "
+            "Negative space is used intentionally for elegance. The composition is balanced, sophisticated, and aspirational.\n\n"
+            "LIGHTING: Warm, natural, architectural. Soft shadows. Sunbeams or diffused window light. Gold hour glow optional.\n\n"
+            "COLOR PALETTE: Warm neutrals — cream, beige, caramel, gold, soft white. Accent colours from the product itself.\n\n"
+            "MOOD: Aspirational, premium, sophisticated, architectural, warm.\n\n"
+            "QUALITY: 4K, ultra-realistic CGI, professional product photography, architectural digest style."
+        ),
+    },
+    "art_nature_immersion": {
+        "name": "Nature Immersion",
+        "description": "The product surrounded by natural beauty. Organic, refreshing, eco-premium.",
+        "style_type": "art_piece",
+        "industry_tags": ["beauty_cosmetics", "perfume_fragrance", "food_beverage", "health_fitness", "home_garden"],
+        "prompt_fragment": (
+            "Create a nature-immersive art-piece product poster in 9:16 mobile wallpaper format (1080x1920). Advanced design level. Ultra-realistic.\n\n"
+            "ENVIRONMENT: The product is placed within a lush natural setting — surrounded by tropical leaves, ferns, moss, flowers, stones, water, or forest elements. "
+            "The nature is hyper-real and abundant. Green dominates. The product sits on a natural surface (wooden stump, mossy rock, shallow water) or floats slightly above it.\n\n"
+            "PRODUCT PLACEMENT: The product is the clear focal point. It is nestled into the natural scene but stands out through lighting and contrast. "
+            "Nature frames the product but does not overwhelm it. Product takes up 20-30% of the frame.\n\n"
+            "BRANDING INTEGRATION: Brand logo is placed at the top centre or top left in a clean modern font (white or earthy green). "
+            "Tagline is positioned below the logo or near the product in a complementary font. "
+            "Feature badges (e.g., 'Organic', 'Eco-Friendly', '100% Natural') are placed near the bottom in subtle white or green frames.\n\n"
+            "LAYOUT & COMPOSITION: 9:16 vertical format. Nature fills the background and mid-ground. Product in the lower-middle or centre. Logo at top. Badges at bottom. "
+            "The composition is lush, immersive, and balanced.\n\n"
+            "LIGHTING: Natural, soft, organic. Dappled sunlight through leaves. Morning dew sparkle. Subtle mist or haze optional.\n\n"
+            "COLOR PALETTE: Rich greens, earthy browns, soft creams, white, gold accents. Product colours pop against the green backdrop.\n\n"
+            "MOOD: Refreshing, organic, premium-natural, immersive, eco-luxury.\n\n"
+            "QUALITY: 4K, ultra-realistic, botanical photography style, National Geographic quality."
+        ),
+    },
+    "art_ingredient_explosion": {
+        "name": "Ingredient Explosion",
+        "description": "Product surrounded by its ingredients mid-flight. Dynamic, fresh, transparent.",
+        "style_type": "art_piece",
+        "industry_tags": ["food_beverage", "beauty_cosmetics", "health_fitness"],
+        "prompt_fragment": (
+            "Create an ingredient-explosion art-piece product poster in 9:16 mobile wallpaper format (1080x1920). Advanced design level. Ultra-realistic.\n\n"
+            "ENVIRONMENT: Clean white or soft gradient background. The product is the anchor in the centre or lower-centre of the frame. "
+            "Around it, ingredients are suspended mid-air in an explosive, dynamic arrangement — fresh fruits, vegetables, herbs, spices, liquids, powders, or natural extracts. "
+            "Everything is frozen in motion as if captured at the peak of an explosion.\n\n"
+            "PRODUCT PLACEMENT: The product sits calmly in the centre while chaos swirls around it. It is the stable focal point. Takes up 20-30% of the frame.\n\n"
+            "BRANDING INTEGRATION: Brand logo is placed at the top centre in bold, modern font (black or brand colour). "
+            "Tagline is positioned below the logo or near the product in clean sans-serif font. "
+            "Feature badges (e.g., 'Fresh Ingredients', 'No Additives', 'Real Food') are placed near the bottom in white or coloured frames.\n\n"
+            "LAYOUT & COMPOSITION: 9:16 vertical format. Ingredients explode radially from behind or around the product. Logo at top. Badges at bottom. "
+            "The composition is dynamic, energetic, and visually exciting.\n\n"
+            "LIGHTING: Bright, clean, commercial. Ingredients are lit to show freshness — water droplets sparkle, colours pop, textures are sharp.\n\n"
+            "COLOR PALETTE: White or soft gradient background. Vibrant ingredient colours (greens, reds, yellows, oranges). Product colours stand out.\n\n"
+            "MOOD: Fresh, dynamic, transparent, energetic, appetising, premium-commercial.\n\n"
+            "QUALITY: 4K, ultra-realistic, high-speed photography style, professional commercial shot."
+        ),
+    },
+    "art_neon_underground": {
+        "name": "Neon Underground",
+        "description": "Dark, edgy, neon-lit. Cyberpunk meets street culture.",
+        "style_type": "art_piece",
+        "industry_tags": ["fashion_ecommerce", "events_entertainment", "fintech_saas_tech", "general_other"],
+        "prompt_fragment": (
+            "Create a neon-underground art-piece product poster in 9:16 mobile wallpaper format (1080x1920). Advanced design level. Ultra-realistic.\n\n"
+            "ENVIRONMENT: Dark, gritty, urban setting — underground tunnel, alleyway, neon-lit room, or cyberpunk street. "
+            "Neon lights (pink, blue, purple, cyan) cast dramatic coloured lighting on the product. Wet pavement reflects the neon glow. Concrete, metal, graffiti, and industrial textures dominate.\n\n"
+            "PRODUCT PLACEMENT: The product is the hero, lit by neon lights from the sides or behind. It stands out against the dark background through bright neon rim lighting or spotlighting. "
+            "Product takes up 20-30% of the frame.\n\n"
+            "BRANDING INTEGRATION: Brand logo is placed at the top in bold, modern, or futuristic font (neon colour or white with glow effect). "
+            "Tagline is positioned below the logo or near the product in a glowing neon-style font. "
+            "Feature badges (e.g., 'Limited Drop', 'Exclusive', 'Underground') are placed near the bottom in neon-framed boxes.\n\n"
+            "LAYOUT & COMPOSITION: 9:16 vertical format. Dark background fills most of the frame. Neon lights create visual interest. Product in lower-middle or centre. Logo at top with glow. Badges at bottom. "
+            "The composition is edgy, moody, and cinematic.\n\n"
+            "LIGHTING: Neon lighting (pink, blue, purple, cyan). Rim lighting on product. Dark shadows. High contrast. Cinematic and dramatic.\n\n"
+            "COLOR PALETTE: Dark blacks and greys. Neon pinks, blues, purples, cyans. Product colours pop against darkness.\n\n"
+            "MOOD: Edgy, underground, cyberpunk, cinematic, bold, rebellious.\n\n"
+            "QUALITY: 4K, ultra-realistic, cinematic cyberpunk style, Blade Runner aesthetic."
+        ),
+    },
+    "art_golden_throne": {
+        "name": "Golden Throne",
+        "description": "Product on a golden pedestal. Regal, premium, crown-jewel treatment.",
+        "style_type": "art_piece",
+        "industry_tags": ["fashion_ecommerce", "perfume_fragrance", "jewellery_watches", "general_other"],
+        "prompt_fragment": (
+            "Create a golden-throne art-piece product poster in 9:16 mobile wallpaper format (1080x1920). Advanced design level. Ultra-realistic.\n\n"
+            "ENVIRONMENT: The product sits on or is surrounded by golden elements — a golden pedestal, throne, platform, or gilded frame. "
+            "Background is rich and luxurious — deep velvet (burgundy, emerald, navy), gold-leafed walls, or soft gradient with gold particles floating. "
+            "The setting feels regal, premium, and exclusive.\n\n"
+            "PRODUCT PLACEMENT: The product is the crown jewel. It sits on the golden pedestal or throne, elevated and highlighted. It is lit with warm, golden light. Takes up 20-30% of the frame.\n\n"
+            "BRANDING INTEGRATION: Brand logo is placed at the top centre in an elegant serif or luxury sans-serif font (gold or white). "
+            "Tagline is positioned below the logo or near the product in a complementary elegant font. "
+            "Feature badges (e.g., 'Premium', 'Luxury', 'Exclusive') are placed near the bottom in gold-framed boxes.\n\n"
+            "LAYOUT & COMPOSITION: 9:16 vertical format. Golden pedestal or throne in lower-middle area. Product on top. Logo at top. Badges at bottom. "
+            "The composition is regal, symmetrical, and luxurious.\n\n"
+            "LIGHTING: Warm golden light. Spotlighting on product. Soft glow around pedestal. Dramatic shadows optional.\n\n"
+            "COLOR PALETTE: Rich gold, deep jewel tones (burgundy, emerald, navy), black, cream. Product colours stand out against luxury backdrop.\n\n"
+            "MOOD: Regal, premium, exclusive, luxurious, crown-jewel, aspirational.\n\n"
+            "QUALITY: 4K, ultra-realistic, luxury commercial photography, high-end editorial."
+        ),
+    },
+    "art_frozen_impact": {
+        "name": "Frozen Impact",
+        "description": "Product surrounded by frozen splash of water, milk, or liquid. Dynamic freeze-frame.",
+        "style_type": "art_piece",
+        "industry_tags": ["food_beverage", "beauty_cosmetics", "health_fitness", "sports_fitness"],
+        "prompt_fragment": (
+            "Create a frozen-impact art-piece product poster in 9:16 mobile wallpaper format (1080x1920). Advanced design level. Ultra-realistic.\n\n"
+            "ENVIRONMENT: Clean white or soft gradient background. The product is the anchor in the centre. "
+            "Around it, a liquid (water, milk, juice, cream, paint) is frozen mid-splash in a dynamic, sculptural shape. "
+            "The splash is perfectly frozen — droplets suspended in air, liquid ribbons curling, impact crown forming. High-speed photography aesthetic.\n\n"
+            "PRODUCT PLACEMENT: The product sits calmly at the centre while the frozen splash surrounds or impacts it. The product is stable; the splash is dynamic. Takes up 20-30% of the frame.\n\n"
+            "BRANDING INTEGRATION: Brand logo is placed at the top centre in bold, modern font (black or brand colour). "
+            "Tagline is positioned below the logo or near the product in clean sans-serif font. "
+            "Feature badges (e.g., 'Hydrating', 'Refreshing', 'Pure') are placed near the bottom in white or coloured frames.\n\n"
+            "LAYOUT & COMPOSITION: 9:16 vertical format. Frozen splash fills mid-ground. Product in centre. Logo at top. Badges at bottom. "
+            "The composition is dynamic, clean, and visually striking.\n\n"
+            "LIGHTING: Bright, clean, commercial. Liquid is backlit or side-lit to show transparency and sparkle. Product is front-lit.\n\n"
+            "COLOR PALETTE: White or soft gradient background. Transparent or coloured liquid (clear water, white milk, orange juice, etc.). Product colours pop.\n\n"
+            "MOOD: Dynamic, fresh, clean, energetic, refreshing, premium-commercial.\n\n"
+            "QUALITY: 4K, ultra-realistic, high-speed photography, commercial product shot."
+        ),
+    },
+    "art_botanical_garden": {
+        "name": "Botanical Garden",
+        "description": "Product in a curated botanical scene. Elegant, scientific, natural luxury.",
+        "style_type": "art_piece",
+        "industry_tags": ["beauty_cosmetics", "perfume_fragrance", "home_garden", "health_fitness"],
+        "prompt_fragment": (
+            "Create a botanical-garden art-piece product poster in 9:16 mobile wallpaper format (1080x1920). Advanced design level. Ultra-realistic.\n\n"
+            "ENVIRONMENT: The product is placed within a carefully curated botanical scene — elegant glass greenhouse, botanical garden display, or minimalist natural setup. "
+            "Plants are arranged intentionally — ferns, eucalyptus, dried flowers, botanical specimens in glass jars, or terrariums. "
+            "The aesthetic is scientific meets luxury — think apothecary meets modern botanical art.\n\n"
+            "PRODUCT PLACEMENT: The product is the focal point, placed on a natural surface (wooden table, stone slab, glass shelf) and framed by botanical elements. Takes up 20-30% of the frame.\n\n"
+            "BRANDING INTEGRATION: Brand logo is placed at the top centre in an elegant serif or modern sans-serif font (deep green or black). "
+            "Tagline is positioned below the logo or near the product in a complementary font. "
+            "Feature badges (e.g., 'Botanical', 'Plant-Based', 'Natural') are placed near the bottom in subtle green or white frames.\n\n"
+            "LAYOUT & COMPOSITION: 9:16 vertical format. Botanical elements fill the background and frame the product. Product in lower-middle area. Logo at top. Badges at bottom. "
+            "The composition is elegant, balanced, and scientific.\n\n"
+            "LIGHTING: Soft, natural, diffused. Greenhouse light quality. Subtle shadows. Clean and bright.\n\n"
+            "COLOR PALETTE: Soft greens, creams, whites, natural wood tones, glass transparency. Product colours stand out against botanical backdrop.\n\n"
+            "MOOD: Elegant, scientific, natural-luxury, apothecary, botanical-art.\n\n"
+            "QUALITY: 4K, ultra-realistic, botanical photography, Kinfolk magazine aesthetic."
+        ),
+    },
+    "art_fire_smoke": {
+        "name": "Fire & Smoke",
+        "description": "Product surrounded by flames, smoke, or heat. Intense, bold, powerful.",
+        "style_type": "art_piece",
+        "industry_tags": ["food_beverage", "fashion_ecommerce", "sports_fitness", "general_other"],
+        "prompt_fragment": (
+            "Create a fire-and-smoke art-piece product poster in 9:16 mobile wallpaper format (1080x1920). Advanced design level. Ultra-realistic.\n\n"
+            "ENVIRONMENT: Dark background (black or deep charcoal). The product is surrounded by fire, flames, smoke, or heat distortion. "
+            "Flames lick upward around the product. Smoke swirls dramatically. Embers float in the air. The scene is intense, bold, and cinematic.\n\n"
+            "PRODUCT PLACEMENT: The product sits calmly at the centre while fire and smoke surround it. The product is untouched by the flames but framed by them. Takes up 20-30% of the frame.\n\n"
+            "BRANDING INTEGRATION: Brand logo is placed at the top centre in bold, modern font (white or fiery orange with glow effect). "
+            "Tagline is positioned below the logo or near the product in a complementary bold font. "
+            "Feature badges (e.g., 'Bold', 'Intense', 'Powerful') are placed near the bottom in white or fiery orange frames.\n\n"
+            "LAYOUT & COMPOSITION: 9:16 vertical format. Flames and smoke fill the mid-ground and background. Product in centre. Logo at top. Badges at bottom. "
+            "The composition is intense, dramatic, and cinematic.\n\n"
+            "LIGHTING: Dramatic fire lighting. Orange, red, yellow glow. Strong contrast. Dark shadows. Cinematic and powerful.\n\n"
+            "COLOR PALETTE: Dark blacks. Fiery oranges, reds, yellows. Smoke greys. Product colours pop against dark fiery backdrop.\n\n"
+            "MOOD: Intense, bold, powerful, cinematic, dramatic, energetic.\n\n"
+            "QUALITY: 4K, ultra-realistic, cinematic fire photography, high-end commercial."
+        ),
+    },
+    "art_crystal_cave": {
+        "name": "Crystal Cave",
+        "description": "Product in a crystal or gemstone cave. Mystical, luxurious, ethereal.",
+        "style_type": "art_piece",
+        "industry_tags": ["beauty_cosmetics", "perfume_fragrance", "jewellery_watches", "general_other"],
+        "prompt_fragment": (
+            "Create a crystal-cave art-piece product poster in 9:16 mobile wallpaper format (1080x1920). Advanced design level. Ultra-realistic.\n\n"
+            "ENVIRONMENT: The product is placed inside or in front of a crystal cave — surrounded by large quartz crystals, amethyst geodes, or gemstone formations. "
+            "Crystals catch and refract light, creating colourful sparkles and glows. The cave is mystical, luxurious, and otherworldly.\n\n"
+            "PRODUCT PLACEMENT: The product sits on a natural crystal platform or floats slightly above it. It is framed by crystals but remains the focal point. Takes up 20-30% of the frame.\n\n"
+            "BRANDING INTEGRATION: Brand logo is placed at the top centre in an elegant serif or luxury sans-serif font (white or crystal colour). "
+            "Tagline is positioned below the logo or near the product in a complementary elegant font. "
+            "Feature badges (e.g., 'Pure', 'Precious', 'Radiant') are placed near the bottom in white or crystal-coloured frames.\n\n"
+            "LAYOUT & COMPOSITION: 9:16 vertical format. Crystals fill the background and mid-ground. Product in lower-middle area. Logo at top. Badges at bottom. "
+            "The composition is mystical, balanced, and luxurious.\n\n"
+            "LIGHTING: Ethereal, magical. Crystals catch light and create sparkles. Soft coloured glows (purple, blue, pink). Mystical and enchanting.\n\n"
+            "COLOR PALETTE: Deep purples, blues, pinks, whites, crystal transparency. Product colours stand out against mystical crystal backdrop.\n\n"
+            "MOOD: Mystical, luxurious, ethereal, enchanting, precious, otherworldly.\n\n"
+            "QUALITY: 4K, ultra-realistic, fantasy photography, mystical commercial aesthetic."
+        ),
+    },
+    "art_ocean_surface": {
+        "name": "Ocean Surface",
+        "description": "Product floating on or under water. Refreshing, clean, serene.",
+        "style_type": "art_piece",
+        "industry_tags": ["beauty_cosmetics", "food_beverage", "health_fitness", "perfume_fragrance"],
+        "prompt_fragment": (
+            "Create an ocean-surface art-piece product poster in 9:16 mobile wallpaper format (1080x1920). Advanced design level. Ultra-realistic.\n\n"
+            "ENVIRONMENT: The product is placed on, in, or under clear blue water. Shot from above or at water level. "
+            "Water is crystal clear — you can see ripples, reflections, light rays penetrating the surface, and subtle underwater distortion. "
+            "The scene is refreshing, clean, and serene. Optional: floating flowers, leaves, or bubbles.\n\n"
+            "PRODUCT PLACEMENT: The product floats on the water surface or sits just beneath it. Water ripples around it. Takes up 20-30% of the frame.\n\n"
+            "BRANDING INTEGRATION: Brand logo is placed at the top centre in clean, modern font (white or aqua blue). "
+            "Tagline is positioned below the logo or near the product in a complementary font. "
+            "Feature badges (e.g., 'Hydrating', 'Pure', 'Refreshing') are placed near the bottom in white or aqua blue frames.\n\n"
+            "LAYOUT & COMPOSITION: 9:16 vertical format. Water fills the frame. Product in lower-middle or centre. Logo at top. Badges at bottom. "
+            "The composition is clean, serene, and refreshing.\n\n"
+            "LIGHTING: Natural, bright, clean. Sunlight penetrates the water, creating light rays and sparkles. Underwater glow.\n\n"
+            "COLOR PALETTE: Clear blues, aqua, turquoise, white, crystal transparency. Product colours pop against clean water backdrop.\n\n"
+            "MOOD: Refreshing, clean, serene, pure, hydrating, natural.\n\n"
+            "QUALITY: 4K, ultra-realistic, underwater photography, clean commercial aesthetic."
+        ),
+    },
+    "art_workshop_craft": {
+        "name": "Workshop Craft",
+        "description": "Product in a workshop or craft studio. Handmade, artisan, authentic.",
+        "style_type": "art_piece",
+        "industry_tags": ["fashion_ecommerce", "home_garden", "food_beverage", "general_other"],
+        "prompt_fragment": (
+            "Create a workshop-craft art-piece product poster in 9:16 mobile wallpaper format (1080x1920). Advanced design level. Ultra-realistic.\n\n"
+            "ENVIRONMENT: The product is displayed in a workshop or craft studio — surrounded by artisan tools, raw materials, workbenches, and handmade textures. "
+            "Leather, wood, metal, fabric, or clay tools are visible. The aesthetic is authentic, rugged, and artisan.\n\n"
+            "PRODUCT PLACEMENT: The product sits on a workbench or natural surface, surrounded by craft tools and materials. It is the finished masterpiece among the raw materials. Takes up 20-30% of the frame.\n\n"
+            "BRANDING INTEGRATION: Brand logo is placed at the top centre in a bold, artisan-style font (black or craft colour). "
+            "Tagline is positioned below the logo or near the product in a complementary handcrafted font. "
+            "Feature badges (e.g., 'Handmade', 'Artisan', 'Crafted') are placed near the bottom in rustic frames.\n\n"
+            "LAYOUT & COMPOSITION: 9:16 vertical format. Workshop tools and materials fill the background. Product in lower-middle area. Logo at top. Badges at bottom. "
+            "The composition is authentic, rugged, and artisan.\n\n"
+            "LIGHTING: Natural workshop light. Warm, directional, with visible texture and shadows. Authentic and real.\n\n"
+            "COLOR PALETTE: Earthy browns, blacks, wood tones, leather, metal greys. Product colours stand out against workshop backdrop.\n\n"
+            "MOOD: Authentic, artisan, handmade, rugged, craft, heritage.\n\n"
+            "QUALITY: 4K, ultra-realistic, artisan photography, heritage brand aesthetic."
+        ),
+    },
+    "art_velvet_stage": {
+        "name": "Velvet Stage",
+        "description": "Product on a velvet-draped stage. Theatrical, elegant, spotlight moment.",
+        "style_type": "art_piece",
+        "industry_tags": ["events_entertainment", "fashion_ecommerce", "perfume_fragrance", "general_other"],
+        "prompt_fragment": (
+            "Create a velvet-stage art-piece product poster in 9:16 mobile wallpaper format (1080x1920). Advanced design level. Ultra-realistic.\n\n"
+            "ENVIRONMENT: The product is placed on or in front of a velvet-draped stage — rich velvet curtains (burgundy, emerald, navy, black) frame the scene. "
+            "A single spotlight illuminates the product from above. The background is dark, theatrical, and elegant. Optional: subtle stage smoke or haze.\n\n"
+            "PRODUCT PLACEMENT: The product sits centre stage, lit by a dramatic spotlight. It is the star of the show. Takes up 20-30% of the frame.\n\n"
+            "BRANDING INTEGRATION: Brand logo is placed at the top centre in an elegant serif or theatrical font (gold or white). "
+            "Tagline is positioned below the logo or near the product in a complementary elegant font. "
+            "Feature badges (e.g., 'Limited Edition', 'Exclusive', 'Premiere') are placed near the bottom in gold or white frames.\n\n"
+            "LAYOUT & COMPOSITION: 9:16 vertical format. Velvet curtains frame the sides and background. Product in centre. Spotlight from above. Logo at top. Badges at bottom. "
+            "The composition is theatrical, elegant, and dramatic.\n\n"
+            "LIGHTING: Single spotlight from above. Dramatic shadows. Optional stage smoke diffusing light. Theatrical and cinematic.\n\n"
+            "COLOR PALETTE: Rich velvet colours (burgundy, emerald, navy, black), gold accents, white spotlight glow. Product colours pop under spotlight.\n\n"
+            "MOOD: Theatrical, elegant, dramatic, spotlight moment, premiere, exclusive.\n\n"
+            "QUALITY: 4K, ultra-realistic, theatrical photography, high-end commercial."
+        ),
+    },
+    "art_tech_orbit": {
+        "name": "Tech Orbit",
+        "description": "Product floating in a futuristic tech environment. Digital, modern, innovative.",
+        "style_type": "art_piece",
+        "industry_tags": ["fintech_saas_tech", "electronics_gadgets", "general_other"],
+        "prompt_fragment": (
+            "Create a tech-orbit art-piece product poster in 9:16 mobile wallpaper format (1080x1920). Advanced design level. Ultra-realistic.\n\n"
+            "ENVIRONMENT: The product floats in a futuristic tech environment — surrounded by holographic rings, digital particles, circuit patterns, or glowing tech elements. "
+            "Background is dark or deep gradient (black to blue, black to purple). The aesthetic is digital, modern, and innovative.\n\n"
+            "PRODUCT PLACEMENT: The product floats in the centre, surrounded by orbiting tech elements (rings, particles, holograms). It is the core of the digital system. Takes up 20-30% of the frame.\n\n"
+            "BRANDING INTEGRATION: Brand logo is placed at the top centre in a modern, futuristic font (white or neon colour with glow). "
+            "Tagline is positioned below the logo or near the product in a complementary tech-style font. "
+            "Feature badges (e.g., 'Innovative', 'Smart', 'Digital') are placed near the bottom in glowing tech frames.\n\n"
+            "LAYOUT & COMPOSITION: 9:16 vertical format. Tech elements orbit around product in centre. Logo at top. Badges at bottom. "
+            "The composition is futuristic, dynamic, and digital.\n\n"
+            "LIGHTING: Digital glow. Neon rim lighting on product. Holographic light effects. Futuristic and glowing.\n\n"
+            "COLOR PALETTE: Dark blacks, deep blues, purples, neon cyans, whites. Product colours pop against digital backdrop.\n\n"
+            "MOOD: Futuristic, innovative, digital, modern, tech-forward, dynamic.\n\n"
+            "QUALITY: 4K, ultra-realistic, sci-fi commercial, tech product photography."
+        ),
+    },
+    "art_sunset_canvas": {
+        "name": "Sunset Canvas",
+        "description": "Product silhouetted or featured in a golden sunset scene. Warm, dreamy, aspirational.",
+        "style_type": "art_piece",
+        "industry_tags": ["travel_hospitality", "fashion_ecommerce", "events_entertainment", "general_other"],
+        "prompt_fragment": (
+            "Create a sunset-canvas art-piece product poster in 9:16 mobile wallpaper format (1080x1920). Advanced design level. Ultra-realistic.\n\n"
+            "ENVIRONMENT: The product is featured against or within a stunning sunset scene — golden hour sky, warm orange and pink gradients, silhouetted landscape (mountains, ocean, city skyline). "
+            "The scene is dreamy, warm, and aspirational. The product can be silhouetted or lit with warm golden light.\n\n"
+            "PRODUCT PLACEMENT: The product is placed in the lower-middle area, either silhouetted against the sunset or lit with golden light. Takes up 20-30% of the frame.\n\n"
+            "BRANDING INTEGRATION: Brand logo is placed at the top centre in a bold, elegant font (white or warm gold). "
+            "Tagline is positioned below the logo or near the product in a complementary font. "
+            "Feature badges (e.g., 'Premium', 'Exclusive', 'Limited') are placed near the bottom in white or warm gold frames.\n\n"
+            "LAYOUT & COMPOSITION: 9:16 vertical format. Sunset sky fills the upper two-thirds. Product in lower-middle area. Logo at top. Badges at bottom. "
+            "The composition is warm, dreamy, and aspirational.\n\n"
+            "LIGHTING: Golden hour lighting. Warm orange, pink, purple sunset glow. Silhouette or warm rim lighting on product.\n\n"
+            "COLOR PALETTE: Warm oranges, pinks, purples, golds, silhouette blacks. Product colours (if lit) pop against sunset backdrop.\n\n"
+            "MOOD: Warm, dreamy, aspirational, golden hour, premium, lifestyle.\n\n"
+            "QUALITY: 4K, ultra-realistic, golden hour photography, cinematic commercial."
+        ),
+    },
+    "art_street_market": {
+        "name": "Street Market",
+        "description": "Product in a vibrant street market scene. Authentic, colourful, community-focused.",
+        "style_type": "art_piece",
+        "industry_tags": ["food_beverage", "fashion_ecommerce", "home_garden", "general_other"],
+        "prompt_fragment": (
+            "Create a street-market art-piece product poster in 9:16 mobile wallpaper format (1080x1920). Advanced design level. Ultra-realistic.\n\n"
+            "ENVIRONMENT: The product is displayed in a vibrant street market scene — colourful market stalls, fresh produce, handmade goods, bustling energy. "
+            "Background shows market life — crates, baskets, textiles, natural textures. The aesthetic is authentic, colourful, and community-focused.\n\n"
+            "PRODUCT PLACEMENT: The product sits prominently on a market table or stand, surrounded by market elements but clearly the hero of the scene. Takes up 20-30% of the frame.\n\n"
+            "BRANDING INTEGRATION: Brand logo is placed at the top centre in a bold, friendly font (black or market colour). "
+            "Tagline is positioned below the logo or near the product in a complementary handcrafted font. "
+            "Feature badges (e.g., 'Fresh', 'Local', 'Handmade') are placed near the bottom in colourful frames.\n\n"
+            "LAYOUT & COMPOSITION: 9:16 vertical format. Market scene fills the background. Product in lower-middle area on market stand. Logo at top. Badges at bottom. "
+            "The composition is vibrant, authentic, and community-focused.\n\n"
+            "LIGHTING: Natural daylight. Bright, colourful, authentic. Slight shadows from market canopy.\n\n"
+            "COLOR PALETTE: Vibrant market colours — reds, yellows, greens, oranges, natural wood tones. Product colours pop against colourful market backdrop.\n\n"
+            "MOOD: Authentic, vibrant, community, fresh, local, colourful, energetic.\n\n"
+            "QUALITY: 4K, ultra-realistic, street photography, authentic commercial aesthetic."
+        ),
+    },
 }
 
 
@@ -1382,6 +1710,10 @@ INDUSTRY_STYLE_MAP: Dict[str, List[str]] = {
         "prod_lifestyle_in_use", "prod_colour_swatch", "prod_scale_context",
         "prod_process_bts", "prod_seasonal_collection", "prod_comparison_duo",
         "prod_360_angles", "prod_bundle_stack", "prod_customer_photo_frame", "prod_price_tag",
+        # Art-Piece Poster styles (9:16 Mobile Wallpaper)
+        "art_luxury_showroom", "art_neon_underground", "art_golden_throne",
+        "art_fire_smoke", "art_workshop_craft", "art_velvet_stage", "art_sunset_canvas",
+        "art_street_market",
     ],
     "food_beverage": [
         "overhead_feast", "dark_moody_food", "bright_fresh", "street_food_energy",
@@ -1389,6 +1721,9 @@ INDUSTRY_STYLE_MAP: Dict[str, List[str]] = {
         # Product-based styles (Expanded 2026)
         "prod_flat_lay_curated", "prod_ingredient_exploded", "prod_process_bts",
         "prod_seasonal_collection", "prod_bundle_stack", "prod_price_tag",
+        # Art-Piece Poster styles (9:16 Mobile Wallpaper)
+        "art_ingredient_explosion", "art_frozen_impact", "art_fire_smoke",
+        "art_workshop_craft", "art_street_market", "art_ocean_surface",
     ],
     "fintech_saas_tech": [
         "corporate_gradient", "data_visual", "trust_builder", "minimal_tech",
@@ -1400,6 +1735,8 @@ INDUSTRY_STYLE_MAP: Dict[str, List[str]] = {
         "saas_infographic_flow", "saas_dark_announcement", "saas_social_proof_wall",
         # Service-based styles
         "svc_stat_grid", "svc_newsletter_teaser", "svc_client_logo_showcase", "svc_hiring_card",
+        # Art-Piece Poster styles (9:16 Mobile Wallpaper)
+        "art_neon_underground", "art_tech_orbit",
     ],
     "beauty_wellness": [
         "glow_up", "soft_pastel", "bold_glam", "clean_clinical",
@@ -1411,12 +1748,17 @@ INDUSTRY_STYLE_MAP: Dict[str, List[str]] = {
         "prod_bundle_stack", "prod_customer_photo_frame",
         # Service-based styles
         "svc_before_after_text",
+        # Art-Piece Poster styles (9:16 Mobile Wallpaper)
+        "art_nature_immersion", "art_ingredient_explosion", "art_botanical_garden",
+        "art_crystal_cave", "art_ocean_surface",
     ],
     "real_estate": [
         "property_showcase", "luxury_listing", "neighbourhood_life",
         "blueprint_modern", "aerial_clean", "trust_builder", "bold_statement",
         # Service-based styles (Expanded 2026)
         "svc_headshot_branded", "svc_authority_quote", "svc_stat_grid",
+        # Art-Piece Poster styles (9:16 Mobile Wallpaper)
+        "art_luxury_showroom",
     ],
     "fitness_gym": [
         "energy_motion", "dark_grit", "bold_loud", "transformation",
@@ -1426,6 +1768,8 @@ INDUSTRY_STYLE_MAP: Dict[str, List[str]] = {
         # Service-based styles (Expanded 2026)
         "svc_tip_carousel", "svc_case_study_result", "svc_before_after_text",
         "svc_question_hook", "svc_checklist_graphic",
+        # Art-Piece Poster styles (9:16 Mobile Wallpaper)
+        "art_frozen_impact", "art_fire_smoke",
     ],
     "education_consulting": [
         "trust_builder", "clean_startup", "bold_statement", "data_visual",
@@ -1444,6 +1788,8 @@ INDUSTRY_STYLE_MAP: Dict[str, List[str]] = {
         "vibrant_tropical", "street_food_energy", "festival_energy",
         # SaaS/Service styles (Expanded 2026)
         "saas_dark_announcement", "svc_event_speaker",
+        # Art-Piece Poster styles (9:16 Mobile Wallpaper)
+        "art_neon_underground", "art_velvet_stage", "art_sunset_canvas",
     ],
     "general_other": [
         "bold_loud", "clean_startup", "lifestyle_natural", "minimal_studio",
@@ -1465,12 +1811,51 @@ INDUSTRY_STYLE_MAP: Dict[str, List[str]] = {
         "svc_framework_diagram", "svc_headshot_branded", "svc_stat_grid",
         "svc_event_speaker", "svc_newsletter_teaser", "svc_checklist_graphic",
         "svc_before_after_text", "svc_question_hook", "svc_client_logo_showcase", "svc_hiring_card",
+        # Art-Piece Poster styles (9:16 Mobile Wallpaper)
+        "art_luxury_showroom", "art_neon_underground", "art_golden_throne",
+        "art_fire_smoke", "art_crystal_cave", "art_workshop_craft",
+        "art_velvet_stage", "art_tech_orbit", "art_sunset_canvas", "art_street_market",
     ],
     "perfume_fragrance": [
         "perf_editorial_ingredient", "perf_noir_luxe", "perf_golden_hour_romance",
         "perf_wet_glass_drama", "perf_smoke_amber", "perf_botanical_garden",
         "perf_street_luxe", "perf_crystal_minimal", "perf_velvet_night",
         "perf_citrus_burst", "perf_heritage_editorial", "perf_floating_surreal",
+        # Art-Piece Poster styles (9:16 Mobile Wallpaper)
+        "art_nature_immersion", "art_golden_throne", "art_botanical_garden",
+        "art_crystal_cave", "art_velvet_stage",
+    ],
+    "home_garden": [
+        "lifestyle_natural", "rustic_warmth", "bright_fresh", "clean_luxe",
+        # Art-Piece Poster styles (9:16 Mobile Wallpaper)
+        "art_luxury_showroom", "art_nature_immersion", "art_botanical_garden",
+        "art_workshop_craft", "art_street_market",
+    ],
+    "health_fitness": [
+        "clean_athletic", "bright_fresh", "natural_organic", "lifestyle_natural",
+        # Art-Piece Poster styles (9:16 Mobile Wallpaper)
+        "art_nature_immersion", "art_ingredient_explosion", "art_frozen_impact",
+        "art_botanical_garden", "art_ocean_surface",
+    ],
+    "jewellery_watches": [
+        "clean_luxe", "minimal_studio", "high_contrast_drama",
+        # Art-Piece Poster styles (9:16 Mobile Wallpaper)
+        "art_golden_throne", "art_crystal_cave",
+    ],
+    "travel_hospitality": [
+        "lifestyle_natural", "bright_fresh", "vibrant_tropical",
+        # Art-Piece Poster styles (9:16 Mobile Wallpaper)
+        "art_sunset_canvas",
+    ],
+    "electronics_gadgets": [
+        "minimal_tech", "dark_mode_pro", "clean_startup",
+        # Art-Piece Poster styles (9:16 Mobile Wallpaper)
+        "art_tech_orbit",
+    ],
+    "sports_fitness": [
+        "energy_motion", "dark_grit", "bold_loud", "clean_athletic",
+        # Art-Piece Poster styles (9:16 Mobile Wallpaper)
+        "art_frozen_impact", "art_fire_smoke",
     ],
 }
 
