@@ -119,36 +119,42 @@ class ApprovalWorkflowService:
                         update_data["approval_notes"] = approval_notes
                     
                     if schedule_option == "schedule":
+                        # Validate before accepting — fail fast with a visible error.
+                        if draft.get("platform") == "instagram" and draft.get("post_type", "feed") != "text":
+                            raw_img = ApprovalWorkflowService._resolve_image_url(draft.get("image_url") or "")
+                            if not raw_img:
+                                errors.append({"draft_id": draft_id, "error": "Instagram requires an image. Add one to this post before scheduling."})
+                                continue
                         update_data["scheduled_date"] = scheduled_datetime or (datetime.utcnow() + timedelta(hours=1))
                         update_data["status"] = "scheduled"
-                        update_data["user_id"] = user_id  # Ensure user_id is on the draft for the scheduler
+                        update_data["user_id"] = user_id
                     elif schedule_option == "immediate":
-                        # Mark for immediate publishing
                         update_data["status"] = "ready_to_publish"
-                    
+
                     await db["content_drafts"].update_one(
                         {"id": draft_id},
                         {"$set": update_data}
                     )
-                    
+
                     approved_drafts.append({
                         "draft_id": draft_id,
                         "platform": draft["platform"],
                         "status": update_data["status"],
                         "scheduled_date": scheduled_datetime.isoformat() if scheduled_datetime else None
                     })
-                    
+
                 except Exception as e:
                     errors.append({"draft_id": draft_id, "error": str(e)})
-            
-            # Publish immediately or send to Outstand with scheduledAt
-            if schedule_option in ("immediate", "schedule") and approved_drafts:
+
+            # ── Immediate publish only ────────────────────────────────────────
+            # Scheduled posts are owned entirely by the cron job (publish_scheduled_content).
+            # We do NOT call _trigger_immediate_publishing for them — that was the source of
+            # the double-publish race and the confusing "deferred to cron" no-op calls.
+            if schedule_option == "immediate" and approved_drafts:
                 publish_results = await ApprovalWorkflowService._trigger_immediate_publishing(
                     db, user_id, [d["draft_id"] for d in approved_drafts],
-                    scheduled_datetime=scheduled_datetime if schedule_option == "schedule" else None,
+                    scheduled_datetime=None,
                 )
-
-                # Update drafts with publishing results
                 for draft in approved_drafts:
                     draft_result = publish_results.get(draft["draft_id"])
                     if draft_result:
@@ -1090,21 +1096,6 @@ class ApprovalWorkflowService:
 
         # ── Instagram direct (via Facebook Page Access Token) ────────────────
         if platform == "instagram" and connection.get("connected_via") in ("instagram_direct", "instagram_direct_oauth"):
-            # Instagram Graph API does not support native scheduling for standard feed posts.
-            # When scheduled_datetime is set the draft is already stored with status="scheduled"
-            # and the cron job (publish_scheduled_content) will call this again at the right
-            # time with scheduled_datetime=None to do the actual publish.
-            if scheduled_datetime:
-                # Validate before deferring — fail fast so the user sees the error
-                # at scheduling time rather than silently at cron time.
-                post_type = draft.get("post_type", "feed")
-                if post_type != "text":
-                    raw_img = ApprovalWorkflowService._resolve_image_url(draft.get("image_url") or "")
-                    if not raw_img:
-                        return {"success": False, "error": "Instagram requires an image. Add one to this post before scheduling."}
-                print(f"⏰ Instagram direct — deferred to cron scheduler for {scheduled_datetime.isoformat()}")
-                return {"success": True, "scheduled": True, "post_id": None}
-
             from app.agents.social_media_manager.services.instagram_direct_service import InstagramDirectService
             ig_user_id = connection.get("ig_user_id")
             page_token = connection.get("page_access_token")
@@ -1183,10 +1174,6 @@ class ApprovalWorkflowService:
             urn = connection.get("person_urn") or connection.get("active_author_urn")
             if not token or not urn:
                 return {"success": False, "error": "LinkedIn connection is missing OAuth token or author URN. Please reconnect your account."}
-            # LinkedIn API does not support native scheduling — defer to cron
-            if scheduled_datetime:
-                print(f"⏰ LinkedIn direct — deferred to cron scheduler for {scheduled_datetime.isoformat()}")
-                return {"success": True, "scheduled": True, "post_id": None}
             image_url = ApprovalWorkflowService._resolve_image_url(draft.get("image_url") or "")
             if image_url and image_url.startswith("data:"):
                 image_url = await ApprovalWorkflowService._upload_base64_to_imgbb(image_url) or ""
@@ -1206,15 +1193,8 @@ class ApprovalWorkflowService:
                 return {"success": False, "error": f"LinkedIn direct publish failed: {str(e)}"}
 
         # ── Facebook direct OAuth — defer scheduled posts to cron ────────────
-        # Facebook's native scheduled_publish_time API has restrictive requirements
-        # (page must have ≥2000 likes, time must be >10 min in the future, etc.).
-        # Instead we mirror the Instagram/LinkedIn pattern: store as scheduled and
-        # let the cron job call _publish_to_platform again with scheduled_datetime=None.
         if platform == "facebook" and connection.get("connected_via") == "facebook_direct_oauth":
-            if scheduled_datetime:
-                print(f"⏰ Facebook direct OAuth — deferred to cron scheduler for {scheduled_datetime.isoformat()}")
-                return {"success": True, "scheduled": True, "post_id": None}
-            # immediate publish — fall through to the legacy Facebook block below
+            pass  # fall through to the legacy Facebook block below
 
         # ── Outstand-connected accounts ───────────────────────────────────────
         if connection.get("connected_via") == "outstand":
