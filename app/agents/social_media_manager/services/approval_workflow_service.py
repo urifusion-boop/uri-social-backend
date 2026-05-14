@@ -1065,6 +1065,13 @@ class ApprovalWorkflowService:
             # and the cron job (publish_scheduled_content) will call this again at the right
             # time with scheduled_datetime=None to do the actual publish.
             if scheduled_datetime:
+                # Validate before deferring — fail fast so the user sees the error
+                # at scheduling time rather than silently at cron time.
+                post_type = draft.get("post_type", "feed")
+                if post_type != "text":
+                    raw_img = ApprovalWorkflowService._resolve_image_url(draft.get("image_url") or "")
+                    if not raw_img:
+                        return {"success": False, "error": "Instagram requires an image. Add one to this post before scheduling."}
                 print(f"⏰ Instagram direct — deferred to cron scheduler for {scheduled_datetime.isoformat()}")
                 return {"success": True, "scheduled": True, "post_id": None}
 
