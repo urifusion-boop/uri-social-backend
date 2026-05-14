@@ -520,6 +520,36 @@ class ApprovalWorkflowService:
             if not scheduled_content:
                 return {"message": "No scheduled content to publish", "published": 0}
 
+            # Deduplicate: keep only the newest scheduled draft per (user_id, platform).
+            # When a user batch-schedules many drafts (including old publish_failed ones),
+            # this prevents flooding a platform with accumulated identical posts.
+            # Outstand-managed drafts (have platform_post_id) are excluded — those are polled, not re-published.
+            _seen_platform_user: dict = {}
+            _to_cancel: list = []
+            _direct_drafts = [
+                d for d in scheduled_content
+                if not d.get("platform_post_id") and d.get("status") == "scheduled"
+            ]
+            _direct_drafts.sort(key=lambda d: d.get("created_at") or datetime.min, reverse=True)
+            for _dup in _direct_drafts:
+                _key = (_dup.get("user_id"), _dup.get("platform"))
+                if _key in _seen_platform_user:
+                    _to_cancel.append(_dup["id"])
+                else:
+                    _seen_platform_user[_key] = _dup["id"]
+            if _to_cancel:
+                await db["content_drafts"].update_many(
+                    {"id": {"$in": _to_cancel}},
+                    {"$set": {
+                        "status": "replaced",
+                        "error_message": "Superseded by a newer draft for the same platform.",
+                        "updated_at": current_time,
+                    }},
+                )
+                print(f"🗑️ Cancelled {len(_to_cancel)} duplicate drafts (kept newest per platform): {_to_cancel}")
+                _cancel_set = set(_to_cancel)
+                scheduled_content = [d for d in scheduled_content if d.get("id") not in _cancel_set]
+
             published_count = 0
             errors = []
 
@@ -1079,6 +1109,7 @@ class ApprovalWorkflowService:
             ig_user_id = connection.get("ig_user_id")
             page_token = connection.get("page_access_token")
             page_id = connection.get("page_id")
+            print(f"🔗 Instagram connection details | ig_user_id={ig_user_id} page_id={page_id} connected_via={connection.get('connected_via')} token_present={'yes' if page_token else 'NO'}")
             if not ig_user_id or not page_token:
                 return {"success": False, "error": "Instagram direct connection is missing credentials. Please reconnect Facebook."}
 
@@ -1107,6 +1138,35 @@ class ApprovalWorkflowService:
                 image_url = ApprovalWorkflowService._resolve_image_url(draft.get("image_url") or "")
                 if image_url and image_url.startswith("data:"):
                     image_url = await ApprovalWorkflowService._upload_base64_to_imgbb(image_url) or ""
+
+                print(f"📱 Instagram feed publish | ig_user_id={ig_user_id} page_id={page_id} token_len={len(page_token) if page_token else 0} raw_image_url={image_url[:120] if image_url else None}")
+
+                # Force-rehost the image through Facebook CDN (page_id available) or
+                # Cloudinary (fallback) to guarantee Instagram can fetch it.
+                # Cloudinary URLs can trigger content-negotiation that serves WebP to
+                # bots — rehosting ensures a clean JPEG that Meta's crawler accepts.
+                if image_url and image_url.startswith("https://"):
+                    print(f"🔄 Pre-uploading Instagram image for reliability...")
+                    try:
+                        import httpx as _httpx_ig
+                        async with _httpx_ig.AsyncClient(timeout=30, follow_redirects=True) as _ig_cl:
+                            _img_r = await _ig_cl.get(image_url)
+                            _img_r.raise_for_status()
+                            _img_bytes = _img_r.content
+                        print(f"   ↓ Downloaded {len(_img_bytes)} bytes (content-type: {_img_r.headers.get('content-type', 'unknown')})")
+                        if page_id:
+                            _rehosted = await InstagramDirectService._upload_to_facebook_cdn(page_id, page_token, _img_bytes)
+                        else:
+                            from app.utils.cloudinary_upload import upload_bytes as _cld_ig
+                            _rehosted = await _cld_ig(_img_bytes, folder="uri-social/instagram")
+                        if _rehosted:
+                            print(f"   ✅ Pre-upload success → {_rehosted}")
+                            image_url = _rehosted
+                        else:
+                            print(f"   ⚠️ Pre-upload returned None — using original URL")
+                    except Exception as _preup_err:
+                        print(f"   ⚠️ Pre-upload failed ({_preup_err}) — using original URL")
+
                 return await InstagramDirectService.publish_post(
                     ig_user_id=ig_user_id,
                     page_access_token=page_token,
