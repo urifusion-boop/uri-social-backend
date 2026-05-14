@@ -125,9 +125,25 @@ class ApprovalWorkflowService:
                             if not raw_img:
                                 errors.append({"draft_id": draft_id, "error": "Instagram requires an image. Add one to this post before scheduling."})
                                 continue
+
+                        # Cancel any OTHER scheduled drafts for this user+platform so the
+                        # cron never publishes stale/accumulated test posts alongside this one.
+                        cancel_result = await db["content_drafts"].update_many(
+                            {
+                                "user_id": user_id,
+                                "platform": draft["platform"],
+                                "status": "scheduled",
+                                "id": {"$ne": draft_id},
+                            },
+                            {"$set": {"status": "replaced", "error_message": "Superseded by a newer scheduled post.", "updated_at": datetime.utcnow()}},
+                        )
+                        if cancel_result.modified_count:
+                            print(f"🗑️ Cancelled {cancel_result.modified_count} old {draft['platform']} drafts for user {user_id}")
+
                         update_data["scheduled_date"] = scheduled_datetime or (datetime.utcnow() + timedelta(hours=1))
                         update_data["status"] = "scheduled"
                         update_data["user_id"] = user_id
+                        update_data["platform_post_id"] = None  # reset so cron picks it up fresh
                     elif schedule_option == "immediate":
                         update_data["status"] = "ready_to_publish"
 
