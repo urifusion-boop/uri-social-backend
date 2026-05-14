@@ -3976,3 +3976,140 @@ async def analyze_custom_font(
     except Exception as e:
         print(f"⚠️ Error analyzing custom font: {e}")
         return UriResponse.error_response(f"Failed to analyze font: {str(e)}")
+
+
+# ============================================================================
+# BLOG CONTENT GENERATOR
+# ============================================================================
+
+class BlogGenerationRequest(BaseModel):
+    """Request model for blog content generation"""
+    topic: str = Field(..., description="Blog post topic/title", min_length=10, max_length=200)
+    keywords: List[str] = Field(..., description="SEO keywords (2-5 keywords)", min_items=1, max_items=10)
+    tone: str = Field(..., description="Content tone: professional, inspirational, educational, conversational")
+    word_count: int = Field(..., description="Target word count: 1000, 2000, or 3000", ge=500, le=5000)
+
+
+@router.post("/generate-blog")
+async def generate_blog_content(
+    request: BlogGenerationRequest,
+    token: dict = Depends(JWTBearer()),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency)
+):
+    """
+    Generate long-form blog content with AI
+
+    Features:
+    - GPT-4 Turbo powered blog writing
+    - SEO-optimized title and meta description
+    - Structured HTML content with proper headings
+    - DALL-E 3 generated featured image
+    - Social media promotional snippets
+    - Brand voice consistency
+
+    Blog Generator Demo - Phase 1
+    """
+    try:
+        user_id = _get_user_id(token)
+        if not user_id:
+            return UriResponse.error_response("User ID not found in token")
+
+        print(f"\n{'='*60}")
+        print(f"📝 BLOG GENERATION REQUEST")
+        print(f"{'='*60}")
+        print(f"Topic: {request.topic}")
+        print(f"Keywords: {', '.join(request.keywords)}")
+        print(f"Tone: {request.tone}")
+        print(f"Word Count: {request.word_count}")
+        print(f"{'='*60}\n")
+
+        # Validate tone
+        valid_tones = ["professional", "inspirational", "educational", "conversational"]
+        if request.tone not in valid_tones:
+            return UriResponse.error_response(
+                f"Invalid tone. Must be one of: {', '.join(valid_tones)}"
+            )
+
+        # Validate word count
+        valid_word_counts = [1000, 2000, 3000]
+        if request.word_count not in valid_word_counts:
+            # Allow approximate values (within 500 words)
+            closest = min(valid_word_counts, key=lambda x: abs(x - request.word_count))
+            if abs(closest - request.word_count) > 500:
+                return UriResponse.error_response(
+                    f"Word count must be approximately 1000, 2000, or 3000 words"
+                )
+            request.word_count = closest
+
+        # Get user's brand profile for voice consistency
+        brand_profile = await BrandProfileService.get_by_user(user_id, db)
+        brand_data = None
+
+        if brand_profile:
+            brand_data = {
+                "brand_name": brand_profile.get("brand_name", "Your Brand"),
+                "derived_voice": brand_profile.get("derived_voice", ""),
+                "brand_colors": brand_profile.get("brand_colors", []),
+                "industry": brand_profile.get("industry", ""),
+            }
+            print(f"✅ Using brand profile: {brand_data['brand_name']}")
+        else:
+            print(f"⚠️ No brand profile found, using defaults")
+
+        # Generate blog content
+        blog_result = await ImageContentService.generate_long_form_content(
+            topic=request.topic,
+            keywords=request.keywords,
+            tone=request.tone,
+            word_count=request.word_count,
+            brand_profile=brand_data,
+            user_id=user_id
+        )
+
+        # Save blog to drafts collection with type="blog"
+        draft_data = {
+            "user_id": user_id,
+            "type": "blog",
+            "status": "draft",
+            "title": blog_result["title"],
+            "meta_description": blog_result["meta_description"],
+            "content": blog_result["content"],
+            "reading_time": blog_result["reading_time"],
+            "word_count": blog_result["word_count"],
+            "featured_image_url": blog_result["featured_image_url"],
+            "social_snippets": blog_result["social_snippets"],
+            "keywords": blog_result["keywords"],
+            "tone": blog_result["tone"],
+            "generated_at": datetime.utcnow(),
+            "created_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow()
+        }
+
+        # Insert into drafts collection
+        drafts_collection = db["drafts"]
+        insert_result = await drafts_collection.insert_one(draft_data)
+        draft_id = str(insert_result.inserted_id)
+
+        print(f"✅ Blog saved to drafts: {draft_id}")
+
+        # Return response
+        response_data = {
+            "draft_id": draft_id,
+            "title": blog_result["title"],
+            "meta_description": blog_result["meta_description"],
+            "content": blog_result["content"],
+            "reading_time": blog_result["reading_time"],
+            "word_count": blog_result["word_count"],
+            "featured_image_url": blog_result["featured_image_url"],
+            "social_snippets": blog_result["social_snippets"],
+            "keywords": blog_result["keywords"],
+            "tone": blog_result["tone"],
+            "generated_at": blog_result["generated_at"]
+        }
+
+        return UriResponse.get_single_data_response("blog_generated", response_data)
+
+    except Exception as e:
+        print(f"❌ Blog generation error: {str(e)}")
+        traceback.print_exc()
+        return UriResponse.error_response(f"Failed to generate blog content: {str(e)}")
