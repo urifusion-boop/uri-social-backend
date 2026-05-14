@@ -669,7 +669,16 @@ Every element in the image must come from the instructions below. Nothing else."
             # These rules make AI graphics look professionally designed (not AI-generated)
             primary_color = brand_colors[0] if brand_colors else "#000000"
             secondary_color = brand_colors[1] if len(brand_colors) > 1 else "#FFFFFF"
-            cta_text = bc.get("default_link", "Link in bio")
+
+            # Use CTA from brand playbook's cta_styles
+            # If user has multiple CTAs, vary them randomly for diversity
+            cta_styles_list = bc.get("cta_styles", [])
+            if isinstance(cta_styles_list, list) and cta_styles_list:
+                import random
+                cta_text = random.choice(cta_styles_list)
+            else:
+                # Fallback to default_link if cta_styles is empty
+                cta_text = bc.get("default_link", "Link in bio")
 
             # Brand name display logic (PRD Section 4)
             # Art-piece posters ALWAYS include brand logo + tagline + badges
