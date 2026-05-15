@@ -3582,12 +3582,11 @@ async def _generate_blog_image_bg(
                 print(f"❌ Cloudinary upload failed for blog image: {str(e)}")
                 print(f"   Storing base64 data URL instead")
 
-        # Update draft with featured image
-        drafts_collection = db["drafts"]
-        from bson import ObjectId
+        # Update blog draft with featured image
+        blog_drafts_collection = db["blog_drafts"]
 
-        await drafts_collection.update_one(
-            {"_id": ObjectId(draft_id)},
+        await blog_drafts_collection.update_one(
+            {"id": draft_id},
             {
                 "$set": {
                     "featured_image_url": stored_url,
@@ -3596,7 +3595,7 @@ async def _generate_blog_image_bg(
             }
         )
 
-        print(f"✅ Blog featured image saved to draft {draft_id}")
+        print(f"✅ Blog featured image saved to blog_drafts {draft_id}")
 
     except Exception as e:
         print(f"❌ Background blog image generation error for draft {draft_id}: {str(e)}")
@@ -4169,10 +4168,13 @@ async def generate_blog_content(
             user_id=user_id
         )
 
-        # Save blog to drafts collection with type="blog"
+        # Save blog to blog_drafts collection (separate from social posts)
+        import uuid
+        draft_id = str(uuid.uuid4())
+
         draft_data = {
+            "id": draft_id,
             "user_id": user_id,
-            "type": "blog",
             "status": "draft",
             "title": blog_result["title"],
             "meta_description": blog_result["meta_description"],
@@ -4189,12 +4191,11 @@ async def generate_blog_content(
             "updated_at": datetime.utcnow()
         }
 
-        # Insert into drafts collection
-        drafts_collection = db["drafts"]
-        insert_result = await drafts_collection.insert_one(draft_data)
-        draft_id = str(insert_result.inserted_id)
+        # Insert into blog_drafts collection
+        blog_drafts_collection = db["blog_drafts"]
+        await blog_drafts_collection.insert_one(draft_data)
 
-        print(f"✅ Blog saved to drafts: {draft_id}")
+        print(f"✅ Blog saved to blog_drafts: {draft_id}")
 
         # Generate featured image in background
         image_ctx = blog_result.get("image_context", {})
@@ -4218,7 +4219,8 @@ async def generate_blog_content(
             "content": blog_result["content"],
             "reading_time": blog_result["reading_time"],
             "word_count": blog_result["word_count"],
-            "featured_image_url": blog_result["featured_image_url"],
+            "featured_image_url": None,  # Will be generated in background
+            "has_image": True,  # Frontend can poll to check when ready
             "social_snippets": blog_result["social_snippets"],
             "keywords": blog_result["keywords"],
             "tone": blog_result["tone"],
