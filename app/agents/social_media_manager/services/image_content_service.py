@@ -2625,47 +2625,21 @@ Write the complete blog post now."""
             word_count_actual = len(full_html.split())
             reading_time = max(1, round(word_count_actual / 200))
 
-            # Generate featured image using existing image generation system
-            print(f"🎨 Generating featured image for: {topic}")
+            # Image will be generated in background task (similar to social posts)
+            # Return placeholder for now
+            featured_image_url = None  # Will be generated in background
 
-            # Build image prompt (blog header style - NO text overlays)
-            color_str = ", ".join(brand_colors[:3]) if brand_colors else "modern professional colors"
+            print(f"✅ Blog content generated: {word_count_actual} words, {reading_time} min read")
+            print(f"🎨 Featured image will be generated in background")
 
-            image_prompt = f"""Professional blog featured image representing: "{blog_data['title']}"
-
-VISUAL CONCEPT:
-Create a high-quality, magazine-style hero image that visually represents the topic: {topic}
-
-STYLE REQUIREMENTS:
-• Photorealistic or high-end illustrative style
-• Landscape composition suitable for blog header
-• Professional, polished, editorial quality
-• Modern and contemporary aesthetic
-• Clear focal point that draws the eye
-• Mood: {tone}, inspiring, engaging
-
-COLOR PALETTE:
-Use these brand colors as inspiration: {color_str}
-Industry context: {industry if industry else "business"}
-
-CRITICAL RULES:
-• ABSOLUTELY NO TEXT, letters, words, or typography anywhere in the image
-• NO logos, brand names, or written elements
-• Pure visual imagery only
-• Suitable for professional publication
-• Landscape orientation optimized for web blog headers"""
-
-            # Use existing _call_dalle_api (consistent with rest of app)
-            image_result = await ImageContentService._call_dalle_api(
-                prompt=image_prompt,
-                size="1536x1024",  # Landscape for blog header
-                image_model="openai/gpt-image-2"
-            )
-
-            if not image_result.get("success"):
-                raise Exception(f"Failed to generate featured image")
-
-            featured_image_url = image_result["url"]
+            # Store image generation context for background task
+            image_generation_context = {
+                "title": blog_data['title'],
+                "topic": topic,
+                "tone": tone,
+                "industry": industry,
+                "brand_colors": brand_colors
+            }
 
             # Generate social media snippets (short versions for promotion)
             print(f"📱 Generating social media snippets")
@@ -2727,7 +2701,8 @@ Return ONLY a JSON object:
                 "social_snippets": social_snippets,
                 "keywords": keywords,
                 "tone": tone,
-                "generated_at": datetime.utcnow().isoformat()
+                "generated_at": datetime.utcnow().isoformat(),
+                "image_context": image_generation_context  # For background task
             }
 
         except json.JSONDecodeError as e:
@@ -2737,6 +2712,66 @@ Return ONLY a JSON object:
         except Exception as e:
             print(f"❌ Blog generation error: {str(e)}")
             raise Exception(f"Failed to generate blog content: {str(e)}")
+
+    @staticmethod
+    async def generate_blog_featured_image(
+        title: str,
+        topic: str,
+        tone: str,
+        industry: str,
+        brand_colors: List[str]
+    ) -> Dict[str, Any]:
+        """
+        Generate a featured image for blog post (called as background task)
+
+        Returns dict with 'success' and 'url' keys
+        """
+        try:
+            print(f"🎨 Generating blog featured image: {title[:50]}...")
+
+            color_str = ", ".join(brand_colors[:3]) if brand_colors else "modern professional colors"
+
+            image_prompt = f"""Professional blog featured image representing: "{title}"
+
+VISUAL CONCEPT:
+Create a high-quality, magazine-style hero image that visually represents the topic: {topic}
+
+STYLE REQUIREMENTS:
+• Photorealistic or high-end illustrative style
+• Landscape composition suitable for blog header
+• Professional, polished, editorial quality
+• Modern and contemporary aesthetic
+• Clear focal point that draws the eye
+• Mood: {tone}, inspiring, engaging
+
+COLOR PALETTE:
+Use these brand colors as inspiration: {color_str}
+Industry context: {industry if industry else "business"}
+
+CRITICAL RULES:
+• ABSOLUTELY NO TEXT, letters, words, or typography anywhere in the image
+• NO logos, brand names, or written elements
+• Pure visual imagery only
+• Suitable for professional publication
+• Landscape orientation optimized for web blog headers"""
+
+            # Use existing _call_dalle_api (consistent with rest of app)
+            image_result = await ImageContentService._call_dalle_api(
+                prompt=image_prompt,
+                size="1536x1024",  # Landscape for blog header
+                image_model="openai/gpt-image-2"
+            )
+
+            if not image_result.get("success"):
+                print(f"❌ Blog image generation failed")
+                return {"success": False, "url": None}
+
+            print(f"✅ Blog featured image generated successfully")
+            return image_result
+
+        except Exception as e:
+            print(f"❌ Blog image generation error: {str(e)}")
+            return {"success": False, "url": None}
 
 
 # Usage Examples:
