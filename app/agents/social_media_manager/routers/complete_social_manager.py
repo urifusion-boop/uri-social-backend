@@ -4075,7 +4075,7 @@ async def generate_blog_content(
             request.word_count = closest
 
         # Get user's brand profile for voice consistency
-        brand_profile = await BrandProfileService.get_by_user(user_id, db)
+        brand_profile = await BrandProfileService.get(user_id, db)
         brand_data = None
 
         if brand_profile:
