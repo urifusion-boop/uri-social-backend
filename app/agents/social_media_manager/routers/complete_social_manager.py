@@ -2846,6 +2846,39 @@ async def debug_outstand_post(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@router.get("/debug/connections-raw")
+async def debug_connections_raw(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Show the raw social_connections documents for the current user.
+    Exposes connected_via, ig_user_id, page_id, and whether page_access_token is present.
+    Used to diagnose Instagram/Facebook routing issues.
+    """
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    conns = await db["social_connections"].find({"user_id": user_id}).to_list(length=50)
+    result = []
+    for c in conns:
+        result.append({
+            "id": c.get("id"),
+            "platform": c.get("platform"),
+            "connected_via": c.get("connected_via"),
+            "connection_status": c.get("connection_status"),
+            "ig_user_id": c.get("ig_user_id"),
+            "page_id": c.get("page_id"),
+            "has_page_access_token": bool(c.get("page_access_token")),
+            "outstand_account_id": c.get("outstand_account_id"),
+            "username": c.get("username"),
+            "created_at": c.get("created_at"),
+            "updated_at": c.get("updated_at"),
+        })
+    return UriResponse.get_single_data_response("connections_raw", result)
+
+
 @router.get("/platform-requirements/{platform}")
 async def get_platform_requirements(platform: str):
     """Get content requirements for a specific platform"""
