@@ -962,7 +962,7 @@ class WhatsAppFlowService:
                 )
                 await _safe_set_state(phone, "showing_content", ctx, db)
             else:
-                await _send(phone, f"Hey {first_name}! 👋 What do you want to create today?")
+                await _send(phone, _daily_morning_greeting(first_name))
             return
 
         # "create/give me a post about [topic]" pattern — extract topic and generate immediately

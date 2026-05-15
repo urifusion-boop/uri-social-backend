@@ -109,12 +109,18 @@ class WhatsAppSessionService:
             {"userId": 1, "first_name": 1, "whatsapp_phone": 1},
         )
         all_users = await cursor.to_list(length=None)
-        # Deduplicate — same phone number must not receive multiple pushes
+        # Deduplicate — normalize before comparing so +7079905366 and
+        # +2347079905366 (same number stored in different formats) don't both
+        # pass through and send the push twice to the same person.
         seen_phones: set = set()
         unique: list = []
         for u in all_users:
-            phone = u.get("whatsapp_phone")
-            if phone and phone not in seen_phones:
+            raw_phone = u.get("whatsapp_phone")
+            if not raw_phone:
+                continue
+            phone = WhatsAppSessionService._normalize_phone(raw_phone)
+            if phone not in seen_phones:
                 seen_phones.add(phone)
+                u["whatsapp_phone"] = phone  # ensure downstream code uses normalised form
                 unique.append(u)
         return unique
