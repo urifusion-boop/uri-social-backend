@@ -805,6 +805,12 @@ class WhatsAppFlowService:
         state: str = session.get("state", "linked")
         ctx: Dict[str, Any] = session.get("context", {})
 
+        # Track when the user last sent us a message (separate from server-side
+        # state changes) so send_daily_push can check the 24-hour window.
+        await WhatsAppSessionService.upsert_session(
+            phone, {"last_inbound_at": datetime.now(timezone.utc).replace(tzinfo=None)}, db
+        )
+
         # ── Handle incoming image attachment ──────────────────────────────
         if media_url and state != "generating_graphic":
             print(f"[WhatsApp] Incoming media from {phone}: {media_url} ({media_content_type})", flush=True)
@@ -2145,7 +2151,22 @@ class WhatsAppFlowService:
                 if not brand:
                     continue
 
-                await _send(phone, _daily_morning_greeting(first_name))
+                # WhatsApp blocks free-text outbound messages once the user
+                # hasn't replied in >23 hours (the 24-hour session window).
+                # Fall back to the approved template so the message always
+                # delivers; free-text works when the window is still open.
+                now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+                last_inbound = session.get("last_inbound_at")
+                within_window = (
+                    last_inbound is not None
+                    and (now_naive - last_inbound).total_seconds() < 23 * 3600
+                )
+                if within_window:
+                    await _send(phone, _daily_morning_greeting(first_name))
+                else:
+                    # Send the pre-approved template — works outside the 24h window
+                    await _send(phone, "", content_sid="HXccf1a2bb34e7ed257c136c842982f5b3")
+                    print(f"[DailyPush] {phone} outside 24h window — used template")
                 await _safe_set_state(phone, "idle", {}, db)
                 sent += 1
 
