@@ -2506,6 +2506,11 @@ OVERALL:
                 - featured_image_url: DALL-E generated featured image
                 - social_snippets: Platform-specific social media posts
         """
+        import json
+        import re
+
+        blog_text = ""  # Initialize to avoid reference errors
+
         try:
             # Extract brand context
             brand_voice = ""
@@ -2588,9 +2593,6 @@ Write the complete blog post now."""
             )
 
             # Parse blog content
-            import json
-            import re
-
             blog_text = blog_response.get("choices", [{}])[0].get("message", {}).get("content", "")
 
             # Extract JSON from response (handle markdown code blocks)
