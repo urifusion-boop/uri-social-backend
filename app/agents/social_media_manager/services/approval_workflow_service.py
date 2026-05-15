@@ -126,19 +126,20 @@ class ApprovalWorkflowService:
                                 errors.append({"draft_id": draft_id, "error": "Instagram requires an image. Add one to this post before scheduling."})
                                 continue
 
-                        # Cancel any OTHER scheduled/failed drafts for this user+platform so the
+                        # Cancel ALL other in-flight drafts for this user+platform so the
                         # cron never publishes stale/accumulated posts alongside this one.
+                        # Includes "publishing" so old Outstand submissions don't keep polling.
                         cancel_result = await db["content_drafts"].update_many(
                             {
                                 "user_id": user_id,
                                 "platform": draft["platform"],
-                                "status": {"$in": ["scheduled", "publish_failed"]},
+                                "status": {"$in": ["scheduled", "publish_failed", "publishing", "ready_to_publish"]},
                                 "id": {"$ne": draft_id},
                             },
                             {"$set": {"status": "replaced", "error_message": "Superseded by a newer scheduled post.", "updated_at": datetime.utcnow()}},
                         )
                         if cancel_result.modified_count:
-                            print(f"🗑️ Cancelled {cancel_result.modified_count} old {draft['platform']} drafts (scheduled+failed) for user {user_id}")
+                            print(f"🗑️ Cancelled {cancel_result.modified_count} old {draft['platform']} drafts (all states) for user {user_id}")
 
                         update_data["scheduled_date"] = scheduled_datetime or (datetime.utcnow() + timedelta(hours=1))
                         update_data["status"] = "scheduled"
@@ -542,18 +543,15 @@ class ApprovalWorkflowService:
             if not scheduled_content:
                 return {"message": "No scheduled content to publish", "published": 0}
 
-            # Deduplicate: keep only the newest scheduled draft per (user_id, platform).
-            # When a user batch-schedules many drafts (including old publish_failed ones),
-            # this prevents flooding a platform with accumulated identical posts.
-            # Outstand-managed drafts (have platform_post_id) are excluded — those are polled, not re-published.
+            # Deduplicate ALL scheduled content: keep only the newest draft per (user_id, platform).
+            # Applies to both direct-publish drafts (no platform_post_id) and
+            # Outstand-polled drafts (has platform_post_id). This prevents old Outstand
+            # submissions from publishing after a newer draft has already been scheduled.
             _seen_platform_user: dict = {}
             _to_cancel: list = []
-            _direct_drafts = [
-                d for d in scheduled_content
-                if not d.get("platform_post_id") and d.get("status") == "scheduled"
-            ]
-            _direct_drafts.sort(key=lambda d: d.get("created_at") or datetime.min, reverse=True)
-            for _dup in _direct_drafts:
+            _all_scheduled = [d for d in scheduled_content if d.get("status") == "scheduled"]
+            _all_scheduled.sort(key=lambda d: d.get("created_at") or datetime.min, reverse=True)
+            for _dup in _all_scheduled:
                 _key = (_dup.get("user_id"), _dup.get("platform"))
                 if _key in _seen_platform_user:
                     _to_cancel.append(_dup["id"])
