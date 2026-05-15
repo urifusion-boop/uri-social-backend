@@ -2576,24 +2576,30 @@ Write the complete blog post now."""
             # Call GPT-4 Turbo for blog content
             print(f"📝 Generating {word_count}-word blog post: {topic}")
 
-            blog_response = await AIService.call_openai_api(
-                model="gpt-4-turbo",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": f"You are an expert SEO content writer specializing in {industry if industry else 'digital marketing'}. You write engaging, well-structured blog posts that rank well in search engines while being valuable to readers."
-                    },
-                    {
-                        "role": "user",
-                        "content": blog_prompt
-                    }
-                ],
-                temperature=0.7,
-                max_tokens=4000
+            from app.services.AIService import client as openai_client
+
+            loop = asyncio.get_running_loop()
+            blog_response = await loop.run_in_executor(
+                None,
+                lambda: openai_client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": f"You are an expert SEO content writer specializing in {industry if industry else 'digital marketing'}. You write engaging, well-structured blog posts that rank well in search engines while being valuable to readers."
+                        },
+                        {
+                            "role": "user",
+                            "content": blog_prompt
+                        }
+                    ],
+                    temperature=0.7,
+                    max_tokens=4000
+                )
             )
 
             # Parse blog content
-            blog_text = blog_response.get("choices", [{}])[0].get("message", {}).get("content", "")
+            blog_text = blog_response.choices[0].message.content
 
             # Extract JSON from response (handle markdown code blocks)
             json_match = re.search(r'```json\s*(\{.*?\})\s*```', blog_text, re.DOTALL)
@@ -2641,14 +2647,19 @@ Requirements:
 - Visually represents the blog topic
 - Modern aesthetic"""
 
-            featured_image_response = await AIService.call_openai_image_generation(
-                prompt=image_prompt,
-                size="1792x1024",  # Landscape for blog header
-                quality="hd",
-                style="natural"
+            featured_image_response = await loop.run_in_executor(
+                None,
+                lambda: openai_client.images.generate(
+                    model="gpt-image-1.5",
+                    prompt=image_prompt,
+                    n=1,
+                    size="1792x1024",  # Landscape for blog header
+                    quality="high",
+                    output_format="webp"
+                )
             )
 
-            featured_image_url = featured_image_response.get("data", [{}])[0].get("url", "")
+            featured_image_url = featured_image_response.data[0].url
 
             # Generate social media snippets (short versions for promotion)
             print(f"📱 Generating social media snippets")
@@ -2676,17 +2687,20 @@ Return ONLY a JSON object:
     "facebook": "post text with hashtags"
 }}"""
 
-            social_response = await AIService.call_openai_api(
-                model="gpt-4-turbo",
-                messages=[
-                    {"role": "system", "content": "You are a social media expert who writes engaging promotional posts."},
-                    {"role": "user", "content": social_prompt}
-                ],
-                temperature=0.8,
-                max_tokens=500
+            social_response = await loop.run_in_executor(
+                None,
+                lambda: openai_client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[
+                        {"role": "system", "content": "You are a social media expert who writes engaging promotional posts."},
+                        {"role": "user", "content": social_prompt}
+                    ],
+                    temperature=0.8,
+                    max_tokens=500
+                )
             )
 
-            social_text = social_response.get("choices", [{}])[0].get("message", {}).get("content", "")
+            social_text = social_response.choices[0].message.content
 
             # Extract JSON from social response
             json_match = re.search(r'```json\s*(\{.*?\})\s*```', social_text, re.DOTALL)
