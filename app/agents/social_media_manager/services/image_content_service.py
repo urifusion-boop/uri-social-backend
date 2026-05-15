@@ -2650,12 +2650,11 @@ Requirements:
             featured_image_response = await loop.run_in_executor(
                 None,
                 lambda: openai_client.images.generate(
-                    model="gpt-image-1.5",
+                    model="dall-e-3",
                     prompt=image_prompt,
                     n=1,
-                    size="1792x1024",  # Landscape for blog header
-                    quality="high",
-                    output_format="webp"
+                    size="1792x1024",
+                    quality="hd"
                 )
             )
 
