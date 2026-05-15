@@ -2625,40 +2625,47 @@ Write the complete blog post now."""
             word_count_actual = len(full_html.split())
             reading_time = max(1, round(word_count_actual / 200))
 
-            # Generate featured image using DALL-E
+            # Generate featured image using existing image generation system
             print(f"🎨 Generating featured image for: {topic}")
 
-            # Build image prompt
+            # Build image prompt (blog header style - NO text overlays)
             color_str = ", ".join(brand_colors[:3]) if brand_colors else "modern professional colors"
 
-            image_prompt = f"""Professional blog featured image for article titled "{blog_data['title']}".
+            image_prompt = f"""Professional blog featured image representing: "{blog_data['title']}"
 
-Style: Modern, clean, professional magazine-style hero image
-Theme: {topic}
-Colors: {color_str}
-Mood: {tone}
-Industry: {industry if industry else "business"}
+VISUAL CONCEPT:
+Create a high-quality, magazine-style hero image that visually represents the topic: {topic}
 
-Requirements:
-- High-quality photographic style
-- Suitable for blog header (landscape format)
-- No text overlays
-- Professional and polished
-- Visually represents the blog topic
-- Modern aesthetic"""
+STYLE REQUIREMENTS:
+• Photorealistic or high-end illustrative style
+• Landscape composition suitable for blog header
+• Professional, polished, editorial quality
+• Modern and contemporary aesthetic
+• Clear focal point that draws the eye
+• Mood: {tone}, inspiring, engaging
 
-            featured_image_response = await loop.run_in_executor(
-                None,
-                lambda: openai_client.images.generate(
-                    model="dall-e-3",
-                    prompt=image_prompt,
-                    n=1,
-                    size="1792x1024",
-                    quality="hd"
-                )
+COLOR PALETTE:
+Use these brand colors as inspiration: {color_str}
+Industry context: {industry if industry else "business"}
+
+CRITICAL RULES:
+• ABSOLUTELY NO TEXT, letters, words, or typography anywhere in the image
+• NO logos, brand names, or written elements
+• Pure visual imagery only
+• Suitable for professional publication
+• Landscape orientation optimized for web blog headers"""
+
+            # Use existing _call_dalle_api (consistent with rest of app)
+            image_result = await ImageContentService._call_dalle_api(
+                prompt=image_prompt,
+                size="1536x1024",  # Landscape for blog header
+                image_model="openai/gpt-image-2"
             )
 
-            featured_image_url = featured_image_response.data[0].url
+            if not image_result.get("success"):
+                raise Exception(f"Failed to generate featured image")
+
+            featured_image_url = image_result["url"]
 
             # Generate social media snippets (short versions for promotion)
             print(f"📱 Generating social media snippets")
