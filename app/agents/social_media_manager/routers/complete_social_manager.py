@@ -3535,6 +3535,75 @@ async def _run_auto_generate_background(user_id: str, db: AsyncIOMotorDatabase):
         print(f"❌ Auto-generate failed for user={user_id}: {e}")
 
 
+async def _generate_blog_image_bg(
+    draft_id: str,
+    title: str,
+    topic: str,
+    tone: str,
+    industry: str,
+    brand_colors: List[str],
+    db: AsyncIOMotorDatabase
+):
+    """
+    Background task: generate featured image for blog post and update draft in DB
+    """
+    try:
+        print(f"\n{'='*60}")
+        print(f"🎨 BACKGROUND: Generating blog featured image")
+        print(f"Draft ID: {draft_id}")
+        print(f"{'='*60}\n")
+
+        # Generate image using ImageContentService
+        image_result = await ImageContentService.generate_blog_featured_image(
+            title=title,
+            topic=topic,
+            tone=tone,
+            industry=industry,
+            brand_colors=brand_colors
+        )
+
+        if not image_result.get("success"):
+            print(f"⚠️ BG blog image generation failed for draft {draft_id}")
+            return
+
+        raw_url = image_result["url"]
+        stored_url = raw_url
+
+        # Upload base64 image to Cloudinary
+        if raw_url and raw_url.startswith("data:"):
+            print(f"🔄 Uploading blog image to Cloudinary for draft {draft_id}...")
+            try:
+                from app.utils.cloudinary_upload import upload_base64
+                stored_url = await upload_base64(raw_url, folder="uri-social/blog-images")
+                print(f"☁️  ✅ CLOUDINARY UPLOAD SUCCESS!")
+                print(f"   📍 Draft ID: {draft_id}")
+                print(f"   🔗 URL: {stored_url}")
+            except Exception as e:
+                print(f"❌ Cloudinary upload failed for blog image: {str(e)}")
+                print(f"   Storing base64 data URL instead")
+
+        # Update draft with featured image
+        drafts_collection = db["drafts"]
+        from bson import ObjectId
+
+        await drafts_collection.update_one(
+            {"_id": ObjectId(draft_id)},
+            {
+                "$set": {
+                    "featured_image_url": stored_url,
+                    "updated_at": datetime.utcnow()
+                }
+            }
+        )
+
+        print(f"✅ Blog featured image saved to draft {draft_id}")
+
+    except Exception as e:
+        print(f"❌ Background blog image generation error for draft {draft_id}: {str(e)}")
+        import traceback
+        traceback.print_exc()
+
+
 # This can be set up as a periodic background task
 async def scheduled_content_publisher(db: AsyncIOMotorDatabase):
     """Periodic task to publish scheduled content"""
@@ -4026,6 +4095,7 @@ class BlogGenerationRequest(BaseModel):
 @router.post("/generate-blog")
 async def generate_blog_content(
     request: BlogGenerationRequest,
+    background_tasks: BackgroundTasks,
     token: dict = Depends(JWTBearer()),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
@@ -4109,7 +4179,8 @@ async def generate_blog_content(
             "content": blog_result["content"],
             "reading_time": blog_result["reading_time"],
             "word_count": blog_result["word_count"],
-            "featured_image_url": blog_result["featured_image_url"],
+            "featured_image_url": None,  # Will be generated in background
+            "has_image": True,  # Flag that image generation is in progress
             "social_snippets": blog_result["social_snippets"],
             "keywords": blog_result["keywords"],
             "tone": blog_result["tone"],
@@ -4124,6 +4195,20 @@ async def generate_blog_content(
         draft_id = str(insert_result.inserted_id)
 
         print(f"✅ Blog saved to drafts: {draft_id}")
+
+        # Generate featured image in background
+        image_ctx = blog_result.get("image_context", {})
+        background_tasks.add_task(
+            _generate_blog_image_bg,
+            draft_id=draft_id,
+            title=image_ctx.get("title", request.topic),
+            topic=image_ctx.get("topic", request.topic),
+            tone=image_ctx.get("tone", request.tone),
+            industry=image_ctx.get("industry", ""),
+            brand_colors=image_ctx.get("brand_colors", []),
+            db=db
+        )
+        print(f"🎨 Blog featured image generation queued for background")
 
         # Return response
         response_data = {
