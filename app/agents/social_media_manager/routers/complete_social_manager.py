@@ -4233,3 +4233,59 @@ async def generate_blog_content(
         print(f"❌ Blog generation error: {str(e)}")
         traceback.print_exc()
         return UriResponse.error_response(f"Failed to generate blog content: {str(e)}")
+
+
+@router.get("/blog-drafts")
+async def get_blog_drafts(
+    token: dict = Depends(JWTBearer()),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency)
+):
+    """Get all blog drafts for the authenticated user"""
+    try:
+        user_id = _get_user_id(token)
+        if not user_id:
+            return UriResponse.error_response("User ID not found in token")
+
+        # Fetch all blog drafts for this user, sorted by created_at descending
+        blog_drafts = await db["blog_drafts"].find(
+            {"user_id": user_id}
+        ).sort("created_at", -1).to_list(length=100)
+
+        # Remove MongoDB _id from results
+        for draft in blog_drafts:
+            draft.pop("_id", None)
+
+        return UriResponse.get_list_data_response("blog_drafts", blog_drafts)
+
+    except Exception as e:
+        print(f"❌ Error fetching blog drafts: {str(e)}")
+        traceback.print_exc()
+        return UriResponse.error_response(f"Failed to fetch blog drafts: {str(e)}")
+
+
+@router.get("/blog-drafts/{draft_id}")
+async def get_blog_draft(
+    draft_id: str,
+    token: dict = Depends(JWTBearer()),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency)
+):
+    """Get a single blog draft by ID (for polling image status)"""
+    try:
+        user_id = _get_user_id(token)
+        if not user_id:
+            return UriResponse.error_response("User ID not found in token")
+
+        draft = await db["blog_drafts"].find_one(
+            {"id": draft_id, "user_id": user_id},
+            {"_id": 0}
+        )
+
+        if not draft:
+            return UriResponse.error_response("Blog draft not found", response_code=404)
+
+        return UriResponse.get_single_data_response("blog_draft", draft)
+
+    except Exception as e:
+        print(f"❌ Error fetching blog draft {draft_id}: {str(e)}")
+        traceback.print_exc()
+        return UriResponse.error_response(f"Failed to fetch blog draft: {str(e)}")
