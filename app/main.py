@@ -33,6 +33,28 @@ app = FastAPI(
 )
 
 
+async def _whatsapp_push_catchup():
+    """Run the WhatsApp daily push if it was missed today (e.g. container restarted after 8am UTC)."""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    if now.hour < 8:
+        return  # too early, let the scheduler handle it at 8am
+    today = now.strftime("%Y-%m-%d")
+    try:
+        from app.database import get_db
+        from app.agents.social_media_manager.services.whatsapp_flow_service import WhatsAppFlowService
+        db = get_db()
+        existing = await db["scheduler_locks"].find_one({"_id": f"daily_whatsapp_push_{today}"})
+        if existing:
+            print(f"[Startup] WhatsApp daily push already ran today ({today}), skipping catch-up")
+            return
+        print(f"[Startup] WhatsApp daily push missed today — running catch-up now")
+        result = await WhatsAppFlowService.send_daily_push(db)
+        print(f"[Startup] Catch-up complete: {result}")
+    except Exception as e:
+        print(f"[Startup] WhatsApp push catch-up failed: {e}")
+
+
 @app.on_event("startup")
 async def startup_event():
     """
@@ -53,6 +75,12 @@ async def startup_event():
         print("✅ Notification scheduler started")
     except Exception as e:
         print(f"⚠️  Warning: Failed to start notification scheduler: {e}")
+
+    # Catch-up: if the container restarted after 8am UTC and missed today's
+    # scheduled push, run it now. The same MongoDB lock used by the scheduler
+    # prevents double-sends even across multiple workers.
+    import asyncio as _aio
+    _aio.create_task(_whatsapp_push_catchup())
 
 # CORS
 # Use explicit origins only (no allow_origin_regex) — Starlette's elif chain
