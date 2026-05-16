@@ -146,21 +146,34 @@ Categories:
         Build prompt for text-only edits
         PRD Section 4.2: Text Edit Prompt Template
         """
-        return f"""{ImageEditingService.PRESERVE_BLOCK}
+        return f"""CRITICAL INSTRUCTION: You are EDITING an existing image's text content.
 
-EDIT TYPE: Text modification only.
+PRESERVE THESE EXACTLY AS-IS:
+- All product photography and imagery
+- Background colors, gradients, and treatments
+- Overall composition and layout structure
+- All decorative elements and design details
+- Margins and spacing between elements
 
-REQUESTED CHANGE: {user_feedback}
+DO NOT PRESERVE TEXT - ALL TEXT MUST BE REPLACED:
+- Replace EVERY text element in the image (header, body, footer, labels, CTAs)
+- This includes large prominent text, small text, top text, bottom text, side text
+- Do not keep any old text visible anywhere in the image
+- The text content is being completely updated
 
-RULES FOR THIS EDIT:
-- Change ONLY the specific text mentioned in the request
-- Keep the EXACT same font family, weight, size, and colour
-  for the changed text
-- Keep the text in the EXACT same position and alignment
-- Do not move, resize, or restyle any other text elements
-- Do not change the background, product image, or any visual element
-- The result should be indistinguishable from the original except
-  for the specific text that was changed"""
+NEW TEXT CONTENT (replace all existing text with this):
+
+{user_feedback}
+
+FORMATTING RULES:
+- Maintain the EXACT same font families, weights, and styles as the original
+- Keep text in the EXACT same positions and alignments as before
+- Preserve text sizes relative to the original (large stays large, small stays small)
+- Keep the same text colors and styling from the original
+- If the new text has multiple lines/sections, position them where the old text was
+- The layout structure must remain identical - only the words change
+
+The result should look like the original design with updated text content."""
 
     @staticmethod
     def build_style_edit_prompt(user_feedback: str) -> str:
@@ -555,7 +568,8 @@ RULES FOR THIS EDIT:
             edited_image_url = await ImageEditingService._call_edit_api(
                 image_bytes=image_bytes,
                 prompt=edit_prompt,
-                size=size
+                size=size,
+                exact_dimensions=(original_width, original_height)
             )
 
             if not edited_image_url:
@@ -653,7 +667,8 @@ RULES FOR THIS EDIT:
     async def _call_edit_api(
         image_bytes: bytes,
         prompt: str,
-        size: str = "1024x1024"
+        size: str = "1024x1024",
+        exact_dimensions: Optional[tuple] = None
     ) -> Optional[str]:
         """
         Call OpenAI images.edit API with GPT-Image-2
@@ -707,6 +722,16 @@ RULES FOR THIS EDIT:
             print(f"🔄 Uploading EDITED image to Cloudinary...")
             # Convert to WebP bytes for efficient storage
             edited_image = Image.open(io.BytesIO(base64.b64decode(b64_data))).convert("RGB")
+
+            # Resize to exact target dimensions if provided
+            # (OpenAI returns rounded-to-16 dimensions, we need exact platform specs like 1080×1350)
+            if exact_dimensions:
+                exact_w, exact_h = exact_dimensions
+                edit_w, edit_h = edited_image.size
+                if (edit_w, edit_h) != (exact_w, exact_h):
+                    print(f"🔄 Resizing edited image from {edit_w}×{edit_h} to {exact_w}×{exact_h} (exact platform dimensions)")
+                    edited_image = edited_image.resize((exact_w, exact_h), Image.LANCZOS)
+
             webp_buffer = io.BytesIO()
             edited_image.save(webp_buffer, format="WEBP", quality=95, method=6)
             webp_bytes = webp_buffer.getvalue()

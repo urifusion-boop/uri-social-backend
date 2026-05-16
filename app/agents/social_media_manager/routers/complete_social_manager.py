@@ -2846,6 +2846,39 @@ async def debug_outstand_post(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@router.get("/debug/connections-raw")
+async def debug_connections_raw(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Show the raw social_connections documents for the current user.
+    Exposes connected_via, ig_user_id, page_id, and whether page_access_token is present.
+    Used to diagnose Instagram/Facebook routing issues.
+    """
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    conns = await db["social_connections"].find({"user_id": user_id}).to_list(length=50)
+    result = []
+    for c in conns:
+        result.append({
+            "id": c.get("id"),
+            "platform": c.get("platform"),
+            "connected_via": c.get("connected_via"),
+            "connection_status": c.get("connection_status"),
+            "ig_user_id": c.get("ig_user_id"),
+            "page_id": c.get("page_id"),
+            "has_page_access_token": bool(c.get("page_access_token")),
+            "outstand_account_id": c.get("outstand_account_id"),
+            "username": c.get("username"),
+            "created_at": c.get("created_at"),
+            "updated_at": c.get("updated_at"),
+        })
+    return UriResponse.get_single_data_response("connections_raw", result)
+
+
 @router.get("/platform-requirements/{platform}")
 async def get_platform_requirements(platform: str):
     """Get content requirements for a specific platform"""
@@ -3502,6 +3535,74 @@ async def _run_auto_generate_background(user_id: str, db: AsyncIOMotorDatabase):
         print(f"❌ Auto-generate failed for user={user_id}: {e}")
 
 
+async def _generate_blog_image_bg(
+    draft_id: str,
+    title: str,
+    topic: str,
+    tone: str,
+    industry: str,
+    brand_colors: List[str],
+    db: AsyncIOMotorDatabase
+):
+    """
+    Background task: generate featured image for blog post and update draft in DB
+    """
+    try:
+        print(f"\n{'='*60}")
+        print(f"🎨 BACKGROUND: Generating blog featured image")
+        print(f"Draft ID: {draft_id}")
+        print(f"{'='*60}\n")
+
+        # Generate image using ImageContentService
+        image_result = await ImageContentService.generate_blog_featured_image(
+            title=title,
+            topic=topic,
+            tone=tone,
+            industry=industry,
+            brand_colors=brand_colors
+        )
+
+        if not image_result.get("success"):
+            print(f"⚠️ BG blog image generation failed for draft {draft_id}")
+            return
+
+        raw_url = image_result["url"]
+        stored_url = raw_url
+
+        # Upload base64 image to Cloudinary
+        if raw_url and raw_url.startswith("data:"):
+            print(f"🔄 Uploading blog image to Cloudinary for draft {draft_id}...")
+            try:
+                from app.utils.cloudinary_upload import upload_base64
+                stored_url = await upload_base64(raw_url, folder="uri-social/blog-images")
+                print(f"☁️  ✅ CLOUDINARY UPLOAD SUCCESS!")
+                print(f"   📍 Draft ID: {draft_id}")
+                print(f"   🔗 URL: {stored_url}")
+            except Exception as e:
+                print(f"❌ Cloudinary upload failed for blog image: {str(e)}")
+                print(f"   Storing base64 data URL instead")
+
+        # Update blog draft with featured image
+        blog_drafts_collection = db["blog_drafts"]
+
+        await blog_drafts_collection.update_one(
+            {"id": draft_id},
+            {
+                "$set": {
+                    "featured_image_url": stored_url,
+                    "updated_at": datetime.utcnow()
+                }
+            }
+        )
+
+        print(f"✅ Blog featured image saved to blog_drafts {draft_id}")
+
+    except Exception as e:
+        print(f"❌ Background blog image generation error for draft {draft_id}: {str(e)}")
+        import traceback
+        traceback.print_exc()
+
+
 # This can be set up as a periodic background task
 async def scheduled_content_publisher(db: AsyncIOMotorDatabase):
     """Periodic task to publish scheduled content"""
@@ -3899,3 +4000,292 @@ async def extract_image_text(
     except Exception as e:
         print(f"⚠️ Error extracting text from image: {e}")
         return UriResponse.error_response(f"Failed to extract text: {str(e)}")
+
+
+@router.post("/upload-custom-font")
+async def upload_custom_font(
+    file: UploadFile = File(...),
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Upload a custom font file (.ttf or .otf) for the user's brand.
+    Typography System PRD - Phase 1: Custom Font Upload
+    """
+    try:
+        user_id = token.get("user_id")
+
+        # Validate file type
+        filename = file.filename.lower()
+        if not (filename.endswith('.ttf') or filename.endswith('.otf')):
+            return UriResponse.error_response("Invalid file type. Please upload .ttf or .otf font files only.")
+
+        # Validate file size (max 5MB)
+        file_bytes = await file.read()
+        file_size_mb = len(file_bytes) / (1024 * 1024)
+        if file_size_mb > 5:
+            return UriResponse.error_response(f"File too large ({file_size_mb:.1f}MB). Maximum size is 5MB.")
+
+        print(f"[CUSTOM_FONT] Uploading font: {file.filename} ({file_size_mb:.2f}MB)")
+
+        # Upload to Cloudinary
+        from app.utils.cloudinary_upload import upload_bytes
+
+        font_url = await upload_bytes(
+            file_bytes,
+            folder=f"uri-social/custom-fonts/{user_id}",
+            resource_type="raw",  # Non-image file
+            public_id=file.filename.rsplit('.', 1)[0]  # Use original filename
+        )
+
+        print(f"[CUSTOM_FONT] ✅ Font uploaded: {font_url}")
+
+        return UriResponse.get_single_data_response("font_uploaded", {
+            "font_url": font_url,
+            "filename": file.filename,
+            "size_mb": round(file_size_mb, 2)
+        })
+
+    except Exception as e:
+        print(f"⚠️ Error uploading custom font: {e}")
+        return UriResponse.error_response(f"Failed to upload font: {str(e)}")
+
+
+@router.post("/analyze-custom-font")
+async def analyze_custom_font(
+    font_url: str = Query(..., description="Cloudinary URL of the uploaded font file"),
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Analyze a custom font using GPT-4o-mini Vision API.
+    Returns font characteristics and a prompt directive for AI image generation.
+    Typography System PRD - Phase 1: Custom Font Analysis
+    """
+    try:
+        from app.agents.social_media_manager.services.custom_font_service import CustomFontService
+
+        print(f"[CUSTOM_FONT] Analyzing font: {font_url}")
+
+        # Analyze the font
+        analysis_result = await CustomFontService.analyze_font(font_url)
+
+        return UriResponse.get_single_data_response("font_analyzed", {
+            "font_url": font_url,
+            "analysis": analysis_result["analysis"],
+            "prompt_directive": analysis_result["prompt_directive"]
+        })
+
+    except Exception as e:
+        print(f"⚠️ Error analyzing custom font: {e}")
+        return UriResponse.error_response(f"Failed to analyze font: {str(e)}")
+
+
+# ============================================================================
+# BLOG CONTENT GENERATOR
+# ============================================================================
+
+class BlogGenerationRequest(BaseModel):
+    """Request model for blog content generation"""
+    topic: str = Field(..., description="Blog post topic/title", min_length=10, max_length=200)
+    keywords: List[str] = Field(..., description="SEO keywords (2-5 keywords)", min_items=1, max_items=10)
+    tone: str = Field(..., description="Content tone: professional, inspirational, educational, conversational")
+    word_count: int = Field(..., description="Target word count: 1000, 2000, or 3000", ge=500, le=5000)
+
+
+@router.post("/generate-blog")
+async def generate_blog_content(
+    request: BlogGenerationRequest,
+    background_tasks: BackgroundTasks,
+    token: dict = Depends(JWTBearer()),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency)
+):
+    """
+    Generate long-form blog content with AI
+
+    Features:
+    - GPT-4 Turbo powered blog writing
+    - SEO-optimized title and meta description
+    - Structured HTML content with proper headings
+    - DALL-E 3 generated featured image
+    - Social media promotional snippets
+    - Brand voice consistency
+
+    Blog Generator Demo - Phase 1
+    """
+    try:
+        user_id = _get_user_id(token)
+        if not user_id:
+            return UriResponse.error_response("User ID not found in token")
+
+        print(f"\n{'='*60}")
+        print(f"📝 BLOG GENERATION REQUEST")
+        print(f"{'='*60}")
+        print(f"Topic: {request.topic}")
+        print(f"Keywords: {', '.join(request.keywords)}")
+        print(f"Tone: {request.tone}")
+        print(f"Word Count: {request.word_count}")
+        print(f"{'='*60}\n")
+
+        # Validate tone
+        valid_tones = ["professional", "inspirational", "educational", "conversational"]
+        if request.tone not in valid_tones:
+            return UriResponse.error_response(
+                f"Invalid tone. Must be one of: {', '.join(valid_tones)}"
+            )
+
+        # Validate word count
+        valid_word_counts = [1000, 2000, 3000]
+        if request.word_count not in valid_word_counts:
+            # Allow approximate values (within 500 words)
+            closest = min(valid_word_counts, key=lambda x: abs(x - request.word_count))
+            if abs(closest - request.word_count) > 500:
+                return UriResponse.error_response(
+                    f"Word count must be approximately 1000, 2000, or 3000 words"
+                )
+            request.word_count = closest
+
+        # Get user's brand profile for voice consistency
+        brand_profile = await BrandProfileService.get(user_id, db)
+        brand_data = None
+
+        if brand_profile:
+            brand_data = {
+                "brand_name": brand_profile.get("brand_name", "Your Brand"),
+                "derived_voice": brand_profile.get("derived_voice", ""),
+                "brand_colors": brand_profile.get("brand_colors", []),
+                "industry": brand_profile.get("industry", ""),
+            }
+            print(f"✅ Using brand profile: {brand_data['brand_name']}")
+        else:
+            print(f"⚠️ No brand profile found, using defaults")
+
+        # Generate blog content
+        blog_result = await ImageContentService.generate_long_form_content(
+            topic=request.topic,
+            keywords=request.keywords,
+            tone=request.tone,
+            word_count=request.word_count,
+            brand_profile=brand_data,
+            user_id=user_id
+        )
+
+        # Save blog to blog_drafts collection (separate from social posts)
+        import uuid
+        draft_id = str(uuid.uuid4())
+
+        draft_data = {
+            "id": draft_id,
+            "user_id": user_id,
+            "status": "draft",
+            "title": blog_result["title"],
+            "meta_description": blog_result["meta_description"],
+            "content": blog_result["content"],
+            "reading_time": blog_result["reading_time"],
+            "word_count": blog_result["word_count"],
+            "featured_image_url": None,  # Will be generated in background
+            "has_image": True,  # Flag that image generation is in progress
+            "social_snippets": blog_result["social_snippets"],
+            "keywords": blog_result["keywords"],
+            "tone": blog_result["tone"],
+            "generated_at": datetime.utcnow(),
+            "created_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow()
+        }
+
+        # Insert into blog_drafts collection
+        blog_drafts_collection = db["blog_drafts"]
+        await blog_drafts_collection.insert_one(draft_data)
+
+        print(f"✅ Blog saved to blog_drafts: {draft_id}")
+
+        # Generate featured image in background
+        image_ctx = blog_result.get("image_context", {})
+        background_tasks.add_task(
+            _generate_blog_image_bg,
+            draft_id=draft_id,
+            title=image_ctx.get("title", request.topic),
+            topic=image_ctx.get("topic", request.topic),
+            tone=image_ctx.get("tone", request.tone),
+            industry=image_ctx.get("industry", ""),
+            brand_colors=image_ctx.get("brand_colors", []),
+            db=db
+        )
+        print(f"🎨 Blog featured image generation queued for background")
+
+        # Return response
+        response_data = {
+            "draft_id": draft_id,
+            "title": blog_result["title"],
+            "meta_description": blog_result["meta_description"],
+            "content": blog_result["content"],
+            "reading_time": blog_result["reading_time"],
+            "word_count": blog_result["word_count"],
+            "featured_image_url": None,  # Will be generated in background
+            "has_image": True,  # Frontend can poll to check when ready
+            "social_snippets": blog_result["social_snippets"],
+            "keywords": blog_result["keywords"],
+            "tone": blog_result["tone"],
+            "generated_at": blog_result["generated_at"]
+        }
+
+        return UriResponse.get_single_data_response("blog_generated", response_data)
+
+    except Exception as e:
+        print(f"❌ Blog generation error: {str(e)}")
+        traceback.print_exc()
+        return UriResponse.error_response(f"Failed to generate blog content: {str(e)}")
+
+
+@router.get("/blog-drafts")
+async def get_blog_drafts(
+    token: dict = Depends(JWTBearer()),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency)
+):
+    """Get all blog drafts for the authenticated user"""
+    try:
+        user_id = _get_user_id(token)
+        if not user_id:
+            return UriResponse.error_response("User ID not found in token")
+
+        # Fetch all blog drafts for this user, sorted by created_at descending
+        blog_drafts = await db["blog_drafts"].find(
+            {"user_id": user_id}
+        ).sort("created_at", -1).to_list(length=100)
+
+        # Remove MongoDB _id from results
+        for draft in blog_drafts:
+            draft.pop("_id", None)
+
+        return UriResponse.get_list_data_response("blog_drafts", blog_drafts)
+
+    except Exception as e:
+        print(f"❌ Error fetching blog drafts: {str(e)}")
+        traceback.print_exc()
+        return UriResponse.error_response(f"Failed to fetch blog drafts: {str(e)}")
+
+
+@router.get("/blog-drafts/{draft_id}")
+async def get_blog_draft(
+    draft_id: str,
+    token: dict = Depends(JWTBearer()),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency)
+):
+    """Get a single blog draft by ID (for polling image status)"""
+    try:
+        user_id = _get_user_id(token)
+        if not user_id:
+            return UriResponse.error_response("User ID not found in token")
+
+        draft = await db["blog_drafts"].find_one(
+            {"id": draft_id, "user_id": user_id},
+            {"_id": 0}
+        )
+
+        if not draft:
+            return UriResponse.error_response("Blog draft not found", response_code=404)
+
+        return UriResponse.get_single_data_response("blog_draft", draft)
+
+    except Exception as e:
+        print(f"❌ Error fetching blog draft {draft_id}: {str(e)}")
+        traceback.print_exc()
+        return UriResponse.error_response(f"Failed to fetch blog draft: {str(e)}")
