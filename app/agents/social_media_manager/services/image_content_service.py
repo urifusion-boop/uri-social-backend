@@ -609,7 +609,15 @@ class ImageContentService:
 
             bc = brand_context or {}
             style_fragment = bc.get("style_prompt_fragment", "")
-            font_prompt = bc.get("font_style_prompt", "")
+
+            # Typography System: Prioritize custom font over library font
+            if bc.get("custom_font_enabled"):
+                font_prompt = bc.get("custom_font_directive", "")
+                print(f"[TYPOGRAPHY] Using custom font directive")
+            else:
+                font_prompt = bc.get("font_style_prompt", "")
+                print(f"[TYPOGRAPHY] Using library font: {bc.get('font_style', 'default')}")
+
             region = bc.get("region", "")
             brand_colors = bc.get("brand_colors") or []
 
@@ -2469,6 +2477,303 @@ OVERALL:
             return UriResponse.error_response(f"Brand consistent image generation failed: {str(e)}")
 
 
+    @staticmethod
+    async def generate_long_form_content(
+        topic: str,
+        keywords: List[str],
+        tone: str,
+        word_count: int,
+        brand_profile: Optional[Dict] = None,
+        user_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Generate long-form blog content using GPT-4 Turbo
+
+        Args:
+            topic: Blog post topic/title
+            keywords: SEO keywords to integrate naturally
+            tone: Content tone (professional, inspirational, educational, conversational)
+            word_count: Target word count (1000, 2000, or 3000)
+            brand_profile: Optional brand context for voice consistency
+            user_id: Optional user ID for tracking
+
+        Returns:
+            Dict with:
+                - title: SEO-optimized title (60-70 chars)
+                - meta_description: SEO meta description (150-160 chars)
+                - content: Full HTML blog content with proper structure
+                - reading_time: Estimated reading time in minutes
+                - featured_image_url: DALL-E generated featured image
+                - social_snippets: Platform-specific social media posts
+        """
+        import json
+        import re
+
+        blog_text = ""  # Initialize to avoid reference errors
+
+        try:
+            # Extract brand context
+            brand_voice = ""
+            brand_colors = []
+            brand_name = "Your Brand"
+            industry = ""
+
+            if brand_profile:
+                brand_voice = brand_profile.get("derived_voice", "")
+                brand_colors = brand_profile.get("brand_colors", [])
+                brand_name = brand_profile.get("brand_name", "Your Brand")
+                industry = brand_profile.get("industry", "")
+
+            # Build blog generation prompt
+            keywords_str = ", ".join(keywords) if keywords else ""
+
+            blog_prompt = f"""Write an SEO-optimized blog post on the following topic:
+
+TOPIC: {topic}
+
+REQUIREMENTS:
+- Target word count: {word_count} words
+- Tone: {tone}
+- SEO Keywords to integrate naturally: {keywords_str}
+{"- Brand Voice: " + brand_voice if brand_voice else ""}
+{"- Industry: " + industry if industry else ""}
+- Brand Name: {brand_name}
+
+STRUCTURE:
+1. SEO Title (60-70 characters, include primary keyword)
+2. Meta Description (150-160 characters, compelling and keyword-rich)
+3. Introduction (150-200 words, hook the reader)
+4. Main Body (4-5 sections with H2 headings, each 200-400 words)
+5. Conclusion (100-150 words with clear CTA)
+
+FORMAT:
+Return ONLY a valid JSON object with this structure:
+{{
+    "title": "SEO-optimized title here",
+    "meta_description": "Meta description here",
+    "introduction": "Introduction paragraph",
+    "sections": [
+        {{
+            "heading": "Section heading",
+            "content": "Section content in HTML with <p>, <strong>, <em>, <ul>, <li> tags"
+        }}
+    ],
+    "conclusion": "Conclusion paragraph with CTA"
+}}
+
+STYLE GUIDELINES:
+- Use short paragraphs (2-3 sentences max)
+- Include bullet points where appropriate
+- Bold important terms
+- Write in second person ("you") for engagement
+- Include statistics or data points if relevant
+- Make it scannable with clear headings
+- Natural keyword integration (no keyword stuffing)
+- Professional yet accessible language
+
+Write the complete blog post now."""
+
+            # Call GPT-4 Turbo for blog content
+            print(f"📝 Generating {word_count}-word blog post: {topic}")
+
+            from app.services.AIService import client as openai_client
+
+            loop = asyncio.get_running_loop()
+            blog_response = await loop.run_in_executor(
+                None,
+                lambda: openai_client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": f"You are an expert SEO content writer specializing in {industry if industry else 'digital marketing'}. You write engaging, well-structured blog posts that rank well in search engines while being valuable to readers."
+                        },
+                        {
+                            "role": "user",
+                            "content": blog_prompt
+                        }
+                    ],
+                    temperature=0.7,
+                    max_tokens=4000
+                )
+            )
+
+            # Parse blog content
+            blog_text = blog_response.choices[0].message.content
+
+            # Extract JSON from response (handle markdown code blocks)
+            json_match = re.search(r'```json\s*(\{.*?\})\s*```', blog_text, re.DOTALL)
+            if json_match:
+                blog_text = json_match.group(1)
+
+            blog_data = json.loads(blog_text)
+
+            # Build HTML content
+            html_parts = []
+            html_parts.append(f"<h1>{blog_data['title']}</h1>")
+            html_parts.append(f"<div class='introduction'>{blog_data['introduction']}</div>")
+
+            for section in blog_data.get('sections', []):
+                html_parts.append(f"<h2>{section['heading']}</h2>")
+                html_parts.append(f"<div class='section-content'>{section['content']}</div>")
+
+            html_parts.append(f"<div class='conclusion'>{blog_data['conclusion']}</div>")
+
+            full_html = "\n\n".join(html_parts)
+
+            # Calculate reading time (average 200 words per minute)
+            word_count_actual = len(full_html.split())
+            reading_time = max(1, round(word_count_actual / 200))
+
+            # Image will be generated in background task (similar to social posts)
+            # Return placeholder for now
+            featured_image_url = None  # Will be generated in background
+
+            print(f"✅ Blog content generated: {word_count_actual} words, {reading_time} min read")
+            print(f"🎨 Featured image will be generated in background")
+
+            # Store image generation context for background task
+            image_generation_context = {
+                "title": blog_data['title'],
+                "topic": topic,
+                "tone": tone,
+                "industry": industry,
+                "brand_colors": brand_colors
+            }
+
+            # Generate social media snippets (short versions for promotion)
+            print(f"📱 Generating social media snippets")
+
+            social_prompt = f"""Create 3 social media posts to promote this blog article:
+
+Title: {blog_data['title']}
+Introduction: {blog_data['introduction']}
+
+Generate posts for:
+1. LinkedIn (professional, 150 characters max)
+2. Twitter (concise, 280 characters max)
+3. Facebook (engaging, 200 characters max)
+
+Each post should:
+- Hook the reader
+- Highlight key value
+- Include 2-3 relevant hashtags
+- Encourage click-through
+
+Return ONLY a JSON object:
+{{
+    "linkedin": "post text with hashtags",
+    "twitter": "post text with hashtags",
+    "facebook": "post text with hashtags"
+}}"""
+
+            social_response = await loop.run_in_executor(
+                None,
+                lambda: openai_client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[
+                        {"role": "system", "content": "You are a social media expert who writes engaging promotional posts."},
+                        {"role": "user", "content": social_prompt}
+                    ],
+                    temperature=0.8,
+                    max_tokens=500
+                )
+            )
+
+            social_text = social_response.choices[0].message.content
+
+            # Extract JSON from social response
+            json_match = re.search(r'```json\s*(\{.*?\})\s*```', social_text, re.DOTALL)
+            if json_match:
+                social_text = json_match.group(1)
+
+            social_snippets = json.loads(social_text)
+
+            print(f"✅ Blog generation complete: {len(full_html)} chars, {reading_time} min read")
+
+            return {
+                "title": blog_data['title'],
+                "meta_description": blog_data['meta_description'],
+                "content": full_html,
+                "reading_time": reading_time,
+                "word_count": word_count_actual,
+                "featured_image_url": featured_image_url,
+                "social_snippets": social_snippets,
+                "keywords": keywords,
+                "tone": tone,
+                "generated_at": datetime.utcnow().isoformat(),
+                "image_context": image_generation_context  # For background task
+            }
+
+        except json.JSONDecodeError as e:
+            print(f"❌ JSON parsing error: {str(e)}")
+            print(f"Raw response: {blog_text[:500]}")
+            raise Exception(f"Failed to parse blog content: {str(e)}")
+        except Exception as e:
+            print(f"❌ Blog generation error: {str(e)}")
+            raise Exception(f"Failed to generate blog content: {str(e)}")
+
+    @staticmethod
+    async def generate_blog_featured_image(
+        title: str,
+        topic: str,
+        tone: str,
+        industry: str,
+        brand_colors: List[str]
+    ) -> Dict[str, Any]:
+        """
+        Generate a featured image for blog post (called as background task)
+
+        Returns dict with 'success' and 'url' keys
+        """
+        try:
+            print(f"🎨 Generating blog featured image: {title[:50]}...")
+
+            color_str = ", ".join(brand_colors[:3]) if brand_colors else "modern professional colors"
+
+            image_prompt = f"""Professional blog featured image representing: "{title}"
+
+VISUAL CONCEPT:
+Create a high-quality, magazine-style hero image that visually represents the topic: {topic}
+
+STYLE REQUIREMENTS:
+• Photorealistic or high-end illustrative style
+• Landscape composition suitable for blog header
+• Professional, polished, editorial quality
+• Modern and contemporary aesthetic
+• Clear focal point that draws the eye
+• Mood: {tone}, inspiring, engaging
+
+COLOR PALETTE:
+Use these brand colors as inspiration: {color_str}
+Industry context: {industry if industry else "business"}
+
+CRITICAL RULES:
+• ABSOLUTELY NO TEXT, letters, words, or typography anywhere in the image
+• NO logos, brand names, or written elements
+• Pure visual imagery only
+• Suitable for professional publication
+• Landscape orientation optimized for web blog headers"""
+
+            # Use existing _call_dalle_api (consistent with rest of app)
+            image_result = await ImageContentService._call_dalle_api(
+                prompt=image_prompt,
+                size="1536x1024",  # Landscape for blog header
+                image_model="openai/gpt-image-2"
+            )
+
+            if not image_result.get("success"):
+                print(f"❌ Blog image generation failed")
+                return {"success": False, "url": None}
+
+            print(f"✅ Blog featured image generated successfully")
+            return image_result
+
+        except Exception as e:
+            print(f"❌ Blog image generation error: {str(e)}")
+            return {"success": False, "url": None}
+
+
 # Usage Examples:
 """
 # Generate content with images
@@ -2497,5 +2802,20 @@ brand_images = await ImageContentService.generate_brand_consistent_images(
         "style": "professional, Nigerian business",
         "industry": "financial services"
     }
+)
+
+# Generate long-form blog content
+blog_result = await ImageContentService.generate_long_form_content(
+    topic="10 Ways AI is Transforming Digital Marketing in 2025",
+    keywords=["AI marketing", "digital transformation", "marketing automation"],
+    tone="professional",
+    word_count=2000,
+    brand_profile={
+        "brand_name": "URI Social",
+        "derived_voice": "Professional, innovative, and results-driven",
+        "brand_colors": ["#CD1B78", "#1a1a1a", "#ffffff"],
+        "industry": "Marketing Technology"
+    },
+    user_id="user_123"
 )
 """
