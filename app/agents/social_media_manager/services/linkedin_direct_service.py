@@ -20,6 +20,7 @@ AUTHORIZATION_URL = "https://www.linkedin.com/oauth/v2/authorization"
 TOKEN_URL = "https://www.linkedin.com/oauth/v2/accessToken"
 USERINFO_URL = "https://api.linkedin.com/v2/userinfo"
 UGC_POSTS_URL = "https://api.linkedin.com/v2/ugcPosts"
+REGISTER_UPLOAD_URL = "https://api.linkedin.com/v2/assets?action=registerUpload"
 ORG_ACLS_URL = "https://api.linkedin.com/v2/organizationAcls"
 
 SCOPES = "openid profile email w_member_social"
@@ -124,7 +125,7 @@ class LinkedInDirectService:
         }
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.post(
-                "https://api.linkedin.com/v2/assets?action=registerUpload",
+                REGISTER_UPLOAD_URL,
                 json=payload,
                 headers={
                     "Authorization": f"Bearer {access_token}",
@@ -156,23 +157,21 @@ class LinkedInDirectService:
 
         if image_url:
             try:
-                # 1. Register upload
                 reg = await self._register_image(access_token, person_urn)
                 upload_url = reg["upload_url"]
                 asset = reg["asset"]
 
-                # 2. Download image and upload to LinkedIn
                 async with httpx.AsyncClient(timeout=60) as client:
                     img_resp = await client.get(image_url)
                     img_resp.raise_for_status()
-                    await client.put(
+                    put_r = await client.put(
                         upload_url,
                         content=img_resp.content,
                         headers={
-                            "Authorization": f"Bearer {access_token}",
                             "Content-Type": img_resp.headers.get("content-type", "image/jpeg"),
                         },
                     )
+                    put_r.raise_for_status()
 
                 media_category = "IMAGE"
                 media = [{
