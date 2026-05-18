@@ -14,6 +14,7 @@ from app.dependencies import get_db_dependency
 from app.domain.responses.uri_response import UriResponse
 from app.services.TrialService import trial_service
 from app.services.NotificationService import notification_service
+from app.services import GAService
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
 
@@ -57,6 +58,8 @@ async def signup(body: SignupRequest, db: AsyncIOMotorDatabase = Depends(get_db_
         "last_name": body.last_name,
         "referralCode": referral_code,
     })
+
+    GAService.track_signup(user_id, method="email")
 
     # PRD 5.1: Activate free trial on successful signup
     trial_status = None
@@ -162,6 +165,7 @@ async def google_auth(body: GoogleAuthRequest, db: AsyncIOMotorDatabase = Depend
         user_id = existing.get("userId") or str(existing["_id"])
         first_name = existing.get("first_name", first_name)
         last_name = existing.get("last_name", last_name)
+        GAService.track_login(user_id, method="google")
     else:
         user_id = str(uuid.uuid4())
         referral_code = uuid.uuid4().hex[:8].upper()
@@ -174,6 +178,8 @@ async def google_auth(body: GoogleAuthRequest, db: AsyncIOMotorDatabase = Depend
             "referralCode": referral_code,
             "auth_provider": "google",
         })
+
+        GAService.track_signup(user_id, method="google")
 
         # PRD 5.1: Activate free trial on signup
         try:
@@ -232,6 +238,7 @@ async def login(body: LoginRequest, db: AsyncIOMotorDatabase = Depends(get_db_de
         raise HTTPException(status_code=401, detail="Invalid email or password.")
 
     user_id = user.get("userId") or str(user["_id"])
+    GAService.track_login(user_id, method="email")
     token = sign_jwt(user_id, user["email"], user.get("first_name", ""), user.get("last_name", ""))
 
     return {
