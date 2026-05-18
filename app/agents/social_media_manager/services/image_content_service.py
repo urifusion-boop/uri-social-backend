@@ -2149,20 +2149,13 @@ OVERALL:
                     b64 = response.data[0].b64_json
                     b64 = ImageContentService._crop_to_ratio(b64, target_w, target_h)
 
-                    # Convert to WebP and resize to exact target dimensions
+                    # Convert to WebP
                     out_img = _PILImage.open(io.BytesIO(_b64.b64decode(b64))).convert("RGB")
-
-                    # Resize to exact platform dimensions
-                    gen_w, gen_h = out_img.size
-                    if (gen_w, gen_h) != (target_w, target_h):
-                        print(f"🔄 Resizing from {gen_w}×{gen_h} to {target_w}×{target_h} (exact platform dimensions)")
-                        out_img = out_img.resize((target_w, target_h), _PILImage.LANCZOS)
-
                     webp_buf = io.BytesIO()
                     out_img.save(webp_buf, format="WEBP", quality=97, method=6)
                     b64_webp = _b64.b64encode(webp_buf.getvalue()).decode()
 
-                    print(f"🎨 gpt-image-1 edit generated (reference image preserved, {target_w}×{target_h})")
+                    print(f"🎨 gpt-image-1 edit generated (reference image preserved, {edit_size})")
                     return {
                         "success": True,
                         "url": f"data:image/webp;base64,{b64_webp}",
@@ -2241,19 +2234,11 @@ OVERALL:
                     _gpt2_b64 = _gpt2_resp.data[0].b64_json
 
                     _gpt2_img = _PILImage.open(_io.BytesIO(_b64.b64decode(_gpt2_b64))).convert("RGB")
-
-                    # Resize to exact target dimensions (e.g., 1080×1350 for Instagram)
-                    # OpenAI generates at 1024×1536, we resize to match platform specs exactly
-                    gen_w, gen_h = _gpt2_img.size
-                    if (gen_w, gen_h) != (target_w, target_h):
-                        print(f"🔄 Resizing from {gen_w}×{gen_h} to {target_w}×{target_h} (exact platform dimensions)")
-                        _gpt2_img = _gpt2_img.resize((target_w, target_h), _PILImage.LANCZOS)
-
                     _gpt2_buf = _io.BytesIO()
                     _gpt2_img.save(_gpt2_buf, format="WEBP", quality=97, method=6)
                     _gpt2_b64 = _b64.b64encode(_gpt2_buf.getvalue()).decode()
 
-                    print(f"✅ GPT-Image-2 ready ({target_w}×{target_h}, {_mode})")
+                    print(f"✅ GPT-Image-2 ready ({_gpt2_size}, {_mode})")
                     return {
                         "success": True,
                         "url": f"data:image/webp;base64,{_gpt2_b64}",
