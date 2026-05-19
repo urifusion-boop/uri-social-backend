@@ -15,7 +15,7 @@ from app.dependencies import get_db_dependency
 from app.domain.responses.uri_response import UriResponse
 from app.services.TrialService import trial_service
 from app.services.NotificationService import notification_service
-from app.services import GAService
+from app.services import PostHogService
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
 
@@ -74,7 +74,7 @@ async def signup(body: SignupRequest, db: AsyncIOMotorDatabase = Depends(get_db_
         "language": "en",
     })
 
-    GAService.track_signup(user_id, method="email")
+    PostHogService.track_signup(user_id, email=body.email, method="email")
 
     # PRD 5.1: Activate free trial on successful signup
     trial_status = None
@@ -185,7 +185,7 @@ async def google_auth(body: GoogleAuthRequest, db: AsyncIOMotorDatabase = Depend
             {"email": email},
             {"$set": {"last_login_at": datetime.utcnow(), "last_seen_at": datetime.utcnow()}}
         )
-        GAService.track_login(user_id, method="google")
+        PostHogService.track_login(user_id, email=email, method="google")
     else:
         user_id = str(uuid.uuid4())
         referral_code = uuid.uuid4().hex[:8].upper()
@@ -213,7 +213,7 @@ async def google_auth(body: GoogleAuthRequest, db: AsyncIOMotorDatabase = Depend
             "language": "en",
         })
 
-        GAService.track_signup(user_id, method="google")
+        PostHogService.track_signup(user_id, email=email, method="google")
 
         # PRD 5.1: Activate free trial on signup
         try:
@@ -272,6 +272,7 @@ async def login(body: LoginRequest, db: AsyncIOMotorDatabase = Depends(get_db_de
         raise HTTPException(status_code=401, detail="Invalid email or password.")
 
     user_id = user.get("userId") or str(user["_id"])
+<<<<<<< HEAD
 
     # Update last_login_at and last_seen_at
     await db["users"].update_one(
@@ -280,6 +281,9 @@ async def login(body: LoginRequest, db: AsyncIOMotorDatabase = Depends(get_db_de
     )
 
     GAService.track_login(user_id, method="email")
+=======
+    PostHogService.track_login(user_id, email=user["email"], method="email")
+>>>>>>> 5d33e70 (feat: replace Google Analytics with PostHog server-side tracking)
     token = sign_jwt(user_id, user["email"], user.get("first_name", ""), user.get("last_name", ""))
 
     return {

@@ -110,9 +110,9 @@ class Settings(BaseSettings):
     # Sentry (optional)
     SENTRY_DSN: Optional[str] = None
 
-    # Google Analytics 4
-    GA4_MEASUREMENT_ID: str = "G-9343V6T4ZQ"
-    GA4_API_SECRET: str = ""  # Measurement Protocol API secret from GA4 Admin
+    # PostHog
+    POSTHOG_API_KEY: str = ""
+    POSTHOG_HOST: str = "https://us.i.posthog.com"
 
     class Config:
         env_file = ".env"
