@@ -272,7 +272,6 @@ async def login(body: LoginRequest, db: AsyncIOMotorDatabase = Depends(get_db_de
         raise HTTPException(status_code=401, detail="Invalid email or password.")
 
     user_id = user.get("userId") or str(user["_id"])
-<<<<<<< HEAD
 
     # Update last_login_at and last_seen_at
     await db["users"].update_one(
@@ -280,10 +279,7 @@ async def login(body: LoginRequest, db: AsyncIOMotorDatabase = Depends(get_db_de
         {"$set": {"last_login_at": datetime.utcnow(), "last_seen_at": datetime.utcnow()}}
     )
 
-    GAService.track_login(user_id, method="email")
-=======
     PostHogService.track_login(user_id, email=user["email"], method="email")
->>>>>>> 5d33e70 (feat: replace Google Analytics with PostHog server-side tracking)
     token = sign_jwt(user_id, user["email"], user.get("first_name", ""), user.get("last_name", ""))
 
     return {
