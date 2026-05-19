@@ -6,6 +6,7 @@ from pydantic import BaseModel, EmailStr
 from passlib.context import CryptContext
 from bson import ObjectId
 import secrets
+from datetime import datetime
 
 from app.core.auth_handler import sign_jwt
 from app.core.config import settings
@@ -50,6 +51,8 @@ async def signup(body: SignupRequest, db: AsyncIOMotorDatabase = Depends(get_db_
     hashed = pwd_context.hash(body.password)
     user_id = str(uuid.uuid4())
     referral_code = uuid.uuid4().hex[:8].upper()
+    now = datetime.utcnow()
+
     result = await db["users"].insert_one({
         "userId": user_id,
         "email": body.email,
@@ -57,6 +60,18 @@ async def signup(body: SignupRequest, db: AsyncIOMotorDatabase = Depends(get_db_
         "first_name": body.first_name,
         "last_name": body.last_name,
         "referralCode": referral_code,
+        # New fields with defaults
+        "role": "user",
+        "created_at": now,
+        "updated_at": now,
+        "is_active": True,
+        "email_verified": False,
+        "account_status": "active",
+        "last_login_at": now,  # Set to now on signup
+        "last_seen_at": now,
+        "phone": None,
+        "timezone": "UTC",
+        "language": "en",
     })
 
     GAService.track_signup(user_id, method="email")
@@ -165,10 +180,17 @@ async def google_auth(body: GoogleAuthRequest, db: AsyncIOMotorDatabase = Depend
         user_id = existing.get("userId") or str(existing["_id"])
         first_name = existing.get("first_name", first_name)
         last_name = existing.get("last_name", last_name)
+        # Update last_login_at for existing users
+        await db["users"].update_one(
+            {"email": email},
+            {"$set": {"last_login_at": datetime.utcnow(), "last_seen_at": datetime.utcnow()}}
+        )
         GAService.track_login(user_id, method="google")
     else:
         user_id = str(uuid.uuid4())
         referral_code = uuid.uuid4().hex[:8].upper()
+        now = datetime.utcnow()
+
         await db["users"].insert_one({
             "userId": user_id,
             "email": email,
@@ -177,6 +199,18 @@ async def google_auth(body: GoogleAuthRequest, db: AsyncIOMotorDatabase = Depend
             "last_name": last_name,
             "referralCode": referral_code,
             "auth_provider": "google",
+            # New fields with defaults
+            "role": "user",
+            "created_at": now,
+            "updated_at": now,
+            "is_active": True,
+            "email_verified": True,  # Google accounts are pre-verified
+            "account_status": "active",
+            "last_login_at": now,
+            "last_seen_at": now,
+            "phone": None,
+            "timezone": "UTC",
+            "language": "en",
         })
 
         GAService.track_signup(user_id, method="google")
@@ -238,6 +272,13 @@ async def login(body: LoginRequest, db: AsyncIOMotorDatabase = Depends(get_db_de
         raise HTTPException(status_code=401, detail="Invalid email or password.")
 
     user_id = user.get("userId") or str(user["_id"])
+
+    # Update last_login_at and last_seen_at
+    await db["users"].update_one(
+        {"email": body.email},
+        {"$set": {"last_login_at": datetime.utcnow(), "last_seen_at": datetime.utcnow()}}
+    )
+
     GAService.track_login(user_id, method="email")
     token = sign_jwt(user_id, user["email"], user.get("first_name", ""), user.get("last_name", ""))
 
