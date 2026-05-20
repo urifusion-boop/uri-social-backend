@@ -401,7 +401,7 @@ async def _gpt_conversational_reply(
         + [ChatMessage(role=h["role"], content=h["content"]) for h in history]
         + [ChatMessage(role="user", content=user_message)]
     )
-    req = ChatModel(model=_CONV_MODEL, messages=messages, temperature=0.8)
+    req = ChatModel(model=_CONV_MODEL, messages=messages, temperature=1)
     try:
         result = await AIService.chat_completion(req)
         if isinstance(result, dict) and result.get("error"):
@@ -731,14 +731,16 @@ async def _generate_content_structured(
         + [ChatMessage(role=h["role"], content=h["content"]) for h in (history or [])]
         + [ChatMessage(role="user", content=user_prompt)]
     )
-    req = ChatModel(model=_CONV_MODEL, messages=messages, temperature=0.85)
+    req = ChatModel(model=_CONV_MODEL, messages=messages, temperature=1)
+    print(f"[WhatsApp] _generate_content_structured | model={_CONV_MODEL} topic={topic!r}", flush=True)
     try:
         result = await AIService.chat_completion(req)
     except Exception as e:
-        print(f"[WhatsApp] _generate_content_structured error: {e}")
+        print(f"[WhatsApp] _generate_content_structured error: {e}", flush=True)
         return None
 
     if isinstance(result, dict) and result.get("error"):
+        print(f"[WhatsApp] _generate_content_structured AI error: {result.get('error')}", flush=True)
         return None
 
     text = result.choices[0].message.content.strip()
@@ -774,7 +776,7 @@ async def _generate_three_ideas(
         + [ChatMessage(role=h["role"], content=h["content"]) for h in (history or [])]
         + [ChatMessage(role="user", content=user_prompt)]
     )
-    req = ChatModel(model=_CONV_MODEL, messages=messages, temperature=0.9)
+    req = ChatModel(model=_CONV_MODEL, messages=messages, temperature=1)
     try:
         result = await AIService.chat_completion(req)
     except Exception as e:
