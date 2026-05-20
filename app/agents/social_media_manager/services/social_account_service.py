@@ -289,16 +289,17 @@ class SocialAccountService:
     ) -> Dict[str, Any]:
         """
         Return all social accounts connected by the user.
-        Queries Outstand directly for live/accurate status.
+        Queries Outstand for Outstand-managed accounts, then merges direct
+        connections from the local DB. Outstand failures are isolated so that
+        direct connections (e.g. Instagram) are always returned.
         """
-        outstand = OutstandService()
-        try:
-            result = await outstand.list_accounts(tenant_id=user_id)
-            accounts = result.get("data", [])
+        by_platform: Dict[str, list] = {}
 
-            # Group by platform
-            by_platform: Dict[str, list] = {}
-            for acc in accounts:
+        # 1. Outstand-managed accounts — failures must not prevent direct connections
+        try:
+            outstand = OutstandService()
+            result = await outstand.list_accounts(tenant_id=user_id)
+            for acc in result.get("data", []):
                 platform = acc.get("network", "unknown")
                 by_platform.setdefault(platform, []).append({
                     "outstand_account_id": acc.get("id"),
@@ -310,8 +311,11 @@ class SocialAccountService:
                     "is_active": bool(acc.get("isActive")),
                     "connected_at": acc.get("createdAt"),
                 })
+        except Exception as e:
+            print(f"[get_user_connections] Outstand list_accounts failed (non-fatal): {e}")
 
-            # Merge in direct connections (e.g. Instagram via Facebook Page token)
+        try:
+            # 2. Direct connections (Instagram OAuth, etc.) stored in local DB
             direct_cursor = db["social_connections"].find({
                 "user_id": user_id,
                 "connected_via": {"$ne": "outstand"},

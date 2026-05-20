@@ -399,23 +399,23 @@ class ImageContentService:
                         draft['image_specs'] = image_result['responseData']['specs']
                         draft['has_image'] = True
 
-                        # Save base64 image to local static storage (served directly)
+                        # Upload base64 image to Cloudinary for permanent CDN storage
                         stored_url = raw_image_url
                         if raw_image_url and raw_image_url.startswith("data:"):
+                            print(f"🔄 Uploading image to Cloudinary for draft {draft['id']} ({draft['platform']})...")
                             try:
-                                import base64 as _b64, re as _re, os as _os, uuid as _uuid
-                                _match = _re.match(r"data:[^;]+;base64,(.+)", raw_image_url, _re.DOTALL)
-                                if _match:
-                                    _filename = f"{_uuid.uuid4().hex}.webp"
-                                    _static_dir = "/app/static/images"
-                                    _os.makedirs(_static_dir, exist_ok=True)
-                                    _img_bytes = _b64.b64decode(_match.group(1))
-                                    with open(f"{_static_dir}/{_filename}", "wb") as _f:
-                                        _f.write(_img_bytes)
-                                    stored_url = f"/static/images/{_filename}"
-                                    print(f"💾 Image saved locally: {stored_url}")
+                                from app.utils.cloudinary_upload import upload_base64
+                                stored_url = await upload_base64(raw_image_url, folder="uri-social/content-drafts")
+                                print(f"☁️  ✅ CLOUDINARY UPLOAD SUCCESS!")
+                                print(f"   📍 Draft ID: {draft['id']}")
+                                print(f"   🌐 Platform: {draft['platform']}")
+                                print(f"   🔗 URL: {stored_url}")
                             except Exception as _save_err:
-                                print(f"⚠️  Local image save error: {_save_err}, keeping base64")
+                                print(f"⚠️  ❌ CLOUDINARY UPLOAD FAILED!")
+                                print(f"   📍 Draft ID: {draft['id']}")
+                                print(f"   🌐 Platform: {draft['platform']}")
+                                print(f"   ❌ Error: {_save_err}")
+                                print(f"   ⚠️  Keeping base64 data URL as fallback")
 
                         # Persist URL to DB
                         if db is not None:
@@ -514,22 +514,20 @@ class ImageContentService:
             raw_url = image_result["responseData"]["image_url"]
             specs = image_result["responseData"]["specs"]
 
-            # Save base64 to local static storage (served directly by backend)
+            # Upload base64 to Cloudinary for permanent CDN storage
             stored_url = raw_url
             if raw_url and raw_url.startswith("data:"):
+                print(f"🔄 Uploading REGENERATED image to Cloudinary for draft {draft_id}...")
                 try:
-                    _match = _re.match(r"data:[^;]+;base64,(.+)", raw_url, _re.DOTALL)
-                    if _match:
-                        _filename = f"{_uuid.uuid4().hex}.webp"
-                        _static_dir = "/app/static/images"
-                        _os.makedirs(_static_dir, exist_ok=True)
-                        _img_bytes = _b64.b64decode(_match.group(1))
-                        with open(f"{_static_dir}/{_filename}", "wb") as _f:
-                            _f.write(_img_bytes)
-                        stored_url = f"/static/images/{_filename}"
-                        print(f"💾 Regenerated image saved locally: {stored_url}")
+                    from app.utils.cloudinary_upload import upload_base64
+                    stored_url = await upload_base64(raw_url, folder="uri-social/content-drafts")
+                    print(f"☁️  ✅ CLOUDINARY REGENERATION UPLOAD SUCCESS!")
+                    print(f"   📍 Draft ID: {draft_id}")
+                    print(f"   🔗 URL: {stored_url}")
                 except Exception as _e:
-                    print(f"⚠️ Local image save error during regeneration: {_e}")
+                    print(f"⚠️  ❌ CLOUDINARY REGENERATION UPLOAD FAILED!")
+                    print(f"   📍 Draft ID: {draft_id}")
+                    print(f"   ❌ Error: {_e}")
 
             await db["content_drafts"].update_one(
                 {"$or": [{"id": draft_id}, {"draft_id": draft_id}]},
@@ -611,7 +609,15 @@ class ImageContentService:
 
             bc = brand_context or {}
             style_fragment = bc.get("style_prompt_fragment", "")
-            font_prompt = bc.get("font_style_prompt", "")
+
+            # Typography System: Prioritize custom font over library font
+            if bc.get("custom_font_enabled"):
+                font_prompt = bc.get("custom_font_directive", "")
+                print(f"[TYPOGRAPHY] Using custom font directive")
+            else:
+                font_prompt = bc.get("font_style_prompt", "")
+                print(f"[TYPOGRAPHY] Using library font: {bc.get('font_style', 'default')}")
+
             region = bc.get("region", "")
             brand_colors = bc.get("brand_colors") or []
 
@@ -619,12 +625,38 @@ class ImageContentService:
             style_slug = bc.get("style_slug", "")
             style_desc = ""
             composition_mode = "immersive"  # default to immersive (PRD Section 1)
+            style_type = None
             if style_slug:
                 from app.agents.social_media_manager.services.style_library import get_style
                 s = get_style(style_slug)
                 if s:
                     style_desc = s.get("description", "")
                     composition_mode = s.get("composition_mode", "immersive")
+                    style_type = s.get("style_type")  # Can be "art_piece" for 9:16 posters
+
+            # ========== ART-PIECE POSTER DETECTION (9:16 Mobile Wallpaper Format) ==========
+            # Check if this is an art-piece poster based on:
+            # 1. Style type is "art_piece" OR
+            # 2. Trigger words in seed content (wallpaper, poster, art piece, full-page promo)
+            seed_lower = seed_content.lower()
+            art_piece_trigger_words = [
+                "wallpaper", "poster", "art piece", "art-piece", "artpiece",
+                "full-page promo", "full page promo", "mobile wallpaper",
+                "phone wallpaper", "vertical poster", "9:16 poster"
+            ]
+            is_art_piece = (
+                style_type == "art_piece" or
+                any(trigger in seed_lower for trigger in art_piece_trigger_words)
+            )
+
+            # Override specs for art-piece posters (9:16 format = 1024x1792)
+            if is_art_piece:
+                specs = {
+                    "width": 1024,
+                    "height": 1792,
+                    "aspect_ratio": "9:16",
+                }
+                print(f"🎨 Art-Piece Poster Mode Activated: 9:16 format (1024x1792)")
 
             # ========== RESTRUCTURED PROMPT ASSEMBLY (PRD Section 3) ==========
             # CRITICAL: Brand rules MUST come FIRST - GPT-Image-2 weights prompt beginning more heavily
@@ -645,11 +677,20 @@ Every element in the image must come from the instructions below. Nothing else."
             # These rules make AI graphics look professionally designed (not AI-generated)
             primary_color = brand_colors[0] if brand_colors else "#000000"
             secondary_color = brand_colors[1] if len(brand_colors) > 1 else "#FFFFFF"
-            cta_text = bc.get("default_link", "Link in bio")
+
+            # Use CTA from brand playbook's cta_styles
+            # If user has multiple CTAs, vary them randomly for diversity
+            cta_styles_list = bc.get("cta_styles", [])
+            if isinstance(cta_styles_list, list) and cta_styles_list:
+                import random
+                cta_text = random.choice(cta_styles_list)
+            else:
+                # Fallback to default_link if cta_styles is empty
+                cta_text = bc.get("default_link", "Link in bio")
 
             # Brand name display logic (PRD Section 4)
-            seed_lower = seed_content.lower()
-            show_brand_name = any([
+            # Art-piece posters ALWAYS include brand logo + tagline + badges
+            show_brand_name = is_art_piece or any([
                 "add our name" in seed_lower,
                 "add the name" in seed_lower,
                 "add our logo" in seed_lower,
@@ -680,7 +721,13 @@ Every element in the image must come from the instructions below. Nothing else."
             ])
 
             brand_name_directive = ""
-            if show_brand_name:
+            if is_art_piece:
+                # Art-piece posters have special branding requirements
+                tagline = bc.get("tagline", "")
+                tagline_text = f'\nTagline: Display "{tagline}" below the logo in complementary font.' if tagline else ""
+                brand_name_directive = f'''Display the brand name "{brand_name}" prominently at the top third or top centre of the poster. Logo size: large and clear.{tagline_text}
+Feature badges: Add 2-3 feature badges (e.g., "Premium Quality", "Limited Edition", "Handcrafted") near the bottom or flanking the product in elegant frames.'''
+            elif show_brand_name:
                 brand_name_directive = f'Display the brand name "{brand_name}" prominently in the design. Spell it exactly as shown.'
             else:
                 brand_name_directive = 'Do NOT display the brand name or logo anywhere. Brand identity is expressed through colours and visual treatment only.'
@@ -828,6 +875,38 @@ Follow these rules precisely for every image. No exceptions.
             if not image_prompt:
                 image_prompt = seed_content.strip()
 
+            # ========== PRODUCT PRESERVATION PIPELINE (PRD: Product-Preservation-Pipeline) ==========
+            # When reference_image provided: forensic analysis + preservation block
+            # This is the KEY innovation that prevents product distortion
+            product_preservation_block = ""
+            cutout_url = reference_image  # Default to original if background removal fails
+
+            if reference_image:
+                try:
+                    print(f"\n{'='*60}")
+                    print(f"🔬 PRODUCT PRESERVATION PIPELINE ACTIVATED")
+                    print(f"{'='*60}")
+
+                    # Step 1: Background removal (get clean product cutout)
+                    from app.utils.background_removal import remove_background
+                    cutout_url = await remove_background(reference_image, method="auto")
+                    print(f"✂️  Background removed: {cutout_url[:80]}...")
+
+                    # Step 2: Forensic product analysis (the key innovation)
+                    from app.agents.social_media_manager.services.product_analysis_service import ProductAnalysisService
+                    product_spec = await ProductAnalysisService.analyze_product_forensically(cutout_url)
+
+                    # Step 3: Build preservation block
+                    product_preservation_block = ProductAnalysisService.build_preservation_block(product_spec)
+
+                    print(f"✅ Product preservation block generated ({len(product_preservation_block)} chars)")
+                    print(f"{'='*60}\n")
+
+                except Exception as e:
+                    print(f"⚠️ Product preservation pipeline error: {str(e)}")
+                    print(f"   Falling back to standard reference image handling")
+                    # Continue with original reference_image, no preservation block
+
             # Add composition block based on style's composition_mode (Immersive Composition System PRD)
             # When a reference image is provided, choose composition style based on the visual style
             if reference_image:
@@ -908,6 +987,12 @@ OVERALL:
 
                 image_prompt = image_prompt.rstrip() + "\n" + composition_block
 
+            # ========== PREPEND PRESERVATION BLOCK (CRITICAL: Must come first) ==========
+            # The preservation block must be at the BEGINNING so GPT-Image-2 weights it heavily
+            if product_preservation_block:
+                image_prompt = product_preservation_block + "\n\n" + image_prompt
+                print(f"📌 Preservation block prepended to prompt (total: {len(image_prompt)} chars)")
+
             # ========== IMAGE GENERATION DEBUG (PRD Section 2) ==========
             from datetime import datetime
             print(f"\n{'='*60}")
@@ -951,10 +1036,13 @@ OVERALL:
                 f"{'━'*60}\n"
             )
 
+            # Use cutout_url (background-removed) if preservation pipeline ran, otherwise original
+            final_reference_image = cutout_url if (reference_image and cutout_url != reference_image) else reference_image
+
             image_response = await ImageContentService._call_dalle_api(
                 prompt=image_prompt,
                 size=f"{specs['width']}x{specs['height']}",
-                reference_image=reference_image,
+                reference_image=final_reference_image,
                 image_model=image_model,
             )
 
@@ -1526,16 +1614,46 @@ OVERALL:
                 vision_refs.append(f"{tmpl_count} template(s)")
             vision_ref_note = f" | vision refs: {', '.join(vision_refs)}" if vision_refs else ""
 
+            # Extract TEXT_LEVEL to know what text is overlaid on the image
+            text_level = 'NONE'
+            text_level_match = _re_hex.search(r'TEXT_LEVEL:\s*([A-Z_]+)', brief_no_hex)
+            if text_level_match:
+                text_level = text_level_match.group(1).strip()
+
+            # Extract the actual text from the FINAL_PROMPT for prefilling
+            image_text_overlay = None
+            if text_level not in ('NONE', 'N/A'):
+                # Try to extract quoted text from the prompt (headline, stat, etc.)
+                text_patterns = [
+                    r'"([^"]{4,100})"',  # Text in quotes
+                    r'text reads[:\s]+"([^"]+)"',  # "text reads: ..."
+                    r'headline[:\s]+"([^"]+)"',  # "headline: ..."
+                    r'stat[:\s]+"([^"]+)"',  # "stat: ..."
+                ]
+                for pattern in text_patterns:
+                    text_match = _re_hex.search(pattern, brief_clean, _re_hex.IGNORECASE)
+                    if text_match:
+                        image_text_overlay = text_match.group(1).strip()
+                        break
+
             print(f"\n{'━'*60}")
-            print(f"🎨 IMAGEN PROMPT — {platform.upper()} | type: {chosen_type}{vision_ref_note}")
+            print(f"🎨 IMAGEN PROMPT — {platform.upper()} | type: {chosen_type} | text: {text_level}{vision_ref_note}")
             print(f"   ✅ fields used ({len(filled)}): {', '.join(filled)}")
             if missing:
                 print(f"   ⚠️  fields missing ({len(missing)}): {', '.join(missing)}")
             print(f"   📝 prompt length: {len(brief_clean)} chars")
+            if image_text_overlay:
+                print(f"   📝 text overlay: {image_text_overlay}")
             print(f"{'━'*60}")
             print(brief_clean)
             print(f"{'━'*60}\n")
-            return brief_clean
+
+            return {
+                "prompt": brief_clean,
+                "image_type": chosen_type,
+                "text_level": text_level,
+                "text_overlay": image_text_overlay
+            }
 
         except Exception as e:
             print(f"⚠️ Image brief generation failed, using static prompt: {e}")
@@ -2344,6 +2462,303 @@ OVERALL:
             return UriResponse.error_response(f"Brand consistent image generation failed: {str(e)}")
 
 
+    @staticmethod
+    async def generate_long_form_content(
+        topic: str,
+        keywords: List[str],
+        tone: str,
+        word_count: int,
+        brand_profile: Optional[Dict] = None,
+        user_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Generate long-form blog content using GPT-4 Turbo
+
+        Args:
+            topic: Blog post topic/title
+            keywords: SEO keywords to integrate naturally
+            tone: Content tone (professional, inspirational, educational, conversational)
+            word_count: Target word count (1000, 2000, or 3000)
+            brand_profile: Optional brand context for voice consistency
+            user_id: Optional user ID for tracking
+
+        Returns:
+            Dict with:
+                - title: SEO-optimized title (60-70 chars)
+                - meta_description: SEO meta description (150-160 chars)
+                - content: Full HTML blog content with proper structure
+                - reading_time: Estimated reading time in minutes
+                - featured_image_url: DALL-E generated featured image
+                - social_snippets: Platform-specific social media posts
+        """
+        import json
+        import re
+
+        blog_text = ""  # Initialize to avoid reference errors
+
+        try:
+            # Extract brand context
+            brand_voice = ""
+            brand_colors = []
+            brand_name = "Your Brand"
+            industry = ""
+
+            if brand_profile:
+                brand_voice = brand_profile.get("derived_voice", "")
+                brand_colors = brand_profile.get("brand_colors", [])
+                brand_name = brand_profile.get("brand_name", "Your Brand")
+                industry = brand_profile.get("industry", "")
+
+            # Build blog generation prompt
+            keywords_str = ", ".join(keywords) if keywords else ""
+
+            blog_prompt = f"""Write an SEO-optimized blog post on the following topic:
+
+TOPIC: {topic}
+
+REQUIREMENTS:
+- Target word count: {word_count} words
+- Tone: {tone}
+- SEO Keywords to integrate naturally: {keywords_str}
+{"- Brand Voice: " + brand_voice if brand_voice else ""}
+{"- Industry: " + industry if industry else ""}
+- Brand Name: {brand_name}
+
+STRUCTURE:
+1. SEO Title (60-70 characters, include primary keyword)
+2. Meta Description (150-160 characters, compelling and keyword-rich)
+3. Introduction (150-200 words, hook the reader)
+4. Main Body (4-5 sections with H2 headings, each 200-400 words)
+5. Conclusion (100-150 words with clear CTA)
+
+FORMAT:
+Return ONLY a valid JSON object with this structure:
+{{
+    "title": "SEO-optimized title here",
+    "meta_description": "Meta description here",
+    "introduction": "Introduction paragraph",
+    "sections": [
+        {{
+            "heading": "Section heading",
+            "content": "Section content in HTML with <p>, <strong>, <em>, <ul>, <li> tags"
+        }}
+    ],
+    "conclusion": "Conclusion paragraph with CTA"
+}}
+
+STYLE GUIDELINES:
+- Use short paragraphs (2-3 sentences max)
+- Include bullet points where appropriate
+- Bold important terms
+- Write in second person ("you") for engagement
+- Include statistics or data points if relevant
+- Make it scannable with clear headings
+- Natural keyword integration (no keyword stuffing)
+- Professional yet accessible language
+
+Write the complete blog post now."""
+
+            # Call GPT-4 Turbo for blog content
+            print(f"📝 Generating {word_count}-word blog post: {topic}")
+
+            from app.services.AIService import client as openai_client
+
+            loop = asyncio.get_running_loop()
+            blog_response = await loop.run_in_executor(
+                None,
+                lambda: openai_client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": f"You are an expert SEO content writer specializing in {industry if industry else 'digital marketing'}. You write engaging, well-structured blog posts that rank well in search engines while being valuable to readers."
+                        },
+                        {
+                            "role": "user",
+                            "content": blog_prompt
+                        }
+                    ],
+                    temperature=0.7,
+                    max_tokens=4000
+                )
+            )
+
+            # Parse blog content
+            blog_text = blog_response.choices[0].message.content
+
+            # Extract JSON from response (handle markdown code blocks)
+            json_match = re.search(r'```json\s*(\{.*?\})\s*```', blog_text, re.DOTALL)
+            if json_match:
+                blog_text = json_match.group(1)
+
+            blog_data = json.loads(blog_text)
+
+            # Build HTML content
+            html_parts = []
+            html_parts.append(f"<h1>{blog_data['title']}</h1>")
+            html_parts.append(f"<div class='introduction'>{blog_data['introduction']}</div>")
+
+            for section in blog_data.get('sections', []):
+                html_parts.append(f"<h2>{section['heading']}</h2>")
+                html_parts.append(f"<div class='section-content'>{section['content']}</div>")
+
+            html_parts.append(f"<div class='conclusion'>{blog_data['conclusion']}</div>")
+
+            full_html = "\n\n".join(html_parts)
+
+            # Calculate reading time (average 200 words per minute)
+            word_count_actual = len(full_html.split())
+            reading_time = max(1, round(word_count_actual / 200))
+
+            # Image will be generated in background task (similar to social posts)
+            # Return placeholder for now
+            featured_image_url = None  # Will be generated in background
+
+            print(f"✅ Blog content generated: {word_count_actual} words, {reading_time} min read")
+            print(f"🎨 Featured image will be generated in background")
+
+            # Store image generation context for background task
+            image_generation_context = {
+                "title": blog_data['title'],
+                "topic": topic,
+                "tone": tone,
+                "industry": industry,
+                "brand_colors": brand_colors
+            }
+
+            # Generate social media snippets (short versions for promotion)
+            print(f"📱 Generating social media snippets")
+
+            social_prompt = f"""Create 3 social media posts to promote this blog article:
+
+Title: {blog_data['title']}
+Introduction: {blog_data['introduction']}
+
+Generate posts for:
+1. LinkedIn (professional, 150 characters max)
+2. Twitter (concise, 280 characters max)
+3. Facebook (engaging, 200 characters max)
+
+Each post should:
+- Hook the reader
+- Highlight key value
+- Include 2-3 relevant hashtags
+- Encourage click-through
+
+Return ONLY a JSON object:
+{{
+    "linkedin": "post text with hashtags",
+    "twitter": "post text with hashtags",
+    "facebook": "post text with hashtags"
+}}"""
+
+            social_response = await loop.run_in_executor(
+                None,
+                lambda: openai_client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[
+                        {"role": "system", "content": "You are a social media expert who writes engaging promotional posts."},
+                        {"role": "user", "content": social_prompt}
+                    ],
+                    temperature=0.8,
+                    max_tokens=500
+                )
+            )
+
+            social_text = social_response.choices[0].message.content
+
+            # Extract JSON from social response
+            json_match = re.search(r'```json\s*(\{.*?\})\s*```', social_text, re.DOTALL)
+            if json_match:
+                social_text = json_match.group(1)
+
+            social_snippets = json.loads(social_text)
+
+            print(f"✅ Blog generation complete: {len(full_html)} chars, {reading_time} min read")
+
+            return {
+                "title": blog_data['title'],
+                "meta_description": blog_data['meta_description'],
+                "content": full_html,
+                "reading_time": reading_time,
+                "word_count": word_count_actual,
+                "featured_image_url": featured_image_url,
+                "social_snippets": social_snippets,
+                "keywords": keywords,
+                "tone": tone,
+                "generated_at": datetime.utcnow().isoformat(),
+                "image_context": image_generation_context  # For background task
+            }
+
+        except json.JSONDecodeError as e:
+            print(f"❌ JSON parsing error: {str(e)}")
+            print(f"Raw response: {blog_text[:500]}")
+            raise Exception(f"Failed to parse blog content: {str(e)}")
+        except Exception as e:
+            print(f"❌ Blog generation error: {str(e)}")
+            raise Exception(f"Failed to generate blog content: {str(e)}")
+
+    @staticmethod
+    async def generate_blog_featured_image(
+        title: str,
+        topic: str,
+        tone: str,
+        industry: str,
+        brand_colors: List[str]
+    ) -> Dict[str, Any]:
+        """
+        Generate a featured image for blog post (called as background task)
+
+        Returns dict with 'success' and 'url' keys
+        """
+        try:
+            print(f"🎨 Generating blog featured image: {title[:50]}...")
+
+            color_str = ", ".join(brand_colors[:3]) if brand_colors else "modern professional colors"
+
+            image_prompt = f"""Professional blog featured image representing: "{title}"
+
+VISUAL CONCEPT:
+Create a high-quality, magazine-style hero image that visually represents the topic: {topic}
+
+STYLE REQUIREMENTS:
+• Photorealistic or high-end illustrative style
+• Landscape composition suitable for blog header
+• Professional, polished, editorial quality
+• Modern and contemporary aesthetic
+• Clear focal point that draws the eye
+• Mood: {tone}, inspiring, engaging
+
+COLOR PALETTE:
+Use these brand colors as inspiration: {color_str}
+Industry context: {industry if industry else "business"}
+
+CRITICAL RULES:
+• ABSOLUTELY NO TEXT, letters, words, or typography anywhere in the image
+• NO logos, brand names, or written elements
+• Pure visual imagery only
+• Suitable for professional publication
+• Landscape orientation optimized for web blog headers"""
+
+            # Use existing _call_dalle_api (consistent with rest of app)
+            image_result = await ImageContentService._call_dalle_api(
+                prompt=image_prompt,
+                size="1536x1024",  # Landscape for blog header
+                image_model="openai/gpt-image-2"
+            )
+
+            if not image_result.get("success"):
+                print(f"❌ Blog image generation failed")
+                return {"success": False, "url": None}
+
+            print(f"✅ Blog featured image generated successfully")
+            return image_result
+
+        except Exception as e:
+            print(f"❌ Blog image generation error: {str(e)}")
+            return {"success": False, "url": None}
+
+
 # Usage Examples:
 """
 # Generate content with images
@@ -2372,5 +2787,20 @@ brand_images = await ImageContentService.generate_brand_consistent_images(
         "style": "professional, Nigerian business",
         "industry": "financial services"
     }
+)
+
+# Generate long-form blog content
+blog_result = await ImageContentService.generate_long_form_content(
+    topic="10 Ways AI is Transforming Digital Marketing in 2025",
+    keywords=["AI marketing", "digital transformation", "marketing automation"],
+    tone="professional",
+    word_count=2000,
+    brand_profile={
+        "brand_name": "URI Social",
+        "derived_voice": "Professional, innovative, and results-driven",
+        "brand_colors": ["#CD1B78", "#1a1a1a", "#ffffff"],
+        "industry": "Marketing Technology"
+    },
+    user_id="user_123"
 )
 """

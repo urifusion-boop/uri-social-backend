@@ -119,36 +119,59 @@ class ApprovalWorkflowService:
                         update_data["approval_notes"] = approval_notes
                     
                     if schedule_option == "schedule":
+                        # Validate before accepting — fail fast with a visible error.
+                        if draft.get("platform") == "instagram" and draft.get("post_type", "feed") != "text":
+                            raw_img = ApprovalWorkflowService._resolve_image_url(draft.get("image_url") or "")
+                            if not raw_img:
+                                errors.append({"draft_id": draft_id, "error": "Instagram requires an image. Add one to this post before scheduling."})
+                                continue
+
+                        # Cancel ALL other in-flight drafts for this user+platform so the
+                        # cron never publishes stale/accumulated posts alongside this one.
+                        # Includes "publishing" so old Outstand submissions don't keep polling.
+                        cancel_result = await db["content_drafts"].update_many(
+                            {
+                                "user_id": user_id,
+                                "platform": draft["platform"],
+                                "status": {"$in": ["scheduled", "publish_failed", "publishing", "ready_to_publish"]},
+                                "id": {"$ne": draft_id},
+                            },
+                            {"$set": {"status": "replaced", "error_message": "Superseded by a newer scheduled post.", "updated_at": datetime.utcnow()}},
+                        )
+                        if cancel_result.modified_count:
+                            print(f"🗑️ Cancelled {cancel_result.modified_count} old {draft['platform']} drafts (all states) for user {user_id}")
+
                         update_data["scheduled_date"] = scheduled_datetime or (datetime.utcnow() + timedelta(hours=1))
                         update_data["status"] = "scheduled"
-                        update_data["user_id"] = user_id  # Ensure user_id is on the draft for the scheduler
+                        update_data["user_id"] = user_id
+                        update_data["platform_post_id"] = None  # reset so cron picks it up fresh
                     elif schedule_option == "immediate":
-                        # Mark for immediate publishing
                         update_data["status"] = "ready_to_publish"
-                    
+
                     await db["content_drafts"].update_one(
                         {"id": draft_id},
                         {"$set": update_data}
                     )
-                    
+
                     approved_drafts.append({
                         "draft_id": draft_id,
                         "platform": draft["platform"],
                         "status": update_data["status"],
                         "scheduled_date": scheduled_datetime.isoformat() if scheduled_datetime else None
                     })
-                    
+
                 except Exception as e:
                     errors.append({"draft_id": draft_id, "error": str(e)})
-            
-            # Publish immediately or send to Outstand with scheduledAt
-            if schedule_option in ("immediate", "schedule") and approved_drafts:
+
+            # ── Immediate publish only ────────────────────────────────────────
+            # Scheduled posts are owned entirely by the cron job (publish_scheduled_content).
+            # We do NOT call _trigger_immediate_publishing for them — that was the source of
+            # the double-publish race and the confusing "deferred to cron" no-op calls.
+            if schedule_option == "immediate" and approved_drafts:
                 publish_results = await ApprovalWorkflowService._trigger_immediate_publishing(
                     db, user_id, [d["draft_id"] for d in approved_drafts],
-                    scheduled_datetime=scheduled_datetime if schedule_option == "schedule" else None,
+                    scheduled_datetime=None,
                 )
-
-                # Update drafts with publishing results
                 for draft in approved_drafts:
                     draft_result = publish_results.get(draft["draft_id"])
                     if draft_result:
@@ -480,9 +503,29 @@ class ApprovalWorkflowService:
         This should be run periodically (e.g., every 5 minutes)
         """
         try:
-            # Find content scheduled for now or past, plus publish_failed drafts
-            # that may have been incorrectly failed (Outstand-handled posts).
             current_time = datetime.utcnow()
+
+            # Clean up stale "publishing" drafts (process crashed mid-publish > 10 min ago)
+            stale_cutoff = current_time - timedelta(minutes=10)
+            await db["content_drafts"].update_many(
+                {"status": "publishing", "updated_at": {"$lte": stale_cutoff}},
+                {"$set": {"status": "scheduled", "updated_at": current_time}},
+            )
+
+            # Only pick up drafts scheduled within the last 24 hours.
+            # Anything older is stale test data or a genuine missed publish —
+            # expire it so it doesn't flood the social accounts on re-deploy.
+            earliest_allowed = current_time - timedelta(hours=24)
+            expired_result = await db["content_drafts"].update_many(
+                {
+                    "status": "scheduled",
+                    "scheduled_date": {"$lte": earliest_allowed},
+                    "platform_post_id": None,
+                },
+                {"$set": {"status": "publish_failed", "error_message": "Scheduled time expired (>24h overdue). Re-schedule to publish.", "updated_at": current_time}},
+            )
+            if expired_result.modified_count:
+                print(f"⏰ Expired {expired_result.modified_count} overdue scheduled drafts (>24h past due)")
 
             scheduled_content = await db["content_drafts"].find({
                 "$or": [
@@ -499,10 +542,37 @@ class ApprovalWorkflowService:
 
             if not scheduled_content:
                 return {"message": "No scheduled content to publish", "published": 0}
-            
+
+            # Deduplicate ALL scheduled content: keep only the newest draft per (user_id, platform).
+            # Applies to both direct-publish drafts (no platform_post_id) and
+            # Outstand-polled drafts (has platform_post_id). This prevents old Outstand
+            # submissions from publishing after a newer draft has already been scheduled.
+            _seen_platform_user: dict = {}
+            _to_cancel: list = []
+            _all_scheduled = [d for d in scheduled_content if d.get("status") == "scheduled"]
+            _all_scheduled.sort(key=lambda d: d.get("created_at") or datetime.min, reverse=True)
+            for _dup in _all_scheduled:
+                _key = (_dup.get("user_id"), _dup.get("platform"))
+                if _key in _seen_platform_user:
+                    _to_cancel.append(_dup["id"])
+                else:
+                    _seen_platform_user[_key] = _dup["id"]
+            if _to_cancel:
+                await db["content_drafts"].update_many(
+                    {"id": {"$in": _to_cancel}},
+                    {"$set": {
+                        "status": "replaced",
+                        "error_message": "Superseded by a newer draft for the same platform.",
+                        "updated_at": current_time,
+                    }},
+                )
+                print(f"🗑️ Cancelled {len(_to_cancel)} duplicate drafts (kept newest per platform): {_to_cancel}")
+                _cancel_set = set(_to_cancel)
+                scheduled_content = [d for d in scheduled_content if d.get("id") not in _cancel_set]
+
             published_count = 0
             errors = []
-            
+
             for draft in scheduled_content:
                 try:
                     # If this draft was already submitted to Outstand (has platform_post_id),
@@ -542,6 +612,17 @@ class ApprovalWorkflowService:
                                 )
                                 print(f"🗑️ Marked stale Outstand draft as published (404) | draft_id={draft['id']}")
                         continue  # Never re-publish a draft already handed to Outstand
+
+                    # Atomically claim this draft before publishing to prevent concurrent cron
+                    # runs from double-publishing the same post.  If another worker already
+                    # claimed it (status changed to "publishing"), skip and move on.
+                    claimed = await db["content_drafts"].find_one_and_update(
+                        {"id": draft["id"], "status": "scheduled"},
+                        {"$set": {"status": "publishing", "updated_at": datetime.utcnow()}},
+                    )
+                    if not claimed:
+                        print(f"⏭️ Draft {draft['id']} already claimed by another cron run — skipping")
+                        continue
 
                     # Use user_id stored directly on the draft
                     draft_user_id = draft.get("user_id")
@@ -604,7 +685,7 @@ class ApprovalWorkflowService:
                         })
                         continue
 
-                    print(f"🕐 Publishing scheduled post | draft_id={draft['id']} platform={draft['platform']} user_id={draft_user_id}")
+                    print(f"🕐 Publishing scheduled post | draft_id={draft['id']} platform={draft['platform']} connected_via={connection.get('connected_via')} user_id={draft_user_id}")
                     publish_result = await ApprovalWorkflowService._publish_to_platform(
                         platform=draft["platform"],
                         draft=draft,
@@ -612,6 +693,9 @@ class ApprovalWorkflowService:
                         scheduled_datetime=None,  # We publish immediately when the time arrives
                         db=db,
                     )
+                    if publish_result is None:
+                        publish_result = {"success": False, "error": f"_publish_to_platform returned None for platform={draft['platform']} connected_via={connection.get('connected_via')} — unhandled publish path"}
+                    print(f"📊 Scheduled publish result | draft_id={draft['id']}: {publish_result}")
 
                     conn_filter = (
                         {"id": connection["id"]} if connection.get("id")
@@ -656,14 +740,25 @@ class ApprovalWorkflowService:
                         errors.append({"draft_id": draft["id"], "error": publish_result.get("error")})
 
                 except Exception as e:
-                    errors.append({"draft_id": draft.get("id", "unknown"), "error": str(e)})
-            
+                    draft_id_for_error = draft.get("id", "unknown")
+                    errors.append({"draft_id": draft_id_for_error, "error": str(e)})
+                    print(f"❌ Exception during scheduled publish for draft_id={draft_id_for_error}: {e}")
+                    # Reset "publishing" back to "publish_failed" so the draft doesn't get stuck
+                    if draft_id_for_error != "unknown":
+                        try:
+                            await db["content_drafts"].update_one(
+                                {"id": draft_id_for_error, "status": "publishing"},
+                                {"$set": {"status": "publish_failed", "error_message": str(e), "updated_at": datetime.utcnow()}},
+                            )
+                        except Exception:
+                            pass
+
             return {
                 "published_count": published_count,
                 "errors": errors,
                 "processed_at": datetime.utcnow().isoformat()
             }
-            
+
         except Exception as e:
             return {"error": f"Scheduled publishing failed: {str(e)}"}
     
@@ -828,56 +923,17 @@ class ApprovalWorkflowService:
     @staticmethod
     async def _upload_base64_to_imgbb(data_url: str) -> Optional[str]:
         """
-        Upload a base64 data URL image to imgBB and return a permanent public URL.
-        This is needed because Outstand must fetch the image from a public URL,
-        and our ngrok/local URLs are not reliably accessible to Outstand's servers.
-        Returns the public URL string or None on failure.
+        Upload a base64 data URL image to Cloudinary and return a permanent public URL.
+        Used everywhere we need a public HTTPS URL for Outstand, Instagram, or Facebook.
+        Returns the Cloudinary secure_url string or None on failure.
         """
-        import httpx as _httpx
-        api_key = settings.IMGBB_API_KEY
-        if not api_key:
-            print("⚠️ IMGBB_API_KEY not set — cannot upload image for Outstand")
-            return None
-
         try:
-            match = re.match(r'data:([^;]+);base64,(.+)', data_url, re.DOTALL)
-            if not match:
-                print("⚠️ imgBB upload: invalid data URL format")
-                return None
-            mime_type = match.group(1)
-            b64_data = match.group(2)
-
-            # Convert to JPEG if the image is WebP or any format unsupported by social platforms
-            if mime_type in ("image/webp", "image/gif") or not mime_type.startswith("image/jpeg"):
-                try:
-                    import base64
-                    import io
-                    from PIL import Image
-                    img_bytes = base64.b64decode(b64_data)
-                    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-                    out = io.BytesIO()
-                    img.save(out, format="JPEG", quality=90)
-                    b64_data = base64.b64encode(out.getvalue()).decode()
-                    print(f"🔄 Converted image from {mime_type} to JPEG for social platform compatibility")
-                except Exception as conv_err:
-                    print(f"⚠️ Image conversion to JPEG failed, uploading original: {conv_err}")
-
-            async with _httpx.AsyncClient(timeout=120) as client:
-                resp = await client.post(
-                    "https://api.imgbb.com/1/upload",
-                    data={"key": api_key, "image": b64_data},
-                )
-                resp_json = resp.json()
-
-            if resp_json.get("success"):
-                url = resp_json["data"]["url"]
-                print(f"📸 Image uploaded to imgBB: {url}")
-                return url
-            else:
-                print(f"⚠️ imgBB upload failed: {resp_json}")
-                return None
+            from app.utils.cloudinary_upload import upload_base64 as _cld_upload
+            url = await _cld_upload(data_url, folder="uri-social/drafts")
+            print(f"📸 Image uploaded to Cloudinary: {url}")
+            return url
         except Exception as e:
-            print(f"⚠️ imgBB upload exception: {e}")
+            print(f"⚠️ Cloudinary upload exception: {e}")
             return None
 
     @staticmethod
@@ -1053,19 +1109,19 @@ class ApprovalWorkflowService:
                     return {"success": False, "error": "X API credits depleted and no Outstand X account connected as fallback."}
 
         # ── Instagram direct (via Facebook Page Access Token) ────────────────
-        if platform == "instagram" and connection.get("connected_via") in ("instagram_direct", "instagram_direct_oauth"):
-            # Instagram Graph API does not support native scheduling for standard feed posts.
-            # When scheduled_datetime is set the draft is already stored with status="scheduled"
-            # and the cron job (publish_scheduled_content) will call this again at the right
-            # time with scheduled_datetime=None to do the actual publish.
-            if scheduled_datetime:
-                print(f"⏰ Instagram direct — deferred to cron scheduler for {scheduled_datetime.isoformat()}")
-                return {"success": True, "scheduled": True, "post_id": None}
-
+        # Match on connected_via OR on presence of ig_user_id credentials (defensive: covers
+        # connections stored with an unexpected connected_via value but valid credentials).
+        _ig_cv = connection.get("connected_via")
+        print(f"🔀 _publish_to_platform routing | platform={platform} connected_via={_ig_cv} ig_user_id={connection.get('ig_user_id')} has_page_token={'yes' if connection.get('page_access_token') else 'NO'}")
+        if platform == "instagram" and (
+            _ig_cv in ("instagram_direct", "instagram_direct_oauth")
+            or (connection.get("ig_user_id") and connection.get("page_access_token"))
+        ):
             from app.agents.social_media_manager.services.instagram_direct_service import InstagramDirectService
             ig_user_id = connection.get("ig_user_id")
             page_token = connection.get("page_access_token")
             page_id = connection.get("page_id")
+            print(f"🔗 Instagram connection details | ig_user_id={ig_user_id} page_id={page_id} connected_via={_ig_cv} token_present={'yes' if page_token else 'NO'}")
             if not ig_user_id or not page_token:
                 return {"success": False, "error": "Instagram direct connection is missing credentials. Please reconnect Facebook."}
 
@@ -1094,6 +1150,35 @@ class ApprovalWorkflowService:
                 image_url = ApprovalWorkflowService._resolve_image_url(draft.get("image_url") or "")
                 if image_url and image_url.startswith("data:"):
                     image_url = await ApprovalWorkflowService._upload_base64_to_imgbb(image_url) or ""
+
+                print(f"📱 Instagram feed publish | ig_user_id={ig_user_id} page_id={page_id} token_len={len(page_token) if page_token else 0} raw_image_url={image_url[:120] if image_url else None}")
+
+                # Force-rehost the image through Facebook CDN (page_id available) or
+                # Cloudinary (fallback) to guarantee Instagram can fetch it.
+                # Cloudinary URLs can trigger content-negotiation that serves WebP to
+                # bots — rehosting ensures a clean JPEG that Meta's crawler accepts.
+                if image_url and image_url.startswith("https://"):
+                    print(f"🔄 Pre-uploading Instagram image for reliability...")
+                    try:
+                        import httpx as _httpx_ig
+                        async with _httpx_ig.AsyncClient(timeout=30, follow_redirects=True) as _ig_cl:
+                            _img_r = await _ig_cl.get(image_url)
+                            _img_r.raise_for_status()
+                            _img_bytes = _img_r.content
+                        print(f"   ↓ Downloaded {len(_img_bytes)} bytes (content-type: {_img_r.headers.get('content-type', 'unknown')})")
+                        if page_id:
+                            _rehosted = await InstagramDirectService._upload_to_facebook_cdn(page_id, page_token, _img_bytes)
+                        else:
+                            from app.utils.cloudinary_upload import upload_bytes as _cld_ig
+                            _rehosted = await _cld_ig(_img_bytes, folder="uri-social/instagram")
+                        if _rehosted:
+                            print(f"   ✅ Pre-upload success → {_rehosted}")
+                            image_url = _rehosted
+                        else:
+                            print(f"   ⚠️ Pre-upload returned None — using original URL")
+                    except Exception as _preup_err:
+                        print(f"   ⚠️ Pre-upload failed ({_preup_err}) — using original URL")
+
                 return await InstagramDirectService.publish_post(
                     ig_user_id=ig_user_id,
                     page_access_token=page_token,
@@ -1110,10 +1195,6 @@ class ApprovalWorkflowService:
             urn = connection.get("person_urn") or connection.get("active_author_urn")
             if not token or not urn:
                 return {"success": False, "error": "LinkedIn connection is missing OAuth token or author URN. Please reconnect your account."}
-            # LinkedIn API does not support native scheduling — defer to cron
-            if scheduled_datetime:
-                print(f"⏰ LinkedIn direct — deferred to cron scheduler for {scheduled_datetime.isoformat()}")
-                return {"success": True, "scheduled": True, "post_id": None}
             image_url = ApprovalWorkflowService._resolve_image_url(draft.get("image_url") or "")
             if image_url and image_url.startswith("data:"):
                 image_url = await ApprovalWorkflowService._upload_base64_to_imgbb(image_url) or ""
@@ -1131,6 +1212,10 @@ class ApprovalWorkflowService:
             except Exception as e:
                 print(f"❌ LinkedIn direct publish failed: {e}")
                 return {"success": False, "error": f"LinkedIn direct publish failed: {str(e)}"}
+
+        # ── Facebook direct OAuth — defer scheduled posts to cron ────────────
+        if platform == "facebook" and connection.get("connected_via") == "facebook_direct_oauth":
+            pass  # fall through to the legacy Facebook block below
 
         # ── Outstand-connected accounts ───────────────────────────────────────
         if connection.get("connected_via") == "outstand":
@@ -1397,7 +1482,22 @@ class ApprovalWorkflowService:
                         if media_fbid:
                             post_data["attached_media"] = [{"media_fbid": media_fbid}]
                     else:
-                        post_data["media"] = [{"url": image_url, "media_type": "IMAGE"}]
+                        # Upload public URL image to Facebook as unpublished photo to get a media_fbid
+                        try:
+                            import httpx as _httpx
+                            async with _httpx.AsyncClient(timeout=30) as _fc:
+                                _upload = await _fc.post(
+                                    f"https://graph.facebook.com/{settings.FACEBOOK_API_VERSION}/{page_id}/photos",
+                                    data={"url": image_url, "published": "false", "access_token": page_token},
+                                )
+                            _fbid = _upload.json().get("id")
+                            if _fbid:
+                                post_data["attached_media"] = [{"media_fbid": _fbid}]
+                                print(f"📸 FB image uploaded by URL: media_fbid={_fbid}")
+                            else:
+                                print(f"⚠️ FB image URL upload failed: {_upload.json()} — posting without image")
+                        except Exception as _img_err:
+                            print(f"⚠️ FB image URL upload error: {_img_err} — posting without image")
 
                 if scheduled_datetime:
                     import calendar
