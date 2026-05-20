@@ -9,12 +9,13 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from app.services.AIService import AIService
 from app.domain.responses.uri_response import UriResponse
-# Caption Voice System imports (keeping code but disabling for now)
-# from app.agents.social_media_manager.services.caption_validator_service import CaptionValidatorService
-# from app.agents.social_media_manager.services.caption_voice_system import (
-#     BANNED_PATTERNS_RULES,
-#     build_voice_profile_instructions,
-# )
+# Caption Voice System imports
+from app.agents.social_media_manager.services.caption_validator_service import CaptionValidatorService
+from app.agents.social_media_manager.services.caption_voice_system import (
+    BANNED_PATTERNS_RULES,
+    build_voice_profile_instructions,
+    get_platform_formatting_rules,
+)
 
 
 class ContentGenerationService:
@@ -404,28 +405,80 @@ Write as if you're sharing hard-won business wisdom with fellow African entrepre
         request_id: Optional[str] = None,
         brand_context: Optional[Dict[str, Any]] = None,
         db: Optional[AsyncIOMotorDatabase] = None,
+        reference_image: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Generate platform-native content simultaneously for all requested platforms
-        
+
         Integrates with your existing URI user system and follows established patterns.
-        
+
         Args:
             user_id: ID of the URI user requesting content
             seed_content: Original content to transform
             platforms: List of platforms to generate content for
             seed_type: Type of seed content (text, url, mention_response, etc.)
             request_id: Optional existing request ID (for regeneration)
-        
+            reference_image: Optional base64 data URL for product/context analysis
+
         Returns:
             Dictionary containing request_id, generated drafts, and status
         """
-        
+
         # Create or use existing request ID
         if not request_id:
             request_id = str(ObjectId())
-        
+
         print(f"🤖 Generating content for {len(platforms)} platforms: {platforms}")
+
+        # ── VISION ANALYSIS: If reference_image provided, analyze it first ──────
+        enriched_seed_content = seed_content
+        if reference_image:
+            print(f"🔍 Reference image detected, analyzing product/context...")
+            try:
+                vision_prompt = f"""Analyze this product image and extract key details to help write engaging social media content.
+
+USER'S REQUEST: {seed_content}
+
+Provide a detailed description including:
+1. Product name/type (what is it?)
+2. Visual appearance (colors, materials, design style, packaging)
+3. Key features or benefits visible in the image
+4. Target audience (who would buy this?)
+5. Emotional appeal (what feeling does it evoke?)
+6. Any text/branding visible on the product
+
+Be specific and descriptive. This analysis will be used to generate authentic product content."""
+
+                vision_request = AIService.build_ai_model(
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": vision_prompt},
+                            {"type": "image_url", "image_url": {"url": reference_image}}
+                        ]
+                    }],
+                    temperature=0.5,
+                )
+
+                vision_response = await AIService.chat_completion(vision_request)
+
+                if isinstance(vision_response, dict) and "error" in vision_response:
+                    print(f"⚠️ Vision analysis failed: {vision_response['error']}")
+                else:
+                    product_analysis = vision_response.choices[0].message.content.strip()
+                    print(f"✅ Product analysis complete: {product_analysis[:150]}...")
+
+                    # Enrich seed_content with product analysis
+                    enriched_seed_content = f"""USER REQUEST: {seed_content}
+
+PRODUCT ANALYSIS FROM IMAGE:
+{product_analysis}
+
+Create social media content about THIS SPECIFIC PRODUCT based on the image analysis above. Do NOT write about Uri Social or content creation services - write about the PRODUCT shown in the image."""
+
+            except Exception as e:
+                print(f"⚠️ Vision analysis error: {e}")
+                # Continue with original seed_content if vision fails
         
         # Validate platforms
         supported_platforms = list(ContentGenerationService.PLATFORM_PROMPTS.keys())
@@ -440,7 +493,7 @@ Write as if you're sharing hard-won business wisdom with fellow African entrepre
         generation_tasks = []
         for platform in valid_platforms:
             task = ContentGenerationService._generate_platform_content(
-                platform, seed_content, request_id, user_id, brand_context
+                platform, enriched_seed_content, request_id, user_id, brand_context
             )
             generation_tasks.append(task)
         
@@ -560,18 +613,34 @@ Write as if you're sharing hard-won business wisdom with fellow African entrepre
             prompt_template = ContentGenerationService.PLATFORM_PROMPTS[platform]
             brand_block = ContentGenerationService._build_brand_block(brand_context, platform=platform)
             platform_prompt = prompt_template.format(seed_content=seed_content)
-            # Brand instructions go first so they govern everything that follows
-            prompt = brand_block + platform_prompt if brand_block else platform_prompt
 
-            # Prepend universal formatting rule — must override any model default toward markdown
-            formatting_rule = (
-                "ABSOLUTE FORMATTING RULE: Output plain text only. "
-                "Never use markdown syntax of any kind — no **bold**, no *italic*, no __underline__, "
-                "no # headings, no bullet hyphens (- or *), no numbered lists with dots, no backticks. "
-                "If you want emphasis, choose stronger words. If you want structure, use line breaks. "
-                "The output will be displayed directly on a social media platform exactly as you write it.\n\n"
-            )
-            prompt = formatting_rule + prompt
+            # Build voice profile instructions if available
+            voice_instructions = ""
+            if brand_context and brand_context.get("voice_profile"):
+                voice_instructions = build_voice_profile_instructions(
+                    brand_context["voice_profile"],
+                    brand_context.get("voice_sample_analysis"),
+                    platform
+                )
+
+            # Get platform-specific formatting rules
+            platform_formatting = get_platform_formatting_rules(platform)
+
+            # Assemble the complete prompt with proper order:
+            # 1. Banned patterns rules (universal)
+            # 2. Formatting rules (universal + platform-specific)
+            # 3. Voice profile (brand-specific)
+            # 4. Brand context
+            # 5. Platform prompt
+            prompt_parts = [
+                BANNED_PATTERNS_RULES,
+                platform_formatting,
+                voice_instructions,
+                brand_block if brand_block else "",
+                platform_prompt
+            ]
+
+            prompt = "\n".join([p for p in prompt_parts if p])
             
             # Use your existing AIService with optimized parameters
             ai_request = AIService.build_ai_model(
@@ -598,46 +667,45 @@ Write as if you're sharing hard-won business wisdom with fellow African entrepre
             )
 
             # ── Caption Validation & Auto-Fix (PRD Section 7) ──────────────────────
-            # TEMPORARILY DISABLED - Testing if this breaks image generation
-            # # Extract custom banned words from voice profile
-            # custom_banned_words = []
-            # if brand_context and brand_context.get("voice_profile"):
-            #     custom_banned_words = brand_context["voice_profile"].get("banned_words", [])
-            #
-            # # Validate the caption
-            # validation_result = CaptionValidatorService.validate_caption(content, custom_banned_words)
-            #
-            # # If validation fails, attempt auto-fix (one retry)
-            # if not validation_result["passed"]:
-            #     print(f"[CAPTION] Validation failed for {platform}: {validation_result['issues']}")
-            #
-            #     # Generate fix prompt
-            #     fix_prompt = CaptionValidatorService.generate_fix_prompt(content, validation_result)
-            #
-            #     # Regenerate with fix instructions
-            #     fix_ai_request = AIService.build_ai_model(
-            #         messages=[{"role": "user", "content": fix_prompt}],
-            #         temperature=0.7,
-            #     )
-            #
-            #     fix_ai_response = await AIService.chat_completion(fix_ai_request)
-            #     if not (isinstance(fix_ai_response, dict) and "error" in fix_ai_response):
-            #         fixed_content = fix_ai_response.choices[0].message.content.strip()
-            #
-            #         # Re-extract hashtags from fixed content
-            #         content, hashtags = ContentGenerationService._extract_and_clean_hashtags(
-            #             fixed_content, platform
-            #         )
-            #
-            #         # Validate again
-            #         revalidation = CaptionValidatorService.validate_caption(content, custom_banned_words)
-            #         if revalidation["passed"]:
-            #             print(f"[CAPTION] ✓ Fixed and validated for {platform}")
-            #         else:
-            #             print(f"[CAPTION] ⚠ Still has issues after fix: {revalidation['issues'][:3]}")
-            #             # Proceed with content anyway, but flag it
-            # else:
-            #     print(f"[CAPTION] ✓ Passed validation for {platform}")
+            # Extract custom banned words from voice profile
+            custom_banned_words = []
+            if brand_context and brand_context.get("voice_profile"):
+                custom_banned_words = brand_context["voice_profile"].get("banned_words", [])
+
+            # Validate the caption
+            validation_result = CaptionValidatorService.validate_caption(content, custom_banned_words)
+
+            # If validation fails, attempt auto-fix (one retry)
+            if not validation_result["passed"]:
+                print(f"[CAPTION] Validation failed for {platform}: {validation_result['issues']}")
+
+                # Generate fix prompt
+                fix_prompt = CaptionValidatorService.generate_fix_prompt(content, validation_result)
+
+                # Regenerate with fix instructions
+                fix_ai_request = AIService.build_ai_model(
+                    messages=[{"role": "user", "content": fix_prompt}],
+                    temperature=0.7,
+                )
+
+                fix_ai_response = await AIService.chat_completion(fix_ai_request)
+                if not (isinstance(fix_ai_response, dict) and "error" in fix_ai_response):
+                    fixed_content = fix_ai_response.choices[0].message.content.strip()
+
+                    # Re-extract hashtags from fixed content
+                    content, hashtags = ContentGenerationService._extract_and_clean_hashtags(
+                        fixed_content, platform
+                    )
+
+                    # Validate again
+                    revalidation = CaptionValidatorService.validate_caption(content, custom_banned_words)
+                    if revalidation["passed"]:
+                        print(f"[CAPTION] ✓ Fixed and validated for {platform}")
+                    else:
+                        print(f"[CAPTION] ⚠ Still has issues after fix: {revalidation['issues'][:3]}")
+                        # Proceed with content anyway, but flag it
+            else:
+                print(f"[CAPTION] ✓ Passed validation for {platform}")
 
             # Generate a draft ID
             draft_id = str(ObjectId())

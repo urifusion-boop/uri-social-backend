@@ -117,10 +117,16 @@ class StoryboardRequest(BaseModel):
     optional_text: Optional[str] = Field(None, max_length=1000)
     target_platform: str = "instagram_reels"
     target_duration_seconds: int = Field(15, ge=5, le=30)
+    video_style: Optional[str] = "clean_commercial"
 
 class StoryboardFramesRequest(BaseModel):
     scenes: List[Dict[str, Any]]
     brand_images: List[str] = Field(default_factory=list, max_items=5)
+
+class PublishVideoDraftRequest(BaseModel):
+    draft_id: str
+    platform: str   # "instagram_reels" | "facebook_reels"
+    caption: Optional[str] = None
 
 class VideoFromStoryboardRequest(BaseModel):
     storyboard: Dict[str, Any]
@@ -396,6 +402,7 @@ async def generate_content(
                 seed_type=request.seed_type,
                 brand_context=brand_context_dict,
                 db=db,
+                reference_image=request.reference_image,
             )
 
         # Tag post_type on all resulting drafts in DB
@@ -561,6 +568,180 @@ async def initiate_social_connections(
     )
 
 
+@router.get("/connect/facebook-direct/initiate")
+async def facebook_direct_initiate(source: Optional[str] = Query("settings")):
+    """
+    Redirect the user's browser to Facebook's OAuth page to connect a Facebook Page
+    directly (without Outstand). On completion, Facebook redirects to
+    /connect/facebook-direct/callback.
+    """
+    import urllib.parse
+
+    app_id = settings.META_APP_ID
+    if not app_id:
+        raise HTTPException(status_code=500, detail="META_APP_ID not configured")
+
+    _base = (settings.PUBLIC_API_URL or settings.URI_GATEWAY_BASE_API_URL).rstrip("/")
+    redirect_uri = f"{_base}/social-media/connect/facebook-direct/callback"
+
+    scopes = [
+        "pages_show_list",
+        "pages_read_engagement",
+        "pages_manage_posts",
+        "pages_manage_metadata",
+    ]
+    params = {
+        "client_id": app_id,
+        "redirect_uri": redirect_uri,
+        "scope": ",".join(scopes),
+        "response_type": "code",
+        "state": source or "settings",
+    }
+    auth_url = f"https://www.facebook.com/{settings.FACEBOOK_API_VERSION}/dialog/oauth?" + urllib.parse.urlencode(params)
+    return RedirectResponse(auth_url)
+
+
+@router.get("/connect/facebook-direct/callback")
+async def facebook_direct_callback(
+    code: Optional[str] = Query(None),
+    state: Optional[str] = Query(None),
+    error: Optional[str] = Query(None),
+    error_reason: Optional[str] = Query(None),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """
+    Facebook OAuth callback for direct Facebook Page connection.
+    Exchanges the auth code for a Page access token, picks the first page,
+    stores a pending connection, and redirects back to the workspace.
+    """
+    import urllib.parse
+    import httpx
+    from datetime import timezone
+
+    web_app_url = settings.WEB_APP_URL.strip("'\"")
+    base_redirect = f"{web_app_url}/workspace?tab=connections"
+
+    if error:
+        msg = urllib.parse.quote(error_reason or error)
+        return RedirectResponse(f"{base_redirect}&connected=false&error={msg}")
+
+    if not code:
+        return RedirectResponse(f"{base_redirect}&connected=false&error=missing_code")
+
+    _base = (settings.PUBLIC_API_URL or settings.URI_GATEWAY_BASE_API_URL).rstrip("/")
+    redirect_uri = f"{_base}/social-media/connect/facebook-direct/callback"
+    app_id = settings.META_APP_ID
+    app_secret = settings.META_APP_SECRET
+    graph_base = f"https://graph.facebook.com/{settings.FACEBOOK_API_VERSION}"
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            # Step 1: exchange code → short-lived user token
+            token_resp = await client.get(
+                f"{graph_base}/oauth/access_token",
+                params={
+                    "client_id": app_id,
+                    "client_secret": app_secret,
+                    "redirect_uri": redirect_uri,
+                    "code": code,
+                },
+            )
+            token_data = token_resp.json()
+            if "error" in token_data:
+                raise ValueError(f"Token exchange error: {token_data['error'].get('message')}")
+            short_token = token_data["access_token"]
+
+            # Step 2: exchange → long-lived user token
+            ll_resp = await client.get(
+                f"{graph_base}/oauth/access_token",
+                params={
+                    "grant_type": "fb_exchange_token",
+                    "client_id": app_id,
+                    "client_secret": app_secret,
+                    "fb_exchange_token": short_token,
+                },
+            )
+            ll_data = ll_resp.json()
+            long_token = ll_data.get("access_token", short_token)
+
+            # Step 3: get the user's Facebook Pages
+            pages_resp = await client.get(
+                f"{graph_base}/me/accounts",
+                params={"access_token": long_token, "fields": "id,name,access_token,picture"},
+            )
+            pages_data = pages_resp.json()
+            pages = pages_data.get("data", [])
+
+            if not pages:
+                err_msg = urllib.parse.quote("No Facebook Pages found. You need a Facebook Page to connect.")
+                return RedirectResponse(f"{base_redirect}&connected=false&error={err_msg}")
+
+            # Use the first page (most users have one main page)
+            page = pages[0]
+            page_id = page["id"]
+            page_name = page["name"]
+            page_token = page["access_token"]
+            profile_pic = page.get("picture", {}).get("data", {}).get("url", "") if isinstance(page.get("picture"), dict) else ""
+
+            now = datetime.now(timezone.utc).isoformat()
+            conn_doc = {
+                "id": f"fb_{page_id}",
+                "user_id": None,               # set by finalize
+                "platform": "facebook",
+                "connected_via": "facebook_direct_oauth",
+                "page_id": page_id,
+                "page_access_token": page_token,
+                "account_name": page_name,
+                "profile_picture_url": profile_pic,
+                "connection_status": "pending_user_match",
+                "connected_at": now,
+                "updated_at": now,
+            }
+            await db["social_connections"].update_one(
+                {"id": f"fb_{page_id}"},
+                {"$set": conn_doc},
+                upsert=True,
+            )
+            print(f"[FBDirectOAuth] ✅ Stored page '{page_name}' (page_id={page_id}) pending user match")
+
+            params_out = (
+                f"connected=facebook_direct"
+                f"&fb_page_id={urllib.parse.quote(page_id)}"
+                f"&page_name={urllib.parse.quote(page_name)}"
+            )
+            return RedirectResponse(f"{base_redirect}&{params_out}")
+
+    except Exception as e:
+        print(f"[FBDirectOAuth] ❌ Error: {e}")
+        return RedirectResponse(
+            f"{base_redirect}&connected=false&error={urllib.parse.quote(str(e))}"
+        )
+
+
+@router.post("/connect/facebook-direct/finalize")
+async def facebook_direct_finalize(
+    fb_page_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Called by the frontend after the Facebook direct OAuth callback to
+    associate the pending connection with the authenticated user.
+    """
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    result = await db["social_connections"].update_one(
+        {"id": f"fb_{fb_page_id}"},
+        {"$set": {"user_id": user_id, "connection_status": "active", "updated_at": datetime.utcnow().isoformat()}},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Facebook connection not found — try reconnecting")
+
+    return UriResponse.get_single_data_response("facebook_connected", {"fb_page_id": fb_page_id})
+
+
 @router.get("/connect/instagram-direct/initiate")
 async def instagram_direct_initiate(source: Optional[str] = Query("settings")):
     """
@@ -615,21 +796,18 @@ async def instagram_direct_callback(
     import httpx
     from datetime import timezone
 
-    source = state or "settings"
-    is_settings = source == "settings"
     web_app_url = settings.WEB_APP_URL.strip("'\"")
-    base_redirect = (
-        f"{web_app_url}/settings/social-accounts"
-        if is_settings
-        else f"{web_app_url}/social-media/brand-setup"
-    )
+    # Always redirect to the workspace connections tab — that is where
+    # the finalizeInstagramDirect handler lives. /settings/social-accounts
+    # does not exist as a route so the finalize call would never fire there.
+    base_redirect = f"{web_app_url}/workspace?tab=connections"
 
     if error:
         msg = urllib.parse.quote(error_reason or error)
-        return RedirectResponse(f"{base_redirect}?connected=false&error={msg}")
+        return RedirectResponse(f"{base_redirect}&connected=false&error={msg}")
 
     if not code:
-        return RedirectResponse(f"{base_redirect}?connected=false&error=missing_code")
+        return RedirectResponse(f"{base_redirect}&connected=false&error=missing_code")
 
     _base = (settings.PUBLIC_API_URL or settings.URI_GATEWAY_BASE_API_URL).rstrip("/")
     redirect_uri = f"{_base}/social-media/connect/instagram-direct/callback"
@@ -724,6 +902,7 @@ async def instagram_direct_callback(
             "platform": "instagram",
             "connected_via": "instagram_direct_oauth",
             "ig_user_id": ig_user_id,
+            "page_id": pid,  # Facebook Page ID linked to this Instagram account
             "page_access_token": page_token,
             "username": username,
             "account_name": username,
@@ -744,12 +923,13 @@ async def instagram_direct_callback(
             f"&ig_user_id={urllib.parse.quote(ig_user_id)}"
             f"&username={urllib.parse.quote(username)}"
         )
-        return RedirectResponse(f"{base_redirect}?{params_out}")
+        # base_redirect already has ?tab=connections so append with &
+        return RedirectResponse(f"{base_redirect}&{params_out}")
 
     except Exception as e:
         print(f"[IGDirectOAuth] ❌ Error: {e}")
         return RedirectResponse(
-            f"{base_redirect}?connected=false&error={urllib.parse.quote(str(e))}"
+            f"{base_redirect}&connected=false&error={urllib.parse.quote(str(e))}"
         )
 
 
@@ -935,6 +1115,29 @@ async def disconnect_instagram_direct(
         raise HTTPException(status_code=404, detail="Instagram connection not found")
 
     return {"status": True, "responseMessage": "Instagram account disconnected"}
+
+
+@router.delete("/connections/facebook-direct")
+async def disconnect_facebook_direct(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Disconnect a Facebook Page connected via direct OAuth (not Outstand).
+    """
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    result = await db["social_connections"].delete_one({
+        "user_id": user_id,
+        "platform": "facebook",
+        "connected_via": "facebook_direct_oauth",
+    })
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Facebook connection not found")
+
+    return {"status": True, "responseMessage": "Facebook page disconnected"}
 
 
 # ==============================================================================
@@ -1958,13 +2161,21 @@ async def get_calendar_trends(
         raise HTTPException(status_code=401, detail="User ID not found in token")
     from app.services.TrendDataService import TrendDataService
     brand = await BrandProfileService.get(user_id, db)
-    # BrandProfileService.get returns a response wrapper dict; unwrap responseData
     if isinstance(brand, dict) and "responseData" in brand:
         brand = brand["responseData"]
-    industry = (brand or {}).get("industry", "business")
-    keywords = await TrendDataService.get_trending_keywords(industry, db=db)
+    brand = brand or {}
+
+    industry = brand.get("industry", "business")
+    region = brand.get("region", "")
+    # Build brand-specific seeds from content pillars and key products
+    brand_seeds = (brand.get("content_pillars") or [])[:2] + (brand.get("key_products_services") or [])[:2]
+
+    keywords = await TrendDataService.get_trending_keywords(
+        industry, region=region, brand_seeds=brand_seeds, db=db
+    )
     return UriResponse.get_single_data_response("trends", {
         "industry": industry,
+        "region": region,
         "keywords": keywords,
         "count": len(keywords),
     })
@@ -2277,6 +2488,31 @@ async def get_performance(
 
         results = await _asyncio.gather(*[_fetch(d) for d in published])
         posts = [r for r in results if r is not None]
+
+        # Persist fetched analytics so PerformanceAnalyticsService has real data
+        if posts:
+            import asyncio as _aio
+            async def _persist(post):
+                try:
+                    await db["content_analytics"].update_one(
+                        {"draft_id": post["draft_id"]},
+                        {"$set": {
+                            "draft_id": post["draft_id"],
+                            "likes": post.get("likes", 0),
+                            "comments": post.get("comments", 0),
+                            "shares": post.get("shares", 0),
+                            "views": post.get("views", 0),
+                            "impressions": post.get("impressions", 0),
+                            "reach": post.get("reach", 0),
+                            "engagement_rate": post.get("engagement_rate", 0),
+                            "platform": post.get("platform", ""),
+                            "updated_at": datetime.utcnow(),
+                        }},
+                        upsert=True,
+                    )
+                except Exception:
+                    pass
+            _aio.ensure_future(_aio.gather(*[_persist(p) for p in posts]))
 
         # Aggregate summary
         def _sum(key): return sum(p.get(key, 0) or 0 for p in posts)
@@ -2609,6 +2845,39 @@ async def debug_outstand_post(
         return UriResponse.get_single_data_response("outstand_post", data)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/debug/connections-raw")
+async def debug_connections_raw(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Show the raw social_connections documents for the current user.
+    Exposes connected_via, ig_user_id, page_id, and whether page_access_token is present.
+    Used to diagnose Instagram/Facebook routing issues.
+    """
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    conns = await db["social_connections"].find({"user_id": user_id}).to_list(length=50)
+    result = []
+    for c in conns:
+        result.append({
+            "id": c.get("id"),
+            "platform": c.get("platform"),
+            "connected_via": c.get("connected_via"),
+            "connection_status": c.get("connection_status"),
+            "ig_user_id": c.get("ig_user_id"),
+            "page_id": c.get("page_id"),
+            "has_page_access_token": bool(c.get("page_access_token")),
+            "outstand_account_id": c.get("outstand_account_id"),
+            "username": c.get("username"),
+            "created_at": c.get("created_at"),
+            "updated_at": c.get("updated_at"),
+        })
+    return UriResponse.get_single_data_response("connections_raw", result)
+
 
 @router.get("/platform-requirements/{platform}")
 async def get_platform_requirements(platform: str):
@@ -3191,12 +3460,17 @@ async def _generate_image_bg(
 
         # Upload base64 image to Cloudinary
         if raw_url and raw_url.startswith("data:"):
+            print(f"🔄 Uploading image to Cloudinary for draft {draft_id}...")
             try:
                 from app.utils.cloudinary_upload import upload_base64
-                stored_url = await upload_base64(raw_url, folder="uri-social/generated")
-                print(f"☁️  BG image uploaded to Cloudinary: {stored_url}")
+                stored_url = await upload_base64(raw_url, folder="uri-social/content-drafts")
+                print(f"☁️  ✅ CLOUDINARY UPLOAD SUCCESS!")
+                print(f"   📍 Draft ID: {draft_id}")
+                print(f"   🔗 URL: {stored_url}")
             except Exception as upload_err:
-                print(f"⚠️  Cloudinary upload error: {upload_err}")
+                print(f"⚠️  ❌ CLOUDINARY UPLOAD FAILED!")
+                print(f"   📍 Draft ID: {draft_id}")
+                print(f"   ❌ Error: {upload_err}")
 
         final_url = stored_url if not stored_url.startswith("data:") else None
         if final_url and db is not None:
@@ -3259,6 +3533,74 @@ async def _run_auto_generate_background(user_id: str, db: AsyncIOMotorDatabase):
         print(f"✅ Auto-generate complete for user={user_id}: {result}")
     except Exception as e:
         print(f"❌ Auto-generate failed for user={user_id}: {e}")
+
+
+async def _generate_blog_image_bg(
+    draft_id: str,
+    title: str,
+    topic: str,
+    tone: str,
+    industry: str,
+    brand_colors: List[str],
+    db: AsyncIOMotorDatabase
+):
+    """
+    Background task: generate featured image for blog post and update draft in DB
+    """
+    try:
+        print(f"\n{'='*60}")
+        print(f"🎨 BACKGROUND: Generating blog featured image")
+        print(f"Draft ID: {draft_id}")
+        print(f"{'='*60}\n")
+
+        # Generate image using ImageContentService
+        image_result = await ImageContentService.generate_blog_featured_image(
+            title=title,
+            topic=topic,
+            tone=tone,
+            industry=industry,
+            brand_colors=brand_colors
+        )
+
+        if not image_result.get("success"):
+            print(f"⚠️ BG blog image generation failed for draft {draft_id}")
+            return
+
+        raw_url = image_result["url"]
+        stored_url = raw_url
+
+        # Upload base64 image to Cloudinary
+        if raw_url and raw_url.startswith("data:"):
+            print(f"🔄 Uploading blog image to Cloudinary for draft {draft_id}...")
+            try:
+                from app.utils.cloudinary_upload import upload_base64
+                stored_url = await upload_base64(raw_url, folder="uri-social/blog-images")
+                print(f"☁️  ✅ CLOUDINARY UPLOAD SUCCESS!")
+                print(f"   📍 Draft ID: {draft_id}")
+                print(f"   🔗 URL: {stored_url}")
+            except Exception as e:
+                print(f"❌ Cloudinary upload failed for blog image: {str(e)}")
+                print(f"   Storing base64 data URL instead")
+
+        # Update blog draft with featured image
+        blog_drafts_collection = db["blog_drafts"]
+
+        await blog_drafts_collection.update_one(
+            {"id": draft_id},
+            {
+                "$set": {
+                    "featured_image_url": stored_url,
+                    "updated_at": datetime.utcnow()
+                }
+            }
+        )
+
+        print(f"✅ Blog featured image saved to blog_drafts {draft_id}")
+
+    except Exception as e:
+        print(f"❌ Background blog image generation error for draft {draft_id}: {str(e)}")
+        import traceback
+        traceback.print_exc()
 
 
 # This can be set up as a periodic background task
@@ -3328,6 +3670,7 @@ async def generate_storyboard(
         brand_context=brand_context,
         target_platform=request.target_platform,
         target_duration_seconds=request.target_duration_seconds,
+        video_style=request.video_style,
     )
 
     if not result.get("status"):
@@ -3515,3 +3858,434 @@ async def list_video_drafts(
     ).sort("created_at", -1).to_list(length=50)
 
     return UriResponse.get_single_data_response("video_drafts", drafts)
+
+
+@router.post("/publish-video-draft")
+async def publish_video_draft(
+    request: PublishVideoDraftRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Start async publishing of a saved video draft to Instagram Reels or Facebook.
+    Returns a job_id immediately. Poll GET /video-publish-job/{job_id} for status.
+    """
+    from app.agents.social_media_manager.services.video_publish_service import VideoPublishService
+
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    # Only Instagram and Facebook supported
+    SUPPORTED = {"instagram_reels", "facebook_reels"}
+    if request.platform not in SUPPORTED:
+        raise HTTPException(status_code=400, detail=f"Platform '{request.platform}' is not yet supported. Supported: {', '.join(SUPPORTED)}")
+
+    # Load the draft
+    draft = await db["content_drafts"].find_one(
+        {"id": request.draft_id, "user_id": user_id, "media_type": "video"},
+        {"_id": 0},
+    )
+    if not draft:
+        raise HTTPException(status_code=404, detail="Video draft not found")
+
+    video_url = draft.get("video_url")
+    if not video_url:
+        raise HTTPException(status_code=400, detail="Draft has no video URL")
+
+    caption = request.caption if request.caption is not None else (draft.get("content") or "")
+
+    # Resolve connection.
+    # instagram_reels → look for "instagram" direct connection
+    # facebook_reels  → look for "facebook" first; fall back to "instagram" because the
+    #                   Instagram OAuth flow stores a Facebook Page access token that can
+    #                   also be used to post videos to the Facebook Page.
+    if request.platform == "instagram_reels":
+        conn = await db["social_connections"].find_one(
+            {"user_id": user_id, "platform": "instagram"},
+            {"_id": 0, "page_access_token": 1, "ig_user_id": 1},
+        )
+        if not conn or not conn.get("page_access_token"):
+            raise HTTPException(status_code=400, detail="No connected Instagram account found. Please connect your account first.")
+        if not conn.get("ig_user_id"):
+            raise HTTPException(status_code=400, detail="Instagram account missing ig_user_id. Please reconnect.")
+    else:  # facebook_reels
+        conn = await db["social_connections"].find_one(
+            {"user_id": user_id, "platform": "facebook"},
+            {"_id": 0, "page_access_token": 1},
+        )
+        if not conn or not conn.get("page_access_token"):
+            # Fall back to Instagram connection — its page_access_token is a Facebook Page token
+            conn = await db["social_connections"].find_one(
+                {"user_id": user_id, "platform": "instagram"},
+                {"_id": 0, "page_access_token": 1},
+            )
+        if not conn or not conn.get("page_access_token"):
+            raise HTTPException(status_code=400, detail="No connected Facebook or Instagram account found. Connect Instagram to enable Facebook posting.")
+
+    job_id = await VideoPublishService.create_job(request.draft_id, request.platform, user_id)
+    background_tasks.add_task(
+        VideoPublishService.run_job,
+        job_id,
+        request.draft_id,
+        request.platform,
+        video_url,
+        caption,
+        conn,
+        db,
+    )
+
+    return UriResponse.get_single_data_response("publish_job", {"job_id": job_id})
+
+
+@router.get("/video-publish-job/{job_id}")
+async def get_video_publish_job(
+    job_id: str,
+    token: dict = Depends(JWTBearer()),
+):
+    """Poll the status of a video publish job."""
+    from app.agents.social_media_manager.services.video_publish_service import get_publish_job
+
+    _get_user_id(token)  # auth check
+    job = await get_publish_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Publish job not found")
+    return UriResponse.get_single_data_response("publish_job", job)
+
+
+@router.post("/extract-image-text")
+async def extract_image_text(
+    image_url: str = Query(..., description="URL of the image to extract text from"),
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Extract text overlaid on an image using OpenAI Vision API.
+    Used when user clicks 'Text' edit button to pre-fill with actual image text.
+    """
+    try:
+        from app.services.AIService import client as ai_client
+
+        prompt = (
+            "Extract ALL text that is overlaid or written on this image. "
+            "Return ONLY the exact text you see - no descriptions, no analysis. "
+            "If there are multiple text elements, list them separated by line breaks. "
+            "If there is no text on the image, return 'No text found'."
+        )
+
+        response = await asyncio.get_running_loop().run_in_executor(
+            None,
+            lambda: ai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": image_url}}
+                        ]
+                    }
+                ],
+                max_tokens=300
+            )
+        )
+
+        extracted_text = response.choices[0].message.content.strip()
+
+        return UriResponse.get_single_data_response("image_text", {
+            "text": extracted_text,
+            "image_url": image_url
+        })
+
+    except Exception as e:
+        print(f"⚠️ Error extracting text from image: {e}")
+        return UriResponse.error_response(f"Failed to extract text: {str(e)}")
+
+
+@router.post("/upload-custom-font")
+async def upload_custom_font(
+    file: UploadFile = File(...),
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Upload a custom font file (.ttf or .otf) for the user's brand.
+    Typography System PRD - Phase 1: Custom Font Upload
+    """
+    try:
+        user_id = token.get("user_id")
+
+        # Validate file type
+        filename = file.filename.lower()
+        if not (filename.endswith('.ttf') or filename.endswith('.otf')):
+            return UriResponse.error_response("Invalid file type. Please upload .ttf or .otf font files only.")
+
+        # Validate file size (max 5MB)
+        file_bytes = await file.read()
+        file_size_mb = len(file_bytes) / (1024 * 1024)
+        if file_size_mb > 5:
+            return UriResponse.error_response(f"File too large ({file_size_mb:.1f}MB). Maximum size is 5MB.")
+
+        print(f"[CUSTOM_FONT] Uploading font: {file.filename} ({file_size_mb:.2f}MB)")
+
+        # Upload to Cloudinary
+        from app.utils.cloudinary_upload import upload_bytes
+
+        font_url = await upload_bytes(
+            file_bytes,
+            folder=f"uri-social/custom-fonts/{user_id}",
+            resource_type="raw",  # Non-image file
+            public_id=file.filename.rsplit('.', 1)[0]  # Use original filename
+        )
+
+        print(f"[CUSTOM_FONT] ✅ Font uploaded: {font_url}")
+
+        return UriResponse.get_single_data_response("font_uploaded", {
+            "font_url": font_url,
+            "filename": file.filename,
+            "size_mb": round(file_size_mb, 2)
+        })
+
+    except Exception as e:
+        print(f"⚠️ Error uploading custom font: {e}")
+        return UriResponse.error_response(f"Failed to upload font: {str(e)}")
+
+
+@router.post("/analyze-custom-font")
+async def analyze_custom_font(
+    font_url: str = Query(..., description="Cloudinary URL of the uploaded font file"),
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Analyze a custom font using GPT-4o-mini Vision API.
+    Returns font characteristics and a prompt directive for AI image generation.
+    Typography System PRD - Phase 1: Custom Font Analysis
+    """
+    try:
+        from app.agents.social_media_manager.services.custom_font_service import CustomFontService
+
+        print(f"[CUSTOM_FONT] Analyzing font: {font_url}")
+
+        # Analyze the font
+        analysis_result = await CustomFontService.analyze_font(font_url)
+
+        return UriResponse.get_single_data_response("font_analyzed", {
+            "font_url": font_url,
+            "analysis": analysis_result["analysis"],
+            "prompt_directive": analysis_result["prompt_directive"]
+        })
+
+    except Exception as e:
+        print(f"⚠️ Error analyzing custom font: {e}")
+        return UriResponse.error_response(f"Failed to analyze font: {str(e)}")
+
+
+# ============================================================================
+# BLOG CONTENT GENERATOR
+# ============================================================================
+
+class BlogGenerationRequest(BaseModel):
+    """Request model for blog content generation"""
+    topic: str = Field(..., description="Blog post topic/title", min_length=10, max_length=200)
+    keywords: List[str] = Field(..., description="SEO keywords (2-5 keywords)", min_items=1, max_items=10)
+    tone: str = Field(..., description="Content tone: professional, inspirational, educational, conversational")
+    word_count: int = Field(..., description="Target word count: 1000, 2000, or 3000", ge=500, le=5000)
+
+
+@router.post("/generate-blog")
+async def generate_blog_content(
+    request: BlogGenerationRequest,
+    background_tasks: BackgroundTasks,
+    token: dict = Depends(JWTBearer()),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency)
+):
+    """
+    Generate long-form blog content with AI
+
+    Features:
+    - GPT-4 Turbo powered blog writing
+    - SEO-optimized title and meta description
+    - Structured HTML content with proper headings
+    - DALL-E 3 generated featured image
+    - Social media promotional snippets
+    - Brand voice consistency
+
+    Blog Generator Demo - Phase 1
+    """
+    try:
+        user_id = _get_user_id(token)
+        if not user_id:
+            return UriResponse.error_response("User ID not found in token")
+
+        print(f"\n{'='*60}")
+        print(f"📝 BLOG GENERATION REQUEST")
+        print(f"{'='*60}")
+        print(f"Topic: {request.topic}")
+        print(f"Keywords: {', '.join(request.keywords)}")
+        print(f"Tone: {request.tone}")
+        print(f"Word Count: {request.word_count}")
+        print(f"{'='*60}\n")
+
+        # Validate tone
+        valid_tones = ["professional", "inspirational", "educational", "conversational"]
+        if request.tone not in valid_tones:
+            return UriResponse.error_response(
+                f"Invalid tone. Must be one of: {', '.join(valid_tones)}"
+            )
+
+        # Validate word count
+        valid_word_counts = [1000, 2000, 3000]
+        if request.word_count not in valid_word_counts:
+            # Allow approximate values (within 500 words)
+            closest = min(valid_word_counts, key=lambda x: abs(x - request.word_count))
+            if abs(closest - request.word_count) > 500:
+                return UriResponse.error_response(
+                    f"Word count must be approximately 1000, 2000, or 3000 words"
+                )
+            request.word_count = closest
+
+        # Get user's brand profile for voice consistency
+        brand_profile = await BrandProfileService.get(user_id, db)
+        brand_data = None
+
+        if brand_profile:
+            brand_data = {
+                "brand_name": brand_profile.get("brand_name", "Your Brand"),
+                "derived_voice": brand_profile.get("derived_voice", ""),
+                "brand_colors": brand_profile.get("brand_colors", []),
+                "industry": brand_profile.get("industry", ""),
+            }
+            print(f"✅ Using brand profile: {brand_data['brand_name']}")
+        else:
+            print(f"⚠️ No brand profile found, using defaults")
+
+        # Generate blog content
+        blog_result = await ImageContentService.generate_long_form_content(
+            topic=request.topic,
+            keywords=request.keywords,
+            tone=request.tone,
+            word_count=request.word_count,
+            brand_profile=brand_data,
+            user_id=user_id
+        )
+
+        # Save blog to blog_drafts collection (separate from social posts)
+        import uuid
+        draft_id = str(uuid.uuid4())
+
+        draft_data = {
+            "id": draft_id,
+            "user_id": user_id,
+            "status": "draft",
+            "title": blog_result["title"],
+            "meta_description": blog_result["meta_description"],
+            "content": blog_result["content"],
+            "reading_time": blog_result["reading_time"],
+            "word_count": blog_result["word_count"],
+            "featured_image_url": None,  # Will be generated in background
+            "has_image": True,  # Flag that image generation is in progress
+            "social_snippets": blog_result["social_snippets"],
+            "keywords": blog_result["keywords"],
+            "tone": blog_result["tone"],
+            "generated_at": datetime.utcnow(),
+            "created_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow()
+        }
+
+        # Insert into blog_drafts collection
+        blog_drafts_collection = db["blog_drafts"]
+        await blog_drafts_collection.insert_one(draft_data)
+
+        print(f"✅ Blog saved to blog_drafts: {draft_id}")
+
+        # Generate featured image in background
+        image_ctx = blog_result.get("image_context", {})
+        background_tasks.add_task(
+            _generate_blog_image_bg,
+            draft_id=draft_id,
+            title=image_ctx.get("title", request.topic),
+            topic=image_ctx.get("topic", request.topic),
+            tone=image_ctx.get("tone", request.tone),
+            industry=image_ctx.get("industry", ""),
+            brand_colors=image_ctx.get("brand_colors", []),
+            db=db
+        )
+        print(f"🎨 Blog featured image generation queued for background")
+
+        # Return response
+        response_data = {
+            "draft_id": draft_id,
+            "title": blog_result["title"],
+            "meta_description": blog_result["meta_description"],
+            "content": blog_result["content"],
+            "reading_time": blog_result["reading_time"],
+            "word_count": blog_result["word_count"],
+            "featured_image_url": None,  # Will be generated in background
+            "has_image": True,  # Frontend can poll to check when ready
+            "social_snippets": blog_result["social_snippets"],
+            "keywords": blog_result["keywords"],
+            "tone": blog_result["tone"],
+            "generated_at": blog_result["generated_at"]
+        }
+
+        return UriResponse.get_single_data_response("blog_generated", response_data)
+
+    except Exception as e:
+        print(f"❌ Blog generation error: {str(e)}")
+        traceback.print_exc()
+        return UriResponse.error_response(f"Failed to generate blog content: {str(e)}")
+
+
+@router.get("/blog-drafts")
+async def get_blog_drafts(
+    token: dict = Depends(JWTBearer()),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency)
+):
+    """Get all blog drafts for the authenticated user"""
+    try:
+        user_id = _get_user_id(token)
+        if not user_id:
+            return UriResponse.error_response("User ID not found in token")
+
+        # Fetch all blog drafts for this user, sorted by created_at descending
+        blog_drafts = await db["blog_drafts"].find(
+            {"user_id": user_id}
+        ).sort("created_at", -1).to_list(length=100)
+
+        # Remove MongoDB _id from results
+        for draft in blog_drafts:
+            draft.pop("_id", None)
+
+        return UriResponse.get_list_data_response("blog_drafts", blog_drafts)
+
+    except Exception as e:
+        print(f"❌ Error fetching blog drafts: {str(e)}")
+        traceback.print_exc()
+        return UriResponse.error_response(f"Failed to fetch blog drafts: {str(e)}")
+
+
+@router.get("/blog-drafts/{draft_id}")
+async def get_blog_draft(
+    draft_id: str,
+    token: dict = Depends(JWTBearer()),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency)
+):
+    """Get a single blog draft by ID (for polling image status)"""
+    try:
+        user_id = _get_user_id(token)
+        if not user_id:
+            return UriResponse.error_response("User ID not found in token")
+
+        draft = await db["blog_drafts"].find_one(
+            {"id": draft_id, "user_id": user_id},
+            {"_id": 0}
+        )
+
+        if not draft:
+            return UriResponse.error_response("Blog draft not found", response_code=404)
+
+        return UriResponse.get_single_data_response("blog_draft", draft)
+
+    except Exception as e:
+        print(f"❌ Error fetching blog draft {draft_id}: {str(e)}")
+        traceback.print_exc()
+        return UriResponse.error_response(f"Failed to fetch blog draft: {str(e)}")

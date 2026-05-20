@@ -85,6 +85,16 @@ class BrandProfileService:
         if "font_style_prompt" in data:
             doc["font_style_prompt"] = data["font_style_prompt"]
 
+        # Custom font fields (Typography System)
+        if "custom_font_enabled" in data:
+            doc["custom_font_enabled"] = data["custom_font_enabled"]
+        if "custom_font_files" in data:
+            doc["custom_font_files"] = data["custom_font_files"]
+        if "custom_font_analysis" in data:
+            doc["custom_font_analysis"] = data["custom_font_analysis"]
+        if "custom_font_directive" in data:
+            doc["custom_font_directive"] = data["custom_font_directive"]
+
         existing = await db[BrandProfileService.COLLECTION].find_one({"user_id": user_id})
 
         # OPTION 2: ONBOARDING VALIDATION - Enforce required fields
@@ -95,22 +105,12 @@ class BrandProfileService:
             (not existing or not existing.get("onboarding_completed"))
         )
 
+        # Allow completing onboarding even without required fields
+        # Users can skip all onboarding steps and go directly to dashboard
+        # They can fill in brand profile details later
         if is_completing_onboarding:
-            required_for_completion = {
-                "brand_name": doc.get("brand_name"),
-                "industry": doc.get("industry"),
-            }
-
-            missing = [field for field, value in required_for_completion.items() if not value]
-
-            if missing:
-                # Cannot complete onboarding without required fields
-                doc["onboarding_completed"] = False
-                from fastapi import HTTPException as _HTTPException
-                raise _HTTPException(
-                    status_code=400,
-                    detail=f"Cannot complete onboarding. Please provide: {', '.join(missing)}",
-                )
+            # No validation - all fields are optional
+            pass
 
         if existing:
             # Once onboarding_completed is True, never allow it to be reset to False
@@ -209,6 +209,11 @@ class BrandProfileService:
             "style_rotation_index": int(profile.get("style_rotation_index") or 0),
             "font_style":           profile.get("font_style", ""),
             "font_style_prompt":    profile.get("font_style_prompt", ""),
+            # Custom font fields (Typography System)
+            "custom_font_enabled":  profile.get("custom_font_enabled", False),
+            "custom_font_files":    profile.get("custom_font_files") or [],
+            "custom_font_analysis": profile.get("custom_font_analysis") or {},
+            "custom_font_directive": profile.get("custom_font_directive", ""),
             # Caption Voice System fields
             "voice_profile":        profile.get("voice_profile") or {},
             "voice_sample_analysis": profile.get("voice_sample_analysis") or {},

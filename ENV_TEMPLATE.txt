@@ -1,0 +1,58 @@
+# ============================================
+# URI Social Backend - Environment Variables
+# ============================================
+# Copy this file to .env and fill in your values
+
+# === Database Configuration ===
+MONGODB_URL=mongodb://localhost:27017
+DATABASE_NAME=uri_social
+
+# === Security ===
+JWT_SECRET=your-jwt-secret-here-minimum-32-chars
+CRON_SECRET=generate-with-openssl-rand-hex-32
+
+# === API Configuration ===
+ENVIRONMENT=development  # development, staging, or production
+
+# === CORS Configuration ===
+# Comma-separated list of allowed origins
+# Development:
+CORS_ALLOWED_ORIGINS=http://localhost:3000,http://localhost:3001
+
+# Production (replace with your domains):
+# CORS_ALLOWED_ORIGINS=https://yourdomain.com,https://app.yourdomain.com
+
+# === Rate Limiting (Optional - Defaults shown) ===
+# These are per-key defaults, can be overridden per key
+DEFAULT_RATE_LIMIT_REQUESTS_PER_HOUR=1000
+DEFAULT_RATE_LIMIT_REQUESTS_PER_DAY=10000
+DEFAULT_RATE_LIMIT_IMAGES_PER_HOUR=50
+DEFAULT_RATE_LIMIT_CONTENT_PER_HOUR=100
+
+# === External Services (Existing - Keep your current values) ===
+# OpenAI, Anthropic, Image services, etc.
+# ... your existing environment variables ...
+
+# ============================================
+# How to Generate Secrets
+# ============================================
+#
+# Generate CRON_SECRET:
+#   openssl rand -hex 32
+#
+# Generate JWT_SECRET (if you don't have one):
+#   openssl rand -hex 32
+#
+# ============================================
+# Required for SDK System
+# ============================================
+#
+# Minimum required variables:
+# - MONGODB_URL
+# - DATABASE_NAME
+# - JWT_SECRET (for API key management dashboard)
+# - CRON_SECRET (for rate limit reset jobs)
+# - ENVIRONMENT
+# - CORS_ALLOWED_ORIGINS
+#
+# ============================================

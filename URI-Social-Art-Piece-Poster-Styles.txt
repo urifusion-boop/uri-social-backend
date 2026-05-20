@@ -1,0 +1,399 @@
+
+
+
+
+
+
+
+URI SOCIAL
+Art-Piece Poster
+Visual Styles
+Product Immersed. Environment Alive. Poster Complete.
+
+
+
+
+
+
+
+
+
+15 Styles • 9:16 Format • Production-Ready Prompts
+May 2026 — Engineering Team
+
+1. What Art-Piece Posters Are
+Art-piece posters are complete, self-contained promotional graphics in 9:16 mobile wallpaper format. The product is immersed in its environment. The brand logo is integrated. The tagline and feature callouts are designed into the composition. The result is a shareable, saveable piece of visual art that doubles as a product advertisement.
+These are NOT backgrounds waiting for text. These are FINISHED posters. The product, the brand, the message, and the environment are one unified composition.
+1.1 What Makes an Art-Piece Poster
+•  The product is the centrepiece, immersed in a three-dimensional environment
+•  The brand logo is prominently placed (usually top centre or top left)
+•  A tagline or headline is designed into the composition with styled typography
+•  Feature badges or USP icons can appear at the bottom
+•  The entire image is designed to be saved as a phone wallpaper or shared on Stories
+•  9:16 vertical format (1080×1920) optimised for phone screens
+•  Every element — product, environment, text, logo — shares the same lighting, colour temperature, and atmosphere
+1.2 How This Differs From Other Styles
+THE KEY DIFFERENCE
+Art-piece posters include the brand logo and feature callouts BECAUSE the format demands it. A phone wallpaper that someone saves needs to communicate the brand. A feed post doesn’t — the brand name is already in the post header. Different format, different rules.
+1.3 Implementation
+When the user asks for a “wallpaper”, “poster”, “art piece”, “full-page promo”, or “Story graphic with product”, route to the art-piece poster pipeline. Use the standard immersive product pipeline but with: 9:16 format, logo included, and the art-piece poster style fragment appended to the prompt.
+// Detection: route to art-piece poster pipeline
+const artPieceTriggers = [
+  'wallpaper', 'poster', 'art piece', 'art-piece', 'full page',
+  'phone wallpaper', 'mobile wallpaper', 'story graphic',
+  'shareable graphic', 'promo poster', 'flyer'
+];
+
+const isArtPiece = artPieceTriggers.some(t => 
+  userRequest.toLowerCase().includes(t)
+);
+
+// If art piece: use 9:16 format + include logo + art-piece style
+// If not: use standard 1:1 immersive composition
+
+2. The 15 Art-Piece Poster Styles
+
+Luxury Showroom
+slug: art_luxury_showroom
+The product in a premium interior. Architectural, warm, aspirational. Like walking into a designer showroom.
+PROMPT FRAGMENT:
+Create a premium art-piece product poster in 9:16 mobile wallpaper format (1080x1920). Advanced design level. Ultra-realistic.
+
+ENVIRONMENT: The product is displayed in a luxury architectural interior. Premium materials surround it: polished wood panelling, textured concrete, brushed metal accents, marble surfaces, or architectural glass. The space feels like a high-end showroom or designer apartment.
+
+LIGHTING: Warm dramatic interior lighting. A single accent spotlight from above illuminates the product with a warm golden cone of light. Ambient warmth from hidden LED strips or recessed lighting creates a premium atmosphere. Strong directional shadows add architectural drama. The product glows under its spotlight.
+
+PRODUCT PLACEMENT: The product is the centrepiece, occupying the middle 40-50% of the frame. It is shown in its natural context: a door in a hallway, a fixture on a wall, furniture in a room, a bottle on a shelf. The product is IN the space, not placed on a surface in front of it.
+
+BRAND LOGO: The brand logo is placed prominently at the top centre of the poster, cleanly integrated into the dark/atmospheric upper portion of the image. The logo should feel like a title card, not a watermark. White or brand-coloured on the dark background.
+
+TAGLINE: A bold headline or tagline is positioned beside or below the product. Mixed typography: sans-serif for structural words, script or italic for emphasis words. The tagline uses brand colours as accent on key words.
+
+FEATURE BADGES: At the bottom of the poster, 3-4 small circular icons with brief feature labels arranged in a horizontal row. Icons are line-art style in brand accent colour on dark background. Labels in small caps below each icon.
+
+BOTTOM BAR: A subtle footer strip at the very bottom with a secondary tagline or CTA in small elegant text.
+
+COLOUR PALETTE: Warm darks (charcoal, dark wood, bronze) with gold/amber lighting accents and brand colour highlights on text. Rich and premium throughout.
+
+DEPTH: Three visible layers: architectural foreground elements slightly soft, sharp product in the middle, atmospheric background receding into warm darkness. The space extends beyond the frame.
+
+QUALITY: 4K, commercial interior photography quality, architectural digest level.
+POSTER LAYOUT: Top: Brand logo. Middle: Product in architectural context with tagline beside it. Bottom: Feature icon badges + CTA footer strip.
+BEST FOR: Doors, windows, architectural products, furniture, home fixtures, luxury interiors, building materials, premium hardware
+
+Nature Immersion
+slug: art_nature_immersion
+The product alive in nature. Water, mountains, sunlight, leaves. Pure and refreshing.
+PROMPT FRAGMENT:
+Create a premium art-piece product poster in 9:16 mobile wallpaper format (1080x1920). Advanced design level. Ultra-realistic.
+
+ENVIRONMENT: The product exists in a vivid natural landscape. Crystal-clear water splashes around the product base. Lush green vegetation frames the edges: leaves, ferns, tropical plants. Behind the product: a stunning natural vista — mountains, waterfalls, blue sky with scattered clouds, or a pristine lake.
+
+The product is IN nature, not placed on a surface in front of a nature photo. Water interacts with the product base. Leaves overlap the edges. Droplets land on the product surface. Sunlight refracts through the water and the product.
+
+LIGHTING: Bright natural sunlight from above and behind the product. God-rays filtering through the canopy or clouds. The light catches water droplets, creating sparkle and refraction. The product is brilliantly lit with the landscape behind it slightly hazier (atmospheric perspective).
+
+PRODUCT: Centred or slightly off-centre, occupying 35-45% of the frame. Water splashing dynamically around the lower third. The product label is clearly visible and readable. Condensation droplets on the product surface if appropriate.
+
+BRAND TEXT: Brand name or personalised text ("For Emma", product name) in elegant script or bold sans-serif at the top of the poster, floating in the sky/atmospheric space above the product. The text integrates with the natural atmosphere — it belongs in the scene.
+
+SECONDARY TEXT: Optional subtext or tagline below the brand text. Smaller, lighter weight.
+
+DYNAMIC ELEMENTS: Water splashes frozen mid-air. Floating water droplets catching sunlight. Leaves drifting. Everything is sharp — high-speed photography freeze.
+
+COLOUR PALETTE: Natural blues, greens, crystal whites, brand colour as accent on text. Fresh, clean, alive.
+
+QUALITY: 4K, National Geographic-level nature photography meets commercial product photography.
+POSTER LAYOUT: Top: Brand name or personalised text in the sky. Centre: Product immersed in water and nature. Bottom: Natural environment extending to frame edge.
+BEST FOR: Water brands, beverages, eco products, natural skincare, outdoor gear, fresh food, anything positioned as natural, pure, or refreshing
+
+Ingredient Explosion
+slug: art_ingredient_explosion
+Maximum energy. Ingredients flying. Juice splashing. Vibrant chaos with a hero product at the centre.
+PROMPT FRAGMENT:
+Create a premium art-piece product poster in 9:16 mobile wallpaper format (1080x1920). Advanced design level. Ultra-realistic.
+
+ENVIRONMENT: An explosive composition where the product’s ingredients or components are erupting outward in all directions. Fruits flying, liquids splashing, particles scattering, leaves spinning. The energy radiates from the product as the epicentre. The background is deep and rich (dark purple, deep blue, or brand colour at low brightness) to make the vibrant ingredients pop.
+
+PRODUCT: Dead centre, occupying 30-40% of the frame. The product is the calm eye of the storm. Sharp, clear, label readable. Everything around it is dynamic. The product itself is NOT moving — it’s the anchor.
+
+INGREDIENTS: 6-10 elements flying around the product at various distances and sizes. Some are whole (a whole mango), some are cut (a sliced strawberry), some are fragments (scattered blueberries, herb leaves). They are at different depths: some in front of the product (slightly blurred foreground), most beside and behind (sharp midground). Liquid arcs and splash trails connect the elements.
+
+BRAND LOGO: Large at the top of the poster. Bold, chunky, colourful typography. Can use gradient or multi-colour matching the ingredient palette. This is the title — big and proud. Subtitle or slogan directly below in clean text.
+
+FEATURE BADGES: 2-3 circular badges in a row between the logo area and the product. Each with an icon and a short label ("Fresh", "Natural", "Healthy"). Colourful — matching the vibrant energy.
+
+TAGLINE: At the bottom, below the product. Script or stylised font. Warm, inviting, appetising.
+
+BOTTOM BAR: Small icons or text at the very bottom: product claims, social handles, contact info. Small, clean, functional.
+
+DYNAMIC ELEMENTS: Every ingredient is frozen mid-flight. Liquid droplets frozen mid-splash. Juice spray arcs. Berry scatter. Leaf spin. The entire frame vibrates with contained energy.
+
+COLOUR PALETTE: Deep dark background (purple, blue, black) with vivid saturated ingredient colours (orange, red, green, yellow, pink) and brand colours for text.
+
+QUALITY: 4K, food advertising campaign level, Innocent Drinks / Fruitsqiz poster energy.
+POSTER LAYOUT: Top: Large brand logo + subtitle + feature badges. Centre: Product with ingredient explosion. Bottom: Tagline + product claims + CTA.
+BEST FOR: Juice, smoothie, food, cereal, snacks, skincare with ingredients, supplements, tea, any product with visible, vibrant ingredients
+
+Neon Underground
+slug: art_neon_underground
+Electric, urban, after-dark. The product owns the night.
+PROMPT FRAGMENT:
+Create a premium art-piece product poster in 9:16 mobile wallpaper format (1080x1920). Advanced design level. Ultra-realistic.
+
+ENVIRONMENT: An urban night scene. The product is positioned in a dark, atmospheric setting — a rain-wet alley, a neon-lit corridor, a nightclub entrance, or a reflective wet street. Neon light sources in {PRIMARY_COLOUR} and {SECONDARY_COLOUR} cast coloured reflections on wet surfaces, the product, and surrounding architecture.
+
+The environment is 70% darkness with concentrated neon colour in strategic zones. Rain-wet surfaces reflect the neon, creating mirror-like pools of colour. The product catches neon reflections on its surface.
+
+LIGHTING: Neon-dominant. Two neon light sources from different sides casting coloured light on the product. The product is the brightest element — both neon sources illuminate it. Deep shadows between the lit areas create drama.
+
+PRODUCT: Centre to lower-centre, occupying 35-40% of the frame. Angled slightly for attitude. The product surface catches neon reflections. If glass: refractions of neon colour through the liquid. If matte: neon rim light on edges.
+
+BRAND TEXT: Brand name at the top in bold, condensed, uppercase sans-serif or neon-style glowing typography. The text appears to emit light — subtle glow effect matching the neon colours. Urban poster energy.
+
+TAGLINE: Below the brand name or beside the product. Clean white or neon accent. Short, punchy, confident.
+
+BOTTOM: CTA or contact info in small clean text. Optional: social handles.
+
+DYNAMIC ELEMENTS: Rain droplets frozen mid-fall catching neon light. Wet surface reflections. Subtle mist or haze in the neon beams. Puddle reflections of the product.
+
+COLOUR PALETTE: Near-black base with concentrated neon brand colours. Wet surface chrome reflections. No warm tones unless the brand palette is warm.
+
+QUALITY: 4K, cinematic night photography, Blade Runner meets product advertising.
+POSTER LAYOUT: Top: Glowing brand name. Centre-lower: Product in neon-lit urban setting. Bottom: CTA.
+BEST FOR: Fashion, streetwear, sneakers, cologne, nightlife brands, tech, gaming, energy drinks, any brand with urban/night energy
+
+Golden Throne
+slug: art_golden_throne
+Opulent. Royal. The product is a crown jewel.
+PROMPT FRAGMENT:
+Create a premium art-piece product poster in 9:16 mobile wallpaper format (1080x1920). Advanced design level. Ultra-realistic.
+
+ENVIRONMENT: A regal, opulent setting. The product sits elevated on a pedestal, plinth, or ornate surface that suggests royalty: marble with gold veins, crushed velvet, a jewel-encrusted tray, or a baroque-style shelf. Behind the product: deep rich darkness with subtle gold ornamental patterns or architectural details at low opacity.
+
+Gold is the dominant accent colour. Gold leaf flakes, gold dust particles, gold-tinted rim lighting. The product is treated as a precious object on display.
+
+LIGHTING: Warm, golden, dramatic. A strong spotlight from above with warm amber tone creates a pool of golden light around the product. The surrounding environment falls into rich darkness. The product’s surface catches golden highlights.
+
+PRODUCT: Centred on its pedestal, occupying 30-40% of the frame. Elevated slightly above centre — looking up at the product adds a subconscious sense of importance. Label clearly visible. Every surface detail catches the golden light.
+
+BRAND TEXT: Brand name at the top in elegant serif typography with gold colour or gold foil effect. Regal, refined, authoritative. A subtitle or brand descriptor below in thin sans-serif.
+
+TAGLINE: Beside or below the product. Script or italic serif for key words. Gold or cream on dark background.
+
+DECORATIVE ELEMENTS: Subtle gold geometric patterns or baroque ornamental corners at the edges of the frame. Gold dust particles floating in the light beam. A faint golden glow emanating from behind the product.
+
+COLOUR PALETTE: Deep black/charcoal base, warm gold accents throughout, brand colour as secondary accent. Rich, warm, exclusive.
+
+QUALITY: 4K, luxury advertising, Vogue/Harper’s level, Tom Ford commercial energy.
+POSTER LAYOUT: Top: Brand name in gold serif. Centre: Product elevated on pedestal in golden spotlight. Bottom: Tagline + subtle decorative frame.
+BEST FOR: Perfume, watches, jewellery, premium spirits, luxury fashion, high-end skincare, limited editions, any product that sells on exclusivity
+
+Frozen Impact
+slug: art_frozen_impact
+High-speed freeze. Liquid exploding. Every droplet sharp.
+PROMPT FRAGMENT:
+Create a premium art-piece product poster in 9:16 mobile wallpaper format (1080x1920). Advanced design level. Ultra-realistic.
+
+ENVIRONMENT: The product is at the centre of a frozen liquid explosion. Milk, water, cream, juice, or whatever liquid relates to the product is erupting outward from the product base in every direction. Every droplet is individually sharp — high-speed photography at 1/5000th second.
+
+The liquid forms a dynamic crown splash around the product. Arcing ribbons of liquid curve upward and outward. Individual droplets are suspended mid-air at various distances, each catching light individually.
+
+LIGHTING: Bright, clean, studio-grade with slight colour tint from the product/liquid. Strong backlight illuminating the liquid splashes, making them glow. The product is front-lit for label readability while the liquid catches dramatic backlighting.
+
+PRODUCT: Dead centre, sharp, label perfectly readable. The product is still — the world around it is exploding. The product is the calm hero amidst liquid chaos.
+
+BRAND TEXT: Brand name at the top in bold typography. Can be rendered in liquid-textured style (letters made of the same liquid). Or clean white on the atmospheric space above the splash zone.
+
+TAGLINE: Below the brand text or at the bottom. Clean, bold, supporting the energy.
+
+LIQUID PROPERTIES: The liquid matches the product — white milk for dairy, orange juice for citrus, clear water for water brands, pink for berry, deep amber for whisky. The liquid colour IS the product story.
+
+BACKGROUND: Deep solid colour (navy, dark brand colour, or black) behind the splash. The dark background makes every droplet visible and dramatic.
+
+QUALITY: 4K, commercial beverage photography, Coca-Cola/Pepsi poster campaign level.
+POSTER LAYOUT: Top: Brand name (possibly liquid-textured). Centre: Product in frozen liquid explosion. Bottom: Tagline + CTA.
+BEST FOR: Dairy, milk, yoghurt, water, juice, beverages, beer, cleaning products, paint, any product associated with liquid
+
+
+Botanical Garden
+slug: art_botanical_garden
+Lush, green, alive. Product nested in living greenery.
+PROMPT FRAGMENT:
+Create a premium art-piece product poster in 9:16 mobile wallpaper format (1080x1920). Advanced design level. Ultra-realistic.
+
+ENVIRONMENT: Dense, lush tropical or garden greenery filling the frame. The product is nestled within the foliage — surrounded by monstera leaves, fern fronds, flowering plants, vine tendrils, and herb sprigs. The vegetation is at multiple depths: some leaves in sharp focus near the product, others softly blurred in foreground and background.
+
+Dappled sunlight filters through the canopy above, creating warm patches of light and gentle shadow patterns across the product and the leaves.
+
+PRODUCT: Centre of the frame within a natural clearing in the foliage. Occupying 30-35% of the frame. The greenery frames the product without obscuring the label. Leaves may gently overlap the base of the product, integrating it into the garden.
+
+BRAND TEXT: Brand name at the top in clean serif or elegant sans-serif. Dark green or brand colour on the lighter sky/canopy area above the foliage. Organic, natural feel.
+
+TAGLINE: Below the brand name or at the bottom of the poster. Warm, inviting, natural tone.
+
+DYNAMIC ELEMENTS: A butterfly or small bird near the foliage (optional). Morning dew droplets on leaves. A single flower petal drifting. Subtle pollen or light motes in the sun beams.
+
+COLOUR PALETTE: Multiple greens (forest, lime, sage, emerald), warm sunlight gold, earth browns, white flower accents, brand colour on text.
+
+QUALITY: 4K, botanical photography meets product advertising, Kew Gardens meets commercial art.
+POSTER LAYOUT: Top: Brand name in natural space above foliage. Centre: Product in lush greenery. Bottom: Tagline nestled in lower foliage.
+BEST FOR: Natural skincare, herbal teas, organic food, plant-based products, essential oils, wellness, eco brands, garden products
+
+Fire & Smoke
+slug: art_fire_smoke
+Primal. Intense. The product forged in fire.
+PROMPT FRAGMENT:
+Create a premium art-piece product poster in 9:16 mobile wallpaper format (1080x1920). Advanced design level. Ultra-realistic.
+
+ENVIRONMENT: The product emerges from an atmosphere of smoke and ember glow. Dense smoke fills the background, catching warm amber and deep red light. Scattered embers and spark particles float upward around the product. The base of the product has a subtle fire glow — warm orange light from below.
+
+The mood is intense, primal, and powerful. Like the product was forged in fire or emerged from a volcanic forge.
+
+PRODUCT: Centre, occupying 35-40% of the frame. Lit from below with warm ember glow and from the side with amber directional light. The product surface catches the warm reflections. Deep shadows on the opposite side.
+
+BRAND TEXT: Bold, heavy, condensed typography at the top. Can be in ember/fire tint or clean white against the smoke. Strong, commanding presence.
+
+TAGLINE: Beside the product or at the bottom. Short, powerful words. Fire-adjacent language.
+
+DYNAMIC ELEMENTS: Ember particles rising (bright orange specks against dark smoke). Smoke wisps curling. Subtle heat distortion in the air. Glow from the base.
+
+COLOUR PALETTE: Deep charcoal blacks, warm amber, fire orange, deep red. Brand colour as accent on text if it’s a warm tone. If brand colour is cool, use it sparingly on text only.
+
+QUALITY: 4K, dramatic commercial photography, intense cinematic lighting.
+POSTER LAYOUT: Top: Bold brand name through smoke. Centre: Product with ember glow and rising sparks. Bottom: Tagline.
+BEST FOR: BBQ, grills, spicy food, hot sauce, whisky, bourbon, cologne, cigar brands, blacksmith/forge products, anything bold and intense
+
+Crystal Cave
+slug: art_crystal_cave
+Ethereal, precious, prismatic. Product as a gem.
+PROMPT FRAGMENT:
+Create a premium art-piece product poster in 9:16 format. The product is surrounded by large translucent crystal formations in amethyst, quartz, and citrine tones. Prismatic rainbow light refracts through the crystals, casting colour spectra across the product surface and the cave walls. The environment is a mystical crystal cavern with the product as the central treasure. Deep jewel-tone background (purple, deep blue) with bright prismatic highlights. Crystals at varying depths create layers. Brand logo at top in thin elegant typography. Product centre with crystal formations wrapping around it. Sparkle particles in the air. 4K, fantasy-meets-luxury commercial quality.
+POSTER LAYOUT: Top: Brand name in elegant thin text. Centre: Product surrounded by crystal formations with prismatic light. Bottom: Tagline.
+BEST FOR: Jewellery, perfume, serum bottles, premium beauty, crystal-adjacent wellness brands, gemstone products
+
+Ocean Surface
+slug: art_ocean_surface
+Expansive, fresh, horizon. Where sea meets sky.
+PROMPT FRAGMENT:
+Create a premium art-piece product poster in 9:16 format. The product sits at the ocean surface — half in water, half above water. The underwater portion shows crystal-clear blue-green water with light caustics and bubbles. The above-water portion shows a stunning horizon: blue sky, scattered clouds, distant coastline. The waterline crosses the product at its mid-section, creating a dramatic split composition. Water splashes and droplets in the air above the waterline. Brand name in the sky area at the top. Product centre, straddling the water surface. Sunlight sparkles on the water surface. 4K, underwater photography meets landscape photography.
+POSTER LAYOUT: Top: Brand name in the sky. Centre: Product at waterline with underwater/above-water split. Bottom: Underwater environment.
+BEST FOR: Water, sunscreen, swim products, marine brands, surf, beach accessories, summer launches, coastal lifestyle
+
+Workshop Craft
+slug: art_workshop_craft
+Handmade. Artisanal. The product in its maker’s space.
+PROMPT FRAGMENT:
+Create a premium art-piece product poster in 9:16 format. The product is displayed in an artisan’s workshop: a wooden workbench with tools, raw materials, leather scraps, sawdust, or flour (depending on product). Warm pendant light from above. The environment tells the story of how the product is made: raw materials on one side, finished product on the other. Visible craftsmanship tools (chisels, brushes, moulds). Warm wood tones, worn surfaces, authentic imperfections. Brand logo at top in hand-lettered or craft-style typography. Rustic, warm, honest. 4K, documentary-style craft photography.
+POSTER LAYOUT: Top: Hand-lettered brand name. Centre: Product on workbench with tools and materials. Bottom: Craft story tagline.
+BEST FOR: Handmade leather goods, woodcraft, artisanal food, bakeries, pottery, craft soap, candles, handmade jewellery, bespoke tailoring
+
+Velvet Stage
+slug: art_velvet_stage
+Theatrical. Dramatic. The product under the spotlight.
+PROMPT FRAGMENT:
+Create a premium art-piece product poster in 9:16 format. The product sits on a surface of crushed velvet in deep jewel tones (burgundy, midnight blue, emerald, or brand colour). A single tight spotlight from directly above creates a perfect circle of light around the product, with the rest of the velvet falling into rich shadow. The velvet texture is visible and tactile — crushed folds catching and absorbing light. The product is the sole performer on this stage. Gold dust particles drift through the spotlight beam. Brand name at top in refined serif with subtle metallic finish. Intimate, close, dramatic. 4K, jewellery photography level.
+POSTER LAYOUT: Top: Brand name in metallic serif. Centre: Product in spotlight on velvet. Bottom: Short tagline.
+BEST FOR: Watches, perfume, jewellery, luxury cosmetics, premium accessories, limited editions, gift products
+
+Tech Orbit
+slug: art_tech_orbit
+Futuristic. Clean. Digital energy surrounding the product.
+PROMPT FRAGMENT:
+Create a premium art-piece product poster in 9:16 format. The product floats in a dark digital space. Orbiting around it: thin glowing lines tracing circular or elliptical paths (like planetary orbits), floating holographic UI elements, data particles, small geometric shapes (hexagons, triangles) in brand accent colour. The product is the centre of a technological solar system. Dark background (#0A0A1A) with cool blue/cyan glow from the orbital elements. Product is the brightest and sharpest element. Subtle grid floor beneath fading into darkness. Brand name at top in geometric, precise sans-serif. Clean, futuristic, authoritative. 4K, sci-fi meets Apple product launch.
+POSTER LAYOUT: Top: Geometric brand name. Centre: Product floating with tech orbits. Bottom: Feature text or CTA.
+BEST FOR: Electronics, gadgets, apps, SaaS products, fintech, AI tools, tech accessories, smartwatches, earbuds, phone cases
+
+Sunset Canvas
+slug: art_sunset_canvas
+Golden, romantic, warm. Product bathed in the last light of the day.
+PROMPT FRAGMENT:
+Create a premium art-piece product poster in 9:16 format. The product is bathed in rich golden hour light. Background: a stunning sunset sky gradient from deep golden amber at the horizon to soft rose-pink to purple-blue at the top. The product sits on a natural surface (sand, stone, wood) that catches the warm golden light. Lens flare from the low sun kisses the edge of the product. Long warm shadows stretch toward the viewer. The entire image glows with amber warmth. Warm bokeh circles in the background from the setting sun. Brand name at top in elegant script or thin serif, warm white or gold. Romantic, aspirational, end-of-day beauty. 4K, golden hour photography perfection.
+POSTER LAYOUT: Top: Brand name in warm script. Centre: Product in golden sunset light. Bottom: Romantic tagline.
+BEST FOR: Beauty, skincare, perfume, fashion, gift products, wedding vendors, romance-adjacent brands, luxury lifestyle
+
+Street Market
+slug: art_street_market
+Authentic. Colourful. Bustling. The product in its cultural context.
+PROMPT FRAGMENT:
+Create a premium art-piece product poster in 9:16 format. The product is displayed in a vibrant, colourful market environment. Surrounding it: rich textures of African market life — patterned textiles (ankara, adire), wooden market stall structures, woven baskets, colourful spices in bowls, stacked fruits, or hanging fabrics. The market is alive but the product is the focal point.
+
+Warm natural light as if in an open-air market. Rich saturated colours from the market goods creating a vibrant frame around the product. The product is sharp and clear; the market elements are slightly softer, creating depth.
+
+The mood is authentic, proudly local, culturally rooted. Not a sterile studio — a living market. Brand name at top in bold, warm typography. Cultural pride meets commercial quality. 4K, National Geographic cultural photography meets product advertising.
+POSTER LAYOUT: Top: Bold brand name. Centre: Product surrounded by vibrant market textures and colours. Bottom: Tagline celebrating local/African identity.
+BEST FOR: Local food brands, African fashion, traditional products, spice brands, craft products, any brand celebrating Nigerian/African identity and cultural authenticity
+
+
+3. Implementation
+3.1 Prompt Assembly for Art-Piece Posters
+Art-piece poster prompts follow the same assembly order as standard images but with three modifications:
+•  Format: 9:16 (1080×1920) instead of 1:1 (1024×1024)
+•  Logo INCLUDED: Override the “no brand name” rule. Art-piece posters include the brand logo prominently.
+•  Extended text: Tagline, feature badges, and CTA are all part of the generated image (not added via FFmpeg post-processing)
+3.2 API Call
+const result = await openai.images.generate({
+  model: 'gpt-image-2',
+  prompt: assembledArtPiecePrompt,
+  n: 1,
+  size: '1024x1792',  // 9:16 vertical
+  quality: 'high',     // art pieces need high quality
+});
+
+// Cost: ~$0.211 per art-piece poster
+3.3 Data Model
+// Add to StyleTemplate:
+style_type: ENUM('image', 'video', 'art_piece') DEFAULT 'image'
+
+// Art-piece styles have style_type = 'art_piece'
+// This tells the pipeline to:
+//   1. Use 9:16 format
+//   2. Include brand logo in the prompt
+//   3. Include tagline and feature badges
+//   4. Override the 'no brand name' rule
+3.4 Industry Mapping
+Show all 15 art-piece styles to every industry during a dedicated “Poster Style” selection. Or auto-select based on product category:
+3.5 Credit Cost
+•  Art-piece posters cost 1 credit (same as standard image campaigns)
+•  The higher quality setting ($0.211 vs $0.053 for wallpaper backgrounds) is justified by the commercial value of the output
+•  These posters drive saves, shares, and WhatsApp forwards — the highest-engagement content type
+THE VALUE
+Art-piece posters are the most shareable content Jane produces. A customer saves a stunning poster of their favourite coffee brand as their phone wallpaper. They show it to friends. The brand gets free distribution every time someone sees that phone screen. This is organic reach that no ad can buy.
+
+
+
+
+End of Art-Piece Poster Visual Styles — 15 Styles
+Not just a post. A piece of art worth saving.
+ | Standard Image | Immersive Composition | Art-Piece Poster
+Format | 1:1 square | 1:1 square | 9:16 vertical (phone screen)
+Logo | Not included (default rule) | Not included | INCLUDED — prominently placed
+Text amount | Headline + CTA only | Headline + CTA only | Logo + tagline + optional feature badges + CTA
+Purpose | Instagram feed post | Instagram feed post | Shareable wallpaper, Story, full-page promo
+Composition | Product in scene | Product immersed in scene | Product immersed + full poster design with all brand elements
+Shareability | Posted by brand | Posted by brand | Saved and shared by customers as phone wallpaper
+Style | Vibe | Environment | Best For
+Luxury Showroom | Premium, architectural, warm lighting | Product in a designer interior space | Doors, furniture, interiors, home products, luxury goods
+Nature Immersion | Fresh, alive, natural world | Product surrounded by nature: water, mountains, leaves | Water, beverages, organic, outdoor, eco products
+Ingredient Explosion | Vibrant, dynamic, energetic burst | Product with ingredients/components flying around it | Juice, smoothies, food, skincare, anything with visible ingredients
+Neon Underground | Urban, electric, nightlife energy | Product in a neon-lit urban environment | Fashion, streetwear, tech, nightlife, youth brands
+Golden Throne | Opulent, royal, commanding | Product elevated on a pedestal with gold accents | Perfume, jewellery, watches, premium spirits, luxury anything
+Frozen Impact | High-speed, explosive, frozen moment | Product surrounded by frozen splashes and particles | Beverages, dairy, cosmetics, any liquid-adjacent product
+Botanical Garden | Lush, green, alive with plants | Product nestled in tropical or garden greenery | Natural products, wellness, tea, herbal, organic beauty
+Fire & Smoke | Intense, dramatic, primal energy | Product emerging from smoke and ember glow | Grills, spicy food, cologne, whisky, bold masculine brands
+Crystal Cave | Ethereal, precious, gem-like | Product surrounded by crystal formations and prismatic light | Jewellery, perfume, skincare serums, premium beauty
+Ocean Surface | Fresh, expansive, horizon energy | Product at the water surface with sky and sea | Water, sunscreen, beach products, summer lines, marine brands
+Workshop Craft | Artisanal, handmade, process-focused | Product in a maker’s workshop with tools and materials | Handmade goods, leather, woodwork, craft brands, artisanal food
+Velvet Stage | Theatrical, dramatic, spotlight | Product on velvet surface with theatrical lighting | Fashion accessories, watches, perfume, any product needing drama
+Tech Orbit | Futuristic, clean, data-driven | Product floating in a digital space with tech elements | Electronics, apps, SaaS, fintech, gadgets, tech accessories
+Sunset Canvas | Warm, romantic, golden | Product bathed in golden hour light with warm sky | Beauty, skincare, fashion, romance-adjacent brands, gift products
+Street Market | Authentic, colourful, bustling | Product in a vibrant market or street food context | Street food, local brands, traditional products, African market energy
+Product Category | Default Art-Piece Styles
+Food / Beverage / Juice | Ingredient Explosion, Frozen Impact, Street Market
+Perfume / Beauty | Golden Throne, Crystal Cave, Sunset Canvas
+Fashion / Streetwear | Neon Underground, Street Market, Velvet Stage
+Water / Eco / Natural | Nature Immersion, Ocean Surface, Botanical Garden
+Electronics / Tech | Tech Orbit, Neon Underground, Frozen Impact
+Home / Architecture / Interior | Luxury Showroom, Workshop Craft, Fire & Smoke
+Jewellery / Watches | Golden Throne, Crystal Cave, Velvet Stage
+General / Other | Luxury Showroom, Ingredient Explosion, Sunset Canvas
