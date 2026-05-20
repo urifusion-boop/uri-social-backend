@@ -861,7 +861,7 @@ async def _do_publish(
     """
     import uuid as _uuid
 
-    if not db or not user_id:
+    if db is None or not user_id:
         print(f"[WhatsApp] _do_publish: missing db or user_id — cannot publish")
         return False
 
