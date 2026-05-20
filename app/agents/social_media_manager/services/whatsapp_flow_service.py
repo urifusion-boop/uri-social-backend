@@ -852,77 +852,75 @@ async def _do_publish(
     media_url: Optional[str],
     scheduled_at: Optional[str],
     db: Optional[AsyncIOMotorDatabase] = None,
+    user_id: str = "",
 ) -> bool:
-    outstand_ids = [a["id"] for a in accounts if a.get("source") == "outstand"]
-    direct_accounts = [a for a in accounts if a.get("source") == "direct"]
+    """
+    Publish or schedule content using the same ApprovalWorkflowService path as the dashboard.
+    Creates one content_draft per platform, then routes through _trigger_immediate_publishing
+    (for post-now) or schedule_content (for future scheduling).
+    """
+    import uuid as _uuid
 
-    success = True
+    if not db or not user_id:
+        print(f"[WhatsApp] _do_publish: missing db or user_id — cannot publish")
+        return False
 
-    if outstand_ids:
+    from app.agents.social_media_manager.services.approval_workflow_service import ApprovalWorkflowService
+
+    # Derive distinct platforms from the selected accounts
+    platforms = list({(acc.get("network") or "").lower() for acc in accounts if acc.get("network")})
+    if not platforms:
+        print("[WhatsApp] _do_publish: no platforms found in accounts list")
+        return False
+
+    print(f"[WhatsApp] _do_publish | user_id={user_id} platforms={platforms} scheduled_at={scheduled_at}")
+
+    now = datetime.utcnow()
+    draft_ids: List[str] = []
+
+    for platform in platforms:
+        draft_id = _uuid.uuid4().hex
+        draft_doc = {
+            "id": draft_id,
+            "request_id": _uuid.uuid4().hex,
+            "platform": platform,
+            "user_id": user_id,
+            "content": caption,
+            "headline": "",
+            "status": "approved",
+            "source": "whatsapp",
+            "created_at": now,
+            "updated_at": now,
+        }
+        if media_url:
+            draft_doc["image_url"] = media_url
+        await db["content_drafts"].insert_one(draft_doc)
+        draft_ids.append(draft_id)
+        print(f"[WhatsApp] Created draft={draft_id} for platform={platform}")
+
+    if scheduled_at:
         try:
-            from app.agents.social_media_manager.services.outstand_service import OutstandService
-            outstand = OutstandService()
-            await outstand.publish_post(
-                outstand_account_ids=outstand_ids,
-                content=caption,
-                scheduled_at=scheduled_at,
-                media_urls=[media_url] if media_url else None,
-            )
-        except Exception as e:
-            print(f"[WhatsApp] outstand publish error: {e}")
-            success = False
-
-    for acc in direct_accounts:
-        platform = acc.get("network", "")
-        try:
-            if platform == "linkedin" and db is not None:
-                from app.agents.social_media_manager.services.linkedin_direct_service import LinkedInDirectService
-                conn = await db["social_connections"].find_one(
-                    {"user_id": acc.get("_user_id"), "platform": "linkedin", "connection_status": "active"}
-                )
-                token = (conn or {}).get("linkedin_access_token") or (conn or {}).get("access_token")
-                urn = (conn or {}).get("person_urn") or (conn or {}).get("active_author_urn")
-                if conn and token and urn:
-                    svc = LinkedInDirectService()
-                    await svc.create_post(access_token=token, person_urn=urn, text=caption, image_url=media_url)
-                else:
-                    print(f"[WhatsApp] LinkedIn direct missing token or URN for user={acc.get('_user_id')}")
-                    success = False
-
-            elif platform == "instagram" and db is not None:
-                from app.agents.social_media_manager.services.instagram_direct_service import InstagramDirectService
-                conn = await db["social_connections"].find_one(
-                    {"user_id": acc.get("_user_id"), "platform": "instagram",
-                     "connected_via": {"$in": ["instagram_direct", "instagram_direct_oauth"]},
-                     "connection_status": "active"}
-                )
-                ig_user_id = (conn or {}).get("ig_user_id")
-                page_token = (conn or {}).get("page_access_token")
-                page_id = (conn or {}).get("page_id")
-                if conn and ig_user_id and page_token:
-                    if scheduled_at:
-                        print(f"[WhatsApp] Instagram scheduling deferred to cron for {scheduled_at}")
-                    else:
-                        result = await InstagramDirectService.publish_post(
-                            ig_user_id=ig_user_id,
-                            page_access_token=page_token,
-                            content=caption,
-                            image_url=media_url or None,
-                            page_id=page_id,
-                        )
-                        if not result.get("success"):
-                            print(f"[WhatsApp] Instagram publish failed: {result.get('error')}")
-                            success = False
-                else:
-                    print(f"[WhatsApp] Instagram direct missing credentials for user={acc.get('_user_id')}")
-                    success = False
-
-            else:
-                print(f"[WhatsApp] direct publish not implemented for {platform}")
-                success = False
-        except Exception as e:
-            print(f"[WhatsApp] direct publish error for {platform}: {e}")
-            success = False
+            scheduled_dt = datetime.fromisoformat(scheduled_at.replace("Z", "+00:00")).replace(tzinfo=None)
+        except Exception:
+            scheduled_dt = now + timedelta(minutes=5)
+        result = await ApprovalWorkflowService.schedule_content(
+            db=db,
+            user_id=user_id,
+            draft_ids=draft_ids,
+            scheduled_datetime=scheduled_dt,
+        )
+        success = bool(result.get("status"))
+        print(f"[WhatsApp] schedule_content result: {result}")
+    else:
+        results = await ApprovalWorkflowService._trigger_immediate_publishing(
+            db=db,
+            user_id=user_id,
+            draft_ids=draft_ids,
+        )
+        success = any(r.get("success") for r in results.values()) if results else False
+        if not success:
+            errors = {did: r.get("error") for did, r in (results or {}).items()}
+            print(f"[WhatsApp] _trigger_immediate_publishing failed: {errors}")
 
     return success
 
@@ -1574,13 +1572,14 @@ class WhatsAppFlowService:
         graphic_url: Optional[str],
         ctx: Dict[str, Any],
         db: AsyncIOMotorDatabase,
+        user_id: str = "",
     ) -> None:
         try:
             await _send(phone, "Publishing... 🚀")
         except Exception as e:
             print(f"[WhatsApp] failed to send 'Publishing...' message: {e}")
         try:
-            success = await _do_publish(selected, caption, graphic_url, scheduled_at=None, db=db)
+            success = await _do_publish(selected, caption, graphic_url, scheduled_at=None, db=db, user_id=user_id)
         except Exception as e:
             print(f"[WhatsApp] _do_publish raised: {e}")
             success = False
@@ -1614,7 +1613,7 @@ class WhatsAppFlowService:
 
         if text in _YES_WORDS:
             if mode == "now":
-                await WhatsAppFlowService._publish_to(phone, selected, caption, graphic_url, ctx, db)
+                await WhatsAppFlowService._publish_to(phone, selected, caption, graphic_url, ctx, db, user_id=user_id)
             else:
                 await _send(phone, SCHEDULE_PROMPT)
                 await _safe_set_state(phone, "awaiting_schedule_time", {**ctx, "_schedule_accounts": selected}, db)
@@ -1706,13 +1705,35 @@ class WhatsAppFlowService:
                 db,
             )
         else:
-            await _send(phone, SCHEDULE_PROMPT)
-            await _safe_set_state(
-                phone,
-                "awaiting_schedule_time",
-                {**ctx, "_schedule_accounts": selected},
-                db,
-            )
+            # If _scheduled_at is already in ctx (user already gave us a time), go straight to scheduling
+            existing_scheduled_at: Optional[str] = ctx.get("_scheduled_at")
+            if existing_scheduled_at:
+                caption = ctx.get("caption", "")
+                graphic_url = ctx.get("last_graphic_url")
+                await _send(phone, "Scheduling your post... 🗓️")
+                scheduled_dt_reuse = _parse_schedule_time(existing_scheduled_at) or datetime.fromisoformat(existing_scheduled_at)
+                success = await _do_publish(selected, caption, graphic_url, scheduled_at=scheduled_dt_reuse.isoformat(), db=db, user_id=user_id)
+                if success:
+                    wat_dt = scheduled_dt_reuse + _WAT_OFFSET
+                    time_str = wat_dt.strftime("%A, %d %B at %-I:%M %p") + " WAT"
+                    platform_names = ", ".join(
+                        NETWORK_LABELS.get(acc.get("network", ""), acc.get("network", "")) for acc in selected
+                    )
+                    await _send(
+                        phone,
+                        f"✅ Scheduled for {time_str}\nPlatform: {platform_names}\n\nWhat would you like to do next?\n\n" + CONTENT_ACTIONS,
+                    )
+                else:
+                    await _send(phone, "❌ Could not schedule right now. Please try again.\n\n" + CONTENT_ACTIONS)
+                await _safe_set_state(phone, "showing_content", ctx, db)
+            else:
+                await _send(phone, SCHEDULE_PROMPT)
+                await _safe_set_state(
+                    phone,
+                    "awaiting_schedule_time",
+                    {**ctx, "_schedule_accounts": selected},
+                    db,
+                )
 
     @staticmethod
     async def _handle_schedule_time(
@@ -1755,7 +1776,7 @@ class WhatsAppFlowService:
         graphic_url = ctx.get("last_graphic_url")
         await _send(phone, "Scheduling your post... 🗓️")
 
-        success = await _do_publish(schedule_accounts, caption, graphic_url, scheduled_at=scheduled_dt.isoformat(), db=db)
+        success = await _do_publish(schedule_accounts, caption, graphic_url, scheduled_at=scheduled_dt.isoformat(), db=db, user_id=user_id)
 
         if success:
             wat_dt = scheduled_dt + _WAT_OFFSET
