@@ -1109,14 +1109,16 @@ class ApprovalWorkflowService:
                     return {"success": False, "error": "X API credits depleted and no Outstand X account connected as fallback."}
 
         # ── Instagram direct (via Facebook Page Access Token) ────────────────
-        # Match on connected_via OR on presence of ig_user_id credentials (defensive: covers
-        # connections stored with an unexpected connected_via value but valid credentials).
+        # Credential-first: if ig_user_id + page_access_token are present, use the direct
+        # Graph API path regardless of how connected_via is stored. This covers any variation
+        # like "instagram_direct", "instagram_direct_oauth", "instagram_oauth", "instagram", etc.
         _ig_cv = connection.get("connected_via")
-        print(f"🔀 _publish_to_platform routing | platform={platform} connected_via={_ig_cv} ig_user_id={connection.get('ig_user_id')} has_page_token={'yes' if connection.get('page_access_token') else 'NO'}")
-        if platform == "instagram" and (
-            _ig_cv in ("instagram_direct", "instagram_direct_oauth")
-            or (connection.get("ig_user_id") and connection.get("page_access_token"))
-        ):
+        _ig_has_creds = bool(connection.get("ig_user_id") and connection.get("page_access_token"))
+        _ig_cv_is_direct = _ig_cv in (
+            "instagram_direct", "instagram_direct_oauth", "instagram_oauth", "instagram"
+        )
+        print(f"🔀 _publish_to_platform routing | platform={platform} connected_via={_ig_cv} ig_user_id={connection.get('ig_user_id')} has_page_token={'yes' if connection.get('page_access_token') else 'NO'} has_creds={_ig_has_creds}")
+        if platform == "instagram" and (_ig_has_creds or _ig_cv_is_direct):
             from app.agents.social_media_manager.services.instagram_direct_service import InstagramDirectService
             ig_user_id = connection.get("ig_user_id")
             page_token = connection.get("page_access_token")
