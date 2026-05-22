@@ -2803,7 +2803,7 @@ async def get_account_metrics(
         linkedin_conns = await db["social_connections"].find(
             {"user_id": user_id, "platform": "linkedin", "connection_status": "active"},
             {"_id": 0, "linkedin_access_token": 1, "person_urn": 1, "active_author_urn": 1,
-             "account_name": 1, "username": 1, "pages": 1},
+             "account_name": 1, "username": 1, "pages": 1, "followers_count": 1},
         ).to_list(length=5)
 
         async def _fetch_linkedin_direct_metrics(conn):
