@@ -145,15 +145,15 @@ class PerformanceAnalyticsService:
 
     @staticmethod
     def _extract_topics(content: str, brand_pillars: List[str] = None) -> List[str]:
+        import re as _re
         text = content.lower()
         found = [
             topic for topic, keywords in _TOPIC_KEYWORDS.items()
-            if any(k in text for k in keywords)
+            if any(_re.search(r'\b' + _re.escape(k) + r'\b', text) for k in keywords)
         ]
-        # Also match brand-specific content pillars directly
         for pillar in (brand_pillars or []):
             pillar_lower = pillar.lower().strip()
-            if pillar_lower and pillar_lower not in found and pillar_lower in text:
+            if pillar_lower and pillar_lower not in found and _re.search(r'\b' + _re.escape(pillar_lower) + r'\b', text):
                 found.append(pillar_lower)
         return found[:3]
 
