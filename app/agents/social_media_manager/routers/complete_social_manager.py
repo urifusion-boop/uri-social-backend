@@ -2640,7 +2640,27 @@ async def get_performance(
                     data = await outstand.get_post_analytics(post_id)
                     agg = data.get("aggregated_metrics") or {}
                     by_account = data.get("metrics_by_account") or []
+                    # Log the full response so we can see what fields Outstand actually returns
+                    print(f"[Outstand analytics] post_id={post_id} agg_keys={list(agg.keys())} agg={agg}")
+                    if by_account:
+                        print(f"[Outstand by_account] sample={by_account[0]}")
                     network = by_account[0]["social_account"]["network"] if by_account else platform
+
+                    # Try multiple field name variants — Outstand may differ by plan/version
+                    def _pick(*keys):
+                        for k in keys:
+                            v = agg.get(k)
+                            if v:
+                                return int(v)
+                        # Also check per-account metrics
+                        for acc in by_account:
+                            m = acc.get("metrics") or acc.get("aggregated_metrics") or {}
+                            for k in keys:
+                                v = m.get(k)
+                                if v:
+                                    return int(v)
+                        return 0
+
                     live_result = {
                         "draft_id": draft.get("id"),
                         "platform_post_id": post_id,
@@ -2648,14 +2668,15 @@ async def get_performance(
                         "content_preview": (draft.get("content") or "")[:120],
                         "published_at": draft.get("published_date", ""),
                         "image_url": draft.get("image_url"),
-                        "likes": agg.get("total_likes", 0),
-                        "comments": agg.get("total_comments", 0),
-                        "shares": agg.get("total_shares", 0),
-                        "views": agg.get("total_views", 0),
-                        "impressions": agg.get("total_impressions", 0),
-                        "reach": agg.get("total_reach", 0),
+                        "likes":       _pick("total_likes", "likes", "reactions_count"),
+                        "comments":    _pick("total_comments", "comments", "comments_count"),
+                        "shares":      _pick("total_shares", "shares", "reposts"),
+                        "views":       _pick("total_views", "views", "video_views", "plays"),
+                        "impressions": _pick("total_impressions", "impressions", "total_reach", "reach"),
+                        "reach":       _pick("total_reach", "reach", "unique_reach"),
                         "engagement_rate": round(agg.get("average_engagement_rate", 0) * 100, 2),
                     }
+                    print(f"[Outstand analytics mapped] likes={live_result['likes']} imp={live_result['impressions']} reach={live_result['reach']}")
                 except Exception as e:
                     print(f"⚠️ Outstand analytics failed for post {post_id}: {e}")
 
@@ -3191,16 +3212,53 @@ async def debug_outstand_post(
     post_id: str,
     token: dict = Depends(JWTBearer())
 ):
-    """
-    Fetch the live status of an Outstand post by its ID.
-    Use this to diagnose why a post appears queued but hasn't appeared on the social network.
-    """
+    """Fetch the live status of an Outstand post by its ID."""
     try:
         outstand = OutstandService()
         data = await outstand.get_post(post_id)
         return UriResponse.get_single_data_response("outstand_post", data)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/debug/outstand-analytics/{post_id}")
+async def debug_outstand_analytics(
+    post_id: str,
+    token: dict = Depends(JWTBearer())
+):
+    """Return the raw Outstand analytics response for a post — shows exactly what fields are available."""
+    try:
+        outstand = OutstandService()
+        data = await outstand.get_post_analytics(post_id)
+        return UriResponse.get_single_data_response("outstand_analytics", data)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/debug/performance-raw")
+async def debug_performance_raw(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """Show raw published drafts + their platform_post_id and outstand markers for this user."""
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+    drafts = await db["content_drafts"].find(
+        {"user_id": user_id, "status": "published"},
+        {"_id": 0, "id": 1, "platform": 1, "platform_post_id": 1,
+         "outstand_post_status": 1, "published_date": 1,
+         "publish_response": {"$exists": True}},
+    ).sort("published_date", -1).to_list(length=20)
+    conns = await db["social_connections"].find(
+        {"user_id": user_id},
+        {"_id": 0, "platform": 1, "connected_via": 1, "ig_user_id": 1,
+         "has_page_token": {"$cond": [{"$ifNull": ["$page_access_token", False]}, True, False]}},
+    ).to_list(length=10)
+    return UriResponse.get_single_data_response("debug_performance", {
+        "drafts": drafts,
+        "connections": conns,
+    })
 
 @router.get("/debug/connections-raw")
 async def debug_connections_raw(
