@@ -2409,30 +2409,50 @@ async def get_performance(
                 async with _httpx.AsyncClient(timeout=20) as _c:
                     media_resp = await _c.get(
                         f"{_graph_base}/{media_id}",
-                        params={"fields": "like_count,comments_count,timestamp,media_type", "access_token": token},
+                        params={"fields": "like_count,comments_count,timestamp,media_type,media_product_type", "access_token": token},
                     )
                     media_data = media_resp.json()
                     if "error" in media_data:
                         print(f"⚠️ IG media fetch error for {media_id}: {media_data['error'].get('message')}")
                         return None
 
-                    impressions = reach = 0
+                    media_type = media_data.get("media_type", "IMAGE")
+                    media_product_type = media_data.get("media_product_type", "")
+                    is_reel = media_product_type == "REELS" or media_type == "REELS"
+                    is_video = media_type == "VIDEO" and not is_reel
+
+                    # Choose metrics based on media type
+                    if is_reel:
+                        metrics = "plays,reach,likes,comments,shares,saved,total_interactions"
+                    elif is_video:
+                        metrics = "impressions,reach,saved,video_views"
+                    else:
+                        metrics = "impressions,reach,saved"
+
+                    impressions = reach = views = 0
                     try:
                         ins_resp = await _c.get(
                             f"{_graph_base}/{media_id}/insights",
-                            params={"metric": "impressions,reach", "period": "lifetime", "access_token": token},
+                            params={"metric": metrics, "period": "lifetime", "access_token": token},
                         )
-                        for item in ins_resp.json().get("data", []):
-                            val = (item.get("values") or [{}])[0].get("value", 0)
-                            if item["name"] == "impressions":
+                        ins_data = ins_resp.json()
+                        for item in ins_data.get("data", []):
+                            # v21+ uses "total_value", older uses "values[0].value"
+                            val = item.get("total_value", {}).get("value") or \
+                                  (item.get("values") or [{}])[0].get("value", 0)
+                            name = item["name"]
+                            if name == "impressions":
                                 impressions = val
-                            elif item["name"] == "reach":
+                            elif name == "reach":
                                 reach = val
-                    except Exception:
-                        pass
+                            elif name in ("plays", "video_views"):
+                                views = val
+                    except Exception as ins_err:
+                        print(f"⚠️ IG insights fetch failed for {media_id}: {ins_err}")
 
                 likes = media_data.get("like_count", 0)
                 comments = media_data.get("comments_count", 0)
+                effective_reach = reach or impressions
                 return {
                     "draft_id": draft.get("id"),
                     "platform_post_id": media_id,
@@ -2443,10 +2463,10 @@ async def get_performance(
                     "likes": likes,
                     "comments": comments,
                     "shares": 0,
-                    "views": 0,
+                    "views": views,
                     "impressions": impressions,
                     "reach": reach,
-                    "engagement_rate": round(((likes + comments) / max(reach, 1)) * 100, 2) if reach else 0,
+                    "engagement_rate": round(((likes + comments) / max(effective_reach, 1)) * 100, 2) if effective_reach else 0,
                 }
             except Exception as e:
                 print(f"⚠️ Instagram direct analytics failed for {media_id}: {e}")
@@ -2648,10 +2668,37 @@ async def get_account_metrics(
                         print(f"⚠️ IG profile fetch error: {profile['error'].get('message')}")
                         return None
 
-                    # Aggregate engagement from published posts in the period
+                    # Account-level insights (impressions, reach, profile_views)
+                    total_impressions = total_reach = total_profile_views = 0
+                    try:
+                        insights_resp = await _c.get(
+                            f"{_graph_base}/{ig_user_id}/insights",
+                            params={
+                                "metric": "impressions,reach,profile_views",
+                                "period": "day",
+                                "since": since_ts,
+                                "until": until_ts,
+                                "access_token": token,
+                            },
+                        )
+                        for item in insights_resp.json().get("data", []):
+                            daily_total = sum(
+                                v.get("value", 0) for v in (item.get("values") or [])
+                            )
+                            name = item.get("name", "")
+                            if name == "impressions":
+                                total_impressions = daily_total
+                            elif name == "reach":
+                                total_reach = daily_total
+                            elif name == "profile_views":
+                                total_profile_views = daily_total
+                    except Exception as ig_ins_err:
+                        print(f"⚠️ IG account insights failed: {ig_ins_err}")
+
+                    # Aggregate per-post engagement in the period
                     posts_resp = await _c.get(
                         f"{_graph_base}/{ig_user_id}/media",
-                        params={"fields": "like_count,comments_count,timestamp", "limit": 50, "access_token": token},
+                        params={"fields": "like_count,comments_count,timestamp,media_type,media_product_type", "limit": 50, "access_token": token},
                     )
                     posts = posts_resp.json().get("data", [])
                     from datetime import timezone as _tz
@@ -2676,18 +2723,23 @@ async def get_account_metrics(
                     "following_count": None,
                     "posts_count": profile.get("media_count"),
                     "engagement": {
-                        "views": 0,
+                        "views": total_impressions,
                         "likes": total_likes,
                         "comments": total_comments,
                         "shares": 0,
                         "reposts": 0,
                         "quotes": 0,
+                        "reach": total_reach,
+                        "profile_views": total_profile_views,
                     },
-                    "engagement_note": f"Likes + comments on posts published in the last {days} days",
+                    "engagement_note": f"Account impressions + reach for the last {days} days via Instagram Insights API",
                     "platform_specific": {
                         "username": profile.get("username"),
                         "biography": profile.get("biography"),
                         "profile_picture_url": profile.get("profile_picture_url"),
+                        "impressions": total_impressions,
+                        "reach": total_reach,
+                        "profile_views": total_profile_views,
                     },
                     "period": {"since": since_ts, "until": until_ts},
                 }
