@@ -2818,31 +2818,51 @@ async def get_account_metrics(
                 # Fetch basic profile (name, email)
                 profile = await svc.get_profile(access_token)
 
-                # Fetch connection count from LinkedIn profile
-                # numConnections is available on the basic profile; falls back to 0
-                followers_count = 0
+                # LinkedIn doesn't expose follower/connection counts with basic scopes.
+                # Try several endpoints in order, fall back to stored value.
+                followers_count = int(conn.get("followers_count", 0) or 0)
                 try:
                     async with _httpx.AsyncClient(timeout=15) as _c:
-                        conn_resp = await _c.get(
-                            "https://api.linkedin.com/v2/people/~:(num-connections,num-connections-capped)",
-                            headers={"Authorization": f"Bearer {access_token}",
-                                     "X-Restli-Protocol-Version": "2.0.0"},
+                        headers_li = {"Authorization": f"Bearer {access_token}",
+                                      "X-Restli-Protocol-Version": "2.0.0"}
+
+                        # 1. networkSizes — works with r_liteprofile on some apps
+                        encoded_urn = person_urn.replace(":", "%3A")
+                        ns_resp = await _c.get(
+                            f"https://api.linkedin.com/v2/networkSizes/{encoded_urn}",
+                            params={"edgeType": "CreatedByMember"},
+                            headers=headers_li,
                         )
-                        if conn_resp.status_code == 200:
-                            d = conn_resp.json()
-                            followers_count = d.get("numConnections", 0) or 0
-                        else:
-                            # Try the newer REST-li v2 people endpoint
+                        if ns_resp.status_code == 200:
+                            followers_count = ns_resp.json().get("firstDegreeSize", 0) or followers_count
+
+                        # 2. Legacy ~: fields (r_liteprofile / r_basicprofile)
+                        elif followers_count == 0:
+                            lp_resp = await _c.get(
+                                "https://api.linkedin.com/v2/people/~:(numConnections,numConnectionsCapped)",
+                                headers=headers_li,
+                            )
+                            if lp_resp.status_code == 200:
+                                followers_count = lp_resp.json().get("numConnections", 0) or followers_count
+
+                        # 3. /me projection
+                        if followers_count == 0:
                             me_resp = await _c.get(
                                 "https://api.linkedin.com/v2/me",
                                 params={"projection": "(numConnections)"},
-                                headers={"Authorization": f"Bearer {access_token}",
-                                         "X-Restli-Protocol-Version": "2.0.0"},
+                                headers=headers_li,
                             )
                             if me_resp.status_code == 200:
-                                followers_count = me_resp.json().get("numConnections", 0) or 0
+                                followers_count = me_resp.json().get("numConnections", 0) or followers_count
+
+                        # Persist successful count so next request can use it as fallback
+                        if followers_count:
+                            await db["social_connections"].update_one(
+                                {"user_id": user_id, "platform": "linkedin"},
+                                {"$set": {"followers_count": followers_count}},
+                            )
                 except Exception:
-                    pass  # follower count is best-effort
+                    pass  # follower count is best-effort; stored value used
 
                 # Count published posts from our DB in the period
                 from datetime import timezone as _tz
