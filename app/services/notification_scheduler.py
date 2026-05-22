@@ -87,6 +87,19 @@ def _job_whatsapp_daily_push():
     _run_async(_run)
 
 
+def _job_publish_scheduled_content():
+    async def _run():
+        from app.database import get_db
+        from app.agents.social_media_manager.services.approval_workflow_service import ApprovalWorkflowService
+        db = get_db()
+        result = await ApprovalWorkflowService.publish_scheduled_content(db=db)
+        published = result.get("published_count", 0)
+        errors = result.get("errors", [])
+        if published > 0 or errors:
+            print(f"📅 Scheduled publish: {published} published, {len(errors)} errors — {errors}")
+    _run_async(_run)
+
+
 def start_notification_scheduler():
     """Start the APScheduler with all notification batch jobs."""
     global _scheduler, _main_loop
@@ -147,8 +160,16 @@ def start_notification_scheduler():
         **_JOB_DEFAULTS,
     )
 
+    # Publish scheduled content every 5 minutes
+    _scheduler.add_job(
+        _job_publish_scheduled_content,
+        CronTrigger(minute="*/5"),
+        id="publish_scheduled_content",
+        **_JOB_DEFAULTS,
+    )
+
     _scheduler.start()
-    print("📅 Notification scheduler started with 5 jobs")
+    print("📅 Notification scheduler started with 6 jobs")
 
 
 def stop_notification_scheduler():
