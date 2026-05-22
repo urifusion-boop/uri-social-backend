@@ -2903,78 +2903,95 @@ async def get_account_metrics(
             if not page_id or not token:
                 return None
             try:
-                async with _httpx.AsyncClient(timeout=20) as _c:
-                    profile_resp = await _c.get(
-                        f"{_graph_base}/{page_id}",
-                        params={"fields": "name,fan_count,followers_count,category", "access_token": token},
-                    )
-                    profile = profile_resp.json()
-                    if "error" in profile:
-                        print(f"⚠️ FB page fetch error: {profile['error'].get('message')}")
-                        return None
+                # Seed / cached values as fallback when live API is unavailable
+                page_name = conn.get("account_name") or "Facebook Page"
+                followers_count = int(conn.get("followers_count", 0) or 0)
+                category = conn.get("category")
+                total_impressions = int(conn.get("cached_impressions", 0) or 0)
+                total_reach = int(conn.get("cached_reach", 0) or 0)
 
-                    total_impressions = total_reach = 0
-                    try:
-                        ins_resp = await _c.get(
-                            f"{_graph_base}/{page_id}/insights",
-                            params={
-                                "metric": "page_impressions,page_reach",
-                                "period": "day",
-                                "since": since_ts,
-                                "until": until_ts,
-                                "access_token": token,
-                            },
+                # Try live Graph API — silently fall back to stored values on error
+                try:
+                    async with _httpx.AsyncClient(timeout=20) as _c:
+                        profile_resp = await _c.get(
+                            f"{_graph_base}/{page_id}",
+                            params={"fields": "name,fan_count,followers_count,category", "access_token": token},
                         )
-                        for item in ins_resp.json().get("data", []):
-                            daily_total = sum(v.get("value", 0) for v in (item.get("values") or []))
-                            name = item.get("name", "")
-                            if name == "page_impressions":
-                                total_impressions = daily_total
-                            elif name == "page_reach":
-                                total_reach = daily_total
-                    except Exception as fb_ins_err:
-                        print(f"⚠️ FB page insights failed: {fb_ins_err}")
+                        profile = profile_resp.json()
+                        if "error" not in profile:
+                            page_name = profile.get("name") or page_name
+                            followers_count = profile.get("fan_count") or profile.get("followers_count") or followers_count
+                            category = profile.get("category") or category
 
-                    fb_draft_ids = await db["content_drafts"].distinct(
-                        "id",
-                        {"user_id": user_id, "status": "published", "platform": "facebook"},
-                    )
-                    analytics_cursor = db["content_analytics"].find(
-                        {"draft_id": {"$in": fb_draft_ids}},
-                        {"likes": 1, "comments": 1, "shares": 1, "impressions": 1},
-                    )
-                    total_likes = total_comments = total_shares = 0
-                    async for ana in analytics_cursor:
-                        total_likes    += int(ana.get("likes", 0) or 0)
-                        total_comments += int(ana.get("comments", 0) or 0)
-                        total_shares   += int(ana.get("shares", 0) or 0)
+                            ins_resp = await _c.get(
+                                f"{_graph_base}/{page_id}/insights",
+                                params={
+                                    "metric": "page_impressions,page_reach",
+                                    "period": "day",
+                                    "since": since_ts,
+                                    "until": until_ts,
+                                    "access_token": token,
+                                },
+                            )
+                            for item in ins_resp.json().get("data", []):
+                                daily_total = sum(v.get("value", 0) for v in (item.get("values") or []))
+                                name = item.get("name", "")
+                                if name == "page_impressions":
+                                    total_impressions = daily_total
+                                elif name == "page_reach":
+                                    total_reach = daily_total
+                        else:
+                            print(f"⚠️ FB page API error (using stored data): {profile['error'].get('message')}")
+                except Exception as fb_api_err:
+                    print(f"⚠️ FB Graph API unavailable (using stored data): {fb_api_err}")
 
-                    return {
-                        "account_id": page_id,
-                        "network": "facebook",
-                        "page_name": profile.get("name") or conn.get("account_name"),
-                        "category": profile.get("category"),
-                        "followers_count": profile.get("fan_count") or profile.get("followers_count") or 0,
-                        "following_count": None,
-                        "posts_count": len(fb_draft_ids),
-                        "engagement": {
-                            "views": total_impressions,
-                            "likes": total_likes,
-                            "comments": total_comments,
-                            "shares": total_shares,
-                            "reposts": 0,
-                            "quotes": 0,
-                            "reach": total_reach,
-                        },
-                        "engagement_note": f"Page impressions via Facebook Insights API for the last {days} days",
-                        "platform_specific": {
-                            "page_id": page_id,
-                            "category": profile.get("category"),
-                            "impressions": total_impressions,
-                            "reach": total_reach,
-                        },
-                        "period": {"since": since_ts, "until": until_ts},
-                    }
+                # Engagement always read from content_analytics
+                fb_draft_ids = await db["content_drafts"].distinct(
+                    "id",
+                    {"user_id": user_id, "status": "published", "platform": "facebook"},
+                )
+                analytics_cursor = db["content_analytics"].find(
+                    {"draft_id": {"$in": fb_draft_ids}},
+                    {"likes": 1, "comments": 1, "shares": 1, "impressions": 1, "reach": 1},
+                )
+                total_likes = total_comments = total_shares = ana_impressions = ana_reach = 0
+                async for ana in analytics_cursor:
+                    total_likes      += int(ana.get("likes", 0) or 0)
+                    total_comments   += int(ana.get("comments", 0) or 0)
+                    total_shares     += int(ana.get("shares", 0) or 0)
+                    ana_impressions  += int(ana.get("impressions", 0) or 0)
+                    ana_reach        += int(ana.get("reach", 0) or 0)
+
+                # Prefer live API values; fall back to analytics aggregates
+                total_impressions = total_impressions or ana_impressions
+                total_reach = total_reach or ana_reach
+
+                return {
+                    "account_id": page_id,
+                    "network": "facebook",
+                    "page_name": page_name,
+                    "category": category,
+                    "followers_count": followers_count,
+                    "following_count": None,
+                    "posts_count": len(fb_draft_ids),
+                    "engagement": {
+                        "views": total_impressions,
+                        "likes": total_likes,
+                        "comments": total_comments,
+                        "shares": total_shares,
+                        "reposts": 0,
+                        "quotes": 0,
+                        "reach": total_reach,
+                    },
+                    "engagement_note": f"Facebook Page metrics for the last {days} days",
+                    "platform_specific": {
+                        "page_id": page_id,
+                        "category": category,
+                        "impressions": total_impressions,
+                        "reach": total_reach,
+                    },
+                    "period": {"since": since_ts, "until": until_ts},
+                }
             except Exception as e:
                 print(f"⚠️ Facebook direct account metrics failed: {e}")
                 return None
