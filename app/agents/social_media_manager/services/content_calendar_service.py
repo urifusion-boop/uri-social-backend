@@ -293,7 +293,11 @@ async def _generate_ideas(
     if _perf_topics:
         _cycled_for_days = [_perf_topics[i % len(_perf_topics)] for i in range(7)]
         days_block = "\n".join(
-            f"Day {i} ({WEEK_DAYS[i]}) → TOPIC: {_cycled_for_days[i]} | type: {mix[i]} ({CONTENT_TYPE_LABELS[mix[i]]}) | hook: {shuffled_hooks[i]} | format: {shuffled_formats[i]}"
+            (
+                f"Day {i} ({WEEK_DAYS[i]}) → "
+                f"TOPIC: {_cycled_for_days[i]} (write about: {_TOPIC_DEFINITIONS.get(_cycled_for_days[i], _cycled_for_days[i])}) | "
+                f"type: {mix[i]} ({CONTENT_TYPE_LABELS[mix[i]]}) | hook: {shuffled_hooks[i]} | format: {shuffled_formats[i]}"
+            )
             for i in range(7)
         )
     else:
@@ -401,17 +405,37 @@ async def _generate_ideas(
         extras.append(f"Topics/themes to avoid: {avoid_str}")
     extras_block = "\n".join(extras)
 
+    # Definitions for what each topic label means as post subject matter.
+    # Critical: prevents AI from misreading e.g. "offer" as "promote this brand"
+    # or "marketing" as "write about social media marketing for this platform".
+    _TOPIC_DEFINITIONS = {
+        "offer":      "deals, discounts, limited-time sales, pricing savings — e.g. a money-saving tip, a promo breakdown, a 'best deal right now' angle",
+        "technology": "practical tech tools, apps, automation, AI — e.g. a tool that saves time, an automation hack, a software comparison",
+        "finance":    "money management, investing, savings, budgeting, profit margins — e.g. an investment tip, a budgeting mistake, a savings strategy",
+        "business":   "entrepreneurship, client acquisition, sales strategy, startup growth — e.g. how to land clients, a scaling lesson, a founder insight",
+        "education":  "step-by-step guides, how-to posts, common mistakes, beginner tips — e.g. a tutorial, a 'what I wish I knew' post, a myth-bust",
+        "marketing":  "audience growth tactics, brand-building, content strategy — e.g. an algorithm insight, a growth hack, a posting strategy",
+        "motivation": "mindset, discipline, resilience, goal-setting — e.g. a personal growth story, a hard truth about success, an anti-procrastination angle",
+        "real estate":"property investing, rental income, mortgage tips, landlord lessons",
+        "fashion":    "style tips, outfit ideas, trend breakdowns, wardrobe hacks",
+        "food":       "recipes, meal prep, food business tips, catering insights",
+        "story":      "behind-the-scenes story, brand journey, case study, team moment",
+    }
+
     # When we have engagement data, assign one proven topic to each day explicitly.
     # This leaves the AI no room to drift back to brand pillars or industry defaults.
     if _perf_topics:
         _cycled = [_perf_topics[i % len(_perf_topics)] for i in range(7)]
-        _topic_lines = "\n".join(f"  Day {i} → topic: {_cycled[i]}" for i in range(7))
+        _topic_lines = "\n".join(
+            f"  Day {i} → TOPIC: {_cycled[i]}  ({_TOPIC_DEFINITIONS.get(_cycled[i], _cycled[i])})"
+            for i in range(7)
+        )
         topic_override_block = (
             f"=== MANDATORY TOPIC ASSIGNMENTS (derived from real engagement data) ===\n"
-            f"Each day's post MUST be about the assigned topic below. No substitutions.\n"
+            f"Each day's post MUST be about the assigned topic — the definition in parentheses tells you exactly what the post should cover.\n"
+            f"CRITICAL: these topics are the SUBJECT MATTER of the post — they are not about this brand's own services or platform.\n"
+            f"The brand voice/audience tells you HOW and WHO to write for — the topic tells you WHAT to write about.\n"
             f"{_topic_lines}\n"
-            f"The brand context tells you WHO you're writing for and HOW to write — not WHAT to write about.\n"
-            f"Do NOT default to the brand's industry or content pillars as the subject matter.\n"
             f"======================================================================="
         )
         content_focus_line = ""  # suppress pillars entirely — topics are set above
@@ -459,7 +483,7 @@ Rules:
 - Never use list-post titles like "5 ways to..." or "5 mistakes..." more than ONCE across the 7 days
 - No two days should share the same emotional tone — vary between inspiring, urgent, curious, empathetic, bold, playful, and authoritative
 - Be SPECIFIC to this brand — use real product/service names, real audience pain points, real industry context
-- Promotional: highlight a genuine product/service benefit with a clear value statement
+- Promotional: when a TOPIC is assigned, write about a deal/offer/value prop WITHIN that topic (e.g. if topic=finance, promote a financial tool or a deal for investors) — do NOT default to promoting this brand's own platform
 - Educational: share an insight directly relevant to this brand's industry and audience
 - Relatable: tap into a real emotion or experience the target audience would recognise instantly
 - Engagement: pose a specific question or poll that this brand's followers would genuinely answer — vary the question style (poll, fill-in-the-blank, debate, personal story prompt)

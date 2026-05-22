@@ -2405,15 +2405,115 @@ async def get_performance(
                 "top_posts": [],
             })
 
-        # Load all direct (non-Outstand) connections so we can use their tokens
+        # Load direct connections — for platform routing
         direct_conns = await db["social_connections"].find(
             {"user_id": user_id, "connected_via": {"$ne": "outstand"}},
             {"_id": 0, "platform": 1, "connected_via": 1, "page_access_token": 1, "ig_user_id": 1},
         ).to_list(length=20)
         direct_conn_map = {c["platform"]: c for c in direct_conns}
 
+        # Load ANY Instagram connection that has a page_access_token (incl. Outstand-linked)
+        # so we can look up media from Instagram even for Outstand-published posts.
+        all_ig_conns = await db["social_connections"].find(
+            {"user_id": user_id, "platform": "instagram", "page_access_token": {"$exists": True}},
+            {"_id": 0, "ig_user_id": 1, "page_access_token": 1},
+        ).to_list(length=5)
+        ig_direct = next((c for c in all_ig_conns if c.get("ig_user_id") and c.get("page_access_token")), None)
+
         outstand = OutstandService()
         _graph_base = f"https://graph.facebook.com/{settings.FACEBOOK_API_VERSION}"
+
+        async def _fetch_instagram_by_timestamp(draft, conn):
+            """Find a published IG post by matching the draft's published_date to media timestamps.
+            Used for Outstand posts where platform_post_id is an Outstand UUID, not an IG media ID."""
+            ig_user_id = conn.get("ig_user_id")
+            token = conn.get("page_access_token")
+            pub_date = draft.get("published_date")
+            if not ig_user_id or not token or not pub_date:
+                return None
+            try:
+                from dateutil.parser import parse as _dp
+                pub_dt = _dp(str(pub_date)) if isinstance(pub_date, str) else pub_date
+                pub_dt = pub_dt.replace(tzinfo=None)
+            except Exception:
+                return None
+            try:
+                async with _httpx.AsyncClient(timeout=20) as _c:
+                    media_resp = await _c.get(
+                        f"{_graph_base}/{ig_user_id}/media",
+                        params={"fields": "id,timestamp,like_count,comments_count,media_type,media_product_type", "limit": 100, "access_token": token},
+                    )
+                    media_list = media_resp.json().get("data", [])
+
+                    best_match = None
+                    best_diff = float("inf")
+                    for m in media_list:
+                        try:
+                            m_dt = _dp(m["timestamp"]).replace(tzinfo=None)
+                            diff = abs((pub_dt - m_dt).total_seconds())
+                            if diff < 3600 and diff < best_diff:  # within 1 hour
+                                best_diff = diff
+                                best_match = m
+                        except Exception:
+                            pass
+
+                    if not best_match:
+                        return None
+
+                    media_id = best_match["id"]
+                    media_type = best_match.get("media_type", "IMAGE")
+                    media_product_type = best_match.get("media_product_type", "")
+                    is_reel = media_product_type == "REELS" or media_type == "REELS"
+                    is_video = media_type == "VIDEO" and not is_reel
+
+                    if is_reel:
+                        metrics = "plays,reach,likes,comments,shares,saved,total_interactions"
+                    elif is_video:
+                        metrics = "impressions,reach,saved,video_views"
+                    else:
+                        metrics = "impressions,reach,saved"
+
+                    impressions = reach = views = 0
+                    try:
+                        ins_resp = await _c.get(
+                            f"{_graph_base}/{media_id}/insights",
+                            params={"metric": metrics, "period": "lifetime", "access_token": token},
+                        )
+                        for item in ins_resp.json().get("data", []):
+                            val = item.get("total_value", {}).get("value") or \
+                                  (item.get("values") or [{}])[0].get("value", 0)
+                            name = item["name"]
+                            if name == "impressions":
+                                impressions = val
+                            elif name == "reach":
+                                reach = val
+                            elif name in ("plays", "video_views"):
+                                views = val
+                    except Exception as ins_e:
+                        print(f"⚠️ IG timestamp-lookup insights failed for {media_id}: {ins_e}")
+
+                    likes = best_match.get("like_count", 0)
+                    comments = best_match.get("comments_count", 0)
+                    effective_reach = reach or impressions
+                    print(f"[IG timestamp match] draft={draft.get('id')} media_id={media_id} diff={best_diff:.0f}s imp={impressions} reach={reach}")
+                    return {
+                        "draft_id": draft.get("id"),
+                        "platform_post_id": media_id,
+                        "platform": "instagram",
+                        "content_preview": (draft.get("content") or "")[:120],
+                        "published_at": draft.get("published_date", ""),
+                        "image_url": draft.get("image_url"),
+                        "likes": likes,
+                        "comments": comments,
+                        "shares": 0,
+                        "views": views,
+                        "impressions": impressions,
+                        "reach": reach,
+                        "engagement_rate": round(((likes + comments) / max(effective_reach, 1)) * 100, 2) if effective_reach else 0,
+                    }
+            except Exception as e:
+                print(f"⚠️ Instagram timestamp lookup failed: {e}")
+                return None
 
         async def _fetch_instagram_direct(draft, conn):
             media_id = draft.get("platform_post_id")
@@ -2522,37 +2622,66 @@ async def get_performance(
         async def _fetch(draft):
             post_id = draft.get("platform_post_id")
             platform = draft.get("platform", "unknown")
+            # Outstand-published posts have outstand_post_status or publish_response set.
+            # Their platform_post_id is an Outstand UUID, NOT a native social media ID.
+            is_outstand_post = bool(draft.get("outstand_post_status") or draft.get("publish_response"))
 
             live_result = None
 
-            if post_id:
-                # Route to direct Graph API for non-Outstand Instagram/Facebook
-                if platform in direct_conn_map and direct_conn_map[platform].get("page_access_token"):
-                    live_result = await _fetch_instagram_direct(draft, direct_conn_map[platform])
-                elif platform not in direct_conn_map:
-                    # Outstand-managed post
-                    try:
-                        data = await outstand.get_post_analytics(post_id)
-                        agg = data.get("aggregated_metrics") or {}
-                        by_account = data.get("metrics_by_account") or []
-                        network = by_account[0]["social_account"]["network"] if by_account else platform
-                        live_result = {
-                            "draft_id": draft.get("id"),
-                            "platform_post_id": post_id,
-                            "platform": network or platform,
-                            "content_preview": (draft.get("content") or "")[:120],
-                            "published_at": draft.get("published_date", ""),
-                            "image_url": draft.get("image_url"),
-                            "likes": agg.get("total_likes", 0),
-                            "comments": agg.get("total_comments", 0),
-                            "shares": agg.get("total_shares", 0),
-                            "views": agg.get("total_views", 0),
-                            "impressions": agg.get("total_impressions", 0),
-                            "reach": agg.get("total_reach", 0),
-                            "engagement_rate": round(agg.get("average_engagement_rate", 0) * 100, 2),
-                        }
-                    except Exception as e:
-                        print(f"⚠️ Analytics fetch failed for post {post_id}: {e}")
+            # Strategy 1: direct-connected post with a real native media ID
+            if post_id and not is_outstand_post:
+                conn = direct_conn_map.get(platform)
+                if conn and conn.get("page_access_token"):
+                    live_result = await _fetch_instagram_direct(draft, conn)
+
+            # Strategy 2: Outstand-published post — get what Outstand has (likes/comments)
+            if live_result is None and post_id and is_outstand_post:
+                try:
+                    data = await outstand.get_post_analytics(post_id)
+                    agg = data.get("aggregated_metrics") or {}
+                    by_account = data.get("metrics_by_account") or []
+                    network = by_account[0]["social_account"]["network"] if by_account else platform
+                    live_result = {
+                        "draft_id": draft.get("id"),
+                        "platform_post_id": post_id,
+                        "platform": network or platform,
+                        "content_preview": (draft.get("content") or "")[:120],
+                        "published_at": draft.get("published_date", ""),
+                        "image_url": draft.get("image_url"),
+                        "likes": agg.get("total_likes", 0),
+                        "comments": agg.get("total_comments", 0),
+                        "shares": agg.get("total_shares", 0),
+                        "views": agg.get("total_views", 0),
+                        "impressions": agg.get("total_impressions", 0),
+                        "reach": agg.get("total_reach", 0),
+                        "engagement_rate": round(agg.get("average_engagement_rate", 0) * 100, 2),
+                    }
+                except Exception as e:
+                    print(f"⚠️ Outstand analytics failed for post {post_id}: {e}")
+
+            # Strategy 3: Instagram timestamp lookup — fills in impressions/reach that
+            # Outstand doesn't sync, by finding the actual IG media via published_date.
+            if platform == "instagram" and ig_direct:
+                needs_impressions = live_result is None or (live_result.get("impressions") or 0) == 0
+                if needs_impressions:
+                    ts_result = await _fetch_instagram_by_timestamp(draft, ig_direct)
+                    if ts_result:
+                        if live_result:
+                            # Merge: keep Outstand engagement counts, use IG for impressions/reach
+                            live_result["impressions"] = ts_result["impressions"]
+                            live_result["reach"] = ts_result.get("reach", 0)
+                            live_result["views"] = ts_result.get("views", 0)
+                            # Use IG likes/comments if Outstand had none
+                            if not live_result.get("likes"):
+                                live_result["likes"] = ts_result.get("likes", 0)
+                            if not live_result.get("comments"):
+                                live_result["comments"] = ts_result.get("comments", 0)
+                            effective = live_result["impressions"] or live_result["reach"] or 1
+                            live_result["engagement_rate"] = round(
+                                ((live_result["likes"] + live_result["comments"]) / effective) * 100, 2
+                            )
+                        else:
+                            live_result = ts_result
 
             # Fall back to content_analytics when live API not available
             return live_result or await _analytics_fallback(draft)
