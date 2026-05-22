@@ -386,6 +386,18 @@ async def _generate_ideas(
         extras.append(f"Topics/themes to avoid: {avoid_str}")
     extras_block = "\n".join(extras)
 
+    # When performance data is available, surface top_topics as the operative
+    # content subjects — these override the generic brand pillars for subject matter.
+    _perf_topics = (performance or {}).get("top_topics", []) if performance and performance.get("has_data") else []
+    if _perf_topics:
+        content_focus_line = (
+            f"Content subjects THIS WEEK (ranked by your real engagement data — write about these): "
+            f"{', '.join(_perf_topics[:5])}\n"
+            f"Brand pillars (for tone/context only): {pillars_str}"
+        )
+    else:
+        content_focus_line = f"Content pillars: {pillars_str}"
+
     prompt = f"""You are a senior social media strategist creating a 7-day content plan.
 
 {brand_block}
@@ -395,7 +407,7 @@ async def _generate_ideas(
 {voice_block}
 
 {performance_block}
-Content pillars: {pillars_str}
+{content_focus_line}
 Platforms: {platforms_str}
 Week starting: {week_start}
 {extras_block}
