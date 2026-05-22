@@ -1201,11 +1201,39 @@ class ApprovalWorkflowService:
             urn = connection.get("person_urn") or connection.get("active_author_urn")
             if not token or not urn:
                 return {"success": False, "error": "LinkedIn connection is missing OAuth token or author URN. Please reconnect your account."}
-            image_url = ApprovalWorkflowService._resolve_image_url(draft.get("image_url") or "")
-            if image_url and image_url.startswith("data:"):
-                image_url = await ApprovalWorkflowService._upload_base64_to_imgbb(image_url) or ""
+            post_type = draft.get("post_type", "feed")
+            svc = LinkedInDirectService()
             try:
-                svc = LinkedInDirectService()
+                # ── LinkedIn carousel ─────────────────────────────────────────
+                if post_type == "carousel":
+                    slides = draft.get("slides", [])
+                    image_urls: List[str] = []
+                    for i, slide in enumerate(slides):
+                        raw = ApprovalWorkflowService._resolve_image_url(slide.get("image_url") or "")
+                        if not raw:
+                            print(f"⚠️ LinkedIn carousel slide {i} has no image_url — skipping")
+                            continue
+                        if raw.startswith("data:"):
+                            raw = await ApprovalWorkflowService._upload_base64_to_imgbb(raw) or ""
+                        if raw:
+                            image_urls.append(raw)
+                    if len(image_urls) < 2:
+                        return {"success": False, "error": f"LinkedIn carousel needs at least 2 images with URLs; only got {len(image_urls)}."}
+                    print(f"📎 LinkedIn carousel: {len(image_urls)} slides for urn={urn}")
+                    result = await svc.create_carousel_post(
+                        access_token=token,
+                        author_urn=urn,
+                        text=content,
+                        image_urls=image_urls,
+                    )
+                    post_id = result.get("post_id")
+                    print(f"✅ LinkedIn carousel publish: post_id={post_id} slides={result.get('slides')}")
+                    return {"success": bool(post_id), "post_id": post_id, "raw_response": result}
+
+                # ── LinkedIn single image / text ──────────────────────────────
+                image_url = ApprovalWorkflowService._resolve_image_url(draft.get("image_url") or "")
+                if image_url and image_url.startswith("data:"):
+                    image_url = await ApprovalWorkflowService._upload_base64_to_imgbb(image_url) or ""
                 result = await svc.create_post(
                     access_token=token,
                     person_urn=urn,
