@@ -386,19 +386,27 @@ async def _generate_ideas(
         extras.append(f"Topics/themes to avoid: {avoid_str}")
     extras_block = "\n".join(extras)
 
-    # When performance data is available, surface top_topics as the operative
-    # content subjects — these override the generic brand pillars for subject matter.
     _perf_topics = (performance or {}).get("top_topics", []) if performance and performance.get("has_data") else []
+
+    # Build a hard topic override block that goes at the very top of the prompt
+    # so it can't be diluted by brand/industry context below it.
     if _perf_topics:
-        content_focus_line = (
-            f"Content subjects THIS WEEK (ranked by your real engagement data — write about these): "
-            f"{', '.join(_perf_topics[:5])}\n"
-            f"Brand pillars (for tone/context only): {pillars_str}"
+        topic_override_block = (
+            f"=== MANDATORY CONTENT BRIEF ===\n"
+            f"This account's audience engages most with these topics (real data, ranked by engagement rate):\n"
+            f"  {', '.join(_perf_topics[:5])}\n"
+            f"Every post idea MUST be about one of these topics. Do not substitute generic brand/industry topics.\n"
+            f"The brand context below tells you WHO you're writing for and HOW to write — not WHAT to write about.\n"
+            f"================================"
         )
+        content_focus_line = f"Content pillars: {pillars_str} (secondary — apply for tone/framing only)"
     else:
+        topic_override_block = ""
         content_focus_line = f"Content pillars: {pillars_str}"
 
     prompt = f"""You are a senior social media strategist creating a 7-day content plan.
+
+{topic_override_block}
 
 {brand_block}
 
