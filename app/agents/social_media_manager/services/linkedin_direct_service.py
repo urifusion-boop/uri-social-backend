@@ -10,7 +10,7 @@ Flow:
 """
 
 import urllib.parse
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 import httpx
 
@@ -139,6 +139,95 @@ class LinkedInDirectService:
             asset = data["value"]["asset"]
             return {"upload_url": upload_url, "asset": asset}
 
+    async def _upload_image(self, access_token: str, author_urn: str, image_url: str) -> str:
+        """Register + upload one image and return its LinkedIn asset URN."""
+        reg = await self._register_image(access_token, author_urn)
+        upload_url = reg["upload_url"]
+        asset = reg["asset"]
+
+        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+            img_resp = await client.get(image_url)
+            img_resp.raise_for_status()
+            content_type = img_resp.headers.get("content-type", "image/jpeg").split(";")[0]
+            put_r = await client.put(
+                upload_url,
+                content=img_resp.content,
+                headers={"Content-Type": content_type},
+            )
+            put_r.raise_for_status()
+
+        return asset
+
+    async def create_carousel_post(
+        self,
+        access_token: str,
+        author_urn: str,
+        text: str,
+        image_urls: List[str],
+    ) -> Dict[str, Any]:
+        """
+        Publish a multi-image post to LinkedIn (organic carousel equivalent).
+
+        LinkedIn's UGC API does NOT support shareMediaCategory=CAROUSEL for organic
+        posts — that requires a sponsored/paid Campaign Manager post.
+
+        The organic equivalent is shareMediaCategory=IMAGE with multiple media items
+        (up to 20 images). LinkedIn renders these as a swipeable image gallery.
+        """
+        if len(image_urls) < 2:
+            raise ValueError("LinkedIn multi-image post requires at least 2 images")
+
+        assets = []
+        for url in image_urls[:20]:
+            try:
+                asset = await self._upload_image(access_token, author_urn, url)
+                assets.append(asset)
+                print(f"[LinkedIn] uploaded image {len(assets)}/{len(image_urls)}: {url[:60]}")
+            except Exception as e:
+                print(f"[LinkedIn] image upload failed for {url}: {e}")
+
+        if len(assets) < 2:
+            raise RuntimeError(f"Only {len(assets)} images uploaded successfully; need at least 2")
+
+        media = [
+            {
+                "status": "READY",
+                "description": {"text": ""},
+                "media": asset,
+                "title": {"text": ""},
+            }
+            for asset in assets
+        ]
+
+        payload = {
+            "author": author_urn,
+            "lifecycleState": "PUBLISHED",
+            "specificContent": {
+                "com.linkedin.ugc.ShareContent": {
+                    "shareCommentary": {"text": text},
+                    "shareMediaCategory": "IMAGE",  # organic multi-image gallery
+                    "media": media,
+                }
+            },
+            "visibility": {"com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC"},
+        }
+
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(
+                UGC_POSTS_URL,
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "X-Restli-Protocol-Version": "2.0.0",
+                    "Content-Type": "application/json",
+                },
+            )
+            if not r.is_success:
+                print(f"[LinkedIn] carousel post error {r.status_code}: {r.text}")
+                r.raise_for_status()
+            post_id = r.headers.get("x-restli-id") or r.headers.get("Location", "")
+            return {"post_id": post_id, "slides": len(assets)}
+
     async def create_post(
         self,
         access_token: str,
@@ -161,14 +250,14 @@ class LinkedInDirectService:
                 upload_url = reg["upload_url"]
                 asset = reg["asset"]
 
-                async with httpx.AsyncClient(timeout=60) as client:
+                async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
                     img_resp = await client.get(image_url)
                     img_resp.raise_for_status()
                     put_r = await client.put(
                         upload_url,
                         content=img_resp.content,
                         headers={
-                            "Content-Type": img_resp.headers.get("content-type", "image/jpeg"),
+                            "Content-Type": img_resp.headers.get("content-type", "image/jpeg").split(";")[0],
                         },
                     )
                     put_r.raise_for_status()
