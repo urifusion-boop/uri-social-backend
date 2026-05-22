@@ -2373,12 +2373,27 @@ async def get_performance(
 
     try:
         date_filter = datetime.utcnow() - timedelta(days=days)
-        published = await db["content_drafts"].find({
+
+        # Fetch all published drafts — filter date in Python to handle both
+        # datetime objects (real posts) and ISO strings (seeded/legacy posts)
+        all_published = await db["content_drafts"].find({
             "user_id": user_id,
             "status": "published",
-            "platform_post_id": {"$exists": True, "$ne": None},
-            "published_date": {"$gte": date_filter},
-        }).sort("published_date", -1).to_list(length=50)
+        }).sort("published_date", -1).to_list(length=200)
+
+        def _is_recent(d):
+            pd = d.get("published_date")
+            if pd is None:
+                return False
+            if isinstance(pd, datetime):
+                return pd.replace(tzinfo=None) >= date_filter
+            try:
+                from dateutil.parser import parse as _dp
+                return _dp(str(pd)).replace(tzinfo=None) >= date_filter
+            except Exception:
+                return True
+
+        published = [d for d in all_published if _is_recent(d)]
 
         if not published:
             return UriResponse.get_single_data_response("performance", {
@@ -2472,39 +2487,75 @@ async def get_performance(
                 print(f"⚠️ Instagram direct analytics failed for {media_id}: {e}")
                 return None
 
+        async def _analytics_fallback(draft):
+            """Read stored content_analytics as fallback when live API isn't available."""
+            draft_id = draft.get("id")
+            if not draft_id:
+                return None
+            ana = await db["content_analytics"].find_one({"draft_id": draft_id})
+            if not ana:
+                return None
+            likes       = int(ana.get("likes", 0) or 0)
+            comments    = int(ana.get("comments", 0) or 0)
+            shares      = int(ana.get("shares", 0) or 0)
+            impressions = int(ana.get("impressions", 0) or 0)
+            views       = int(ana.get("views", 0) or 0)
+            reach       = int(ana.get("reach", 0) or 0)
+            effective   = impressions or reach or 1
+            platform    = ana.get("platform") or draft.get("platform", "unknown")
+            return {
+                "draft_id": draft_id,
+                "platform_post_id": draft.get("platform_post_id") or "",
+                "platform": platform,
+                "content_preview": (draft.get("content") or "")[:120],
+                "published_at": draft.get("published_date", ""),
+                "image_url": draft.get("image_url"),
+                "likes": likes,
+                "comments": comments,
+                "shares": shares,
+                "views": views,
+                "impressions": impressions,
+                "reach": reach,
+                "engagement_rate": round(((likes + comments) / effective) * 100, 2),
+            }
+
         async def _fetch(draft):
             post_id = draft.get("platform_post_id")
             platform = draft.get("platform", "unknown")
-            if not post_id:
-                return None
 
-            # Route to direct Graph API for non-Outstand platforms
-            if platform in direct_conn_map:
-                return await _fetch_instagram_direct(draft, direct_conn_map[platform])
+            live_result = None
 
-            try:
-                data = await outstand.get_post_analytics(post_id)
-                agg = data.get("aggregated_metrics") or {}
-                by_account = data.get("metrics_by_account") or []
-                network = by_account[0]["social_account"]["network"] if by_account else platform
-                return {
-                    "draft_id": draft.get("id"),
-                    "platform_post_id": post_id,
-                    "platform": network or platform,
-                    "content_preview": (draft.get("content") or "")[:120],
-                    "published_at": draft.get("published_date", ""),
-                    "image_url": draft.get("image_url"),
-                    "likes": agg.get("total_likes", 0),
-                    "comments": agg.get("total_comments", 0),
-                    "shares": agg.get("total_shares", 0),
-                    "views": agg.get("total_views", 0),
-                    "impressions": agg.get("total_impressions", 0),
-                    "reach": agg.get("total_reach", 0),
-                    "engagement_rate": round(agg.get("average_engagement_rate", 0) * 100, 2),
-                }
-            except Exception as e:
-                print(f"⚠️ Analytics fetch failed for post {post_id}: {e}")
-                return None
+            if post_id:
+                # Route to direct Graph API for non-Outstand Instagram/Facebook
+                if platform in direct_conn_map and direct_conn_map[platform].get("page_access_token"):
+                    live_result = await _fetch_instagram_direct(draft, direct_conn_map[platform])
+                elif platform not in direct_conn_map:
+                    # Outstand-managed post
+                    try:
+                        data = await outstand.get_post_analytics(post_id)
+                        agg = data.get("aggregated_metrics") or {}
+                        by_account = data.get("metrics_by_account") or []
+                        network = by_account[0]["social_account"]["network"] if by_account else platform
+                        live_result = {
+                            "draft_id": draft.get("id"),
+                            "platform_post_id": post_id,
+                            "platform": network or platform,
+                            "content_preview": (draft.get("content") or "")[:120],
+                            "published_at": draft.get("published_date", ""),
+                            "image_url": draft.get("image_url"),
+                            "likes": agg.get("total_likes", 0),
+                            "comments": agg.get("total_comments", 0),
+                            "shares": agg.get("total_shares", 0),
+                            "views": agg.get("total_views", 0),
+                            "impressions": agg.get("total_impressions", 0),
+                            "reach": agg.get("total_reach", 0),
+                            "engagement_rate": round(agg.get("average_engagement_rate", 0) * 100, 2),
+                        }
+                    except Exception as e:
+                        print(f"⚠️ Analytics fetch failed for post {post_id}: {e}")
+
+            # Fall back to content_analytics when live API not available
+            return live_result or await _analytics_fallback(draft)
 
         results = await _asyncio.gather(*[_fetch(d) for d in published])
         posts = [r for r in results if r is not None]
@@ -2766,19 +2817,29 @@ async def get_account_metrics(
                 # Fetch basic profile (name, email)
                 profile = await svc.get_profile(access_token)
 
-                # Fetch follower count from LinkedIn Community Management API
-                # Works for personal profiles; falls back to 0 if scope not granted
+                # Fetch connection count from LinkedIn profile
+                # numConnections is available on the basic profile; falls back to 0
                 followers_count = 0
                 try:
                     async with _httpx.AsyncClient(timeout=15) as _c:
-                        fol_resp = await _c.get(
-                            "https://api.linkedin.com/v2/networkSizes/urn:li:person:" + person_urn.split(":")[-1],
-                            params={"edgeType": "CompanyFollowedByMember"},
+                        conn_resp = await _c.get(
+                            "https://api.linkedin.com/v2/people/~:(num-connections,num-connections-capped)",
                             headers={"Authorization": f"Bearer {access_token}",
                                      "X-Restli-Protocol-Version": "2.0.0"},
                         )
-                        if fol_resp.status_code == 200:
-                            followers_count = fol_resp.json().get("firstDegreeSize", 0)
+                        if conn_resp.status_code == 200:
+                            d = conn_resp.json()
+                            followers_count = d.get("numConnections", 0) or 0
+                        else:
+                            # Try the newer REST-li v2 people endpoint
+                            me_resp = await _c.get(
+                                "https://api.linkedin.com/v2/me",
+                                params={"projection": "(numConnections)"},
+                                headers={"Authorization": f"Bearer {access_token}",
+                                         "X-Restli-Protocol-Version": "2.0.0"},
+                            )
+                            if me_resp.status_code == 200:
+                                followers_count = me_resp.json().get("numConnections", 0) or 0
                 except Exception:
                     pass  # follower count is best-effort
 
