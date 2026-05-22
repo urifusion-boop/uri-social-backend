@@ -2568,6 +2568,13 @@ async def get_performance(
                 likes = media_data.get("like_count", 0)
                 comments = media_data.get("comments_count", 0)
                 effective_reach = reach or impressions
+                # When insights return 0 (Personal account), still compute a meaningful
+                # engagement figure from raw interaction counts so the dashboard isn't blank.
+                if effective_reach:
+                    eng_rate = round(((likes + comments) / effective_reach) * 100, 2)
+                else:
+                    # No impressions available — rate is unmeasurable, but engagement is real
+                    eng_rate = 0
                 return {
                     "draft_id": draft.get("id"),
                     "platform_post_id": media_id,
@@ -2581,7 +2588,8 @@ async def get_performance(
                     "views": views,
                     "impressions": impressions,
                     "reach": reach,
-                    "engagement_rate": round(((likes + comments) / max(effective_reach, 1)) * 100, 2) if effective_reach else 0,
+                    "engagement_rate": eng_rate,
+                    "insights_available": effective_reach > 0,
                 }
             except Exception as e:
                 print(f"⚠️ Instagram direct analytics failed for {media_id}: {e}")
@@ -2619,18 +2627,23 @@ async def get_performance(
                 "engagement_rate": round(((likes + comments) / effective) * 100, 2),
             }
 
+        import re as _re
+
         async def _fetch(draft):
             post_id = draft.get("platform_post_id")
             platform = draft.get("platform", "unknown")
-            # Outstand-published posts have outstand_post_status or publish_response set.
-            # Their platform_post_id is an Outstand UUID, NOT a native social media ID.
+            # Outstand stores the NATIVE social media ID as platform_post_id (e.g. Instagram
+            # media IDs are 15-18 digit numbers).  Outstand's own internal post IDs are short
+            # base64 strings (EgFFA, ZxDCu) or LinkedIn URNs.
+            # Route numeric IG IDs directly to Instagram Graph API — Outstand analytics fails on them.
+            is_ig_media_id = bool(post_id and platform == "instagram" and _re.match(r'^\d{15,}$', str(post_id)))
             is_outstand_post = bool(draft.get("outstand_post_status") or draft.get("publish_response"))
 
             live_result = None
 
-            # Strategy 1: direct-connected post with a real native media ID
-            if post_id and not is_outstand_post:
-                conn = direct_conn_map.get(platform)
+            # Strategy 1: real Instagram media ID — use Graph API directly
+            if post_id and platform == "instagram" and (is_ig_media_id or not is_outstand_post):
+                conn = ig_direct or direct_conn_map.get(platform)
                 if conn and conn.get("page_access_token"):
                     live_result = await _fetch_instagram_direct(draft, conn)
 
@@ -2738,6 +2751,7 @@ async def get_performance(
         # Aggregate summary
         def _sum(key): return sum(p.get(key, 0) or 0 for p in posts)
         total_posts = len(posts)
+        insights_available = any(p.get("insights_available") or (p.get("impressions") or 0) > 0 for p in posts)
         summary = {
             "total_posts": total_posts,
             "total_impressions": _sum("impressions"),
@@ -2749,6 +2763,11 @@ async def get_performance(
             "avg_engagement_rate": round(
                 sum(p.get("engagement_rate", 0) or 0 for p in posts) / total_posts, 2
             ) if total_posts else 0,
+            "insights_available": insights_available,
+            "insights_note": None if insights_available else (
+                "Impressions and reach require an Instagram Business or Creator account. "
+                "Go to Instagram → Profile → Edit Profile → Switch to Professional Account to unlock full analytics."
+            ),
         }
 
         # Per-platform breakdown
