@@ -325,18 +325,27 @@ async def _generate_ideas(
     # ── Performance Intelligence block ────────────────────────────────────────
     performance_block = ""
     if performance and performance.get("has_data"):
-        perf_lines = []
         top_topics = performance.get("top_topics", [])
-        if top_topics:
-            perf_lines.append(f"Top performing topics for this account: {', '.join(top_topics[:5])}")
         top_formats = performance.get("top_formats", [])
+        best_hour = performance.get("best_posting_hour")
+
+        perf_lines = []
+        if top_topics:
+            # Surface as a primary directive, not a soft hint
+            perf_lines.append(
+                f"PROVEN TOP TOPICS (highest engagement for this account): {', '.join(top_topics[:5])}. "
+                f"AT LEAST 4 of the 7 days MUST be about one of these topics. "
+                f"Blend them with the brand pillars — e.g. an Educational post should teach something from one of these top topics."
+            )
         if top_formats:
             perf_lines.append(f"Best performing format: {top_formats[0]}")
-        best_hour = performance.get("best_posting_hour")
         if best_hour is not None:
             perf_lines.append(f"Best posting time: {best_hour}:00")
         if perf_lines:
-            performance_block = "Account performance signals (use these to inform content angles):\n" + "\n".join(f"  - {l}" for l in perf_lines)
+            performance_block = (
+                "⚡ PERFORMANCE DATA — this account's real engagement history (treat as primary creative brief):\n"
+                + "\n".join(f"  - {l}" for l in perf_lines)
+            )
 
     brand_block = f"Brand: {brand_name}"
     if tagline:
@@ -385,12 +394,12 @@ async def _generate_ideas(
 
 {voice_block}
 
+{performance_block}
 Content pillars: {pillars_str}
 Platforms: {platforms_str}
 Week starting: {week_start}
 {extras_block}
 {market_intel_block}
-{performance_block}
 {avoid_repeat_block}
 {force_token_block}
 Generate a 7-day content plan. For each day produce:
