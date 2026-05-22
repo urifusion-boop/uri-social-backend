@@ -14,6 +14,7 @@ import json
 import re
 import uuid
 import secrets
+import random
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -86,6 +87,28 @@ CONTENT_TYPE_LABELS = {
 }
 
 WEEK_DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+# 7 distinct hook styles — one is assigned to each day so no two posts open the same way
+HOOK_STYLES = [
+    "Bold statement — open with a provocative or surprising claim that stops the scroll",
+    "Data/stat — lead with a specific number, percentage, or research finding",
+    "Story-led — open with a short first-person or customer story (1-2 sentences max)",
+    "Direct question — ask the audience something they instantly have an opinion about",
+    "Myth-bust — start with a common misconception then flip it",
+    "How-to opener — begin with 'Here's how…' or 'The exact steps we use to…'",
+    "Relatable frustration — open with a pain point the audience recognises instantly",
+]
+
+# 7 distinct post formats — rotated across the week for visual variety
+POST_FORMATS = [
+    "Single image with caption",
+    "Carousel (3-5 slides)",
+    "Short-form video / Reel (15-30 sec concept)",
+    "Text-only post (strong copy, no image needed)",
+    "Poll or interactive question",
+    "Infographic or data visual",
+    "Before/after or side-by-side comparison",
+]
 
 
 def _get_monday(ref: datetime) -> datetime:
@@ -258,8 +281,14 @@ async def _generate_ideas(
         if lines:
             platform_tone_block = "Platform-specific tones:\n" + "\n".join(lines)
 
+    # Shuffle hook styles and formats so each week has a different assignment
+    shuffled_hooks = HOOK_STYLES[:]
+    shuffled_formats = POST_FORMATS[:]
+    random.shuffle(shuffled_hooks)
+    random.shuffle(shuffled_formats)
+
     days_block = "\n".join(
-        f"Day {i} ({WEEK_DAYS[i]}) → type: {mix[i]} ({CONTENT_TYPE_LABELS[mix[i]]})"
+        f"Day {i} ({WEEK_DAYS[i]}) → type: {mix[i]} ({CONTENT_TYPE_LABELS[mix[i]]}) | hook: {shuffled_hooks[i]} | format: {shuffled_formats[i]}"
         for i in range(7)
     )
 
@@ -368,7 +397,7 @@ Generate a 7-day content plan. For each day produce:
 - title: a short, punchy content idea title (max 10 words) — make it feel native to the platform and brand
 - description: 2-3 sentences with a concrete, specific angle. Include what to say, who it speaks to, and why it matters for this brand right now.
 
-Day assignments (use these content types exactly):
+Day assignments — follow the content type, hook style, AND format exactly for each day:
 {days_block}
 
 Return ONLY a valid JSON array of exactly 7 objects:
@@ -381,24 +410,27 @@ Return ONLY a valid JSON array of exactly 7 objects:
 
 Rules:
 - GROUND each idea in the trending topics and performance signals provided above — these are real signals, not generic suggestions
-- Every day must have a DIFFERENT angle, format feel, and hook — no two titles should start with the same phrase
-- Never use list-post titles like "5 ways to..." or "5 mistakes..." more than once across the 7 days
+- EVERY day must use its assigned hook style and format — this is mandatory, not optional
+- No two titles should start with the same word or phrase — maximum variety across all 7
+- Never use list-post titles like "5 ways to..." or "5 mistakes..." more than ONCE across the 7 days
+- No two days should share the same emotional tone — vary between inspiring, urgent, curious, empathetic, bold, playful, and authoritative
 - Be SPECIFIC to this brand — use real product/service names, real audience pain points, real industry context
 - Promotional: highlight a genuine product/service benefit with a clear value statement
 - Educational: share an insight directly relevant to this brand's industry and audience
-- Relatable: tap into a real emotion or experience the target audience would recognise
+- Relatable: tap into a real emotion or experience the target audience would recognise instantly
 - Engagement: pose a specific question or poll that this brand's followers would genuinely answer — vary the question style (poll, fill-in-the-blank, debate, personal story prompt)
 - Behind the scenes: ROTATE each week between these distinct angles — workspace setup, product/service creation process, team doing actual work (NOT "Meet the team" introductions), packaging/delivery moment, before-and-after of a real project, client prep or discovery call, tool/workflow walkthrough. Do NOT default to team introduction posts.
 - Match the brand voice exactly — if casual, be casual; if bold, be bold
 - Never be generic — every idea should be impossible to copy-paste to a different brand
+- If you notice you are writing similar angles back-to-back, STOP and pick a completely different direction
 """
 
     ai_request = AIService.build_ai_model(
         messages=[{"role": "user", "content": prompt}],
-        model="gpt-4o" if force else "gpt-4o-mini",
-        temperature=0.95 if force else 0.88,
+        model="gpt-4o",
+        temperature=0.95 if force else 0.9,
     )
-    print(f"[Calendar] _generate_ideas model={'gpt-4o' if force else 'gpt-4o-mini'} temperature={0.95 if force else 0.8} force={force}", flush=True)
+    print(f"[Calendar] _generate_ideas model=gpt-4o temperature={0.95 if force else 0.9} force={force}", flush=True)
     response = await AIService.chat_completion(ai_request)
     if isinstance(response, dict) and response.get("error"):
         raise ValueError(response["error"])
