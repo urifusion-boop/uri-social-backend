@@ -642,6 +642,10 @@ class ApprovalWorkflowService:
                     }).sort("created_at", -1).limit(1)
                     conn_list = await connections_cursor.to_list(length=1)
                     connection = conn_list[0] if conn_list else None
+                    if connection:
+                        print(f"🔗 Scheduled publish connection | platform={draft['platform']} connected_via={connection.get('connected_via')} ig_user_id={connection.get('ig_user_id')} has_page_token={'yes' if connection.get('page_access_token') else 'NO'} outstand_id={connection.get('outstand_account_id')}")
+                    else:
+                        print(f"⚠️ No active {draft['platform']} connection found for user_id={draft_user_id} — will try Outstand fallback")
 
                     # Outstand live-lookup fallback (same as _trigger_immediate_publishing)
                     if not connection:
