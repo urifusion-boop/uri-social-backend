@@ -2698,7 +2698,8 @@ async def get_account_metrics(
         # ── Direct (non-Outstand) connections ─────────────────────────────────
         direct_conns = await db["social_connections"].find(
             {"user_id": user_id, "connected_via": {"$ne": "outstand"}},
-            {"_id": 0, "platform": 1, "connected_via": 1, "page_access_token": 1, "ig_user_id": 1, "page_name": 1},
+            {"_id": 0, "platform": 1, "connected_via": 1, "page_access_token": 1,
+             "ig_user_id": 1, "page_name": 1, "page_id": 1, "account_name": 1},
         ).to_list(length=20)
 
         _graph_base = f"https://graph.facebook.com/{settings.FACEBOOK_API_VERSION}"
@@ -2896,10 +2897,96 @@ async def get_account_metrics(
                 print(f"⚠️ LinkedIn direct account metrics failed for {person_urn}: {e}")
                 return None
 
+        async def _fetch_facebook_direct_metrics(conn):
+            page_id = conn.get("page_id")
+            token = conn.get("page_access_token")
+            if not page_id or not token:
+                return None
+            try:
+                async with _httpx.AsyncClient(timeout=20) as _c:
+                    profile_resp = await _c.get(
+                        f"{_graph_base}/{page_id}",
+                        params={"fields": "name,fan_count,followers_count,category", "access_token": token},
+                    )
+                    profile = profile_resp.json()
+                    if "error" in profile:
+                        print(f"⚠️ FB page fetch error: {profile['error'].get('message')}")
+                        return None
+
+                    total_impressions = total_reach = 0
+                    try:
+                        ins_resp = await _c.get(
+                            f"{_graph_base}/{page_id}/insights",
+                            params={
+                                "metric": "page_impressions,page_reach",
+                                "period": "day",
+                                "since": since_ts,
+                                "until": until_ts,
+                                "access_token": token,
+                            },
+                        )
+                        for item in ins_resp.json().get("data", []):
+                            daily_total = sum(v.get("value", 0) for v in (item.get("values") or []))
+                            name = item.get("name", "")
+                            if name == "page_impressions":
+                                total_impressions = daily_total
+                            elif name == "page_reach":
+                                total_reach = daily_total
+                    except Exception as fb_ins_err:
+                        print(f"⚠️ FB page insights failed: {fb_ins_err}")
+
+                    fb_draft_ids = await db["content_drafts"].distinct(
+                        "id",
+                        {"user_id": user_id, "status": "published", "platform": "facebook"},
+                    )
+                    analytics_cursor = db["content_analytics"].find(
+                        {"draft_id": {"$in": fb_draft_ids}},
+                        {"likes": 1, "comments": 1, "shares": 1, "impressions": 1},
+                    )
+                    total_likes = total_comments = total_shares = 0
+                    async for ana in analytics_cursor:
+                        total_likes    += int(ana.get("likes", 0) or 0)
+                        total_comments += int(ana.get("comments", 0) or 0)
+                        total_shares   += int(ana.get("shares", 0) or 0)
+
+                    return {
+                        "account_id": page_id,
+                        "network": "facebook",
+                        "page_name": profile.get("name") or conn.get("account_name"),
+                        "category": profile.get("category"),
+                        "followers_count": profile.get("fan_count") or profile.get("followers_count") or 0,
+                        "following_count": None,
+                        "posts_count": len(fb_draft_ids),
+                        "engagement": {
+                            "views": total_impressions,
+                            "likes": total_likes,
+                            "comments": total_comments,
+                            "shares": total_shares,
+                            "reposts": 0,
+                            "quotes": 0,
+                            "reach": total_reach,
+                        },
+                        "engagement_note": f"Page impressions via Facebook Insights API for the last {days} days",
+                        "platform_specific": {
+                            "page_id": page_id,
+                            "category": profile.get("category"),
+                            "impressions": total_impressions,
+                            "reach": total_reach,
+                        },
+                        "period": {"since": since_ts, "until": until_ts},
+                    }
+            except Exception as e:
+                print(f"⚠️ Facebook direct account metrics failed: {e}")
+                return None
+
         async def _fetch_direct_metrics(conn):
-            if conn.get("connected_via") in ("instagram_direct", "instagram_direct_oauth"):
+            platform = conn.get("platform", "")
+            connected_via = conn.get("connected_via", "")
+            if connected_via in ("instagram_direct", "instagram_direct_oauth") or platform == "instagram":
                 return await _fetch_instagram_direct_metrics(conn)
-            return None  # extend here for other direct platforms
+            elif platform == "facebook" or connected_via == "facebook_direct_oauth":
+                return await _fetch_facebook_direct_metrics(conn)
+            return None
 
         outstand_results, direct_results, linkedin_results = await _asyncio.gather(
             _asyncio.gather(*[_fetch_outstand_metrics(a) for a in outstand_accounts]),
