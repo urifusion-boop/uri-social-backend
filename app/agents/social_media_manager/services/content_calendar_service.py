@@ -281,16 +281,26 @@ async def _generate_ideas(
         if lines:
             platform_tone_block = "Platform-specific tones:\n" + "\n".join(lines)
 
+    # Resolve performance topics early — needed for both days_block and topic_override_block
+    _perf_topics = (performance or {}).get("top_topics", []) if performance and performance.get("has_data") else []
+
     # Shuffle hook styles and formats so each week has a different assignment
     shuffled_hooks = HOOK_STYLES[:]
     shuffled_formats = POST_FORMATS[:]
     random.shuffle(shuffled_hooks)
     random.shuffle(shuffled_formats)
 
-    days_block = "\n".join(
-        f"Day {i} ({WEEK_DAYS[i]}) → type: {mix[i]} ({CONTENT_TYPE_LABELS[mix[i]]}) | hook: {shuffled_hooks[i]} | format: {shuffled_formats[i]}"
-        for i in range(7)
-    )
+    if _perf_topics:
+        _cycled_for_days = [_perf_topics[i % len(_perf_topics)] for i in range(7)]
+        days_block = "\n".join(
+            f"Day {i} ({WEEK_DAYS[i]}) → TOPIC: {_cycled_for_days[i]} | type: {mix[i]} ({CONTENT_TYPE_LABELS[mix[i]]}) | hook: {shuffled_hooks[i]} | format: {shuffled_formats[i]}"
+            for i in range(7)
+        )
+    else:
+        days_block = "\n".join(
+            f"Day {i} ({WEEK_DAYS[i]}) → type: {mix[i]} ({CONTENT_TYPE_LABELS[mix[i]]}) | hook: {shuffled_hooks[i]} | format: {shuffled_formats[i]}"
+            for i in range(7)
+        )
 
     avoid_repeat_block = ""
     if previous_titles:
@@ -320,7 +330,12 @@ async def _generate_ideas(
             growth = kw.get("growth_rate", 0)
             suffix = f" (+{growth:.0f}% on Google)" if kw_type == "rising" and growth else f" (score: {score})"
             trend_lines.append(f"  - {kw['keyword']}{suffix}")
-        market_intel_block = "Current trending topics in this industry (Market Intel — prioritise these):\n" + "\n".join(trend_lines)
+        intel_label = (
+            "Trending keywords (use as angles/hooks within the assigned topics above — do NOT change the topic):"
+            if _perf_topics else
+            "Current trending topics in this industry (Market Intel — prioritise these):"
+        )
+        market_intel_block = intel_label + "\n" + "\n".join(trend_lines)
 
     # ── Performance Intelligence block ────────────────────────────────────────
     performance_block = ""
@@ -386,20 +401,20 @@ async def _generate_ideas(
         extras.append(f"Topics/themes to avoid: {avoid_str}")
     extras_block = "\n".join(extras)
 
-    _perf_topics = (performance or {}).get("top_topics", []) if performance and performance.get("has_data") else []
-
-    # Build a hard topic override block that goes at the very top of the prompt
-    # so it can't be diluted by brand/industry context below it.
+    # When we have engagement data, assign one proven topic to each day explicitly.
+    # This leaves the AI no room to drift back to brand pillars or industry defaults.
     if _perf_topics:
+        _cycled = [_perf_topics[i % len(_perf_topics)] for i in range(7)]
+        _topic_lines = "\n".join(f"  Day {i} → topic: {_cycled[i]}" for i in range(7))
         topic_override_block = (
-            f"=== MANDATORY CONTENT BRIEF ===\n"
-            f"This account's audience engages most with these topics (real data, ranked by engagement rate):\n"
-            f"  {', '.join(_perf_topics[:5])}\n"
-            f"Every post idea MUST be about one of these topics. Do not substitute generic brand/industry topics.\n"
-            f"The brand context below tells you WHO you're writing for and HOW to write — not WHAT to write about.\n"
-            f"================================"
+            f"=== MANDATORY TOPIC ASSIGNMENTS (derived from real engagement data) ===\n"
+            f"Each day's post MUST be about the assigned topic below. No substitutions.\n"
+            f"{_topic_lines}\n"
+            f"The brand context tells you WHO you're writing for and HOW to write — not WHAT to write about.\n"
+            f"Do NOT default to the brand's industry or content pillars as the subject matter.\n"
+            f"======================================================================="
         )
-        content_focus_line = f"Content pillars: {pillars_str} (secondary — apply for tone/framing only)"
+        content_focus_line = ""  # suppress pillars entirely — topics are set above
     else:
         topic_override_block = ""
         content_focus_line = f"Content pillars: {pillars_str}"
