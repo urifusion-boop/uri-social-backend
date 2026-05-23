@@ -3036,17 +3036,33 @@ async def get_account_metrics(
                 except Exception:
                     pass  # follower count is best-effort; stored value used
 
-                # Count posts published through our platform to LinkedIn
-                post_count = await db["content_drafts"].count_documents({
-                    "user_id": user_id,
-                    "status": "published",
-                    "platforms": {"$in": ["linkedin"]},
-                })
+                # Fetch published LinkedIn posts and aggregate real likes + comments
+                # via /v2/socialActions (works with w_member_social scope).
+                li_drafts = await db["content_drafts"].find(
+                    {"user_id": user_id, "status": "published", "platforms": {"$in": ["linkedin"]},
+                     "platform_post_id": {"$exists": True, "$ne": None}},
+                    {"_id": 0, "platform_post_id": 1},
+                ).to_list(length=50)
+                post_count = len(li_drafts)
 
-                # LinkedIn's personal REST API does not expose post impressions,
-                # reactions, or comments without LinkedIn Marketing API access
-                # (requires a separate application approval from LinkedIn).
-                # We return 0 for engagement metrics and surface an honest note.
+                total_likes = total_comments = 0
+                async def _li_social(draft):
+                    urn = draft.get("platform_post_id", "")
+                    if not urn or not urn.startswith("urn:li:"):
+                        return
+                    try:
+                        sa = await svc.get_post_social_actions(access_token, urn)
+                        return sa.get("likes", 0), sa.get("comments", 0)
+                    except Exception:
+                        return 0, 0
+
+                sa_results = await _asyncio.gather(*[_li_social(d) for d in li_drafts], return_exceptions=True)
+                for res in sa_results:
+                    if res and not isinstance(res, Exception):
+                        total_likes += res[0]
+                        total_comments += res[1]
+
+                # Impressions/reach require LinkedIn Marketing API (separate approval).
                 return {
                     "account_id": person_urn,
                     "network": "linkedin",
@@ -3057,13 +3073,13 @@ async def get_account_metrics(
                     "posts_count": post_count,
                     "engagement": {
                         "views": 0,
-                        "likes": 0,
-                        "comments": 0,
+                        "likes": total_likes,
+                        "comments": total_comments,
                         "shares": 0,
                         "reposts": 0,
                         "quotes": 0,
                     },
-                    "engagement_note": "LinkedIn personal API does not expose post analytics. Connect a LinkedIn Company Page for full engagement metrics.",
+                    "engagement_note": "Likes and comments are live from LinkedIn. Impressions require LinkedIn Marketing API access.",
                     "platform_specific": {
                         "email": profile.get("email"),
                         "person_urn": person_urn,
