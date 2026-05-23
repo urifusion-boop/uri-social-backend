@@ -258,8 +258,13 @@ async def login(body: LoginRequest, db: AsyncIOMotorDatabase = Depends(get_db_de
 
     user_id = user.get("userId") or str(user["_id"])
 
-    # Check if email is verified (skip for Google OAuth users)
-    if not user.get("email_verified") and user.get("auth_provider") != "google":
+    # Check if email is verified - ONLY block NEW users who haven't verified yet
+    # Existing users (account_status == "active") can login even if email not verified
+    if (not user.get("email_verified") and
+        user.get("auth_provider") != "google" and
+        user.get("account_status") == "pending_verification"):
+
+        # This is a NEW user who just signed up and hasn't verified yet
         # Generate and send a new verification code
         verification_code = ''.join([str(random.randint(0, 9)) for _ in range(6)])
         verification_code_expires = datetime.utcnow() + timedelta(minutes=15)
@@ -315,6 +320,7 @@ async def login(body: LoginRequest, db: AsyncIOMotorDatabase = Depends(get_db_de
             "email": user["email"],
             "firstName": user.get("first_name", ""),
             "lastName": user.get("last_name", ""),
+            "emailVerified": user.get("email_verified", False),
         },
     }
 
@@ -352,7 +358,10 @@ async def verify_email(body: VerifyEmailRequest, db: AsyncIOMotorDatabase = Depe
     user_id = user.get("userId") or str(user["_id"])
     now = datetime.utcnow()
 
-    # Update user as verified and activate trial
+    # Check if this is a NEW user (just signed up) or EXISTING user
+    is_new_user = user.get("account_status") == "pending_verification"
+
+    # Update user as verified
     await db["users"].update_one(
         {"email": body.email},
         {
@@ -370,39 +379,43 @@ async def verify_email(body: VerifyEmailRequest, db: AsyncIOMotorDatabase = Depe
         }
     )
 
-    # Activate free trial on verification
+    # ONLY activate trial for NEW users, NOT for existing users
     trial_status = None
-    try:
-        trial_result = await trial_service.activate_trial(user_id)
-        trial_status = {
-            "is_trial": trial_result.is_trial,
-            "trial_active": trial_result.trial_active,
-            "trial_credits": trial_result.trial_credits,
-            "credits_remaining": trial_result.credits_remaining,
-            "days_remaining": trial_result.days_remaining,
-            "trial_end_date": trial_result.trial_end_date.isoformat() if trial_result.trial_end_date else None,
-        }
-    except Exception as e:
-        print(f"⚠️ Trial activation failed for {user_id}: {e}")
+    if is_new_user:
+        try:
+            trial_result = await trial_service.activate_trial(user_id)
+            trial_status = {
+                "is_trial": trial_result.is_trial,
+                "trial_active": trial_result.trial_active,
+                "trial_credits": trial_result.trial_credits,
+                "credits_remaining": trial_result.credits_remaining,
+                "days_remaining": trial_result.days_remaining,
+                "trial_end_date": trial_result.trial_end_date.isoformat() if trial_result.trial_end_date else None,
+            }
+        except Exception as e:
+            print(f"⚠️ Trial activation failed for {user_id}: {e}")
 
-    # Send welcome email
-    try:
-        import asyncio
-        asyncio.ensure_future(notification_service.notify_signup(
-            user_id=user_id,
-            email=body.email,
-            first_name=user.get("first_name", ""),
-            trial_days=trial_status.get("days_remaining", 3) if trial_status else 0,
-            trial_credits=trial_status.get("trial_credits", 10) if trial_status else 0,
-        ))
-        asyncio.ensure_future(notification_service.notify_admin_new_signup(
-            email=body.email,
-            first_name=user.get("first_name", ""),
-            last_name=user.get("last_name", ""),
-            auth_provider="email",
-        ))
-    except Exception as e:
-        print(f"⚠️ Welcome email failed for {user_id}: {e}")
+        # Send welcome email ONLY for new users
+        try:
+            import asyncio
+            asyncio.ensure_future(notification_service.notify_signup(
+                user_id=user_id,
+                email=body.email,
+                first_name=user.get("first_name", ""),
+                trial_days=trial_status.get("days_remaining", 3) if trial_status else 0,
+                trial_credits=trial_status.get("trial_credits", 10) if trial_status else 0,
+            ))
+            asyncio.ensure_future(notification_service.notify_admin_new_signup(
+                email=body.email,
+                first_name=user.get("first_name", ""),
+                last_name=user.get("last_name", ""),
+                auth_provider="email",
+            ))
+        except Exception as e:
+            print(f"⚠️ Welcome email failed for {user_id}: {e}")
+    else:
+        # For existing users, just log the verification
+        print(f"✅ Existing user {user_id} verified their email. Credits and subscription preserved.")
 
     # Generate JWT token
     token = sign_jwt(user_id, user["email"], user.get("first_name", ""), user.get("last_name", ""))
