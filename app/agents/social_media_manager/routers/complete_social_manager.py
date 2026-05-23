@@ -2995,7 +2995,7 @@ async def get_account_metrics(
                         headers_li = {"Authorization": f"Bearer {access_token}",
                                       "X-Restli-Protocol-Version": "2.0.0"}
 
-                        # 1. networkSizes — works with r_liteprofile on some apps
+                        # 1. networkSizes — requires r_network scope
                         encoded_urn = person_urn.replace(":", "%3A")
                         ns_resp = await _c.get(
                             f"https://api.linkedin.com/v2/networkSizes/{encoded_urn}",
