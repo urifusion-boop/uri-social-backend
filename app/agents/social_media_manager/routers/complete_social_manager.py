@@ -2479,16 +2479,20 @@ async def get_performance(
                             f"{_graph_base}/{media_id}/insights",
                             params={"metric": metrics, "period": "lifetime", "access_token": token},
                         )
-                        for item in ins_resp.json().get("data", []):
-                            val = item.get("total_value", {}).get("value") or \
-                                  (item.get("values") or [{}])[0].get("value", 0)
-                            name = item["name"]
-                            if name == "impressions":
-                                impressions = val
-                            elif name == "reach":
-                                reach = val
-                            elif name in ("plays", "video_views"):
-                                views = val
+                        ins_data_ts = ins_resp.json()
+                        if "error" in ins_data_ts:
+                            print(f"⚠️ IG insights error for {media_id}: {ins_data_ts['error'].get('message')} (code {ins_data_ts['error'].get('code')})")
+                        else:
+                            for item in ins_data_ts.get("data", []):
+                                val = item.get("total_value", {}).get("value") or \
+                                      (item.get("values") or [{}])[0].get("value", 0)
+                                name = item["name"]
+                                if name == "impressions":
+                                    impressions = val
+                                elif name == "reach":
+                                    reach = val
+                                elif name in ("plays", "video_views"):
+                                    views = val
                     except Exception as ins_e:
                         print(f"⚠️ IG timestamp-lookup insights failed for {media_id}: {ins_e}")
 
@@ -2509,7 +2513,7 @@ async def get_performance(
                         "views": views,
                         "impressions": impressions,
                         "reach": reach,
-                        "engagement_rate": round(((likes + comments) / max(effective_reach, 1)) * 100, 2) if effective_reach else 0,
+                        "engagement_rate": round(((likes + comments) / effective_reach) * 100, 2) if effective_reach else None,
                     }
             except Exception as e:
                 print(f"⚠️ Instagram timestamp lookup failed: {e}")
@@ -2551,30 +2555,32 @@ async def get_performance(
                             params={"metric": metrics, "period": "lifetime", "access_token": token},
                         )
                         ins_data = ins_resp.json()
-                        for item in ins_data.get("data", []):
-                            # v21+ uses "total_value", older uses "values[0].value"
-                            val = item.get("total_value", {}).get("value") or \
-                                  (item.get("values") or [{}])[0].get("value", 0)
-                            name = item["name"]
-                            if name == "impressions":
-                                impressions = val
-                            elif name == "reach":
-                                reach = val
-                            elif name in ("plays", "video_views"):
-                                views = val
+                        if "error" in ins_data:
+                            print(f"⚠️ IG insights error for {media_id}: {ins_data['error'].get('message')} (code {ins_data['error'].get('code')})")
+                        else:
+                            for item in ins_data.get("data", []):
+                                # v21+ uses "total_value", older uses "values[0].value"
+                                val = item.get("total_value", {}).get("value") or \
+                                      (item.get("values") or [{}])[0].get("value", 0)
+                                name = item["name"]
+                                if name == "impressions":
+                                    impressions = val
+                                elif name == "reach":
+                                    reach = val
+                                elif name in ("plays", "video_views"):
+                                    views = val
                     except Exception as ins_err:
                         print(f"⚠️ IG insights fetch failed for {media_id}: {ins_err}")
 
                 likes = media_data.get("like_count", 0)
                 comments = media_data.get("comments_count", 0)
                 effective_reach = reach or impressions
-                # When insights return 0 (Personal account), still compute a meaningful
-                # engagement figure from raw interaction counts so the dashboard isn't blank.
+                # Engagement rate is only meaningful when we have reach/impressions.
+                # Return null when unavailable so the frontend shows "N/A" not "0%".
                 if effective_reach:
                     eng_rate = round(((likes + comments) / effective_reach) * 100, 2)
                 else:
-                    # No impressions available — rate is unmeasurable, but engagement is real
-                    eng_rate = 0
+                    eng_rate = None
                 return {
                     "draft_id": draft.get("id"),
                     "platform_post_id": media_id,
