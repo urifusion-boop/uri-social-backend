@@ -2892,27 +2892,30 @@ async def get_account_metrics(
                     # Account-level insights (impressions, reach, profile_views)
                     total_impressions = total_reach = total_profile_views = 0
                     try:
+                        # Try total_value period first (Meta's preferred format for date ranges)
                         insights_resp = await _c.get(
                             f"{_graph_base}/{ig_user_id}/insights",
                             params={
                                 "metric": "impressions,reach,profile_views",
-                                "period": "day",
+                                "period": "total_value",
                                 "since": since_ts,
                                 "until": until_ts,
                                 "access_token": token,
                             },
                         )
-                        for item in insights_resp.json().get("data", []):
-                            daily_total = sum(
-                                v.get("value", 0) for v in (item.get("values") or [])
-                            )
+                        ins_data = insights_resp.json().get("data", [])
+                        for item in ins_data:
                             name = item.get("name", "")
+                            # total_value format (newer)
+                            val = item.get("total_value", {}).get("value") or \
+                                  sum(v.get("value", 0) for v in (item.get("values") or []))
                             if name == "impressions":
-                                total_impressions = daily_total
+                                total_impressions = val
                             elif name == "reach":
-                                total_reach = daily_total
+                                total_reach = val
                             elif name == "profile_views":
-                                total_profile_views = daily_total
+                                total_profile_views = val
+                        print(f"[IG insights] user={ig_user_id} imp={total_impressions} reach={total_reach} pv={total_profile_views}")
                     except Exception as ig_ins_err:
                         print(f"⚠️ IG account insights failed: {ig_ins_err}")
 
