@@ -3053,12 +3053,12 @@ async def get_account_metrics(
                     "following_count": None,
                     "posts_count": post_count,
                     "engagement": {
-                        "views": None,
-                        "likes": None,
-                        "comments": None,
-                        "shares": None,
-                        "reposts": None,
-                        "quotes": None,
+                        "views": 0,
+                        "likes": 0,
+                        "comments": 0,
+                        "shares": 0,
+                        "reposts": 0,
+                        "quotes": 0,
                     },
                     "engagement_note": "LinkedIn personal API does not expose post analytics. Connect a LinkedIn Company Page for full engagement metrics.",
                     "platform_specific": {
