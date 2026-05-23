@@ -23,7 +23,7 @@ UGC_POSTS_URL = "https://api.linkedin.com/v2/ugcPosts"
 REGISTER_UPLOAD_URL = "https://api.linkedin.com/v2/assets?action=registerUpload"
 ORG_ACLS_URL = "https://api.linkedin.com/v2/organizationAcls"
 
-SCOPES = "openid profile email w_member_social"
+SCOPES = "openid profile email w_member_social r_network"
 
 
 class LinkedInDirectService:
