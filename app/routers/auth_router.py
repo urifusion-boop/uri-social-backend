@@ -260,9 +260,40 @@ async def login(body: LoginRequest, db: AsyncIOMotorDatabase = Depends(get_db_de
 
     # Check if email is verified (skip for Google OAuth users)
     if not user.get("email_verified") and user.get("auth_provider") != "google":
+        # Generate and send a new verification code
+        verification_code = ''.join([str(random.randint(0, 9)) for _ in range(6)])
+        verification_code_expires = datetime.utcnow() + timedelta(minutes=15)
+
+        await db["users"].update_one(
+            {"email": body.email},
+            {
+                "$set": {
+                    "verification_code": verification_code,
+                    "verification_code_expires": verification_code_expires,
+                    "updated_at": datetime.utcnow(),
+                }
+            }
+        )
+
+        # Send new verification email
+        try:
+            import asyncio
+            asyncio.ensure_future(email_service.send_email(
+                to_email=body.email,
+                subject="Verify your URI Social account",
+                template_name="email_verification",
+                template_vars={
+                    "first_name": user.get("first_name") or "there",
+                    "verification_code": verification_code,
+                    "expires_in": "15 minutes",
+                }
+            ))
+        except Exception as e:
+            print(f"⚠️ Verification email failed for {body.email}: {e}")
+
         raise HTTPException(
             status_code=403,
-            detail="Please verify your email before logging in. Check your inbox for the verification code."
+            detail="Please verify your email before logging in. We've sent a new verification code to your inbox."
         )
 
     # Update last_login_at and last_seen_at
