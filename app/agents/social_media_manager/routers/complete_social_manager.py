@@ -3039,7 +3039,7 @@ async def get_account_metrics(
                 # Fetch published LinkedIn posts and aggregate real likes + comments
                 # via /v2/socialActions (works with w_member_social scope).
                 li_drafts = await db["content_drafts"].find(
-                    {"user_id": user_id, "status": "published", "platforms": {"$in": ["linkedin"]},
+                    {"user_id": user_id, "status": "published", "platform": "linkedin",
                      "platform_post_id": {"$exists": True, "$ne": None}},
                     {"_id": 0, "platform_post_id": 1},
                 ).to_list(length=50)
