@@ -190,27 +190,22 @@ class InstagramDirectService:
                     "success": False,
                     "error": "Could not download/convert image for Instagram. Please re-generate the post.",
                 }
-            if page_id:
-                rehosted = await InstagramDirectService._upload_to_facebook_cdn(
-                    page_id, page_access_token, jpeg_bytes
-                )
-            else:
+            # Use Cloudinary — its URLs are always publicly accessible by Instagram's
+            # media servers. Facebook CDN URLs for unpublished photos can have IP
+            # restrictions that prevent Meta's own crawler from fetching them,
+            # causing containers to sit with no status indefinitely.
+            try:
+                from app.utils.cloudinary_upload import upload_bytes as _cld_bytes
+                rehosted = await _cld_bytes(jpeg_bytes, folder="uri-social/instagram")
+            except Exception as _cld_err:
+                print(f"⚠️ Cloudinary upload failed: {_cld_err}")
                 rehosted = None
-
-            if not rehosted:
-                # Fallback: Cloudinary (always configured, guaranteed HTTPS)
-                try:
-                    import io as _io, base64 as _b64
-                    from app.utils.cloudinary_upload import upload_bytes as _cld_bytes
-                    rehosted = await _cld_bytes(jpeg_bytes, folder="uri-social/instagram")
-                except Exception as _cld_err:
-                    print(f"⚠️ Cloudinary fallback upload failed: {_cld_err}")
             if not rehosted:
                 return {
                     "success": False,
                     "error": "Could not host image for Instagram publishing.",
                 }
-            print(f"✅ Re-hosted image URL: {rehosted}")
+            print(f"✅ Re-hosted image URL (Cloudinary JPEG): {rehosted}")
             image_url = rehosted
 
         async with httpx.AsyncClient(timeout=60) as client:
@@ -234,17 +229,23 @@ class InstagramDirectService:
             # Instagram processes the image asynchronously; publishing before FINISHED
             # causes error_subcode 2207027 ("Media is not ready to be published").
             import asyncio as _asyncio
-            for attempt in range(12):  # poll up to ~60s (12 × 5s)
+            for attempt in range(24):  # poll up to ~120s (24 × 5s)
                 status_resp = await client.get(
                     f"{GRAPH_BASE}/{creation_id}",
-                    params={"fields": "status_code", "access_token": page_access_token},
+                    params={"fields": "status_code,status_error", "access_token": page_access_token},
                 )
-                status_code = status_resp.json().get("status_code", "")
-                print(f"⏳ Container {creation_id} status: {status_code} (attempt {attempt + 1})")
+                status_data = status_resp.json()
+                status_code = status_data.get("status_code", "")
+                if not status_code and "error" in status_data:
+                    err = status_data["error"]
+                    print(f"❌ Container status API error: {err}")
+                    return {"success": False, "error": f"Container status check failed: {err.get('message', str(err))}"}
+                print(f"⏳ Container {creation_id} status: {status_code!r} (attempt {attempt + 1}) | response={status_data}")
                 if status_code == "FINISHED":
                     break
                 if status_code == "ERROR":
-                    return {"success": False, "error": "Instagram container processing failed (status=ERROR)."}
+                    status_error = status_data.get("status_error") or {}
+                    return {"success": False, "error": f"Instagram container processing failed: {status_error}"}
                 await _asyncio.sleep(5)
             else:
                 return {"success": False, "error": "Instagram container timed out waiting for FINISHED status."}
