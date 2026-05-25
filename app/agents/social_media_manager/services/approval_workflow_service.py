@@ -120,10 +120,14 @@ class ApprovalWorkflowService:
                     
                     if schedule_option == "schedule":
                         # Validate before accepting — fail fast with a visible error.
-                        if draft.get("platform") == "instagram" and draft.get("post_type", "feed") != "text":
+                        if draft.get("platform") == "instagram" and draft.get("post_type", "feed") not in ("text", "carousel"):
                             raw_img = ApprovalWorkflowService._resolve_image_url(draft.get("image_url") or "")
                             if not raw_img:
                                 errors.append({"draft_id": draft_id, "error": "Instagram requires an image. Add one to this post before scheduling."})
+                                continue
+                        elif draft.get("platform") == "instagram" and draft.get("post_type") == "carousel":
+                            if not draft.get("slides"):
+                                errors.append({"draft_id": draft_id, "error": "Instagram carousel requires slides. Re-generate the post."})
                                 continue
 
                         # Cancel ALL other in-flight drafts for this user+platform so the
@@ -1158,32 +1162,6 @@ class ApprovalWorkflowService:
                     image_url = await ApprovalWorkflowService._upload_base64_to_imgbb(image_url) or ""
 
                 print(f"📱 Instagram feed publish | ig_user_id={ig_user_id} page_id={page_id} token_len={len(page_token) if page_token else 0} raw_image_url={image_url[:120] if image_url else None}")
-
-                # Force-rehost the image through Facebook CDN (page_id available) or
-                # Cloudinary (fallback) to guarantee Instagram can fetch it.
-                # Cloudinary URLs can trigger content-negotiation that serves WebP to
-                # bots — rehosting ensures a clean JPEG that Meta's crawler accepts.
-                if image_url and image_url.startswith("https://"):
-                    print(f"🔄 Pre-uploading Instagram image for reliability...")
-                    try:
-                        import httpx as _httpx_ig
-                        async with _httpx_ig.AsyncClient(timeout=30, follow_redirects=True) as _ig_cl:
-                            _img_r = await _ig_cl.get(image_url)
-                            _img_r.raise_for_status()
-                            _img_bytes = _img_r.content
-                        print(f"   ↓ Downloaded {len(_img_bytes)} bytes (content-type: {_img_r.headers.get('content-type', 'unknown')})")
-                        if page_id:
-                            _rehosted = await InstagramDirectService._upload_to_facebook_cdn(page_id, page_token, _img_bytes)
-                        else:
-                            from app.utils.cloudinary_upload import upload_bytes as _cld_ig
-                            _rehosted = await _cld_ig(_img_bytes, folder="uri-social/instagram")
-                        if _rehosted:
-                            print(f"   ✅ Pre-upload success → {_rehosted}")
-                            image_url = _rehosted
-                        else:
-                            print(f"   ⚠️ Pre-upload returned None — using original URL")
-                    except Exception as _preup_err:
-                        print(f"   ⚠️ Pre-upload failed ({_preup_err}) — using original URL")
 
                 return await InstagramDirectService.publish_post(
                     ig_user_id=ig_user_id,
