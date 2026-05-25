@@ -3044,57 +3044,23 @@ async def get_account_metrics(
                 from app.agents.social_media_manager.services.linkedin_direct_service import LinkedInDirectService
                 svc = LinkedInDirectService()
 
-                # Fetch basic profile (name, email)
-                profile = await svc.get_profile(access_token)
-
-                # LinkedIn doesn't expose follower/connection counts with basic scopes.
-                # Try several endpoints in order, fall back to stored value.
-                followers_count = int(conn.get("followers_count", 0) or 0)
+                # /v2/userinfo works with openid+profile scope (always granted)
+                display_name = conn.get("account_name") or conn.get("username") or "LinkedIn"
+                needs_reconnect = False
                 try:
-                    async with _httpx.AsyncClient(timeout=15) as _c:
-                        headers_li = {"Authorization": f"Bearer {access_token}",
-                                      "X-Restli-Protocol-Version": "2.0.0"}
-
-                        # 1. networkSizes — requires r_network scope
-                        encoded_urn = person_urn.replace(":", "%3A")
-                        ns_resp = await _c.get(
-                            f"https://api.linkedin.com/v2/networkSizes/{encoded_urn}",
-                            params={"edgeType": "CreatedByMember"},
-                            headers=headers_li,
-                        )
-                        if ns_resp.status_code == 200:
-                            followers_count = ns_resp.json().get("firstDegreeSize", 0) or followers_count
-
-                        # 2. Legacy ~: fields (r_liteprofile / r_basicprofile)
-                        elif followers_count == 0:
-                            lp_resp = await _c.get(
-                                "https://api.linkedin.com/v2/people/~:(numConnections,numConnectionsCapped)",
-                                headers=headers_li,
-                            )
-                            if lp_resp.status_code == 200:
-                                followers_count = lp_resp.json().get("numConnections", 0) or followers_count
-
-                        # 3. /me projection
-                        if followers_count == 0:
-                            me_resp = await _c.get(
-                                "https://api.linkedin.com/v2/me",
-                                params={"projection": "(numConnections)"},
-                                headers=headers_li,
-                            )
-                            if me_resp.status_code == 200:
-                                followers_count = me_resp.json().get("numConnections", 0) or followers_count
-
-                        # Persist successful count so next request can use it as fallback
-                        if followers_count:
-                            await db["social_connections"].update_one(
-                                {"user_id": user_id, "platform": "linkedin"},
-                                {"$set": {"followers_count": followers_count}},
-                            )
+                    async with _httpx.AsyncClient(timeout=10) as _c:
+                        ui = await _c.get("https://api.linkedin.com/v2/userinfo",
+                                          headers={"Authorization": f"Bearer {access_token}"})
+                        if ui.status_code == 200:
+                            display_name = ui.json().get("name") or display_name
                 except Exception:
-                    pass  # follower count is best-effort; stored value used
+                    pass
 
-                # Fetch published LinkedIn posts and aggregate real likes + comments
-                # via /v2/socialActions (works with w_member_social scope).
+                # followers: networkSizes requires r_network (restricted scope) — not available
+                # Use cached value from DB if present, otherwise 0
+                followers_count = int(conn.get("followers_count", 0) or 0)
+
+                # post count from DB (always accurate)
                 li_drafts = await db["content_drafts"].find(
                     {"user_id": user_id, "status": "published", "platform": "linkedin",
                      "platform_post_id": {"$exists": True, "$ne": None}},
@@ -3102,50 +3068,38 @@ async def get_account_metrics(
                 ).to_list(length=50)
                 post_count = len(li_drafts)
 
-                total_likes = total_comments = 0
-                async def _li_social(draft):
-                    urn = draft.get("platform_post_id", "")
-                    if not urn or not urn.startswith("urn:li:"):
-                        return
-                    try:
-                        sa = await svc.get_post_social_actions(access_token, urn)
-                        return sa.get("likes", 0), sa.get("comments", 0)
-                    except Exception:
-                        return 0, 0
+                # LinkedIn does not allow reading likes/comments for personal posts
+                # without Marketing Developer Platform (MDP) access.
+                # Return None so the frontend can display "-" instead of misleading "0".
+                total_likes = None
+                total_comments = None
 
-                sa_results = await _asyncio.gather(*[_li_social(d) for d in li_drafts], return_exceptions=True)
-                for res in sa_results:
-                    if res and not isinstance(res, Exception):
-                        total_likes += res[0]
-                        total_comments += res[1]
-
-                # Impressions/reach require LinkedIn Marketing API (separate approval).
                 return {
                     "account_id": person_urn,
                     "network": "linkedin",
-                    "page_name": profile.get("name") or conn.get("account_name") or conn.get("username"),
+                    "page_name": display_name,
                     "category": None,
                     "followers_count": followers_count,
                     "following_count": None,
                     "posts_count": post_count,
                     "engagement": {
-                        "views": 0,
+                        "views": None,
                         "likes": total_likes,
                         "comments": total_comments,
-                        "shares": 0,
-                        "reposts": 0,
-                        "quotes": 0,
+                        "shares": None,
+                        "reposts": None,
+                        "quotes": None,
                     },
-                    "engagement_note": "Likes and comments are live from LinkedIn. Impressions require LinkedIn Marketing API access.",
+                    "engagement_note": "LinkedIn's standard API does not provide engagement stats for personal profiles. Upgrade to LinkedIn Marketing API for full analytics.",
+                    "needs_reconnect": False,
                     "platform_specific": {
-                        "email": profile.get("email"),
                         "person_urn": person_urn,
                         "pages": conn.get("pages", []),
                     },
                     "period": {"since": since_ts, "until": until_ts},
                 }
             except Exception as e:
-                print(f"⚠️ LinkedIn direct account metrics failed for {person_urn}: {e}")
+                print(f"⚠️ LinkedIn direct account metrics failed for {person_urn}: {e}", flush=True)
                 return None
 
         async def _fetch_facebook_direct_metrics(conn):
