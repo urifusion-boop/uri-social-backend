@@ -2408,7 +2408,8 @@ async def get_performance(
         # Load direct connections — for platform routing
         direct_conns = await db["social_connections"].find(
             {"user_id": user_id, "connected_via": {"$ne": "outstand"}},
-            {"_id": 0, "platform": 1, "connected_via": 1, "page_access_token": 1, "ig_user_id": 1},
+            {"_id": 0, "platform": 1, "connected_via": 1, "page_access_token": 1,
+             "ig_user_id": 1, "linkedin_access_token": 1},
         ).to_list(length=20)
         direct_conn_map = {c["platform"]: c for c in direct_conns}
 
@@ -2469,9 +2470,9 @@ async def get_performance(
                     if is_reel:
                         metrics = "plays,reach,likes,comments,shares,saved,total_interactions"
                     elif is_video:
-                        metrics = "impressions,reach,saved,video_views"
+                        metrics = "reach,saved,video_views,total_interactions"
                     else:
-                        metrics = "impressions,reach,saved"
+                        metrics = "reach,saved,total_interactions"
 
                     impressions = reach = views = 0
                     try:
@@ -2491,6 +2492,7 @@ async def get_performance(
                                     impressions = val
                                 elif name == "reach":
                                     reach = val
+                                    impressions = impressions or val
                                 elif name in ("plays", "video_views"):
                                     views = val
                     except Exception as ins_e:
@@ -2540,15 +2542,18 @@ async def get_performance(
                     is_reel = media_product_type == "REELS" or media_type == "REELS"
                     is_video = media_type == "VIDEO" and not is_reel
 
-                    # Choose metrics based on media type
+                    # Instagram Graph API v22+ removed "impressions" from per-media insights.
+                    # Use "reach" + "total_interactions" for images/carousels.
+                    # Reels still support "plays" and "reach".
                     if is_reel:
                         metrics = "plays,reach,likes,comments,shares,saved,total_interactions"
                     elif is_video:
-                        metrics = "impressions,reach,saved,video_views"
+                        metrics = "reach,saved,video_views,total_interactions"
                     else:
-                        metrics = "impressions,reach,saved"
+                        # IMAGE / CAROUSEL_ALBUM — impressions removed in v22+
+                        metrics = "reach,saved,total_interactions"
 
-                    impressions = reach = views = 0
+                    impressions = reach = views = total_interactions = 0
                     try:
                         ins_resp = await _c.get(
                             f"{_graph_base}/{media_id}/insights",
@@ -2559,7 +2564,6 @@ async def get_performance(
                             print(f"⚠️ IG insights error for {media_id}: {ins_data['error'].get('message')} (code {ins_data['error'].get('code')})")
                         else:
                             for item in ins_data.get("data", []):
-                                # v21+ uses "total_value", older uses "values[0].value"
                                 val = item.get("total_value", {}).get("value") or \
                                       (item.get("values") or [{}])[0].get("value", 0)
                                 name = item["name"]
@@ -2567,8 +2571,11 @@ async def get_performance(
                                     impressions = val
                                 elif name == "reach":
                                     reach = val
+                                    impressions = impressions or val  # use reach as impressions fallback
                                 elif name in ("plays", "video_views"):
                                     views = val
+                                elif name == "total_interactions":
+                                    total_interactions = val
                     except Exception as ins_err:
                         print(f"⚠️ IG insights fetch failed for {media_id}: {ins_err}")
 
@@ -2615,7 +2622,7 @@ async def get_performance(
             impressions = int(ana.get("impressions", 0) or 0)
             views       = int(ana.get("views", 0) or 0)
             reach       = int(ana.get("reach", 0) or 0)
-            effective   = impressions or reach or 1
+            effective   = impressions or reach or 0
             platform    = ana.get("platform") or draft.get("platform", "unknown")
             return {
                 "draft_id": draft_id,
@@ -2630,7 +2637,7 @@ async def get_performance(
                 "views": views,
                 "impressions": impressions,
                 "reach": reach,
-                "engagement_rate": round(((likes + comments) / effective) * 100, 2),
+                "engagement_rate": round(((likes + comments) / effective) * 100, 2) if effective else None,
             }
 
         import re as _re
@@ -2643,18 +2650,27 @@ async def get_performance(
             # base64 strings (EgFFA, ZxDCu) or LinkedIn URNs.
             # Route numeric IG IDs directly to Instagram Graph API — Outstand analytics fails on them.
             is_ig_media_id = bool(post_id and platform == "instagram" and _re.match(r'^\d{15,}$', str(post_id)))
-            is_outstand_post = bool(draft.get("outstand_post_status") or draft.get("publish_response"))
+            # "queued" means Outstand accepted the post and will publish it (or already has).
+            # Treat queued + any publish_response as an Outstand-routed post.
+            is_outstand_post = bool(
+                draft.get("outstand_post_status")  # "queued", "published", etc.
+                or draft.get("publish_response")
+                or (post_id and isinstance(post_id, str) and post_id.startswith("urn:li:"))  # LinkedIn URN
+            )
 
             live_result = None
+            print(f"[_fetch] platform={platform} post_id={repr(post_id)} is_ig={is_ig_media_id} is_outstand={is_outstand_post}", flush=True)
 
-            # Strategy 1: real Instagram media ID — use Graph API directly
-            if post_id and platform == "instagram" and (is_ig_media_id or not is_outstand_post):
+            # Strategy 1: real Instagram media ID — use Graph API directly.
+            # Always run this when post_id looks like a real IG media ID (15+ digits),
+            # regardless of outstand_post_status — Outstand queues real IG media IDs too.
+            if post_id and platform == "instagram" and is_ig_media_id:
                 conn = ig_direct or direct_conn_map.get(platform)
                 if conn and conn.get("page_access_token"):
                     live_result = await _fetch_instagram_direct(draft, conn)
 
             # Strategy 2: Outstand-published post — get what Outstand has (likes/comments)
-            if live_result is None and post_id and is_outstand_post:
+            if live_result is None and post_id and is_outstand_post and not str(post_id).startswith("urn:li:"):
                 try:
                     data = await outstand.get_post_analytics(post_id)
                     agg = data.get("aggregated_metrics") or {}
@@ -2698,6 +2714,41 @@ async def get_performance(
                     print(f"[Outstand analytics mapped] likes={live_result['likes']} imp={live_result['impressions']} reach={live_result['reach']}")
                 except Exception as e:
                     print(f"⚠️ Outstand analytics failed for post {post_id}: {e}")
+
+            # Strategy 2b: LinkedIn URN — query LinkedIn socialActions API directly
+            if live_result is None and platform == "linkedin" and post_id and str(post_id).startswith("urn:li:"):
+                li_conn = direct_conn_map.get("linkedin")
+                if not li_conn:
+                    li_conn_raw = await db["social_connections"].find_one(
+                        {"user_id": user_id, "platform": "linkedin", "connection_status": "active"},
+                        {"_id": 0, "linkedin_access_token": 1},
+                    )
+                    li_conn = li_conn_raw
+                if li_conn and li_conn.get("linkedin_access_token"):
+                    try:
+                        from app.agents.social_media_manager.services.linkedin_direct_service import LinkedInDirectService
+                        _li_svc = LinkedInDirectService()
+                        sa = await _li_svc.get_post_social_actions(li_conn["linkedin_access_token"], post_id)
+                        likes = sa.get("likes", 0)
+                        comments = sa.get("comments", 0)
+                        print(f"[LinkedIn direct] urn={post_id} likes={likes} comments={comments}", flush=True)
+                        live_result = {
+                            "draft_id": draft.get("id"),
+                            "platform_post_id": post_id,
+                            "platform": "linkedin",
+                            "content_preview": (draft.get("content") or "")[:120],
+                            "published_at": draft.get("published_date", ""),
+                            "image_url": draft.get("image_url"),
+                            "likes": likes,
+                            "comments": comments,
+                            "shares": 0,
+                            "views": 0,
+                            "impressions": 0,
+                            "reach": 0,
+                            "engagement_rate": None,
+                        }
+                    except Exception as _li_err:
+                        print(f"⚠️ LinkedIn direct analytics failed for {post_id}: {_li_err}", flush=True)
 
             # Strategy 3: Instagram timestamp lookup — fills in impressions/reach that
             # Outstand doesn't sync, by finding the actual IG media via published_date.
