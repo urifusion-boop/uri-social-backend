@@ -1129,11 +1129,60 @@ class ApprovalWorkflowService:
 
             if post_type == "carousel":
                 slides = draft.get("slides", [])
+
+                # ── VALIDATE ALL CAROUSEL SLIDES HAVE IMAGES ──
+                # Unlike Facebook (which handles missing images inline), Instagram requires
+                # all slides to have valid public HTTPS URLs before publishing.
+                if not slides:
+                    return {"success": False, "error": "Carousel has no slides."}
+
+                validated_slides = []
+                for i, slide in enumerate(slides):
+                    slide_image_url = slide.get("image_url") or ""
+
+                    # Check if image is missing
+                    if not slide_image_url:
+                        # Check if image generation failed or is still processing
+                        if slide.get("image_failed"):
+                            return {
+                                "success": False,
+                                "error": f"Slide {i + 1} image generation failed. Please regenerate the image before publishing."
+                            }
+                        else:
+                            return {
+                                "success": False,
+                                "error": f"Slide {i + 1} image is still being generated. Please wait a moment and try again."
+                            }
+
+                    # Check if image is still a base64 data URL (Cloudinary upload failed)
+                    if slide_image_url.startswith("data:"):
+                        return {
+                            "success": False,
+                            "error": f"Slide {i + 1} image failed to upload to cloud storage. Please regenerate the image."
+                        }
+
+                    # Check if image is a valid HTTPS URL
+                    if not slide_image_url.startswith("https://"):
+                        return {
+                            "success": False,
+                            "error": f"Slide {i + 1} has an invalid image URL. Please regenerate the image."
+                        }
+
+                    validated_slides.append(slide)
+
+                if len(validated_slides) < 2:
+                    return {
+                        "success": False,
+                        "error": f"Instagram carousels require at least 2 slides with images. Only {len(validated_slides)} slides have valid images."
+                    }
+
+                print(f"📸 Instagram carousel validation passed: {len(validated_slides)} slides with valid image URLs")
+
                 return await InstagramDirectService.publish_carousel(
                     ig_user_id=ig_user_id,
                     page_access_token=page_token,
                     caption=content,
-                    slides=slides,
+                    slides=validated_slides,
                     page_id=page_id,
                 )
             elif post_type == "story":
