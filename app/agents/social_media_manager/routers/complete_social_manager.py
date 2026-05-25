@@ -2985,6 +2985,8 @@ async def get_account_metrics(
                     from datetime import timezone as _tz
                     since_dt = datetime.utcfromtimestamp(since_ts).replace(tzinfo=_tz.utc)
                     total_likes = total_comments = 0
+                    post_views_sum = 0
+                    post_ids_in_period = []
                     for post in posts:
                         try:
                             from datetime import datetime as _dt
@@ -2992,8 +2994,35 @@ async def get_account_metrics(
                             if post_dt >= since_dt:
                                 total_likes += post.get("like_count", 0)
                                 total_comments += post.get("comments_count", 0)
+                                post_ids_in_period.append(post.get("id"))
                         except Exception:
                             pass
+
+                    # If Insights API returned 0 impressions, fall back to summing
+                    # per-post reach via live IG API calls (same source as Top Posts)
+                    if total_impressions == 0 and post_ids_in_period:
+                        try:
+                            async def _fetch_post_reach(pid):
+                                try:
+                                    r = await _c.get(
+                                        f"{_graph_base}/{pid}/insights",
+                                        params={"metric": "reach,total_interactions", "access_token": token},
+                                    )
+                                    items = r.json().get("data", [])
+                                    for item in items:
+                                        if item.get("name") == "reach":
+                                            vals = item.get("values", [])
+                                            return sum(v.get("value", 0) for v in vals) if vals else item.get("total_value", {}).get("value", 0)
+                                except Exception:
+                                    pass
+                                return 0
+                            reach_results = await _asyncio.gather(*[_fetch_post_reach(pid) for pid in post_ids_in_period[:20]])
+                            post_views_sum = sum(r for r in reach_results if isinstance(r, (int, float)))
+                            if post_views_sum:
+                                total_impressions = post_views_sum
+                                print(f"[IG] Insights API=0 → summed per-post reach: {total_impressions}")
+                        except Exception as _fb_err:
+                            print(f"[IG] per-post reach fallback failed: {_fb_err}")
 
                 return {
                     "account_id": ig_user_id,
