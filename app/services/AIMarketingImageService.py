@@ -209,11 +209,11 @@ class AIMarketingImageService:
         generation_id = result_insert.inserted_id
 
         try:
-            # Call existing DALL-E service (reuses existing integration)
+            # Use GPT-Image-2 for high-quality marketing images (same as Create Content)
             result = await ImageContentService._call_dalle_api(
                 prompt=prompt,
                 size=size,
-                image_model="dall-e-3"
+                image_model="openai/gpt-image-2"
             )
 
             if result.get("success"):
