@@ -270,6 +270,11 @@ class UpdateMemberRoleRequest(BaseModel):
     custom_permissions: Optional[WorkspacePermissions] = None
 
 
+class UpdateMemberPermissionsRequest(BaseModel):
+    """Request model for updating custom permissions"""
+    permissions: WorkspacePermissions
+
+
 class WorkspaceMemberResponse(BaseModel):
     """Response model for workspace member"""
     id: str
