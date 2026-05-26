@@ -281,6 +281,23 @@ async def _generate_ideas(
         if lines:
             platform_tone_block = "Platform-specific tones:\n" + "\n".join(lines)
 
+    # Definitions for what each topic label means as post subject matter.
+    # Critical: prevents AI from misreading e.g. "offer" as "promote this brand"
+    # or "marketing" as "write about social media marketing for this platform".
+    _TOPIC_DEFINITIONS = {
+        "offer":      "deals, discounts, limited-time sales, pricing savings — e.g. a money-saving tip, a promo breakdown, a 'best deal right now' angle",
+        "technology": "practical tech tools, apps, automation, AI — e.g. a tool that saves time, an automation hack, a software comparison",
+        "finance":    "money management, investing, savings, budgeting, profit margins — e.g. an investment tip, a budgeting mistake, a savings strategy",
+        "business":   "entrepreneurship, client acquisition, sales strategy, startup growth — e.g. how to land clients, a scaling lesson, a founder insight",
+        "education":  "step-by-step guides, how-to posts, common mistakes, beginner tips — e.g. a tutorial, a 'what I wish I knew' post, a myth-bust",
+        "marketing":  "audience growth tactics, brand-building, content strategy — e.g. an algorithm insight, a growth hack, a posting strategy",
+        "motivation": "mindset, discipline, resilience, goal-setting — e.g. a personal growth story, a hard truth about success, an anti-procrastination angle",
+        "real estate":"property investing, rental income, mortgage tips, landlord lessons",
+        "fashion":    "style tips, outfit ideas, trend breakdowns, wardrobe hacks",
+        "food":       "recipes, meal prep, food business tips, catering insights",
+        "story":      "behind-the-scenes story, brand journey, case study, team moment",
+    }
+
     # Resolve performance topics early — needed for both days_block and topic_override_block
     _perf_topics = (performance or {}).get("top_topics", []) if performance and performance.get("has_data") else []
 
@@ -404,23 +421,6 @@ async def _generate_ideas(
     if avoid_str:
         extras.append(f"Topics/themes to avoid: {avoid_str}")
     extras_block = "\n".join(extras)
-
-    # Definitions for what each topic label means as post subject matter.
-    # Critical: prevents AI from misreading e.g. "offer" as "promote this brand"
-    # or "marketing" as "write about social media marketing for this platform".
-    _TOPIC_DEFINITIONS = {
-        "offer":      "deals, discounts, limited-time sales, pricing savings — e.g. a money-saving tip, a promo breakdown, a 'best deal right now' angle",
-        "technology": "practical tech tools, apps, automation, AI — e.g. a tool that saves time, an automation hack, a software comparison",
-        "finance":    "money management, investing, savings, budgeting, profit margins — e.g. an investment tip, a budgeting mistake, a savings strategy",
-        "business":   "entrepreneurship, client acquisition, sales strategy, startup growth — e.g. how to land clients, a scaling lesson, a founder insight",
-        "education":  "step-by-step guides, how-to posts, common mistakes, beginner tips — e.g. a tutorial, a 'what I wish I knew' post, a myth-bust",
-        "marketing":  "audience growth tactics, brand-building, content strategy — e.g. an algorithm insight, a growth hack, a posting strategy",
-        "motivation": "mindset, discipline, resilience, goal-setting — e.g. a personal growth story, a hard truth about success, an anti-procrastination angle",
-        "real estate":"property investing, rental income, mortgage tips, landlord lessons",
-        "fashion":    "style tips, outfit ideas, trend breakdowns, wardrobe hacks",
-        "food":       "recipes, meal prep, food business tips, catering insights",
-        "story":      "behind-the-scenes story, brand journey, case study, team moment",
-    }
 
     # When we have engagement data, assign one proven topic to each day explicitly.
     # This leaves the AI no room to drift back to brand pillars or industry defaults.
