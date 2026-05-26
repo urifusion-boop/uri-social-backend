@@ -2421,6 +2421,13 @@ async def get_performance(
         ).to_list(length=5)
         ig_direct = next((c for c in all_ig_conns if c.get("ig_user_id") and c.get("page_access_token")), None)
 
+        # Load Facebook direct connection for per-post analytics (same pattern as ig_direct)
+        all_fb_conns = await db["social_connections"].find(
+            {"user_id": user_id, "platform": "facebook", "page_access_token": {"$exists": True}},
+            {"_id": 0, "page_id": 1, "page_access_token": 1},
+        ).to_list(length=5)
+        fb_direct = next((c for c in all_fb_conns if c.get("page_id") and c.get("page_access_token")), None)
+
         outstand = OutstandService()
         _graph_base = f"https://graph.facebook.com/{settings.FACEBOOK_API_VERSION}"
 
@@ -2519,6 +2526,88 @@ async def get_performance(
                     }
             except Exception as e:
                 print(f"⚠️ Instagram timestamp lookup failed: {e}")
+                return None
+
+        async def _fetch_facebook_by_timestamp(draft, conn):
+            """Find a published Facebook post by matching the draft's published_date to page post timestamps.
+            Used for Outstand posts where platform_post_id is an Outstand UUID, not a FB post ID."""
+            page_id = conn.get("page_id")
+            token = conn.get("page_access_token")
+            pub_date = draft.get("published_date")
+            if not page_id or not token or not pub_date:
+                return None
+            try:
+                from dateutil.parser import parse as _dp
+                pub_dt = _dp(str(pub_date)) if isinstance(pub_date, str) else pub_date
+                pub_dt = pub_dt.replace(tzinfo=None)
+            except Exception:
+                return None
+            try:
+                async with _httpx.AsyncClient(timeout=20) as _c:
+                    posts_resp = await _c.get(
+                        f"{_graph_base}/{page_id}/posts",
+                        params={
+                            "fields": "id,created_time,reactions.summary(total_count),comments.summary(total_count),shares",
+                            "limit": 100,
+                            "access_token": token,
+                        },
+                    )
+                    posts_data = posts_resp.json().get("data", [])
+
+                    best_match = None
+                    best_diff = float("inf")
+                    for p in posts_data:
+                        try:
+                            p_dt = _dp(p["created_time"]).replace(tzinfo=None)
+                            diff = abs((pub_dt - p_dt).total_seconds())
+                            if diff < 3600 and diff < best_diff:
+                                best_diff = diff
+                                best_match = p
+                        except Exception:
+                            pass
+
+                    if not best_match:
+                        return None
+
+                    fb_post_id = best_match["id"]
+                    likes = (best_match.get("reactions") or {}).get("summary", {}).get("total_count", 0)
+                    comments = (best_match.get("comments") or {}).get("summary", {}).get("total_count", 0)
+                    shares = (best_match.get("shares") or {}).get("count", 0)
+
+                    impressions = reach = 0
+                    try:
+                        ins_resp = await _c.get(
+                            f"{_graph_base}/{fb_post_id}/insights",
+                            params={"metric": "post_impressions,post_impressions_unique", "access_token": token},
+                        )
+                        for item in ins_resp.json().get("data", []):
+                            val = (item.get("values") or [{}])[-1].get("value", 0)
+                            if item.get("name") == "post_impressions":
+                                impressions = val
+                            elif item.get("name") == "post_impressions_unique":
+                                reach = val
+                    except Exception as ins_e:
+                        print(f"⚠️ FB post insights failed for {fb_post_id}: {ins_e}")
+
+                    effective = reach or impressions or 1
+                    print(f"[FB timestamp match] draft={draft.get('id')} post_id={fb_post_id} diff={best_diff:.0f}s imp={impressions} reach={reach}")
+                    return {
+                        "draft_id": draft.get("id"),
+                        "platform_post_id": fb_post_id,
+                        "platform": "facebook",
+                        "content_preview": (draft.get("content") or "")[:120],
+                        "published_at": draft.get("published_date", ""),
+                        "image_url": draft.get("image_url"),
+                        "likes": likes,
+                        "comments": comments,
+                        "shares": shares,
+                        "views": impressions,
+                        "impressions": impressions,
+                        "reach": reach,
+                        "engagement_rate": round(((likes + comments + shares) / effective) * 100, 2) if effective else None,
+                    }
+            except Exception as e:
+                print(f"⚠️ Facebook timestamp lookup failed: {e}")
                 return None
 
         async def _fetch_instagram_direct(draft, conn):
@@ -2770,6 +2859,29 @@ async def get_performance(
                             effective = live_result["impressions"] or live_result["reach"] or 1
                             live_result["engagement_rate"] = round(
                                 ((live_result["likes"] + live_result["comments"]) / effective) * 100, 2
+                            )
+                        else:
+                            live_result = ts_result
+
+            # Strategy 3b: Facebook timestamp lookup — same pattern as Instagram above.
+            if platform == "facebook" and fb_direct:
+                needs_fb_metrics = live_result is None or (live_result.get("impressions") or 0) == 0
+                if needs_fb_metrics:
+                    ts_result = await _fetch_facebook_by_timestamp(draft, fb_direct)
+                    if ts_result:
+                        if live_result:
+                            live_result["impressions"] = ts_result["impressions"]
+                            live_result["reach"] = ts_result.get("reach", 0)
+                            live_result["views"] = ts_result.get("impressions", 0)
+                            if not live_result.get("likes"):
+                                live_result["likes"] = ts_result.get("likes", 0)
+                            if not live_result.get("comments"):
+                                live_result["comments"] = ts_result.get("comments", 0)
+                            if not live_result.get("shares"):
+                                live_result["shares"] = ts_result.get("shares", 0)
+                            effective = live_result["impressions"] or live_result["reach"] or 1
+                            live_result["engagement_rate"] = round(
+                                ((live_result["likes"] + live_result["comments"] + live_result["shares"]) / effective) * 100, 2
                             )
                         else:
                             live_result = ts_result
