@@ -510,11 +510,13 @@ class ApprovalWorkflowService:
             current_time = datetime.utcnow()
             print(f"📅 publish_scheduled_content | starting at {current_time.isoformat()}")
 
-            # Clean up stale "publishing" drafts (process crashed mid-publish > 10 min ago)
+            # Clean up stale "publishing" drafts (process crashed mid-publish > 10 min ago).
+            # Also clear platform_post_id so the draft re-enters the direct-publish path
+            # instead of being misidentified as an Outstand post.
             stale_cutoff = current_time - timedelta(minutes=10)
             stale_result = await db["content_drafts"].update_many(
                 {"status": "publishing", "updated_at": {"$lte": stale_cutoff}},
-                {"$set": {"status": "scheduled", "updated_at": current_time}},
+                {"$set": {"status": "scheduled", "platform_post_id": None, "updated_at": current_time}},
             )
             if stale_result.modified_count:
                 print(f"⚠️ Stale cleanup: reset {stale_result.modified_count} 'publishing' drafts back to 'scheduled' (were stuck >10min)")
@@ -589,43 +591,62 @@ class ApprovalWorkflowService:
 
             for draft in scheduled_content:
                 try:
-                    # If this draft was already submitted to Outstand (has platform_post_id),
-                    # poll Outstand for its published status instead of re-publishing.
+                    # If this draft was already submitted (has platform_post_id), determine
+                    # how to handle it based on the ID format:
+                    # - Facebook direct post IDs look like "1234567_9876543" (digits_digits)
+                    # - Outstand post IDs are short alphanumeric strings like "gQXux"
                     existing_post_id = draft.get("platform_post_id")
                     if existing_post_id:
-                        try:
-                            from app.agents.social_media_manager.services.outstand_service import OutstandService
-                            outstand = OutstandService()
-                            post_data = await outstand.get_post(existing_post_id)
-                            post = post_data.get("post", {})
-                            if post.get("publishedAt") and not post.get("isDraft"):
-                                await db["content_drafts"].update_one(
-                                    {"id": draft["id"]},
-                                    {"$set": {
-                                        "status": "published",
-                                        "published_date": datetime.utcnow(),
-                                        "updated_at": datetime.utcnow(),
-                                    }},
-                                )
-                                published_count += 1
-                                print(f"✅ Outstand-scheduled post confirmed published | draft_id={draft['id']} post_id={existing_post_id}")
-                            else:
-                                print(f"⏳ Outstand post not yet published | draft_id={draft['id']} post_id={existing_post_id}")
-                        except Exception as e:
-                            print(f"⚠️ Could not poll Outstand for draft_id={draft['id']}: {e}")
-                            # If Outstand returns 404 the post no longer exists there.
-                            # Mark as published to stop infinite retry polling.
-                            if "404" in str(e):
-                                await db["content_drafts"].update_one(
-                                    {"id": draft["id"]},
-                                    {"$set": {
-                                        "status": "published",
-                                        "published_date": datetime.utcnow(),
-                                        "updated_at": datetime.utcnow(),
-                                    }},
-                                )
-                                print(f"🗑️ Marked stale Outstand draft as published (404) | draft_id={draft['id']}")
-                        continue  # Never re-publish a draft already handed to Outstand
+                        import re as _re
+                        _is_fb_direct_id = bool(_re.match(r'^\d+_\d+$', str(existing_post_id)))
+                        if _is_fb_direct_id:
+                            # This is a Facebook Graph API post ID stored as platform_post_id.
+                            # The post already exists on Facebook — mark as published so this
+                            # draft stops cycling through the cron.
+                            await db["content_drafts"].update_one(
+                                {"id": draft["id"]},
+                                {"$set": {
+                                    "status": "published",
+                                    "published_date": datetime.utcnow(),
+                                    "updated_at": datetime.utcnow(),
+                                }},
+                            )
+                            published_count += 1
+                            print(f"✅ Facebook direct post confirmed live | draft_id={draft['id']} fb_post_id={existing_post_id}")
+                        else:
+                            # Outstand post ID — poll Outstand for confirmation
+                            try:
+                                from app.agents.social_media_manager.services.outstand_service import OutstandService
+                                outstand = OutstandService()
+                                post_data = await outstand.get_post(existing_post_id)
+                                post = post_data.get("post", {})
+                                if post.get("publishedAt") and not post.get("isDraft"):
+                                    await db["content_drafts"].update_one(
+                                        {"id": draft["id"]},
+                                        {"$set": {
+                                            "status": "published",
+                                            "published_date": datetime.utcnow(),
+                                            "updated_at": datetime.utcnow(),
+                                        }},
+                                    )
+                                    published_count += 1
+                                    print(f"✅ Outstand-scheduled post confirmed published | draft_id={draft['id']} post_id={existing_post_id}")
+                                else:
+                                    print(f"⏳ Outstand post not yet published | draft_id={draft['id']} post_id={existing_post_id}")
+                            except Exception as e:
+                                print(f"⚠️ Could not poll Outstand for draft_id={draft['id']}: {e}")
+                                # 404 = post no longer exists in Outstand; mark published to stop retry loop.
+                                if "404" in str(e):
+                                    await db["content_drafts"].update_one(
+                                        {"id": draft["id"]},
+                                        {"$set": {
+                                            "status": "published",
+                                            "published_date": datetime.utcnow(),
+                                            "updated_at": datetime.utcnow(),
+                                        }},
+                                    )
+                                    print(f"🗑️ Marked stale Outstand draft as published (404) | draft_id={draft['id']}")
+                        continue  # Never re-publish a draft that already has a post_id
 
                     # Atomically claim this draft before publishing to prevent concurrent cron
                     # runs from double-publishing the same post.  If another worker already
