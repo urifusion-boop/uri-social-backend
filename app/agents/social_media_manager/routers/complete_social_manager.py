@@ -2760,6 +2760,31 @@ async def get_performance(
 
             # Strategy 2: Outstand-published post — get what Outstand has (likes/comments)
             if live_result is None and post_id and is_outstand_post and not str(post_id).startswith("urn:li:"):
+                # Pre-check: if Outstand says the post failed to publish, skip analytics
+                # and mark the result so the frontend can surface the failure.
+                try:
+                    post_status_data = await outstand.get_post(post_id)
+                    outstand_post = post_status_data.get("post", {})
+                    _outstand_containers = outstand_post.get("socialAccounts") or []
+                    _any_failed = any(c.get("status") == "failed" for c in _outstand_containers)
+                    if _any_failed and not outstand_post.get("publishedAt"):
+                        _err = next((c.get("error") for c in _outstand_containers if c.get("status") == "failed"), "")
+                        print(f"[Outstand] post {post_id} failed to publish: {_err[:120]}")
+                        return {
+                            "draft_id": draft.get("id"),
+                            "platform_post_id": post_id,
+                            "platform": platform,
+                            "content_preview": (draft.get("content") or "")[:120],
+                            "published_at": draft.get("published_date", ""),
+                            "image_url": draft.get("image_url"),
+                            "likes": 0, "comments": 0, "shares": 0,
+                            "views": 0, "impressions": 0, "reach": 0,
+                            "engagement_rate": None,
+                            "publish_failed": True,
+                            "publish_error": _err[:200] if _err else "Post failed to publish",
+                        }
+                except Exception:
+                    pass  # non-critical — continue to analytics fetch
                 try:
                     data = await outstand.get_post_analytics(post_id)
                     agg = data.get("aggregated_metrics") or {}
