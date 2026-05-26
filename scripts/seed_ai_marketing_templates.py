@@ -19,7 +19,7 @@ from app.core.config import settings
 from app.models.ai_prompt_template import PromptTemplate, PromptSection
 
 
-async def seed_templates():
+async def seed_templates(db):
     """Seed default AI marketing image templates"""
 
     print("🌱 Seeding AI Marketing Image Templates...")
@@ -373,29 +373,48 @@ async def seed_templates():
     ]
 
     # Insert or update templates
+    from datetime import datetime
+    collection = db["ai_prompt_templates"]
+
     for template_data in templates:
         template_id = template_data["template_id"]
 
+        # Convert PromptSection objects to dicts
+        sections_data = [{"name": s.name, "content": s.content} for s in template_data["sections"]]
+
+        # Prepare document for MongoDB
+        doc = {
+            "template_id": template_data["template_id"],
+            "name": template_data["name"],
+            "description": template_data["description"],
+            "category": template_data["category"],
+            "default_aspect_ratio": template_data["default_aspect_ratio"],
+            "default_size": template_data["default_size"],
+            "variables": template_data["variables"],
+            "sections": sections_data,
+            "example_images": [],
+            "is_active": True,
+            "is_premium": False,
+            "usage_count": 0,
+            "workspace_id": None,
+            "created_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow(),
+        }
+
         # Check if template already exists
-        existing = await PromptTemplate.find_one({"template_id": template_id})
+        existing = await collection.find_one({"template_id": template_id})
 
         if existing:
             print(f"   ↻ Updating template: {template_data['name']}")
             # Update existing template
-            existing.name = template_data["name"]
-            existing.description = template_data["description"]
-            existing.category = template_data["category"]
-            existing.default_aspect_ratio = template_data["default_aspect_ratio"]
-            existing.default_size = template_data["default_size"]
-            existing.variables = template_data["variables"]
-            existing.sections = template_data["sections"]
-            existing.updated_at = datetime.utcnow()
-            await existing.save()
+            await collection.update_one(
+                {"template_id": template_id},
+                {"$set": {**doc, "updated_at": datetime.utcnow()}}
+            )
         else:
             print(f"   ✨ Creating template: {template_data['name']}")
             # Create new template
-            template = PromptTemplate(**template_data)
-            await template.save()
+            await collection.insert_one(doc)
 
     print("\n✅ AI Marketing Image Templates seeded successfully!")
     print(f"   Total templates: {len(templates)}")
@@ -404,12 +423,16 @@ async def seed_templates():
 async def main():
     """Main execution"""
     from datetime import datetime
+    import app.database as db_module
 
     # Connect to MongoDB
     connect_to_mongo(settings.MONGODB_DB)
 
+    # Get database
+    db = db_module.client[settings.MONGODB_DB]
+
     try:
-        await seed_templates()
+        await seed_templates(db)
     except Exception as e:
         print(f"\n❌ Error seeding templates: {e}")
         import traceback
