@@ -207,6 +207,8 @@ class InstagramDirectService:
             print(f"✅ Re-hosted image URL (Cloudinary JPEG): {rehosted}")
             image_url = rehosted
 
+        import asyncio as _asyncio
+
         async with httpx.AsyncClient(timeout=60) as client:
             # Step 1 — create media container
             container_resp = await client.post(
@@ -218,56 +220,55 @@ class InstagramDirectService:
                 },
             )
             container_data = container_resp.json()
+            print(f"📦 Instagram container creation response: {container_data}")
             creation_id = container_data.get("id")
             if not creation_id:
                 error_msg = (container_data.get("error") or {}).get("message", str(container_data))
                 print(f"❌ Instagram media container failed: {container_data}")
                 return {"success": False, "error": f"Media container error: {error_msg}"}
 
-            # Step 1b — wait for container to finish processing (status_code = FINISHED)
-            # Instagram processes the image asynchronously; publishing before FINISHED
-            # causes error_subcode 2207027 ("Media is not ready to be published").
-            import asyncio as _asyncio
-            for attempt in range(24):  # poll up to ~120s (24 × 5s)
-                status_resp = await client.get(
-                    f"{GRAPH_BASE}/{creation_id}",
-                    params={"fields": "status_code,status_error", "access_token": page_access_token},
-                )
-                status_data = status_resp.json()
-                status_code = status_data.get("status_code", "")
-                if not status_code and "error" in status_data:
-                    err = status_data["error"]
-                    print(f"❌ Container status API error: {err}")
-                    return {"success": False, "error": f"Container status check failed: {err.get('message', str(err))}"}
-                print(f"⏳ Container {creation_id} status: {status_code!r} (attempt {attempt + 1}) | {status_data}")
-                if status_code == "FINISHED":
-                    break
-                if status_code == "ERROR":
-                    status_error = status_data.get("status_error") or {}
-                    return {"success": False, "error": f"Instagram container processing failed: {status_error}"}
-                await _asyncio.sleep(5)
-            else:
-                return {"success": False, "error": "Instagram container timed out waiting for FINISHED status."}
+            # Step 1b — give Instagram time to process the container.
+            # We intentionally skip polling GET /{container_id}?fields=status_code because
+            # that endpoint requires instagram_basic scope. Tokens connected via Facebook
+            # Page OAuth often have instagram_content_publish but not instagram_basic,
+            # causing Authorization Error (code 100, subcode 33) on every status poll.
+            # Instead we wait 10s then attempt publish, retrying up to 6× (60s total)
+            # if Instagram returns "Media is not ready" (error subcode 2207027).
+            print(f"⏳ Container {creation_id} created — waiting 10s for Instagram to process...")
+            await _asyncio.sleep(10)
 
-            # Step 2 — publish
-            publish_resp = await client.post(
-                f"{GRAPH_BASE}/{ig_user_id}/media_publish",
-                params={
-                    "creation_id": creation_id,
-                    "access_token": page_access_token,
-                },
-            )
-            publish_data = publish_resp.json()
-            post_id = publish_data.get("id")
-            if post_id:
-                print(f"✅ Instagram direct publish success: post_id={post_id}")
-            else:
-                print(f"❌ Instagram direct publish failed: {publish_data}")
-            return {
-                "success": bool(post_id),
-                "post_id": post_id,
-                "raw_response": publish_data,
-            }
+            # Step 2 — publish with retry on "media not ready"
+            for attempt in range(6):
+                publish_resp = await client.post(
+                    f"{GRAPH_BASE}/{ig_user_id}/media_publish",
+                    params={
+                        "creation_id": creation_id,
+                        "access_token": page_access_token,
+                    },
+                )
+                publish_data = publish_resp.json()
+                post_id = publish_data.get("id")
+                if post_id:
+                    print(f"✅ Instagram direct publish success: post_id={post_id} (attempt {attempt + 1})")
+                    return {"success": True, "post_id": post_id, "raw_response": publish_data}
+
+                err = publish_data.get("error") or {}
+                err_subcode = err.get("error_subcode") or err.get("error_data", {})
+                print(f"⚠️ Instagram publish attempt {attempt + 1} failed: {publish_data}")
+
+                # 2207027 = media not yet ready; retry after a short wait
+                if err.get("error_subcode") == 2207027 or "2207027" in str(publish_data):
+                    wait = 10 * (attempt + 1)
+                    print(f"⏳ Media not ready — retrying in {wait}s (attempt {attempt + 1}/6)")
+                    await _asyncio.sleep(wait)
+                    continue
+
+                # Any other error is not retriable
+                error_msg = err.get("message", str(publish_data))
+                return {"success": False, "error": f"Instagram publish failed: {error_msg}"}
+
+            print(f"❌ Instagram publish timed out after 6 attempts for container {creation_id}")
+            return {"success": False, "error": "Instagram media container was not ready after 60s. Try again."}
 
     @staticmethod
     async def publish_carousel(
