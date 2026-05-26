@@ -508,13 +508,16 @@ class ApprovalWorkflowService:
         """
         try:
             current_time = datetime.utcnow()
+            print(f"📅 publish_scheduled_content | starting at {current_time.isoformat()}")
 
             # Clean up stale "publishing" drafts (process crashed mid-publish > 10 min ago)
             stale_cutoff = current_time - timedelta(minutes=10)
-            await db["content_drafts"].update_many(
+            stale_result = await db["content_drafts"].update_many(
                 {"status": "publishing", "updated_at": {"$lte": stale_cutoff}},
                 {"$set": {"status": "scheduled", "updated_at": current_time}},
             )
+            if stale_result.modified_count:
+                print(f"⚠️ Stale cleanup: reset {stale_result.modified_count} 'publishing' drafts back to 'scheduled' (were stuck >10min)")
 
             # Only pick up drafts scheduled within the last 24 hours.
             # Anything older is stale test data or a genuine missed publish —
@@ -544,6 +547,8 @@ class ApprovalWorkflowService:
                 ]
             }).to_list(length=100)
 
+            print(f"📋 Found {len(scheduled_content)} candidate draft(s) | ids={[d.get('id') for d in scheduled_content]} statuses={[d.get('status') for d in scheduled_content]} platforms={[d.get('platform') for d in scheduled_content]} user_ids={[str(d.get('user_id'))[:8] for d in scheduled_content]} sched_dates={[str(d.get('scheduled_date'))[:16] for d in scheduled_content]} post_ids={[d.get('platform_post_id') for d in scheduled_content]}")
+
             if not scheduled_content:
                 return {"message": "No scheduled content to publish", "published": 0}
 
@@ -556,23 +561,28 @@ class ApprovalWorkflowService:
             _all_scheduled = [d for d in scheduled_content if d.get("status") == "scheduled"]
             _all_scheduled.sort(key=lambda d: d.get("created_at") or datetime.min, reverse=True)
             for _dup in _all_scheduled:
-                _key = (_dup.get("user_id"), _dup.get("platform"))
+                _key = (str(_dup.get("user_id")), _dup.get("platform"))
                 if _key in _seen_platform_user:
-                    _to_cancel.append(_dup["id"])
+                    _to_cancel.append(_dup.get("id"))
                 else:
-                    _seen_platform_user[_key] = _dup["id"]
+                    _seen_platform_user[_key] = _dup.get("id")
             if _to_cancel:
-                await db["content_drafts"].update_many(
-                    {"id": {"$in": _to_cancel}},
-                    {"$set": {
-                        "status": "replaced",
-                        "error_message": "Superseded by a newer draft for the same platform.",
-                        "updated_at": current_time,
-                    }},
-                )
-                print(f"🗑️ Cancelled {len(_to_cancel)} duplicate drafts (kept newest per platform): {_to_cancel}")
+                # Filter out None IDs before cancelling to avoid matching unindexed docs
+                valid_cancel_ids = [i for i in _to_cancel if i is not None]
+                if valid_cancel_ids:
+                    await db["content_drafts"].update_many(
+                        {"id": {"$in": valid_cancel_ids}},
+                        {"$set": {
+                            "status": "replaced",
+                            "error_message": "Superseded by a newer draft for the same platform.",
+                            "updated_at": current_time,
+                        }},
+                    )
+                print(f"🗑️ Cancelled {len(valid_cancel_ids)} duplicate drafts (kept newest per platform): {valid_cancel_ids}")
                 _cancel_set = set(_to_cancel)
                 scheduled_content = [d for d in scheduled_content if d.get("id") not in _cancel_set]
+
+            print(f"✅ After dedup: {len(scheduled_content)} draft(s) to process | ids={[d.get('id') for d in scheduled_content]}")
 
             published_count = 0
             errors = []
@@ -620,6 +630,7 @@ class ApprovalWorkflowService:
                     # Atomically claim this draft before publishing to prevent concurrent cron
                     # runs from double-publishing the same post.  If another worker already
                     # claimed it (status changed to "publishing"), skip and move on.
+                    print(f"🔒 Claiming draft {draft.get('id')} | current status={draft.get('status')} platform={draft.get('platform')} user_id={draft.get('user_id')} sched={draft.get('scheduled_date')}")
                     claimed = await db["content_drafts"].find_one_and_update(
                         {"id": draft["id"], "status": "scheduled"},
                         {"$set": {"status": "publishing", "updated_at": datetime.utcnow()}},
@@ -627,6 +638,7 @@ class ApprovalWorkflowService:
                     if not claimed:
                         print(f"⏭️ Draft {draft['id']} already claimed by another cron run — skipping")
                         continue
+                    print(f"✅ Claimed draft {draft.get('id')} — proceeding to publish")
 
                     # Use user_id stored directly on the draft
                     draft_user_id = draft.get("user_id")
@@ -705,8 +717,9 @@ class ApprovalWorkflowService:
                         {"id": connection["id"]} if connection.get("id")
                         else {"user_id": draft_user_id, "outstand_account_id": connection.get("outstand_account_id")}
                     )
+                    print(f"📊 Publish result for draft {draft.get('id')}: success={publish_result.get('success')} post_id={publish_result.get('post_id')} error={publish_result.get('error')}")
                     if publish_result.get("success"):
-                        await db["content_drafts"].update_one(
+                        update_res = await db["content_drafts"].update_one(
                             {"id": draft["id"]},
                             {"$set": {
                                 "status": "published",
@@ -717,6 +730,7 @@ class ApprovalWorkflowService:
                                 "updated_at": datetime.utcnow(),
                             }},
                         )
+                        print(f"💾 Status→published update | draft={draft.get('id')} matched={update_res.matched_count} modified={update_res.modified_count}")
                         await db["social_connections"].update_one(conn_filter, {"$inc": {"total_posts_published": 1}})
                         published_count += 1
 
