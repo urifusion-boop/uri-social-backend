@@ -602,6 +602,7 @@ async def generate_plan(
     days: List[Dict[str, Any]] = []
 
     # ── AI generation (always used — grounded in trend + performance signals) ─
+    _ai_error: Optional[str] = None
     try:
         if trend_keywords or performance.get("has_data"):
             generation_method = "data_driven" if performance.get("has_data") else "trend_driven"
@@ -613,7 +614,9 @@ async def generate_plan(
             force=force,
         )
     except Exception as exc:
-        print(f"[Calendar] AI generation failed: {exc}")
+        import traceback as _tb
+        _ai_error = str(exc)
+        print(f"[Calendar] AI generation failed: {exc}\n{_tb.format_exc()}")
         ai_ideas = []
 
     for i, idea in enumerate(ai_ideas):
@@ -664,7 +667,8 @@ async def generate_plan(
         if restored:
             restored.pop("_id", None)
             return restored
-        raise RuntimeError("Content generation failed and no previous plan to restore. Please try again.")
+        reason = f" Cause: {_ai_error}" if _ai_error else ""
+        raise RuntimeError(f"Content generation failed and no previous plan to restore.{reason}")
 
     plan_id = str(uuid.uuid4())
     doc = {
