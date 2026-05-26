@@ -84,13 +84,7 @@ async def get_template(
     if not template:
         raise HTTPException(status_code=404, detail=f"Template '{template_id}' not found")
 
-    return {
-        **template.to_dict(),
-        "sections": [
-            {"name": section.name, "content": section.content}
-            for section in template.sections
-        ]
-    }
+    return template
 
 
 @router.post("/generate")

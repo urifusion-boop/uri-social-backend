@@ -3,7 +3,8 @@
 import re
 from typing import Dict, List, Any, Optional
 from datetime import datetime
-from app.models.ai_prompt_template import PromptTemplate, AIImageGeneration, PromptSection
+from bson import ObjectId
+from app.database import get_db
 from app.agents.social_media_manager.services.image_content_service import ImageContentService
 
 
@@ -32,6 +33,9 @@ class AIMarketingImageService:
         Returns:
             List of template dictionaries
         """
+        db = get_db()
+        collection = db["ai_prompt_templates"]
+
         query = {"is_active": True}
 
         if category:
@@ -46,24 +50,40 @@ class AIMarketingImageService:
         if is_premium is not None:
             query["is_premium"] = is_premium
 
-        templates = await PromptTemplate.find(query).to_list()
-        return [template.to_dict() for template in templates]
+        cursor = collection.find(query)
+        templates = await cursor.to_list(length=None)
+
+        # Convert ObjectId to string for JSON serialization
+        for template in templates:
+            if "_id" in template:
+                template["id"] = str(template["_id"])
+                del template["_id"]
+
+        return templates
 
     @staticmethod
-    async def get_template(template_id: str) -> Optional[PromptTemplate]:
+    async def get_template(template_id: str) -> Optional[Dict[str, Any]]:
         """Get a specific template by ID"""
-        return await PromptTemplate.find_one({"template_id": template_id, "is_active": True})
+        db = get_db()
+        collection = db["ai_prompt_templates"]
+        template = await collection.find_one({"template_id": template_id, "is_active": True})
+
+        if template and "_id" in template:
+            template["id"] = str(template["_id"])
+            del template["_id"]
+
+        return template
 
     @staticmethod
     def build_prompt_from_template(
-        template: PromptTemplate,
+        template: Dict[str, Any],
         variables: Dict[str, str]
     ) -> str:
         """
         Build complete AI prompt from template and variable replacements
 
         Args:
-            template: PromptTemplate document
+            template: Template dictionary
             variables: Dict of variable replacements
                       e.g., {"PRODUCT_NAME": "URISocial SDK", "BRAND": "URISocial"}
 
@@ -73,12 +93,12 @@ class AIMarketingImageService:
         prompt_parts = []
 
         # Build prompt from sections
-        for section in template.sections:
+        for section in template.get("sections", []):
             # Add section header
-            prompt_parts.append(f"{section.name}:")
+            prompt_parts.append(f"{section['name']}:")
 
             # Add section content
-            for line in section.content:
+            for line in section.get("content", []):
                 prompt_parts.append(line)
 
             # Add spacing between sections
@@ -162,24 +182,31 @@ class AIMarketingImageService:
         prompt = AIMarketingImageService.build_prompt_from_template(template, variables)
 
         # Determine size
-        final_aspect_ratio = aspect_ratio or template.default_aspect_ratio
+        final_aspect_ratio = aspect_ratio or template.get("default_aspect_ratio", "1:1")
         size = AIMarketingImageService.convert_aspect_ratio_to_size(final_aspect_ratio)
 
         # Create generation record
-        generation = AIImageGeneration(
-            user_id=user_id,
-            workspace_id=workspace_id,
-            template_id=template_id,
-            template_name=template.name,
-            prompt=prompt,
-            variables=variables,
-            size=size,
-            aspect_ratio=final_aspect_ratio,
-            status="pending",
-            provider="dall-e-3",
-            model="dall-e-3",
-        )
-        await generation.save()
+        db = get_db()
+        generations_collection = db["ai_image_generations"]
+
+        generation_doc = {
+            "user_id": user_id,
+            "workspace_id": workspace_id,
+            "template_id": template_id,
+            "template_name": template.get("name"),
+            "prompt": prompt,
+            "variables": variables,
+            "size": size,
+            "aspect_ratio": final_aspect_ratio,
+            "status": "pending",
+            "provider": "dall-e-3",
+            "model": "dall-e-3",
+            "cost_credits": 0,
+            "cost_usd": 0.0,
+            "created_at": datetime.utcnow(),
+        }
+        result_insert = await generations_collection.insert_one(generation_doc)
+        generation_id = result_insert.inserted_id
 
         try:
             # Call existing DALL-E service (reuses existing integration)
@@ -190,59 +217,73 @@ class AIMarketingImageService:
             )
 
             if result.get("success"):
-                # Update generation record with success
-                generation.status = "completed"
-                generation.dalle_url = result.get("url")
-                generation.image_url = result.get("url")  # Can be uploaded to Cloudinary later
-
                 # Calculate generation time
                 end_time = datetime.utcnow()
-                generation.generation_time_ms = int((end_time - start_time).total_seconds() * 1000)
+                generation_time_ms = int((end_time - start_time).total_seconds() * 1000)
 
                 # Track cost (DALL-E 3 standard pricing)
-                if size == "1024x1024":
-                    generation.cost_usd = 0.04
-                else:  # 1024x1792 or 1792x1024
-                    generation.cost_usd = 0.08
+                cost_usd = 0.04 if size == "1024x1024" else 0.08
+
+                # Update generation record with success
+                await generations_collection.update_one(
+                    {"_id": generation_id},
+                    {"$set": {
+                        "status": "completed",
+                        "dalle_url": result.get("url"),
+                        "image_url": result.get("url"),
+                        "generation_time_ms": generation_time_ms,
+                        "cost_usd": cost_usd,
+                    }}
+                )
 
                 # Update template usage count
-                await PromptTemplate.find_one({"template_id": template_id}).update(
+                templates_collection = db["ai_prompt_templates"]
+                await templates_collection.update_one(
+                    {"template_id": template_id},
                     {"$inc": {"usage_count": 1}}
                 )
 
-                await generation.save()
-
                 return {
                     "success": True,
-                    "generation_id": str(generation.id),
-                    "image_url": generation.image_url,
+                    "generation_id": str(generation_id),
+                    "image_url": result.get("url"),
+                    "dalle_url": result.get("url"),
                     "prompt": prompt,
-                    "template_name": template.name,
+                    "template_name": template.get("name"),
                     "size": size,
                     "aspect_ratio": final_aspect_ratio,
+                    "status": "completed",
                 }
             else:
                 # Update generation record with failure
-                generation.status = "failed"
-                generation.error_message = result.get("error", "Unknown error")
-                await generation.save()
+                await generations_collection.update_one(
+                    {"_id": generation_id},
+                    {"$set": {
+                        "status": "failed",
+                        "error_message": result.get("error", "Unknown error"),
+                    }}
+                )
 
                 return {
                     "success": False,
                     "error": result.get("error", "Image generation failed"),
-                    "generation_id": str(generation.id),
+                    "generation_id": str(generation_id),
                 }
 
         except Exception as e:
             # Update generation record with error
-            generation.status = "failed"
-            generation.error_message = str(e)
-            await generation.save()
+            await generations_collection.update_one(
+                {"_id": generation_id},
+                {"$set": {
+                    "status": "failed",
+                    "error_message": str(e),
+                }}
+            )
 
             return {
                 "success": False,
                 "error": f"Generation error: {str(e)}",
-                "generation_id": str(generation.id),
+                "generation_id": str(generation_id),
             }
 
     @staticmethod
@@ -252,20 +293,30 @@ class AIMarketingImageService:
         limit: int = 50
     ) -> List[Dict[str, Any]]:
         """Get user's generation history"""
+        db = get_db()
+        collection = db["ai_image_generations"]
+
         query = {"user_id": user_id}
         if workspace_id:
             query["workspace_id"] = workspace_id
 
-        generations = await AIImageGeneration.find(query) \
-            .sort([("created_at", -1)]) \
-            .limit(limit) \
-            .to_list()
+        cursor = collection.find(query).sort("created_at", -1).limit(limit)
+        generations = await cursor.to_list(length=limit)
 
-        return [gen.to_dict() for gen in generations]
+        # Convert ObjectId to string
+        for gen in generations:
+            if "_id" in gen:
+                gen["id"] = str(gen["_id"])
+                del gen["_id"]
+
+        return generations
 
     @staticmethod
     async def get_generation_stats(user_id: str) -> Dict[str, Any]:
         """Get user's generation statistics"""
+        db = get_db()
+        collection = db["ai_image_generations"]
+
         pipeline = [
             {"$match": {"user_id": user_id}},
             {"$group": {
@@ -278,7 +329,8 @@ class AIMarketingImageService:
             }}
         ]
 
-        result = await AIImageGeneration.aggregate(pipeline).to_list()
+        cursor = collection.aggregate(pipeline)
+        result = await cursor.to_list(length=1)
 
         if result:
             stats = result[0]
