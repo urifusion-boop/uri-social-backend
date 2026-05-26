@@ -23,6 +23,7 @@ async def seed_templates(db):
     """Seed default AI marketing image templates"""
 
     print("🌱 Seeding AI Marketing Image Templates...")
+    print(f"   Database: {db.name}")
 
     templates = [
         # Template 1: Modern Doodle Collage
