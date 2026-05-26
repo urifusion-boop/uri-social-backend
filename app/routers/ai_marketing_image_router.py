@@ -178,7 +178,10 @@ async def list_categories(
 
     Returns a list of unique categories for filtering templates.
     """
-    from app.models.ai_prompt_template import PromptTemplate
+    from app.database import get_db
+
+    db = get_db()
+    collection = db["ai_prompt_templates"]
 
     # Get distinct categories
     pipeline = [
@@ -187,7 +190,8 @@ async def list_categories(
         {"$sort": {"_id": 1}}
     ]
 
-    results = await PromptTemplate.aggregate(pipeline).to_list()
+    cursor = collection.aggregate(pipeline)
+    results = await cursor.to_list(length=None)
 
     categories = [
         {"category": r["_id"], "template_count": r["count"]}
