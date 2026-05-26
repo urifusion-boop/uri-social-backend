@@ -1304,9 +1304,25 @@ class ApprovalWorkflowService:
                 print(f"❌ LinkedIn direct publish failed: {e}")
                 return {"success": False, "error": f"LinkedIn direct publish failed: {str(e)}"}
 
-        # ── Facebook direct OAuth — defer scheduled posts to cron ────────────
+        # ── Facebook direct OAuth — scheduled → Outstand, publish now → direct ──
         if platform == "facebook" and connection.get("connected_via") == "facebook_direct_oauth":
-            pass  # fall through to the legacy Facebook block below
+            if scheduled_datetime and db is not None:
+                # Route scheduled posts through Outstand to avoid the duplicate-publish
+                # loop caused by FB Graph API post IDs being polled as Outstand IDs.
+                _fb_user_id = connection.get("user_id")
+                _fb_outstand_conn = await db["social_connections"].find_one({
+                    "user_id": _fb_user_id,
+                    "platform": "facebook",
+                    "connected_via": "outstand",
+                    "connection_status": "active",
+                })
+                if _fb_outstand_conn and _fb_outstand_conn.get("outstand_account_id"):
+                    print(f"📅 FB scheduled → routing via Outstand (account_id={_fb_outstand_conn['outstand_account_id']})")
+                    connection = _fb_outstand_conn
+                    # fall through to Outstand block below
+                else:
+                    print(f"⚠️ FB scheduled — no Outstand Facebook connection found, falling back to direct FB API")
+                    # fall through to legacy Facebook block below
 
         # ── Outstand-connected accounts ───────────────────────────────────────
         if connection.get("connected_via") == "outstand":
