@@ -1693,6 +1693,272 @@ STYLES: Dict[str, Dict[str, Any]] = {
             "QUALITY: 4K, ultra-realistic, street photography, authentic commercial aesthetic."
         ),
     },
+
+    # ══════════════════════════════════════════════════════════════
+    # MARKETING TEMPLATES (Professional AI-Generated Prompt Templates)
+    # ══════════════════════════════════════════════════════════════
+
+    "modern_doodle_collage": {
+        "name": "Modern Doodle Collage",
+        "description": "Editorial fashion poster with playful doodle graphics and minimalist product focus",
+        "industry_tags": ["fashion_ecommerce", "beauty_wellness", "general_other"],
+        "style_type": "marketing_template",
+        "template_category": "editorial",
+        "composition_mode": "editorial",
+        "prompt_fragment": (
+            "FORMAT:\n"
+            "Square or 4:5 social media poster. Minimalist editorial composition with a human model in a dynamic fashion pose interacting with [PRODUCT_NAME]. "
+            "The layout is split into three visual zones: top (playful doodle graphics), middle (human model + product), bottom (clean text space).\n\n"
+
+            "STYLE:\n"
+            "Modern editorial fashion meets playful collage. The aesthetic blends minimalist product photography with hand-drawn doodle overlays — "
+            "think illustrated stars, arrows, squiggles, and abstract shapes floating around the model and product. The doodles add personality without overwhelming the composition.\n\n"
+
+            "COMPOSITION:\n"
+            "• Top 25%: Abstract doodle elements (stars, arrows, circles) in accent colors — playful but not chaotic\n"
+            "• Middle 50%: Human model in a confident, natural pose holding or wearing [PRODUCT_NAME]. The model should look editorial but relatable. "
+            "Product is clearly visible and well-lit. Background is a solid soft color (cream, light grey, or pastel)\n"
+            "• Bottom 25%: Clean text space with plenty of breathing room. Simple bold typography for headline or tagline\n\n"
+
+            "MODEL:\n"
+            "A diverse, fashionable human model in casual-chic attire (neutral tones to not compete with product). Natural, confident expression. "
+            "The model is interacting with [PRODUCT_NAME] — holding it, wearing it, or showcasing it in a lifestyle context. Pose is dynamic but not overly stylized.\n\n"
+
+            "TYPOGRAPHY:\n"
+            "Bold sans-serif headline at the bottom in a single accent color (pulled from product or doodles). Text is large, legible, and has space around it. "
+            "Optional: Small subtext in lighter weight.\n\n"
+
+            "COLOR PALETTE:\n"
+            "Base: Soft neutral background (cream, off-white, light grey, blush pink)\n"
+            "Accent: 1-2 vibrant colors for doodles and text (coral, teal, mustard yellow, or bold red)\n"
+            "Product colors should pop against the neutral base\n\n"
+
+            "LIGHTING:\n"
+            "Soft, even editorial lighting. No harsh shadows. The model and product should be well-lit with a slight halo effect to make them stand out from the background.\n\n"
+
+            "MOOD:\n"
+            "Fresh, approachable, editorial, playful, confident. It feels like a high-end fashion campaign but with personality and warmth.\n\n"
+
+            "QUALITY:\n"
+            "High-resolution, clean lines, polished but not overly retouched. Doodles should look intentional and hand-drawn (not clipart).\n\n"
+
+            "FINAL RENDER:\n"
+            "A balanced composition where the human model and [PRODUCT_NAME] are the clear heroes, framed by playful doodle accents and clean typography. "
+            "The result is scroll-stopping, shareable, and perfectly suited for Instagram feed or stories."
+        ),
+    },
+
+    "minimalist_editorial": {
+        "name": "Minimalist Editorial",
+        "description": "Clean luxury aesthetic with bold typography and sophisticated product showcase",
+        "industry_tags": ["fashion_ecommerce", "beauty_wellness", "luxury_brands"],
+        "style_type": "marketing_template",
+        "template_category": "editorial",
+        "composition_mode": "editorial",
+        "prompt_fragment": (
+            "FORMAT:\n"
+            "Square or 4:5 Instagram post. High-end editorial layout with extreme minimalism. The focus is on [PRODUCT_NAME] as the singular hero, "
+            "supported by bold typography and abundant negative space.\n\n"
+
+            "STYLE:\n"
+            "Ultra-minimalist luxury editorial. Think high-fashion magazine spreads — clean, sophisticated, with an almost architectural precision. "
+            "Every element is intentional. The aesthetic is expensive, refined, and confidence-inducing.\n\n"
+
+            "COMPOSITION:\n"
+            "• Top 30%: Bold, oversized typography (brand name or product headline) in a modern serif or sans-serif. Text is aligned left or centered with lots of breathing room\n"
+            "• Middle 40%: [PRODUCT_NAME] shot in pristine detail against a solid background (pure white, soft grey, or muted pastel). "
+            "The product is lit dramatically to create subtle shadows and depth. It sits slightly off-center for visual interest\n"
+            "• Bottom 30%: Clean space with optional tagline in small, refined type. Minimal text — let the product speak\n\n"
+
+            "MODEL:\n"
+            "No human model. This is pure product-focused editorial. [PRODUCT_NAME] is the star, captured in sharp detail with perfect lighting and angles.\n\n"
+
+            "TYPOGRAPHY:\n"
+            "Bold, oversized headline in a luxury typeface (modern serif like Playfair Display or clean sans like Helvetica Neue). "
+            "Text is large, confident, and takes up significant visual space. Color is typically black, charcoal, or a muted accent color.\n\n"
+
+            "COLOR PALETTE:\n"
+            "Monochromatic or duo-tone:\n"
+            "• Background: Pure white, soft grey, cream, or muted pastel (blush, sage, powder blue)\n"
+            "• Product: Natural product colors, but overall palette is restrained and cohesive\n"
+            "• Typography: Black, charcoal, or a single muted accent color\n\n"
+
+            "LIGHTING:\n"
+            "Studio lighting with dramatic contrast. The product should have defined shadows that add depth without being harsh. "
+            "Think luxury product photography — clean, controlled, with a sense of dimension.\n\n"
+
+            "MOOD:\n"
+            "Luxurious, confident, sophisticated, expensive, editorial, aspirational. This is for brands that want to feel premium and high-end.\n\n"
+
+            "QUALITY:\n"
+            "Ultra-high resolution. Razor-sharp product detail. Flawless execution. Every pixel is intentional.\n\n"
+
+            "FINAL RENDER:\n"
+            "A striking, museum-quality image where [PRODUCT_NAME] is elevated to art. Bold typography commands attention, while negative space creates breathing room. "
+            "The result is unmistakably premium and scroll-stopping."
+        ),
+    },
+
+    "drink_splash": {
+        "name": "Drink Splash",
+        "description": "High-energy beverage photography with dramatic liquid motion and vibrant colors",
+        "industry_tags": ["food_beverage", "general_other"],
+        "style_type": "marketing_template",
+        "template_category": "beverage",
+        "composition_mode": "product_focus",
+        "prompt_fragment": (
+            "FORMAT:\n"
+            "Square or 4:5 social media post. High-energy commercial product shot optimized for beverage brands. "
+            "The composition is centered, dynamic, and designed to stop the scroll.\n\n"
+
+            "STYLE:\n"
+            "High-energy commercial beverage photography. Think Red Bull, Coca-Cola, or craft beer campaigns — vibrant, fresh, and full of motion. "
+            "The aesthetic is polished but energetic, with a focus on freshness, flavor, and movement.\n\n"
+
+            "COMPOSITION:\n"
+            "• Center: [PRODUCT_NAME] (bottle, can, or glass) is the clear hero, positioned dead center or slightly off-center for dynamic tension\n"
+            "• Foreground: Dramatic liquid splash frozen mid-motion — droplets flying, liquid arcing through the air. "
+            "The splash should feel powerful but not chaotic. It frames the product without obscuring it\n"
+            "• Background: Solid vibrant color or gradient that complements the drink (electric blue, citrus orange, lime green, deep red). "
+            "The background is clean and allows the product and splash to pop\n"
+            "• Optional garnish: Fresh fruit slices (lemon, lime, orange, berries) floating near the splash or at the base of the product\n\n"
+
+            "MODEL:\n"
+            "No human model. This is pure product and motion. [PRODUCT_NAME] is the star, supported by the liquid splash and color.\n\n"
+
+            "TYPOGRAPHY:\n"
+            "Optional: Bold product name or tagline at the top or bottom in a modern, punchy typeface. Text should be minimal and not compete with the splash. "
+            "Color is typically white or a bright accent that contrasts with the background.\n\n"
+
+            "COLOR PALETTE:\n"
+            "Vibrant and high-contrast:\n"
+            "• Background: Bold, saturated color (electric blue, bright orange, lime green, deep magenta, or gradient)\n"
+            "• Product: Natural product colors (label, liquid color)\n"
+            "• Splash: Clear or tinted to match the drink (water, juice, soda bubbles)\n"
+            "• Garnish: Natural fruit colors for added freshness\n\n"
+
+            "LIGHTING:\n"
+            "High-speed studio lighting to freeze the splash in perfect detail. Dramatic backlighting or side lighting creates highlights on the droplets and product. "
+            "The lighting should make the liquid glisten and the product label sharp and readable.\n\n"
+
+            "MOOD:\n"
+            "Energetic, refreshing, bold, dynamic, thirst-quenching. This is for brands that want to convey freshness, flavor, and excitement.\n\n"
+
+            "QUALITY:\n"
+            "Ultra-high resolution. Razor-sharp details on droplets, splash motion, and product label. High-speed capture aesthetic — every droplet is crisp.\n\n"
+
+            "FINAL RENDER:\n"
+            "A jaw-dropping action shot where [PRODUCT_NAME] is surrounded by a dramatic liquid splash that feels alive. "
+            "Vibrant colors, sharp details, and dynamic motion create an image that screams refreshment and energy. Perfect for social feeds, ads, or hero banners."
+        ),
+    },
+
+    "food_trust_builder": {
+        "name": "Food Trust Builder",
+        "description": "Authentic farm-to-table aesthetic with natural ingredients and transparent sourcing story",
+        "industry_tags": ["food_beverage", "health_wellness", "organic_natural"],
+        "style_type": "marketing_template",
+        "template_category": "food",
+        "composition_mode": "lifestyle",
+        "prompt_fragment": (
+            "FORMAT:\n"
+            "4:5 or square Instagram post. Authentic, trust-building food photography designed for brands that prioritize transparency, quality ingredients, and ethical sourcing. "
+            "The composition tells a story of craftsmanship and care.\n\n"
+
+            "STYLE:\n"
+            "Farm-to-table meets artisanal food photography. The aesthetic is warm, natural, and honest — think farmers market, rustic kitchens, and handcrafted food. "
+            "It feels real, not overly styled. The goal is to build trust and convey quality.\n\n"
+
+            "COMPOSITION:\n"
+            "• Center: [PRODUCT_NAME] (packaged food product or prepared dish) is the hero, placed on a natural surface (wood table, marble counter, linen cloth)\n"
+            "• Surrounding context: Raw ingredients that go into the product are arranged around it — fresh vegetables, grains, herbs, spices. "
+            "These ingredients tell the sourcing story and emphasize quality\n"
+            "• Props: Natural, minimal props — wooden bowls, ceramic dishes, fresh herbs, burlap, twine. Props should support, not distract\n"
+            "• Layout: Flat lay or 45-degree angle. Ingredients are arranged in a natural, unforced way with space between elements\n\n"
+
+            "MODEL:\n"
+            "Optional: Human hands in the frame — preparing food, holding ingredients, or arranging the product. Hands should look real and diverse (not stock photo perfect). "
+            "If no hands, the composition is purely product + ingredients.\n\n"
+
+            "TYPOGRAPHY:\n"
+            "Optional: Small, handwritten-style text overlay with key messaging — 'Made with [ingredient]', 'Farm Fresh', 'No Preservatives', '100% Organic'. "
+            "Text is subtle, transparent, and placed in negative space. Typically white or soft black.\n\n"
+
+            "COLOR PALETTE:\n"
+            "Warm, natural, earthy:\n"
+            "• Base: Natural wood tones, cream, linen whites, soft greys\n"
+            "• Ingredients: Vibrant natural colors — greens (herbs, vegetables), reds (tomatoes, peppers), golden yellows (grains, oils)\n"
+            "• Product: Natural packaging colors (kraft paper, earth tones, or brand colors that feel organic)\n\n"
+
+            "LIGHTING:\n"
+            "Soft natural window light from the side or above. Gentle shadows that add depth without being harsh. The lighting should feel like morning sunlight in a kitchen — "
+            "warm, inviting, and honest.\n\n"
+
+            "MOOD:\n"
+            "Trustworthy, authentic, wholesome, transparent, artisanal, farm-fresh, honest. This is for brands that want to emphasize quality, sourcing, and care.\n\n"
+
+            "QUALITY:\n"
+            "High resolution but not overly polished. Textures should be visible — wood grain, fabric weave, herb details. The aesthetic is 'real food, real ingredients'.\n\n"
+
+            "FINAL RENDER:\n"
+            "A warm, inviting image where [PRODUCT_NAME] is surrounded by the raw ingredients and context that tell its story. "
+            "The viewer immediately understands the quality, sourcing, and care behind the product. Perfect for organic brands, artisanal food companies, and transparency-focused marketing."
+        ),
+    },
+
+    "hyperpop_perspective": {
+        "name": "Hyperpop Perspective",
+        "description": "Bold ultra-saturated aesthetic with dramatic angles and Gen-Z energy",
+        "industry_tags": ["fashion_ecommerce", "beauty_wellness", "tech_innovation", "general_other"],
+        "style_type": "marketing_template",
+        "template_category": "ecommerce",
+        "composition_mode": "creative",
+        "prompt_fragment": (
+            "FORMAT:\n"
+            "4:5 or 9:16 vertical social post. Ultra-modern, hyper-saturated product photography designed for Gen-Z and bold brands. "
+            "The composition is dramatic, colorful, and unmistakably attention-grabbing.\n\n"
+
+            "STYLE:\n"
+            "Hyperpop meets maximalist product photography. Think neon-soaked, high-contrast, ultra-vibrant aesthetics inspired by cyberpunk, Y2K nostalgia, and digital art. "
+            "The vibe is bold, confident, and designed to stop thumbs mid-scroll.\n\n"
+
+            "COMPOSITION:\n"
+            "• Center-stage: [PRODUCT_NAME] is shot from a dramatic low angle or tilted perspective (Dutch angle). "
+            "The product feels larger-than-life and powerful\n"
+            "• Background: Vibrant gradient or solid neon color (electric pink, cyan blue, acid green, sunset orange). "
+            "Background can include subtle geometric shapes, gradients, or light streaks for added energy\n"
+            "• Lighting effects: Neon glows, lens flares, light streaks, or holographic reflections around the product. These effects add dimension and futuristic energy\n"
+            "• Foreground elements: Optional floating geometric shapes (spheres, cubes, rings) in complementary neon colors to frame the product\n\n"
+
+            "MODEL:\n"
+            "Optional: If human presence is needed, include a Gen-Z model with bold style (colorful hair, statement makeup, futuristic accessories). "
+            "Model is secondary to the product and shot from dramatic angles. If no model, the product is the sole hero.\n\n"
+
+            "TYPOGRAPHY:\n"
+            "Bold, futuristic typeface (think techno, cyberpunk, or ultra-bold sans). Text is large, layered, and colorful — often with gradient fills, glows, or 3D effects. "
+            "Headline sits at top or bottom with high contrast against the background.\n\n"
+
+            "COLOR PALETTE:\n"
+            "Ultra-saturated and high-contrast:\n"
+            "• Background: Neon gradients (pink-to-blue, orange-to-purple, green-to-cyan) or solid neon colors\n"
+            "• Product: Natural product colors, but the lighting and effects make it pop with neon highlights\n"
+            "• Accents: Electric blue, hot pink, acid green, cyber yellow, magenta, holographic reflections\n\n"
+
+            "LIGHTING:\n"
+            "Dramatic, high-contrast lighting with neon accent lights. The product is backlit or side-lit to create glowing edges (rim lighting). "
+            "Lens flares, light leaks, and glows are intentional and add to the futuristic aesthetic.\n\n"
+
+            "MOOD:\n"
+            "Bold, energetic, futuristic, confident, rebellious, hyper-modern. This is for brands targeting Gen-Z, gaming culture, or anyone wanting to make a loud statement.\n\n"
+
+            "QUALITY:\n"
+            "Ultra-high resolution with intentional digital effects. Colors are pumped to maximum saturation. Details are sharp, but the aesthetic embraces digital maximalism.\n\n"
+
+            "FINAL RENDER:\n"
+            "A visually explosive image where [PRODUCT_NAME] dominates the frame with dramatic angles, neon colors, and futuristic energy. "
+            "The result is impossible to ignore — perfect for bold brands, hype drops, and Gen-Z-focused campaigns."
+        ),
+    },
 }
 
 

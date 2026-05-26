@@ -47,6 +47,48 @@ class ImageContentService:
     }
 
     @staticmethod
+    def inject_brand_variables(prompt_fragment: str, brand_context: Dict[str, Any]) -> str:
+        """
+        Replace template variables like [PRODUCT_NAME], [BRAND], [SERVICE] with actual brand data.
+
+        Args:
+            prompt_fragment: Template prompt with placeholders
+            brand_context: Brand context dictionary with brand data
+
+        Returns:
+            Prompt with variables replaced
+        """
+        # Get brand data
+        brand_name = brand_context.get("brand_name", "the product")
+        products = brand_context.get("key_products_services", [])
+
+        # Replace [PRODUCT_NAME] or [PRODUCT] with first product/service
+        if products and ("[PRODUCT" in prompt_fragment.upper()):
+            product_name = products[0]
+            # Replace various product placeholder formats
+            prompt_fragment = prompt_fragment.replace("[PRODUCT_NAME]", product_name)
+            prompt_fragment = prompt_fragment.replace("[Product_Name]", product_name)
+            prompt_fragment = prompt_fragment.replace("[PRODUCT]", product_name)
+            prompt_fragment = prompt_fragment.replace("[Product]", product_name)
+            prompt_fragment = prompt_fragment.replace("[SERVICE]", product_name)
+            prompt_fragment = prompt_fragment.replace("[Service]", product_name)
+        elif "[PRODUCT" in prompt_fragment.upper():
+            # Fallback if no products defined
+            prompt_fragment = prompt_fragment.replace("[PRODUCT_NAME]", brand_name)
+            prompt_fragment = prompt_fragment.replace("[Product_Name]", brand_name)
+            prompt_fragment = prompt_fragment.replace("[PRODUCT]", brand_name)
+            prompt_fragment = prompt_fragment.replace("[Product]", brand_name)
+            prompt_fragment = prompt_fragment.replace("[SERVICE]", brand_name)
+            prompt_fragment = prompt_fragment.replace("[Service]", brand_name)
+
+        # Replace [BRAND] with brand name
+        if brand_name and "[BRAND]" in prompt_fragment:
+            prompt_fragment = prompt_fragment.replace("[BRAND]", brand_name)
+            prompt_fragment = prompt_fragment.replace("[Brand]", brand_name)
+
+        return prompt_fragment
+
+    @staticmethod
     async def check_reference_image_quality(image_url: str) -> Dict[str, Any]:
         """
         Quality gate for reference images (PRD Section 3: Quality Gate).
@@ -609,6 +651,10 @@ class ImageContentService:
 
             bc = brand_context or {}
             style_fragment = bc.get("style_prompt_fragment", "")
+
+            # Inject brand variables for marketing templates (replaces [PRODUCT_NAME], [BRAND], etc.)
+            if style_fragment:
+                style_fragment = ImageContentService.inject_brand_variables(style_fragment, bc)
 
             # Typography System: Prioritize custom font over library font
             if bc.get("custom_font_enabled"):
