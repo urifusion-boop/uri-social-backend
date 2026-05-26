@@ -2,6 +2,7 @@ fastapi==0.115.5
 posthog>=3.5.0
 uvicorn==0.32.0
 motor==3.6.0
+beanie>=1.26.0
 pydantic==2.10.2
 pydantic-settings==2.6.1
 openai>=2.0.0
