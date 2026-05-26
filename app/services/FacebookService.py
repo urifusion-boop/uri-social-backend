@@ -2,7 +2,7 @@
 Minimal FacebookService stub for the uri-agent.
 Only implements the two methods used by ApprovalWorkflowService.
 """
-import requests
+import httpx
 from http import HTTPStatus
 from typing import Any, Dict
 
@@ -19,7 +19,6 @@ class FacebookService:
         url = f"https://graph.facebook.com/{settings.FACEBOOK_API_VERSION}/{page_id}/feed"
         headers = {"Authorization": f"Bearer {access_token}"}
 
-        # Build payload from post_data dict
         payload: Dict[str, Any] = {
             "message": post_data.get("message", ""),
             "published": post_data.get("published", True),
@@ -30,14 +29,16 @@ class FacebookService:
             payload["scheduled_publish_time"] = post_data["scheduled_publish_time"]
 
         try:
-            response = requests.post(url, headers=headers, json=payload)
+            async with httpx.AsyncClient(timeout=60) as client:
+                response = await client.post(url, headers=headers, json=payload)
+            print(f"📘 FB post_on_facebook | status={response.status_code} body={response.text[:300]}")
             if response.status_code != HTTPStatus.OK:
                 return UriResponse.get_single_data_response(
                     "publish_post", None, code=response.status_code
                 )
             return UriResponse.create_response("publish_post", response.json())
         except Exception as e:
-            print(f"Error posting to Facebook: {e}")
+            print(f"❌ Error posting to Facebook: {e}")
             raise
 
     @staticmethod
@@ -51,7 +52,10 @@ class FacebookService:
         if payload.get("published"):
             payload.pop("scheduled_publish_time", None)
 
-        response = requests.post(url, headers=headers, json=payload)
+        async with httpx.AsyncClient(timeout=60) as client:
+            response = await client.post(url, headers=headers, json=payload)
+
+        print(f"📘 FB publish_post | status={response.status_code} body={response.text[:300]}")
 
         if response.status_code != HTTPStatus.OK:
             return UriResponse.get_single_data_response(
