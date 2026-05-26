@@ -113,8 +113,8 @@ class WorkspaceService:
     @staticmethod
     async def get_workspaces_by_client(
         client_id: str,
-        include_archived: bool = False,
-        db: AsyncIOMotorDatabase
+        db: AsyncIOMotorDatabase,
+        include_archived: bool = False
     ) -> List[Workspace]:
         """Get all workspaces for a client"""
         query = {"client_id": client_id}
@@ -345,8 +345,8 @@ class WorkspaceService:
     @staticmethod
     async def get_workspace_members(
         workspace_id: str,
-        include_inactive: bool = False,
-        db: AsyncIOMotorDatabase
+        db: AsyncIOMotorDatabase,
+        include_inactive: bool = False
     ) -> List[WorkspaceMember]:
         """Get all members of a workspace"""
         query = {"workspace_id": workspace_id}
