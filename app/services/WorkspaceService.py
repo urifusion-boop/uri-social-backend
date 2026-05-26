@@ -549,8 +549,8 @@ class WorkspaceService:
     async def increment_workspace_usage(
         workspace_id: str,
         metric: str,
-        amount: int = 1,
-        db: AsyncIOMotorDatabase
+        db: AsyncIOMotorDatabase,
+        amount: int = 1
     ) -> bool:
         """Increment workspace usage statistics"""
         metric_map = {
