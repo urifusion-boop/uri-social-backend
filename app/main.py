@@ -17,6 +17,10 @@ from app.routers.auth_router import router as auth_router
 from app.routers.billing_router import router as billing_router
 from app.routers.notification_router import router as notification_router
 from app.routers.bug_report_router import router as bug_report_router
+from app.routers.client_router import router as client_router
+from app.routers.workspace_router import router as workspace_router
+from app.routers.workspace_member_router import router as workspace_member_router
+from app.routers.ai_marketing_image_router import router as ai_marketing_image_router
 
 # Initialize Sentry
 initialize_sentry()
@@ -144,6 +148,18 @@ app.include_router(
 app.include_router(whatsapp_router)
 app.include_router(x_router)
 app.include_router(linkedin_router)
+
+# Include multi-tenant routers (Enterprise/SDK features)
+app.include_router(client_router)
+app.include_router(workspace_router)
+app.include_router(workspace_member_router)
+
+# Include AI Marketing Image router under /social-media prefix
+app.include_router(
+    ai_marketing_image_router,
+    prefix="/social-media",
+    tags=["AI Marketing Images"],
+)
 
 
 # Serve generated images directly from backend (avoids third-party CDN like imgBB)
