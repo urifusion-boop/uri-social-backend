@@ -2698,21 +2698,21 @@ async def get_performance(
                 return None
 
         async def _analytics_fallback(draft):
-            """Read stored content_analytics as fallback when live API isn't available."""
+            """Read stored content_analytics as fallback when live API isn't available.
+            Always returns a result (with 0s if no stored data) so every published post
+            is counted in the by_platform breakdown."""
             draft_id = draft.get("id")
             if not draft_id:
                 return None
             ana = await db["content_analytics"].find_one({"draft_id": draft_id})
-            if not ana:
-                return None
-            likes       = int(ana.get("likes", 0) or 0)
-            comments    = int(ana.get("comments", 0) or 0)
-            shares      = int(ana.get("shares", 0) or 0)
-            impressions = int(ana.get("impressions", 0) or 0)
-            views       = int(ana.get("views", 0) or 0)
-            reach       = int(ana.get("reach", 0) or 0)
+            likes       = int((ana or {}).get("likes", 0) or 0)
+            comments    = int((ana or {}).get("comments", 0) or 0)
+            shares      = int((ana or {}).get("shares", 0) or 0)
+            impressions = int((ana or {}).get("impressions", 0) or 0)
+            views       = int((ana or {}).get("views", 0) or 0)
+            reach       = int((ana or {}).get("reach", 0) or 0)
             effective   = impressions or reach or 0
-            platform    = ana.get("platform") or draft.get("platform", "unknown")
+            platform    = (ana or {}).get("platform") or draft.get("platform", "unknown")
             return {
                 "draft_id": draft_id,
                 "platform_post_id": draft.get("platform_post_id") or "",
