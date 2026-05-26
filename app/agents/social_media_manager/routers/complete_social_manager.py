@@ -587,6 +587,7 @@ async def facebook_direct_initiate(source: Optional[str] = Query("settings")):
     scopes = [
         "pages_show_list",
         "pages_read_engagement",
+        "pages_read_insights",
         "pages_manage_posts",
         "pages_manage_metadata",
     ]
