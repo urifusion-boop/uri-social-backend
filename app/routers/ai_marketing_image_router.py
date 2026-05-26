@@ -1,11 +1,12 @@
 # app/routers/ai_marketing_image_router.py
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Any
 from pydantic import BaseModel, Field
 
 from app.services.AIMarketingImageService import AIMarketingImageService
 from app.dependencies import get_current_workspace_context
+from app.domain.responses.uri_response import UriResponse
 
 
 router = APIRouter(prefix="/ai-marketing-images", tags=["AI Marketing Images"])
@@ -47,11 +48,11 @@ class TemplateResponse(BaseModel):
 
 
 # Endpoints
-@router.get("/templates", response_model=List[TemplateResponse])
+@router.get("/templates")
 async def list_templates(
     category: Optional[str] = Query(None, description="Filter by category"),
     current_context: dict = Depends(get_current_workspace_context)
-):
+) -> Dict[str, Any]:
     """
     List all available AI marketing image templates
 
@@ -66,14 +67,17 @@ async def list_templates(
         workspace_id=workspace_id
     )
 
-    return templates
+    return UriResponse.get_list_data_response(
+        entity_name="AI Marketing Template",
+        data=templates
+    )
 
 
 @router.get("/templates/{template_id}")
 async def get_template(
     template_id: str,
     current_context: dict = Depends(get_current_workspace_context)
-):
+) -> Dict[str, Any]:
     """
     Get details of a specific template
 
@@ -84,14 +88,17 @@ async def get_template(
     if not template:
         raise HTTPException(status_code=404, detail=f"Template '{template_id}' not found")
 
-    return template
+    return UriResponse.get_single_data_response(
+        entity_name="AI Marketing Template",
+        data=template
+    )
 
 
 @router.post("/generate")
 async def generate_image(
     request: GenerateImageRequest,
     current_context: dict = Depends(get_current_workspace_context)
-):
+) -> Dict[str, Any]:
     """
     Generate an AI marketing image using a template
 
@@ -117,15 +124,22 @@ async def generate_image(
             detail=result.get("error", "Image generation failed")
         )
 
-    return {
-        "success": True,
+    generation_data = {
         "generation_id": result["generation_id"],
         "image_url": result["image_url"],
+        "dalle_url": result.get("dalle_url"),
         "prompt": result["prompt"],
         "template_name": result["template_name"],
         "size": result["size"],
         "aspect_ratio": result["aspect_ratio"],
+        "status": result.get("status", "completed"),
     }
+
+    return UriResponse.create_response(
+        entity_name="AI Marketing Image",
+        data=generation_data,
+        message="Image generated successfully"
+    )
 
 
 @router.get("/generations")
