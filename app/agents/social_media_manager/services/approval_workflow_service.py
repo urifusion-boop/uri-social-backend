@@ -1304,11 +1304,13 @@ class ApprovalWorkflowService:
                 print(f"❌ LinkedIn direct publish failed: {e}")
                 return {"success": False, "error": f"LinkedIn direct publish failed: {str(e)}"}
 
-        # ── Facebook direct OAuth — scheduled → Outstand, publish now → direct ──
+        # ── Facebook direct OAuth — prefer Outstand if available ────────────────
+        # The cron always calls _publish_to_platform with scheduled_datetime=None,
+        # so we can't gate on scheduled_datetime. Always check for an Outstand FB
+        # connection first. Direct FB API post IDs (pageId_postId format) break the
+        # Outstand polling loop and cause 8x duplicate publishes.
         if platform == "facebook" and connection.get("connected_via") == "facebook_direct_oauth":
-            if scheduled_datetime and db is not None:
-                # Route scheduled posts through Outstand to avoid the duplicate-publish
-                # loop caused by FB Graph API post IDs being polled as Outstand IDs.
+            if db is not None:
                 _fb_user_id = connection.get("user_id")
                 _fb_outstand_conn = await db["social_connections"].find_one({
                     "user_id": _fb_user_id,
@@ -1317,11 +1319,11 @@ class ApprovalWorkflowService:
                     "connection_status": "active",
                 })
                 if _fb_outstand_conn and _fb_outstand_conn.get("outstand_account_id"):
-                    print(f"📅 FB scheduled → routing via Outstand (account_id={_fb_outstand_conn['outstand_account_id']})")
+                    print(f"📅 FB → routing via Outstand (account_id={_fb_outstand_conn['outstand_account_id']})")
                     connection = _fb_outstand_conn
                     # fall through to Outstand block below
                 else:
-                    print(f"⚠️ FB scheduled — no Outstand Facebook connection found, falling back to direct FB API")
+                    print(f"⚠️ FB — no Outstand Facebook connection found, using direct FB API")
                     # fall through to legacy Facebook block below
 
         # ── Outstand-connected accounts ───────────────────────────────────────
