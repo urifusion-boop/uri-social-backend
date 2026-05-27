@@ -522,9 +522,7 @@ class ApprovalWorkflowService:
             if stale_result.modified_count:
                 print(f"⚠️ Stale cleanup: reset {stale_result.modified_count} 'publishing' drafts back to 'scheduled' (were stuck >10min)")
 
-            # Only pick up drafts scheduled within the last 24 hours.
-            # Anything older is stale test data or a genuine missed publish —
-            # expire it so it doesn't flood the social accounts on re-deploy.
+            # Expire overdue scheduled drafts (>24h past due, not yet sent).
             earliest_allowed = current_time - timedelta(hours=24)
             expired_result = await db["content_drafts"].update_many(
                 {
@@ -536,6 +534,20 @@ class ApprovalWorkflowService:
             )
             if expired_result.modified_count:
                 print(f"⏰ Expired {expired_result.modified_count} overdue scheduled drafts (>24h past due)")
+
+            # Stop polling platform_post_id drafts that have been stuck in publish_failed
+            # for >48h — Outstand will never confirm them and they waste cron cycles.
+            stale_poll_cutoff = current_time - timedelta(hours=48)
+            stale_poll_result = await db["content_drafts"].update_many(
+                {
+                    "status": "publish_failed",
+                    "platform_post_id": {"$exists": True, "$ne": None},
+                    "updated_at": {"$lte": stale_poll_cutoff},
+                },
+                {"$set": {"status": "publish_failed", "platform_post_id": None, "error_message": "Post confirmation timed out (>48h). Re-schedule to retry.", "updated_at": current_time}},
+            )
+            if stale_poll_result.modified_count:
+                print(f"🧹 Cleared {stale_poll_result.modified_count} stale publish_failed drafts (>48h unconfirmed)")
 
             scheduled_content = await db["content_drafts"].find({
                 "$or": [
