@@ -1316,26 +1316,47 @@ class ApprovalWorkflowService:
                 print(f"❌ LinkedIn direct publish failed: {e}")
                 return {"success": False, "error": f"LinkedIn direct publish failed: {str(e)}"}
 
-        # ── Facebook direct OAuth — prefer Outstand if available ────────────────
-        # The cron always calls _publish_to_platform with scheduled_datetime=None,
-        # so we can't gate on scheduled_datetime. Always check for an Outstand FB
-        # connection first. Direct FB API post IDs (pageId_postId format) break the
-        # Outstand polling loop and cause 8x duplicate publishes.
+        # ── Facebook direct OAuth — always route through Outstand ────────────────
+        # Direct FB API post IDs (pageId_postId format) break the Outstand polling
+        # loop and cause 8x duplicate publishes. Always use Outstand for Facebook.
         if platform == "facebook" and connection.get("connected_via") == "facebook_direct_oauth":
             if db is not None:
                 _fb_user_id = connection.get("user_id")
+                # 1. Check DB for existing Outstand FB connection
                 _fb_outstand_conn = await db["social_connections"].find_one({
                     "user_id": _fb_user_id,
                     "platform": "facebook",
                     "connected_via": "outstand",
                     "connection_status": "active",
                 })
+                # 2. If not in DB, do a live lookup against Outstand API
+                if not (_fb_outstand_conn and _fb_outstand_conn.get("outstand_account_id")):
+                    try:
+                        from app.agents.social_media_manager.services.outstand_service import OutstandService as _OS, PLATFORM_TO_NETWORK as _PTN
+                        _os = _OS()
+                        _live = await _os.list_accounts(tenant_id=str(_fb_user_id), network="facebook")
+                        _accs = _live.get("data", [])
+                        if _accs:
+                            _acc = _accs[0]
+                            _fb_outstand_conn = {
+                                "user_id": _fb_user_id,
+                                "platform": "facebook",
+                                "outstand_account_id": _acc.get("id"),
+                                "connected_via": "outstand",
+                                "connection_status": "active",
+                            }
+                            print(f"📡 FB Outstand live-lookup found account: {_acc.get('id')}")
+                        else:
+                            print(f"⚠️ FB Outstand live-lookup: no Facebook accounts in Outstand for user {_fb_user_id}")
+                    except Exception as _os_err:
+                        print(f"⚠️ FB Outstand live-lookup failed: {_os_err}")
+
                 if _fb_outstand_conn and _fb_outstand_conn.get("outstand_account_id"):
                     print(f"📅 FB → routing via Outstand (account_id={_fb_outstand_conn['outstand_account_id']})")
                     connection = _fb_outstand_conn
                     # fall through to Outstand block below
                 else:
-                    print(f"⚠️ FB — no Outstand Facebook connection found, using direct FB API")
+                    print(f"⚠️ FB — no Outstand Facebook account found anywhere, falling back to direct FB API")
                     # fall through to legacy Facebook block below
 
         # ── Outstand-connected accounts ───────────────────────────────────────
