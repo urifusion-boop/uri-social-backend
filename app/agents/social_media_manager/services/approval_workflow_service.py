@@ -1171,6 +1171,46 @@ class ApprovalWorkflowService:
                 else:
                     return {"success": False, "error": "X API credits depleted and no Outstand X account connected as fallback."}
 
+        # ── Instagram: prefer Outstand if an Outstand IG account exists ─────
+        # If the stored connection is instagram_direct but Outstand also has an
+        # Instagram account for this user, route through Outstand instead so that
+        # scheduling, polling, and post confirmation all work correctly.
+        if platform == "instagram" and connection.get("connected_via") in (
+            "instagram_direct", "instagram_direct_oauth", "instagram_oauth", "instagram"
+        ) and db is not None:
+            _ig_user_id = connection.get("user_id")
+            _ig_outstand_conn = await db["social_connections"].find_one({
+                "user_id": _ig_user_id,
+                "platform": "instagram",
+                "connected_via": "outstand",
+                "connection_status": "active",
+            })
+            if not (_ig_outstand_conn and _ig_outstand_conn.get("outstand_account_id")):
+                try:
+                    from app.agents.social_media_manager.services.outstand_service import OutstandService as _OS
+                    _os = _OS()
+                    _live = await _os.list_accounts(tenant_id=str(_ig_user_id), network="instagram")
+                    _accs = _live.get("data", [])
+                    if _accs:
+                        _acc = _accs[0]
+                        _ig_outstand_conn = {
+                            "user_id": _ig_user_id,
+                            "platform": "instagram",
+                            "outstand_account_id": _acc.get("id"),
+                            "connected_via": "outstand",
+                            "connection_status": "active",
+                        }
+                        print(f"📡 Instagram Outstand live-lookup found account: {_acc.get('id')}")
+                    else:
+                        print(f"⚠️ Instagram Outstand live-lookup: no Instagram accounts in Outstand for user {_ig_user_id}")
+                except Exception as _ig_os_err:
+                    print(f"⚠️ Instagram Outstand live-lookup failed: {_ig_os_err}")
+            if _ig_outstand_conn and _ig_outstand_conn.get("outstand_account_id"):
+                print(f"📸 Instagram → routing via Outstand (account_id={_ig_outstand_conn['outstand_account_id']})")
+                connection = _ig_outstand_conn
+            else:
+                print(f"⚠️ Instagram — no Outstand account found, falling back to direct Graph API")
+
         # ── Instagram direct (via Facebook Page Access Token) ────────────────
         # Credential-first: if ig_user_id + page_access_token are present, use the
         # direct Graph API path regardless of how connected_via is stored.
