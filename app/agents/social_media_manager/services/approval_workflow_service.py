@@ -511,12 +511,13 @@ class ApprovalWorkflowService:
             print(f"📅 publish_scheduled_content | starting at {current_time.isoformat()}")
 
             # Clean up stale "publishing" drafts (process crashed mid-publish > 10 min ago).
-            # Also clear platform_post_id so the draft re-enters the direct-publish path
-            # instead of being misidentified as an Outstand post.
+            # Do NOT clear platform_post_id here — if a post_id was already stored (step 1
+            # of the two-phase status update below), the condition-3/4 "confirmed live"
+            # detection will mark the draft published on the next cron run without re-publishing.
             stale_cutoff = current_time - timedelta(minutes=10)
             stale_result = await db["content_drafts"].update_many(
                 {"status": "publishing", "updated_at": {"$lte": stale_cutoff}},
-                {"$set": {"status": "scheduled", "platform_post_id": None, "updated_at": current_time}},
+                {"$set": {"status": "scheduled", "updated_at": current_time}},
             )
             if stale_result.modified_count:
                 print(f"⚠️ Stale cleanup: reset {stale_result.modified_count} 'publishing' drafts back to 'scheduled' (were stuck >10min)")
@@ -740,12 +741,23 @@ class ApprovalWorkflowService:
                     )
                     print(f"📊 Publish result for draft {draft.get('id')}: success={publish_result.get('success')} post_id={publish_result.get('post_id')} error={publish_result.get('error')}")
                     if publish_result.get("success"):
+                        _post_id = publish_result.get("post_id")
+                        # Phase 1: persist post_id while draft is still "publishing".
+                        # If phase 2 hangs and the stale cleanup later resets status back
+                        # to "scheduled", the post_id survives and the confirmed-live
+                        # detection on the next cron run marks it published — no re-publish.
+                        if _post_id:
+                            await db["content_drafts"].update_one(
+                                {"id": draft["id"]},
+                                {"$set": {"platform_post_id": _post_id, "updated_at": datetime.utcnow()}},
+                            )
+                        # Phase 2: mark as published
                         update_res = await db["content_drafts"].update_one(
                             {"id": draft["id"]},
                             {"$set": {
                                 "status": "published",
                                 "published_date": datetime.utcnow(),
-                                "platform_post_id": publish_result.get("post_id"),
+                                "platform_post_id": _post_id,
                                 "outstand_post_status": publish_result.get("outstand_status", "queued"),
                                 "publish_response": publish_result.get("raw_response"),
                                 "updated_at": datetime.utcnow(),
