@@ -217,8 +217,10 @@ class SocialAccountService:
 
             # Auto-detect Instagram Business Accounts linked to connected Facebook Pages.
             # Page access tokens were captured server-side in get_pending_connection.
+            # Skip if Outstand already connected Instagram (its account takes priority for publishing).
             print(f"[Finalize] stored platforms: {[s['platform'] for s in stored]}")
-            if any(s["platform"] == "facebook" for s in stored):
+            _outstand_stored_instagram = any(s["platform"] == "instagram" for s in stored)
+            if any(s["platform"] == "facebook" for s in stored) and not _outstand_stored_instagram:
                 from .instagram_direct_service import InstagramDirectService
                 for page_id in selected_page_ids:
                     token_doc = await db["pending_page_tokens"].find_one(
@@ -261,7 +263,9 @@ class SocialAccountService:
                         "account_name": ig.get("name") or ig.get("username"),
                     })
                     print(f"✅ Instagram direct: @{ig.get('username')} (ig_user_id={ig['id']})")
-                await db["pending_page_tokens"].delete_many({"session_token": session_token})
+            elif _outstand_stored_instagram:
+                print(f"✅ Instagram already connected via Outstand — skipping instagram_direct detection")
+            await db["pending_page_tokens"].delete_many({"session_token": session_token})
 
             return UriResponse.get_single_data_response("accounts_connected", {
                 "user_id": user_id,
