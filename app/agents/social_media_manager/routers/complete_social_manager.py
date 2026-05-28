@@ -1782,7 +1782,11 @@ async def sync_image_across_drafts(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
     token: dict = Depends(JWTBearer()),
 ):
-    """Copy image_url from a source draft to one or more target drafts (same user only)."""
+    """
+    Copy images from a source draft to one or more target drafts (same user only).
+    For carousel drafts: syncs all slide image_urls (targets must have the same slide count).
+    For feed/story drafts: syncs the single image_url.
+    """
     user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
@@ -1791,26 +1795,59 @@ async def sync_image_across_drafts(
 
     source = await db["content_drafts"].find_one(
         {"id": request.source_draft_id, "user_id": user_id},
-        {"image_url": 1, "has_image": 1},
     )
     if not source:
         raise HTTPException(status_code=404, detail="Source draft not found")
 
-    image_url = source.get("image_url")
-    if not image_url:
-        raise HTTPException(status_code=422, detail="Source draft has no image yet")
-
     if not request.target_draft_ids:
         raise HTTPException(status_code=422, detail="No target draft IDs provided")
 
-    result = await db["content_drafts"].update_many(
-        {"id": {"$in": request.target_draft_ids}, "user_id": user_id},
-        {"$set": {"image_url": image_url, "has_image": True}},
-    )
+    is_carousel = source.get("post_type") == "carousel"
+    updated_count = 0
+    skipped = []
+
+    if is_carousel:
+        source_slides = source.get("slides") or []
+        if not source_slides or not any(s.get("image_url") for s in source_slides):
+            raise HTTPException(status_code=422, detail="Source carousel has no slide images yet")
+
+        source_image_urls = [s.get("image_url") for s in source_slides]
+
+        targets = await db["content_drafts"].find(
+            {"id": {"$in": request.target_draft_ids}, "user_id": user_id}
+        ).to_list(length=50)
+
+        for target in targets:
+            target_slides = target.get("slides") or []
+            if len(target_slides) != len(source_slides):
+                skipped.append({"id": target.get("id"), "reason": f"slide count mismatch ({len(target_slides)} vs {len(source_slides)})"})
+                continue
+
+            updated_slides = []
+            for i, slide in enumerate(target_slides):
+                updated_slides.append({**slide, "image_url": source_image_urls[i]})
+
+            await db["content_drafts"].update_one(
+                {"id": target.get("id"), "user_id": user_id},
+                {"$set": {"slides": updated_slides, "has_image": True, "updated_at": datetime.utcnow()}},
+            )
+            updated_count += 1
+    else:
+        image_url = source.get("image_url")
+        if not image_url:
+            raise HTTPException(status_code=422, detail="Source draft has no image yet")
+
+        result = await db["content_drafts"].update_many(
+            {"id": {"$in": request.target_draft_ids}, "user_id": user_id},
+            {"$set": {"image_url": image_url, "has_image": True, "updated_at": datetime.utcnow()}},
+        )
+        updated_count = result.modified_count
 
     return UriResponse.get_single_data_response("sync_image", {
-        "updated_count": result.modified_count,
+        "updated_count": updated_count,
         "source_draft_id": request.source_draft_id,
+        "is_carousel": is_carousel,
+        "skipped": skipped,
     })
 
 
