@@ -106,41 +106,7 @@ class SocialAccountService:
             raw_pages = pending_data.get("availablePages", [])
             print(f"[PendingConnection] raw availablePages: {raw_pages}")
 
-            # Store page access tokens server-side so finalize_connection can use
-            # them to auto-detect linked Instagram Business Accounts.
             augmented_pages = list(raw_pages)
-            if raw_pages and db is not None:
-                from .instagram_direct_service import InstagramDirectService
-                token_docs = []
-                for p in raw_pages:
-                    if not p.get("id") or not p.get("pageAccessToken"):
-                        print(f"[PendingConnection] ⚠️ Skipping page '{p.get('name')}' (id={p.get('id')}) — no pageAccessToken returned by Outstand. Instagram cannot be detected for this page.")
-                        continue
-                    token_docs.append({
-                        "session_token": session_token,
-                        "page_id": p["id"],
-                        "page_access_token": p["pageAccessToken"],
-                        "page_name": p.get("name", ""),
-                    })
-                    # Preview linked Instagram account for the selector UI
-                    print(f"[PendingConnection] 🔍 Checking Instagram for page '{p.get('name')}' (id={p.get('id')})")
-                    ig = await InstagramDirectService.get_instagram_account_from_page(
-                        p["id"], p["pageAccessToken"]
-                    )
-                    if ig:
-                        augmented_pages.append({
-                            "id": ig["id"],
-                            "name": ig.get("name") or ig.get("username"),
-                            "username": ig.get("username"),
-                            "type": "instagram_business_account",
-                            "network": "instagram",
-                            "profilePictureUrl": ig.get("profile_picture_url"),
-                            "auto_connect": True,
-                            "linked_page_id": p["id"],
-                        })
-                if token_docs:
-                    await db["pending_page_tokens"].delete_many({"session_token": session_token})
-                    await db["pending_page_tokens"].insert_many(token_docs)
 
             return UriResponse.get_single_data_response("pending_connection", {
                 "session_token": session_token,
@@ -215,56 +181,7 @@ class SocialAccountService:
                     "account_name": acc.get("nickname") or acc.get("username"),
                 })
 
-            # Auto-detect Instagram Business Accounts linked to connected Facebook Pages.
-            # Page access tokens were captured server-side in get_pending_connection.
-            # Skip if Outstand already connected Instagram (its account takes priority for publishing).
             print(f"[Finalize] stored platforms: {[s['platform'] for s in stored]}")
-            _outstand_stored_instagram = any(s["platform"] == "instagram" for s in stored)
-            if any(s["platform"] == "facebook" for s in stored) and not _outstand_stored_instagram:
-                from .instagram_direct_service import InstagramDirectService
-                for page_id in selected_page_ids:
-                    token_doc = await db["pending_page_tokens"].find_one(
-                        {"session_token": session_token, "page_id": page_id}
-                    )
-                    if not token_doc or not token_doc.get("page_access_token"):
-                        continue
-                    page_token = token_doc["page_access_token"]
-                    ig = await InstagramDirectService.get_instagram_account_from_page(page_id, page_token)
-                    if not ig:
-                        print(f"ℹ️ No Instagram Business Account linked to Facebook Page {page_id}")
-                        continue
-                    ig_doc = {
-                        "id": ig["id"],
-                        "user_id": user_id,
-                        "platform": "instagram",
-                        "connected_via": "instagram_direct",
-                        "ig_user_id": ig["id"],
-                        "page_id": page_id,
-                        "page_access_token": page_token,
-                        "username": ig.get("username"),
-                        "account_name": ig.get("name") or ig.get("username"),
-                        "profile_picture_url": ig.get("profile_picture_url"),
-                        "connection_status": "active",
-                        "connected_at": now,
-                        "updated_at": now,
-                    }
-                    # Delete any existing doc that could conflict on either the id_1 index
-                    # or the user+platform combination (stale docs from prior test runs).
-                    await db["social_connections"].delete_many({
-                        "$or": [
-                            {"id": ig["id"]},
-                            {"user_id": user_id, "platform": "instagram"},
-                        ]
-                    })
-                    await db["social_connections"].insert_one(ig_doc)
-                    stored.append({
-                        "platform": "instagram",
-                        "username": ig.get("username"),
-                        "account_name": ig.get("name") or ig.get("username"),
-                    })
-                    print(f"✅ Instagram direct: @{ig.get('username')} (ig_user_id={ig['id']})")
-            elif _outstand_stored_instagram:
-                print(f"✅ Instagram already connected via Outstand — skipping instagram_direct detection")
             await db["pending_page_tokens"].delete_many({"session_token": session_token})
 
             return UriResponse.get_single_data_response("accounts_connected", {

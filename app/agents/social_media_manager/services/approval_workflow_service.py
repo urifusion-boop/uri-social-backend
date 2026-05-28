@@ -167,10 +167,7 @@ class ApprovalWorkflowService:
                 except Exception as e:
                     errors.append({"draft_id": draft_id, "error": str(e)})
 
-            # ── Immediate publish only ────────────────────────────────────────
-            # Scheduled posts are owned entirely by the cron job (publish_scheduled_content).
-            # We do NOT call _trigger_immediate_publishing for them — that was the source of
-            # the double-publish race and the confusing "deferred to cron" no-op calls.
+            # ── Immediate publish ────────────────────────────────────────────────
             if schedule_option == "immediate" and approved_drafts:
                 publish_results = await ApprovalWorkflowService._trigger_immediate_publishing(
                     db, user_id, [d["draft_id"] for d in approved_drafts],
@@ -180,6 +177,32 @@ class ApprovalWorkflowService:
                     draft_result = publish_results.get(draft["draft_id"])
                     if draft_result:
                         draft["publish_result"] = draft_result
+
+            # ── Outstand native scheduling ───────────────────────────────────────
+            # For Outstand-connected platforms, submit to Outstand NOW with scheduledAt
+            # so Outstand handles the timed release. The cron polls using the returned
+            # post_id to confirm when Outstand marks it published.
+            # Non-Outstand platforms (LinkedIn, X) keep status=scheduled and are
+            # published by the cron when scheduled_date arrives.
+            elif schedule_option == "schedule" and approved_drafts:
+                _schedule_dt = scheduled_datetime or (datetime.utcnow() + timedelta(hours=1))
+                for _d in approved_drafts:
+                    try:
+                        _conn = await db["social_connections"].find_one({
+                            "user_id": user_id,
+                            "platform": _d["platform"],
+                            "connection_status": "active",
+                            "connected_via": "outstand",
+                        })
+                        if _conn:
+                            print(f"📅 Outstand native schedule | draft_id={_d['draft_id']} platform={_d['platform']} at={_schedule_dt.isoformat()}")
+                            _res = await ApprovalWorkflowService._trigger_immediate_publishing(
+                                db, user_id, [_d["draft_id"]],
+                                scheduled_datetime=_schedule_dt,
+                            )
+                            _d["publish_result"] = _res.get(_d["draft_id"])
+                    except Exception as _se:
+                        print(f"⚠️ Outstand schedule submission failed for draft_id={_d['draft_id']}: {_se}")
             
             return UriResponse.get_single_data_response("content_approval", {
                 "approved_drafts": approved_drafts,
@@ -1499,8 +1522,19 @@ class ApprovalWorkflowService:
                                 {"$set": {"image_url": public_image_url, "updated_at": datetime.utcnow()}},
                             )
                     else:
-                        # Re-upload WebP images since Facebook/Instagram don't support WebP
-                        if image_url.lower().endswith(".webp"):
+                        # Re-upload WebP images since Outstand/Facebook don't support WebP.
+                        # Fast path: Cloudinary serves any uploaded WebP as JPEG by swapping
+                        # the extension — no download/re-upload needed.
+                        if image_url.lower().endswith(".webp") and "res.cloudinary.com" in image_url:
+                            jpeg_url = image_url[:-5] + ".jpg"
+                            print(f"🔄 WebP → JPEG via Cloudinary URL rewrite: {jpeg_url}")
+                            media_urls = [jpeg_url]
+                            if db is not None:
+                                await db["content_drafts"].update_one(
+                                    {"id": draft["id"]},
+                                    {"$set": {"image_url": jpeg_url, "updated_at": datetime.utcnow()}},
+                                )
+                        elif image_url.lower().endswith(".webp"):
                             print(f"🔄 Cached image is WebP — re-uploading as JPEG for social platform compatibility")
                             try:
                                 import base64
@@ -1517,10 +1551,11 @@ class ApprovalWorkflowService:
                                 converted_url = await ApprovalWorkflowService._upload_base64_to_imgbb(fake_data_url)
                                 if converted_url:
                                     media_urls = [converted_url]
-                                    await db["content_drafts"].update_one(
-                                        {"id": draft["id"]},
-                                        {"$set": {"image_url": converted_url, "updated_at": datetime.utcnow()}},
-                                    )
+                                    if db is not None:
+                                        await db["content_drafts"].update_one(
+                                            {"id": draft["id"]},
+                                            {"$set": {"image_url": converted_url, "updated_at": datetime.utcnow()}},
+                                        )
                                 else:
                                     media_urls = [image_url]
                             except Exception as webp_err:
