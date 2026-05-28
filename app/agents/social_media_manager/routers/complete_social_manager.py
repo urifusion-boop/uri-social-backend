@@ -2945,6 +2945,20 @@ async def get_performance(
 
         # Aggregate summary
         def _sum(key): return sum(p.get(key, 0) or 0 for p in posts)
+
+        def _build_insights_note(post_list):
+            platforms = {p.get("platform") for p in post_list}
+            if platforms == {"linkedin"} or platforms == {"linkedin", None}:
+                return (
+                    "LinkedIn's standard API does not provide impressions or engagement stats "
+                    "for personal profiles. Upgrade to LinkedIn Marketing API for full analytics."
+                )
+            if "instagram" in platforms:
+                return (
+                    "Impressions and reach require an Instagram Business or Creator account. "
+                    "Go to Instagram → Profile → Edit Profile → Switch to Professional Account."
+                )
+            return "Analytics will appear here once your posts have been live for at least 24 hours."
         total_posts = len(posts)
         insights_available = any(p.get("insights_available") or (p.get("impressions") or 0) > 0 for p in posts)
         summary = {
@@ -2959,10 +2973,7 @@ async def get_performance(
                 sum(p.get("engagement_rate", 0) or 0 for p in posts) / total_posts, 2
             ) if total_posts else 0,
             "insights_available": insights_available,
-            "insights_note": None if insights_available else (
-                "Impressions and reach require an Instagram Business or Creator account. "
-                "Go to Instagram → Profile → Edit Profile → Switch to Professional Account to unlock full analytics."
-            ),
+            "insights_note": None if insights_available else _build_insights_note(posts),
         }
 
         # Per-platform breakdown
