@@ -758,10 +758,13 @@ class ApprovalWorkflowService:
                             print(f"❌ Outstand fallback lookup failed for scheduled post: {e}")
 
                     if not connection:
-                        errors.append({
-                            "draft_id": draft["id"],
-                            "error": f"No active connection for {draft['platform']}",
-                        })
+                        err_msg = f"No active {draft['platform']} account connected. Reconnect in Settings → Connected Accounts."
+                        errors.append({"draft_id": draft["id"], "error": err_msg})
+                        await db["content_drafts"].update_one(
+                            {"id": draft["id"]},
+                            {"$set": {"status": "publish_failed", "error_message": err_msg, "updated_at": datetime.utcnow()}},
+                        )
+                        print(f"❌ No connection for draft {draft['id']} ({draft['platform']}) — marked publish_failed")
                         continue
 
                     print(f"🕐 Publishing scheduled post | draft_id={draft['id']} platform={draft['platform']} connected_via={connection.get('connected_via')} user_id={draft_user_id}")
