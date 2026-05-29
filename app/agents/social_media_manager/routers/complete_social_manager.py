@@ -3070,8 +3070,12 @@ async def get_account_metrics(
         since_ts = int((datetime.utcnow() - timedelta(days=days)).timestamp())
 
         # ── Outstand accounts ─────────────────────────────────────────────────
-        result = await outstand.list_accounts(tenant_id=user_id)
-        outstand_accounts = result.get("data", [])
+        try:
+            result = await outstand.list_accounts(tenant_id=user_id)
+            outstand_accounts = result.get("data", [])
+        except Exception as _os_err:
+            print(f"⚠️ Outstand list_accounts failed in account-metrics (non-fatal): {_os_err}")
+            outstand_accounts = []
 
         async def _fetch_outstand_metrics(acc):
             account_id = acc.get("id")
