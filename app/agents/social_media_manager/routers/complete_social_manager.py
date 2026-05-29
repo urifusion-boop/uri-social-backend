@@ -5021,11 +5021,9 @@ _AGENT_SYSTEM_PROMPT = """You are URI Agent, the built-in AI assistant for URI S
 - If you don't know something specific about their account, say so honestly.
 
 ## Response format
-Always respond with valid JSON in this exact shape:
-{
-  "reply": "<your plain-text reply to the user>",
-  "navigate": "<section key or null>"
-}
+Your ENTIRE response must be a single valid JSON object — no text before it, no text after it, no markdown fences.
+Return ONLY this raw JSON:
+{"reply": "<your plain-text reply>", "navigate": "<section key or null>"}
 
 Only set "navigate" when the user should be taken to a specific section. Set it to null otherwise.
 """
@@ -5098,11 +5096,23 @@ async def agent_chat(
 
         raw = result.choices[0].message.content.strip()
 
+        parsed = None
         try:
             parsed = json.loads(raw)
-            reply = parsed.get("reply", raw)
+        except json.JSONDecodeError:
+            # Model added preamble text before the JSON — find the object
+            import re
+            m = re.search(r'\{[\s\S]*?"reply"[\s\S]*?\}', raw)
+            if m:
+                try:
+                    parsed = json.loads(m.group())
+                except json.JSONDecodeError:
+                    pass
+
+        if parsed:
+            reply = parsed.get("reply") or raw
             navigate = parsed.get("navigate") or None
-        except (json.JSONDecodeError, AttributeError):
+        else:
             reply = raw
             navigate = None
 
