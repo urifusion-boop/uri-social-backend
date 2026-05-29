@@ -1312,7 +1312,11 @@ class ApprovalWorkflowService:
                 )
 
         # ── LinkedIn direct (OAuth 2.0) ───────────────────────────────────────
-        if platform == "linkedin" and connection.get("connected_via") == "linkedin_direct":
+        # Also match when connected_via is unset/unexpected but the connection has a token —
+        # guards against stale "outstand" entries that got upserted over the direct connection.
+        _li_has_token = bool(connection.get("linkedin_access_token") or connection.get("access_token"))
+        _li_has_urn = bool(connection.get("person_urn") or connection.get("active_author_urn"))
+        if platform == "linkedin" and (connection.get("connected_via") == "linkedin_direct" or (_li_has_token and _li_has_urn)):
             from app.agents.social_media_manager.services.linkedin_direct_service import LinkedInDirectService
             token = connection.get("linkedin_access_token") or connection.get("access_token")
             urn = connection.get("person_urn") or connection.get("active_author_urn")
