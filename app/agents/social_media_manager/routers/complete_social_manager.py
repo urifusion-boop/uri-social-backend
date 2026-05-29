@@ -4971,3 +4971,156 @@ async def get_blog_draft(
         print(f"❌ Error fetching blog draft {draft_id}: {str(e)}")
         traceback.print_exc()
         return UriResponse.error_response(f"Failed to fetch blog draft: {str(e)}")
+
+
+# ---------------------------------------------------------------------------
+# URI Agent chat — in-app assistant
+# ---------------------------------------------------------------------------
+
+_AGENT_SYSTEM_PROMPT = """You are URI Agent, the built-in AI assistant for URI Social — a social media management platform. You help users navigate the platform, understand features, troubleshoot issues, and get the most out of the product.
+
+## Platform sections (use these exact keys when returning a navigate action)
+- "workspace"     → URI Agent chat (current section)
+- "schedule"      → Posting Schedule — drafts waiting for review, scheduled posts, content calendar
+- "performance"   → Performance — post analytics, engagement metrics, reach per platform
+- "intel"         → Market Intel — competitor analysis, trending topics, audience insights
+- "playbook"      → Brand Playbook — tone of voice, brand colours, content guidelines
+- "blog"          → Blog Generator — AI-generated long-form blog posts
+- "blog-drafts"   → Blog Drafts — saved and published blog posts
+- "connections"   → Connected Accounts — connect/disconnect Facebook, Instagram, WhatsApp, LinkedIn
+- "settings"      → Settings — account settings, approval workflow, auto-scheduling preferences
+- "billing"       → Billing — subscription plans, credits, payment history
+- "notifications" → Notifications — activity feed and alerts
+
+## Key features to know
+- **Content generation**: Users describe a topic/campaign and URI generates posts for all connected platforms simultaneously. Posts appear in Posting Schedule → Needs Review.
+- **Platforms supported**: Instagram (feed, carousel, story), Facebook (feed, carousel), WhatsApp, LinkedIn. Twitter/X is coming soon.
+- **Approval workflow**: "Auto-approve" publishes immediately; "Manual review" sends drafts to Needs Review first. Configurable in Settings.
+- **Scheduling**: Pick a date/time per post. The cron job publishes every 5 minutes — posts go live within 5 min of their scheduled time.
+- **Images**: Generate AI images per post. Instagram requires an image to publish. Carousel posts have per-slide images.
+- **Sync images**: When multiple carousel drafts have the same slide count, you can sync images from one platform to the others.
+- **Connected Accounts**: Facebook uses Outstand OAuth; Instagram uses Meta direct OAuth. They connect independently.
+- **Credits**: Each content generation costs 1 credit. Credits can be topped up in Billing.
+- **Blog Generator**: Generates long-form SEO blog posts separately from social posts.
+- **Brand Playbook**: Stores brand voice, tone, colours, and audience — used to personalise generated content.
+- **Market Intel**: Shows trending topics and competitor post analysis for your industry.
+- **Auto-scheduling**: URI Agent can auto-generate and schedule posts on a recurring basis. Configure in Settings.
+
+## Common issues
+- "Instagram not publishing" → Check Connected Accounts. Instagram requires a Business/Creator account linked to a Facebook page.
+- "Post failed" → Check Connected Accounts to confirm the platform is still connected. Token may have expired — reconnect.
+- "No drafts showing" → Go to Posting Schedule. If approval is set to Auto-approve they appear in Scheduled, otherwise in Needs Review.
+- "Image not generating" → Images generate in the background after draft creation. Refresh the draft after ~30 seconds.
+- "Can't schedule" → Ensure the platform account is connected first. Then select drafts and click Schedule All.
+
+## Response rules
+- Be concise and friendly — 1-4 sentences max for simple questions.
+- When the answer involves navigating somewhere, always include a navigate action.
+- If the user wants to generate content, tell them to type their topic/campaign and you'll create it — do NOT navigate away.
+- Never make up features that don't exist.
+- If you don't know something specific about their account, say so honestly.
+
+## Response format
+Always respond with valid JSON in this exact shape:
+{
+  "reply": "<your plain-text reply to the user>",
+  "navigate": "<section key or null>"
+}
+
+Only set "navigate" when the user should be taken to a specific section. Set it to null otherwise.
+"""
+
+
+class AgentChatMessage(BaseModel):
+    role: str  # "user" or "assistant"
+    content: str
+
+
+class AgentChatRequest(BaseModel):
+    messages: List[AgentChatMessage]  # full conversation history, latest message last
+
+
+@router.get("/agent/chat/history")
+async def get_agent_chat_history(
+    token: dict = Depends(JWTBearer()),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """Return the last 100 persisted messages for this user."""
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    messages = await db["agent_chat_messages"].find(
+        {"user_id": user_id},
+        {"_id": 0, "user_id": 0},
+    ).sort("created_at", 1).to_list(length=100)
+
+    return UriResponse.get_list_data_response("agent_chat_history", messages)
+
+
+@router.delete("/agent/chat/history")
+async def clear_agent_chat_history(
+    token: dict = Depends(JWTBearer()),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """Archive (delete) the current conversation so the user starts fresh."""
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    await db["agent_chat_messages"].delete_many({"user_id": user_id})
+    return UriResponse.get_single_data_response("cleared", {"cleared": True})
+
+
+@router.post("/agent/chat")
+async def agent_chat(
+    request: AgentChatRequest,
+    token: dict = Depends(JWTBearer()),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """URI Agent in-app assistant — answers questions and navigates the user."""
+    from app.services.AIService import AIService
+    from app.domain.models.chat_model import ChatMessage, ChatModel
+
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    try:
+        messages = [ChatMessage(role="system", content=_AGENT_SYSTEM_PROMPT)]
+        for m in request.messages:
+            messages.append(ChatMessage(role=m.role, content=m.content))
+
+        result = await AIService.chat_completion(ChatModel(model="gpt-4o-mini", messages=messages, temperature=0.4))
+
+        if isinstance(result, dict) and "error" in result:
+            return UriResponse.error_response(result["error"])
+
+        raw = result.choices[0].message.content.strip()
+
+        try:
+            parsed = json.loads(raw)
+            reply = parsed.get("reply", raw)
+            navigate = parsed.get("navigate") or None
+        except (json.JSONDecodeError, AttributeError):
+            reply = raw
+            navigate = None
+
+        # Persist the latest user turn and the AI reply
+        user_msg = request.messages[-1] if request.messages else None
+        if user_msg:
+            now = datetime.utcnow()
+            await db["agent_chat_messages"].insert_many([
+                {"user_id": user_id, "role": "user", "content": user_msg.content, "created_at": now, "surface": "web"},
+                {"user_id": user_id, "role": "assistant", "content": reply, "created_at": now, "surface": "web"},
+            ])
+
+        return UriResponse.get_single_data_response("agent_chat", {
+            "reply": reply,
+            "navigate": navigate,
+        })
+
+    except Exception as e:
+        print(f"❌ agent_chat error: {e}")
+        traceback.print_exc()
+        return UriResponse.error_response("Agent is unavailable right now. Please try again.")
