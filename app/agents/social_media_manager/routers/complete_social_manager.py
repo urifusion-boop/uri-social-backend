@@ -1982,8 +1982,8 @@ async def get_scheduled_content(
 
         scheduled_drafts = await db["content_drafts"].find({
             "$or": [
-                {"user_id": user_id, "status": "scheduled"},
-                {"request_id": {"$in": request_ids}, "status": "scheduled"},
+                {"user_id": user_id, "status": {"$in": ["scheduled", "publish_failed"]}},
+                {"request_id": {"$in": request_ids}, "status": {"$in": ["scheduled", "publish_failed"]}},
             ]
         }).sort("scheduled_date", 1).to_list(length=100)
 

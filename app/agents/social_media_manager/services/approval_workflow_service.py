@@ -130,20 +130,22 @@ class ApprovalWorkflowService:
                                 errors.append({"draft_id": draft_id, "error": "Instagram carousel requires slides. Re-generate the post."})
                                 continue
 
-                        # Cancel ALL other in-flight drafts for this user+platform so the
-                        # cron never publishes stale/accumulated posts alongside this one.
-                        # Includes "publishing" so old Outstand submissions don't keep polling.
+                        # Cancel only "publishing"/"ready_to_publish" stuck states for this
+                        # user+platform — NOT already-scheduled posts for other dates.
+                        # Users should be able to queue multiple posts for different times.
+                        # The cron deduplicates at publish time; we only need to clear states
+                        # that indicate a post is actively in-flight right now.
                         cancel_result = await db["content_drafts"].update_many(
                             {
                                 "user_id": user_id,
                                 "platform": draft["platform"],
-                                "status": {"$in": ["scheduled", "publish_failed", "publishing", "ready_to_publish"]},
+                                "status": {"$in": ["publishing", "ready_to_publish"]},
                                 "id": {"$ne": draft_id},
                             },
                             {"$set": {"status": "replaced", "error_message": "Superseded by a newer scheduled post.", "updated_at": datetime.utcnow()}},
                         )
                         if cancel_result.modified_count:
-                            print(f"🗑️ Cancelled {cancel_result.modified_count} old {draft['platform']} drafts (all states) for user {user_id}")
+                            print(f"🗑️ Cancelled {cancel_result.modified_count} in-flight {draft['platform']} drafts for user {user_id}")
 
                         update_data["scheduled_date"] = scheduled_datetime or (datetime.utcnow() + timedelta(hours=1))
                         update_data["status"] = "scheduled"
