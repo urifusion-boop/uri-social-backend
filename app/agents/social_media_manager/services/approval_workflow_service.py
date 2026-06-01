@@ -120,10 +120,14 @@ class ApprovalWorkflowService:
                     
                     if schedule_option == "schedule":
                         # Validate before accepting — fail fast with a visible error.
-                        if draft.get("platform") == "instagram" and draft.get("post_type", "feed") != "text":
+                        if draft.get("platform") == "instagram" and draft.get("post_type", "feed") not in ("text", "carousel"):
                             raw_img = ApprovalWorkflowService._resolve_image_url(draft.get("image_url") or "")
                             if not raw_img:
                                 errors.append({"draft_id": draft_id, "error": "Instagram requires an image. Add one to this post before scheduling."})
+                                continue
+                        elif draft.get("platform") == "instagram" and draft.get("post_type") == "carousel":
+                            if not draft.get("slides"):
+                                errors.append({"draft_id": draft_id, "error": "Instagram carousel requires slides. Re-generate the post."})
                                 continue
 
                         # Cancel ALL other in-flight drafts for this user+platform so the
@@ -642,6 +646,10 @@ class ApprovalWorkflowService:
                     }).sort("created_at", -1).limit(1)
                     conn_list = await connections_cursor.to_list(length=1)
                     connection = conn_list[0] if conn_list else None
+                    if connection:
+                        print(f"🔗 Scheduled publish connection | platform={draft['platform']} connected_via={connection.get('connected_via')} ig_user_id={connection.get('ig_user_id')} has_page_token={'yes' if connection.get('page_access_token') else 'NO'} outstand_id={connection.get('outstand_account_id')}")
+                    else:
+                        print(f"⚠️ No active {draft['platform']} connection found for user_id={draft_user_id} — will try Outstand fallback")
 
                     # Outstand live-lookup fallback (same as _trigger_immediate_publishing)
                     if not connection:
@@ -1109,14 +1117,16 @@ class ApprovalWorkflowService:
                     return {"success": False, "error": "X API credits depleted and no Outstand X account connected as fallback."}
 
         # ── Instagram direct (via Facebook Page Access Token) ────────────────
-        # Match on connected_via OR on presence of ig_user_id credentials (defensive: covers
-        # connections stored with an unexpected connected_via value but valid credentials).
+        # Credential-first: if ig_user_id + page_access_token are present, use the direct
+        # Graph API path regardless of how connected_via is stored. This covers any variation
+        # like "instagram_direct", "instagram_direct_oauth", "instagram_oauth", "instagram", etc.
         _ig_cv = connection.get("connected_via")
-        print(f"🔀 _publish_to_platform routing | platform={platform} connected_via={_ig_cv} ig_user_id={connection.get('ig_user_id')} has_page_token={'yes' if connection.get('page_access_token') else 'NO'}")
-        if platform == "instagram" and (
-            _ig_cv in ("instagram_direct", "instagram_direct_oauth")
-            or (connection.get("ig_user_id") and connection.get("page_access_token"))
-        ):
+        _ig_has_creds = bool(connection.get("ig_user_id") and connection.get("page_access_token"))
+        _ig_cv_is_direct = _ig_cv in (
+            "instagram_direct", "instagram_direct_oauth", "instagram_oauth", "instagram"
+        )
+        print(f"🔀 _publish_to_platform routing | platform={platform} connected_via={_ig_cv} ig_user_id={connection.get('ig_user_id')} has_page_token={'yes' if connection.get('page_access_token') else 'NO'} has_creds={_ig_has_creds}")
+        if platform == "instagram" and (_ig_has_creds or _ig_cv_is_direct):
             from app.agents.social_media_manager.services.instagram_direct_service import InstagramDirectService
             ig_user_id = connection.get("ig_user_id")
             page_token = connection.get("page_access_token")
@@ -1153,32 +1163,6 @@ class ApprovalWorkflowService:
 
                 print(f"📱 Instagram feed publish | ig_user_id={ig_user_id} page_id={page_id} token_len={len(page_token) if page_token else 0} raw_image_url={image_url[:120] if image_url else None}")
 
-                # Force-rehost the image through Facebook CDN (page_id available) or
-                # Cloudinary (fallback) to guarantee Instagram can fetch it.
-                # Cloudinary URLs can trigger content-negotiation that serves WebP to
-                # bots — rehosting ensures a clean JPEG that Meta's crawler accepts.
-                if image_url and image_url.startswith("https://"):
-                    print(f"🔄 Pre-uploading Instagram image for reliability...")
-                    try:
-                        import httpx as _httpx_ig
-                        async with _httpx_ig.AsyncClient(timeout=30, follow_redirects=True) as _ig_cl:
-                            _img_r = await _ig_cl.get(image_url)
-                            _img_r.raise_for_status()
-                            _img_bytes = _img_r.content
-                        print(f"   ↓ Downloaded {len(_img_bytes)} bytes (content-type: {_img_r.headers.get('content-type', 'unknown')})")
-                        if page_id:
-                            _rehosted = await InstagramDirectService._upload_to_facebook_cdn(page_id, page_token, _img_bytes)
-                        else:
-                            from app.utils.cloudinary_upload import upload_bytes as _cld_ig
-                            _rehosted = await _cld_ig(_img_bytes, folder="uri-social/instagram")
-                        if _rehosted:
-                            print(f"   ✅ Pre-upload success → {_rehosted}")
-                            image_url = _rehosted
-                        else:
-                            print(f"   ⚠️ Pre-upload returned None — using original URL")
-                    except Exception as _preup_err:
-                        print(f"   ⚠️ Pre-upload failed ({_preup_err}) — using original URL")
-
                 return await InstagramDirectService.publish_post(
                     ig_user_id=ig_user_id,
                     page_access_token=page_token,
@@ -1195,11 +1179,39 @@ class ApprovalWorkflowService:
             urn = connection.get("person_urn") or connection.get("active_author_urn")
             if not token or not urn:
                 return {"success": False, "error": "LinkedIn connection is missing OAuth token or author URN. Please reconnect your account."}
-            image_url = ApprovalWorkflowService._resolve_image_url(draft.get("image_url") or "")
-            if image_url and image_url.startswith("data:"):
-                image_url = await ApprovalWorkflowService._upload_base64_to_imgbb(image_url) or ""
+            post_type = draft.get("post_type", "feed")
+            svc = LinkedInDirectService()
             try:
-                svc = LinkedInDirectService()
+                # ── LinkedIn carousel ─────────────────────────────────────────
+                if post_type == "carousel":
+                    slides = draft.get("slides", [])
+                    image_urls: List[str] = []
+                    for i, slide in enumerate(slides):
+                        raw = ApprovalWorkflowService._resolve_image_url(slide.get("image_url") or "")
+                        if not raw:
+                            print(f"⚠️ LinkedIn carousel slide {i} has no image_url — skipping")
+                            continue
+                        if raw.startswith("data:"):
+                            raw = await ApprovalWorkflowService._upload_base64_to_imgbb(raw) or ""
+                        if raw:
+                            image_urls.append(raw)
+                    if len(image_urls) < 2:
+                        return {"success": False, "error": f"LinkedIn carousel needs at least 2 images with URLs; only got {len(image_urls)}."}
+                    print(f"📎 LinkedIn carousel: {len(image_urls)} slides for urn={urn}")
+                    result = await svc.create_carousel_post(
+                        access_token=token,
+                        author_urn=urn,
+                        text=content,
+                        image_urls=image_urls,
+                    )
+                    post_id = result.get("post_id")
+                    print(f"✅ LinkedIn carousel publish: post_id={post_id} slides={result.get('slides')}")
+                    return {"success": bool(post_id), "post_id": post_id, "raw_response": result}
+
+                # ── LinkedIn single image / text ──────────────────────────────
+                image_url = ApprovalWorkflowService._resolve_image_url(draft.get("image_url") or "")
+                if image_url and image_url.startswith("data:"):
+                    image_url = await ApprovalWorkflowService._upload_base64_to_imgbb(image_url) or ""
                 result = await svc.create_post(
                     access_token=token,
                     person_urn=urn,
