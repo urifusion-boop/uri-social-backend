@@ -1693,6 +1693,1543 @@ STYLES: Dict[str, Dict[str, Any]] = {
             "QUALITY: 4K, ultra-realistic, street photography, authentic commercial aesthetic."
         ),
     },
+
+    # ══════════════════════════════════════════════════════════════
+    # MARKETING TEMPLATES (Professional AI-Generated Prompt Templates)
+    # ══════════════════════════════════════════════════════════════
+
+    "modern_doodle_collage": {
+        "name": "Modern Doodle Collage",
+        "description": "Editorial fashion poster with playful doodle graphics and minimalist product focus",
+        "industry_tags": ["fashion_ecommerce", "beauty_wellness", "general_other"],
+        "style_type": "marketing_template",
+        "template_category": "editorial",
+        "composition_mode": "editorial",
+        "prompt_fragment": (
+            "FORMAT:\n"
+            "Square or 4:5 social media poster. Minimalist editorial composition with a human model in a dynamic fashion pose interacting with [PRODUCT_NAME]. "
+            "The layout is split into three visual zones: top (playful doodle graphics), middle (human model + product), bottom (clean text space).\n\n"
+
+            "STYLE:\n"
+            "Modern editorial fashion meets playful collage. The aesthetic blends minimalist product photography with hand-drawn doodle overlays — "
+            "think illustrated stars, arrows, squiggles, and abstract shapes floating around the model and product. The doodles add personality without overwhelming the composition.\n\n"
+
+            "COMPOSITION:\n"
+            "• Top 25%: Abstract doodle elements (stars, arrows, circles) in accent colors — playful but not chaotic\n"
+            "• Middle 50%: Human model in a confident, natural pose holding or wearing [PRODUCT_NAME]. The model should look editorial but relatable. "
+            "Product is clearly visible and well-lit. Background is a solid soft color (cream, light grey, or pastel)\n"
+            "• Bottom 25%: Clean text space with plenty of breathing room. Simple bold typography for headline or tagline\n\n"
+
+            "MODEL:\n"
+            "A diverse, fashionable human model in casual-chic attire (neutral tones to not compete with product). Natural, confident expression. "
+            "The model is interacting with [PRODUCT_NAME] — holding it, wearing it, or showcasing it in a lifestyle context. Pose is dynamic but not overly stylized.\n\n"
+
+            "TYPOGRAPHY:\n"
+            "Bold sans-serif headline at the bottom in a single accent color (pulled from product or doodles). Text is large, legible, and has space around it. "
+            "Optional: Small subtext in lighter weight.\n\n"
+
+            "COLOR PALETTE:\n"
+            "Base: Soft neutral background (cream, off-white, light grey, blush pink)\n"
+            "Accent: 1-2 vibrant colors for doodles and text (coral, teal, mustard yellow, or bold red)\n"
+            "Product colors should pop against the neutral base\n\n"
+
+            "LIGHTING:\n"
+            "Soft, even editorial lighting. No harsh shadows. The model and product should be well-lit with a slight halo effect to make them stand out from the background.\n\n"
+
+            "MOOD:\n"
+            "Fresh, approachable, editorial, playful, confident. It feels like a high-end fashion campaign but with personality and warmth.\n\n"
+
+            "QUALITY:\n"
+            "High-resolution, clean lines, polished but not overly retouched. Doodles should look intentional and hand-drawn (not clipart).\n\n"
+
+            "FINAL RENDER:\n"
+            "A balanced composition where the human model and [PRODUCT_NAME] are the clear heroes, framed by playful doodle accents and clean typography. "
+            "The result is scroll-stopping, shareable, and perfectly suited for Instagram feed or stories."
+        ),
+    },
+
+    "minimalist_editorial": {
+        "name": "Minimalist Editorial",
+        "description": "Clean luxury aesthetic with bold typography and sophisticated product showcase",
+        "industry_tags": ["fashion_ecommerce", "beauty_wellness", "luxury_brands"],
+        "style_type": "marketing_template",
+        "template_category": "editorial",
+        "composition_mode": "editorial",
+        "prompt_fragment": (
+            "FORMAT:\n"
+            "Square or 4:5 Instagram post. High-end editorial layout with extreme minimalism. The focus is on [PRODUCT_NAME] as the singular hero, "
+            "supported by bold typography and abundant negative space.\n\n"
+
+            "STYLE:\n"
+            "Ultra-minimalist luxury editorial. Think high-fashion magazine spreads — clean, sophisticated, with an almost architectural precision. "
+            "Every element is intentional. The aesthetic is expensive, refined, and confidence-inducing.\n\n"
+
+            "COMPOSITION:\n"
+            "• Top 30%: Bold, oversized typography (brand name or product headline) in a modern serif or sans-serif. Text is aligned left or centered with lots of breathing room\n"
+            "• Middle 40%: [PRODUCT_NAME] shot in pristine detail against a solid background (pure white, soft grey, or muted pastel). "
+            "The product is lit dramatically to create subtle shadows and depth. It sits slightly off-center for visual interest\n"
+            "• Bottom 30%: Clean space with optional tagline in small, refined type. Minimal text — let the product speak\n\n"
+
+            "MODEL:\n"
+            "No human model. This is pure product-focused editorial. [PRODUCT_NAME] is the star, captured in sharp detail with perfect lighting and angles.\n\n"
+
+            "TYPOGRAPHY:\n"
+            "Bold, oversized headline in a luxury typeface (modern serif like Playfair Display or clean sans like Helvetica Neue). "
+            "Text is large, confident, and takes up significant visual space. Color is typically black, charcoal, or a muted accent color.\n\n"
+
+            "COLOR PALETTE:\n"
+            "Monochromatic or duo-tone:\n"
+            "• Background: Pure white, soft grey, cream, or muted pastel (blush, sage, powder blue)\n"
+            "• Product: Natural product colors, but overall palette is restrained and cohesive\n"
+            "• Typography: Black, charcoal, or a single muted accent color\n\n"
+
+            "LIGHTING:\n"
+            "Studio lighting with dramatic contrast. The product should have defined shadows that add depth without being harsh. "
+            "Think luxury product photography — clean, controlled, with a sense of dimension.\n\n"
+
+            "MOOD:\n"
+            "Luxurious, confident, sophisticated, expensive, editorial, aspirational. This is for brands that want to feel premium and high-end.\n\n"
+
+            "QUALITY:\n"
+            "Ultra-high resolution. Razor-sharp product detail. Flawless execution. Every pixel is intentional.\n\n"
+
+            "FINAL RENDER:\n"
+            "A striking, museum-quality image where [PRODUCT_NAME] is elevated to art. Bold typography commands attention, while negative space creates breathing room. "
+            "The result is unmistakably premium and scroll-stopping."
+        ),
+    },
+
+    "drink_splash": {
+        "name": "Drink Splash",
+        "description": "High-energy beverage photography with dramatic liquid motion and vibrant colors",
+        "industry_tags": ["food_beverage", "general_other"],
+        "style_type": "marketing_template",
+        "template_category": "beverage",
+        "composition_mode": "product_focus",
+        "prompt_fragment": (
+            "FORMAT:\n"
+            "Square or 4:5 social media post. High-energy commercial product shot optimized for beverage brands. "
+            "The composition is centered, dynamic, and designed to stop the scroll.\n\n"
+
+            "STYLE:\n"
+            "High-energy commercial beverage photography. Think Red Bull, Coca-Cola, or craft beer campaigns — vibrant, fresh, and full of motion. "
+            "The aesthetic is polished but energetic, with a focus on freshness, flavor, and movement.\n\n"
+
+            "COMPOSITION:\n"
+            "• Center: [PRODUCT_NAME] (bottle, can, or glass) is the clear hero, positioned dead center or slightly off-center for dynamic tension\n"
+            "• Foreground: Dramatic liquid splash frozen mid-motion — droplets flying, liquid arcing through the air. "
+            "The splash should feel powerful but not chaotic. It frames the product without obscuring it\n"
+            "• Background: Solid vibrant color or gradient that complements the drink (electric blue, citrus orange, lime green, deep red). "
+            "The background is clean and allows the product and splash to pop\n"
+            "• Optional garnish: Fresh fruit slices (lemon, lime, orange, berries) floating near the splash or at the base of the product\n\n"
+
+            "MODEL:\n"
+            "No human model. This is pure product and motion. [PRODUCT_NAME] is the star, supported by the liquid splash and color.\n\n"
+
+            "TYPOGRAPHY:\n"
+            "Optional: Bold product name or tagline at the top or bottom in a modern, punchy typeface. Text should be minimal and not compete with the splash. "
+            "Color is typically white or a bright accent that contrasts with the background.\n\n"
+
+            "COLOR PALETTE:\n"
+            "Vibrant and high-contrast:\n"
+            "• Background: Bold, saturated color (electric blue, bright orange, lime green, deep magenta, or gradient)\n"
+            "• Product: Natural product colors (label, liquid color)\n"
+            "• Splash: Clear or tinted to match the drink (water, juice, soda bubbles)\n"
+            "• Garnish: Natural fruit colors for added freshness\n\n"
+
+            "LIGHTING:\n"
+            "High-speed studio lighting to freeze the splash in perfect detail. Dramatic backlighting or side lighting creates highlights on the droplets and product. "
+            "The lighting should make the liquid glisten and the product label sharp and readable.\n\n"
+
+            "MOOD:\n"
+            "Energetic, refreshing, bold, dynamic, thirst-quenching. This is for brands that want to convey freshness, flavor, and excitement.\n\n"
+
+            "QUALITY:\n"
+            "Ultra-high resolution. Razor-sharp details on droplets, splash motion, and product label. High-speed capture aesthetic — every droplet is crisp.\n\n"
+
+            "FINAL RENDER:\n"
+            "A jaw-dropping action shot where [PRODUCT_NAME] is surrounded by a dramatic liquid splash that feels alive. "
+            "Vibrant colors, sharp details, and dynamic motion create an image that screams refreshment and energy. Perfect for social feeds, ads, or hero banners."
+        ),
+    },
+
+    "food_trust_builder": {
+        "name": "Food Trust Builder",
+        "description": "Authentic farm-to-table aesthetic with natural ingredients and transparent sourcing story",
+        "industry_tags": ["food_beverage", "health_wellness", "organic_natural"],
+        "style_type": "marketing_template",
+        "template_category": "food",
+        "composition_mode": "lifestyle",
+        "prompt_fragment": (
+            "FORMAT:\n"
+            "4:5 or square Instagram post. Authentic, trust-building food photography designed for brands that prioritize transparency, quality ingredients, and ethical sourcing. "
+            "The composition tells a story of craftsmanship and care.\n\n"
+
+            "STYLE:\n"
+            "Farm-to-table meets artisanal food photography. The aesthetic is warm, natural, and honest — think farmers market, rustic kitchens, and handcrafted food. "
+            "It feels real, not overly styled. The goal is to build trust and convey quality.\n\n"
+
+            "COMPOSITION:\n"
+            "• Center: [PRODUCT_NAME] (packaged food product or prepared dish) is the hero, placed on a natural surface (wood table, marble counter, linen cloth)\n"
+            "• Surrounding context: Raw ingredients that go into the product are arranged around it — fresh vegetables, grains, herbs, spices. "
+            "These ingredients tell the sourcing story and emphasize quality\n"
+            "• Props: Natural, minimal props — wooden bowls, ceramic dishes, fresh herbs, burlap, twine. Props should support, not distract\n"
+            "• Layout: Flat lay or 45-degree angle. Ingredients are arranged in a natural, unforced way with space between elements\n\n"
+
+            "MODEL:\n"
+            "Optional: Human hands in the frame — preparing food, holding ingredients, or arranging the product. Hands should look real and diverse (not stock photo perfect). "
+            "If no hands, the composition is purely product + ingredients.\n\n"
+
+            "TYPOGRAPHY:\n"
+            "Optional: Small, handwritten-style text overlay with key messaging — 'Made with [ingredient]', 'Farm Fresh', 'No Preservatives', '100% Organic'. "
+            "Text is subtle, transparent, and placed in negative space. Typically white or soft black.\n\n"
+
+            "COLOR PALETTE:\n"
+            "Warm, natural, earthy:\n"
+            "• Base: Natural wood tones, cream, linen whites, soft greys\n"
+            "• Ingredients: Vibrant natural colors — greens (herbs, vegetables), reds (tomatoes, peppers), golden yellows (grains, oils)\n"
+            "• Product: Natural packaging colors (kraft paper, earth tones, or brand colors that feel organic)\n\n"
+
+            "LIGHTING:\n"
+            "Soft natural window light from the side or above. Gentle shadows that add depth without being harsh. The lighting should feel like morning sunlight in a kitchen — "
+            "warm, inviting, and honest.\n\n"
+
+            "MOOD:\n"
+            "Trustworthy, authentic, wholesome, transparent, artisanal, farm-fresh, honest. This is for brands that want to emphasize quality, sourcing, and care.\n\n"
+
+            "QUALITY:\n"
+            "High resolution but not overly polished. Textures should be visible — wood grain, fabric weave, herb details. The aesthetic is 'real food, real ingredients'.\n\n"
+
+            "FINAL RENDER:\n"
+            "A warm, inviting image where [PRODUCT_NAME] is surrounded by the raw ingredients and context that tell its story. "
+            "The viewer immediately understands the quality, sourcing, and care behind the product. Perfect for organic brands, artisanal food companies, and transparency-focused marketing."
+        ),
+    },
+
+    "hyperpop_perspective": {
+        "name": "Hyperpop Perspective",
+        "description": "Bold ultra-saturated aesthetic with dramatic angles and Gen-Z energy",
+        "industry_tags": ["fashion_ecommerce", "beauty_wellness", "tech_innovation", "general_other"],
+        "style_type": "marketing_template",
+        "template_category": "ecommerce",
+        "composition_mode": "creative",
+        "prompt_fragment": (
+            "FORMAT:\n"
+            "4:5 or 9:16 vertical social post. Ultra-modern, hyper-saturated product photography designed for Gen-Z and bold brands. "
+            "The composition is dramatic, colorful, and unmistakably attention-grabbing.\n\n"
+
+            "STYLE:\n"
+            "Hyperpop meets maximalist product photography. Think neon-soaked, high-contrast, ultra-vibrant aesthetics inspired by cyberpunk, Y2K nostalgia, and digital art. "
+            "The vibe is bold, confident, and designed to stop thumbs mid-scroll.\n\n"
+
+            "COMPOSITION:\n"
+            "• Center-stage: [PRODUCT_NAME] is shot from a dramatic low angle or tilted perspective (Dutch angle). "
+            "The product feels larger-than-life and powerful\n"
+            "• Background: Vibrant gradient or solid neon color (electric pink, cyan blue, acid green, sunset orange). "
+            "Background can include subtle geometric shapes, gradients, or light streaks for added energy\n"
+            "• Lighting effects: Neon glows, lens flares, light streaks, or holographic reflections around the product. These effects add dimension and futuristic energy\n"
+            "• Foreground elements: Optional floating geometric shapes (spheres, cubes, rings) in complementary neon colors to frame the product\n\n"
+
+            "MODEL:\n"
+            "Optional: If human presence is needed, include a Gen-Z model with bold style (colorful hair, statement makeup, futuristic accessories). "
+            "Model is secondary to the product and shot from dramatic angles. If no model, the product is the sole hero.\n\n"
+
+            "TYPOGRAPHY:\n"
+            "Bold, futuristic typeface (think techno, cyberpunk, or ultra-bold sans). Text is large, layered, and colorful — often with gradient fills, glows, or 3D effects. "
+            "Headline sits at top or bottom with high contrast against the background.\n\n"
+
+            "COLOR PALETTE:\n"
+            "Ultra-saturated and high-contrast:\n"
+            "• Background: Neon gradients (pink-to-blue, orange-to-purple, green-to-cyan) or solid neon colors\n"
+            "• Product: Natural product colors, but the lighting and effects make it pop with neon highlights\n"
+            "• Accents: Electric blue, hot pink, acid green, cyber yellow, magenta, holographic reflections\n\n"
+
+            "LIGHTING:\n"
+            "Dramatic, high-contrast lighting with neon accent lights. The product is backlit or side-lit to create glowing edges (rim lighting). "
+            "Lens flares, light leaks, and glows are intentional and add to the futuristic aesthetic.\n\n"
+
+            "MOOD:\n"
+            "Bold, energetic, futuristic, confident, rebellious, hyper-modern. This is for brands targeting Gen-Z, gaming culture, or anyone wanting to make a loud statement.\n\n"
+
+            "QUALITY:\n"
+            "Ultra-high resolution with intentional digital effects. Colors are pumped to maximum saturation. Details are sharp, but the aesthetic embraces digital maximalism.\n\n"
+
+            "FINAL RENDER:\n"
+            "A visually explosive image where [PRODUCT_NAME] dominates the frame with dramatic angles, neon colors, and futuristic energy. "
+            "The result is impossible to ignore — perfect for bold brands, hype drops, and Gen-Z-focused campaigns."
+        ),
+    },
+
+    # ══════════════════════════════════════════════════════════════
+    # VISUAL STYLE GUIDES 2026 (28 Professional Styles)
+    # ══════════════════════════════════════════════════════════════
+
+    # ── STARTUP / SAAS VISUAL STYLES (13 styles) ──────────────────
+
+    "strategic_collage_editorial": {
+        "name": "Strategic Collage Editorial",
+        "description": "Premium startup-editorial with modern strategic collage aesthetic and paper textures.",
+        "industry_tags": ["fintech_saas_tech", "professional_services", "general_other"],
+        "style_type": "marketing_template",
+        "template_category": "saas",
+        "prompt_fragment": (
+            "Create a premium startup-editorial campaign visual in a modern \"strategic collage\" aesthetic.\n\n"
+            "STYLE:\n"
+            "• Clean SaaS branding blended with magazine editorial design and subtle handcrafted paper textures.\n\n"
+            "LAYOUT:\n"
+            "• Asymmetrical split-screen composition.\n"
+            "• Layered content blocks.\n"
+            "• Editorial grid system with intentional imbalance.\n"
+            "• Soft torn-paper framing around image areas.\n\n"
+            "VISUAL DIRECTION:\n"
+            "• Authentic human-centered startup photography.\n"
+            "• Realistic African environments.\n"
+            "• Warm cinematic lighting.\n"
+            "• Slight film grain.\n"
+            "• Documentary realism.\n\n"
+            "TYPOGRAPHY:\n"
+            "• Oversized modern sans-serif typography.\n"
+            "• Bold hierarchy.\n"
+            "• Minimal but expressive.\n\n"
+            "MOOD:\n"
+            "• Intelligent, scalable, modern, human-centered.\n\n"
+            "QUALITY:\n"
+            "• Behance-level presentation quality.\n"
+            "• Shot like a premium global startup campaign."
+        ),
+    },
+
+    "premium_utility_minimalism": {
+        "name": "Premium Utility Minimalism",
+        "description": "Ultra-clean enterprise SaaS branding inspired by Apple-level minimalism.",
+        "industry_tags": ["fintech_saas_tech", "professional_services", "real_estate"],
+        "style_type": "marketing_template",
+        "template_category": "saas",
+        "prompt_fragment": (
+            "Create a premium minimalist startup campaign visual in a modern utility-first aesthetic.\n\n"
+            "STYLE:\n"
+            "• Ultra-clean enterprise SaaS branding inspired by Apple-level minimalism.\n\n"
+            "LAYOUT:\n"
+            "• Centered composition.\n"
+            "• Massive negative space.\n"
+            "• Perfect visual hierarchy.\n"
+            "• Minimal elements only.\n\n"
+            "VISUAL DIRECTION:\n"
+            "• Studio-grade realism.\n"
+            "• Controlled lighting.\n"
+            "• Refined reflections.\n"
+            "• Polished interface presentation.\n\n"
+            "TYPOGRAPHY:\n"
+            "• Minimal sans-serif typography.\n"
+            "• Elegant spacing.\n"
+            "• Quiet luxury visual language.\n\n"
+            "COLOR SYSTEM:\n"
+            "• Monochrome palette with one restrained accent color.\n\n"
+            "MOOD:\n"
+            "• Precise, intelligent, premium, scalable.\n\n"
+            "QUALITY:\n"
+            "• Global enterprise campaign quality.\n"
+            "• Luxury SaaS branding."
+        ),
+    },
+
+    "neo_brutalist_startup": {
+        "name": "Neo-Brutalist Startup",
+        "description": "Disruptive startup branding mixed with underground editorial aesthetics.",
+        "industry_tags": ["fintech_saas_tech", "events_entertainment", "general_other"],
+        "style_type": "marketing_template",
+        "template_category": "saas",
+        "prompt_fragment": (
+            "Create a neo-brutalist startup campaign poster with raw anti-design energy.\n\n"
+            "STYLE:\n"
+            "• Disruptive startup branding mixed with underground editorial aesthetics.\n\n"
+            "LAYOUT:\n"
+            "• Broken grid composition.\n"
+            "• Intentional misalignment.\n"
+            "• Aggressive asymmetry.\n"
+            "• Oversized cropped typography.\n\n"
+            "TYPOGRAPHY:\n"
+            "• Heavy bold sans-serif.\n"
+            "• Compressed spacing.\n"
+            "• Large scale text dominance.\n\n"
+            "TEXTURE:\n"
+            "• Paper grain.\n"
+            "• Photocopy imperfections.\n"
+            "• Raw tactile surfaces.\n\n"
+            "COLOR SYSTEM:\n"
+            "• Black, white, and aggressive accent colors.\n\n"
+            "MOOD:\n"
+            "• Bold, rebellious, internet-native, disruptive.\n\n"
+            "QUALITY:\n"
+            "• Premium anti-design aesthetic.\n"
+            "• Feels like a venture-backed startup challenging an industry."
+        ),
+    },
+
+    "cinematic_startup_realism": {
+        "name": "Cinematic Startup Realism",
+        "description": "Modern startup storytelling blended with cinematic human realism.",
+        "industry_tags": ["fintech_saas_tech", "professional_services", "general_other"],
+        "style_type": "marketing_template",
+        "template_category": "saas",
+        "prompt_fragment": (
+            "Create a cinematic startup campaign visual in a documentary realism style.\n\n"
+            "STYLE:\n"
+            "• Modern startup storytelling blended with cinematic human realism.\n\n"
+            "VISUAL DIRECTION:\n"
+            "• Authentic candid moments.\n"
+            "• Natural body language.\n"
+            "• Realistic African environments.\n"
+            "• Warm practical lighting.\n\n"
+            "CAMERA STYLE:\n"
+            "• Shot on an 85mm cinema lens.\n"
+            "• Shallow depth of field.\n"
+            "• Slight motion blur.\n"
+            "• Natural framing.\n\n"
+            "TEXTURE:\n"
+            "• Film grain.\n"
+            "• Realistic skin texture.\n"
+            "• Environmental imperfections.\n\n"
+            "MOOD:\n"
+            "• Ambitious, emotional, human, mission-driven.\n\n"
+            "QUALITY:\n"
+            "• Feels like a Netflix startup documentary campaign.\n"
+            "• Ultra-realistic cinematic photography."
+        ),
+    },
+
+    "futuristic_enterprise_glow": {
+        "name": "Futuristic Enterprise Glow",
+        "description": "Advanced AI infrastructure branding with cinematic realism.",
+        "industry_tags": ["fintech_saas_tech", "professional_services"],
+        "style_type": "marketing_template",
+        "template_category": "saas",
+        "prompt_fragment": (
+            "Create a futuristic enterprise AI campaign visual with cinematic infrastructure aesthetics.\n\n"
+            "STYLE:\n"
+            "• Advanced AI infrastructure branding blended with premium cinematic realism.\n\n"
+            "LAYOUT:\n"
+            "• Layered dimensional composition.\n"
+            "• Floating interface systems.\n"
+            "• Depth-heavy framing.\n\n"
+            "LIGHTING:\n"
+            "• Volumetric glow.\n"
+            "• Neon reflections.\n"
+            "• Atmospheric lighting.\n"
+            "• Subtle holographic effects.\n\n"
+            "COLOR SYSTEM:\n"
+            "• Deep blacks, electric blue, soft violet highlights.\n\n"
+            "VISUAL DIRECTION:\n"
+            "• Sophisticated AI environments.\n"
+            "• Abstract intelligent systems.\n"
+            "• Premium enterprise atmosphere.\n\n"
+            "MOOD:\n"
+            "• Advanced, inevitable, intelligent, globally scalable.\n\n"
+            "QUALITY:\n"
+            "• Hollywood-level sci-fi realism.\n"
+            "• Premium enterprise AI campaign quality."
+        ),
+    },
+
+    "quiet_luxury_saas": {
+        "name": "Quiet Luxury SaaS",
+        "description": "Minimal enterprise branding fused with luxury editorial restraint.",
+        "industry_tags": ["fintech_saas_tech", "professional_services", "real_estate"],
+        "style_type": "marketing_template",
+        "template_category": "saas",
+        "prompt_fragment": (
+            "Create a premium startup campaign visual in a Quiet Luxury SaaS aesthetic for [PRODUCT/SERVICE].\n\n"
+            "STYLE:\n"
+            "• Minimal enterprise branding fused with luxury editorial restraint and modern architectural composition.\n\n"
+            "VISUAL LANGUAGE:\n"
+            "• Sophisticated simplicity.\n"
+            "• Large negative space.\n"
+            "• Precise visual hierarchy.\n"
+            "• Quiet confidence instead of loud marketing energy.\n\n"
+            "COMPOSITION:\n"
+            "• Centered or asymmetrical editorial layout.\n"
+            "• Massive breathing room.\n"
+            "• Minimal but intentional object placement.\n"
+            "• Calm balanced framing.\n\n"
+            "SUBJECT:\n"
+            "• Realistic African professional or founder figure.\n"
+            "• Natural skin texture.\n"
+            "• Refined understated confidence.\n"
+            "• Minimal expressive posing.\n\n"
+            "WARDROBE:\n"
+            "• Contemporary luxury minimalism.\n"
+            "• Muted monochrome tailoring.\n"
+            "• Modern founder aesthetic.\n\n"
+            "ENVIRONMENT:\n"
+            "• Architectural studio environment.\n"
+            "• Soft matte surfaces.\n"
+            "• Minimal premium interiors.\n\n"
+            "TYPOGRAPHY:\n"
+            "• Elegant sans-serif typography.\n"
+            "• Restrained hierarchy.\n"
+            "• Minimal wording.\n"
+            "• Editorial spacing precision.\n\n"
+            "LIGHTING:\n"
+            "• Soft directional daylight.\n"
+            "• Luxury architectural shadows.\n"
+            "• Subtle natural contrast.\n\n"
+            "COLOR SYSTEM:\n"
+            "• Bone white, charcoal, warm gray, muted neutrals.\n\n"
+            "MOOD:\n"
+            "• Intelligent. Expensive. Calm. Globally scalable.\n\n"
+            "QUALITY:\n"
+            "• Luxury SaaS campaign quality.\n"
+            "• Shot with Hasselblad medium-format realism.\n"
+            "• Architectural editorial photography.\n"
+            "• Subtle film grain."
+        ),
+    },
+
+    "kinetic_startup_energy": {
+        "name": "Kinetic Startup Energy",
+        "description": "Modern Gen Z startup branding blended with motion-heavy editorial design.",
+        "industry_tags": ["fintech_saas_tech", "events_entertainment", "general_other"],
+        "style_type": "marketing_template",
+        "template_category": "saas",
+        "prompt_fragment": (
+            "Create a premium startup campaign visual in a Kinetic Startup Energy aesthetic for [PRODUCT/SERVICE].\n\n"
+            "STYLE:\n"
+            "• Modern Gen Z startup branding blended with motion-heavy editorial campaign design.\n\n"
+            "VISUAL LANGUAGE:\n"
+            "• Fast-moving composition.\n"
+            "• Dynamic asymmetry.\n"
+            "• Floating visual elements.\n"
+            "• Energetic typography systems.\n\n"
+            "COMPOSITION:\n"
+            "• Layered movement-driven layout.\n"
+            "• Overlapping content blocks.\n"
+            "• Kinetic framing.\n"
+            "• Directional visual flow.\n\n"
+            "SUBJECT:\n"
+            "• Young realistic African creatives or founders captured mid-motion.\n"
+            "• Authentic expressions.\n"
+            "• Natural imperfections.\n"
+            "• Candid startup realism.\n\n"
+            "GRAPHICS:\n"
+            "• Floating interface fragments.\n"
+            "• Motion blur accents.\n"
+            "• Directional arrows.\n"
+            "• Dynamic visual rhythm.\n\n"
+            "TYPOGRAPHY:\n"
+            "• Bold oversized typography interacting with the composition.\n"
+            "• Curved or layered placement.\n"
+            "• Digital-culture visual energy.\n\n"
+            "LIGHTING:\n"
+            "• Bright cinematic glow.\n"
+            "• Soft neon reflections.\n"
+            "• Energetic contrast.\n\n"
+            "COLOR SYSTEM:\n"
+            "• Monochrome foundation with electric accent gradients.\n\n"
+            "MOOD:\n"
+            "• Ambitious. Fast-moving. Youthful. Culturally relevant.\n\n"
+            "QUALITY:\n"
+            "• Premium startup launch campaign.\n"
+            "• Pinterest-worthy editorial energy.\n"
+            "• High-fashion startup realism."
+        ),
+    },
+
+    "afro_futurist_enterprise": {
+        "name": "Afro-Futurist Enterprise",
+        "description": "African cultural sophistication fused with futuristic enterprise technology branding.",
+        "industry_tags": ["fintech_saas_tech", "professional_services", "general_other"],
+        "style_type": "marketing_template",
+        "template_category": "saas",
+        "prompt_fragment": (
+            "Create a premium startup campaign visual in an Afro-Futurist Enterprise aesthetic for [PRODUCT/SERVICE].\n\n"
+            "STYLE:\n"
+            "• African cultural sophistication fused with futuristic enterprise technology branding.\n\n"
+            "VISUAL LANGUAGE:\n"
+            "• Monumental composition.\n"
+            "• Cinematic African futurism.\n"
+            "• Premium infrastructure aesthetics.\n"
+            "• Human-centered technological optimism.\n\n"
+            "COMPOSITION:\n"
+            "• Hero-focused editorial framing.\n"
+            "• Layered dimensional environments.\n"
+            "• Large-scale cinematic perspective.\n\n"
+            "SUBJECT:\n"
+            "• Realistic African founders, professionals, or creatives.\n"
+            "• Powerful presence.\n"
+            "• Natural skin texture.\n"
+            "• Authentic African identity representation.\n\n"
+            "ENVIRONMENT:\n"
+            "• Futuristic African urban atmosphere.\n"
+            "• Premium architectural environments.\n"
+            "• Subtle cultural texture references.\n\n"
+            "LIGHTING:\n"
+            "• Golden cinematic lighting mixed with futuristic glow accents.\n"
+            "• Atmospheric depth.\n"
+            "• Volumetric realism.\n\n"
+            "TYPOGRAPHY:\n"
+            "• Minimal enterprise typography with bold strategic hierarchy.\n\n"
+            "COLOR SYSTEM:\n"
+            "• Earth tones fused with electric amber, deep bronze, muted black, and controlled neon accents.\n\n"
+            "MOOD:\n"
+            "• Visionary. Intelligent. Globally ambitious. Culturally rooted.\n\n"
+            "QUALITY:\n"
+            "• Hollywood-grade campaign realism.\n"
+            "• Luxury African technology branding.\n"
+            "• Behance-level art direction."
+        ),
+    },
+
+    "founder_documentary": {
+        "name": "Founder Documentary",
+        "description": "Human-centered startup storytelling blended with cinematic documentary realism.",
+        "industry_tags": ["fintech_saas_tech", "professional_services", "general_other"],
+        "style_type": "marketing_template",
+        "template_category": "saas",
+        "prompt_fragment": (
+            "Create a premium startup campaign visual in a Founder Documentary Editorial aesthetic for [PRODUCT/SERVICE].\n\n"
+            "STYLE:\n"
+            "• Human-centered startup storytelling blended with cinematic documentary realism.\n\n"
+            "VISUAL LANGUAGE:\n"
+            "• Authentic entrepreneurial atmosphere.\n"
+            "• Emotionally grounded realism.\n"
+            "• Natural environmental storytelling.\n\n"
+            "COMPOSITION:\n"
+            "• Documentary-style framing.\n"
+            "• Candid human positioning.\n"
+            "• Natural asymmetry.\n"
+            "• Editorial storytelling hierarchy.\n\n"
+            "SUBJECT:\n"
+            "• Realistic African founder or startup professional.\n"
+            "• Authentic facial expression.\n"
+            "• Natural skin texture.\n"
+            "• Unpolished emotional realism.\n\n"
+            "ENVIRONMENT:\n"
+            "• Real startup environments.\n"
+            "• Laptops, workspaces, cafés, creative studios, urban environments.\n"
+            "• Subtle environmental imperfections.\n\n"
+            "TYPOGRAPHY:\n"
+            "• Minimal editorial typography integrated carefully into the composition.\n\n"
+            "LIGHTING:\n"
+            "• Natural practical lighting.\n"
+            "• Golden-hour realism.\n"
+            "• Cinematic shadow depth.\n\n"
+            "TEXTURE:\n"
+            "• Film grain.\n"
+            "• Documentary photography realism.\n"
+            "• Natural atmosphere.\n\n"
+            "MOOD:\n"
+            "• Driven. Human. Ambitious. Emotionally believable.\n\n"
+            "QUALITY:\n"
+            "• Netflix-style startup documentary campaign.\n"
+            "• Cinematic editorial realism.\n"
+            "• Premium storytelling photography."
+        ),
+    },
+
+    "intelligent_interface_surrealism": {
+        "name": "Intelligent Interface Surrealism",
+        "description": "Advanced AI-native branding fused with cinematic surreal interface environments.",
+        "industry_tags": ["fintech_saas_tech", "professional_services"],
+        "style_type": "marketing_template",
+        "template_category": "saas",
+        "prompt_fragment": (
+            "Create a premium startup campaign visual in an Intelligent Interface Surrealism aesthetic for [PRODUCT/SERVICE].\n\n"
+            "STYLE:\n"
+            "• Advanced AI-native branding fused with cinematic surreal interface environments.\n\n"
+            "VISUAL LANGUAGE:\n"
+            "• Dimensional interface layering.\n"
+            "• Controlled futuristic surrealism.\n"
+            "• Intelligent system visualization.\n\n"
+            "COMPOSITION:\n"
+            "• Floating interface architecture.\n"
+            "• Depth-heavy composition.\n"
+            "• Layered spatial framing.\n\n"
+            "SUBJECT:\n"
+            "• Realistic African creative professional interacting naturally with intelligent digital systems.\n"
+            "• Authentic emotional realism.\n"
+            "• Natural body language.\n\n"
+            "INTERFACES:\n"
+            "• Translucent UI layers.\n"
+            "• Abstract intelligent systems.\n"
+            "• Floating data architecture.\n"
+            "• Soft glassmorphism aesthetics.\n\n"
+            "LIGHTING:\n"
+            "• Atmospheric glow.\n"
+            "• Volumetric depth.\n"
+            "• Subtle neon reflections.\n"
+            "• Dark cinematic contrast.\n\n"
+            "TYPOGRAPHY:\n"
+            "• Minimal futuristic editorial typography.\n\n"
+            "COLOR SYSTEM:\n"
+            "• Deep monochrome palette with restrained electric accents.\n\n"
+            "MOOD:\n"
+            "• Intelligent. Experimental. Visionary. Advanced.\n\n"
+            "QUALITY:\n"
+            "• Hollywood-grade AI campaign realism.\n"
+            "• Premium futuristic editorial art direction.\n"
+            "• Medium-format cinematic rendering."
+        ),
+    },
+
+    "tactical_workspace_realism": {
+        "name": "Tactical Workspace Realism",
+        "description": "Modern startup operations culture blended with cinematic productivity realism.",
+        "industry_tags": ["fintech_saas_tech", "professional_services", "general_other"],
+        "style_type": "marketing_template",
+        "template_category": "saas",
+        "prompt_fragment": (
+            "Create a premium SaaS campaign visual in a Tactical Workspace Realism aesthetic for [PRODUCT/SERVICE].\n\n"
+            "STYLE:\n"
+            "• Modern startup operations culture blended with cinematic productivity realism.\n\n"
+            "VISUAL LANGUAGE:\n"
+            "• High-performance workspace environments.\n"
+            "• Operational intelligence aesthetics.\n"
+            "• Focused execution energy.\n\n"
+            "COMPOSITION:\n"
+            "• Layered workstation framing.\n"
+            "• Overlapping productivity tools and interface systems.\n"
+            "• Structured but lived-in composition.\n\n"
+            "SUBJECT:\n"
+            "• Realistic African startup operator, founder, or creative professional.\n"
+            "• Focused natural body language.\n"
+            "• Authentic concentration and movement.\n\n"
+            "ENVIRONMENT:\n"
+            "• Premium startup workspace.\n"
+            "• Laptops, floating dashboards, notes, creative systems, ambient operational tools.\n\n"
+            "INTERFACES:\n"
+            "• Minimal intelligent UI overlays.\n"
+            "• Workflow visualizations.\n"
+            "• Structured information systems.\n\n"
+            "LIGHTING:\n"
+            "• Practical monitor glow.\n"
+            "• Warm workstation lighting.\n"
+            "• Cinematic desk atmosphere.\n\n"
+            "TYPOGRAPHY:\n"
+            "• Utility-focused editorial typography.\n"
+            "• Precise hierarchy.\n"
+            "• Minimal but functional.\n\n"
+            "COLOR SYSTEM:\n"
+            "• Warm neutrals with restrained digital accent colors.\n\n"
+            "MOOD:\n"
+            "• Focused. Competent. Fast-moving. Operationally elite.\n\n"
+            "QUALITY:\n"
+            "• Premium startup productivity campaign.\n"
+            "• Cinematic workspace realism.\n"
+            "• Behance-level SaaS art direction."
+        ),
+    },
+
+    "internet_culture_maximalism": {
+        "name": "Internet Culture Maximalism",
+        "description": "Internet-native startup branding fused with chaotic editorial collage energy.",
+        "industry_tags": ["fintech_saas_tech", "events_entertainment", "general_other"],
+        "style_type": "marketing_template",
+        "template_category": "saas",
+        "prompt_fragment": (
+            "Create a premium startup campaign visual in an Internet Culture Maximalism aesthetic for [PRODUCT/SERVICE].\n\n"
+            "STYLE:\n"
+            "• Internet-native startup branding fused with chaotic editorial collage energy and digital culture aesthetics.\n\n"
+            "VISUAL LANGUAGE:\n"
+            "• Layered visual density.\n"
+            "• Controlled internet chaos.\n"
+            "• Experimental composition systems.\n\n"
+            "COMPOSITION:\n"
+            "• Overlapping interface fragments.\n"
+            "• Sticker-like graphics.\n"
+            "• Asymmetrical visual layering.\n"
+            "• Dense editorial hierarchy.\n\n"
+            "SUBJECT:\n"
+            "• Young realistic African digital-native creatives.\n"
+            "• Authentic internet-culture energy.\n"
+            "• Natural individuality and expressive attitude.\n\n"
+            "GRAPHICS:\n"
+            "• Browser windows.\n"
+            "• Memetic visual elements.\n"
+            "• Floating digital artifacts.\n"
+            "• Interface fragments.\n"
+            "• Playful internet symbolism.\n\n"
+            "TYPOGRAPHY:\n"
+            "• Mixed-scale typography.\n"
+            "• Experimental placement.\n"
+            "• Digital zine-inspired hierarchy.\n\n"
+            "TEXTURE:\n"
+            "• Compression artifacts.\n"
+            "• Digital grain.\n"
+            "• Screen realism.\n"
+            "• Intentional imperfect rendering.\n\n"
+            "LIGHTING:\n"
+            "• Screen glow.\n"
+            "• RGB reflections.\n"
+            "• Late-night digital atmosphere.\n\n"
+            "COLOR SYSTEM:\n"
+            "• Neutral base with saturated digital accent colors.\n\n"
+            "MOOD:\n"
+            "• Chaotic. Creative. Hyper-online. Experimental.\n\n"
+            "QUALITY:\n"
+            "• Premium internet-era startup campaign.\n"
+            "• Editorial digital-culture realism.\n"
+            "• High-end experimental art direction."
+        ),
+    },
+
+    "optimistic_human_future": {
+        "name": "Optimistic Human Future",
+        "description": "Human-centered technology branding blended with cinematic warmth and future optimism.",
+        "industry_tags": ["fintech_saas_tech", "professional_services", "general_other"],
+        "style_type": "marketing_template",
+        "template_category": "saas",
+        "prompt_fragment": (
+            "Create a premium startup campaign visual in an Optimistic Human Future aesthetic for [PRODUCT/SERVICE].\n\n"
+            "STYLE:\n"
+            "• Human-centered technology branding blended with cinematic warmth and future optimism.\n\n"
+            "VISUAL LANGUAGE:\n"
+            "• Open emotionally uplifting composition.\n"
+            "• Authentic human interaction.\n"
+            "• Accessible technological sophistication.\n\n"
+            "COMPOSITION:\n"
+            "• Breathable editorial layout.\n"
+            "• Natural human framing.\n"
+            "• Large uplifting visual space.\n\n"
+            "SUBJECT:\n"
+            "• Realistic African families, founders, creatives, or professionals.\n"
+            "• Warm authentic emotional realism.\n"
+            "• Natural expressions and body language.\n\n"
+            "ENVIRONMENT:\n"
+            "• Modern African urban environments.\n"
+            "• Clean future-facing spaces.\n"
+            "• Human-centered technological integration.\n\n"
+            "LIGHTING:\n"
+            "• Warm sunlight realism.\n"
+            "• Golden ambient glow.\n"
+            "• Natural atmospheric depth.\n\n"
+            "TYPOGRAPHY:\n"
+            "• Friendly modern editorial typography.\n"
+            "• Soft hierarchy.\n"
+            "• Human-centered communication.\n\n"
+            "COLOR SYSTEM:\n"
+            "• Warm neutrals with optimistic accent colors.\n\n"
+            "MOOD:\n"
+            "• Hopeful. Human. Trustworthy. Forward-looking.\n\n"
+            "QUALITY:\n"
+            "• Premium global technology campaign realism.\n"
+            "• Cinematic emotional storytelling.\n"
+            "• Luxury commercial photography quality."
+        ),
+    },
+
+    # ── FASHION VISUAL STYLES (10 styles) ──────────────────────────
+
+    "neo_luxury_street": {
+        "name": "Neo-Luxury Street",
+        "description": "Luxury streetwear branding fused with minimalist editorial fashion photography.",
+        "industry_tags": ["fashion_ecommerce", "beauty_wellness", "general_other"],
+        "style_type": "marketing_template",
+        "template_category": "fashion",
+        "prompt_fragment": (
+            "Create a premium fashion campaign visual in a Neo-Luxury Street Editorial aesthetic for [BRAND/PRODUCT].\n\n"
+            "STYLE:\n"
+            "• Luxury streetwear branding fused with minimalist editorial fashion photography.\n\n"
+            "VISUAL LANGUAGE:\n"
+            "• Effortless cool.\n"
+            "• Premium cultural sophistication.\n"
+            "• Modern youth authority.\n\n"
+            "COMPOSITION:\n"
+            "• Editorial asymmetry.\n"
+            "• Large negative space.\n"
+            "• Magazine-grade framing.\n"
+            "• Integrated typography placement.\n\n"
+            "SUBJECT:\n"
+            "• Realistic young African model with authentic individuality.\n"
+            "• Natural skin texture.\n"
+            "• Relaxed confident body language.\n"
+            "• Subtle emotional detachment.\n\n"
+            "WARDROBE:\n"
+            "• Elevated monochrome streetwear.\n"
+            "• Layered silhouettes.\n"
+            "• Premium contemporary fashion styling.\n\n"
+            "ENVIRONMENT:\n"
+            "• Minimal urban architecture or clean editorial studio space.\n\n"
+            "LIGHTING:\n"
+            "• Soft cinematic realism.\n"
+            "• Fashion-editorial shadows.\n"
+            "• Subtle natural contrast.\n\n"
+            "TYPOGRAPHY:\n"
+            "• Minimal bold sans-serif typography with refined editorial spacing.\n\n"
+            "TEXTURE:\n"
+            "• Film grain.\n"
+            "• Luxury matte realism.\n"
+            "• Natural fabric texture visibility.\n\n"
+            "COLOR SYSTEM:\n"
+            "• Muted monochrome palette with restrained accent tones.\n\n"
+            "MOOD:\n"
+            "• Cool. Confident. Expensive. Culturally aware.\n\n"
+            "QUALITY:\n"
+            "• Luxury fashion campaign realism.\n"
+            "• Shot with medium-format editorial photography.\n"
+            "• Behance-level art direction."
+        ),
+    },
+
+    "afro_cinematic_fashion": {
+        "name": "Afro-Cinematic Fashion",
+        "description": "Luxury African fashion storytelling fused with cinematic editorial realism.",
+        "industry_tags": ["fashion_ecommerce", "beauty_wellness", "events_entertainment"],
+        "style_type": "marketing_template",
+        "template_category": "fashion",
+        "prompt_fragment": (
+            "Create a premium fashion campaign visual in an Afro-Cinematic Fashion Realism aesthetic for [BRAND/PRODUCT].\n\n"
+            "STYLE:\n"
+            "• Luxury African fashion storytelling fused with cinematic editorial realism.\n\n"
+            "VISUAL LANGUAGE:\n"
+            "• Emotionally rich atmosphere.\n"
+            "• Cultural sophistication.\n"
+            "• Modern African elegance.\n\n"
+            "COMPOSITION:\n"
+            "• Story-driven cinematic framing.\n"
+            "• Layered environmental depth.\n"
+            "• Editorial balance between intimacy and grandeur.\n\n"
+            "SUBJECT:\n"
+            "• Realistic African models with authentic individuality and emotional presence.\n"
+            "• Natural skin texture.\n"
+            "• Expressive but restrained realism.\n\n"
+            "WARDROBE:\n"
+            "• Contemporary African luxury styling.\n"
+            "• Elegant silhouettes.\n"
+            "• Premium textile visibility.\n"
+            "• Modern cultural fusion.\n\n"
+            "ENVIRONMENT:\n"
+            "• Atmospheric African urban or architectural environments.\n"
+            "• Warm textured realism.\n"
+            "• Subtle cultural environmental storytelling.\n\n"
+            "LIGHTING:\n"
+            "• Golden-hour cinematic lighting.\n"
+            "• Warm atmospheric glow.\n"
+            "• Soft shadow realism.\n\n"
+            "TYPOGRAPHY:\n"
+            "• Minimal elegant editorial typography.\n\n"
+            "TEXTURE:\n"
+            "• Film grain.\n"
+            "• Organic skin realism.\n"
+            "• Visible textile detail.\n\n"
+            "COLOR SYSTEM:\n"
+            "• Earth tones, warm neutrals, deep blacks, bronze accents.\n\n"
+            "MOOD:\n"
+            "• Elegant. Rooted. Emotional. Sophisticated.\n\n"
+            "QUALITY:\n"
+            "• Luxury fashion-film realism.\n"
+            "• Hollywood-grade editorial cinematography.\n"
+            "• Premium African fashion campaign quality."
+        ),
+    },
+
+    "hyper_minimal_fashion": {
+        "name": "Hyper-Minimal Fashion",
+        "description": "Architectural luxury minimalism fused with modern fashion utility aesthetics.",
+        "industry_tags": ["fashion_ecommerce", "beauty_wellness", "real_estate"],
+        "style_type": "marketing_template",
+        "template_category": "fashion",
+        "prompt_fragment": (
+            "Create a premium fashion campaign visual in a Hyper-Minimal Fashion Utility aesthetic for [BRAND/PRODUCT].\n\n"
+            "STYLE:\n"
+            "• Architectural luxury minimalism fused with modern fashion utility aesthetics.\n\n"
+            "VISUAL LANGUAGE:\n"
+            "• Disciplined composition.\n"
+            "• Quiet luxury.\n"
+            "• Structural precision.\n\n"
+            "COMPOSITION:\n"
+            "• Clean geometric framing.\n"
+            "• Massive negative space.\n"
+            "• Centered visual hierarchy.\n\n"
+            "SUBJECT:\n"
+            "• Realistic African model with calm understated confidence.\n"
+            "• Natural realism.\n"
+            "• Minimal expressive posing.\n\n"
+            "WARDROBE:\n"
+            "• Structured monochrome garments.\n"
+            "• Architectural silhouettes.\n"
+            "• Minimal styling complexity.\n\n"
+            "ENVIRONMENT:\n"
+            "• Minimal architectural environment.\n"
+            "• Concrete, matte, or gallery-inspired spaces.\n\n"
+            "LIGHTING:\n"
+            "• Controlled studio lighting.\n"
+            "• Subtle luxury shadows.\n"
+            "• Clean tonal gradients.\n\n"
+            "TYPOGRAPHY:\n"
+            "• Refined minimalist typography with precise spacing systems.\n\n"
+            "TEXTURE:\n"
+            "• Ultra-clean realism.\n"
+            "• Visible fabric texture.\n"
+            "• Soft matte finishes.\n\n"
+            "COLOR SYSTEM:\n"
+            "• Black, white, charcoal, muted neutral tones.\n\n"
+            "MOOD:\n"
+            "• Refined. Disciplined. Modern. Exclusive.\n\n"
+            "QUALITY:\n"
+            "• Luxury minimalist fashion campaign realism.\n"
+            "• Medium-format editorial photography.\n"
+            "• Global luxury brand art direction."
+        ),
+    },
+
+    "raw_youth_culture": {
+        "name": "Raw Youth Culture",
+        "description": "Underground youth fashion culture fused with raw editorial realism.",
+        "industry_tags": ["fashion_ecommerce", "events_entertainment", "general_other"],
+        "style_type": "marketing_template",
+        "template_category": "fashion",
+        "prompt_fragment": (
+            "Create a premium fashion campaign visual in a Raw Youth Culture aesthetic for [BRAND/PRODUCT].\n\n"
+            "STYLE:\n"
+            "• Underground youth fashion culture fused with raw editorial realism.\n\n"
+            "VISUAL LANGUAGE:\n"
+            "• Imperfect spontaneity.\n"
+            "• Rebellious visual energy.\n"
+            "• Anti-corporate authenticity.\n\n"
+            "COMPOSITION:\n"
+            "• Off-center framing.\n"
+            "• Flash-photo realism.\n"
+            "• Layered zine-inspired composition.\n\n"
+            "SUBJECT:\n"
+            "• Young realistic African creatives with authentic individuality and expressive body language.\n\n"
+            "WARDROBE:\n"
+            "• DIY-inspired streetwear styling.\n"
+            "• Layered fashion textures.\n"
+            "• Vintage-modern fusion.\n\n"
+            "ENVIRONMENT:\n"
+            "• Urban realism.\n"
+            "• Concrete spaces.\n"
+            "• Night environments.\n"
+            "• Underground cultural atmosphere.\n\n"
+            "TYPOGRAPHY:\n"
+            "• Raw oversized typography.\n"
+            "• Experimental placement.\n"
+            "• Zine-inspired hierarchy.\n\n"
+            "TEXTURE:\n"
+            "• Heavy film grain.\n"
+            "• Motion blur.\n"
+            "• Flash reflections.\n"
+            "• Photographic imperfections.\n\n"
+            "LIGHTING:\n"
+            "• Direct flash realism.\n"
+            "• Harsh nightlife contrast.\n"
+            "• Ambient urban glow.\n\n"
+            "COLOR SYSTEM:\n"
+            "• Muted dark tones with occasional aggressive accent colors.\n\n"
+            "MOOD:\n"
+            "• Rebellious. Youthful. Creative. Underground.\n\n"
+            "QUALITY:\n"
+            "• Premium underground fashion editorial realism.\n"
+            "• High-fashion youth campaign energy."
+        ),
+    },
+
+    "dreamlike_fashion_surrealism": {
+        "name": "Dreamlike Fashion Surrealism",
+        "description": "Luxury avant-garde fashion fused with cinematic dream realism.",
+        "industry_tags": ["fashion_ecommerce", "beauty_wellness", "events_entertainment"],
+        "style_type": "marketing_template",
+        "template_category": "fashion",
+        "prompt_fragment": (
+            "Create a premium fashion campaign visual in a Dreamlike Fashion Surrealism aesthetic for [BRAND/PRODUCT].\n\n"
+            "STYLE:\n"
+            "• Luxury avant-garde fashion fused with cinematic dream realism.\n\n"
+            "VISUAL LANGUAGE:\n"
+            "• Emotional fantasy.\n"
+            "• Surreal elegance.\n"
+            "• Atmospheric visual poetry.\n\n"
+            "COMPOSITION:\n"
+            "• Floating cinematic framing.\n"
+            "• Soft dimensional layering.\n"
+            "• Dreamlike editorial balance.\n\n"
+            "SUBJECT:\n"
+            "• Realistic African model with sculptural emotional presence.\n"
+            "• Natural realism blended with subtle surreal atmosphere.\n\n"
+            "WARDROBE:\n"
+            "• Avant-garde luxury fashion styling.\n"
+            "• Sculptural silhouettes.\n"
+            "• Textural elegance.\n\n"
+            "ENVIRONMENT:\n"
+            "• Atmospheric surreal environments.\n"
+            "• Soft architectural abstraction.\n"
+            "• Dreamlike environmental realism.\n\n"
+            "LIGHTING:\n"
+            "• Ethereal glow.\n"
+            "• Atmospheric haze.\n"
+            "• Soft cinematic contrast.\n\n"
+            "TYPOGRAPHY:\n"
+            "• Minimal luxury editorial typography.\n\n"
+            "TEXTURE:\n"
+            "• Soft film grain.\n"
+            "• Elegant atmospheric realism.\n"
+            "• Luxury textile detail.\n\n"
+            "COLOR SYSTEM:\n"
+            "• Muted atmospheric tones with soft luminous highlights.\n\n"
+            "MOOD:\n"
+            "• Seductive. Mythological. Emotional. Luxurious.\n\n"
+            "QUALITY:\n"
+            "• Luxury couture campaign realism.\n"
+            "• Hollywood-level fashion cinematography.\n"
+            "• Avant-garde editorial art direction."
+        ),
+    },
+
+    "coastal_luxury_escape": {
+        "name": "Coastal Luxury Escape",
+        "description": "Luxury resort fashion fused with cinematic leisure editorial photography.",
+        "industry_tags": ["fashion_ecommerce", "travel_hospitality", "beauty_wellness"],
+        "style_type": "marketing_template",
+        "template_category": "fashion",
+        "prompt_fragment": (
+            "Create a premium fashion campaign visual in a Coastal Luxury Escape aesthetic for [BRAND/PRODUCT].\n\n"
+            "STYLE:\n"
+            "• Luxury resort fashion fused with cinematic leisure editorial photography.\n\n"
+            "VISUAL LANGUAGE:\n"
+            "• Soft power elegance.\n"
+            "• Effortless wealth.\n"
+            "• Relaxed aspirational sophistication.\n\n"
+            "COMPOSITION:\n"
+            "• Breathable editorial framing.\n"
+            "• Natural asymmetry.\n"
+            "• Large atmospheric space.\n\n"
+            "SUBJECT:\n"
+            "• Realistic African models with understated confidence and relaxed body language.\n"
+            "• Natural skin texture.\n"
+            "• Authentic luxury presence.\n\n"
+            "WARDROBE:\n"
+            "• Premium resort wear.\n"
+            "• Flowing silhouettes.\n"
+            "• Luxury casual styling.\n"
+            "• Natural textile movement.\n\n"
+            "ENVIRONMENT:\n"
+            "• Coastal architecture.\n"
+            "• Luxury terraces.\n"
+            "• Mediterranean-inspired environments.\n"
+            "• Ocean atmosphere.\n\n"
+            "LIGHTING:\n"
+            "• Golden sunlight realism.\n"
+            "• Warm reflective highlights.\n"
+            "• Soft luxury shadows.\n\n"
+            "TYPOGRAPHY:\n"
+            "• Minimal elegant editorial typography with refined spacing.\n\n"
+            "TEXTURE:\n"
+            "• Luxury textile realism.\n"
+            "• Natural skin detail.\n"
+            "• Subtle film grain.\n\n"
+            "COLOR SYSTEM:\n"
+            "• Warm whites, sand tones, muted blues, natural neutrals.\n\n"
+            "MOOD:\n"
+            "• Free. Elegant. Wealthy. Relaxed.\n\n"
+            "QUALITY:\n"
+            "• Luxury global resort campaign realism.\n"
+            "• High-fashion editorial cinematography.\n"
+            "• Medium-format photography quality."
+        ),
+    },
+
+    "performance_futurism": {
+        "name": "Performance Futurism",
+        "description": "Elite athletic branding fused with futuristic sports editorial realism.",
+        "industry_tags": ["fitness_gym", "fashion_ecommerce", "general_other"],
+        "style_type": "marketing_template",
+        "template_category": "fashion",
+        "prompt_fragment": (
+            "Create a premium fashion campaign visual in a Performance Futurism aesthetic for [BRAND/PRODUCT].\n\n"
+            "STYLE:\n"
+            "• Elite athletic branding fused with futuristic sports editorial realism.\n\n"
+            "VISUAL LANGUAGE:\n"
+            "• Controlled intensity.\n"
+            "• Physical optimization.\n"
+            "• High-performance visual energy.\n\n"
+            "COMPOSITION:\n"
+            "• Dynamic movement framing.\n"
+            "• Athletic posture emphasis.\n"
+            "• Directional visual flow.\n\n"
+            "SUBJECT:\n"
+            "• Realistic African athlete or fitness model.\n"
+            "• Natural muscular realism.\n"
+            "• Authentic sweat texture.\n"
+            "• Focused emotional intensity.\n\n"
+            "WARDROBE:\n"
+            "• Technical performance wear.\n"
+            "• Structured athletic silhouettes.\n"
+            "• Premium activewear realism.\n\n"
+            "ENVIRONMENT:\n"
+            "• Minimal futuristic training environments.\n"
+            "• Industrial athletic spaces.\n"
+            "• Atmospheric performance settings.\n\n"
+            "LIGHTING:\n"
+            "• High-contrast cinematic lighting.\n"
+            "• Reflective sweat highlights.\n"
+            "• Energetic shadow depth.\n\n"
+            "TYPOGRAPHY:\n"
+            "• Bold performance typography with directional hierarchy.\n\n"
+            "TEXTURE:\n"
+            "• Fabric realism.\n"
+            "• Sweat detail.\n"
+            "• Subtle motion blur.\n"
+            "• Performance atmosphere.\n\n"
+            "COLOR SYSTEM:\n"
+            "• Monochrome technical palette with restrained energy accents.\n\n"
+            "MOOD:\n"
+            "• Disciplined. Powerful. Focused. Elite.\n\n"
+            "QUALITY:\n"
+            "• Nike-level campaign realism.\n"
+            "• Hollywood sports cinematography.\n"
+            "• Premium athletic fashion art direction."
+        ),
+    },
+
+    "vintage_luxury_revival": {
+        "name": "Vintage Luxury Revival",
+        "description": "Timeless luxury fashion fused with cinematic nostalgic realism.",
+        "industry_tags": ["fashion_ecommerce", "beauty_wellness", "general_other"],
+        "style_type": "marketing_template",
+        "template_category": "fashion",
+        "prompt_fragment": (
+            "Create a premium fashion campaign visual in a Vintage Luxury Revival aesthetic for [BRAND/PRODUCT].\n\n"
+            "STYLE:\n"
+            "• Timeless luxury fashion fused with cinematic nostalgic realism.\n\n"
+            "VISUAL LANGUAGE:\n"
+            "• Classic elegance.\n"
+            "• Emotional permanence.\n"
+            "• Old-world sophistication.\n\n"
+            "COMPOSITION:\n"
+            "• Refined editorial framing.\n"
+            "• Balanced visual hierarchy.\n"
+            "• Cinematic environmental storytelling.\n\n"
+            "SUBJECT:\n"
+            "• Realistic African model with mature understated confidence.\n"
+            "• Natural realism.\n"
+            "• Elegant body language.\n\n"
+            "WARDROBE:\n"
+            "• Tailored vintage-inspired luxury styling.\n"
+            "• Classic silhouettes.\n"
+            "• Premium material emphasis.\n\n"
+            "ENVIRONMENT:\n"
+            "• Elegant architectural interiors.\n"
+            "• Vintage luxury environments.\n"
+            "• Warm cinematic atmosphere.\n\n"
+            "LIGHTING:\n"
+            "• Warm film-style lighting.\n"
+            "• Soft nostalgic glow.\n"
+            "• Classic shadow realism.\n\n"
+            "TYPOGRAPHY:\n"
+            "• Elegant serif and minimalist editorial typography combination.\n\n"
+            "TEXTURE:\n"
+            "• Film grain.\n"
+            "• Vintage realism.\n"
+            "• Premium material detail.\n\n"
+            "COLOR SYSTEM:\n"
+            "• Warm browns, cream tones, muted blacks, deep gold accents.\n\n"
+            "MOOD:\n"
+            "• Timeless. Elegant. Nostalgic. Refined.\n\n"
+            "QUALITY:\n"
+            "• Luxury heritage fashion campaign realism.\n"
+            "• Classic fashion-film cinematography.\n"
+            "• Premium editorial storytelling."
+        ),
+    },
+
+    "hyper_commercial_fashion": {
+        "name": "Hyper-Commercial Fashion",
+        "description": "High-energy commercial fashion advertising fused with cinematic product realism.",
+        "industry_tags": ["fashion_ecommerce", "beauty_wellness", "general_other"],
+        "style_type": "marketing_template",
+        "template_category": "fashion",
+        "prompt_fragment": (
+            "Create a premium fashion campaign visual in a Hyper-Commercial Fashion Impact aesthetic for [BRAND/PRODUCT].\n\n"
+            "STYLE:\n"
+            "• High-energy commercial fashion advertising fused with cinematic product realism.\n\n"
+            "VISUAL LANGUAGE:\n"
+            "• Attention-dominant composition.\n"
+            "• Bold campaign hierarchy.\n"
+            "• Mass-market visual desirability.\n\n"
+            "COMPOSITION:\n"
+            "• Large hero framing.\n"
+            "• Aggressive typography balance.\n"
+            "• Clear visual focal hierarchy.\n\n"
+            "SUBJECT:\n"
+            "• Realistic African fashion model with energetic expressive confidence.\n"
+            "• Commercial-grade realism.\n"
+            "• Natural skin detail.\n\n"
+            "WARDROBE:\n"
+            "• Trend-forward fashion styling.\n"
+            "• Bold silhouette emphasis.\n"
+            "• Product visibility prioritization.\n\n"
+            "LIGHTING:\n"
+            "• Bright commercial studio lighting.\n"
+            "• High-definition fashion realism.\n"
+            "• Strong reflective contrast.\n\n"
+            "TYPOGRAPHY:\n"
+            "• Oversized bold typography optimized for readability and impact.\n\n"
+            "TEXTURE:\n"
+            "• Ultra-clean realism.\n"
+            "• Sharp textile detail.\n"
+            "• Commercial-grade polish.\n\n"
+            "COLOR SYSTEM:\n"
+            "• High-contrast palette with strong campaign accent colors.\n\n"
+            "MOOD:\n"
+            "• Exciting. Bold. Desirable. High-energy.\n\n"
+            "QUALITY:\n"
+            "• Global commercial fashion campaign quality.\n"
+            "• Super Bowl advertising realism.\n"
+            "• Premium e-commerce art direction."
+        ),
+    },
+
+    "romantic_noir_fashion": {
+        "name": "Romantic Noir Fashion",
+        "description": "Luxury sensual fashion fused with cinematic noir editorial realism.",
+        "industry_tags": ["fashion_ecommerce", "beauty_wellness", "events_entertainment"],
+        "style_type": "marketing_template",
+        "template_category": "fashion",
+        "prompt_fragment": (
+            "Create a premium fashion campaign visual in a Romantic Noir Fashion aesthetic for [BRAND/PRODUCT].\n\n"
+            "STYLE:\n"
+            "• Luxury sensual fashion fused with cinematic noir editorial realism.\n\n"
+            "VISUAL LANGUAGE:\n"
+            "• Emotional mystery.\n"
+            "• Dark elegance.\n"
+            "• Intimate sophistication.\n\n"
+            "COMPOSITION:\n"
+            "• Close cinematic framing.\n"
+            "• Layered shadow composition.\n"
+            "• Emotionally charged visual balance.\n\n"
+            "SUBJECT:\n"
+            "• Realistic African model with magnetic understated emotional presence.\n"
+            "• Natural skin realism.\n"
+            "• Subtle sensual body language.\n\n"
+            "WARDROBE:\n"
+            "• Elegant eveningwear or luxury sensual styling.\n"
+            "• Textural richness.\n"
+            "• Flowing silhouettes.\n\n"
+            "ENVIRONMENT:\n"
+            "• Dark cinematic interiors.\n"
+            "• Luxury nightlife atmosphere.\n"
+            "• Velvet-like environmental realism.\n\n"
+            "LIGHTING:\n"
+            "• Low-key cinematic lighting.\n"
+            "• Soft reflective highlights.\n"
+            "• Shadow-heavy atmosphere.\n\n"
+            "TYPOGRAPHY:\n"
+            "• Elegant luxury editorial typography with restrained placement.\n\n"
+            "TEXTURE:\n"
+            "• Velvet shadow realism.\n"
+            "• Film grain.\n"
+            "• Luxury fabric detail.\n\n"
+            "COLOR SYSTEM:\n"
+            "• Deep blacks, burgundy, muted gold, dark chocolate tones.\n\n"
+            "MOOD:\n"
+            "• Seductive. Mysterious. Elegant. Emotional.\n\n"
+            "QUALITY:\n"
+            "• Luxury perfume-campaign realism.\n"
+            "• Hollywood noir cinematography.\n"
+            "• Premium couture art direction."
+        ),
+    },
+
+    # ── PRODUCT VISUAL STYLES (5 styles) ────────────────────────────
+
+    "elemental_explosion_realism": {
+        "name": "Elemental Explosion Realism",
+        "description": "Hyper-commercial product advertising fused with cinematic high-speed physics realism.",
+        "industry_tags": ["food_beverage", "beauty_wellness", "general_other"],
+        "style_type": "marketing_template",
+        "template_category": "product",
+        "prompt_fragment": (
+            "Create a premium product campaign visual in an Elemental Explosion Realism aesthetic for [PRODUCT].\n\n"
+            "STYLE:\n"
+            "• Hyper-commercial product advertising fused with cinematic high-speed physics realism.\n\n"
+            "VISUAL LANGUAGE:\n"
+            "• The product is the calm center of an explosive sensory environment.\n"
+            "• The surrounding world reacts violently to the product's energy.\n\n"
+            "COMPOSITION:\n"
+            "• Product positioned dead center as the dominant visual hero.\n"
+            "• Dynamic outward explosion composition.\n"
+            "• Liquid, particles, smoke, powder, or ingredient fragments erupt outward from the product.\n\n"
+            "PHYSICS:\n"
+            "• Frozen high-speed motion.\n"
+            "• Individual droplets sharply visible.\n"
+            "• Controlled explosion symmetry.\n\n"
+            "ENVIRONMENT:\n"
+            "• The environment behaves as if transformed by the product itself.\n\n"
+            "LIGHTING:\n"
+            "• Commercial studio backlighting.\n"
+            "• Cinematic rim lighting.\n"
+            "• Bright reflective highlights.\n"
+            "• Ultra-sharp texture illumination.\n\n"
+            "TEXTURE:\n"
+            "• Hyper-detailed liquid realism.\n"
+            "• Sharp particle definition.\n"
+            "• Visible condensation and surface texture.\n\n"
+            "COLOR SYSTEM:\n"
+            "• Color palette derived from the product ingredients and branding.\n\n"
+            "MOOD:\n"
+            "• Explosive. Fresh. Powerful. Sensory.\n\n"
+            "QUALITY:\n"
+            "• Shot like a Super Bowl commercial.\n"
+            "• 1/5000-second high-speed photography realism.\n"
+            "• Hollywood commercial art direction."
+        ),
+    },
+
+    "monumental_product_worship": {
+        "name": "Monumental Product Worship",
+        "description": "Luxury product advertising fused with cinematic monumental reverence.",
+        "industry_tags": ["fashion_ecommerce", "beauty_wellness", "food_beverage", "general_other"],
+        "style_type": "marketing_template",
+        "template_category": "product",
+        "prompt_fragment": (
+            "Create a premium product campaign visual in a Monumental Product Worship aesthetic for [PRODUCT].\n\n"
+            "STYLE:\n"
+            "• Luxury product advertising fused with cinematic monumental reverence.\n\n"
+            "VISUAL LANGUAGE:\n"
+            "• The product feels sacred, iconic, and larger than life.\n"
+            "• The environment exists to glorify the object.\n\n"
+            "COMPOSITION:\n"
+            "• Heroic central framing.\n"
+            "• Low-angle cinematic perspective.\n"
+            "• Massive environmental scale surrounding the product.\n\n"
+            "ENVIRONMENT:\n"
+            "• Architectural or atmospheric environments behaving like temples to the product.\n\n"
+            "LIGHTING:\n"
+            "• Divine spotlighting.\n"
+            "• Volumetric atmospheric glow.\n"
+            "• Controlled luxury reflections.\n\n"
+            "TEXTURE:\n"
+            "• Extreme material realism.\n"
+            "• Luxury surface detail obsession.\n"
+            "• Premium tactile visibility.\n\n"
+            "COLOR SYSTEM:\n"
+            "• Deep blacks, metallic tones, warm golds, muted luxury accents.\n\n"
+            "MOOD:\n"
+            "• Powerful. Sacred. Expensive. Iconic.\n\n"
+            "QUALITY:\n"
+            "• Luxury flagship advertising realism.\n"
+            "• Hollywood cinematic rendering.\n"
+            "• Global luxury campaign art direction."
+        ),
+    },
+
+    "ingredient_world_immersion": {
+        "name": "Ingredient World Immersion",
+        "description": "Luxury ingredient-focused advertising fused with cinematic organic realism.",
+        "industry_tags": ["food_beverage", "beauty_wellness", "general_other"],
+        "style_type": "marketing_template",
+        "template_category": "product",
+        "prompt_fragment": (
+            "Create a premium product campaign visual in an Ingredient World Immersion aesthetic for [PRODUCT].\n\n"
+            "STYLE:\n"
+            "• Luxury ingredient-focused advertising fused with cinematic organic realism.\n\n"
+            "VISUAL LANGUAGE:\n"
+            "• The product exists naturally inside an immersive world built from its ingredients and sensory identity.\n\n"
+            "COMPOSITION:\n"
+            "• Product integrated organically into ingredient environments.\n"
+            "• Layered sensory framing.\n"
+            "• Natural compositional flow.\n\n"
+            "ENVIRONMENT:\n"
+            "• Oversized realistic ingredients surrounding the product.\n"
+            "• Ingredient landscapes behaving like immersive worlds.\n\n"
+            "LIGHTING:\n"
+            "• Natural cinematic lighting.\n"
+            "• Fresh reflective highlights.\n"
+            "• Organic atmospheric realism.\n\n"
+            "TEXTURE:\n"
+            "• Hyper-detailed ingredient realism.\n"
+            "• Visible moisture, texture, fibers, and natural imperfections.\n\n"
+            "COLOR SYSTEM:\n"
+            "• Entire palette derived from the product ingredients.\n\n"
+            "MOOD:\n"
+            "• Fresh. Organic. Sensory. Authentic.\n\n"
+            "QUALITY:\n"
+            "• Luxury food and beauty campaign realism.\n"
+            "• Macro commercial photography quality.\n"
+            "• Premium sensory art direction."
+        ),
+    },
+
+    "atmospheric_luxury_suspension": {
+        "name": "Atmospheric Luxury Suspension",
+        "description": "Luxury minimalist advertising fused with atmospheric cinematic elegance.",
+        "industry_tags": ["fashion_ecommerce", "beauty_wellness", "general_other"],
+        "style_type": "marketing_template",
+        "template_category": "product",
+        "prompt_fragment": (
+            "Create a premium product campaign visual in an Atmospheric Luxury Suspension aesthetic for [PRODUCT].\n\n"
+            "STYLE:\n"
+            "• Luxury minimalist advertising fused with atmospheric cinematic elegance.\n\n"
+            "VISUAL LANGUAGE:\n"
+            "• The product floats in a refined emotional atmosphere.\n"
+            "• Controlled luxury minimalism.\n"
+            "• Elegant visual stillness.\n\n"
+            "COMPOSITION:\n"
+            "• Centered suspended product.\n"
+            "• Large negative space.\n"
+            "• Minimal environmental distraction.\n\n"
+            "ENVIRONMENT:\n"
+            "• Atmospheric luxury void.\n"
+            "• Soft haze.\n"
+            "• Minimal abstract dimensionality.\n\n"
+            "LIGHTING:\n"
+            "• Soft cinematic glow.\n"
+            "• Controlled reflective highlights.\n"
+            "• Elegant shadow gradients.\n\n"
+            "TEXTURE:\n"
+            "• Extreme material realism.\n"
+            "• Luxury reflective control.\n"
+            "• Subtle atmospheric depth.\n\n"
+            "COLOR SYSTEM:\n"
+            "• Muted monochrome luxury palette with restrained accent tones.\n\n"
+            "MOOD:\n"
+            "• Elegant. Calm. Sophisticated. Exclusive.\n\n"
+            "QUALITY:\n"
+            "• Luxury perfume-campaign realism.\n"
+            "• Medium-format studio photography.\n"
+            "• Global premium advertising art direction."
+        ),
+    },
+
+    "cinematic_narrative_product_scene": {
+        "name": "Cinematic Narrative Product Scene",
+        "description": "Lifestyle storytelling fused with cinematic commercial realism.",
+        "industry_tags": ["food_beverage", "beauty_wellness", "fashion_ecommerce", "general_other"],
+        "style_type": "marketing_template",
+        "template_category": "product",
+        "prompt_fragment": (
+            "Create a premium product campaign visual in a Cinematic Narrative Product Scene aesthetic for [PRODUCT].\n\n"
+            "STYLE:\n"
+            "• Lifestyle storytelling fused with cinematic commercial realism.\n\n"
+            "VISUAL LANGUAGE:\n"
+            "• The product exists naturally within a beautiful emotionally resonant human moment.\n\n"
+            "COMPOSITION:\n"
+            "• Story-driven framing.\n"
+            "• Natural environmental balance.\n"
+            "• Product positioned as the emotional anchor of the scene.\n\n"
+            "SUBJECTS:\n"
+            "• Realistic African human subjects with authentic emotional interaction.\n\n"
+            "ENVIRONMENT:\n"
+            "• Real lived-in environments.\n"
+            "• Natural lifestyle realism.\n"
+            "• Subtle environmental storytelling.\n\n"
+            "LIGHTING:\n"
+            "• Warm cinematic realism.\n"
+            "• Natural practical lighting.\n"
+            "• Emotional atmospheric depth.\n\n"
+            "TEXTURE:\n"
+            "• Realistic environmental imperfections.\n"
+            "• Natural skin detail.\n"
+            "• Authentic material realism.\n\n"
+            "COLOR SYSTEM:\n"
+            "• Warm emotionally cohesive palette derived from the scene atmosphere.\n\n"
+            "MOOD:\n"
+            "• Human. Aspirational. Emotional. Believable.\n\n"
+            "QUALITY:\n"
+            "• Luxury lifestyle advertising realism.\n"
+            "• Netflix-commercial cinematography.\n"
+            "• Premium brand storytelling art direction."
+        ),
+    },
 }
 
 
@@ -1714,6 +3251,11 @@ INDUSTRY_STYLE_MAP: Dict[str, List[str]] = {
         "art_luxury_showroom", "art_neon_underground", "art_golden_throne",
         "art_fire_smoke", "art_workshop_craft", "art_velvet_stage", "art_sunset_canvas",
         "art_street_market",
+        # Fashion Visual Style Guides 2026 (10 styles)
+        "neo_luxury_street", "afro_cinematic_fashion", "hyper_minimal_fashion",
+        "raw_youth_culture", "dreamlike_fashion_surrealism", "coastal_luxury_escape",
+        "performance_futurism", "vintage_luxury_revival", "hyper_commercial_fashion",
+        "romantic_noir_fashion",
     ],
     "food_beverage": [
         "overhead_feast", "dark_moody_food", "bright_fresh", "street_food_energy",
@@ -1724,6 +3266,10 @@ INDUSTRY_STYLE_MAP: Dict[str, List[str]] = {
         # Art-Piece Poster styles (9:16 Mobile Wallpaper)
         "art_ingredient_explosion", "art_frozen_impact", "art_fire_smoke",
         "art_workshop_craft", "art_street_market", "art_ocean_surface",
+        # Product Visual Style Guides 2026 (5 styles)
+        "elemental_explosion_realism", "monumental_product_worship",
+        "ingredient_world_immersion", "atmospheric_luxury_suspension",
+        "cinematic_narrative_product_scene",
     ],
     "fintech_saas_tech": [
         "corporate_gradient", "data_visual", "trust_builder", "minimal_tech",
@@ -1737,6 +3283,12 @@ INDUSTRY_STYLE_MAP: Dict[str, List[str]] = {
         "svc_stat_grid", "svc_newsletter_teaser", "svc_client_logo_showcase", "svc_hiring_card",
         # Art-Piece Poster styles (9:16 Mobile Wallpaper)
         "art_neon_underground", "art_tech_orbit",
+        # Startup/SaaS Visual Style Guides 2026 (13 styles)
+        "strategic_collage_editorial", "premium_utility_minimalism", "neo_brutalist_startup",
+        "cinematic_startup_realism", "futuristic_enterprise_glow", "quiet_luxury_saas",
+        "kinetic_startup_energy", "afro_futurist_enterprise", "founder_documentary",
+        "intelligent_interface_surrealism", "tactical_workspace_realism",
+        "internet_culture_maximalism", "optimistic_human_future",
     ],
     "beauty_wellness": [
         "glow_up", "soft_pastel", "bold_glam", "clean_clinical",
@@ -1751,6 +3303,10 @@ INDUSTRY_STYLE_MAP: Dict[str, List[str]] = {
         # Art-Piece Poster styles (9:16 Mobile Wallpaper)
         "art_nature_immersion", "art_ingredient_explosion", "art_botanical_garden",
         "art_crystal_cave", "art_ocean_surface",
+        # Product Visual Style Guides 2026 (5 styles)
+        "elemental_explosion_realism", "monumental_product_worship",
+        "ingredient_world_immersion", "atmospheric_luxury_suspension",
+        "cinematic_narrative_product_scene",
     ],
     "real_estate": [
         "property_showcase", "luxury_listing", "neighbourhood_life",
@@ -1815,6 +3371,10 @@ INDUSTRY_STYLE_MAP: Dict[str, List[str]] = {
         "art_luxury_showroom", "art_neon_underground", "art_golden_throne",
         "art_fire_smoke", "art_crystal_cave", "art_workshop_craft",
         "art_velvet_stage", "art_tech_orbit", "art_sunset_canvas", "art_street_market",
+        # Visual Style Guides 2026 (Representative selection)
+        "strategic_collage_editorial", "premium_utility_minimalism", "cinematic_startup_realism",
+        "neo_luxury_street", "afro_cinematic_fashion", "hyper_minimal_fashion",
+        "elemental_explosion_realism", "monumental_product_worship", "atmospheric_luxury_suspension",
     ],
     "perfume_fragrance": [
         "perf_editorial_ingredient", "perf_noir_luxe", "perf_golden_hour_romance",

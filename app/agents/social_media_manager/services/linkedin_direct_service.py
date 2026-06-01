@@ -301,3 +301,26 @@ class LinkedInDirectService:
             r.raise_for_status()
             post_id = r.headers.get("x-restli-id") or r.headers.get("Location", "")
             return {"post_id": post_id}
+
+    async def get_post_social_actions(self, access_token: str, post_urn: str) -> Dict[str, Any]:
+        """
+        Fetch likes + comments for a post the authenticated user owns.
+        Works with w_member_social scope.
+        post_urn: e.g. "urn:li:ugcPost:123456789"
+        Returns {"likes": int, "comments": int}.
+        """
+        encoded = urllib.parse.quote(post_urn, safe="")
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(
+                f"https://api.linkedin.com/v2/socialActions/{encoded}",
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "X-Restli-Protocol-Version": "2.0.0",
+                },
+            )
+            if r.status_code != 200:
+                return {"likes": 0, "comments": 0}
+            data = r.json()
+            likes = (data.get("likesSummary") or {}).get("totalLikes", 0)
+            comments = (data.get("commentsSummary") or {}).get("aggregatedTotalComments", 0)
+            return {"likes": likes, "comments": comments}

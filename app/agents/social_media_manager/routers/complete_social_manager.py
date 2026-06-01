@@ -587,6 +587,7 @@ async def facebook_direct_initiate(source: Optional[str] = Query("settings")):
     scopes = [
         "pages_show_list",
         "pages_read_engagement",
+        "read_insights",
         "pages_manage_posts",
         "pages_manage_metadata",
     ]
@@ -1781,7 +1782,11 @@ async def sync_image_across_drafts(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
     token: dict = Depends(JWTBearer()),
 ):
-    """Copy image_url from a source draft to one or more target drafts (same user only)."""
+    """
+    Copy images from a source draft to one or more target drafts (same user only).
+    For carousel drafts: syncs all slide image_urls (targets must have the same slide count).
+    For feed/story drafts: syncs the single image_url.
+    """
     user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
@@ -1790,26 +1795,59 @@ async def sync_image_across_drafts(
 
     source = await db["content_drafts"].find_one(
         {"id": request.source_draft_id, "user_id": user_id},
-        {"image_url": 1, "has_image": 1},
     )
     if not source:
         raise HTTPException(status_code=404, detail="Source draft not found")
 
-    image_url = source.get("image_url")
-    if not image_url:
-        raise HTTPException(status_code=422, detail="Source draft has no image yet")
-
     if not request.target_draft_ids:
         raise HTTPException(status_code=422, detail="No target draft IDs provided")
 
-    result = await db["content_drafts"].update_many(
-        {"id": {"$in": request.target_draft_ids}, "user_id": user_id},
-        {"$set": {"image_url": image_url, "has_image": True}},
-    )
+    is_carousel = source.get("post_type") == "carousel"
+    updated_count = 0
+    skipped = []
+
+    if is_carousel:
+        source_slides = source.get("slides") or []
+        if not source_slides or not any(s.get("image_url") for s in source_slides):
+            raise HTTPException(status_code=422, detail="Source carousel has no slide images yet")
+
+        source_image_urls = [s.get("image_url") for s in source_slides]
+
+        targets = await db["content_drafts"].find(
+            {"id": {"$in": request.target_draft_ids}, "user_id": user_id}
+        ).to_list(length=50)
+
+        for target in targets:
+            target_slides = target.get("slides") or []
+            if len(target_slides) != len(source_slides):
+                skipped.append({"id": target.get("id"), "reason": f"slide count mismatch ({len(target_slides)} vs {len(source_slides)})"})
+                continue
+
+            updated_slides = []
+            for i, slide in enumerate(target_slides):
+                updated_slides.append({**slide, "image_url": source_image_urls[i]})
+
+            await db["content_drafts"].update_one(
+                {"id": target.get("id"), "user_id": user_id},
+                {"$set": {"slides": updated_slides, "has_image": True, "updated_at": datetime.utcnow()}},
+            )
+            updated_count += 1
+    else:
+        image_url = source.get("image_url")
+        if not image_url:
+            raise HTTPException(status_code=422, detail="Source draft has no image yet")
+
+        result = await db["content_drafts"].update_many(
+            {"id": {"$in": request.target_draft_ids}, "user_id": user_id},
+            {"$set": {"image_url": image_url, "has_image": True, "updated_at": datetime.utcnow()}},
+        )
+        updated_count = result.modified_count
 
     return UriResponse.get_single_data_response("sync_image", {
-        "updated_count": result.modified_count,
+        "updated_count": updated_count,
         "source_draft_id": request.source_draft_id,
+        "is_carousel": is_carousel,
+        "skipped": skipped,
     })
 
 
@@ -1944,8 +1982,8 @@ async def get_scheduled_content(
 
         scheduled_drafts = await db["content_drafts"].find({
             "$or": [
-                {"user_id": user_id, "status": "scheduled"},
-                {"request_id": {"$in": request_ids}, "status": "scheduled"},
+                {"user_id": user_id, "status": {"$in": ["scheduled", "publish_failed"]}},
+                {"request_id": {"$in": request_ids}, "status": {"$in": ["scheduled", "publish_failed"]}},
             ]
         }).sort("scheduled_date", 1).to_list(length=100)
 
@@ -2373,12 +2411,27 @@ async def get_performance(
 
     try:
         date_filter = datetime.utcnow() - timedelta(days=days)
-        published = await db["content_drafts"].find({
+
+        # Fetch all published drafts — filter date in Python to handle both
+        # datetime objects (real posts) and ISO strings (seeded/legacy posts)
+        all_published = await db["content_drafts"].find({
             "user_id": user_id,
             "status": "published",
-            "platform_post_id": {"$exists": True, "$ne": None},
-            "published_date": {"$gte": date_filter},
-        }).sort("published_date", -1).to_list(length=50)
+        }).sort("published_date", -1).to_list(length=200)
+
+        def _is_recent(d):
+            pd = d.get("published_date")
+            if pd is None:
+                return False
+            if isinstance(pd, datetime):
+                return pd.replace(tzinfo=None) >= date_filter
+            try:
+                from dateutil.parser import parse as _dp
+                return _dp(str(pd)).replace(tzinfo=None) >= date_filter
+            except Exception:
+                return True
+
+        published = [d for d in all_published if _is_recent(d)]
 
         if not published:
             return UriResponse.get_single_data_response("performance", {
@@ -2390,15 +2443,210 @@ async def get_performance(
                 "top_posts": [],
             })
 
-        # Load all direct (non-Outstand) connections so we can use their tokens
+        # Load direct connections — for platform routing
         direct_conns = await db["social_connections"].find(
             {"user_id": user_id, "connected_via": {"$ne": "outstand"}},
-            {"_id": 0, "platform": 1, "connected_via": 1, "page_access_token": 1, "ig_user_id": 1},
+            {"_id": 0, "platform": 1, "connected_via": 1, "page_access_token": 1,
+             "ig_user_id": 1, "linkedin_access_token": 1},
         ).to_list(length=20)
         direct_conn_map = {c["platform"]: c for c in direct_conns}
 
+        # Load ANY Instagram connection that has a page_access_token (incl. Outstand-linked)
+        # so we can look up media from Instagram even for Outstand-published posts.
+        all_ig_conns = await db["social_connections"].find(
+            {"user_id": user_id, "platform": "instagram", "page_access_token": {"$exists": True}},
+            {"_id": 0, "ig_user_id": 1, "page_access_token": 1},
+        ).to_list(length=5)
+        ig_direct = next((c for c in all_ig_conns if c.get("ig_user_id") and c.get("page_access_token")), None)
+
+        # Load Facebook direct connection for per-post analytics (same pattern as ig_direct)
+        all_fb_conns = await db["social_connections"].find(
+            {"user_id": user_id, "platform": "facebook", "page_access_token": {"$exists": True}},
+            {"_id": 0, "page_id": 1, "page_access_token": 1},
+        ).to_list(length=5)
+        fb_direct = next((c for c in all_fb_conns if c.get("page_id") and c.get("page_access_token")), None)
+
         outstand = OutstandService()
         _graph_base = f"https://graph.facebook.com/{settings.FACEBOOK_API_VERSION}"
+
+        async def _fetch_instagram_by_timestamp(draft, conn):
+            """Find a published IG post by matching the draft's published_date to media timestamps.
+            Used for Outstand posts where platform_post_id is an Outstand UUID, not an IG media ID."""
+            ig_user_id = conn.get("ig_user_id")
+            token = conn.get("page_access_token")
+            pub_date = draft.get("published_date")
+            if not ig_user_id or not token or not pub_date:
+                return None
+            try:
+                from dateutil.parser import parse as _dp
+                pub_dt = _dp(str(pub_date)) if isinstance(pub_date, str) else pub_date
+                pub_dt = pub_dt.replace(tzinfo=None)
+            except Exception:
+                return None
+            try:
+                async with _httpx.AsyncClient(timeout=20) as _c:
+                    media_resp = await _c.get(
+                        f"{_graph_base}/{ig_user_id}/media",
+                        params={"fields": "id,timestamp,like_count,comments_count,media_type,media_product_type", "limit": 100, "access_token": token},
+                    )
+                    media_list = media_resp.json().get("data", [])
+
+                    best_match = None
+                    best_diff = float("inf")
+                    for m in media_list:
+                        try:
+                            m_dt = _dp(m["timestamp"]).replace(tzinfo=None)
+                            diff = abs((pub_dt - m_dt).total_seconds())
+                            if diff < 3600 and diff < best_diff:  # within 1 hour
+                                best_diff = diff
+                                best_match = m
+                        except Exception:
+                            pass
+
+                    if not best_match:
+                        return None
+
+                    media_id = best_match["id"]
+                    media_type = best_match.get("media_type", "IMAGE")
+                    media_product_type = best_match.get("media_product_type", "")
+                    is_reel = media_product_type == "REELS" or media_type == "REELS"
+                    is_video = media_type == "VIDEO" and not is_reel
+
+                    if is_reel:
+                        metrics = "plays,reach,likes,comments,shares,saved,total_interactions"
+                    elif is_video:
+                        metrics = "reach,saved,video_views,total_interactions"
+                    else:
+                        metrics = "reach,saved,total_interactions"
+
+                    impressions = reach = views = 0
+                    try:
+                        ins_resp = await _c.get(
+                            f"{_graph_base}/{media_id}/insights",
+                            params={"metric": metrics, "period": "lifetime", "access_token": token},
+                        )
+                        ins_data_ts = ins_resp.json()
+                        if "error" in ins_data_ts:
+                            print(f"⚠️ IG insights error for {media_id}: {ins_data_ts['error'].get('message')} (code {ins_data_ts['error'].get('code')})")
+                        else:
+                            for item in ins_data_ts.get("data", []):
+                                val = item.get("total_value", {}).get("value") or \
+                                      (item.get("values") or [{}])[0].get("value", 0)
+                                name = item["name"]
+                                if name == "impressions":
+                                    impressions = val
+                                elif name == "reach":
+                                    reach = val
+                                    impressions = impressions or val
+                                elif name in ("plays", "video_views"):
+                                    views = val
+                    except Exception as ins_e:
+                        print(f"⚠️ IG timestamp-lookup insights failed for {media_id}: {ins_e}")
+
+                    likes = best_match.get("like_count", 0)
+                    comments = best_match.get("comments_count", 0)
+                    effective_reach = reach or impressions
+                    print(f"[IG timestamp match] draft={draft.get('id')} media_id={media_id} diff={best_diff:.0f}s imp={impressions} reach={reach}")
+                    return {
+                        "draft_id": draft.get("id"),
+                        "platform_post_id": media_id,
+                        "platform": "instagram",
+                        "content_preview": (draft.get("content") or "")[:120],
+                        "published_at": draft.get("published_date", ""),
+                        "image_url": draft.get("image_url"),
+                        "likes": likes,
+                        "comments": comments,
+                        "shares": 0,
+                        "views": views,
+                        "impressions": impressions,
+                        "reach": reach,
+                        "engagement_rate": round(((likes + comments) / effective_reach) * 100, 2) if effective_reach else None,
+                    }
+            except Exception as e:
+                print(f"⚠️ Instagram timestamp lookup failed: {e}")
+                return None
+
+        async def _fetch_facebook_by_timestamp(draft, conn):
+            """Find a published Facebook post by matching the draft's published_date to page post timestamps.
+            Used for Outstand posts where platform_post_id is an Outstand UUID, not a FB post ID."""
+            page_id = conn.get("page_id")
+            token = conn.get("page_access_token")
+            pub_date = draft.get("published_date")
+            if not page_id or not token or not pub_date:
+                return None
+            try:
+                from dateutil.parser import parse as _dp
+                pub_dt = _dp(str(pub_date)) if isinstance(pub_date, str) else pub_date
+                pub_dt = pub_dt.replace(tzinfo=None)
+            except Exception:
+                return None
+            try:
+                async with _httpx.AsyncClient(timeout=20) as _c:
+                    posts_resp = await _c.get(
+                        f"{_graph_base}/{page_id}/posts",
+                        params={
+                            "fields": "id,created_time,reactions.summary(total_count),comments.summary(total_count),shares",
+                            "limit": 100,
+                            "access_token": token,
+                        },
+                    )
+                    posts_data = posts_resp.json().get("data", [])
+
+                    best_match = None
+                    best_diff = float("inf")
+                    for p in posts_data:
+                        try:
+                            p_dt = _dp(p["created_time"]).replace(tzinfo=None)
+                            diff = abs((pub_dt - p_dt).total_seconds())
+                            if diff < 3600 and diff < best_diff:
+                                best_diff = diff
+                                best_match = p
+                        except Exception:
+                            pass
+
+                    if not best_match:
+                        return None
+
+                    fb_post_id = best_match["id"]
+                    likes = (best_match.get("reactions") or {}).get("summary", {}).get("total_count", 0)
+                    comments = (best_match.get("comments") or {}).get("summary", {}).get("total_count", 0)
+                    shares = (best_match.get("shares") or {}).get("count", 0)
+
+                    impressions = reach = 0
+                    try:
+                        ins_resp = await _c.get(
+                            f"{_graph_base}/{fb_post_id}/insights",
+                            params={"metric": "post_impressions,post_impressions_unique", "access_token": token},
+                        )
+                        for item in ins_resp.json().get("data", []):
+                            val = (item.get("values") or [{}])[-1].get("value", 0)
+                            if item.get("name") == "post_impressions":
+                                impressions = val
+                            elif item.get("name") == "post_impressions_unique":
+                                reach = val
+                    except Exception as ins_e:
+                        print(f"⚠️ FB post insights failed for {fb_post_id}: {ins_e}")
+
+                    effective = reach or impressions or 1
+                    print(f"[FB timestamp match] draft={draft.get('id')} post_id={fb_post_id} diff={best_diff:.0f}s imp={impressions} reach={reach}")
+                    return {
+                        "draft_id": draft.get("id"),
+                        "platform_post_id": fb_post_id,
+                        "platform": "facebook",
+                        "content_preview": (draft.get("content") or "")[:120],
+                        "published_at": draft.get("published_date", ""),
+                        "image_url": draft.get("image_url"),
+                        "likes": likes,
+                        "comments": comments,
+                        "shares": shares,
+                        "views": impressions,
+                        "impressions": impressions,
+                        "reach": reach,
+                        "engagement_rate": round(((likes + comments + shares) / effective) * 100, 2) if effective else None,
+                    }
+            except Exception as e:
+                print(f"⚠️ Facebook timestamp lookup failed: {e}")
+                return None
 
         async def _fetch_instagram_direct(draft, conn):
             media_id = draft.get("platform_post_id")
@@ -2409,30 +2657,64 @@ async def get_performance(
                 async with _httpx.AsyncClient(timeout=20) as _c:
                     media_resp = await _c.get(
                         f"{_graph_base}/{media_id}",
-                        params={"fields": "like_count,comments_count,timestamp,media_type", "access_token": token},
+                        params={"fields": "like_count,comments_count,timestamp,media_type,media_product_type", "access_token": token},
                     )
                     media_data = media_resp.json()
                     if "error" in media_data:
                         print(f"⚠️ IG media fetch error for {media_id}: {media_data['error'].get('message')}")
                         return None
 
-                    impressions = reach = 0
+                    media_type = media_data.get("media_type", "IMAGE")
+                    media_product_type = media_data.get("media_product_type", "")
+                    is_reel = media_product_type == "REELS" or media_type == "REELS"
+                    is_video = media_type == "VIDEO" and not is_reel
+
+                    # Instagram Graph API v22+ removed "impressions" from per-media insights.
+                    # Use "reach" + "total_interactions" for images/carousels.
+                    # Reels still support "plays" and "reach".
+                    if is_reel:
+                        metrics = "plays,reach,likes,comments,shares,saved,total_interactions"
+                    elif is_video:
+                        metrics = "reach,saved,video_views,total_interactions"
+                    else:
+                        # IMAGE / CAROUSEL_ALBUM — impressions removed in v22+
+                        metrics = "reach,saved,total_interactions"
+
+                    impressions = reach = views = total_interactions = 0
                     try:
                         ins_resp = await _c.get(
                             f"{_graph_base}/{media_id}/insights",
-                            params={"metric": "impressions,reach", "period": "lifetime", "access_token": token},
+                            params={"metric": metrics, "period": "lifetime", "access_token": token},
                         )
-                        for item in ins_resp.json().get("data", []):
-                            val = (item.get("values") or [{}])[0].get("value", 0)
-                            if item["name"] == "impressions":
-                                impressions = val
-                            elif item["name"] == "reach":
-                                reach = val
-                    except Exception:
-                        pass
+                        ins_data = ins_resp.json()
+                        if "error" in ins_data:
+                            print(f"⚠️ IG insights error for {media_id}: {ins_data['error'].get('message')} (code {ins_data['error'].get('code')})")
+                        else:
+                            for item in ins_data.get("data", []):
+                                val = item.get("total_value", {}).get("value") or \
+                                      (item.get("values") or [{}])[0].get("value", 0)
+                                name = item["name"]
+                                if name == "impressions":
+                                    impressions = val
+                                elif name == "reach":
+                                    reach = val
+                                    impressions = impressions or val  # use reach as impressions fallback
+                                elif name in ("plays", "video_views"):
+                                    views = val
+                                elif name == "total_interactions":
+                                    total_interactions = val
+                    except Exception as ins_err:
+                        print(f"⚠️ IG insights fetch failed for {media_id}: {ins_err}")
 
                 likes = media_data.get("like_count", 0)
                 comments = media_data.get("comments_count", 0)
+                effective_reach = reach or impressions
+                # Engagement rate is only meaningful when we have reach/impressions.
+                # Return null when unavailable so the frontend shows "N/A" not "0%".
+                if effective_reach:
+                    eng_rate = round(((likes + comments) / effective_reach) * 100, 2)
+                else:
+                    eng_rate = None
                 return {
                     "draft_id": draft.get("id"),
                     "platform_post_id": media_id,
@@ -2443,48 +2725,232 @@ async def get_performance(
                     "likes": likes,
                     "comments": comments,
                     "shares": 0,
-                    "views": 0,
+                    "views": views,
                     "impressions": impressions,
                     "reach": reach,
-                    "engagement_rate": round(((likes + comments) / max(reach, 1)) * 100, 2) if reach else 0,
+                    "engagement_rate": eng_rate,
+                    "insights_available": effective_reach > 0,
                 }
             except Exception as e:
                 print(f"⚠️ Instagram direct analytics failed for {media_id}: {e}")
                 return None
 
+        async def _analytics_fallback(draft):
+            """Read stored content_analytics as fallback when live API isn't available.
+            Always returns a result (with 0s if no stored data) so every published post
+            is counted in the by_platform breakdown."""
+            draft_id = draft.get("id")
+            if not draft_id:
+                return None
+            ana = await db["content_analytics"].find_one({"draft_id": draft_id})
+            likes       = int((ana or {}).get("likes", 0) or 0)
+            comments    = int((ana or {}).get("comments", 0) or 0)
+            shares      = int((ana or {}).get("shares", 0) or 0)
+            impressions = int((ana or {}).get("impressions", 0) or 0)
+            views       = int((ana or {}).get("views", 0) or 0)
+            reach       = int((ana or {}).get("reach", 0) or 0)
+            effective   = impressions or reach or 0
+            platform    = (ana or {}).get("platform") or draft.get("platform", "unknown")
+            return {
+                "draft_id": draft_id,
+                "platform_post_id": draft.get("platform_post_id") or "",
+                "platform": platform,
+                "content_preview": (draft.get("content") or "")[:120],
+                "published_at": draft.get("published_date", ""),
+                "image_url": draft.get("image_url"),
+                "likes": likes,
+                "comments": comments,
+                "shares": shares,
+                "views": views,
+                "impressions": impressions,
+                "reach": reach,
+                "engagement_rate": round(((likes + comments) / effective) * 100, 2) if effective else None,
+            }
+
+        import re as _re
+
         async def _fetch(draft):
             post_id = draft.get("platform_post_id")
             platform = draft.get("platform", "unknown")
-            if not post_id:
-                return None
+            # Outstand stores the NATIVE social media ID as platform_post_id (e.g. Instagram
+            # media IDs are 15-18 digit numbers).  Outstand's own internal post IDs are short
+            # base64 strings (EgFFA, ZxDCu) or LinkedIn URNs.
+            # Route numeric IG IDs directly to Instagram Graph API — Outstand analytics fails on them.
+            is_ig_media_id = bool(post_id and platform == "instagram" and _re.match(r'^\d{15,}$', str(post_id)))
+            # "queued" means Outstand accepted the post and will publish it (or already has).
+            # Treat queued + any publish_response as an Outstand-routed post.
+            is_outstand_post = bool(
+                draft.get("outstand_post_status")  # "queued", "published", etc.
+                or draft.get("publish_response")
+                or (post_id and isinstance(post_id, str) and post_id.startswith("urn:li:"))  # LinkedIn URN
+            )
 
-            # Route to direct Graph API for non-Outstand platforms
-            if platform in direct_conn_map:
-                return await _fetch_instagram_direct(draft, direct_conn_map[platform])
+            live_result = None
+            print(f"[_fetch] platform={platform} post_id={repr(post_id)} is_ig={is_ig_media_id} is_outstand={is_outstand_post}", flush=True)
 
-            try:
-                data = await outstand.get_post_analytics(post_id)
-                agg = data.get("aggregated_metrics") or {}
-                by_account = data.get("metrics_by_account") or []
-                network = by_account[0]["social_account"]["network"] if by_account else platform
-                return {
-                    "draft_id": draft.get("id"),
-                    "platform_post_id": post_id,
-                    "platform": network or platform,
-                    "content_preview": (draft.get("content") or "")[:120],
-                    "published_at": draft.get("published_date", ""),
-                    "image_url": draft.get("image_url"),
-                    "likes": agg.get("total_likes", 0),
-                    "comments": agg.get("total_comments", 0),
-                    "shares": agg.get("total_shares", 0),
-                    "views": agg.get("total_views", 0),
-                    "impressions": agg.get("total_impressions", 0),
-                    "reach": agg.get("total_reach", 0),
-                    "engagement_rate": round(agg.get("average_engagement_rate", 0) * 100, 2),
-                }
-            except Exception as e:
-                print(f"⚠️ Analytics fetch failed for post {post_id}: {e}")
-                return None
+            # Strategy 1: real Instagram media ID — use Graph API directly.
+            # Always run this when post_id looks like a real IG media ID (15+ digits),
+            # regardless of outstand_post_status — Outstand queues real IG media IDs too.
+            if post_id and platform == "instagram" and is_ig_media_id:
+                conn = ig_direct or direct_conn_map.get(platform)
+                if conn and conn.get("page_access_token"):
+                    live_result = await _fetch_instagram_direct(draft, conn)
+
+            # Strategy 2: Outstand-published post — get what Outstand has (likes/comments)
+            if live_result is None and post_id and is_outstand_post and not str(post_id).startswith("urn:li:"):
+                # Pre-check: if Outstand says the post failed to publish, skip analytics
+                # and mark the result so the frontend can surface the failure.
+                try:
+                    post_status_data = await outstand.get_post(post_id)
+                    outstand_post = post_status_data.get("post", {})
+                    _outstand_containers = outstand_post.get("socialAccounts") or []
+                    _any_failed = any(c.get("status") == "failed" for c in _outstand_containers)
+                    if _any_failed and not outstand_post.get("publishedAt"):
+                        _err = next((c.get("error") for c in _outstand_containers if c.get("status") == "failed"), "")
+                        print(f"[Outstand] post {post_id} failed to publish: {_err[:120]}")
+                        return {
+                            "draft_id": draft.get("id"),
+                            "platform_post_id": post_id,
+                            "platform": platform,
+                            "content_preview": (draft.get("content") or "")[:120],
+                            "published_at": draft.get("published_date", ""),
+                            "image_url": draft.get("image_url"),
+                            "likes": 0, "comments": 0, "shares": 0,
+                            "views": 0, "impressions": 0, "reach": 0,
+                            "engagement_rate": None,
+                            "publish_failed": True,
+                            "publish_error": _err[:200] if _err else "Post failed to publish",
+                        }
+                except Exception:
+                    pass  # non-critical — continue to analytics fetch
+                try:
+                    data = await outstand.get_post_analytics(post_id)
+                    agg = data.get("aggregated_metrics") or {}
+                    by_account = data.get("metrics_by_account") or []
+                    # Log the full response so we can see what fields Outstand actually returns
+                    print(f"[Outstand analytics] post_id={post_id} agg_keys={list(agg.keys())} agg={agg}")
+                    if by_account:
+                        print(f"[Outstand by_account] sample={by_account[0]}")
+                    network = by_account[0]["social_account"]["network"] if by_account else platform
+
+                    # Try multiple field name variants — Outstand may differ by plan/version
+                    def _pick(*keys):
+                        for k in keys:
+                            v = agg.get(k)
+                            if v:
+                                return int(v)
+                        # Also check per-account metrics
+                        for acc in by_account:
+                            m = acc.get("metrics") or acc.get("aggregated_metrics") or {}
+                            for k in keys:
+                                v = m.get(k)
+                                if v:
+                                    return int(v)
+                        return 0
+
+                    live_result = {
+                        "draft_id": draft.get("id"),
+                        "platform_post_id": post_id,
+                        "platform": network or platform,
+                        "content_preview": (draft.get("content") or "")[:120],
+                        "published_at": draft.get("published_date", ""),
+                        "image_url": draft.get("image_url"),
+                        "likes":       _pick("total_likes", "likes", "reactions_count"),
+                        "comments":    _pick("total_comments", "comments", "comments_count"),
+                        "shares":      _pick("total_shares", "shares", "reposts"),
+                        "views":       _pick("total_views", "views", "video_views", "plays"),
+                        "impressions": _pick("total_impressions", "impressions", "total_reach", "reach"),
+                        "reach":       _pick("total_reach", "reach", "unique_reach"),
+                        "engagement_rate": round(agg.get("average_engagement_rate", 0) * 100, 2),
+                    }
+                    print(f"[Outstand analytics mapped] likes={live_result['likes']} imp={live_result['impressions']} reach={live_result['reach']}")
+                except Exception as e:
+                    print(f"⚠️ Outstand analytics failed for post {post_id}: {e}")
+
+            # Strategy 2b: LinkedIn URN — query LinkedIn socialActions API directly
+            if live_result is None and platform == "linkedin" and post_id and str(post_id).startswith("urn:li:"):
+                li_conn = direct_conn_map.get("linkedin")
+                if not li_conn:
+                    li_conn_raw = await db["social_connections"].find_one(
+                        {"user_id": user_id, "platform": "linkedin", "connection_status": "active"},
+                        {"_id": 0, "linkedin_access_token": 1},
+                    )
+                    li_conn = li_conn_raw
+                if li_conn and li_conn.get("linkedin_access_token"):
+                    try:
+                        from app.agents.social_media_manager.services.linkedin_direct_service import LinkedInDirectService
+                        _li_svc = LinkedInDirectService()
+                        sa = await _li_svc.get_post_social_actions(li_conn["linkedin_access_token"], post_id)
+                        likes = sa.get("likes", 0)
+                        comments = sa.get("comments", 0)
+                        print(f"[LinkedIn direct] urn={post_id} likes={likes} comments={comments}", flush=True)
+                        live_result = {
+                            "draft_id": draft.get("id"),
+                            "platform_post_id": post_id,
+                            "platform": "linkedin",
+                            "content_preview": (draft.get("content") or "")[:120],
+                            "published_at": draft.get("published_date", ""),
+                            "image_url": draft.get("image_url"),
+                            "likes": likes,
+                            "comments": comments,
+                            "shares": 0,
+                            "views": 0,
+                            "impressions": 0,
+                            "reach": 0,
+                            "engagement_rate": None,
+                        }
+                    except Exception as _li_err:
+                        print(f"⚠️ LinkedIn direct analytics failed for {post_id}: {_li_err}", flush=True)
+
+            # Strategy 3: Instagram timestamp lookup — fills in impressions/reach that
+            # Outstand doesn't sync, by finding the actual IG media via published_date.
+            if platform == "instagram" and ig_direct:
+                needs_impressions = live_result is None or (live_result.get("impressions") or 0) == 0
+                if needs_impressions:
+                    ts_result = await _fetch_instagram_by_timestamp(draft, ig_direct)
+                    if ts_result:
+                        if live_result:
+                            # Merge: keep Outstand engagement counts, use IG for impressions/reach
+                            live_result["impressions"] = ts_result["impressions"]
+                            live_result["reach"] = ts_result.get("reach", 0)
+                            live_result["views"] = ts_result.get("views", 0)
+                            # Use IG likes/comments if Outstand had none
+                            if not live_result.get("likes"):
+                                live_result["likes"] = ts_result.get("likes", 0)
+                            if not live_result.get("comments"):
+                                live_result["comments"] = ts_result.get("comments", 0)
+                            effective = live_result["impressions"] or live_result["reach"] or 1
+                            live_result["engagement_rate"] = round(
+                                ((live_result["likes"] + live_result["comments"]) / effective) * 100, 2
+                            )
+                        else:
+                            live_result = ts_result
+
+            # Strategy 3b: Facebook timestamp lookup — same pattern as Instagram above.
+            if platform == "facebook" and fb_direct:
+                needs_fb_metrics = live_result is None or (live_result.get("impressions") or 0) == 0
+                if needs_fb_metrics:
+                    ts_result = await _fetch_facebook_by_timestamp(draft, fb_direct)
+                    if ts_result:
+                        if live_result:
+                            live_result["impressions"] = ts_result["impressions"]
+                            live_result["reach"] = ts_result.get("reach", 0)
+                            live_result["views"] = ts_result.get("impressions", 0)
+                            if not live_result.get("likes"):
+                                live_result["likes"] = ts_result.get("likes", 0)
+                            if not live_result.get("comments"):
+                                live_result["comments"] = ts_result.get("comments", 0)
+                            if not live_result.get("shares"):
+                                live_result["shares"] = ts_result.get("shares", 0)
+                            effective = live_result["impressions"] or live_result["reach"] or 1
+                            live_result["engagement_rate"] = round(
+                                ((live_result["likes"] + live_result["comments"] + live_result["shares"]) / effective) * 100, 2
+                            )
+                        else:
+                            live_result = ts_result
+
+            # Fall back to content_analytics when live API not available
+            return live_result or await _analytics_fallback(draft)
 
         results = await _asyncio.gather(*[_fetch(d) for d in published])
         posts = [r for r in results if r is not None]
@@ -2516,7 +2982,22 @@ async def get_performance(
 
         # Aggregate summary
         def _sum(key): return sum(p.get(key, 0) or 0 for p in posts)
+
+        def _build_insights_note(post_list):
+            platforms = {p.get("platform") for p in post_list}
+            if platforms == {"linkedin"} or platforms == {"linkedin", None}:
+                return (
+                    "LinkedIn's standard API does not provide impressions or engagement stats "
+                    "for personal profiles. Upgrade to LinkedIn Marketing API for full analytics."
+                )
+            if "instagram" in platforms:
+                return (
+                    "Impressions and reach require an Instagram Business or Creator account. "
+                    "Go to Instagram → Profile → Edit Profile → Switch to Professional Account."
+                )
+            return "Analytics will appear here once your posts have been live for at least 24 hours."
         total_posts = len(posts)
+        insights_available = any(p.get("insights_available") or (p.get("impressions") or 0) > 0 for p in posts)
         summary = {
             "total_posts": total_posts,
             "total_impressions": _sum("impressions"),
@@ -2528,6 +3009,8 @@ async def get_performance(
             "avg_engagement_rate": round(
                 sum(p.get("engagement_rate", 0) or 0 for p in posts) / total_posts, 2
             ) if total_posts else 0,
+            "insights_available": insights_available,
+            "insights_note": None if insights_available else _build_insights_note(posts),
         }
 
         # Per-platform breakdown
@@ -2587,8 +3070,12 @@ async def get_account_metrics(
         since_ts = int((datetime.utcnow() - timedelta(days=days)).timestamp())
 
         # ── Outstand accounts ─────────────────────────────────────────────────
-        result = await outstand.list_accounts(tenant_id=user_id)
-        outstand_accounts = result.get("data", [])
+        try:
+            result = await outstand.list_accounts(tenant_id=user_id)
+            outstand_accounts = result.get("data", [])
+        except Exception as _os_err:
+            print(f"⚠️ Outstand list_accounts failed in account-metrics (non-fatal): {_os_err}")
+            outstand_accounts = []
 
         async def _fetch_outstand_metrics(acc):
             account_id = acc.get("id")
@@ -2627,7 +3114,8 @@ async def get_account_metrics(
         # ── Direct (non-Outstand) connections ─────────────────────────────────
         direct_conns = await db["social_connections"].find(
             {"user_id": user_id, "connected_via": {"$ne": "outstand"}},
-            {"_id": 0, "platform": 1, "connected_via": 1, "page_access_token": 1, "ig_user_id": 1, "page_name": 1},
+            {"_id": 0, "platform": 1, "connected_via": 1, "page_access_token": 1,
+             "ig_user_id": 1, "page_name": 1, "page_id": 1, "account_name": 1},
         ).to_list(length=20)
 
         _graph_base = f"https://graph.facebook.com/{settings.FACEBOOK_API_VERSION}"
@@ -2648,15 +3136,47 @@ async def get_account_metrics(
                         print(f"⚠️ IG profile fetch error: {profile['error'].get('message')}")
                         return None
 
-                    # Aggregate engagement from published posts in the period
+                    # Account-level insights (impressions, reach, profile_views)
+                    total_impressions = total_reach = total_profile_views = 0
+                    try:
+                        # Try total_value period first (Meta's preferred format for date ranges)
+                        insights_resp = await _c.get(
+                            f"{_graph_base}/{ig_user_id}/insights",
+                            params={
+                                "metric": "impressions,reach,profile_views",
+                                "period": "total_value",
+                                "since": since_ts,
+                                "until": until_ts,
+                                "access_token": token,
+                            },
+                        )
+                        ins_data = insights_resp.json().get("data", [])
+                        for item in ins_data:
+                            name = item.get("name", "")
+                            # total_value format (newer)
+                            val = item.get("total_value", {}).get("value") or \
+                                  sum(v.get("value", 0) for v in (item.get("values") or []))
+                            if name == "impressions":
+                                total_impressions = val
+                            elif name == "reach":
+                                total_reach = val
+                            elif name == "profile_views":
+                                total_profile_views = val
+                        print(f"[IG insights] user={ig_user_id} imp={total_impressions} reach={total_reach} pv={total_profile_views}")
+                    except Exception as ig_ins_err:
+                        print(f"⚠️ IG account insights failed: {ig_ins_err}")
+
+                    # Aggregate per-post engagement in the period
                     posts_resp = await _c.get(
                         f"{_graph_base}/{ig_user_id}/media",
-                        params={"fields": "like_count,comments_count,timestamp", "limit": 50, "access_token": token},
+                        params={"fields": "like_count,comments_count,timestamp,media_type,media_product_type", "limit": 100, "access_token": token},
                     )
                     posts = posts_resp.json().get("data", [])
                     from datetime import timezone as _tz
                     since_dt = datetime.utcfromtimestamp(since_ts).replace(tzinfo=_tz.utc)
                     total_likes = total_comments = 0
+                    post_views_sum = 0
+                    post_ids_in_period = []
                     for post in posts:
                         try:
                             from datetime import datetime as _dt
@@ -2664,8 +3184,35 @@ async def get_account_metrics(
                             if post_dt >= since_dt:
                                 total_likes += post.get("like_count", 0)
                                 total_comments += post.get("comments_count", 0)
+                                post_ids_in_period.append(post.get("id"))
                         except Exception:
                             pass
+
+                    # If Insights API returned 0 impressions, fall back to summing
+                    # per-post reach via live IG API calls (same source as Top Posts)
+                    if total_impressions == 0 and post_ids_in_period:
+                        try:
+                            async def _fetch_post_reach(pid):
+                                try:
+                                    r = await _c.get(
+                                        f"{_graph_base}/{pid}/insights",
+                                        params={"metric": "reach,total_interactions", "access_token": token},
+                                    )
+                                    items = r.json().get("data", [])
+                                    for item in items:
+                                        if item.get("name") == "reach":
+                                            vals = item.get("values", [])
+                                            return sum(v.get("value", 0) for v in vals) if vals else item.get("total_value", {}).get("value", 0)
+                                except Exception:
+                                    pass
+                                return 0
+                            reach_results = await _asyncio.gather(*[_fetch_post_reach(pid) for pid in post_ids_in_period[:20]])
+                            post_views_sum = sum(r for r in reach_results if isinstance(r, (int, float)))
+                            if post_views_sum:
+                                total_impressions = post_views_sum
+                                print(f"[IG] Insights API=0 → summed per-post reach: {total_impressions}")
+                        except Exception as _fb_err:
+                            print(f"[IG] per-post reach fallback failed: {_fb_err}")
 
                 return {
                     "account_id": ig_user_id,
@@ -2676,18 +3223,23 @@ async def get_account_metrics(
                     "following_count": None,
                     "posts_count": profile.get("media_count"),
                     "engagement": {
-                        "views": 0,
+                        "views": total_impressions,
                         "likes": total_likes,
                         "comments": total_comments,
                         "shares": 0,
                         "reposts": 0,
                         "quotes": 0,
+                        "reach": total_reach,
+                        "profile_views": total_profile_views,
                     },
-                    "engagement_note": f"Likes + comments on posts published in the last {days} days",
+                    "engagement_note": f"Account impressions + reach for the last {days} days via Instagram Insights API",
                     "platform_specific": {
                         "username": profile.get("username"),
                         "biography": profile.get("biography"),
                         "profile_picture_url": profile.get("profile_picture_url"),
+                        "impressions": total_impressions,
+                        "reach": total_reach,
+                        "profile_views": total_profile_views,
                     },
                     "period": {"since": since_ts, "until": until_ts},
                 }
@@ -2699,7 +3251,7 @@ async def get_account_metrics(
         linkedin_conns = await db["social_connections"].find(
             {"user_id": user_id, "platform": "linkedin", "connection_status": "active"},
             {"_id": 0, "linkedin_access_token": 1, "person_urn": 1, "active_author_urn": 1,
-             "account_name": 1, "username": 1, "pages": 1},
+             "account_name": 1, "username": 1, "pages": 1, "followers_count": 1},
         ).to_list(length=5)
 
         async def _fetch_linkedin_direct_metrics(conn):
@@ -2711,58 +3263,145 @@ async def get_account_metrics(
                 from app.agents.social_media_manager.services.linkedin_direct_service import LinkedInDirectService
                 svc = LinkedInDirectService()
 
-                # Fetch basic profile (name, email)
-                profile = await svc.get_profile(access_token)
-
-                # Fetch follower count from LinkedIn Community Management API
-                # Works for personal profiles; falls back to 0 if scope not granted
-                followers_count = 0
+                # /v2/userinfo works with openid+profile scope (always granted)
+                display_name = conn.get("account_name") or conn.get("username") or "LinkedIn"
+                needs_reconnect = False
                 try:
-                    async with _httpx.AsyncClient(timeout=15) as _c:
-                        fol_resp = await _c.get(
-                            "https://api.linkedin.com/v2/networkSizes/urn:li:person:" + person_urn.split(":")[-1],
-                            params={"edgeType": "CompanyFollowedByMember"},
-                            headers={"Authorization": f"Bearer {access_token}",
-                                     "X-Restli-Protocol-Version": "2.0.0"},
-                        )
-                        if fol_resp.status_code == 200:
-                            followers_count = fol_resp.json().get("firstDegreeSize", 0)
+                    async with _httpx.AsyncClient(timeout=10) as _c:
+                        ui = await _c.get("https://api.linkedin.com/v2/userinfo",
+                                          headers={"Authorization": f"Bearer {access_token}"})
+                        if ui.status_code == 200:
+                            display_name = ui.json().get("name") or display_name
                 except Exception:
-                    pass  # follower count is best-effort
+                    pass
 
-                # Count published posts from our DB in the period
-                from datetime import timezone as _tz
-                since_dt = datetime.utcfromtimestamp(since_ts).replace(tzinfo=_tz.utc)
-                post_count = await db["content_drafts"].count_documents({
-                    "user_id": user_id,
-                    "status": "published",
-                    "platforms": {"$in": ["linkedin"]},
-                })
+                # followers: networkSizes requires r_network (restricted scope) — not available
+                # Use cached value from DB if present, otherwise 0
+                followers_count = int(conn.get("followers_count", 0) or 0)
 
-                # Aggregate likes + comments from content_analytics for LinkedIn posts
-                li_draft_ids = await db["content_drafts"].distinct(
-                    "id",
-                    {"user_id": user_id, "status": "published", "platforms": {"$in": ["linkedin"]}},
-                )
-                analytics_cursor = db["content_analytics"].find(
-                    {"draft_id": {"$in": li_draft_ids}},
-                    {"likes": 1, "comments": 1, "shares": 1, "impressions": 1},
-                )
-                total_likes = total_comments = total_shares = total_impressions = 0
-                async for ana in analytics_cursor:
-                    total_likes       += int(ana.get("likes", 0) or 0)
-                    total_comments    += int(ana.get("comments", 0) or 0)
-                    total_shares      += int(ana.get("shares", 0) or 0)
-                    total_impressions += int(ana.get("impressions", 0) or 0)
+                # post count from DB (always accurate)
+                li_drafts = await db["content_drafts"].find(
+                    {"user_id": user_id, "status": "published", "platform": "linkedin",
+                     "platform_post_id": {"$exists": True, "$ne": None}},
+                    {"_id": 0, "platform_post_id": 1},
+                ).to_list(length=50)
+                post_count = len(li_drafts)
+
+                # LinkedIn does not allow reading likes/comments for personal posts
+                # without Marketing Developer Platform (MDP) access.
+                # Return None so the frontend can display "-" instead of misleading "0".
+                total_likes = None
+                total_comments = None
 
                 return {
                     "account_id": person_urn,
                     "network": "linkedin",
-                    "page_name": profile.get("name") or conn.get("account_name") or conn.get("username"),
+                    "page_name": display_name,
                     "category": None,
                     "followers_count": followers_count,
                     "following_count": None,
                     "posts_count": post_count,
+                    "engagement": {
+                        "views": None,
+                        "likes": total_likes,
+                        "comments": total_comments,
+                        "shares": None,
+                        "reposts": None,
+                        "quotes": None,
+                    },
+                    "engagement_note": "LinkedIn's standard API does not provide engagement stats for personal profiles. Upgrade to LinkedIn Marketing API for full analytics.",
+                    "needs_reconnect": False,
+                    "platform_specific": {
+                        "person_urn": person_urn,
+                        "pages": conn.get("pages", []),
+                    },
+                    "period": {"since": since_ts, "until": until_ts},
+                }
+            except Exception as e:
+                print(f"⚠️ LinkedIn direct account metrics failed for {person_urn}: {e}", flush=True)
+                return None
+
+        async def _fetch_facebook_direct_metrics(conn):
+            page_id = conn.get("page_id")
+            token = conn.get("page_access_token")
+            if not page_id or not token:
+                return None
+            try:
+                page_name = conn.get("account_name") or "Facebook Page"
+                followers_count = int(conn.get("followers_count", 0) or 0)
+                category = conn.get("category")
+                total_impressions = total_reach = 0
+                total_likes = total_comments = total_shares = 0
+                posts_count = 0
+
+                async with _httpx.AsyncClient(timeout=30) as _c:
+                    # 1. Page profile — followers, name, category
+                    profile_resp = await _c.get(
+                        f"{_graph_base}/{page_id}",
+                        params={"fields": "name,fan_count,followers_count,category", "access_token": token},
+                    )
+                    profile = profile_resp.json()
+                    if "error" not in profile:
+                        page_name = profile.get("name") or page_name
+                        followers_count = profile.get("fan_count") or profile.get("followers_count") or followers_count
+                        category = profile.get("category") or category
+                    else:
+                        print(f"⚠️ FB page profile error: {profile.get('error', {}).get('message')}")
+
+                    # 2. Page-level insights — impressions, reach
+                    try:
+                        ins_resp = await _c.get(
+                            f"{_graph_base}/{page_id}/insights",
+                            params={
+                                "metric": "page_impressions,page_reach",
+                                "period": "day",
+                                "since": since_ts,
+                                "until": until_ts,
+                                "access_token": token,
+                            },
+                        )
+                        for item in ins_resp.json().get("data", []):
+                            daily_total = sum(v.get("value", 0) for v in (item.get("values") or []))
+                            if item.get("name") == "page_impressions":
+                                total_impressions = daily_total
+                            elif item.get("name") == "page_reach":
+                                total_reach = daily_total
+                    except Exception as ins_err:
+                        print(f"⚠️ FB insights failed: {ins_err}")
+
+                    # 3. Real post engagement — reactions (likes), comments, shares from Graph API
+                    try:
+                        posts_resp = await _c.get(
+                            f"{_graph_base}/{page_id}/posts",
+                            params={
+                                "fields": "id,created_time,reactions.summary(total_count),comments.summary(total_count),shares",
+                                "limit": 100,
+                                "since": since_ts,
+                                "until": until_ts,
+                                "access_token": token,
+                            },
+                        )
+                        posts_data = posts_resp.json().get("data", [])
+                        posts_count = len(posts_data)
+                        for post in posts_data:
+                            reactions = post.get("reactions") or {}
+                            total_likes += (reactions.get("summary") or {}).get("total_count", 0)
+                            comments = post.get("comments") or {}
+                            total_comments += (comments.get("summary") or {}).get("total_count", 0)
+                            shares = post.get("shares") or {}
+                            total_shares += shares.get("count", 0)
+                        print(f"[FB] {posts_count} posts in period → likes={total_likes} comments={total_comments} shares={total_shares}")
+                    except Exception as posts_err:
+                        print(f"⚠️ FB posts engagement failed: {posts_err}")
+
+                return {
+                    "account_id": page_id,
+                    "network": "facebook",
+                    "page_name": page_name,
+                    "category": category,
+                    "followers_count": followers_count,
+                    "following_count": None,
+                    "posts_count": posts_count or None,
                     "engagement": {
                         "views": total_impressions,
                         "likes": total_likes,
@@ -2770,23 +3409,29 @@ async def get_account_metrics(
                         "shares": total_shares,
                         "reposts": 0,
                         "quotes": 0,
+                        "reach": total_reach,
                     },
-                    "engagement_note": f"From {post_count} LinkedIn posts published (all time)",
+                    "engagement_note": f"Facebook Page metrics for the last {days} days (live Graph API)",
                     "platform_specific": {
-                        "email": profile.get("email"),
-                        "person_urn": person_urn,
-                        "pages": conn.get("pages", []),
+                        "page_id": page_id,
+                        "category": category,
+                        "impressions": total_impressions,
+                        "reach": total_reach,
                     },
                     "period": {"since": since_ts, "until": until_ts},
                 }
             except Exception as e:
-                print(f"⚠️ LinkedIn direct account metrics failed for {person_urn}: {e}")
+                print(f"⚠️ Facebook direct account metrics failed: {e}")
                 return None
 
         async def _fetch_direct_metrics(conn):
-            if conn.get("connected_via") in ("instagram_direct", "instagram_direct_oauth"):
+            platform = conn.get("platform", "")
+            connected_via = conn.get("connected_via", "")
+            if connected_via in ("instagram_direct", "instagram_direct_oauth") or platform == "instagram":
                 return await _fetch_instagram_direct_metrics(conn)
-            return None  # extend here for other direct platforms
+            elif platform == "facebook" or connected_via == "facebook_direct_oauth":
+                return await _fetch_facebook_direct_metrics(conn)
+            return None
 
         outstand_results, direct_results, linkedin_results = await _asyncio.gather(
             _asyncio.gather(*[_fetch_outstand_metrics(a) for a in outstand_accounts]),
@@ -2835,16 +3480,53 @@ async def debug_outstand_post(
     post_id: str,
     token: dict = Depends(JWTBearer())
 ):
-    """
-    Fetch the live status of an Outstand post by its ID.
-    Use this to diagnose why a post appears queued but hasn't appeared on the social network.
-    """
+    """Fetch the live status of an Outstand post by its ID."""
     try:
         outstand = OutstandService()
         data = await outstand.get_post(post_id)
         return UriResponse.get_single_data_response("outstand_post", data)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/debug/outstand-analytics/{post_id}")
+async def debug_outstand_analytics(
+    post_id: str,
+    token: dict = Depends(JWTBearer())
+):
+    """Return the raw Outstand analytics response for a post — shows exactly what fields are available."""
+    try:
+        outstand = OutstandService()
+        data = await outstand.get_post_analytics(post_id)
+        return UriResponse.get_single_data_response("outstand_analytics", data)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/debug/performance-raw")
+async def debug_performance_raw(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """Show raw published drafts + their platform_post_id and outstand markers for this user."""
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+    drafts = await db["content_drafts"].find(
+        {"user_id": user_id, "status": "published"},
+        {"_id": 0, "id": 1, "platform": 1, "platform_post_id": 1,
+         "outstand_post_status": 1, "published_date": 1,
+         "publish_response": {"$exists": True}},
+    ).sort("published_date", -1).to_list(length=20)
+    conns = await db["social_connections"].find(
+        {"user_id": user_id},
+        {"_id": 0, "platform": 1, "connected_via": 1, "ig_user_id": 1,
+         "has_page_token": {"$cond": [{"$ifNull": ["$page_access_token", False]}, True, False]}},
+    ).to_list(length=10)
+    return UriResponse.get_single_data_response("debug_performance", {
+        "drafts": drafts,
+        "connections": conns,
+    })
 
 @router.get("/debug/connections-raw")
 async def debug_connections_raw(
@@ -4289,3 +4971,347 @@ async def get_blog_draft(
         print(f"❌ Error fetching blog draft {draft_id}: {str(e)}")
         traceback.print_exc()
         return UriResponse.error_response(f"Failed to fetch blog draft: {str(e)}")
+
+
+# ---------------------------------------------------------------------------
+# URI Agent chat — in-app assistant
+# ---------------------------------------------------------------------------
+
+_AGENT_SYSTEM_PROMPT = """You are URI Agent, the built-in AI assistant for URI Social — a social media management platform. You help users navigate the platform, understand features, troubleshoot issues, and get the most out of the product.
+
+## Platform sections (use these exact keys when returning a navigate action)
+- "workspace"     → URI Agent chat (current section)
+- "schedule"      → Posting Schedule — drafts waiting for review, scheduled posts, content calendar
+- "performance"   → Performance — post analytics, engagement metrics, reach per platform
+- "intel"         → Market Intel — competitor analysis, trending topics, audience insights
+- "playbook"      → Brand Playbook — tone of voice, brand colours, content guidelines
+- "blog"          → Blog Generator — AI-generated long-form blog posts
+- "blog-drafts"   → Blog Drafts — saved and published blog posts
+- "connections"   → Connected Accounts — connect/disconnect Facebook, Instagram, WhatsApp, LinkedIn
+- "settings"      → Settings — account settings, approval workflow, auto-scheduling preferences
+- "billing"       → Billing — subscription plans, credits, payment history
+- "notifications" → Notifications — activity feed and alerts
+
+## Key features to know
+- **Content generation**: Users describe a topic/campaign and URI generates posts for all connected platforms simultaneously. Posts appear in Posting Schedule → Needs Review.
+- **Platforms supported**: Instagram (feed, carousel, story), Facebook (feed, carousel), WhatsApp, LinkedIn. Twitter/X is coming soon.
+- **Approval workflow**: "Auto-approve" publishes immediately; "Manual review" sends drafts to Needs Review first. Configurable in Settings.
+- **Scheduling**: Pick a date/time per post. The cron job publishes every 5 minutes — posts go live within 5 min of their scheduled time.
+- **Images**: Generate AI images per post. Instagram requires an image to publish. Carousel posts have per-slide images.
+- **Sync images**: When multiple carousel drafts have the same slide count, you can sync images from one platform to the others.
+- **Connected Accounts**: Facebook uses Outstand OAuth; Instagram uses Meta direct OAuth. They connect independently.
+- **Credits**: Each content generation costs 1 credit. Credits can be topped up in Billing.
+- **Blog Generator**: Generates long-form SEO blog posts separately from social posts.
+- **Brand Playbook**: Stores brand voice, tone, colours, and audience — used to personalise generated content.
+- **Market Intel**: Shows trending topics and competitor post analysis for your industry.
+- **Auto-scheduling**: URI Agent can auto-generate and schedule posts on a recurring basis. Configure in Settings.
+
+## Common issues
+- "Instagram not publishing" → Check Connected Accounts. Instagram requires a Business/Creator account linked to a Facebook page.
+- "Post failed" → Check Connected Accounts to confirm the platform is still connected. Token may have expired — reconnect.
+- "No drafts showing" → Go to Posting Schedule. If approval is set to Auto-approve they appear in Scheduled, otherwise in Needs Review.
+- "Image not generating" → Images generate in the background after draft creation. Refresh the draft after ~30 seconds.
+- "Can't schedule" → Ensure the platform account is connected first. Then select drafts and click Schedule All.
+
+## Navigation rules — read carefully
+ALWAYS set navigate (never null) when the user says "show me", "take me", "go to", "open", "where is", or names a section. Use the exact key from the list above.
+
+Phrase → key mapping (non-exhaustive, use judgment for similar phrases):
+- "show me billing" / "billing" / "credits" / "plans" / "subscription" → "billing"
+- "connect my instagram" / "connect accounts" / "connected accounts" / "accounts" → "connections"
+- "show me my drafts" / "drafts" / "posting schedule" / "scheduled posts" / "needs review" → "schedule"
+- "show me performance" / "analytics" / "stats" / "engagement" → "performance"
+- "market intel" / "competitor" / "trends" → "intel"
+- "brand playbook" / "brand voice" / "tone" → "playbook"
+- "blog" / "blog generator" / "write a blog" → "blog"
+- "settings" / "approval workflow" / "auto-schedule" → "settings"
+- "notifications" → "notifications"
+
+Set navigate to null ONLY when the user is asking a general question with no intent to go somewhere (e.g. "how does scheduling work?" or "what is a carousel post?").
+
+## Response rules
+- Be concise and friendly — 1-4 sentences max for simple questions.
+- If the user wants to generate content, tell them to type their topic/campaign — do NOT navigate away.
+- Never make up features that don't exist.
+- If you don't know something specific about their account, say so honestly.
+
+## Content generation
+When the user asks to create, write, generate, or draft social media posts, set the "generate" field with the extracted topic and platforms. Do NOT just tell them to go somewhere — actually trigger the generation.
+Example: user says "write 3 posts about our summer sale" →
+{"reply": "On it! Generating posts about your summer sale now...", "navigate": null, "generate": {"topic": "summer sale", "platforms": ["instagram", "facebook"]}}
+
+If the user mentions specific platforms (e.g. "Instagram only"), use those. Otherwise default to ["instagram", "facebook"].
+Set generate to null for everything that is not a content creation request.
+
+## Response format
+Your ENTIRE response must be a single valid JSON object — no text before it, no text after it, no markdown fences.
+Return ONLY this raw JSON:
+{"reply": "<your plain-text reply>", "navigate": "<section key or null>", "generate": {"topic": "<topic>", "platforms": ["instagram", "facebook"]} | null}
+"""
+
+
+_AGENT_SYSTEM_PROMPT_STREAM = _AGENT_SYSTEM_PROMPT.replace(
+    "## Response format\nYour ENTIRE response must be a single valid JSON object — no text before it, no text after it, no markdown fences.\nReturn ONLY this raw JSON:\n{\"reply\": \"<your plain-text reply>\", \"navigate\": \"<section key or null>\"}\n\nOnly set \"navigate\" when the user should be taken to a specific section. Set it to null otherwise.",
+    """## Response format
+Start your response with NAVIGATE:<key>| where <key> is the section to navigate to, or NAVIGATE:null| if no navigation is needed. Then write your plain-text reply immediately after the pipe — no newline between the prefix and the reply.
+
+Examples:
+NAVIGATE:billing|I'll take you to the Billing section where you can view plans and credits.
+NAVIGATE:null|Here's how the Posting Schedule works: after generating content, posts land in Needs Review.
+NAVIGATE:connections|To connect Instagram, head to Connected Accounts and follow the OAuth steps.
+
+Do NOT include any text before the NAVIGATE: prefix. Do NOT add a newline after the pipe."""
+)
+
+
+class AgentChatMessage(BaseModel):
+    role: str  # "user" or "assistant"
+    content: str
+
+
+class AgentChatRequest(BaseModel):
+    messages: List[AgentChatMessage]  # full conversation history, latest message last
+    image_url: Optional[str] = None   # Cloudinary URL of an attached image for vision
+
+
+def _build_oai_messages(system_prompt: str, request: AgentChatRequest) -> list:
+    """Build the OpenAI messages list, injecting an image_url into the last user turn when provided."""
+    msgs = [{"role": "system", "content": system_prompt}]
+    for i, m in enumerate(request.messages):
+        is_last_user = i == len(request.messages) - 1 and m.role == "user"
+        if is_last_user and request.image_url:
+            msgs.append({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": m.content or "What do you see in this image?"},
+                    {"type": "image_url", "image_url": {"url": request.image_url, "detail": "low"}},
+                ],
+            })
+        else:
+            msgs.append({"role": m.role, "content": m.content})
+    return msgs
+
+
+@router.post("/agent/chat/upload")
+async def upload_chat_image(
+    file: UploadFile = File(...),
+    token: dict = Depends(JWTBearer()),
+):
+    """Upload an image for use in the agent chat. Returns a Cloudinary URL."""
+    from app.utils.cloudinary_upload import upload_bytes
+
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    filename = (file.filename or "").lower()
+    content_type = (file.content_type or "").lower()
+    allowed_types = {"image/jpeg", "image/jpg", "image/png", "image/webp", "image/heic"}
+    allowed_exts = (".jpg", ".jpeg", ".png", ".webp", ".heic")
+
+    if content_type not in allowed_types and not any(filename.endswith(e) for e in allowed_exts):
+        return UriResponse.error_response("Only JPEG, PNG, WebP, and HEIC images are supported.")
+
+    file_bytes = await file.read()
+    size_mb = len(file_bytes) / (1024 * 1024)
+    if size_mb > 10:
+        return UriResponse.error_response(f"File too large ({size_mb:.1f}MB). Maximum is 10MB.")
+
+    try:
+        url = await upload_bytes(file_bytes, folder=f"uri-social/chat-images/{user_id}")
+        return UriResponse.get_single_data_response("image_uploaded", {"url": url})
+    except Exception as e:
+        print(f"❌ chat image upload error: {e}")
+        return UriResponse.error_response("Image upload failed. Please try again.")
+
+
+@router.post("/agent/chat/stream")
+async def agent_chat_stream(
+    request: AgentChatRequest,
+    token: dict = Depends(JWTBearer()),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """Streaming version of agent chat — returns SSE tokens as they arrive."""
+    from openai import AsyncOpenAI
+    from app.core.config import settings
+    from fastapi.responses import StreamingResponse as _StreamingResponse
+
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    messages = _build_oai_messages(_AGENT_SYSTEM_PROMPT_STREAM, request)
+
+    async_client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+
+    async def generate():
+        full_text = ""
+        navigate = None
+        nav_extracted = False
+        nav_buffer = ""
+
+        try:
+            stream = await async_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=messages,
+                temperature=0.4,
+                stream=True,
+            )
+            async for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta.content or ""
+                if not delta:
+                    continue
+                full_text += delta
+
+                if not nav_extracted:
+                    nav_buffer += delta
+                    if "|" in nav_buffer:
+                        prefix, rest = nav_buffer.split("|", 1)
+                        nav_raw = prefix.replace("NAVIGATE:", "").strip()
+                        navigate = None if nav_raw in ("null", "") else nav_raw
+                        nav_extracted = True
+                        if rest:
+                            yield f"data: {json.dumps({'token': rest})}\n\n"
+                else:
+                    yield f"data: {json.dumps({'token': delta})}\n\n"
+
+        except Exception as e:
+            print(f"❌ agent_chat_stream error: {e}")
+            yield f"data: {json.dumps({'error': 'Stream failed. Please try again.'})}\n\n"
+            return
+
+        # Extract just the reply text (strip the NAVIGATE: prefix)
+        reply_text = full_text.split("|", 1)[1] if "|" in full_text else full_text
+
+        # Persist to DB
+        user_msg = request.messages[-1] if request.messages else None
+        if user_msg and reply_text.strip():
+            now = datetime.utcnow()
+            try:
+                await db["agent_chat_messages"].insert_many([
+                    {"user_id": user_id, "role": "user", "content": user_msg.content, "created_at": now, "surface": "web"},
+                    {"user_id": user_id, "role": "assistant", "content": reply_text.strip(), "created_at": now, "surface": "web"},
+                ])
+            except Exception:
+                pass
+
+        yield f"data: {json.dumps({'done': True, 'navigate': navigate})}\n\n"
+
+    return _StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.get("/agent/chat/history")
+async def get_agent_chat_history(
+    token: dict = Depends(JWTBearer()),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """Return the last 100 persisted messages for this user."""
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    messages = await db["agent_chat_messages"].find(
+        {"user_id": user_id},
+        {"_id": 0, "user_id": 0},
+    ).sort("created_at", 1).to_list(length=100)
+
+    return UriResponse.get_list_data_response("agent_chat_history", messages)
+
+
+@router.delete("/agent/chat/history")
+async def clear_agent_chat_history(
+    token: dict = Depends(JWTBearer()),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """Archive (delete) the current conversation so the user starts fresh."""
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    await db["agent_chat_messages"].delete_many({"user_id": user_id})
+    return UriResponse.get_single_data_response("cleared", {"cleared": True})
+
+
+@router.post("/agent/chat")
+async def agent_chat(
+    request: AgentChatRequest,
+    token: dict = Depends(JWTBearer()),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """URI Agent in-app assistant — answers questions and navigates the user."""
+    from app.services.AIService import AIService
+    from app.domain.models.chat_model import ChatMessage, ChatModel
+
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    try:
+        oai_messages = _build_oai_messages(_AGENT_SYSTEM_PROMPT, request)
+
+        if request.image_url:
+            from openai import AsyncOpenAI
+            from app.core.config import settings
+            _ac = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+            result = await _ac.chat.completions.create(
+                model="gpt-4o-mini", messages=oai_messages, temperature=0.4
+            )
+        else:
+            messages = [ChatMessage(role=m["role"], content=m["content"]) for m in oai_messages]
+            result = await AIService.chat_completion(ChatModel(model="gpt-4o-mini", messages=messages, temperature=0.4))
+
+        if isinstance(result, dict) and "error" in result:
+            return UriResponse.error_response(result["error"])
+
+        raw = result.choices[0].message.content.strip()
+
+        parsed = None
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            # Model added preamble text before the JSON — find the object
+            import re
+            m = re.search(r'\{[\s\S]*?"reply"[\s\S]*?\}', raw)
+            if m:
+                try:
+                    parsed = json.loads(m.group())
+                except json.JSONDecodeError:
+                    pass
+
+        if parsed:
+            reply = parsed.get("reply") or raw
+            navigate = parsed.get("navigate") or None
+            generate = parsed.get("generate") or None
+            # Validate generate shape
+            if generate and not (isinstance(generate, dict) and generate.get("topic")):
+                generate = None
+        else:
+            reply = raw
+            navigate = None
+            generate = None
+
+        # Persist the latest user turn and the AI reply
+        user_msg = request.messages[-1] if request.messages else None
+        if user_msg:
+            now = datetime.utcnow()
+            await db["agent_chat_messages"].insert_many([
+                {"user_id": user_id, "role": "user", "content": user_msg.content, "created_at": now, "surface": "web"},
+                {"user_id": user_id, "role": "assistant", "content": reply, "created_at": now, "surface": "web"},
+            ])
+
+        return UriResponse.get_single_data_response("agent_chat", {
+            "reply": reply,
+            "navigate": navigate,
+            "generate": generate,
+        })
+
+    except Exception as e:
+        print(f"❌ agent_chat error: {e}")
+        traceback.print_exc()
+        return UriResponse.error_response("Agent is unavailable right now. Please try again.")

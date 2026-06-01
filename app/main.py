@@ -17,6 +17,9 @@ from app.routers.auth_router import router as auth_router
 from app.routers.billing_router import router as billing_router
 from app.routers.notification_router import router as notification_router
 from app.routers.bug_report_router import router as bug_report_router
+from app.routers.client_router import router as client_router
+from app.routers.workspace_router import router as workspace_router
+from app.routers.workspace_member_router import router as workspace_member_router
 
 # Initialize Sentry
 initialize_sentry()
@@ -145,6 +148,10 @@ app.include_router(whatsapp_router)
 app.include_router(x_router)
 app.include_router(linkedin_router)
 
+# Include multi-tenant routers (Enterprise/SDK features)
+app.include_router(client_router)
+app.include_router(workspace_router)
+app.include_router(workspace_member_router)
 
 # Serve generated images directly from backend (avoids third-party CDN like imgBB)
 _BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
