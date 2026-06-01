@@ -236,14 +236,24 @@ class SocialAccountService:
             print(f"[get_user_connections] Outstand list_accounts failed (non-fatal): {e}")
 
         try:
-            # 2. Direct connections (Instagram OAuth, etc.) stored in local DB
-            direct_cursor = db["social_connections"].find({
+            # 2. All active connections from local DB.
+            # For Outstand-managed accounts already returned in step 1, skip to avoid duplicates.
+            # This ensures connections are shown even when the Outstand API is unavailable.
+            outstand_ids_seen = {
+                acc.get("outstand_account_id")
+                for accs in by_platform.values()
+                for acc in accs
+                if acc.get("outstand_account_id")
+            }
+            local_cursor = db["social_connections"].find({
                 "user_id": user_id,
-                "connected_via": {"$ne": "outstand"},
                 "connection_status": "active",
             })
-            async for doc in direct_cursor:
+            async for doc in local_cursor:
                 platform = doc.get("platform", "unknown")
+                doc_outstand_id = doc.get("outstand_account_id") or doc.get("id")
+                if doc_outstand_id and doc_outstand_id in outstand_ids_seen:
+                    continue
                 by_platform.setdefault(platform, []).append({
                     "platform": platform,
                     "connected_via": doc.get("connected_via"),

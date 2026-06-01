@@ -1782,7 +1782,11 @@ async def sync_image_across_drafts(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
     token: dict = Depends(JWTBearer()),
 ):
-    """Copy image_url from a source draft to one or more target drafts (same user only)."""
+    """
+    Copy images from a source draft to one or more target drafts (same user only).
+    For carousel drafts: syncs all slide image_urls (targets must have the same slide count).
+    For feed/story drafts: syncs the single image_url.
+    """
     user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
@@ -1791,26 +1795,59 @@ async def sync_image_across_drafts(
 
     source = await db["content_drafts"].find_one(
         {"id": request.source_draft_id, "user_id": user_id},
-        {"image_url": 1, "has_image": 1},
     )
     if not source:
         raise HTTPException(status_code=404, detail="Source draft not found")
 
-    image_url = source.get("image_url")
-    if not image_url:
-        raise HTTPException(status_code=422, detail="Source draft has no image yet")
-
     if not request.target_draft_ids:
         raise HTTPException(status_code=422, detail="No target draft IDs provided")
 
-    result = await db["content_drafts"].update_many(
-        {"id": {"$in": request.target_draft_ids}, "user_id": user_id},
-        {"$set": {"image_url": image_url, "has_image": True}},
-    )
+    is_carousel = source.get("post_type") == "carousel"
+    updated_count = 0
+    skipped = []
+
+    if is_carousel:
+        source_slides = source.get("slides") or []
+        if not source_slides or not any(s.get("image_url") for s in source_slides):
+            raise HTTPException(status_code=422, detail="Source carousel has no slide images yet")
+
+        source_image_urls = [s.get("image_url") for s in source_slides]
+
+        targets = await db["content_drafts"].find(
+            {"id": {"$in": request.target_draft_ids}, "user_id": user_id}
+        ).to_list(length=50)
+
+        for target in targets:
+            target_slides = target.get("slides") or []
+            if len(target_slides) != len(source_slides):
+                skipped.append({"id": target.get("id"), "reason": f"slide count mismatch ({len(target_slides)} vs {len(source_slides)})"})
+                continue
+
+            updated_slides = []
+            for i, slide in enumerate(target_slides):
+                updated_slides.append({**slide, "image_url": source_image_urls[i]})
+
+            await db["content_drafts"].update_one(
+                {"id": target.get("id"), "user_id": user_id},
+                {"$set": {"slides": updated_slides, "has_image": True, "updated_at": datetime.utcnow()}},
+            )
+            updated_count += 1
+    else:
+        image_url = source.get("image_url")
+        if not image_url:
+            raise HTTPException(status_code=422, detail="Source draft has no image yet")
+
+        result = await db["content_drafts"].update_many(
+            {"id": {"$in": request.target_draft_ids}, "user_id": user_id},
+            {"$set": {"image_url": image_url, "has_image": True, "updated_at": datetime.utcnow()}},
+        )
+        updated_count = result.modified_count
 
     return UriResponse.get_single_data_response("sync_image", {
-        "updated_count": result.modified_count,
+        "updated_count": updated_count,
         "source_draft_id": request.source_draft_id,
+        "is_carousel": is_carousel,
+        "skipped": skipped,
     })
 
 
@@ -1945,8 +1982,8 @@ async def get_scheduled_content(
 
         scheduled_drafts = await db["content_drafts"].find({
             "$or": [
-                {"user_id": user_id, "status": "scheduled"},
-                {"request_id": {"$in": request_ids}, "status": "scheduled"},
+                {"user_id": user_id, "status": {"$in": ["scheduled", "publish_failed"]}},
+                {"request_id": {"$in": request_ids}, "status": {"$in": ["scheduled", "publish_failed"]}},
             ]
         }).sort("scheduled_date", 1).to_list(length=100)
 
@@ -2945,6 +2982,20 @@ async def get_performance(
 
         # Aggregate summary
         def _sum(key): return sum(p.get(key, 0) or 0 for p in posts)
+
+        def _build_insights_note(post_list):
+            platforms = {p.get("platform") for p in post_list}
+            if platforms == {"linkedin"} or platforms == {"linkedin", None}:
+                return (
+                    "LinkedIn's standard API does not provide impressions or engagement stats "
+                    "for personal profiles. Upgrade to LinkedIn Marketing API for full analytics."
+                )
+            if "instagram" in platforms:
+                return (
+                    "Impressions and reach require an Instagram Business or Creator account. "
+                    "Go to Instagram → Profile → Edit Profile → Switch to Professional Account."
+                )
+            return "Analytics will appear here once your posts have been live for at least 24 hours."
         total_posts = len(posts)
         insights_available = any(p.get("insights_available") or (p.get("impressions") or 0) > 0 for p in posts)
         summary = {
@@ -2959,10 +3010,7 @@ async def get_performance(
                 sum(p.get("engagement_rate", 0) or 0 for p in posts) / total_posts, 2
             ) if total_posts else 0,
             "insights_available": insights_available,
-            "insights_note": None if insights_available else (
-                "Impressions and reach require an Instagram Business or Creator account. "
-                "Go to Instagram → Profile → Edit Profile → Switch to Professional Account to unlock full analytics."
-            ),
+            "insights_note": None if insights_available else _build_insights_note(posts),
         }
 
         # Per-platform breakdown
@@ -3022,8 +3070,12 @@ async def get_account_metrics(
         since_ts = int((datetime.utcnow() - timedelta(days=days)).timestamp())
 
         # ── Outstand accounts ─────────────────────────────────────────────────
-        result = await outstand.list_accounts(tenant_id=user_id)
-        outstand_accounts = result.get("data", [])
+        try:
+            result = await outstand.list_accounts(tenant_id=user_id)
+            outstand_accounts = result.get("data", [])
+        except Exception as _os_err:
+            print(f"⚠️ Outstand list_accounts failed in account-metrics (non-fatal): {_os_err}")
+            outstand_accounts = []
 
         async def _fetch_outstand_metrics(acc):
             account_id = acc.get("id")
@@ -4919,3 +4971,333 @@ async def get_blog_draft(
         print(f"❌ Error fetching blog draft {draft_id}: {str(e)}")
         traceback.print_exc()
         return UriResponse.error_response(f"Failed to fetch blog draft: {str(e)}")
+
+
+# ---------------------------------------------------------------------------
+# URI Agent chat — in-app assistant
+# ---------------------------------------------------------------------------
+
+_AGENT_SYSTEM_PROMPT = """You are URI Agent, the built-in AI assistant for URI Social — a social media management platform. You help users navigate the platform, understand features, troubleshoot issues, and get the most out of the product.
+
+## Platform sections (use these exact keys when returning a navigate action)
+- "workspace"     → URI Agent chat (current section)
+- "schedule"      → Posting Schedule — drafts waiting for review, scheduled posts, content calendar
+- "performance"   → Performance — post analytics, engagement metrics, reach per platform
+- "intel"         → Market Intel — competitor analysis, trending topics, audience insights
+- "playbook"      → Brand Playbook — tone of voice, brand colours, content guidelines
+- "blog"          → Blog Generator — AI-generated long-form blog posts
+- "blog-drafts"   → Blog Drafts — saved and published blog posts
+- "connections"   → Connected Accounts — connect/disconnect Facebook, Instagram, WhatsApp, LinkedIn
+- "settings"      → Settings — account settings, approval workflow, auto-scheduling preferences
+- "billing"       → Billing — subscription plans, credits, payment history
+- "notifications" → Notifications — activity feed and alerts
+
+## Key features to know
+- **Content generation**: Users describe a topic/campaign and URI generates posts for all connected platforms simultaneously. Posts appear in Posting Schedule → Needs Review.
+- **Platforms supported**: Instagram (feed, carousel, story), Facebook (feed, carousel), WhatsApp, LinkedIn. Twitter/X is coming soon.
+- **Approval workflow**: "Auto-approve" publishes immediately; "Manual review" sends drafts to Needs Review first. Configurable in Settings.
+- **Scheduling**: Pick a date/time per post. The cron job publishes every 5 minutes — posts go live within 5 min of their scheduled time.
+- **Images**: Generate AI images per post. Instagram requires an image to publish. Carousel posts have per-slide images.
+- **Sync images**: When multiple carousel drafts have the same slide count, you can sync images from one platform to the others.
+- **Connected Accounts**: Facebook uses Outstand OAuth; Instagram uses Meta direct OAuth. They connect independently.
+- **Credits**: Each content generation costs 1 credit. Credits can be topped up in Billing.
+- **Blog Generator**: Generates long-form SEO blog posts separately from social posts.
+- **Brand Playbook**: Stores brand voice, tone, colours, and audience — used to personalise generated content.
+- **Market Intel**: Shows trending topics and competitor post analysis for your industry.
+- **Auto-scheduling**: URI Agent can auto-generate and schedule posts on a recurring basis. Configure in Settings.
+
+## Common issues
+- "Instagram not publishing" → Check Connected Accounts. Instagram requires a Business/Creator account linked to a Facebook page.
+- "Post failed" → Check Connected Accounts to confirm the platform is still connected. Token may have expired — reconnect.
+- "No drafts showing" → Go to Posting Schedule. If approval is set to Auto-approve they appear in Scheduled, otherwise in Needs Review.
+- "Image not generating" → Images generate in the background after draft creation. Refresh the draft after ~30 seconds.
+- "Can't schedule" → Ensure the platform account is connected first. Then select drafts and click Schedule All.
+
+## Navigation rules — read carefully
+ALWAYS set navigate (never null) when the user says "show me", "take me", "go to", "open", "where is", or names a section. Use the exact key from the list above.
+
+Phrase → key mapping (non-exhaustive, use judgment for similar phrases):
+- "show me billing" / "billing" / "credits" / "plans" / "subscription" → "billing"
+- "connect my instagram" / "connect accounts" / "connected accounts" / "accounts" → "connections"
+- "show me my drafts" / "drafts" / "posting schedule" / "scheduled posts" / "needs review" → "schedule"
+- "show me performance" / "analytics" / "stats" / "engagement" → "performance"
+- "market intel" / "competitor" / "trends" → "intel"
+- "brand playbook" / "brand voice" / "tone" → "playbook"
+- "blog" / "blog generator" / "write a blog" → "blog"
+- "settings" / "approval workflow" / "auto-schedule" → "settings"
+- "notifications" → "notifications"
+
+Set navigate to null ONLY when the user is asking a general question with no intent to go somewhere (e.g. "how does scheduling work?" or "what is a carousel post?").
+
+## Response rules
+- Be concise and friendly — 1-4 sentences max for simple questions.
+- If the user wants to generate content, tell them to type their topic/campaign — do NOT navigate away.
+- Never make up features that don't exist.
+- If you don't know something specific about their account, say so honestly.
+
+## Response format
+Your ENTIRE response must be a single valid JSON object — no text before it, no text after it, no markdown fences.
+Return ONLY this raw JSON:
+{"reply": "<your plain-text reply>", "navigate": "<section key or null>"}
+"""
+
+
+_AGENT_SYSTEM_PROMPT_STREAM = _AGENT_SYSTEM_PROMPT.replace(
+    "## Response format\nYour ENTIRE response must be a single valid JSON object — no text before it, no text after it, no markdown fences.\nReturn ONLY this raw JSON:\n{\"reply\": \"<your plain-text reply>\", \"navigate\": \"<section key or null>\"}\n\nOnly set \"navigate\" when the user should be taken to a specific section. Set it to null otherwise.",
+    """## Response format
+Start your response with NAVIGATE:<key>| where <key> is the section to navigate to, or NAVIGATE:null| if no navigation is needed. Then write your plain-text reply immediately after the pipe — no newline between the prefix and the reply.
+
+Examples:
+NAVIGATE:billing|I'll take you to the Billing section where you can view plans and credits.
+NAVIGATE:null|Here's how the Posting Schedule works: after generating content, posts land in Needs Review.
+NAVIGATE:connections|To connect Instagram, head to Connected Accounts and follow the OAuth steps.
+
+Do NOT include any text before the NAVIGATE: prefix. Do NOT add a newline after the pipe."""
+)
+
+
+class AgentChatMessage(BaseModel):
+    role: str  # "user" or "assistant"
+    content: str
+
+
+class AgentChatRequest(BaseModel):
+    messages: List[AgentChatMessage]  # full conversation history, latest message last
+    image_url: Optional[str] = None   # Cloudinary URL of an attached image for vision
+
+
+def _build_oai_messages(system_prompt: str, request: AgentChatRequest) -> list:
+    """Build the OpenAI messages list, injecting an image_url into the last user turn when provided."""
+    msgs = [{"role": "system", "content": system_prompt}]
+    for i, m in enumerate(request.messages):
+        is_last_user = i == len(request.messages) - 1 and m.role == "user"
+        if is_last_user and request.image_url:
+            msgs.append({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": m.content or "What do you see in this image?"},
+                    {"type": "image_url", "image_url": {"url": request.image_url, "detail": "low"}},
+                ],
+            })
+        else:
+            msgs.append({"role": m.role, "content": m.content})
+    return msgs
+
+
+@router.post("/agent/chat/upload")
+async def upload_chat_image(
+    file: UploadFile = File(...),
+    token: dict = Depends(JWTBearer()),
+):
+    """Upload an image for use in the agent chat. Returns a Cloudinary URL."""
+    from app.utils.cloudinary_upload import upload_bytes
+
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    filename = (file.filename or "").lower()
+    content_type = (file.content_type or "").lower()
+    allowed_types = {"image/jpeg", "image/jpg", "image/png", "image/webp", "image/heic"}
+    allowed_exts = (".jpg", ".jpeg", ".png", ".webp", ".heic")
+
+    if content_type not in allowed_types and not any(filename.endswith(e) for e in allowed_exts):
+        return UriResponse.error_response("Only JPEG, PNG, WebP, and HEIC images are supported.")
+
+    file_bytes = await file.read()
+    size_mb = len(file_bytes) / (1024 * 1024)
+    if size_mb > 10:
+        return UriResponse.error_response(f"File too large ({size_mb:.1f}MB). Maximum is 10MB.")
+
+    try:
+        url = await upload_bytes(file_bytes, folder=f"uri-social/chat-images/{user_id}")
+        return UriResponse.get_single_data_response("image_uploaded", {"url": url})
+    except Exception as e:
+        print(f"❌ chat image upload error: {e}")
+        return UriResponse.error_response("Image upload failed. Please try again.")
+
+
+@router.post("/agent/chat/stream")
+async def agent_chat_stream(
+    request: AgentChatRequest,
+    token: dict = Depends(JWTBearer()),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """Streaming version of agent chat — returns SSE tokens as they arrive."""
+    from openai import AsyncOpenAI
+    from app.core.config import settings
+    from fastapi.responses import StreamingResponse as _StreamingResponse
+
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    messages = _build_oai_messages(_AGENT_SYSTEM_PROMPT_STREAM, request)
+
+    async_client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+
+    async def generate():
+        full_text = ""
+        navigate = None
+        nav_extracted = False
+        nav_buffer = ""
+
+        try:
+            stream = await async_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=messages,
+                temperature=0.4,
+                stream=True,
+            )
+            async for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta.content or ""
+                if not delta:
+                    continue
+                full_text += delta
+
+                if not nav_extracted:
+                    nav_buffer += delta
+                    if "|" in nav_buffer:
+                        prefix, rest = nav_buffer.split("|", 1)
+                        nav_raw = prefix.replace("NAVIGATE:", "").strip()
+                        navigate = None if nav_raw in ("null", "") else nav_raw
+                        nav_extracted = True
+                        if rest:
+                            yield f"data: {json.dumps({'token': rest})}\n\n"
+                else:
+                    yield f"data: {json.dumps({'token': delta})}\n\n"
+
+        except Exception as e:
+            print(f"❌ agent_chat_stream error: {e}")
+            yield f"data: {json.dumps({'error': 'Stream failed. Please try again.'})}\n\n"
+            return
+
+        # Extract just the reply text (strip the NAVIGATE: prefix)
+        reply_text = full_text.split("|", 1)[1] if "|" in full_text else full_text
+
+        # Persist to DB
+        user_msg = request.messages[-1] if request.messages else None
+        if user_msg and reply_text.strip():
+            now = datetime.utcnow()
+            try:
+                await db["agent_chat_messages"].insert_many([
+                    {"user_id": user_id, "role": "user", "content": user_msg.content, "created_at": now, "surface": "web"},
+                    {"user_id": user_id, "role": "assistant", "content": reply_text.strip(), "created_at": now, "surface": "web"},
+                ])
+            except Exception:
+                pass
+
+        yield f"data: {json.dumps({'done': True, 'navigate': navigate})}\n\n"
+
+    return _StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.get("/agent/chat/history")
+async def get_agent_chat_history(
+    token: dict = Depends(JWTBearer()),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """Return the last 100 persisted messages for this user."""
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    messages = await db["agent_chat_messages"].find(
+        {"user_id": user_id},
+        {"_id": 0, "user_id": 0},
+    ).sort("created_at", 1).to_list(length=100)
+
+    return UriResponse.get_list_data_response("agent_chat_history", messages)
+
+
+@router.delete("/agent/chat/history")
+async def clear_agent_chat_history(
+    token: dict = Depends(JWTBearer()),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """Archive (delete) the current conversation so the user starts fresh."""
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    await db["agent_chat_messages"].delete_many({"user_id": user_id})
+    return UriResponse.get_single_data_response("cleared", {"cleared": True})
+
+
+@router.post("/agent/chat")
+async def agent_chat(
+    request: AgentChatRequest,
+    token: dict = Depends(JWTBearer()),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """URI Agent in-app assistant — answers questions and navigates the user."""
+    from app.services.AIService import AIService
+    from app.domain.models.chat_model import ChatMessage, ChatModel
+
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    try:
+        oai_messages = _build_oai_messages(_AGENT_SYSTEM_PROMPT, request)
+
+        if request.image_url:
+            from openai import AsyncOpenAI
+            from app.core.config import settings
+            _ac = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+            result = await _ac.chat.completions.create(
+                model="gpt-4o-mini", messages=oai_messages, temperature=0.4
+            )
+        else:
+            messages = [ChatMessage(role=m["role"], content=m["content"]) for m in oai_messages]
+            result = await AIService.chat_completion(ChatModel(model="gpt-4o-mini", messages=messages, temperature=0.4))
+
+        if isinstance(result, dict) and "error" in result:
+            return UriResponse.error_response(result["error"])
+
+        raw = result.choices[0].message.content.strip()
+
+        parsed = None
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            # Model added preamble text before the JSON — find the object
+            import re
+            m = re.search(r'\{[\s\S]*?"reply"[\s\S]*?\}', raw)
+            if m:
+                try:
+                    parsed = json.loads(m.group())
+                except json.JSONDecodeError:
+                    pass
+
+        if parsed:
+            reply = parsed.get("reply") or raw
+            navigate = parsed.get("navigate") or None
+        else:
+            reply = raw
+            navigate = None
+
+        # Persist the latest user turn and the AI reply
+        user_msg = request.messages[-1] if request.messages else None
+        if user_msg:
+            now = datetime.utcnow()
+            await db["agent_chat_messages"].insert_many([
+                {"user_id": user_id, "role": "user", "content": user_msg.content, "created_at": now, "surface": "web"},
+                {"user_id": user_id, "role": "assistant", "content": reply, "created_at": now, "surface": "web"},
+            ])
+
+        return UriResponse.get_single_data_response("agent_chat", {
+            "reply": reply,
+            "navigate": navigate,
+        })
+
+    except Exception as e:
+        print(f"❌ agent_chat error: {e}")
+        traceback.print_exc()
+        return UriResponse.error_response("Agent is unavailable right now. Please try again.")
