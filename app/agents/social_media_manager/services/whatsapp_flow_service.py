@@ -401,7 +401,7 @@ async def _gpt_conversational_reply(
         + [ChatMessage(role=h["role"], content=h["content"]) for h in history]
         + [ChatMessage(role="user", content=user_message)]
     )
-    req = ChatModel(model=_CONV_MODEL, messages=messages, temperature=0.8)
+    req = ChatModel(model=_CONV_MODEL, messages=messages, temperature=1)
     try:
         result = await AIService.chat_completion(req)
         if isinstance(result, dict) and result.get("error"):
@@ -469,7 +469,14 @@ NO_BRAND = (
 )
 
 CONTENT_ACTIONS = (
-    "What's next? I can post it, schedule it, make a graphic, write something fresh, or tweak anything — just say."
+    "What's next?\n\n"
+    "📤 *Post it* — publish now\n"
+    "🗓️ *Schedule it* — pick a date & time\n"
+    "🎨 *Make a graphic* — generate a visual\n"
+    "✏️ *Edit caption* — rewrite or give instructions\n"
+    "📰 *Edit headline* — change the title\n"
+    "🔄 *New post* — write about something else\n\n"
+    "Just tell me what you want!"
 )
 
 CAPABILITIES = (
@@ -731,14 +738,16 @@ async def _generate_content_structured(
         + [ChatMessage(role=h["role"], content=h["content"]) for h in (history or [])]
         + [ChatMessage(role="user", content=user_prompt)]
     )
-    req = ChatModel(model=_CONV_MODEL, messages=messages, temperature=0.85)
+    req = ChatModel(model=_CONV_MODEL, messages=messages, temperature=1)
+    print(f"[WhatsApp] _generate_content_structured | model={_CONV_MODEL} topic={topic!r}", flush=True)
     try:
         result = await AIService.chat_completion(req)
     except Exception as e:
-        print(f"[WhatsApp] _generate_content_structured error: {e}")
+        print(f"[WhatsApp] _generate_content_structured error: {e}", flush=True)
         return None
 
     if isinstance(result, dict) and result.get("error"):
+        print(f"[WhatsApp] _generate_content_structured AI error: {result.get('error')}", flush=True)
         return None
 
     text = result.choices[0].message.content.strip()
@@ -774,7 +783,7 @@ async def _generate_three_ideas(
         + [ChatMessage(role=h["role"], content=h["content"]) for h in (history or [])]
         + [ChatMessage(role="user", content=user_prompt)]
     )
-    req = ChatModel(model=_CONV_MODEL, messages=messages, temperature=0.9)
+    req = ChatModel(model=_CONV_MODEL, messages=messages, temperature=1)
     try:
         result = await AIService.chat_completion(req)
     except Exception as e:
@@ -791,6 +800,42 @@ async def _generate_three_ideas(
         if m:
             ideas.append(m.group(1).strip().strip('"'))
     return ideas[:3] if ideas else None
+
+
+async def _ai_rewrite_caption(
+    instruction: str,
+    current_caption: str,
+    brand: Dict[str, Any],
+    history: Optional[List[Dict[str, str]]] = None,
+) -> Optional[str]:
+    """
+    Use Jane (gpt-5.5) to rewrite the caption based on a user instruction.
+    Handles both explicit instructions ("make it shorter") and full replacements.
+    """
+    from app.domain.models.chat_model import ChatMessage, ChatModel
+    from app.services.AIService import AIService
+
+    user_prompt = (
+        f"Current caption:\n{current_caption}\n\n"
+        f"User instruction: {instruction}\n\n"
+        "Rewrite the caption following the instruction. "
+        "If the instruction is a full replacement caption, return it cleaned up. "
+        "Return ONLY the new caption text — no labels, no quotes, no extra commentary."
+    )
+    messages = (
+        [ChatMessage(role="system", content=_jane_system(brand))]
+        + [ChatMessage(role=h["role"], content=h["content"]) for h in (history or [])]
+        + [ChatMessage(role="user", content=user_prompt)]
+    )
+    req = ChatModel(model=_CONV_MODEL, messages=messages, temperature=1)
+    try:
+        result = await AIService.chat_completion(req)
+        if isinstance(result, dict) and result.get("error"):
+            return None
+        return result.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"[WhatsApp] _ai_rewrite_caption error: {e}", flush=True)
+        return None
 
 
 # ── Outstand helpers ──────────────────────────────────────────────────────────
@@ -861,7 +906,7 @@ async def _do_publish(
     """
     import uuid as _uuid
 
-    if not db or not user_id:
+    if db is None or not user_id:
         print(f"[WhatsApp] _do_publish: missing db or user_id — cannot publish")
         return False
 
@@ -1968,6 +2013,28 @@ class WhatsAppFlowService:
                 await WhatsAppFlowService._create_and_show_content(phone, ctx.get("topic", ""), user_id, new_ctx, db)
                 return
 
+        # Detect caption rewrite instruction — "make the caption shorter", "add emojis", "shorten it"
+        _CAPTION_INSTRUCTION_PATTERNS = (
+            r"(?:make|rewrite|fix|update|shorten|lengthen|expand|simplify|clean up|improve)\s+(?:the\s+)?caption",
+            r"(?:add|remove)\s+(?:emojis?|hashtags?|a\s+call\s+to\s+action|cta)",
+            r"(?:shorten|lengthen|expand|simplify|clean\s+up)\s+(?:it|this)",
+            r"caption\s+(?:should|needs?\s+to|must)\s+",
+        )
+        if any(re.search(p, raw_body, re.IGNORECASE) for p in _CAPTION_INSTRUCTION_PATTERNS):
+            current_caption = ctx.get("caption", "")
+            if current_caption:
+                brand = await BrandProfileService.get_brand_profile(user_id, db) or {}
+                await _send(phone, "Rewriting caption... ✏️")
+                new_caption = await _ai_rewrite_caption(raw_body, current_caption, brand)
+                if new_caption:
+                    new_ctx = {**ctx, "caption": new_caption}
+                    await _send(phone, _format_content(new_ctx))
+                    await _safe_set_state(phone, "showing_content", new_ctx, db)
+                else:
+                    await _send(phone, "Couldn't rewrite the caption right now. Try again.")
+                    await _safe_set_state(phone, "showing_content", ctx, db)
+                return
+
         # Detect field from text
         field = None
         if "headline" in text and "sub" not in text:
@@ -1984,18 +2051,32 @@ class WhatsAppFlowService:
                 "headline": "What should the new headline be?",
                 "subheadline": "What should the new subheadline be?",
                 "tone": "What tone would you like? (e.g. motivational, funny, bold, professional)",
-                "caption": "Type the new caption:",
+                "caption": "Type the new caption or give me an instruction (e.g. *make it shorter*, *add emojis*):",
             }
             await _send(phone, prompts[field])
             await _safe_set_state(phone, "awaiting_edit_value", {**ctx, "edit_field": field}, db)
+            return
+
+        # Check if user wants a graphic edit
+        _GRAPHIC_EDIT_WORDS = {
+            "graphic", "image", "picture", "photo", "visual", "design",
+            "regenerate", "new graphic", "new image", "different graphic",
+            "different image", "redo graphic", "redo image",
+        }
+        if any(w in text for w in _GRAPHIC_EDIT_WORDS):
+            await WhatsAppFlowService._generate_graphic(phone, user_id, ctx, db)
             return
 
         # Ask what to edit if we still don't know
         await _send(
             phone,
             "What would you like to change?\n\n"
-            "Say *headline*, *subheadline*, *tone*, or describe what you want — "
-            "e.g. *make it funnier* or *change the headline to something bolder*"
+            "✏️ *Caption* — rewrite or give me an instruction (e.g. make it shorter, add emojis)\n"
+            "📰 *Headline* — change the title\n"
+            "💬 *Subheadline* — change the supporting line\n"
+            "🎭 *Tone* — e.g. more professional, funnier, bolder\n"
+            "🎨 *Graphic* — regenerate the image\n\n"
+            "Or just describe what you want!"
         )
         await _safe_set_state(phone, "awaiting_edit_choice", ctx, db)
 
@@ -2014,6 +2095,19 @@ class WhatsAppFlowService:
             await WhatsAppFlowService._create_and_show_content(
                 phone, ctx.get("topic", value), user_id, new_ctx, db
             )
+        elif field == "caption":
+            # Always use AI rewrite for caption edits — handles both instructions
+            # ("make it shorter") and direct replacements ("Here is my new caption…")
+            brand = await BrandProfileService.get_brand_profile(user_id, db) or {}
+            await _send(phone, "Rewriting caption... ✏️")
+            new_caption = await _ai_rewrite_caption(value, ctx.get("caption", ""), brand)
+            if new_caption:
+                new_ctx = {**ctx, "caption": new_caption}
+                await _send(phone, _format_content(new_ctx))
+                await _safe_set_state(phone, "showing_content", new_ctx, db)
+            else:
+                await _send(phone, "Couldn't rewrite the caption right now. Try again or type the caption directly.")
+                await _safe_set_state(phone, "showing_content", ctx, db)
         else:
             new_ctx = {**ctx, field: value}
             await _send(phone, _format_content(new_ctx))
