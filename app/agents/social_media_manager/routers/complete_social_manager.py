@@ -5050,6 +5050,58 @@ class AgentChatMessage(BaseModel):
 
 class AgentChatRequest(BaseModel):
     messages: List[AgentChatMessage]  # full conversation history, latest message last
+    image_url: Optional[str] = None   # Cloudinary URL of an attached image for vision
+
+
+def _build_oai_messages(system_prompt: str, request: AgentChatRequest) -> list:
+    """Build the OpenAI messages list, injecting an image_url into the last user turn when provided."""
+    msgs = [{"role": "system", "content": system_prompt}]
+    for i, m in enumerate(request.messages):
+        is_last_user = i == len(request.messages) - 1 and m.role == "user"
+        if is_last_user and request.image_url:
+            msgs.append({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": m.content or "What do you see in this image?"},
+                    {"type": "image_url", "image_url": {"url": request.image_url, "detail": "low"}},
+                ],
+            })
+        else:
+            msgs.append({"role": m.role, "content": m.content})
+    return msgs
+
+
+@router.post("/agent/chat/upload")
+async def upload_chat_image(
+    file: UploadFile = File(...),
+    token: dict = Depends(JWTBearer()),
+):
+    """Upload an image for use in the agent chat. Returns a Cloudinary URL."""
+    from app.utils.cloudinary_upload import upload_bytes
+
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    filename = (file.filename or "").lower()
+    content_type = (file.content_type or "").lower()
+    allowed_types = {"image/jpeg", "image/jpg", "image/png", "image/webp", "image/heic"}
+    allowed_exts = (".jpg", ".jpeg", ".png", ".webp", ".heic")
+
+    if content_type not in allowed_types and not any(filename.endswith(e) for e in allowed_exts):
+        return UriResponse.error_response("Only JPEG, PNG, WebP, and HEIC images are supported.")
+
+    file_bytes = await file.read()
+    size_mb = len(file_bytes) / (1024 * 1024)
+    if size_mb > 10:
+        return UriResponse.error_response(f"File too large ({size_mb:.1f}MB). Maximum is 10MB.")
+
+    try:
+        url = await upload_bytes(file_bytes, folder=f"uri-social/chat-images/{user_id}")
+        return UriResponse.get_single_data_response("image_uploaded", {"url": url})
+    except Exception as e:
+        print(f"❌ chat image upload error: {e}")
+        return UriResponse.error_response("Image upload failed. Please try again.")
 
 
 @router.post("/agent/chat/stream")
@@ -5067,9 +5119,7 @@ async def agent_chat_stream(
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
-    messages = [{"role": "system", "content": _AGENT_SYSTEM_PROMPT_STREAM}]
-    for m in request.messages:
-        messages.append({"role": m.role, "content": m.content})
+    messages = _build_oai_messages(_AGENT_SYSTEM_PROMPT_STREAM, request)
 
     async_client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
 
@@ -5182,11 +5232,18 @@ async def agent_chat(
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
     try:
-        messages = [ChatMessage(role="system", content=_AGENT_SYSTEM_PROMPT)]
-        for m in request.messages:
-            messages.append(ChatMessage(role=m.role, content=m.content))
+        oai_messages = _build_oai_messages(_AGENT_SYSTEM_PROMPT, request)
 
-        result = await AIService.chat_completion(ChatModel(model="gpt-4o-mini", messages=messages, temperature=0.4))
+        if request.image_url:
+            from openai import AsyncOpenAI
+            from app.core.config import settings
+            _ac = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+            result = await _ac.chat.completions.create(
+                model="gpt-4o-mini", messages=oai_messages, temperature=0.4
+            )
+        else:
+            messages = [ChatMessage(role=m["role"], content=m["content"]) for m in oai_messages]
+            result = await AIService.chat_completion(ChatModel(model="gpt-4o-mini", messages=messages, temperature=0.4))
 
         if isinstance(result, dict) and "error" in result:
             return UriResponse.error_response(result["error"])
