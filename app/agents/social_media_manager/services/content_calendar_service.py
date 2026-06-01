@@ -14,6 +14,7 @@ import json
 import re
 import uuid
 import secrets
+import random
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -86,6 +87,28 @@ CONTENT_TYPE_LABELS = {
 }
 
 WEEK_DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+# 7 distinct hook styles — one is assigned to each day so no two posts open the same way
+HOOK_STYLES = [
+    "Bold statement — open with a provocative or surprising claim that stops the scroll",
+    "Data/stat — lead with a specific number, percentage, or research finding",
+    "Story-led — open with a short first-person or customer story (1-2 sentences max)",
+    "Direct question — ask the audience something they instantly have an opinion about",
+    "Myth-bust — start with a common misconception then flip it",
+    "How-to opener — begin with 'Here's how…' or 'The exact steps we use to…'",
+    "Relatable frustration — open with a pain point the audience recognises instantly",
+]
+
+# 7 distinct post formats — rotated across the week for visual variety
+POST_FORMATS = [
+    "Single image with caption",
+    "Carousel (3-5 slides)",
+    "Short-form video / Reel (15-30 sec concept)",
+    "Text-only post (strong copy, no image needed)",
+    "Poll or interactive question",
+    "Infographic or data visual",
+    "Before/after or side-by-side comparison",
+]
 
 
 def _get_monday(ref: datetime) -> datetime:
@@ -258,10 +281,47 @@ async def _generate_ideas(
         if lines:
             platform_tone_block = "Platform-specific tones:\n" + "\n".join(lines)
 
-    days_block = "\n".join(
-        f"Day {i} ({WEEK_DAYS[i]}) → type: {mix[i]} ({CONTENT_TYPE_LABELS[mix[i]]})"
-        for i in range(7)
-    )
+    # Definitions for what each topic label means as post subject matter.
+    # Critical: prevents AI from misreading e.g. "offer" as "promote this brand"
+    # or "marketing" as "write about social media marketing for this platform".
+    _TOPIC_DEFINITIONS = {
+        "offer":      "deals, discounts, limited-time sales, pricing savings — e.g. a money-saving tip, a promo breakdown, a 'best deal right now' angle",
+        "technology": "practical tech tools, apps, automation, AI — e.g. a tool that saves time, an automation hack, a software comparison",
+        "finance":    "money management, investing, savings, budgeting, profit margins — e.g. an investment tip, a budgeting mistake, a savings strategy",
+        "business":   "entrepreneurship, client acquisition, sales strategy, startup growth — e.g. how to land clients, a scaling lesson, a founder insight",
+        "education":  "step-by-step guides, how-to posts, common mistakes, beginner tips — e.g. a tutorial, a 'what I wish I knew' post, a myth-bust",
+        "marketing":  "audience growth tactics, brand-building, content strategy — e.g. an algorithm insight, a growth hack, a posting strategy",
+        "motivation": "mindset, discipline, resilience, goal-setting — e.g. a personal growth story, a hard truth about success, an anti-procrastination angle",
+        "real estate":"property investing, rental income, mortgage tips, landlord lessons",
+        "fashion":    "style tips, outfit ideas, trend breakdowns, wardrobe hacks",
+        "food":       "recipes, meal prep, food business tips, catering insights",
+        "story":      "behind-the-scenes story, brand journey, case study, team moment",
+    }
+
+    # Resolve performance topics early — needed for both days_block and topic_override_block
+    _perf_topics = (performance or {}).get("top_topics", []) if performance and performance.get("has_data") else []
+
+    # Shuffle hook styles and formats so each week has a different assignment
+    shuffled_hooks = HOOK_STYLES[:]
+    shuffled_formats = POST_FORMATS[:]
+    random.shuffle(shuffled_hooks)
+    random.shuffle(shuffled_formats)
+
+    if _perf_topics:
+        _cycled_for_days = [_perf_topics[i % len(_perf_topics)] for i in range(7)]
+        days_block = "\n".join(
+            (
+                f"Day {i} ({WEEK_DAYS[i]}) → "
+                f"TOPIC: {_cycled_for_days[i]} (write about: {_TOPIC_DEFINITIONS.get(_cycled_for_days[i], _cycled_for_days[i])}) | "
+                f"type: {mix[i]} ({CONTENT_TYPE_LABELS[mix[i]]}) | hook: {shuffled_hooks[i]} | format: {shuffled_formats[i]}"
+            )
+            for i in range(7)
+        )
+    else:
+        days_block = "\n".join(
+            f"Day {i} ({WEEK_DAYS[i]}) → type: {mix[i]} ({CONTENT_TYPE_LABELS[mix[i]]}) | hook: {shuffled_hooks[i]} | format: {shuffled_formats[i]}"
+            for i in range(7)
+        )
 
     avoid_repeat_block = ""
     if previous_titles:
@@ -291,23 +351,37 @@ async def _generate_ideas(
             growth = kw.get("growth_rate", 0)
             suffix = f" (+{growth:.0f}% on Google)" if kw_type == "rising" and growth else f" (score: {score})"
             trend_lines.append(f"  - {kw['keyword']}{suffix}")
-        market_intel_block = "Current trending topics in this industry (Market Intel — prioritise these):\n" + "\n".join(trend_lines)
+        intel_label = (
+            "Trending keywords (use as angles/hooks within the assigned topics above — do NOT change the topic):"
+            if _perf_topics else
+            "Current trending topics in this industry (Market Intel — prioritise these):"
+        )
+        market_intel_block = intel_label + "\n" + "\n".join(trend_lines)
 
     # ── Performance Intelligence block ────────────────────────────────────────
     performance_block = ""
     if performance and performance.get("has_data"):
-        perf_lines = []
         top_topics = performance.get("top_topics", [])
-        if top_topics:
-            perf_lines.append(f"Top performing topics for this account: {', '.join(top_topics[:5])}")
         top_formats = performance.get("top_formats", [])
+        best_hour = performance.get("best_posting_hour")
+
+        perf_lines = []
+        if top_topics:
+            # Surface as a primary directive, not a soft hint
+            perf_lines.append(
+                f"PROVEN TOP TOPICS (highest engagement for this account): {', '.join(top_topics[:5])}. "
+                f"AT LEAST 4 of the 7 days MUST be about one of these topics. "
+                f"Blend them with the brand pillars — e.g. an Educational post should teach something from one of these top topics."
+            )
         if top_formats:
             perf_lines.append(f"Best performing format: {top_formats[0]}")
-        best_hour = performance.get("best_posting_hour")
         if best_hour is not None:
             perf_lines.append(f"Best posting time: {best_hour}:00")
         if perf_lines:
-            performance_block = "Account performance signals (use these to inform content angles):\n" + "\n".join(f"  - {l}" for l in perf_lines)
+            performance_block = (
+                "⚡ PERFORMANCE DATA — this account's real engagement history (treat as primary creative brief):\n"
+                + "\n".join(f"  - {l}" for l in perf_lines)
+            )
 
     brand_block = f"Brand: {brand_name}"
     if tagline:
@@ -348,7 +422,30 @@ async def _generate_ideas(
         extras.append(f"Topics/themes to avoid: {avoid_str}")
     extras_block = "\n".join(extras)
 
+    # When we have engagement data, assign one proven topic to each day explicitly.
+    # This leaves the AI no room to drift back to brand pillars or industry defaults.
+    if _perf_topics:
+        _cycled = [_perf_topics[i % len(_perf_topics)] for i in range(7)]
+        _topic_lines = "\n".join(
+            f"  Day {i} → TOPIC: {_cycled[i]}  ({_TOPIC_DEFINITIONS.get(_cycled[i], _cycled[i])})"
+            for i in range(7)
+        )
+        topic_override_block = (
+            f"=== MANDATORY TOPIC ASSIGNMENTS (derived from real engagement data) ===\n"
+            f"Each day's post MUST be about the assigned topic — the definition in parentheses tells you exactly what the post should cover.\n"
+            f"CRITICAL: these topics are the SUBJECT MATTER of the post — they are not about this brand's own services or platform.\n"
+            f"The brand voice/audience tells you HOW and WHO to write for — the topic tells you WHAT to write about.\n"
+            f"{_topic_lines}\n"
+            f"======================================================================="
+        )
+        content_focus_line = ""  # suppress pillars entirely — topics are set above
+    else:
+        topic_override_block = ""
+        content_focus_line = f"Content pillars: {pillars_str}"
+
     prompt = f"""You are a senior social media strategist creating a 7-day content plan.
+
+{topic_override_block}
 
 {brand_block}
 
@@ -356,19 +453,19 @@ async def _generate_ideas(
 
 {voice_block}
 
-Content pillars: {pillars_str}
+{performance_block}
+{content_focus_line}
 Platforms: {platforms_str}
 Week starting: {week_start}
 {extras_block}
 {market_intel_block}
-{performance_block}
 {avoid_repeat_block}
 {force_token_block}
 Generate a 7-day content plan. For each day produce:
 - title: a short, punchy content idea title (max 10 words) — make it feel native to the platform and brand
 - description: 2-3 sentences with a concrete, specific angle. Include what to say, who it speaks to, and why it matters for this brand right now.
 
-Day assignments (use these content types exactly):
+Day assignments — follow the content type, hook style, AND format exactly for each day:
 {days_block}
 
 Return ONLY a valid JSON array of exactly 7 objects:
@@ -381,24 +478,27 @@ Return ONLY a valid JSON array of exactly 7 objects:
 
 Rules:
 - GROUND each idea in the trending topics and performance signals provided above — these are real signals, not generic suggestions
-- Every day must have a DIFFERENT angle, format feel, and hook — no two titles should start with the same phrase
-- Never use list-post titles like "5 ways to..." or "5 mistakes..." more than once across the 7 days
+- EVERY day must use its assigned hook style and format — this is mandatory, not optional
+- No two titles should start with the same word or phrase — maximum variety across all 7
+- Never use list-post titles like "5 ways to..." or "5 mistakes..." more than ONCE across the 7 days
+- No two days should share the same emotional tone — vary between inspiring, urgent, curious, empathetic, bold, playful, and authoritative
 - Be SPECIFIC to this brand — use real product/service names, real audience pain points, real industry context
-- Promotional: highlight a genuine product/service benefit with a clear value statement
+- Promotional: when a TOPIC is assigned, write about a deal/offer/value prop WITHIN that topic (e.g. if topic=finance, promote a financial tool or a deal for investors) — do NOT default to promoting this brand's own platform
 - Educational: share an insight directly relevant to this brand's industry and audience
-- Relatable: tap into a real emotion or experience the target audience would recognise
+- Relatable: tap into a real emotion or experience the target audience would recognise instantly
 - Engagement: pose a specific question or poll that this brand's followers would genuinely answer — vary the question style (poll, fill-in-the-blank, debate, personal story prompt)
 - Behind the scenes: ROTATE each week between these distinct angles — workspace setup, product/service creation process, team doing actual work (NOT "Meet the team" introductions), packaging/delivery moment, before-and-after of a real project, client prep or discovery call, tool/workflow walkthrough. Do NOT default to team introduction posts.
 - Match the brand voice exactly — if casual, be casual; if bold, be bold
 - Never be generic — every idea should be impossible to copy-paste to a different brand
+- If you notice you are writing similar angles back-to-back, STOP and pick a completely different direction
 """
 
     ai_request = AIService.build_ai_model(
         messages=[{"role": "user", "content": prompt}],
-        model="gpt-4o" if force else "gpt-4o-mini",
-        temperature=0.95 if force else 0.88,
+        model="gpt-4o",
+        temperature=0.95 if force else 0.9,
     )
-    print(f"[Calendar] _generate_ideas model={'gpt-4o' if force else 'gpt-4o-mini'} temperature={0.95 if force else 0.8} force={force}", flush=True)
+    print(f"[Calendar] _generate_ideas model=gpt-4o temperature={0.95 if force else 0.9} force={force}", flush=True)
     response = await AIService.chat_completion(ai_request)
     if isinstance(response, dict) and response.get("error"):
         raise ValueError(response["error"])
@@ -502,6 +602,7 @@ async def generate_plan(
     days: List[Dict[str, Any]] = []
 
     # ── AI generation (always used — grounded in trend + performance signals) ─
+    _ai_error: Optional[str] = None
     try:
         if trend_keywords or performance.get("has_data"):
             generation_method = "data_driven" if performance.get("has_data") else "trend_driven"
@@ -513,7 +614,9 @@ async def generate_plan(
             force=force,
         )
     except Exception as exc:
-        print(f"[Calendar] AI generation failed: {exc}")
+        import traceback as _tb
+        _ai_error = str(exc)
+        print(f"[Calendar] AI generation failed: {exc}\n{_tb.format_exc()}")
         ai_ideas = []
 
     for i, idea in enumerate(ai_ideas):
@@ -564,7 +667,8 @@ async def generate_plan(
         if restored:
             restored.pop("_id", None)
             return restored
-        raise RuntimeError("Content generation failed and no previous plan to restore. Please try again.")
+        reason = f" Cause: {_ai_error}" if _ai_error else ""
+        raise RuntimeError(f"Content generation failed and no previous plan to restore.{reason}")
 
     plan_id = str(uuid.uuid4())
     doc = {

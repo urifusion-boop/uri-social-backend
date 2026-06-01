@@ -1,0 +1,45 @@
+name: Publish Scheduled Posts
+
+on:
+  schedule:
+    # Runs every 5 minutes — triggers the backend cron endpoint that
+    # checks for scheduled posts whose time has passed and publishes them.
+    - cron: '*/5 * * * *'
+  workflow_dispatch: # allow manual trigger for testing
+
+jobs:
+  trigger-staging:
+    name: Staging — publish scheduled
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call publish-scheduled (staging)
+        run: |
+          STATUS=$(curl -s -o /tmp/staging_response.json -w "%{http_code}" \
+            -X POST https://api-staging.urisocial.com/social-media/publish-scheduled \
+            -H "Content-Type: application/json" \
+            -H "X-Cron-Secret: ${{ secrets.CRON_SECRET }}" \
+            --max-time 30)
+          echo "HTTP $STATUS"
+          cat /tmp/staging_response.json
+          if [ "$STATUS" -ge 500 ]; then
+            echo "::error::Staging publish-scheduled returned $STATUS"
+            exit 1
+          fi
+
+  trigger-production:
+    name: Production — publish scheduled
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call publish-scheduled (production)
+        run: |
+          STATUS=$(curl -s -o /tmp/prod_response.json -w "%{http_code}" \
+            -X POST https://api.urisocial.com/social-media/publish-scheduled \
+            -H "Content-Type: application/json" \
+            -H "X-Cron-Secret: ${{ secrets.CRON_SECRET }}" \
+            --max-time 30)
+          echo "HTTP $STATUS"
+          cat /tmp/prod_response.json
+          if [ "$STATUS" -ge 500 ]; then
+            echo "::error::Production publish-scheduled returned $STATUS"
+            exit 1
+          fi

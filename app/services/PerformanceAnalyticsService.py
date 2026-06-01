@@ -9,19 +9,28 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 
 
 # Topic keyword → canonical topic label
+# Rules: every keyword must be a whole word (matched with \b boundaries).
+# Avoid generic words that appear in unrelated contexts:
+#   - "growth" removed from motivation (too common in business/finance: "revenue growth")
+#   - "success" → kept but only matches standalone "success" (not "successful", "customer success" as phrase)
+#   - "process" removed from story (matches "acquisition process", "sales process")
+#   - "off" removed from offer (matches "lay off", "take off", "off the record")
+#   - "land" removed from real estate (matches "land a client", "landing page")
+#   - "buy" removed from real estate (matches any sales/e-commerce copy)
+#   - "wear" removed from fashion (matches "don't wear your emotions", "swear")
 _TOPIC_KEYWORDS: Dict[str, List[str]] = {
     "finance":    ["money", "finance", "investment", "savings", "profit", "revenue", "cost", "budget"],
     "education":  ["learn", "guide", "tips", "how to", "beginner", "mistakes", "advice", "tutorial"],
-    "motivation": ["success", "achieve", "goals", "mindset", "growth", "challenge", "inspire"],
+    "motivation": ["achieve", "goals", "mindset", "challenge", "inspire", "discipline", "consistency"],
     "marketing":  ["marketing", "brand", "audience", "content", "social media", "engagement", "campaign"],
-    "business":   ["business", "startup", "entrepreneur", "client", "customer", "sales", "revenue"],
+    "business":   ["business", "startup", "entrepreneur", "client", "customer", "sales", "revenue", "growth"],
     "technology": ["tech", "software", "app", "digital", "automation", "AI", "platform", "tool"],
-    "health":     ["health", "wellness", "fitness", "mental", "wellbeing", "nutrition"],
-    "real estate":["property", "real estate", "house", "land", "rent", "buy", "mortgage"],
-    "fashion":    ["fashion", "style", "outfit", "clothing", "wear", "streetwear"],
-    "food":       ["food", "meal", "recipe", "cook", "eat", "restaurant", "catering"],
-    "offer":      ["discount", "promo", "offer", "sale", "deal", "combo", "price", "off"],
-    "story":      ["behind", "story", "journey", "our team", "process", "how we"],
+    "health":     ["health", "wellness", "fitness", "mental health", "wellbeing", "nutrition"],
+    "real estate":["property", "real estate", "house", "rent", "mortgage", "landlord", "tenant"],
+    "fashion":    ["fashion", "style", "outfit", "clothing", "streetwear"],
+    "food":       ["food", "meal", "recipe", "cook", "restaurant", "catering"],
+    "offer":      ["discount", "promo", "offer", "sale", "deal", "combo", "price"],
+    "story":      ["behind the scenes", "our story", "journey", "our team", "how we", "case study"],
 }
 
 
@@ -145,15 +154,15 @@ class PerformanceAnalyticsService:
 
     @staticmethod
     def _extract_topics(content: str, brand_pillars: List[str] = None) -> List[str]:
+        import re as _re
         text = content.lower()
         found = [
             topic for topic, keywords in _TOPIC_KEYWORDS.items()
-            if any(k in text for k in keywords)
+            if any(_re.search(r'\b' + _re.escape(k) + r'\b', text) for k in keywords)
         ]
-        # Also match brand-specific content pillars directly
         for pillar in (brand_pillars or []):
             pillar_lower = pillar.lower().strip()
-            if pillar_lower and pillar_lower not in found and pillar_lower in text:
+            if pillar_lower and pillar_lower not in found and _re.search(r'\b' + _re.escape(pillar_lower) + r'\b', text):
                 found.append(pillar_lower)
         return found[:3]
 

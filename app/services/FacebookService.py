@@ -2,7 +2,8 @@
 Minimal FacebookService stub for the uri-agent.
 Only implements the two methods used by ApprovalWorkflowService.
 """
-import requests
+import json
+import httpx
 from http import HTTPStatus
 from typing import Any, Dict
 
@@ -15,43 +16,58 @@ class FacebookService:
     async def post_on_facebook(page_id: str, post_data: dict, access_token: str):
         """
         Posts content on Facebook using the Graph API.
+        Sends access_token as query param + form-encoded body (not Bearer + JSON)
+        to avoid Facebook error code 1 on certain token types.
         """
         url = f"https://graph.facebook.com/{settings.FACEBOOK_API_VERSION}/{page_id}/feed"
-        headers = {"Authorization": f"Bearer {access_token}"}
+        params = {"access_token": access_token}
 
-        # Build payload from post_data dict
-        payload: Dict[str, Any] = {
+        form: Dict[str, Any] = {
             "message": post_data.get("message", ""),
-            "published": post_data.get("published", True),
+            "published": str(post_data.get("published", True)).lower(),
         }
         if post_data.get("attached_media"):
-            payload["attached_media"] = post_data["attached_media"]
+            form["attached_media"] = json.dumps(post_data["attached_media"])
         if post_data.get("scheduled_publish_time"):
-            payload["scheduled_publish_time"] = post_data["scheduled_publish_time"]
+            form["scheduled_publish_time"] = str(post_data["scheduled_publish_time"])
 
         try:
-            response = requests.post(url, headers=headers, json=payload)
+            async with httpx.AsyncClient(timeout=60) as client:
+                response = await client.post(url, params=params, data=form)
+            print(f"📘 FB post_on_facebook | status={response.status_code} body={response.text[:300]}")
             if response.status_code != HTTPStatus.OK:
                 return UriResponse.get_single_data_response(
                     "publish_post", None, code=response.status_code
                 )
             return UriResponse.create_response("publish_post", response.json())
         except Exception as e:
-            print(f"Error posting to Facebook: {e}")
+            print(f"❌ Error posting to Facebook: {e}")
             raise
 
     @staticmethod
     async def publish_post(page_id: str, payload: dict, access_token: str):
         """
         Publishes a post to a Facebook Page.
+        Sends access_token as query param + form-encoded body (not Bearer + JSON)
+        to avoid Facebook error code 1 on certain token types.
         """
         url = f"https://graph.facebook.com/{settings.FACEBOOK_API_VERSION}/{page_id}/feed"
-        headers = {"Authorization": f"Bearer {access_token}"}
+        params = {"access_token": access_token}
 
-        if payload.get("published"):
-            payload.pop("scheduled_publish_time", None)
+        published = payload.get("published", True)
+        form: Dict[str, Any] = {
+            "message": payload.get("message", ""),
+            "published": str(published).lower(),
+        }
+        if payload.get("attached_media"):
+            form["attached_media"] = json.dumps(payload["attached_media"])
+        if not published and payload.get("scheduled_publish_time"):
+            form["scheduled_publish_time"] = str(payload["scheduled_publish_time"])
 
-        response = requests.post(url, headers=headers, json=payload)
+        async with httpx.AsyncClient(timeout=60) as client:
+            response = await client.post(url, params=params, data=form)
+
+        print(f"📘 FB publish_post | status={response.status_code} body={response.text[:300]}")
 
         if response.status_code != HTTPStatus.OK:
             return UriResponse.get_single_data_response(
