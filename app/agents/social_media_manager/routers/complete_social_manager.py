@@ -5029,6 +5029,20 @@ Only set "navigate" when the user should be taken to a specific section. Set it 
 """
 
 
+_AGENT_SYSTEM_PROMPT_STREAM = _AGENT_SYSTEM_PROMPT.replace(
+    "## Response format\nYour ENTIRE response must be a single valid JSON object — no text before it, no text after it, no markdown fences.\nReturn ONLY this raw JSON:\n{\"reply\": \"<your plain-text reply>\", \"navigate\": \"<section key or null>\"}\n\nOnly set \"navigate\" when the user should be taken to a specific section. Set it to null otherwise.",
+    """## Response format
+Start your response with NAVIGATE:<key>| where <key> is the section to navigate to, or NAVIGATE:null| if no navigation is needed. Then write your plain-text reply immediately after the pipe — no newline between the prefix and the reply.
+
+Examples:
+NAVIGATE:billing|I'll take you to the Billing section where you can view plans and credits.
+NAVIGATE:null|Here's how the Posting Schedule works: after generating content, posts land in Needs Review.
+NAVIGATE:connections|To connect Instagram, head to Connected Accounts and follow the OAuth steps.
+
+Do NOT include any text before the NAVIGATE: prefix. Do NOT add a newline after the pipe."""
+)
+
+
 class AgentChatMessage(BaseModel):
     role: str  # "user" or "assistant"
     content: str
@@ -5036,6 +5050,89 @@ class AgentChatMessage(BaseModel):
 
 class AgentChatRequest(BaseModel):
     messages: List[AgentChatMessage]  # full conversation history, latest message last
+
+
+@router.post("/agent/chat/stream")
+async def agent_chat_stream(
+    request: AgentChatRequest,
+    token: dict = Depends(JWTBearer()),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """Streaming version of agent chat — returns SSE tokens as they arrive."""
+    from openai import AsyncOpenAI
+    from app.core.config import settings
+    from fastapi.responses import StreamingResponse as _StreamingResponse
+
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    messages = [{"role": "system", "content": _AGENT_SYSTEM_PROMPT_STREAM}]
+    for m in request.messages:
+        messages.append({"role": m.role, "content": m.content})
+
+    async_client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+
+    async def generate():
+        full_text = ""
+        navigate = None
+        nav_extracted = False
+        nav_buffer = ""
+
+        try:
+            stream = await async_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=messages,
+                temperature=0.4,
+                stream=True,
+            )
+            async for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta.content or ""
+                if not delta:
+                    continue
+                full_text += delta
+
+                if not nav_extracted:
+                    nav_buffer += delta
+                    if "|" in nav_buffer:
+                        prefix, rest = nav_buffer.split("|", 1)
+                        nav_raw = prefix.replace("NAVIGATE:", "").strip()
+                        navigate = None if nav_raw in ("null", "") else nav_raw
+                        nav_extracted = True
+                        if rest:
+                            yield f"data: {json.dumps({'token': rest})}\n\n"
+                else:
+                    yield f"data: {json.dumps({'token': delta})}\n\n"
+
+        except Exception as e:
+            print(f"❌ agent_chat_stream error: {e}")
+            yield f"data: {json.dumps({'error': 'Stream failed. Please try again.'})}\n\n"
+            return
+
+        # Extract just the reply text (strip the NAVIGATE: prefix)
+        reply_text = full_text.split("|", 1)[1] if "|" in full_text else full_text
+
+        # Persist to DB
+        user_msg = request.messages[-1] if request.messages else None
+        if user_msg and reply_text.strip():
+            now = datetime.utcnow()
+            try:
+                await db["agent_chat_messages"].insert_many([
+                    {"user_id": user_id, "role": "user", "content": user_msg.content, "created_at": now, "surface": "web"},
+                    {"user_id": user_id, "role": "assistant", "content": reply_text.strip(), "created_at": now, "surface": "web"},
+                ])
+            except Exception:
+                pass
+
+        yield f"data: {json.dumps({'done': True, 'navigate': navigate})}\n\n"
+
+    return _StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.get("/agent/chat/history")
