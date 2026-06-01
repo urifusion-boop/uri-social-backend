@@ -5253,17 +5253,19 @@ async def agent_chat(
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
     try:
-        oai_messages = _build_oai_messages(_AGENT_SYSTEM_PROMPT, request)
-
+        # Build message list — use raw dicts for vision, ChatMessage objects otherwise
         if request.image_url:
             from openai import AsyncOpenAI
             from app.core.config import settings
+            oai_messages = _build_oai_messages(_AGENT_SYSTEM_PROMPT, request)
             _ac = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
             result = await _ac.chat.completions.create(
                 model="gpt-4o-mini", messages=oai_messages, temperature=0.4
             )
         else:
-            messages = [ChatMessage(role=m["role"], content=m["content"]) for m in oai_messages]
+            messages = [ChatMessage(role="system", content=_AGENT_SYSTEM_PROMPT)]
+            for m in request.messages:
+                messages.append(ChatMessage(role=m.role, content=m.content))
             result = await AIService.chat_completion(ChatModel(model="gpt-4o-mini", messages=messages, temperature=0.4))
 
         if isinstance(result, dict) and "error" in result:
@@ -5275,7 +5277,6 @@ async def agent_chat(
         try:
             parsed = json.loads(raw)
         except json.JSONDecodeError:
-            # Model added preamble text before the JSON — find the object
             import re
             m = re.search(r'\{[\s\S]*?"reply"[\s\S]*?\}', raw)
             if m:
@@ -5288,13 +5289,28 @@ async def agent_chat(
             reply = parsed.get("reply") or raw
             navigate = parsed.get("navigate") or None
             generate = parsed.get("generate") or None
-            # Validate generate shape
             if generate and not (isinstance(generate, dict) and generate.get("topic")):
                 generate = None
         else:
             reply = raw
             navigate = None
             generate = None
+
+        # Backend fallback: if model forgot the generate field but user clearly asked for content
+        if generate is None and request.messages:
+            user_text = request.messages[-1].content.lower()
+            generation_keywords = ["generate", "create", "write", "draft", "make posts", "make content"]
+            if any(kw in user_text for kw in generation_keywords):
+                platforms = []
+                if "instagram" in user_text:
+                    platforms.append("instagram")
+                if "facebook" in user_text:
+                    platforms.append("facebook")
+                if "linkedin" in user_text:
+                    platforms.append("linkedin")
+                if not platforms:
+                    platforms = ["instagram", "facebook"]
+                generate = {"topic": request.messages[-1].content, "platforms": platforms}
 
         # Persist the latest user turn and the AI reply
         user_msg = request.messages[-1] if request.messages else None
