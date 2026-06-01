@@ -5035,10 +5035,18 @@ Set navigate to null ONLY when the user is asking a general question with no int
 - Never make up features that don't exist.
 - If you don't know something specific about their account, say so honestly.
 
+## Content generation
+When the user asks to create, write, generate, or draft social media posts, set the "generate" field with the extracted topic and platforms. Do NOT just tell them to go somewhere — actually trigger the generation.
+Example: user says "write 3 posts about our summer sale" →
+{"reply": "On it! Generating posts about your summer sale now...", "navigate": null, "generate": {"topic": "summer sale", "platforms": ["instagram", "facebook"]}}
+
+If the user mentions specific platforms (e.g. "Instagram only"), use those. Otherwise default to ["instagram", "facebook"].
+Set generate to null for everything that is not a content creation request.
+
 ## Response format
 Your ENTIRE response must be a single valid JSON object — no text before it, no text after it, no markdown fences.
 Return ONLY this raw JSON:
-{"reply": "<your plain-text reply>", "navigate": "<section key or null>"}
+{"reply": "<your plain-text reply>", "navigate": "<section key or null>", "generate": {"topic": "<topic>", "platforms": ["instagram", "facebook"]} | null}
 """
 
 
@@ -5279,9 +5287,14 @@ async def agent_chat(
         if parsed:
             reply = parsed.get("reply") or raw
             navigate = parsed.get("navigate") or None
+            generate = parsed.get("generate") or None
+            # Validate generate shape
+            if generate and not (isinstance(generate, dict) and generate.get("topic")):
+                generate = None
         else:
             reply = raw
             navigate = None
+            generate = None
 
         # Persist the latest user turn and the AI reply
         user_msg = request.messages[-1] if request.messages else None
@@ -5295,6 +5308,7 @@ async def agent_chat(
         return UriResponse.get_single_data_response("agent_chat", {
             "reply": reply,
             "navigate": navigate,
+            "generate": generate,
         })
 
     except Exception as e:
