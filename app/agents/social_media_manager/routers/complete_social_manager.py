@@ -5036,17 +5036,22 @@ Set navigate to null ONLY when the user is asking a general question with no int
 - If you don't know something specific about their account, say so honestly.
 
 ## Content generation
-When the user asks to create, write, generate, or draft social media posts, set the "generate" field with the extracted topic and platforms. Do NOT just tell them to go somewhere — actually trigger the generation.
-Example: user says "write 3 posts about our summer sale" →
-{"reply": "On it! Generating posts about your summer sale now...", "navigate": null, "generate": {"topic": "summer sale", "platforms": ["instagram", "facebook"]}}
+When the user asks to create, write, generate, or draft social media posts, set the "generate" field.
+Set include_images to true ONLY when the user explicitly mentions images, photos, visuals, or pictures.
+Set include_images to false for text-only requests.
 
-If the user mentions specific platforms (e.g. "Instagram only"), use those. Otherwise default to ["instagram", "facebook"].
+Examples:
+- "write 3 posts about our summer sale" → {"topic": "summer sale", "platforms": ["instagram", "facebook"], "include_images": false}
+- "generate posts with images about our new product" → {"topic": "new product", "platforms": ["instagram", "facebook"], "include_images": true}
+- "create Instagram content with photos about Lagos Fashion Week" → {"topic": "Lagos Fashion Week", "platforms": ["instagram"], "include_images": true}
+
+If the user mentions specific platforms, use those. Otherwise default to ["instagram", "facebook"].
 Set generate to null for everything that is not a content creation request.
 
 ## Response format
 Your ENTIRE response must be a single valid JSON object — no text before it, no text after it, no markdown fences.
 Return ONLY this raw JSON:
-{"reply": "<your plain-text reply>", "navigate": "<section key or null>", "generate": {"topic": "<topic>", "platforms": ["instagram", "facebook"]} | null}
+{"reply": "<your plain-text reply>", "navigate": "<section key or null>", "generate": {"topic": "<topic>", "platforms": ["instagram", "facebook"], "include_images": false} | null}
 """
 
 
@@ -5310,7 +5315,15 @@ async def agent_chat(
                     platforms.append("linkedin")
                 if not platforms:
                     platforms = ["instagram", "facebook"]
-                generate = {"topic": request.messages[-1].content, "platforms": platforms}
+                image_keywords = ["with image", "with photo", "with visual", "with picture", "with graphic"]
+                include_images = any(kw in user_text for kw in image_keywords)
+                generate = {"topic": request.messages[-1].content, "platforms": platforms, "include_images": include_images}
+
+        # Ensure include_images is always present in the generate field
+        if generate and "include_images" not in generate:
+            user_text = (request.messages[-1].content if request.messages else "").lower()
+            image_keywords = ["with image", "with photo", "with visual", "with picture", "with graphic"]
+            generate["include_images"] = any(kw in user_text for kw in image_keywords)
 
         # Persist the latest user turn and the AI reply
         user_msg = request.messages[-1] if request.messages else None
