@@ -714,13 +714,32 @@ class ApprovalWorkflowService:
                         errors.append({"draft_id": draft["id"], "error": "Cannot determine user_id for draft"})
                         continue
 
-                    connections_cursor = db["social_connections"].find({
-                        "user_id": draft_user_id,
-                        "platform": draft["platform"],
-                        "connection_status": "active",
-                    }).sort("created_at", -1).limit(1)
-                    conn_list = await connections_cursor.to_list(length=1)
-                    connection = conn_list[0] if conn_list else None
+                    # For platforms that use direct OAuth (not Outstand), prefer the connection
+                    # that has actual publishing credentials rather than a shadow Outstand doc
+                    # that may sort first by created_at.
+                    _platform_key = draft["platform"]
+                    if _platform_key == "linkedin":
+                        # Prefer direct connections with an access token
+                        connection = await db["social_connections"].find_one({
+                            "user_id": draft_user_id,
+                            "platform": _platform_key,
+                            "connection_status": "active",
+                            "linkedin_access_token": {"$exists": True, "$ne": None},
+                        })
+                        if not connection:
+                            connection = await db["social_connections"].find_one({
+                                "user_id": draft_user_id,
+                                "platform": _platform_key,
+                                "connection_status": "active",
+                            })
+                    else:
+                        connections_cursor = db["social_connections"].find({
+                            "user_id": draft_user_id,
+                            "platform": _platform_key,
+                            "connection_status": "active",
+                        }).sort("created_at", -1).limit(1)
+                        conn_list = await connections_cursor.to_list(length=1)
+                        connection = conn_list[0] if conn_list else None
 
                     # Outstand live-lookup fallback — skip platforms that always use direct APIs
                     if not connection and draft["platform"] not in ("instagram", "linkedin"):
