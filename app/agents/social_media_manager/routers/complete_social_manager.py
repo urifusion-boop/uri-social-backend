@@ -4995,7 +4995,10 @@ async def get_blog_draft(
 # URI Agent chat — in-app assistant
 # ---------------------------------------------------------------------------
 
-_AGENT_SYSTEM_PROMPT = """You are URI Agent, the built-in AI assistant for URI Social — a social media management platform. You help users navigate the platform, understand features, troubleshoot issues, and get the most out of the product.
+_AGENT_SYSTEM_PROMPT_TEMPLATE = """You are URI Agent, the built-in AI assistant for URI Social — a social media management platform. You help users navigate the platform, answer questions about their brand, understand features, and troubleshoot issues.
+
+## This user's brand profile
+{brand_context}
 
 ## Platform sections (use these exact keys when returning a navigate action)
 - "workspace"     → URI Agent chat (current section)
@@ -5016,7 +5019,6 @@ _AGENT_SYSTEM_PROMPT = """You are URI Agent, the built-in AI assistant for URI S
 - **Approval workflow**: "Auto-approve" publishes immediately; "Manual review" sends drafts to Needs Review first. Configurable in Settings.
 - **Scheduling**: Pick a date/time per post. The cron job publishes every 5 minutes — posts go live within 5 min of their scheduled time.
 - **Images**: Generate AI images per post. Instagram requires an image to publish. Carousel posts have per-slide images.
-- **Sync images**: When multiple carousel drafts have the same slide count, you can sync images from one platform to the others.
 - **Connected Accounts**: Facebook uses Outstand OAuth; Instagram uses Meta direct OAuth. They connect independently.
 - **Credits**: Each content generation costs 1 credit. Credits can be topped up in Billing.
 - **Blog Generator**: Generates long-form SEO blog posts separately from social posts.
@@ -5032,11 +5034,11 @@ _AGENT_SYSTEM_PROMPT = """You are URI Agent, the built-in AI assistant for URI S
 - "Can't schedule" → Ensure the platform account is connected first. Then select drafts and click Schedule All.
 
 ## Navigation rules — read carefully
-ALWAYS set navigate (never null) when the user says "show me", "take me", "go to", "open", "where is", or names a section. Use the exact key from the list above.
+ALWAYS set navigate (never null) when the user says "show me", "take me", "go to", "open", "where is", or names a section.
 
-Phrase → key mapping (non-exhaustive, use judgment for similar phrases):
+Phrase → key mapping:
 - "show me billing" / "billing" / "credits" / "plans" / "subscription" → "billing"
-- "connect my instagram" / "connect accounts" / "connected accounts" / "accounts" → "connections"
+- "connect my instagram" / "connect accounts" / "connected accounts" → "connections"
 - "show me my drafts" / "drafts" / "posting schedule" / "scheduled posts" / "needs review" → "schedule"
 - "show me performance" / "analytics" / "stats" / "engagement" → "performance"
 - "market intel" / "competitor" / "trends" → "intel"
@@ -5044,39 +5046,58 @@ Phrase → key mapping (non-exhaustive, use judgment for similar phrases):
 - "blog" / "blog generator" / "write a blog" → "blog"
 - "settings" / "approval workflow" / "auto-schedule" → "settings"
 - "notifications" → "notifications"
+- "generate posts" / "create posts" / "write posts" / "create content" → "schedule"
 
-Set navigate to null ONLY when the user is asking a general question with no intent to go somewhere (e.g. "how does scheduling work?" or "what is a carousel post?").
+When the user asks to generate, create, or write social media posts, reply with something like "Head over to Posting Schedule where you can generate posts for your brand." and set navigate to "schedule".
+
+Set navigate to null ONLY when the user is asking a general question with no navigation intent.
 
 ## Response rules
 - Be concise and friendly — 1-4 sentences max for simple questions.
-- If the user wants to generate content, tell them to type their topic/campaign — do NOT navigate away.
+- When answering questions about the user's brand, use the brand profile above. Be specific — use their actual brand name, industry, voice, and audience.
+- If a brand profile field is empty, say you don't have that info yet and suggest they complete their Brand Playbook.
 - Never make up features that don't exist.
-- If you don't know something specific about their account, say so honestly.
-
-## Content generation
-When the user asks to create, write, generate, or draft social media posts, set the "generate" field.
-Set include_images to true ONLY when the user explicitly mentions images, photos, visuals, or pictures.
-Set include_images to false for text-only requests.
-
-Examples:
-- "write 3 posts about our summer sale" → {"topic": "summer sale", "platforms": ["instagram", "facebook"], "include_images": false}
-- "generate posts with images about our new product" → {"topic": "new product", "platforms": ["instagram", "facebook"], "include_images": true}
-- "create Instagram content with photos about Lagos Fashion Week" → {"topic": "Lagos Fashion Week", "platforms": ["instagram"], "include_images": true}
-
-If the user mentions specific platforms, use those. Otherwise default to ["instagram", "facebook"].
-Set generate to null for everything that is not a content creation request.
 
 ## Response format
 Your ENTIRE response must be a single valid JSON object — no text before it, no text after it, no markdown fences.
 Return ONLY this raw JSON:
-{"reply": "<your plain-text reply>", "navigate": "<section key or null>", "generate": {"topic": "<topic>", "platforms": ["instagram", "facebook"], "include_images": false} | null}
+{"reply": "<your plain-text reply>", "navigate": "<section key or null>"}
 """
 
 
-_AGENT_SYSTEM_PROMPT_STREAM = _AGENT_SYSTEM_PROMPT.replace(
-    "## Response format\nYour ENTIRE response must be a single valid JSON object — no text before it, no text after it, no markdown fences.\nReturn ONLY this raw JSON:\n{\"reply\": \"<your plain-text reply>\", \"navigate\": \"<section key or null>\"}\n\nOnly set \"navigate\" when the user should be taken to a specific section. Set it to null otherwise.",
-    """## Response format
-Start your response with NAVIGATE:<key>| where <key> is the section to navigate to, or NAVIGATE:null| if no navigation is needed. Then write your plain-text reply immediately after the pipe — no newline between the prefix and the reply.
+def _build_agent_system_prompt(brand_context: dict) -> str:
+    """Inject brand profile into the system prompt."""
+    if not brand_context:
+        brand_str = "No brand profile set up yet. Suggest the user completes their Brand Playbook."
+    else:
+        lines = []
+        if brand_context.get("brand_name"):
+            lines.append(f"- Brand name: {brand_context['brand_name']}")
+        if brand_context.get("industry"):
+            lines.append(f"- Industry: {brand_context['industry']}")
+        if brand_context.get("business_description"):
+            lines.append(f"- Business: {brand_context['business_description']}")
+        if brand_context.get("tagline"):
+            lines.append(f"- Tagline: {brand_context['tagline']}")
+        if brand_context.get("brand_voice"):
+            lines.append(f"- Brand voice: {brand_context['brand_voice']}")
+        if brand_context.get("target_audience"):
+            lines.append(f"- Target audience: {brand_context['target_audience']}")
+        if brand_context.get("key_products_services"):
+            lines.append(f"- Key products/services: {', '.join(brand_context['key_products_services'])}")
+        if brand_context.get("content_pillars"):
+            lines.append(f"- Content pillars: {', '.join(brand_context['content_pillars'])}")
+        if brand_context.get("region"):
+            lines.append(f"- Market/region: {brand_context['region']}")
+        if brand_context.get("primary_goal"):
+            lines.append(f"- Primary goal: {brand_context['primary_goal']}")
+        brand_str = "\n".join(lines) if lines else "Brand profile is incomplete."
+    return _AGENT_SYSTEM_PROMPT_TEMPLATE.format(brand_context=brand_str)
+
+
+_AGENT_SYSTEM_PROMPT_STREAM_TEMPLATE = _AGENT_SYSTEM_PROMPT_TEMPLATE.replace(
+    '{"reply": "<your plain-text reply>", "navigate": "<section key or null>"}',
+    """Start your response with NAVIGATE:<key>| where <key> is the section to navigate to, or NAVIGATE:null| if no navigation is needed. Then write your plain-text reply immediately after the pipe — no newline between the prefix and the reply.
 
 Examples:
 NAVIGATE:billing|I'll take you to the Billing section where you can view plans and credits.
@@ -5085,6 +5106,28 @@ NAVIGATE:connections|To connect Instagram, head to Connected Accounts and follow
 
 Do NOT include any text before the NAVIGATE: prefix. Do NOT add a newline after the pipe."""
 )
+
+
+def _build_agent_system_prompt_stream(brand_context: dict) -> str:
+    """Build brand-aware system prompt for the streaming endpoint."""
+    if not brand_context:
+        brand_str = "No brand profile set up yet. Suggest the user completes their Brand Playbook."
+    else:
+        lines = []
+        if brand_context.get("brand_name"):
+            lines.append(f"- Brand name: {brand_context['brand_name']}")
+        if brand_context.get("industry"):
+            lines.append(f"- Industry: {brand_context['industry']}")
+        if brand_context.get("business_description"):
+            lines.append(f"- Business: {brand_context['business_description']}")
+        if brand_context.get("brand_voice"):
+            lines.append(f"- Brand voice: {brand_context['brand_voice']}")
+        if brand_context.get("target_audience"):
+            lines.append(f"- Target audience: {brand_context['target_audience']}")
+        if brand_context.get("key_products_services"):
+            lines.append(f"- Key products/services: {', '.join(brand_context['key_products_services'])}")
+        brand_str = "\n".join(lines) if lines else "Brand profile is incomplete."
+    return _AGENT_SYSTEM_PROMPT_STREAM_TEMPLATE.format(brand_context=brand_str)
 
 
 class AgentChatMessage(BaseModel):
@@ -5163,7 +5206,10 @@ async def agent_chat_stream(
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
-    messages = _build_oai_messages(_AGENT_SYSTEM_PROMPT_STREAM, request)
+    brand_profile_doc = await db["brand_profiles"].find_one({"user_id": user_id})
+    brand_ctx = BrandProfileService.to_brand_context(brand_profile_doc or {})
+    stream_system_prompt = _build_agent_system_prompt_stream(brand_ctx)
+    messages = _build_oai_messages(stream_system_prompt, request)
 
     async_client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
 
@@ -5276,17 +5322,23 @@ async def agent_chat(
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
     try:
+        # Fetch brand profile to personalise the system prompt
+        brand_profile_doc = await db["brand_profiles"].find_one({"user_id": user_id})
+        brand_context = BrandProfileService.to_brand_context(brand_profile_doc or {})
+        system_prompt = _build_agent_system_prompt(brand_context)
+
         # Build message list — use raw dicts for vision, ChatMessage objects otherwise
         if request.image_url:
             from openai import AsyncOpenAI
             from app.core.config import settings
-            oai_messages = _build_oai_messages(_AGENT_SYSTEM_PROMPT, request)
+            request_with_prompt = type("R", (), {"messages": request.messages, "image_url": request.image_url})()
+            oai_messages = _build_oai_messages(system_prompt, request_with_prompt)
             _ac = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
             result = await _ac.chat.completions.create(
                 model="gpt-4o-mini", messages=oai_messages, temperature=0.4
             )
         else:
-            messages = [ChatMessage(role="system", content=_AGENT_SYSTEM_PROMPT)]
+            messages = [ChatMessage(role="system", content=system_prompt)]
             for m in request.messages:
                 messages.append(ChatMessage(role=m.role, content=m.content))
             result = await AIService.chat_completion(ChatModel(model="gpt-4o-mini", messages=messages, temperature=0.4))
@@ -5311,37 +5363,9 @@ async def agent_chat(
         if parsed:
             reply = parsed.get("reply") or raw
             navigate = parsed.get("navigate") or None
-            generate = parsed.get("generate") or None
-            if generate and not (isinstance(generate, dict) and generate.get("topic")):
-                generate = None
         else:
             reply = raw
             navigate = None
-            generate = None
-
-        # Backend fallback: if model forgot the generate field but user clearly asked for content
-        if generate is None and request.messages:
-            user_text = request.messages[-1].content.lower()
-            generation_keywords = ["generate", "create", "write", "draft", "make posts", "make content"]
-            if any(kw in user_text for kw in generation_keywords):
-                platforms = []
-                if "instagram" in user_text:
-                    platforms.append("instagram")
-                if "facebook" in user_text:
-                    platforms.append("facebook")
-                if "linkedin" in user_text:
-                    platforms.append("linkedin")
-                if not platforms:
-                    platforms = ["instagram", "facebook"]
-                image_keywords = ["with image", "with photo", "with visual", "with picture", "with graphic"]
-                include_images = any(kw in user_text for kw in image_keywords)
-                generate = {"topic": request.messages[-1].content, "platforms": platforms, "include_images": include_images}
-
-        # Ensure include_images is always present in the generate field
-        if generate and "include_images" not in generate:
-            user_text = (request.messages[-1].content if request.messages else "").lower()
-            image_keywords = ["with image", "with photo", "with visual", "with picture", "with graphic"]
-            generate["include_images"] = any(kw in user_text for kw in image_keywords)
 
         # Persist the latest user turn and the AI reply
         user_msg = request.messages[-1] if request.messages else None
@@ -5355,7 +5379,6 @@ async def agent_chat(
         return UriResponse.get_single_data_response("agent_chat", {
             "reply": reply,
             "navigate": navigate,
-            "generate": generate,
         })
 
     except Exception as e:
