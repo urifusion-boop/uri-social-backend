@@ -5061,7 +5061,7 @@ Set navigate to null ONLY when the user is asking a general question with no nav
 ## Response format
 Your ENTIRE response must be a single valid JSON object — no text before it, no text after it, no markdown fences.
 Return ONLY this raw JSON:
-{"reply": "<your plain-text reply>", "navigate": "<section key or null>"}
+{{"reply": "<your plain-text reply>", "navigate": "<section key or null>"}}
 """
 
 
@@ -5096,7 +5096,7 @@ def _build_agent_system_prompt(brand_context: dict) -> str:
 
 
 _AGENT_SYSTEM_PROMPT_STREAM_TEMPLATE = _AGENT_SYSTEM_PROMPT_TEMPLATE.replace(
-    '{"reply": "<your plain-text reply>", "navigate": "<section key or null>"}',
+    '{{"reply": "<your plain-text reply>", "navigate": "<section key or null>"}}',
     """Start your response with NAVIGATE:<key>| where <key> is the section to navigate to, or NAVIGATE:null| if no navigation is needed. Then write your plain-text reply immediately after the pipe — no newline between the prefix and the reply.
 
 Examples:
