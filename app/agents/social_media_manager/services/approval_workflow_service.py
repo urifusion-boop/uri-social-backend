@@ -722,8 +722,8 @@ class ApprovalWorkflowService:
                     conn_list = await connections_cursor.to_list(length=1)
                     connection = conn_list[0] if conn_list else None
 
-                    # Outstand live-lookup fallback — skip Instagram (always direct Graph API)
-                    if not connection and draft["platform"] != "instagram":
+                    # Outstand live-lookup fallback — skip platforms that always use direct APIs
+                    if not connection and draft["platform"] not in ("instagram", "linkedin"):
                         try:
                             from app.agents.social_media_manager.services.outstand_service import OutstandService, PLATFORM_TO_NETWORK
                             outstand = OutstandService()
@@ -890,7 +890,7 @@ class ApprovalWorkflowService:
 
                 # Fall back to Outstand live lookup if local mirror is empty.
                 # Skip Instagram — it always uses direct Graph API, never Outstand.
-                if not connection and platform != "instagram":
+                if not connection and platform not in ("instagram", "linkedin"):
                     print(f"⚠️ No local {platform} connection for user_id={user_id}, querying Outstand directly...")
                     try:
                         from app.agents.social_media_manager.services.outstand_service import OutstandService, PLATFORM_TO_NETWORK

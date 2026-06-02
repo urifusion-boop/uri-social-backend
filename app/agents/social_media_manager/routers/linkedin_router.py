@@ -176,6 +176,7 @@ async def linkedin_oauth_callback(
                 "linkedin_access_token": access_token,
                 "token_expires_at": token_expires_at,
                 "connected_at": now,
+                "created_at": now,
                 "updated_at": now,
             }
         },
