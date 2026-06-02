@@ -1452,9 +1452,10 @@ async def update_carousel_slide(
     body = await request.json()
     headline = body.get("headline")
     body_text = body.get("body")
+    image_url = body.get("image_url")
 
-    if not headline and not body_text:
-        raise HTTPException(status_code=400, detail="headline or body is required")
+    if not headline and not body_text and image_url is None:
+        raise HTTPException(status_code=400, detail="headline, body, or image_url is required")
 
     # Verify draft exists and belongs to user
     draft = await db["content_drafts"].find_one(
@@ -1478,6 +1479,10 @@ async def update_carousel_slide(
         update_fields[f"slides.{slide_index}.headline"] = headline.strip()
     if body_text:
         update_fields[f"slides.{slide_index}.body"] = body_text.strip()
+    if image_url is not None:
+        update_fields[f"slides.{slide_index}.image_url"] = image_url
+        update_fields[f"slides.{slide_index}.image_failed"] = False
+        update_fields["has_image"] = True
     update_fields["updated_at"] = datetime.utcnow()
 
     # Update the slide
@@ -4153,6 +4158,11 @@ async def _generate_image_bg(
 
         if not image_result.get("status"):
             print(f"⚠️ BG image gen failed for draft {draft_id}: {image_result.get('responseMessage')}")
+            if db and post_type == "carousel" and slide_index is not None:
+                await db["content_drafts"].update_one(
+                    {"id": draft_id},
+                    {"$set": {f"slides.{slide_index}.image_failed": True}},
+                )
             return
 
         raw_url = image_result["responseData"]["image_url"]
