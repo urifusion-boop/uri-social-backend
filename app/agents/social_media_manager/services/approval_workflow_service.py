@@ -747,12 +747,14 @@ class ApprovalWorkflowService:
                             "connection_status": "active",
                             "linkedin_access_token": {"$exists": True, "$ne": None},
                         })
+                        print(f"🔍 LinkedIn token-first lookup | user={draft_user_id} found={bool(connection)} connected_via={connection.get('connected_via') if connection else 'N/A'} has_token={bool(connection.get('linkedin_access_token')) if connection else False} has_urn={bool(connection.get('person_urn') or connection.get('active_author_urn')) if connection else False}")
                         if not connection:
                             connection = await db["social_connections"].find_one({
                                 "user_id": draft_user_id,
                                 "platform": _platform_key,
                                 "connection_status": "active",
                             })
+                            print(f"🔍 LinkedIn fallback lookup | found={bool(connection)} connected_via={connection.get('connected_via') if connection else 'N/A'} has_token={bool(connection.get('linkedin_access_token')) if connection else False} has_urn={bool(connection.get('person_urn') or connection.get('active_author_urn')) if connection else False}")
                     else:
                         connections_cursor = db["social_connections"].find({
                             "user_id": draft_user_id,
@@ -1357,6 +1359,8 @@ class ApprovalWorkflowService:
         # guards against stale "outstand" entries that got upserted over the direct connection.
         _li_has_token = bool(connection.get("linkedin_access_token") or connection.get("access_token"))
         _li_has_urn = bool(connection.get("person_urn") or connection.get("active_author_urn"))
+        if platform == "linkedin":
+            print(f"🔗 LinkedIn publish check | connected_via={connection.get('connected_via')} has_token={_li_has_token} has_urn={_li_has_urn} condition={'PASS' if (connection.get('connected_via')=='linkedin_direct' or (_li_has_token and _li_has_urn)) else 'FAIL'}")
         if platform == "linkedin" and (connection.get("connected_via") == "linkedin_direct" or (_li_has_token and _li_has_urn)):
             from app.agents.social_media_manager.services.linkedin_direct_service import LinkedInDirectService
             token = connection.get("linkedin_access_token") or connection.get("access_token")
