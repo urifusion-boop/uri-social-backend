@@ -4331,6 +4331,7 @@ async def trigger_publish_scheduled(
         raise HTTPException(status_code=403, detail="Invalid cron secret")
 
     result = await ApprovalWorkflowService.publish_scheduled_content(db=db)
+    result["_v"] = "b69"
     return result
 
 
