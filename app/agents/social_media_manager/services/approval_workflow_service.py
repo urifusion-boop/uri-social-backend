@@ -669,6 +669,7 @@ class ApprovalWorkflowService:
                                     "status": "published",
                                     "published_date": datetime.utcnow(),
                                     "updated_at": datetime.utcnow(),
+                                    "error_message": None,
                                 }},
                             )
                             published_count += 1
@@ -687,6 +688,7 @@ class ApprovalWorkflowService:
                                             "status": "published",
                                             "published_date": datetime.utcnow(),
                                             "updated_at": datetime.utcnow(),
+                                            "error_message": None,
                                         }},
                                     )
                                     published_count += 1
@@ -703,6 +705,7 @@ class ApprovalWorkflowService:
                                             "status": "published",
                                             "published_date": datetime.utcnow(),
                                             "updated_at": datetime.utcnow(),
+                                            "error_message": None,
                                         }},
                                     )
                                     print(f"🗑️ Marked stale Outstand draft as published (404) | draft_id={draft['id']}")
@@ -842,6 +845,7 @@ class ApprovalWorkflowService:
                                 "outstand_post_status": publish_result.get("outstand_status", "queued"),
                                 "publish_response": publish_result.get("raw_response"),
                                 "updated_at": datetime.utcnow(),
+                                "error_message": None,
                             }},
                         )
                         print(f"💾 Status→published update | draft={draft.get('id')} matched={update_res.matched_count} modified={update_res.modified_count}")
