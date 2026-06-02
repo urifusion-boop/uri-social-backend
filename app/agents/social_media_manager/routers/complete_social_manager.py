@@ -3136,35 +3136,68 @@ async def get_account_metrics(
                         print(f"⚠️ IG profile fetch error: {profile['error'].get('message')}")
                         return None
 
-                    # Account-level insights (impressions, reach, profile_views)
-                    total_impressions = total_reach = total_profile_views = 0
+                    # Account-level insights
+                    # "views" (v21+) counts posts + reels + stories + lives — matches
+                    # what Instagram's Professional Dashboard shows. Fall back to
+                    # "impressions" (feed-only) if the account/token doesn't support it.
+                    total_views = total_impressions = total_reach = total_profile_views = 0
                     try:
-                        # Try total_value period first (Meta's preferred format for date ranges)
                         insights_resp = await _c.get(
                             f"{_graph_base}/{ig_user_id}/insights",
                             params={
-                                "metric": "impressions,reach,profile_views",
+                                "metric": "views,reach,profile_views",
                                 "period": "total_value",
                                 "since": since_ts,
                                 "until": until_ts,
                                 "access_token": token,
                             },
                         )
-                        ins_data = insights_resp.json().get("data", [])
+                        ins_json = insights_resp.json()
+                        ins_data = ins_json.get("data", [])
+                        # If "views" is unsupported the API returns an error object with no data
+                        if ins_json.get("error") or not ins_data:
+                            raise ValueError(f"views metric unavailable: {ins_json.get('error', {}).get('message', 'no data')}")
                         for item in ins_data:
                             name = item.get("name", "")
-                            # total_value format (newer)
-                            val = item.get("total_value", {}).get("value") or \
+                            tv = item.get("total_value", {})
+                            val = tv.get("value") if tv.get("value") is not None else \
                                   sum(v.get("value", 0) for v in (item.get("values") or []))
-                            if name == "impressions":
-                                total_impressions = val
+                            if name == "views":
+                                total_views = val or 0
                             elif name == "reach":
-                                total_reach = val
+                                total_reach = val or 0
                             elif name == "profile_views":
-                                total_profile_views = val
-                        print(f"[IG insights] user={ig_user_id} imp={total_impressions} reach={total_reach} pv={total_profile_views}")
+                                total_profile_views = val or 0
+                        total_impressions = total_views
+                        print(f"[IG insights v21] user={ig_user_id} views={total_views} reach={total_reach} pv={total_profile_views}")
                     except Exception as ig_ins_err:
-                        print(f"⚠️ IG account insights failed: {ig_ins_err}")
+                        print(f"⚠️ IG views metric failed, falling back to impressions: {ig_ins_err}")
+                        try:
+                            insights_resp = await _c.get(
+                                f"{_graph_base}/{ig_user_id}/insights",
+                                params={
+                                    "metric": "impressions,reach,profile_views",
+                                    "period": "total_value",
+                                    "since": since_ts,
+                                    "until": until_ts,
+                                    "access_token": token,
+                                },
+                            )
+                            ins_data = insights_resp.json().get("data", [])
+                            for item in ins_data:
+                                name = item.get("name", "")
+                                tv = item.get("total_value", {})
+                                val = tv.get("value") if tv.get("value") is not None else \
+                                      sum(v.get("value", 0) for v in (item.get("values") or []))
+                                if name == "impressions":
+                                    total_impressions = val or 0
+                                elif name == "reach":
+                                    total_reach = val or 0
+                                elif name == "profile_views":
+                                    total_profile_views = val or 0
+                            print(f"[IG insights fallback] user={ig_user_id} imp={total_impressions} reach={total_reach} pv={total_profile_views}")
+                        except Exception as ig_fb_err:
+                            print(f"⚠️ IG account insights fallback also failed: {ig_fb_err}")
 
                     # Aggregate per-post engagement in the period
                     posts_resp = await _c.get(
@@ -3232,12 +3265,12 @@ async def get_account_metrics(
                         "reach": total_reach,
                         "profile_views": total_profile_views,
                     },
-                    "engagement_note": f"Account impressions + reach for the last {days} days via Instagram Insights API",
+                    "engagement_note": f"Total views (posts + reels + stories) for the last {days} days via Instagram Insights API",
                     "platform_specific": {
                         "username": profile.get("username"),
                         "biography": profile.get("biography"),
                         "profile_picture_url": profile.get("profile_picture_url"),
-                        "impressions": total_impressions,
+                        "views": total_views or total_impressions,
                         "reach": total_reach,
                         "profile_views": total_profile_views,
                     },
