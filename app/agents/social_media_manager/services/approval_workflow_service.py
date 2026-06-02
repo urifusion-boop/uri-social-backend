@@ -578,6 +578,24 @@ class ApprovalWorkflowService:
             if stale_poll_result.modified_count:
                 print(f"🧹 Cleared {stale_poll_result.modified_count} stale publish_failed drafts (>48h unconfirmed)")
 
+            # Retry publish_failed drafts that never made it to a platform (no platform_post_id)
+            # and are overdue. Only targets BSON Date fields so $lte works. Cap at 3 retries
+            # to avoid infinite loops for permanent content errors (e.g. carousel with no images).
+            retry_result = await db["content_drafts"].update_many(
+                {
+                    "status": "publish_failed",
+                    "platform_post_id": None,
+                    "scheduled_date": {"$lte": current_time, "$type": "date"},
+                    "publish_retry_count": {"$not": {"$gte": 3}},
+                },
+                {
+                    "$set": {"status": "scheduled", "updated_at": current_time},
+                    "$inc": {"publish_retry_count": 1},
+                },
+            )
+            if retry_result.modified_count:
+                print(f"🔄 Reset {retry_result.modified_count} publish_failed draft(s) to scheduled for retry")
+
             scheduled_content = await db["content_drafts"].find({
                 "$or": [
                     # Drafts due for publishing (no platform_post_id = not yet sent anywhere)
