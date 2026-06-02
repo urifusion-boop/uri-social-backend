@@ -3136,68 +3136,53 @@ async def get_account_metrics(
                         print(f"⚠️ IG profile fetch error: {profile['error'].get('message')}")
                         return None
 
-                    # Account-level insights
-                    # "views" (v21+) counts posts + reels + stories + lives — matches
-                    # what Instagram's Professional Dashboard shows. Fall back to
-                    # "impressions" (feed-only) if the account/token doesn't support it.
+                    # Account-level insights — Graph API v21+ rules:
+                    #  • views + profile_views: period=day + metric_type=total_value (sums the period)
+                    #  • reach: period=day without metric_type (returns daily array we sum)
+                    # "views" counts reels + stories + posts, matching Instagram's Professional Dashboard.
                     total_views = total_impressions = total_reach = total_profile_views = 0
                     try:
-                        insights_resp = await _c.get(
+                        ins_resp = await _c.get(
                             f"{_graph_base}/{ig_user_id}/insights",
                             params={
-                                "metric": "views,reach,profile_views",
-                                "period": "total_value",
+                                "metric": "views,profile_views",
+                                "period": "day",
+                                "metric_type": "total_value",
                                 "since": since_ts,
                                 "until": until_ts,
                                 "access_token": token,
                             },
                         )
-                        ins_json = insights_resp.json()
-                        ins_data = ins_json.get("data", [])
-                        # If "views" is unsupported the API returns an error object with no data
-                        if ins_json.get("error") or not ins_data:
-                            raise ValueError(f"views metric unavailable: {ins_json.get('error', {}).get('message', 'no data')}")
-                        for item in ins_data:
+                        ins_json = ins_resp.json()
+                        if ins_json.get("error"):
+                            raise ValueError(ins_json["error"].get("message", "unknown error"))
+                        for item in ins_json.get("data", []):
                             name = item.get("name", "")
-                            tv = item.get("total_value", {})
-                            val = tv.get("value") if tv.get("value") is not None else \
-                                  sum(v.get("value", 0) for v in (item.get("values") or []))
+                            val = item.get("total_value", {}).get("value") or 0
                             if name == "views":
-                                total_views = val or 0
-                            elif name == "reach":
-                                total_reach = val or 0
+                                total_views = val
                             elif name == "profile_views":
-                                total_profile_views = val or 0
+                                total_profile_views = val
                         total_impressions = total_views
+
+                        # reach uses a different parameter set — fetch separately
+                        reach_resp = await _c.get(
+                            f"{_graph_base}/{ig_user_id}/insights",
+                            params={
+                                "metric": "reach",
+                                "period": "day",
+                                "since": since_ts,
+                                "until": until_ts,
+                                "access_token": token,
+                            },
+                        )
+                        for item in reach_resp.json().get("data", []):
+                            if item.get("name") == "reach":
+                                total_reach = sum(v.get("value", 0) for v in item.get("values", []))
+
                         print(f"[IG insights v21] user={ig_user_id} views={total_views} reach={total_reach} pv={total_profile_views}")
                     except Exception as ig_ins_err:
-                        print(f"⚠️ IG views metric failed, falling back to impressions: {ig_ins_err}")
-                        try:
-                            insights_resp = await _c.get(
-                                f"{_graph_base}/{ig_user_id}/insights",
-                                params={
-                                    "metric": "impressions,reach,profile_views",
-                                    "period": "total_value",
-                                    "since": since_ts,
-                                    "until": until_ts,
-                                    "access_token": token,
-                                },
-                            )
-                            ins_data = insights_resp.json().get("data", [])
-                            for item in ins_data:
-                                name = item.get("name", "")
-                                tv = item.get("total_value", {})
-                                val = tv.get("value") if tv.get("value") is not None else \
-                                      sum(v.get("value", 0) for v in (item.get("values") or []))
-                                if name == "impressions":
-                                    total_impressions = val or 0
-                                elif name == "reach":
-                                    total_reach = val or 0
-                                elif name == "profile_views":
-                                    total_profile_views = val or 0
-                            print(f"[IG insights fallback] user={ig_user_id} imp={total_impressions} reach={total_reach} pv={total_profile_views}")
-                        except Exception as ig_fb_err:
-                            print(f"⚠️ IG account insights fallback also failed: {ig_fb_err}")
+                        print(f"⚠️ IG account insights failed: {ig_ins_err}")
 
                     # Aggregate per-post engagement in the period
                     posts_resp = await _c.get(
