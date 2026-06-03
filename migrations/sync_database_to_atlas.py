@@ -2,8 +2,12 @@
 Database Sync Script - Old VM MongoDB to New VM MongoDB Atlas
 Syncs only URISocial-related collections, excluding Uri Insights collections.
 
+COLLECTION LIST: Verified by analyzing actual db["..."] and get_db()["..."] usage in codebase
+- Excludes: leads, apollo_data, lazarus (Uri Insights only)
+- Includes: WhatsApp, social media, content, billing, and all related collections
+
 This script will:
-1. Copy missing collections entirely (blog_drafts)
+1. Copy missing collections entirely (e.g. blog_drafts, embeddings, etc.)
 2. Sync existing collections by upserting documents based on _id
 3. Preserve data that only exists in new VM (like newer subscription_tiers)
 
@@ -27,40 +31,63 @@ from typing import Dict, List, Set
 OLD_MONGODB_URI = "mongodb://urifusion:UriTest2024!@4.221.74.63:27018/Uri_Insight?authSource=admin"
 NEW_MONGODB_URI = "mongodb+srv://urisocial:SweetJesus99%40@cluster0.qomenuh.mongodb.net/urisocial?appName=Cluster0"
 
-# URISocial collections to sync (based on uri-social-backend codebase analysis)
+# URISocial collections to sync (verified by analyzing codebase collection usage)
 URISOCIAL_COLLECTIONS = [
+    # Core settings
     "app_settings",
-    "auto_content_settings",
-    "blog_drafts",
-    "brand_profiles",
-    "bug_reports",
-    "cache",
-    "content_analytics",
-    "content_calendar_plans",
+
+    # WhatsApp & Chat
+    "agent_chat_messages",
+    "whatsapp_sessions",
+
+    # Social Media Connections
+    "social_connections",
+    "pending_page_tokens",
+    "linkedin_oauth_pending",
+    "x_oauth_pending",
+
+    # Content Management
     "content_drafts",
     "content_requests",
-    "credit_transactions",
-    "facebook_user_pages",
+    "content_calendar_plans",
+    "content_analytics",
+
+    # Brand & Auto Content
+    "brand_profiles",
+    "auto_content_settings",
+    "account_analytics_context",
+
+    # Media Generation
     "image_versions",
-    "influencers",
-    "linkedin_oauth_pending",
-    "notifications",
-    "payment_transactions",
-    "pending_page_tokens",
-    "scan_history",
-    "scheduler_locks",
-    "social_connections",
-    "spam",
-    "storyboard_frame_jobs",
-    "subscription_tiers",
-    "trackers",
-    "trends_cache",
-    "user_credits",
-    "user_trials",
-    "users",
     "video_generation_jobs",
-    "whatsapp_sessions",
-    "x_oauth_pending",
+    "video_publish_jobs",
+    "storyboard_frame_jobs",
+    "blog_drafts",
+    "drafts",
+
+    # AI & Embeddings
+    "embeddings",
+    "influencers",
+    "ai_image_generations",
+    "ai_prompt_templates",
+    "content_templates",
+
+    # Billing & Credits
+    "user_credits",
+    "credit_transactions",
+    "payment_transactions",
+    "subscription_tiers",
+    "user_trials",
+
+    # Users
+    "users",
+
+    # System
+    "cache",
+    "trends_cache",
+    "scheduler_locks",
+    "notifications",
+    "bug_reports",
 ]
 
 # Collections that exist only in old VM (need to copy entirely)
