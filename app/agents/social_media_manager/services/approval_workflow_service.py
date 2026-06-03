@@ -190,9 +190,15 @@ class ApprovalWorkflowService:
                 _schedule_dt = scheduled_datetime or (datetime.utcnow() + timedelta(hours=1))
                 for _d in approved_drafts:
                     try:
-                        # Instagram always uses direct Graph API + cron; never route via Outstand
-                        if _d["platform"] == "instagram":
-                            print(f"📸 Instagram direct — cron will publish at scheduled_date ({_schedule_dt.isoformat()})")
+                        # Instagram and Facebook carousels always use cron path.
+                        # Instagram: always direct Graph API.
+                        # Facebook carousels: Outstand with scheduled_at + multiple media_urls
+                        # publishes each slide as a separate post; cron handles them correctly
+                        # by calling _publish_to_platform at publish time with scheduled_at=None.
+                        if _d["platform"] == "instagram" or (
+                            _d["platform"] == "facebook" and _d.get("post_type", "feed") == "carousel"
+                        ):
+                            print(f"📸 {_d['platform']} carousel/direct — cron will publish at scheduled_date ({_schedule_dt.isoformat()})")
                             continue
                         _conn = await db["social_connections"].find_one({
                             "user_id": user_id,
@@ -200,11 +206,13 @@ class ApprovalWorkflowService:
                             "connection_status": "active",
                             "connected_via": "outstand",
                         })
-                        # Facebook connected via direct OAuth also routes through Outstand.
-                        # _trigger_immediate_publishing → _publish_to_platform already has the
-                        # facebook_direct_oauth → Outstand redirect, so entering that path here
-                        # gives Schedule All the same Outstand-native scheduling as individual drafts.
-                        if not _conn and _d["platform"] == "facebook":
+                        # Facebook connected via direct OAuth also routes through Outstand for
+                        # feed posts. Carousels are excluded here — Outstand native scheduling
+                        # with scheduled_at + multiple media_urls publishes each slide as a
+                        # separate post. Carousels use the cron path (same as individual scheduling):
+                        # cron fires at scheduled_date, calls _publish_to_platform with no
+                        # scheduled_at, which handles the carousel as one post correctly.
+                        if not _conn and _d["platform"] == "facebook" and _d.get("post_type", "feed") != "carousel":
                             _conn = await db["social_connections"].find_one({
                                 "user_id": user_id,
                                 "platform": "facebook",
