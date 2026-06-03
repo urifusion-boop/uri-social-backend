@@ -257,6 +257,7 @@ class SocialAccountService:
                 by_platform.setdefault(platform, []).append({
                     "platform": platform,
                     "connected_via": doc.get("connected_via"),
+                    "outstand_account_id": doc.get("outstand_account_id"),
                     "username": doc.get("username"),
                     "account_name": doc.get("account_name"),
                     "profile_picture_url": doc.get("profile_picture_url"),
