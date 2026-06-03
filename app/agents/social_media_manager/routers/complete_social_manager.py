@@ -1452,9 +1452,10 @@ async def update_carousel_slide(
     body = await request.json()
     headline = body.get("headline")
     body_text = body.get("body")
+    image_url = body.get("image_url")
 
-    if not headline and not body_text:
-        raise HTTPException(status_code=400, detail="headline or body is required")
+    if not headline and not body_text and image_url is None:
+        raise HTTPException(status_code=400, detail="headline, body, or image_url is required")
 
     # Verify draft exists and belongs to user
     draft = await db["content_drafts"].find_one(
@@ -1478,6 +1479,10 @@ async def update_carousel_slide(
         update_fields[f"slides.{slide_index}.headline"] = headline.strip()
     if body_text:
         update_fields[f"slides.{slide_index}.body"] = body_text.strip()
+    if image_url is not None:
+        update_fields[f"slides.{slide_index}.image_url"] = image_url
+        update_fields[f"slides.{slide_index}.image_failed"] = False
+        update_fields["has_image"] = True
     update_fields["updated_at"] = datetime.utcnow()
 
     # Update the slide
@@ -3136,33 +3141,51 @@ async def get_account_metrics(
                         print(f"⚠️ IG profile fetch error: {profile['error'].get('message')}")
                         return None
 
-                    # Account-level insights (impressions, reach, profile_views)
-                    total_impressions = total_reach = total_profile_views = 0
+                    # Account-level insights — Graph API v21+ rules:
+                    #  • views + profile_views: period=day + metric_type=total_value (sums the period)
+                    #  • reach: period=day without metric_type (returns daily array we sum)
+                    # "views" counts reels + stories + posts, matching Instagram's Professional Dashboard.
+                    total_views = total_impressions = total_reach = total_profile_views = 0
                     try:
-                        # Try total_value period first (Meta's preferred format for date ranges)
-                        insights_resp = await _c.get(
+                        ins_resp = await _c.get(
                             f"{_graph_base}/{ig_user_id}/insights",
                             params={
-                                "metric": "impressions,reach,profile_views",
-                                "period": "total_value",
+                                "metric": "views,profile_views",
+                                "period": "day",
+                                "metric_type": "total_value",
                                 "since": since_ts,
                                 "until": until_ts,
                                 "access_token": token,
                             },
                         )
-                        ins_data = insights_resp.json().get("data", [])
-                        for item in ins_data:
+                        ins_json = ins_resp.json()
+                        if ins_json.get("error"):
+                            raise ValueError(ins_json["error"].get("message", "unknown error"))
+                        for item in ins_json.get("data", []):
                             name = item.get("name", "")
-                            # total_value format (newer)
-                            val = item.get("total_value", {}).get("value") or \
-                                  sum(v.get("value", 0) for v in (item.get("values") or []))
-                            if name == "impressions":
-                                total_impressions = val
-                            elif name == "reach":
-                                total_reach = val
+                            val = item.get("total_value", {}).get("value") or 0
+                            if name == "views":
+                                total_views = val
                             elif name == "profile_views":
                                 total_profile_views = val
-                        print(f"[IG insights] user={ig_user_id} imp={total_impressions} reach={total_reach} pv={total_profile_views}")
+                        total_impressions = total_views
+
+                        # reach uses a different parameter set — fetch separately
+                        reach_resp = await _c.get(
+                            f"{_graph_base}/{ig_user_id}/insights",
+                            params={
+                                "metric": "reach",
+                                "period": "day",
+                                "since": since_ts,
+                                "until": until_ts,
+                                "access_token": token,
+                            },
+                        )
+                        for item in reach_resp.json().get("data", []):
+                            if item.get("name") == "reach":
+                                total_reach = sum(v.get("value", 0) for v in item.get("values", []))
+
+                        print(f"[IG insights v21] user={ig_user_id} views={total_views} reach={total_reach} pv={total_profile_views}")
                     except Exception as ig_ins_err:
                         print(f"⚠️ IG account insights failed: {ig_ins_err}")
 
@@ -3232,12 +3255,12 @@ async def get_account_metrics(
                         "reach": total_reach,
                         "profile_views": total_profile_views,
                     },
-                    "engagement_note": f"Account impressions + reach for the last {days} days via Instagram Insights API",
+                    "engagement_note": f"Total views (posts + reels + stories) for the last {days} days via Instagram Insights API",
                     "platform_specific": {
                         "username": profile.get("username"),
                         "biography": profile.get("biography"),
                         "profile_picture_url": profile.get("profile_picture_url"),
-                        "impressions": total_impressions,
+                        "views": total_views or total_impressions,
                         "reach": total_reach,
                         "profile_views": total_profile_views,
                     },
@@ -4135,6 +4158,11 @@ async def _generate_image_bg(
 
         if not image_result.get("status"):
             print(f"⚠️ BG image gen failed for draft {draft_id}: {image_result.get('responseMessage')}")
+            if db and post_type == "carousel" and slide_index is not None:
+                await db["content_drafts"].update_one(
+                    {"id": draft_id},
+                    {"$set": {f"slides.{slide_index}.image_failed": True}},
+                )
             return
 
         raw_url = image_result["responseData"]["image_url"]
@@ -4977,7 +5005,10 @@ async def get_blog_draft(
 # URI Agent chat — in-app assistant
 # ---------------------------------------------------------------------------
 
-_AGENT_SYSTEM_PROMPT = """You are URI Agent, the built-in AI assistant for URI Social — a social media management platform. You help users navigate the platform, understand features, troubleshoot issues, and get the most out of the product.
+_AGENT_SYSTEM_PROMPT_TEMPLATE = """You are URI Agent, the built-in AI assistant for URI Social — a social media management platform. You help users navigate the platform, answer questions about their brand, understand features, and troubleshoot issues.
+
+## This user's brand profile
+{brand_context}
 
 ## Platform sections (use these exact keys when returning a navigate action)
 - "workspace"     → URI Agent chat (current section)
@@ -4998,7 +5029,6 @@ _AGENT_SYSTEM_PROMPT = """You are URI Agent, the built-in AI assistant for URI S
 - **Approval workflow**: "Auto-approve" publishes immediately; "Manual review" sends drafts to Needs Review first. Configurable in Settings.
 - **Scheduling**: Pick a date/time per post. The cron job publishes every 5 minutes — posts go live within 5 min of their scheduled time.
 - **Images**: Generate AI images per post. Instagram requires an image to publish. Carousel posts have per-slide images.
-- **Sync images**: When multiple carousel drafts have the same slide count, you can sync images from one platform to the others.
 - **Connected Accounts**: Facebook uses Outstand OAuth; Instagram uses Meta direct OAuth. They connect independently.
 - **Credits**: Each content generation costs 1 credit. Credits can be topped up in Billing.
 - **Blog Generator**: Generates long-form SEO blog posts separately from social posts.
@@ -5014,11 +5044,11 @@ _AGENT_SYSTEM_PROMPT = """You are URI Agent, the built-in AI assistant for URI S
 - "Can't schedule" → Ensure the platform account is connected first. Then select drafts and click Schedule All.
 
 ## Navigation rules — read carefully
-ALWAYS set navigate (never null) when the user says "show me", "take me", "go to", "open", "where is", or names a section. Use the exact key from the list above.
+ALWAYS set navigate (never null) when the user says "show me", "take me", "go to", "open", "where is", or names a section.
 
-Phrase → key mapping (non-exhaustive, use judgment for similar phrases):
+Phrase → key mapping:
 - "show me billing" / "billing" / "credits" / "plans" / "subscription" → "billing"
-- "connect my instagram" / "connect accounts" / "connected accounts" / "accounts" → "connections"
+- "connect my instagram" / "connect accounts" / "connected accounts" → "connections"
 - "show me my drafts" / "drafts" / "posting schedule" / "scheduled posts" / "needs review" → "schedule"
 - "show me performance" / "analytics" / "stats" / "engagement" → "performance"
 - "market intel" / "competitor" / "trends" → "intel"
@@ -5026,34 +5056,58 @@ Phrase → key mapping (non-exhaustive, use judgment for similar phrases):
 - "blog" / "blog generator" / "write a blog" → "blog"
 - "settings" / "approval workflow" / "auto-schedule" → "settings"
 - "notifications" → "notifications"
+- "generate posts" / "create posts" / "write posts" / "create content" → "schedule"
 
-Set navigate to null ONLY when the user is asking a general question with no intent to go somewhere (e.g. "how does scheduling work?" or "what is a carousel post?").
+When the user asks to generate, create, or write social media posts, reply with something like "Head over to Posting Schedule where you can generate posts for your brand." and set navigate to "schedule".
+
+Set navigate to null ONLY when the user is asking a general question with no navigation intent.
 
 ## Response rules
 - Be concise and friendly — 1-4 sentences max for simple questions.
-- If the user wants to generate content, tell them to type their topic/campaign — do NOT navigate away.
+- When answering questions about the user's brand, use the brand profile above. Be specific — use their actual brand name, industry, voice, and audience.
+- If a brand profile field is empty, say you don't have that info yet and suggest they complete their Brand Playbook.
 - Never make up features that don't exist.
-- If you don't know something specific about their account, say so honestly.
-
-## Content generation
-When the user asks to create, write, generate, or draft social media posts, set the "generate" field with the extracted topic and platforms. Do NOT just tell them to go somewhere — actually trigger the generation.
-Example: user says "write 3 posts about our summer sale" →
-{"reply": "On it! Generating posts about your summer sale now...", "navigate": null, "generate": {"topic": "summer sale", "platforms": ["instagram", "facebook"]}}
-
-If the user mentions specific platforms (e.g. "Instagram only"), use those. Otherwise default to ["instagram", "facebook"].
-Set generate to null for everything that is not a content creation request.
 
 ## Response format
 Your ENTIRE response must be a single valid JSON object — no text before it, no text after it, no markdown fences.
 Return ONLY this raw JSON:
-{"reply": "<your plain-text reply>", "navigate": "<section key or null>", "generate": {"topic": "<topic>", "platforms": ["instagram", "facebook"]} | null}
+{{"reply": "<your plain-text reply>", "navigate": "<section key or null>"}}
 """
 
 
-_AGENT_SYSTEM_PROMPT_STREAM = _AGENT_SYSTEM_PROMPT.replace(
-    "## Response format\nYour ENTIRE response must be a single valid JSON object — no text before it, no text after it, no markdown fences.\nReturn ONLY this raw JSON:\n{\"reply\": \"<your plain-text reply>\", \"navigate\": \"<section key or null>\"}\n\nOnly set \"navigate\" when the user should be taken to a specific section. Set it to null otherwise.",
-    """## Response format
-Start your response with NAVIGATE:<key>| where <key> is the section to navigate to, or NAVIGATE:null| if no navigation is needed. Then write your plain-text reply immediately after the pipe — no newline between the prefix and the reply.
+def _build_agent_system_prompt(brand_context: dict) -> str:
+    """Inject brand profile into the system prompt."""
+    if not brand_context:
+        brand_str = "No brand profile set up yet. Suggest the user completes their Brand Playbook."
+    else:
+        lines = []
+        if brand_context.get("brand_name"):
+            lines.append(f"- Brand name: {brand_context['brand_name']}")
+        if brand_context.get("industry"):
+            lines.append(f"- Industry: {brand_context['industry']}")
+        if brand_context.get("business_description"):
+            lines.append(f"- Business: {brand_context['business_description']}")
+        if brand_context.get("tagline"):
+            lines.append(f"- Tagline: {brand_context['tagline']}")
+        if brand_context.get("brand_voice"):
+            lines.append(f"- Brand voice: {brand_context['brand_voice']}")
+        if brand_context.get("target_audience"):
+            lines.append(f"- Target audience: {brand_context['target_audience']}")
+        if brand_context.get("key_products_services"):
+            lines.append(f"- Key products/services: {', '.join(brand_context['key_products_services'])}")
+        if brand_context.get("content_pillars"):
+            lines.append(f"- Content pillars: {', '.join(brand_context['content_pillars'])}")
+        if brand_context.get("region"):
+            lines.append(f"- Market/region: {brand_context['region']}")
+        if brand_context.get("primary_goal"):
+            lines.append(f"- Primary goal: {brand_context['primary_goal']}")
+        brand_str = "\n".join(lines) if lines else "Brand profile is incomplete."
+    return _AGENT_SYSTEM_PROMPT_TEMPLATE.format(brand_context=brand_str)
+
+
+_AGENT_SYSTEM_PROMPT_STREAM_TEMPLATE = _AGENT_SYSTEM_PROMPT_TEMPLATE.replace(
+    '{{"reply": "<your plain-text reply>", "navigate": "<section key or null>"}}',
+    """Start your response with NAVIGATE:<key>| where <key> is the section to navigate to, or NAVIGATE:null| if no navigation is needed. Then write your plain-text reply immediately after the pipe — no newline between the prefix and the reply.
 
 Examples:
 NAVIGATE:billing|I'll take you to the Billing section where you can view plans and credits.
@@ -5062,6 +5116,28 @@ NAVIGATE:connections|To connect Instagram, head to Connected Accounts and follow
 
 Do NOT include any text before the NAVIGATE: prefix. Do NOT add a newline after the pipe."""
 )
+
+
+def _build_agent_system_prompt_stream(brand_context: dict) -> str:
+    """Build brand-aware system prompt for the streaming endpoint."""
+    if not brand_context:
+        brand_str = "No brand profile set up yet. Suggest the user completes their Brand Playbook."
+    else:
+        lines = []
+        if brand_context.get("brand_name"):
+            lines.append(f"- Brand name: {brand_context['brand_name']}")
+        if brand_context.get("industry"):
+            lines.append(f"- Industry: {brand_context['industry']}")
+        if brand_context.get("business_description"):
+            lines.append(f"- Business: {brand_context['business_description']}")
+        if brand_context.get("brand_voice"):
+            lines.append(f"- Brand voice: {brand_context['brand_voice']}")
+        if brand_context.get("target_audience"):
+            lines.append(f"- Target audience: {brand_context['target_audience']}")
+        if brand_context.get("key_products_services"):
+            lines.append(f"- Key products/services: {', '.join(brand_context['key_products_services'])}")
+        brand_str = "\n".join(lines) if lines else "Brand profile is incomplete."
+    return _AGENT_SYSTEM_PROMPT_STREAM_TEMPLATE.format(brand_context=brand_str)
 
 
 class AgentChatMessage(BaseModel):
@@ -5140,7 +5216,10 @@ async def agent_chat_stream(
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
-    messages = _build_oai_messages(_AGENT_SYSTEM_PROMPT_STREAM, request)
+    brand_profile_doc = await db["brand_profiles"].find_one({"user_id": user_id})
+    brand_ctx = BrandProfileService.to_brand_context(brand_profile_doc or {})
+    stream_system_prompt = _build_agent_system_prompt_stream(brand_ctx)
+    messages = _build_oai_messages(stream_system_prompt, request)
 
     async_client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
 
@@ -5253,17 +5332,25 @@ async def agent_chat(
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
     try:
-        oai_messages = _build_oai_messages(_AGENT_SYSTEM_PROMPT, request)
+        # Fetch brand profile to personalise the system prompt
+        brand_profile_doc = await db["brand_profiles"].find_one({"user_id": user_id})
+        brand_context = BrandProfileService.to_brand_context(brand_profile_doc or {})
+        system_prompt = _build_agent_system_prompt(brand_context)
 
+        # Build message list — use raw dicts for vision, ChatMessage objects otherwise
         if request.image_url:
             from openai import AsyncOpenAI
             from app.core.config import settings
+            request_with_prompt = type("R", (), {"messages": request.messages, "image_url": request.image_url})()
+            oai_messages = _build_oai_messages(system_prompt, request_with_prompt)
             _ac = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
             result = await _ac.chat.completions.create(
                 model="gpt-4o-mini", messages=oai_messages, temperature=0.4
             )
         else:
-            messages = [ChatMessage(role=m["role"], content=m["content"]) for m in oai_messages]
+            messages = [ChatMessage(role="system", content=system_prompt)]
+            for m in request.messages:
+                messages.append(ChatMessage(role=m.role, content=m.content))
             result = await AIService.chat_completion(ChatModel(model="gpt-4o-mini", messages=messages, temperature=0.4))
 
         if isinstance(result, dict) and "error" in result:
@@ -5275,7 +5362,6 @@ async def agent_chat(
         try:
             parsed = json.loads(raw)
         except json.JSONDecodeError:
-            # Model added preamble text before the JSON — find the object
             import re
             m = re.search(r'\{[\s\S]*?"reply"[\s\S]*?\}', raw)
             if m:
@@ -5287,14 +5373,9 @@ async def agent_chat(
         if parsed:
             reply = parsed.get("reply") or raw
             navigate = parsed.get("navigate") or None
-            generate = parsed.get("generate") or None
-            # Validate generate shape
-            if generate and not (isinstance(generate, dict) and generate.get("topic")):
-                generate = None
         else:
             reply = raw
             navigate = None
-            generate = None
 
         # Persist the latest user turn and the AI reply
         user_msg = request.messages[-1] if request.messages else None
@@ -5308,7 +5389,6 @@ async def agent_chat(
         return UriResponse.get_single_data_response("agent_chat", {
             "reply": reply,
             "navigate": navigate,
-            "generate": generate,
         })
 
     except Exception as e:
