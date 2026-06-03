@@ -200,6 +200,17 @@ class ApprovalWorkflowService:
                             "connection_status": "active",
                             "connected_via": "outstand",
                         })
+                        # Facebook connected via direct OAuth also routes through Outstand.
+                        # _trigger_immediate_publishing → _publish_to_platform already has the
+                        # facebook_direct_oauth → Outstand redirect, so entering that path here
+                        # gives Schedule All the same Outstand-native scheduling as individual drafts.
+                        if not _conn and _d["platform"] == "facebook":
+                            _conn = await db["social_connections"].find_one({
+                                "user_id": user_id,
+                                "platform": "facebook",
+                                "connection_status": "active",
+                                "connected_via": "facebook_direct_oauth",
+                            })
                         if _conn:
                             print(f"📅 Outstand native schedule | draft_id={_d['draft_id']} platform={_d['platform']} at={_schedule_dt.isoformat()}")
                             _res = await ApprovalWorkflowService._trigger_immediate_publishing(
