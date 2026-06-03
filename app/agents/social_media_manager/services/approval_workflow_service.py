@@ -578,6 +578,24 @@ class ApprovalWorkflowService:
             if stale_poll_result.modified_count:
                 print(f"🧹 Cleared {stale_poll_result.modified_count} stale publish_failed drafts (>48h unconfirmed)")
 
+            # Retry publish_failed drafts that never made it to a platform (no platform_post_id)
+            # and are overdue. Only targets BSON Date fields so $lte works. Cap at 3 retries
+            # to avoid infinite loops for permanent content errors (e.g. carousel with no images).
+            retry_result = await db["content_drafts"].update_many(
+                {
+                    "status": "publish_failed",
+                    "platform_post_id": None,
+                    "scheduled_date": {"$lte": current_time, "$type": "date"},
+                    "publish_retry_count": {"$not": {"$gte": 3}},
+                },
+                {
+                    "$set": {"status": "scheduled", "updated_at": current_time},
+                    "$inc": {"publish_retry_count": 1},
+                },
+            )
+            if retry_result.modified_count:
+                print(f"🔄 Reset {retry_result.modified_count} publish_failed draft(s) to scheduled for retry")
+
             scheduled_content = await db["content_drafts"].find({
                 "$or": [
                     # Drafts due for publishing (no platform_post_id = not yet sent anywhere)
@@ -651,6 +669,7 @@ class ApprovalWorkflowService:
                                     "status": "published",
                                     "published_date": datetime.utcnow(),
                                     "updated_at": datetime.utcnow(),
+                                    "error_message": None,
                                 }},
                             )
                             published_count += 1
@@ -669,6 +688,7 @@ class ApprovalWorkflowService:
                                             "status": "published",
                                             "published_date": datetime.utcnow(),
                                             "updated_at": datetime.utcnow(),
+                                            "error_message": None,
                                         }},
                                     )
                                     published_count += 1
@@ -685,6 +705,7 @@ class ApprovalWorkflowService:
                                             "status": "published",
                                             "published_date": datetime.utcnow(),
                                             "updated_at": datetime.utcnow(),
+                                            "error_message": None,
                                         }},
                                     )
                                     print(f"🗑️ Marked stale Outstand draft as published (404) | draft_id={draft['id']}")
@@ -714,20 +735,37 @@ class ApprovalWorkflowService:
                         errors.append({"draft_id": draft["id"], "error": "Cannot determine user_id for draft"})
                         continue
 
-                    connections_cursor = db["social_connections"].find({
-                        "user_id": draft_user_id,
-                        "platform": draft["platform"],
-                        "connection_status": "active",
-                    }).sort("created_at", -1).limit(1)
-                    conn_list = await connections_cursor.to_list(length=1)
-                    connection = conn_list[0] if conn_list else None
-                    if connection:
-                        print(f"🔗 Scheduled publish connection | platform={draft['platform']} connected_via={connection.get('connected_via')} ig_user_id={connection.get('ig_user_id')} has_page_token={'yes' if connection.get('page_access_token') else 'NO'} outstand_id={connection.get('outstand_account_id')}")
+                    # For platforms that use direct OAuth (not Outstand), prefer the connection
+                    # that has actual publishing credentials rather than a shadow Outstand doc
+                    # that may sort first by created_at.
+                    _platform_key = draft["platform"]
+                    if _platform_key == "linkedin":
+                        # Prefer direct connections with an access token
+                        connection = await db["social_connections"].find_one({
+                            "user_id": draft_user_id,
+                            "platform": _platform_key,
+                            "connection_status": "active",
+                            "linkedin_access_token": {"$exists": True, "$ne": None},
+                        })
+                        print(f"🔍 LinkedIn token-first lookup | user={draft_user_id} found={bool(connection)} connected_via={connection.get('connected_via') if connection else 'N/A'} has_token={bool(connection.get('linkedin_access_token')) if connection else False} has_urn={bool(connection.get('person_urn') or connection.get('active_author_urn')) if connection else False}")
+                        if not connection:
+                            connection = await db["social_connections"].find_one({
+                                "user_id": draft_user_id,
+                                "platform": _platform_key,
+                                "connection_status": "active",
+                            })
+                            print(f"🔍 LinkedIn fallback lookup | found={bool(connection)} connected_via={connection.get('connected_via') if connection else 'N/A'} has_token={bool(connection.get('linkedin_access_token')) if connection else False} has_urn={bool(connection.get('person_urn') or connection.get('active_author_urn')) if connection else False}")
                     else:
-                        print(f"⚠️ No active {draft['platform']} connection found for user_id={draft_user_id} — will try Outstand fallback")
+                        connections_cursor = db["social_connections"].find({
+                            "user_id": draft_user_id,
+                            "platform": _platform_key,
+                            "connection_status": "active",
+                        }).sort("created_at", -1).limit(1)
+                        conn_list = await connections_cursor.to_list(length=1)
+                        connection = conn_list[0] if conn_list else None
 
-                    # Outstand live-lookup fallback — skip Instagram (always direct Graph API)
-                    if not connection and draft["platform"] != "instagram":
+                    # Outstand live-lookup fallback — skip platforms that always use direct APIs
+                    if not connection and draft["platform"] not in ("instagram", "linkedin"):
                         try:
                             from app.agents.social_media_manager.services.outstand_service import OutstandService, PLATFORM_TO_NETWORK
                             outstand = OutstandService()
@@ -809,6 +847,7 @@ class ApprovalWorkflowService:
                                 "outstand_post_status": publish_result.get("outstand_status", "queued"),
                                 "publish_response": publish_result.get("raw_response"),
                                 "updated_at": datetime.utcnow(),
+                                "error_message": None,
                             }},
                         )
                         print(f"💾 Status→published update | draft={draft.get('id')} matched={update_res.matched_count} modified={update_res.modified_count}")
@@ -894,7 +933,7 @@ class ApprovalWorkflowService:
 
                 # Fall back to Outstand live lookup if local mirror is empty.
                 # Skip Instagram — it always uses direct Graph API, never Outstand.
-                if not connection and platform != "instagram":
+                if not connection and platform not in ("instagram", "linkedin"):
                     print(f"⚠️ No local {platform} connection for user_id={user_id}, querying Outstand directly...")
                     try:
                         from app.agents.social_media_manager.services.outstand_service import OutstandService, PLATFORM_TO_NETWORK
@@ -1320,6 +1359,8 @@ class ApprovalWorkflowService:
         # guards against stale "outstand" entries that got upserted over the direct connection.
         _li_has_token = bool(connection.get("linkedin_access_token") or connection.get("access_token"))
         _li_has_urn = bool(connection.get("person_urn") or connection.get("active_author_urn"))
+        if platform == "linkedin":
+            print(f"🔗 LinkedIn publish check | connected_via={connection.get('connected_via')} has_token={_li_has_token} has_urn={_li_has_urn} condition={'PASS' if (connection.get('connected_via')=='linkedin_direct' or (_li_has_token and _li_has_urn)) else 'FAIL'}")
         if platform == "linkedin" and (connection.get("connected_via") == "linkedin_direct" or (_li_has_token and _li_has_urn)):
             from app.agents.social_media_manager.services.linkedin_direct_service import LinkedInDirectService
             token = connection.get("linkedin_access_token") or connection.get("access_token")
