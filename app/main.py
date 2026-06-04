@@ -6,7 +6,7 @@ from fastapi.responses import JSONResponse
 from fastapi import HTTPException
 from fastapi.staticfiles import StaticFiles
 
-from app.database import connect_to_mongo
+from app.database import connect_to_mongo, connect_to_sdk_gateway_db
 from app.core.config import settings
 from app.core.sentry_config import initialize_sentry
 from app.agents.social_media_manager.routers.complete_social_manager import router as social_media_router
@@ -26,6 +26,7 @@ initialize_sentry()
 
 # Connect to MongoDB
 connect_to_mongo(settings.MONGODB_DB)
+connect_to_sdk_gateway_db()
 
 app = FastAPI(
     title="URI Agent — Social Media Manager",

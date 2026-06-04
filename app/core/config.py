@@ -114,9 +114,14 @@ class Settings(BaseSettings):
     POSTHOG_API_KEY: str = ""
     POSTHOG_HOST: str = "https://us.i.posthog.com"
 
+
+    # SDK Gateway Database (for API key authentication only)
+    SDK_GATEWAY_MONGODB_URI: Optional[str] = None
+    SDK_GATEWAY_DB: str = "sdk-gateway"
     class Config:
         env_file = ".env"
         extra = "ignore"
 
 
 settings = Settings()
+
