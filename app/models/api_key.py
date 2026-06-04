@@ -96,7 +96,7 @@ class APIKey(BaseModel):
     user_id: str = Field(..., description="User ID who owns this API key")
 
     # API Key details
-    key_prefix: str = Field(..., description="First 8 chars of key for display (e.g., 'uri_sk_abcd1234')")
+    key_prefix: str = Field(..., description="First 8 chars of key for display (e.g., 'urisocial_abcd1234')")
     key_hash: str = Field(..., description="SHA256 hash of the full API key")
 
     name: str = Field(..., max_length=100, description="Human-readable name for the key")
@@ -138,10 +138,10 @@ class APIKey(BaseModel):
     def generate_api_key() -> str:
         """
         Generate a secure API key
-        Format: uri_sk_<32 random chars>
+        Format: urisocial_<32 random chars>
         """
         random_part = secrets.token_urlsafe(24)  # 32 chars after base64 encoding
-        return f"uri_sk_{random_part}"
+        return f"urisocial_{random_part}"
 
     @staticmethod
     def hash_api_key(api_key: str) -> str:
