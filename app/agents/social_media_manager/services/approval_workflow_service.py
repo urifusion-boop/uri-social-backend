@@ -162,6 +162,7 @@ class ApprovalWorkflowService:
                     approved_drafts.append({
                         "draft_id": draft_id,
                         "platform": draft["platform"],
+                        "post_type": draft.get("post_type", "feed"),
                         "status": update_data["status"],
                         "scheduled_date": scheduled_datetime.isoformat() if scheduled_datetime else None
                     })
