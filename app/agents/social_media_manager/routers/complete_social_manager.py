@@ -1985,10 +1985,12 @@ async def get_scheduled_content(
         requests = await db["content_requests"].find({"user_id": user_id}, {"id": 1}).to_list(length=200)
         request_ids = [req["id"] for req in requests if req.get("id")]
 
+        import os as _os
+        _scheduled_statuses = ["scheduled", "staging_scheduled", "publish_failed"]
         scheduled_drafts = await db["content_drafts"].find({
             "$or": [
-                {"user_id": user_id, "status": {"$in": ["scheduled", "publish_failed"]}},
-                {"request_id": {"$in": request_ids}, "status": {"$in": ["scheduled", "publish_failed"]}},
+                {"user_id": user_id, "status": {"$in": _scheduled_statuses}},
+                {"request_id": {"$in": request_ids}, "status": {"$in": _scheduled_statuses}},
             ]
         }).sort("scheduled_date", 1).to_list(length=100)
 
