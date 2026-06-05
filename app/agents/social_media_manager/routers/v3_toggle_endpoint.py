@@ -9,6 +9,7 @@ and route to V3 system if enabled.
 from fastapi import APIRouter, Depends, HTTPException
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from typing import Optional
+from datetime import datetime
 
 from app.database import get_db
 from app.dependencies import get_current_user
@@ -46,7 +47,7 @@ async def toggle_v3_for_user(
             {
                 "$set": {
                     "use_v3_prompts": enabled,
-                    "v3_enabled_at": None if not enabled else db.get_collection("brand_profiles").database.client.get_database().get_collection("$cmd").aggregate([{"$currentDate": {}}]).next()["_created"],
+                    "v3_enabled_at": datetime.utcnow() if enabled else None,
                 }
             },
             upsert=False
