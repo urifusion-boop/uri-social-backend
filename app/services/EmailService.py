@@ -86,24 +86,20 @@ class EmailService:
             try:
                 # Create a new connection for each attempt to avoid stale connections
                 # Port 465: use_tls=True (direct SSL/TLS)
-                # Port 587: start_tls=True (plain connection, then upgrade with STARTTLS)
-                if settings.SMTP_PORT == 465:
-                    smtp = aiosmtplib.SMTP(
-                        hostname=settings.SMTP_HOST,
-                        port=settings.SMTP_PORT,
-                        use_tls=True,  # Direct SSL/TLS for port 465
-                        timeout=30,
-                    )
-                else:
-                    # Port 587 or other - use STARTTLS
-                    smtp = aiosmtplib.SMTP(
-                        hostname=settings.SMTP_HOST,
-                        port=settings.SMTP_PORT,
-                        start_tls=True,  # Upgrade plain connection to TLS
-                        timeout=30,
-                    )
+                # Port 587: connect plain, then call starttls()
+                smtp = aiosmtplib.SMTP(
+                    hostname=settings.SMTP_HOST,
+                    port=settings.SMTP_PORT,
+                    use_tls=(settings.SMTP_PORT == 465),  # Direct TLS only for port 465
+                    timeout=30,
+                )
 
                 await smtp.connect()
+
+                # For port 587, upgrade to TLS after connecting
+                if settings.SMTP_PORT == 587:
+                    await smtp.starttls()
+
                 await smtp.login(settings.SMTP_USERNAME, settings.SMTP_PASSWORD)
                 await smtp.send_message(msg)
                 await smtp.quit()
@@ -145,24 +141,20 @@ class EmailService:
             try:
                 # Create a new connection for each attempt to avoid stale connections
                 # Port 465: use_tls=True (direct SSL/TLS)
-                # Port 587: start_tls=True (plain connection, then upgrade with STARTTLS)
-                if settings.SMTP_PORT == 465:
-                    smtp = aiosmtplib.SMTP(
-                        hostname=settings.SMTP_HOST,
-                        port=settings.SMTP_PORT,
-                        use_tls=True,  # Direct SSL/TLS for port 465
-                        timeout=30,
-                    )
-                else:
-                    # Port 587 or other - use STARTTLS
-                    smtp = aiosmtplib.SMTP(
-                        hostname=settings.SMTP_HOST,
-                        port=settings.SMTP_PORT,
-                        start_tls=True,  # Upgrade plain connection to TLS
-                        timeout=30,
-                    )
+                # Port 587: connect plain, then call starttls()
+                smtp = aiosmtplib.SMTP(
+                    hostname=settings.SMTP_HOST,
+                    port=settings.SMTP_PORT,
+                    use_tls=(settings.SMTP_PORT == 465),  # Direct TLS only for port 465
+                    timeout=30,
+                )
 
                 await smtp.connect()
+
+                # For port 587, upgrade to TLS after connecting
+                if settings.SMTP_PORT == 587:
+                    await smtp.starttls()
+
                 await smtp.login(settings.SMTP_USERNAME, settings.SMTP_PASSWORD)
                 await smtp.send_message(msg)
                 await smtp.quit()
