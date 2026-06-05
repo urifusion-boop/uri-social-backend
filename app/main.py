@@ -13,6 +13,8 @@ from app.agents.social_media_manager.routers.complete_social_manager import rout
 from app.agents.social_media_manager.routers.whatsapp_router import router as whatsapp_router
 from app.agents.social_media_manager.routers.x_router import router as x_router
 from app.agents.social_media_manager.routers.linkedin_router import router as linkedin_router
+from app.agents.social_media_manager.routers.v3_test_router import router as v3_test_router
+from app.agents.social_media_manager.routers.v3_toggle_endpoint import router as v3_toggle_router
 from app.routers.auth_router import router as auth_router
 from app.routers.billing_router import router as billing_router
 from app.routers.notification_router import router as notification_router
@@ -147,6 +149,12 @@ app.include_router(
 app.include_router(whatsapp_router)
 app.include_router(x_router)
 app.include_router(linkedin_router)
+
+# Include V3 testing router (isolated for A/B testing)
+app.include_router(v3_test_router, prefix="/social-media", tags=["V3 Testing"])
+
+# Include V3 toggle router (production integration with frontend toggle)
+app.include_router(v3_toggle_router, prefix="/social-media", tags=["V3 Production Toggle"])
 
 # Include multi-tenant routers (Enterprise/SDK features)
 app.include_router(client_router)
