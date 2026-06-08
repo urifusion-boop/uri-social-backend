@@ -59,32 +59,40 @@ async def signup(body: SignupRequest, db: AsyncIOMotorDatabase = Depends(get_db_
     verification_code = ''.join([str(random.randint(0, 9)) for _ in range(6)])
     verification_code_expires = now + timedelta(minutes=15)  # Code expires in 15 minutes
 
-    result = await db["users"].insert_one({
-        "userId": user_id,
-        "email": body.email,
-        "password": hashed,
-        "first_name": body.first_name,
-        "last_name": body.last_name,
-        "referralCode": referral_code,
-        # New fields with defaults
-        "role": "user",
-        "created_at": now,
-        "updated_at": now,
-        "is_active": False,  # Set to False until email verified
-        "email_verified": False,
-        "verification_code": verification_code,
-        "verification_code_expires": verification_code_expires,
-        "account_status": "pending_verification",
-        "last_login_at": None,
-        "last_seen_at": now,
-        "phone": None,
-        "timezone": "UTC",
-        "language": "en",
-    })
+    try:
+        result = await db["users"].insert_one({
+            "userId": user_id,
+            "email": body.email,
+            "password": hashed,
+            "first_name": body.first_name,
+            "last_name": body.last_name,
+            "referralCode": referral_code,
+            # New fields with defaults
+            "role": "user",
+            "created_at": now,
+            "updated_at": now,
+            "is_active": False,  # Set to False until email verified
+            "email_verified": False,
+            "verification_code": verification_code,
+            "verification_code_expires": verification_code_expires,
+            "account_status": "pending_verification",
+            "last_login_at": None,
+            "last_seen_at": now,
+            "phone": None,
+            "timezone": "UTC",
+            "language": "en",
+        })
+    except Exception as e:
+        # Duplicate key error (if email index exists) or other DB errors
+        if "duplicate" in str(e).lower() or "E11000" in str(e):
+            raise HTTPException(status_code=409, detail="A user with this email already exists.")
+        else:
+            print(f"❌ User creation failed for {body.email}: {e}")
+            raise HTTPException(status_code=500, detail="Account creation failed. Please try again.")
 
     PostHogService.track_signup(user_id, email=body.email, method="email")
 
-    # Send verification email
+    # Send verification email - ONLY send if insert succeeded
     try:
         import asyncio
         asyncio.ensure_future(email_service.send_email(
