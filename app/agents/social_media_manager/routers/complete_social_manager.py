@@ -4,7 +4,7 @@ import asyncio
 import json
 import subprocess
 import traceback
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query, Request, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query, Request, UploadFile, File, Form
 from fastapi.responses import RedirectResponse, StreamingResponse, JSONResponse
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from pydantic import BaseModel, Field
@@ -5397,3 +5397,82 @@ async def agent_chat(
         print(f"❌ agent_chat error: {e}")
         traceback.print_exc()
         return UriResponse.error_response("Agent is unavailable right now. Please try again.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Video-to-Video editing (PRD §3 — Level 1 FFmpeg pipeline)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post("/edit-video")
+async def edit_video(
+    background_tasks: BackgroundTasks,
+    video: UploadFile = File(...),
+    platform: str = Form("instagram_reels"),
+    enhancements: str = Form("{}"),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Accept a raw video upload, run the Level 1 FFmpeg editing pipeline
+    (crop 9:16, colour grade, trim, text overlays, export H.264),
+    and save the result as a reel ContentDraft.
+    Returns job_id immediately — poll GET /edit-video-job/{job_id} for status.
+    """
+    from app.agents.social_media_manager.services.video_edit_service import VideoEditService
+    from app.utils.cloudinary_upload import upload_bytes as _upload
+
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    ALLOWED_TYPES = {"video/mp4", "video/quicktime", "video/webm", "video/x-m4v", "video/x-matroska"}
+    if video.content_type not in ALLOWED_TYPES:
+        raise HTTPException(status_code=400, detail="Unsupported format. Please upload MP4, MOV, or WebM.")
+
+    video_bytes = await video.read()
+    if len(video_bytes) > 200 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File too large. Maximum size is 200MB.")
+    if len(video_bytes) == 0:
+        raise HTTPException(status_code=400, detail="Empty file received.")
+
+    try:
+        enhancements_dict = json.loads(enhancements)
+    except Exception:
+        enhancements_dict = {}
+
+    # Archive the original
+    original_url = await _upload(video_bytes, folder="uri-social/original-videos", resource_type="video")
+
+    job_id = await VideoEditService.create_job(user_id, original_url, platform, enhancements_dict)
+
+    background_tasks.add_task(
+        VideoEditService.run_job,
+        job_id,
+        user_id,
+        video_bytes,
+        platform,
+        enhancements_dict,
+    )
+
+    return UriResponse.get_single_data_response("edit_video", {"job_id": job_id, "status": "processing"})
+
+
+@router.get("/edit-video-job/{job_id}")
+async def get_edit_video_job(
+    job_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """Poll the status of a video editing job."""
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    job = await db["video_edit_jobs"].find_one(
+        {"job_id": job_id, "user_id": user_id},
+        {"_id": 0},
+    )
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    return UriResponse.get_single_data_response("edit_video_job", job)
