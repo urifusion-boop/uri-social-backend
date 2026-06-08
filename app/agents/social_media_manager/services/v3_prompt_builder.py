@@ -173,6 +173,36 @@ class V3PromptBuilder:
         BLOCK 1: Product Core Definition (Rulebook p.10-13)
         Forensic documentation of the reference product.
         """
+        # Extract label information from forensic analysis
+        label_info = product_spec.get('label', {})
+        label_text_lines = label_info.get('text_lines', [])
+
+        # Build detailed label description
+        if label_info.get('present') and label_text_lines:
+            # Construct detailed label specification with exact text
+            label_description = f"The product label MUST display the following text EXACTLY as shown:\n"
+            for i, text_line in enumerate(label_text_lines, 1):
+                label_description += f"   Line {i}: \"{text_line}\"\n"
+
+            # Add label styling details
+            label_bg = label_info.get('background_colour', '')
+            label_txt_color = label_info.get('text_colour', '')
+            label_font = label_info.get('font_style', '')
+            label_position = label_info.get('position', '')
+
+            if label_bg:
+                label_description += f"   Label background: {label_bg}\n"
+            if label_txt_color:
+                label_description += f"   Text color: {label_txt_color}\n"
+            if label_font:
+                label_description += f"   Font style: {label_font}\n"
+            if label_position:
+                label_description += f"   Label position: {label_position}\n"
+
+            label_description += "   CRITICAL: All text must be legible, correctly spelled, and match the original product exactly."
+        else:
+            label_description = 'All text and branding on product must be clearly visible and match the reference image exactly'
+
         return f"""PRODUCT PRESERVATION DIRECTIVE:
 This image MUST include the exact product shown in the reference image.
 
@@ -183,7 +213,7 @@ PRODUCT IDENTITY:
 
 MANDATORY PRESERVATION RULES:
 1. SHAPE: {product_spec.get('shape_description', 'Preserve exact silhouette and proportions')}
-2. LABELS: {product_spec.get('label_description', 'All text and branding on product must be clearly visible')}
+2. LABELS: {label_description}
 3. MATERIALS: {product_spec.get('material_description', 'Preserve surface texture and material properties')}
 4. SCALE: Product must be {product_spec.get('relative_size', 'prominently sized')} within the frame
 
