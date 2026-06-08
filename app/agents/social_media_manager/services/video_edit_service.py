@@ -1,11 +1,14 @@
 import asyncio
+import glob
 import json
 import os
+import random
 import subprocess
 import tempfile
 import uuid
 from datetime import datetime
 
+from app.core.config import settings
 from app.database import get_db
 from app.utils.cloudinary_upload import upload_bytes
 
@@ -39,7 +42,15 @@ class VideoEditService:
         return job_id
 
     @staticmethod
-    async def run_job(job_id: str, user_id: str, video_bytes: bytes, platform: str, enhancements: dict):
+    async def run_job(
+        job_id: str,
+        user_id: str,
+        video_bytes: bytes,
+        platform: str,
+        enhancements: dict,
+        brand_name: str = "",
+        brand_cta: str = "",
+    ):
         db = get_db()
         col = db["video_edit_jobs"]
 
@@ -47,7 +58,9 @@ class VideoEditService:
             loop = asyncio.get_running_loop()
             result = await loop.run_in_executor(
                 None,
-                lambda: VideoEditService._run_ffmpeg_pipeline(video_bytes, platform, enhancements),
+                lambda: VideoEditService._run_ffmpeg_pipeline(
+                    video_bytes, platform, enhancements, brand_name, brand_cta
+                ),
             )
             edited_bytes: bytes = result["bytes"]
             edits_applied: list = result["edits_applied"]
@@ -91,135 +104,347 @@ class VideoEditService:
             }})
 
     # ─────────────────────────────────────────────────────────────────────────
-    # FFmpeg pipeline
+    # Main FFmpeg pipeline
     # ─────────────────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _run_ffmpeg_pipeline(video_bytes: bytes, platform: str, enhancements: dict) -> dict:
+    def _run_ffmpeg_pipeline(
+        video_bytes: bytes,
+        platform: str,
+        enhancements: dict,
+        brand_name: str,
+        brand_cta: str,
+    ) -> dict:
         target = PLATFORM_TARGETS.get(platform, PLATFORM_TARGETS["instagram_reels"])
         target_duration = target["duration"]
         target_w, target_h = target["width"], target["height"]
-
         edits_applied = []
 
         with tempfile.TemporaryDirectory() as tmp:
             input_path = os.path.join(tmp, "input.mp4")
-            output_path = os.path.join(tmp, "output.mp4")
-
             with open(input_path, "wb") as f:
                 f.write(video_bytes)
 
             meta = VideoEditService._get_metadata(input_path)
-            duration = meta.get("duration", 30.0)
-            width = meta.get("width", 1920)
-            height = meta.get("height", 1080)
-            has_audio = meta.get("has_audio", False)
+            duration   = meta.get("duration", 30.0)
+            width      = meta.get("width", 1920)
+            height     = meta.get("height", 1080)
+            has_audio  = meta.get("has_audio", False)
+            trim_dur   = min(float(duration), float(target_duration))
 
-            trim_duration = min(float(duration), float(target_duration))
+            # ── Step 1: stabilise ─────────────────────────────────────────
+            working_path = input_path
+            if enhancements.get("stabilise", True):
+                stabilised = VideoEditService._stabilise(input_path, tmp, trim_dur)
+                if stabilised:
+                    working_path = stabilised
+                    edits_applied.append("Stabilised")
+
+            # ── Step 2-5: crop → scale → colour → text ────────────────────
             filters = []
 
-            # Crop to 9:16
             if enhancements.get("crop_916", True):
-                input_ratio = width / height if height > 0 else 1.78
+                input_ratio  = width / height if height > 0 else 1.78
                 target_ratio = 9 / 16
                 if abs(input_ratio - target_ratio) > 0.05:
                     if input_ratio > target_ratio:
-                        new_w = int(height * 9 / 16)
+                        new_w  = int(height * 9 / 16)
                         crop_x = int((width - new_w) / 2)
                         filters.append(f"crop={new_w}:{height}:{crop_x}:0")
                     else:
-                        new_h = int(width * 16 / 9)
+                        new_h  = int(width * 16 / 9)
                         crop_y = int((height - new_h) / 2)
                         filters.append(f"crop={width}:{new_h}:0:{crop_y}")
                     edits_applied.append("Cropped to 9:16")
 
-            # Scale to target resolution with letterbox padding
             filters.append(f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease")
             filters.append(f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:black")
 
-            # Colour grade (warm eq)
             if enhancements.get("colour_grade", True):
                 filters.append("eq=brightness=0.03:saturation=1.15:gamma_r=1.05:gamma_b=0.95")
                 edits_applied.append("Colour graded")
 
-            # Text overlays
             if enhancements.get("add_text_overlays", True):
                 headline = (enhancements.get("headline_text") or "").strip()
-                cta = (enhancements.get("cta_text") or "").strip()
-                font = VideoEditService._find_font()
-                if font and (headline or cta):
+                cta_text = (enhancements.get("cta_text") or "").strip()
+                font     = VideoEditService._find_font()
+                if font and (headline or cta_text):
                     if headline:
-                        safe = headline.replace("'", "\\'").replace(":", "\\:").replace("\\", "\\\\")
-                        show_until = min(trim_duration, 4.0)
+                        safe = headline.replace("'", "\\'").replace(":", "\\:")
+                        show_until = min(trim_dur, 4.0)
                         filters.append(
                             f"drawtext=text='{safe}':fontfile='{font}':"
                             f"fontsize=52:fontcolor=white:x=(w-text_w)/2:y=h*0.12:"
                             f"box=1:boxcolor=black@0.45:boxborderw=10:"
                             f"enable='between(t,0,{show_until:.1f})'"
                         )
-                    if cta:
-                        safe = cta.replace("'", "\\'").replace(":", "\\:").replace("\\", "\\\\")
-                        cta_start = max(trim_duration - 4.0, trim_duration * 0.7)
+                    if cta_text:
+                        safe      = cta_text.replace("'", "\\'").replace(":", "\\:")
+                        cta_start = max(trim_dur - 4.0, trim_dur * 0.7)
                         filters.append(
                             f"drawtext=text='{safe}':fontfile='{font}':"
                             f"fontsize=36:fontcolor=white:x=(w-text_w)/2:y=h*0.85:"
                             f"box=1:boxcolor=black@0.45:boxborderw=8:"
-                            f"enable='between(t,{cta_start:.1f},{trim_duration:.1f})'"
+                            f"enable='between(t,{cta_start:.1f},{trim_dur:.1f})'"
                         )
                     edits_applied.append("Text overlays added")
 
-            # Build and run FFmpeg command
+            # ── Step 6: export main clip ───────────────────────────────────
+            main_path = os.path.join(tmp, "main.mp4")
             vf = ",".join(filters) if filters else None
-            cmd = ["ffmpeg", "-y", "-i", input_path, "-t", str(trim_duration)]
+            cmd = ["ffmpeg", "-y", "-i", working_path, "-t", str(trim_dur)]
             if vf:
                 cmd += ["-vf", vf]
-            cmd += ["-c:v", "libx264", "-preset", "fast", "-crf", "23", "-r", "30", "-movflags", "+faststart"]
+            cmd += ["-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                    "-r", "30", "-movflags", "+faststart", "-pix_fmt", "yuv420p"]
             if has_audio:
                 cmd += ["-c:a", "aac", "-b:a", "128k", "-ar", "48000"]
             else:
                 cmd += ["-an"]
-            cmd.append(output_path)
-
-            proc = subprocess.run(cmd, capture_output=True, timeout=180)
-            if proc.returncode != 0:
-                raise RuntimeError(f"FFmpeg error: {proc.stderr.decode()[-800:]}")
+            cmd.append(main_path)
+            VideoEditService._run(cmd)
 
             if enhancements.get("smart_trim", True):
-                edits_applied.append(f"Trimmed to {int(trim_duration)}s")
+                edits_applied.append(f"Trimmed to {int(trim_dur)}s")
+
+            # ── Step 7: branded intro ─────────────────────────────────────
+            intro_path = None
+            if enhancements.get("add_intro", True):
+                intro_path = VideoEditService._make_intro(tmp, brand_name, target_w, target_h)
+                if intro_path:
+                    edits_applied.append("Branded intro added")
+
+            # ── Step 8: branded outro ─────────────────────────────────────
+            outro_path = None
+            if enhancements.get("add_outro", True):
+                cta_line   = brand_cta or enhancements.get("cta_text") or "Follow us for more"
+                outro_path = VideoEditService._make_outro(tmp, cta_line, target_w, target_h)
+                if outro_path:
+                    edits_applied.append("Branded outro added")
+
+            # ── Step 9: concatenate intro + main + outro ──────────────────
+            assembled_path = main_path
+            parts = [p for p in [intro_path, main_path, outro_path] if p]
+            if len(parts) > 1:
+                assembled_path = VideoEditService._concat(parts, tmp, has_audio)
+
+            # ── Step 10: background music ──────────────────────────────────
+            final_path = assembled_path
+            if enhancements.get("add_music", True):
+                mood        = enhancements.get("music_mood", "upbeat")
+                music_track = VideoEditService._find_music_track(mood)
+                if music_track:
+                    final_path = VideoEditService._mix_music(assembled_path, music_track, tmp, has_audio)
+                    edits_applied.append(f"Background music added ({mood})")
+
             edits_applied.append("Exported 1080×1920 H.264")
 
-            with open(output_path, "rb") as f:
+            with open(final_path, "rb") as f:
                 return {"bytes": f.read(), "edits_applied": edits_applied}
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Stabilisation
+    # ─────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _stabilise(input_path: str, tmp: str, duration: float) -> str | None:
+        """Two-pass vidstab with fallback to deshake."""
+        stabilised = os.path.join(tmp, "stabilised.mp4")
+
+        # Try vidstab (requires libvidstab compiled into ffmpeg)
+        transforms = os.path.join(tmp, "transforms.trf")
+        try:
+            VideoEditService._run([
+                "ffmpeg", "-y", "-i", input_path, "-t", str(duration),
+                "-vf", f"vidstabdetect=shakiness=5:accuracy=15:result={transforms}",
+                "-f", "null", "-",
+            ])
+            VideoEditService._run([
+                "ffmpeg", "-y", "-i", input_path, "-t", str(duration),
+                "-vf", f"vidstabtransform=smoothing=10:crop=black:zoom=1:input={transforms}",
+                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                "-c:a", "copy", "-movflags", "+faststart", stabilised,
+            ])
+            return stabilised
+        except subprocess.CalledProcessError:
+            pass
+
+        # Fallback: deshake (always available)
+        try:
+            VideoEditService._run([
+                "ffmpeg", "-y", "-i", input_path, "-t", str(duration),
+                "-vf", "deshake",
+                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                "-c:a", "copy", "-movflags", "+faststart", stabilised,
+            ])
+            return stabilised
+        except subprocess.CalledProcessError:
+            return None
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Intro / Outro generation (programmatic — no asset files required)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _make_intro(tmp: str, brand_name: str, w: int, h: int) -> str | None:
+        """1.5s black screen with brand name fading in."""
+        font = VideoEditService._find_font()
+        if not font:
+            return None
+        out = os.path.join(tmp, "intro.mp4")
+        label = (brand_name or "URI Social").replace("'", "\\'").replace(":", "\\:")
+        vf = (
+            f"drawtext=text='{label}':fontfile='{font}':"
+            f"fontsize=64:fontcolor=white:x=(w-text_w)/2:y=(h-text_h)/2:"
+            f"alpha='if(lt(t,0.4),t/0.4,if(gt(t,1.1),(1.5-t)/0.4,1))'"
+        )
+        try:
+            VideoEditService._run([
+                "ffmpeg", "-y",
+                "-f", "lavfi", "-i", f"color=c=black:s={w}x{h}:r=30:d=1.5",
+                "-vf", vf,
+                "-c:v", "libx264", "-preset", "fast", "-pix_fmt", "yuv420p", "-an", out,
+            ])
+            return out
+        except subprocess.CalledProcessError:
+            return None
+
+    @staticmethod
+    def _make_outro(tmp: str, cta_text: str, w: int, h: int) -> str | None:
+        """2s black screen with CTA text."""
+        font = VideoEditService._find_font()
+        if not font:
+            return None
+        out = os.path.join(tmp, "outro.mp4")
+        label = (cta_text or "Follow us for more").replace("'", "\\'").replace(":", "\\:")
+        vf = (
+            f"drawtext=text='{label}':fontfile='{font}':"
+            f"fontsize=48:fontcolor=white:x=(w-text_w)/2:y=(h-text_h)/2:"
+            f"alpha='if(lt(t,0.3),t/0.3,if(gt(t,1.7),(2-t)/0.3,1))'"
+        )
+        try:
+            VideoEditService._run([
+                "ffmpeg", "-y",
+                "-f", "lavfi", "-i", f"color=c=black:s={w}x{h}:r=30:d=2.0",
+                "-vf", vf,
+                "-c:v", "libx264", "-preset", "fast", "-pix_fmt", "yuv420p", "-an", out,
+            ])
+            return out
+        except subprocess.CalledProcessError:
+            return None
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Concatenation
+    # ─────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _concat(parts: list[str], tmp: str, has_audio: bool) -> str:
+        out = os.path.join(tmp, "assembled.mp4")
+        list_path = os.path.join(tmp, "concat_list.txt")
+        with open(list_path, "w") as f:
+            for p in parts:
+                f.write(f"file '{p}'\n")
+        cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path]
+        if has_audio:
+            cmd += ["-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                    "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out]
+        else:
+            cmd += ["-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                    "-an", "-movflags", "+faststart", out]
+        VideoEditService._run(cmd)
+        return out
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Background music mixing
+    # ─────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _find_music_track(mood: str) -> str | None:
+        """Look for a track in MUSIC_LIBRARY_PATH/{mood}/*.mp3 (or .wav/m4a)."""
+        base = (settings.MUSIC_LIBRARY_PATH or "").strip()
+        if not base:
+            return None
+        mood_dir = os.path.join(base, mood)
+        tracks = (
+            glob.glob(os.path.join(mood_dir, "*.mp3")) +
+            glob.glob(os.path.join(mood_dir, "*.wav")) +
+            glob.glob(os.path.join(mood_dir, "*.m4a"))
+        )
+        if not tracks:
+            # Try root of music library as fallback
+            tracks = (
+                glob.glob(os.path.join(base, "*.mp3")) +
+                glob.glob(os.path.join(base, "*.wav"))
+            )
+        return random.choice(tracks) if tracks else None
+
+    @staticmethod
+    def _mix_music(video_path: str, music_path: str, tmp: str, has_original_audio: bool) -> str:
+        out = os.path.join(tmp, "with_music.mp4")
+        if has_original_audio:
+            # Mix at 18% volume behind original audio
+            filter_complex = "[1:a]volume=0.18[bg];[0:a][bg]amix=inputs=2:duration=shortest[aout]"
+            cmd = [
+                "ffmpeg", "-y", "-i", video_path, "-i", music_path,
+                "-filter_complex", filter_complex,
+                "-map", "0:v", "-map", "[aout]",
+                "-c:v", "copy", "-c:a", "aac", "-b:a", "128k", "-ar", "48000",
+                "-shortest", out,
+            ]
+        else:
+            # No original audio — use music at 25%
+            cmd = [
+                "ffmpeg", "-y", "-i", video_path, "-i", music_path,
+                "-filter_complex", "[1:a]volume=0.25,atrim=duration=60[bg]",
+                "-map", "0:v", "-map", "[bg]",
+                "-c:v", "copy", "-c:a", "aac", "-b:a", "128k", "-ar", "48000",
+                "-shortest", out,
+            ]
+        VideoEditService._run(cmd)
+        return out
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Helpers
+    # ─────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _run(cmd: list[str]) -> None:
+        result = subprocess.run(cmd, capture_output=True, timeout=180)
+        if result.returncode != 0:
+            raise subprocess.CalledProcessError(
+                result.returncode, cmd,
+                output=result.stdout, stderr=result.stderr,
+            )
 
     @staticmethod
     def _get_metadata(path: str) -> dict:
         try:
             proc = subprocess.run(
-                ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", "-show_format", path],
+                ["ffprobe", "-v", "quiet", "-print_format", "json",
+                 "-show_streams", "-show_format", path],
                 capture_output=True, timeout=30,
             )
             if proc.returncode != 0:
                 return {"duration": 15.0, "width": 1920, "height": 1080, "has_audio": False}
-            data = json.loads(proc.stdout)
-            video_s = next((s for s in data.get("streams", []) if s.get("codec_type") == "video"), None)
-            audio_s = next((s for s in data.get("streams", []) if s.get("codec_type") == "audio"), None)
+            data     = json.loads(proc.stdout)
+            video_s  = next((s for s in data.get("streams", []) if s.get("codec_type") == "video"), None)
+            audio_s  = next((s for s in data.get("streams", []) if s.get("codec_type") == "audio"), None)
             duration = float(data.get("format", {}).get("duration", 15.0))
-            width = int(video_s.get("width", 1920)) if video_s else 1920
-            height = int(video_s.get("height", 1080)) if video_s else 1080
+            width    = int(video_s.get("width",  1920)) if video_s else 1920
+            height   = int(video_s.get("height", 1080)) if video_s else 1080
             return {"duration": duration, "width": width, "height": height, "has_audio": audio_s is not None}
         except Exception:
             return {"duration": 15.0, "width": 1920, "height": 1080, "has_audio": False}
 
     @staticmethod
     def _find_font() -> str | None:
-        candidates = [
+        for p in [
             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
             "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
             "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
             "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
             "/System/Library/Fonts/Helvetica.ttc",
-        ]
-        for p in candidates:
+        ]:
             if os.path.exists(p):
                 return p
         return None

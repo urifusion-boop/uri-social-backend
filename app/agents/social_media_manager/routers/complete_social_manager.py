@@ -5440,6 +5440,18 @@ async def edit_video(
     except Exception:
         enhancements_dict = {}
 
+    # Load brand data for intro/outro generation
+    brand_name = ""
+    brand_cta  = ""
+    try:
+        profile_result = await BrandProfileService.get(user_id, db)
+        profile_data   = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
+        brand_name = profile_data.get("brand_name", "")
+        cta_styles = profile_data.get("cta_styles") or []
+        brand_cta  = cta_styles[0] if cta_styles else ""
+    except Exception:
+        pass
+
     # Archive the original
     original_url = await _upload(video_bytes, folder="uri-social/original-videos", resource_type="video")
 
@@ -5452,6 +5464,8 @@ async def edit_video(
         video_bytes,
         platform,
         enhancements_dict,
+        brand_name,
+        brand_cta,
     )
 
     return UriResponse.get_single_data_response("edit_video", {"job_id": job_id, "status": "processing"})

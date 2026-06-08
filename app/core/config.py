@@ -87,6 +87,11 @@ class Settings(BaseSettings):
     # e.g. https://api-staging.urisocial.com  or  http://localhost:9003
     PUBLIC_API_URL: str = ""
 
+    # Video editing — path to royalty-free music library on the server
+    # Expected layout: {MUSIC_LIBRARY_PATH}/{mood}/*.mp3  e.g. /opt/uri-music/upbeat/track1.mp3
+    # Leave empty to skip background music (pipeline still runs, just without audio overlay)
+    MUSIC_LIBRARY_PATH: str = ""
+
     # Bypass flags for local development
     BYPASS_SUBSCRIPTION_CHECK: bool = False
     BYPASS_FEATURE_LIMIT_CHECK: bool = False
