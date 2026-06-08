@@ -877,11 +877,13 @@ async def instagram_direct_callback(
                 ig_account = ig_data.get("instagram_business_account")
                 if ig_account:
                     ig_user_id = str(ig_account["id"])
-                    page_token = ptok
+                    # Store the user's long-lived token instead of page token
+                    # The long_token has instagram_content_publish permission
+                    page_token = long_token
                     # Step 5: fetch Instagram profile
                     profile_resp = await client.get(
                         f"https://graph.facebook.com/v20.0/{ig_user_id}",
-                        params={"fields": "id,username,name,profile_picture_url", "access_token": ptok},
+                        params={"fields": "id,username,name,profile_picture_url", "access_token": long_token},
                     )
                     profile = profile_resp.json()
                     print(f"[IGDirectOAuth] ig profile: {profile}")
