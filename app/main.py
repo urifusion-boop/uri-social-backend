@@ -51,6 +51,15 @@ async def startup_event():
     except Exception as e:
         print(f"⚠️  Warning: Failed to initialize subscription tiers: {e}")
 
+    # Ensure unique email index on users collection (prevents duplicate signups)
+    try:
+        from app.database import get_db
+        db = await get_db()
+        await db["users"].create_index("email", unique=True)
+        print("✅ Unique email index ensured on users collection")
+    except Exception as e:
+        print(f"⚠️  Warning: Failed to create email index: {e}")
+
     # Start notification scheduler (PRD 8: Scheduled Jobs)
     try:
         from app.services.notification_scheduler import start_notification_scheduler
