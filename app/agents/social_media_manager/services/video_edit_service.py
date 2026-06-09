@@ -135,7 +135,7 @@ class VideoEditService:
             # ── Step 1: stabilise ─────────────────────────────────────────
             working_path = input_path
             if enhancements.get("stabilise", True):
-                stabilised = VideoEditService._stabilise(input_path, tmp, trim_dur)
+                stabilised = VideoEditService._stabilise(input_path, tmp, trim_dur, has_audio)
                 if stabilised:
                     working_path = stabilised
                     edits_applied.append("Stabilised")
@@ -190,19 +190,39 @@ class VideoEditService:
                     edits_applied.append("Text overlays added")
 
             # ── Step 6: export main clip ───────────────────────────────────
+            # Always include an audio track (silent if source has none) so
+            # all parts share the same stream layout for concat.
             main_path = os.path.join(tmp, "main.mp4")
             vf = ",".join(filters) if filters else None
-            cmd = ["ffmpeg", "-y", "-i", working_path, "-t", str(trim_dur)]
-            if vf:
-                cmd += ["-vf", vf]
-            cmd += ["-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                    "-r", "30", "-movflags", "+faststart", "-pix_fmt", "yuv420p"]
             if has_audio:
-                cmd += ["-c:a", "aac", "-b:a", "128k", "-ar", "48000"]
+                cmd = ["ffmpeg", "-y", "-i", working_path, "-t", str(trim_dur)]
+                if vf:
+                    cmd += ["-vf", vf]
+                cmd += [
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                    "-r", "30", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                    "-c:a", "aac", "-b:a", "128k", "-ar", "48000",
+                    main_path,
+                ]
             else:
-                cmd += ["-an"]
-            cmd.append(main_path)
+                # No source audio — mix in a silent track so concat works cleanly
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-i", working_path,
+                    "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
+                    "-t", str(trim_dur),
+                ]
+                if vf:
+                    cmd += ["-vf", vf]
+                cmd += [
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                    "-r", "30", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                    "-c:a", "aac", "-b:a", "128k", "-ar", "48000",
+                    "-shortest", main_path,
+                ]
             VideoEditService._run(cmd)
+            # All parts now have audio — treat as has_audio for concat
+            has_audio = True
 
             if enhancements.get("smart_trim", True):
                 edits_applied.append(f"Trimmed to {int(trim_dur)}s")
@@ -247,9 +267,10 @@ class VideoEditService:
     # ─────────────────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _stabilise(input_path: str, tmp: str, duration: float) -> str | None:
-        """Two-pass vidstab with fallback to deshake."""
+    def _stabilise(input_path: str, tmp: str, duration: float, has_audio: bool) -> str | None:
+        """Two-pass vidstab with fallback to deshake. Handles audio/no-audio."""
         stabilised = os.path.join(tmp, "stabilised.mp4")
+        audio_args = ["-c:a", "aac", "-b:a", "128k"] if has_audio else ["-an"]
 
         # Try vidstab (requires libvidstab compiled into ffmpeg)
         transforms = os.path.join(tmp, "transforms.trf")
@@ -263,19 +284,19 @@ class VideoEditService:
                 "ffmpeg", "-y", "-i", input_path, "-t", str(duration),
                 "-vf", f"vidstabtransform=smoothing=10:crop=black:zoom=1:input={transforms}",
                 "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                "-c:a", "copy", "-movflags", "+faststart", stabilised,
+                *audio_args, "-movflags", "+faststart", stabilised,
             ])
             return stabilised
         except subprocess.CalledProcessError:
             pass
 
-        # Fallback: deshake (always available)
+        # Fallback: deshake (always available in standard ffmpeg builds)
         try:
             VideoEditService._run([
                 "ffmpeg", "-y", "-i", input_path, "-t", str(duration),
                 "-vf", "deshake",
                 "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                "-c:a", "copy", "-movflags", "+faststart", stabilised,
+                *audio_args, "-movflags", "+faststart", stabilised,
             ])
             return stabilised
         except subprocess.CalledProcessError:
@@ -287,7 +308,7 @@ class VideoEditService:
 
     @staticmethod
     def _make_intro(tmp: str, brand_name: str, w: int, h: int) -> str | None:
-        """1.5s black screen with brand name fading in."""
+        """1.5s black screen with brand name fading in. Always includes silent audio for clean concat."""
         font = VideoEditService._find_font()
         if not font:
             return None
@@ -302,8 +323,10 @@ class VideoEditService:
             VideoEditService._run([
                 "ffmpeg", "-y",
                 "-f", "lavfi", "-i", f"color=c=black:s={w}x{h}:r=30:d=1.5",
+                "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
                 "-vf", vf,
-                "-c:v", "libx264", "-preset", "fast", "-pix_fmt", "yuv420p", "-an", out,
+                "-c:v", "libx264", "-preset", "fast", "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "128k", "-shortest", out,
             ])
             return out
         except subprocess.CalledProcessError:
@@ -311,7 +334,7 @@ class VideoEditService:
 
     @staticmethod
     def _make_outro(tmp: str, cta_text: str, w: int, h: int) -> str | None:
-        """2s black screen with CTA text."""
+        """2s black screen with CTA text. Always includes silent audio for clean concat."""
         font = VideoEditService._find_font()
         if not font:
             return None
@@ -326,32 +349,50 @@ class VideoEditService:
             VideoEditService._run([
                 "ffmpeg", "-y",
                 "-f", "lavfi", "-i", f"color=c=black:s={w}x{h}:r=30:d=2.0",
+                "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
                 "-vf", vf,
-                "-c:v", "libx264", "-preset", "fast", "-pix_fmt", "yuv420p", "-an", out,
+                "-c:v", "libx264", "-preset", "fast", "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "128k", "-shortest", out,
             ])
             return out
         except subprocess.CalledProcessError:
             return None
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Concatenation
+    # Concatenation — all parts must have video+audio (intro/outro carry silent audio)
     # ─────────────────────────────────────────────────────────────────────────
 
     @staticmethod
     def _concat(parts: list[str], tmp: str, has_audio: bool) -> str:
+        """Concat parts using filter_complex so codec/stream mismatches are always resolved."""
         out = os.path.join(tmp, "assembled.mp4")
-        list_path = os.path.join(tmp, "concat_list.txt")
-        with open(list_path, "w") as f:
-            for p in parts:
-                f.write(f"file '{p}'\n")
-        cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path]
+        n = len(parts)
+
+        # Build -i args and filter_complex concat
+        input_args = []
+        for p in parts:
+            input_args += ["-i", p]
+
         if has_audio:
-            cmd += ["-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                    "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out]
+            streams = "".join(f"[{i}:v][{i}:a]" for i in range(n))
+            fc = f"{streams}concat=n={n}:v=1:a=1[vout][aout]"
+            VideoEditService._run([
+                "ffmpeg", "-y", *input_args,
+                "-filter_complex", fc,
+                "-map", "[vout]", "-map", "[aout]",
+                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out,
+            ])
         else:
-            cmd += ["-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                    "-an", "-movflags", "+faststart", out]
-        VideoEditService._run(cmd)
+            streams = "".join(f"[{i}:v]" for i in range(n))
+            fc = f"{streams}concat=n={n}:v=1:a=0[vout]"
+            VideoEditService._run([
+                "ffmpeg", "-y", *input_args,
+                "-filter_complex", fc,
+                "-map", "[vout]",
+                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                "-an", "-movflags", "+faststart", out,
+            ])
         return out
 
     # ─────────────────────────────────────────────────────────────────────────
