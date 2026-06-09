@@ -76,6 +76,7 @@ class VideoEditService:
             await db["content_drafts"].insert_one({
                 "id": draft_id,
                 "draft_id": draft_id,
+                "request_id": draft_id,
                 "user_id": user_id,
                 "platform": platform_key,
                 "post_type": "reel",
