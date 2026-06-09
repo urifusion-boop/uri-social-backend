@@ -8,6 +8,8 @@ import tempfile
 import uuid
 from datetime import datetime
 
+import httpx
+
 from app.core.config import settings
 from app.database import get_db
 from app.utils.cloudinary_upload import upload_bytes
@@ -50,16 +52,33 @@ class VideoEditService:
         enhancements: dict,
         brand_name: str = "",
         brand_cta: str = "",
+        brand_colors: list = None,
+        logo_url: str = "",
+        logo_position: str = "bottom_right",
+        tagline: str = "",
     ):
         db = get_db()
         col = db["video_edit_jobs"]
+
+        # Download logo bytes async before entering the executor
+        logo_bytes: bytes | None = None
+        if logo_url:
+            try:
+                async with httpx.AsyncClient(timeout=15) as client:
+                    r = await client.get(logo_url)
+                    if r.status_code == 200:
+                        logo_bytes = r.content
+            except Exception:
+                pass
 
         try:
             loop = asyncio.get_running_loop()
             result = await loop.run_in_executor(
                 None,
                 lambda: VideoEditService._run_ffmpeg_pipeline(
-                    video_bytes, platform, enhancements, brand_name, brand_cta
+                    video_bytes, platform, enhancements,
+                    brand_name, brand_cta,
+                    brand_colors or [], logo_bytes, logo_position, tagline,
                 ),
             )
             edited_bytes: bytes = result["bytes"]
@@ -115,6 +134,10 @@ class VideoEditService:
         enhancements: dict,
         brand_name: str,
         brand_cta: str,
+        brand_colors: list = None,
+        logo_bytes: bytes | None = None,
+        logo_position: str = "bottom_right",
+        tagline: str = "",
     ) -> dict:
         target = PLATFORM_TARGETS.get(platform, PLATFORM_TARGETS["instagram_reels"])
         target_duration = target["duration"]
@@ -228,28 +251,44 @@ class VideoEditService:
             if enhancements.get("smart_trim", True):
                 edits_applied.append(f"Trimmed to {int(trim_dur)}s")
 
-            # ── Step 7: branded intro ─────────────────────────────────────
+            # ── Step 7: logo overlay on the main clip ─────────────────────
+            primary_color = (brand_colors or ["#000000"])[0] if brand_colors else "#000000"
+            logo_path = None
+            if logo_bytes:
+                logo_path = os.path.join(tmp, "logo.png")
+                with open(logo_path, "wb") as f:
+                    f.write(logo_bytes)
+
+            if logo_path:
+                logo_main = VideoEditService._apply_logo(main_path, logo_path, logo_position, tmp, "logo_main.mp4")
+                if logo_main:
+                    main_path = logo_main
+                    edits_applied.append("Logo overlaid")
+
+            # ── Step 8: branded intro ─────────────────────────────────────
             intro_path = None
             if enhancements.get("add_intro", True):
-                intro_path = VideoEditService._make_intro(tmp, brand_name, target_w, target_h)
+                intro_path = VideoEditService._make_intro(
+                    tmp, brand_name, tagline, primary_color, logo_path, target_w, target_h
+                )
                 if intro_path:
                     edits_applied.append("Branded intro added")
 
-            # ── Step 8: branded outro ─────────────────────────────────────
+            # ── Step 9: branded outro ─────────────────────────────────────
             outro_path = None
             if enhancements.get("add_outro", True):
                 cta_line   = brand_cta or enhancements.get("cta_text") or "Follow us for more"
-                outro_path = VideoEditService._make_outro(tmp, cta_line, target_w, target_h)
+                outro_path = VideoEditService._make_outro(tmp, cta_line, primary_color, target_w, target_h)
                 if outro_path:
                     edits_applied.append("Branded outro added")
 
-            # ── Step 9: concatenate intro + main + outro ──────────────────
+            # ── Step 10: concatenate intro + main + outro ──────────────────
             assembled_path = main_path
             parts = [p for p in [intro_path, main_path, outro_path] if p]
             if len(parts) > 1:
                 assembled_path = VideoEditService._concat(parts, tmp, has_audio)
 
-            # ── Step 10: background music ──────────────────────────────────
+            # ── Step 11: background music ──────────────────────────────────
             final_path = assembled_path
             if enhancements.get("add_music", True):
                 mood        = enhancements.get("music_mood", "upbeat")
@@ -308,38 +347,111 @@ class VideoEditService:
     # ─────────────────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _make_intro(tmp: str, brand_name: str, w: int, h: int) -> str | None:
-        """1.5s black screen with brand name fading in. Always includes silent audio for clean concat."""
-        font = VideoEditService._find_font()
-        if not font:
-            return None
-        out = os.path.join(tmp, "intro.mp4")
-        label = (brand_name or "URI Social").replace("'", "\\'").replace(":", "\\:")
-        vf = (
-            f"drawtext=text='{label}':fontfile='{font}':"
-            f"fontsize=64:fontcolor=white:x=(w-text_w)/2:y=(h-text_h)/2:"
-            f"alpha='if(lt(t,0.4),t/0.4,if(gt(t,1.1),(1.5-t)/0.4,1))'"
+    def _apply_logo(
+        video_path: str,
+        logo_path: str,
+        position: str,
+        tmp: str,
+        out_name: str = "with_logo.mp4",
+    ) -> str | None:
+        """Overlay a scaled logo in a corner of the video throughout."""
+        out = os.path.join(tmp, out_name)
+        # Scale logo to 10% of video width, preserve aspect ratio
+        logo_w = 108  # 10% of 1080
+        POSITIONS = {
+            "top_left":     f"10:10",
+            "top_right":    f"W-w-10:10",
+            "bottom_left":  f"10:H-h-10",
+            "bottom_right": f"W-w-10:H-h-10",
+        }
+        overlay_xy = POSITIONS.get(position, POSITIONS["bottom_right"])
+        fc = (
+            f"[1:v]scale={logo_w}:-1,format=rgba,"
+            f"colorchannelmixer=aa=0.85[logo];"
+            f"[0:v][logo]overlay={overlay_xy}:format=auto[vout]"
         )
         try:
             VideoEditService._run([
-                "ffmpeg", "-y",
-                "-f", "lavfi", "-i", f"color=c=black:s={w}x{h}:r=30:d=1.5",
-                "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
-                "-vf", vf,
-                "-c:v", "libx264", "-preset", "fast", "-pix_fmt", "yuv420p",
-                "-c:a", "aac", "-b:a", "128k", "-shortest", out,
+                "ffmpeg", "-y", "-i", video_path, "-i", logo_path,
+                "-filter_complex", fc,
+                "-map", "[vout]", "-map", "0:a?",
+                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                "-c:a", "copy", "-movflags", "+faststart", out,
             ])
             return out
         except subprocess.CalledProcessError:
             return None
 
     @staticmethod
-    def _make_outro(tmp: str, cta_text: str, w: int, h: int) -> str | None:
-        """2s black screen with CTA text. Always includes silent audio for clean concat."""
+    def _make_intro(
+        tmp: str,
+        brand_name: str,
+        tagline: str,
+        bg_color: str,
+        logo_path: str | None,
+        w: int,
+        h: int,
+    ) -> str | None:
+        """1.5s branded intro — brand color background, logo (if available), brand name + tagline."""
+        font = VideoEditService._find_font()
+        if not font:
+            return None
+        out = os.path.join(tmp, "intro.mp4")
+        safe_color = bg_color.lstrip("#") if bg_color else "000000"
+        name_label = (brand_name or "URI Social").replace("'", "\\'").replace(":", "\\:")
+        tag_label  = (tagline or "").replace("'", "\\'").replace(":", "\\:")
+
+        # Build filter chain on the color source
+        filters = [
+            f"drawtext=text='{name_label}':fontfile='{font}':"
+            f"fontsize=64:fontcolor=white:x=(w-text_w)/2:y=(h-text_h)/2-30:"
+            f"alpha='if(lt(t,0.4),t/0.4,if(gt(t,1.1),(1.5-t)/0.4,1))'"
+        ]
+        if tag_label:
+            filters.append(
+                f"drawtext=text='{tag_label}':fontfile='{font}':"
+                f"fontsize=32:fontcolor=white@0.8:x=(w-text_w)/2:y=(h-text_h)/2+50:"
+                f"alpha='if(lt(t,0.4),t/0.4,if(gt(t,1.1),(1.5-t)/0.4,1))'"
+            )
+
+        try:
+            # Step 1: generate color + text clip
+            base_out = os.path.join(tmp, "intro_base.mp4")
+            VideoEditService._run([
+                "ffmpeg", "-y",
+                "-f", "lavfi", "-i", f"color=c=0x{safe_color}:s={w}x{h}:r=30:d=1.5",
+                "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
+                "-vf", ",".join(filters),
+                "-c:v", "libx264", "-preset", "fast", "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "128k", "-shortest", base_out,
+            ])
+
+            # Step 2: overlay logo if available
+            if logo_path:
+                logo_out = VideoEditService._apply_logo(base_out, logo_path, "top_right", tmp, "intro_logo.mp4")
+                if logo_out:
+                    base_out = logo_out
+
+            # Copy to final name
+            VideoEditService._run(["ffmpeg", "-y", "-i", base_out, "-c", "copy", out])
+            return out
+        except subprocess.CalledProcessError:
+            return None
+
+    @staticmethod
+    def _make_outro(
+        tmp: str,
+        cta_text: str,
+        bg_color: str,
+        w: int,
+        h: int,
+    ) -> str | None:
+        """2s branded outro — brand color background with CTA text."""
         font = VideoEditService._find_font()
         if not font:
             return None
         out = os.path.join(tmp, "outro.mp4")
+        safe_color = bg_color.lstrip("#") if bg_color else "000000"
         label = (cta_text or "Follow us for more").replace("'", "\\'").replace(":", "\\:")
         vf = (
             f"drawtext=text='{label}':fontfile='{font}':"
@@ -349,7 +461,7 @@ class VideoEditService:
         try:
             VideoEditService._run([
                 "ffmpeg", "-y",
-                "-f", "lavfi", "-i", f"color=c=black:s={w}x{h}:r=30:d=2.0",
+                "-f", "lavfi", "-i", f"color=c=0x{safe_color}:s={w}x{h}:r=30:d=2.0",
                 "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
                 "-vf", vf,
                 "-c:v", "libx264", "-preset", "fast", "-pix_fmt", "yuv420p",

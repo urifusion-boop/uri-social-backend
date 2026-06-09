@@ -5440,15 +5440,23 @@ async def edit_video(
     except Exception:
         enhancements_dict = {}
 
-    # Load brand data for intro/outro generation
-    brand_name = ""
-    brand_cta  = ""
+    # Load brand data for intro/outro/logo
+    brand_name    = ""
+    brand_cta     = ""
+    brand_colors  = []
+    logo_url      = ""
+    logo_position = "bottom_right"
+    tagline       = ""
     try:
         profile_result = await BrandProfileService.get(user_id, db)
         profile_data   = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
-        brand_name = profile_data.get("brand_name", "")
-        cta_styles = profile_data.get("cta_styles") or []
-        brand_cta  = cta_styles[0] if cta_styles else ""
+        brand_name    = profile_data.get("brand_name", "")
+        tagline       = profile_data.get("tagline", "")
+        cta_styles    = profile_data.get("cta_styles") or []
+        brand_cta     = cta_styles[0] if cta_styles else (profile_data.get("default_link") or "")
+        brand_colors  = profile_data.get("brand_colors") or []
+        logo_url      = profile_data.get("logo_url") or ""
+        logo_position = profile_data.get("logo_position") or "bottom_right"
     except Exception:
         pass
 
@@ -5466,6 +5474,10 @@ async def edit_video(
         enhancements_dict,
         brand_name,
         brand_cta,
+        brand_colors,
+        logo_url,
+        logo_position,
+        tagline,
     )
 
     return UriResponse.get_single_data_response("edit_video", {"job_id": job_id, "status": "processing"})
