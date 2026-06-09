@@ -5419,7 +5419,6 @@ async def edit_video(
     Returns job_id immediately — poll GET /edit-video-job/{job_id} for status.
     """
     from app.agents.social_media_manager.services.video_edit_service import VideoEditService
-    from app.utils.cloudinary_upload import upload_bytes as _upload
 
     user_id = _get_user_id(token)
     if not user_id:
@@ -5460,10 +5459,8 @@ async def edit_video(
     except Exception:
         pass
 
-    # Archive the original
-    original_url = await _upload(video_bytes, folder="uri-social/original-videos", resource_type="video")
-
-    job_id = await VideoEditService.create_job(user_id, original_url, platform, enhancements_dict)
+    # Create job immediately and return — original upload happens inside run_job
+    job_id = await VideoEditService.create_job(user_id, "", platform, enhancements_dict)
 
     background_tasks.add_task(
         VideoEditService.run_job,

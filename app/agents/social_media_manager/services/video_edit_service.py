@@ -75,6 +75,15 @@ class VideoEditService:
                 print(f"[VideoEdit] logo download exception: {e}")
 
         try:
+            # Archive the original video now (inside background task, not the request)
+            try:
+                original_url = await upload_bytes(
+                    video_bytes, folder="uri-social/original-videos", resource_type="video"
+                )
+                await col.update_one({"job_id": job_id}, {"$set": {"original_video_url": original_url}})
+            except Exception:
+                pass  # Archival failure should not block the edit
+
             loop = asyncio.get_running_loop()
             result = await loop.run_in_executor(
                 None,
