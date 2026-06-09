@@ -68,8 +68,11 @@ class VideoEditService:
                     r = await client.get(logo_url)
                     if r.status_code == 200:
                         logo_bytes = r.content
-            except Exception:
-                pass
+                        print(f"[VideoEdit] logo downloaded: {len(logo_bytes)} bytes from {logo_url[:80]}")
+                    else:
+                        print(f"[VideoEdit] logo download failed: HTTP {r.status_code} for {logo_url[:80]}")
+            except Exception as e:
+                print(f"[VideoEdit] logo download exception: {e}")
 
         try:
             loop = asyncio.get_running_loop()
@@ -354,32 +357,43 @@ class VideoEditService:
         tmp: str,
         out_name: str = "with_logo.mp4",
     ) -> str | None:
-        """Overlay a scaled logo in a corner of the video throughout."""
+        """Overlay a scaled logo in a corner of the video throughout.
+        Works with PNG, JPEG, and WebP logos. Height is forced even for libx264."""
         out = os.path.join(tmp, out_name)
-        # Scale logo to 10% of video width, preserve aspect ratio
-        logo_w = 108  # 10% of 1080
+        # Scale to 120px wide; trunc(ow/a/2)*2 keeps height even (libx264 requirement)
+        logo_scale = "scale=120:trunc(ow/a/2)*2"
         POSITIONS = {
-            "top_left":     f"10:10",
-            "top_right":    f"W-w-10:10",
-            "bottom_left":  f"10:H-h-10",
-            "bottom_right": f"W-w-10:H-h-10",
+            "top_left":     "10:10",
+            "top_right":    "W-w-10:10",
+            "bottom_left":  "10:H-h-10",
+            "bottom_right": "W-w-10:H-h-10",
         }
         overlay_xy = POSITIONS.get(position, POSITIONS["bottom_right"])
+        # format=rgba normalises the logo to RGBA (works for PNG, JPEG, WebP).
+        # The overlay filter composites it cleanly without extra alpha manipulation.
         fc = (
-            f"[1:v]scale={logo_w}:-1,format=rgba,"
-            f"colorchannelmixer=aa=0.85[logo];"
+            f"[1:v]{logo_scale},format=rgba[logo];"
             f"[0:v][logo]overlay={overlay_xy}:format=auto[vout]"
         )
         try:
-            VideoEditService._run([
-                "ffmpeg", "-y", "-i", video_path, "-i", logo_path,
-                "-filter_complex", fc,
-                "-map", "[vout]", "-map", "0:a?",
-                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                "-c:a", "copy", "-movflags", "+faststart", out,
-            ])
+            result = subprocess.run(
+                [
+                    "ffmpeg", "-y", "-i", video_path, "-i", logo_path,
+                    "-filter_complex", fc,
+                    "-map", "[vout]", "-map", "0:a?",
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                    "-c:a", "aac", "-b:a", "128k",
+                    "-movflags", "+faststart", out,
+                ],
+                capture_output=True,
+                timeout=180,
+            )
+            if result.returncode != 0:
+                print(f"[VideoEdit] logo overlay failed:\n{result.stderr.decode()[-600:]}")
+                return None
             return out
-        except subprocess.CalledProcessError:
+        except Exception as e:
+            print(f"[VideoEdit] logo overlay exception: {e}")
             return None
 
     @staticmethod
