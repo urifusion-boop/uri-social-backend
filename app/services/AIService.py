@@ -33,13 +33,16 @@ class AIService:
     async def chat_completion(request: ChatModel):
         try:
             loop = asyncio.get_running_loop()
+            kwargs = dict(
+                model=request.model,
+                messages=[message.dict() for message in request.messages],
+                temperature=request.temperature,
+            )
+            if request.max_tokens:
+                kwargs["max_tokens"] = request.max_tokens
             completion = await loop.run_in_executor(
                 None,
-                lambda: client.chat.completions.create(
-                    model=request.model,
-                    messages=[message.dict() for message in request.messages],
-                    temperature=request.temperature,
-                ),
+                lambda: client.chat.completions.create(**kwargs),
             )
             return completion
         except Exception as e:

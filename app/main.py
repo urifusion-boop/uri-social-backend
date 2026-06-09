@@ -22,6 +22,7 @@ from app.routers.bug_report_router import router as bug_report_router
 from app.routers.client_router import router as client_router
 from app.routers.workspace_router import router as workspace_router
 from app.routers.workspace_member_router import router as workspace_member_router
+from app.agents.social_media_manager.routers.blog_router import router as blog_router
 
 # Initialize Sentry
 initialize_sentry()
@@ -164,6 +165,9 @@ app.include_router(v3_test_router, prefix="/social-media", tags=["V3 Testing"])
 
 # Include V3 toggle router (production integration with frontend toggle)
 app.include_router(v3_toggle_router, prefix="/social-media", tags=["V3 Production Toggle"])
+
+# Include Blog Generator (Writing DNA + blog generation)
+app.include_router(blog_router, prefix="/social-media", tags=["Blog Generator"])
 
 # Include multi-tenant routers (Enterprise/SDK features)
 app.include_router(client_router)
