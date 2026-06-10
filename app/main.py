@@ -15,6 +15,7 @@ from app.agents.social_media_manager.routers.x_router import router as x_router
 from app.agents.social_media_manager.routers.linkedin_router import router as linkedin_router
 from app.agents.social_media_manager.routers.v3_test_router import router as v3_test_router
 from app.agents.social_media_manager.routers.v3_toggle_endpoint import router as v3_toggle_router
+from app.agents.social_media_manager.routers.custom_visual_guides import router as custom_guides_router
 from app.routers.auth_router import router as auth_router
 from app.routers.billing_router import router as billing_router
 from app.routers.notification_router import router as notification_router
@@ -168,6 +169,9 @@ app.include_router(v3_toggle_router, prefix="/social-media", tags=["V3 Productio
 
 # Include Blog Generator (Writing DNA + blog generation)
 app.include_router(blog_router, prefix="/social-media", tags=["Blog Generator"])
+
+# Include custom visual guides router
+app.include_router(custom_guides_router)
 
 # Include multi-tenant routers (Enterprise/SDK features)
 app.include_router(client_router)
