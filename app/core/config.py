@@ -100,6 +100,15 @@ class Settings(BaseSettings):
     # Register a free production key at https://devportal.jamendo.com/
     JAMENDO_CLIENT_ID: str = "b6747d04"
 
+    # ── Video Polish — Clipping API (PRD §4) ─────────────────────────────
+    # Sign up at https://reap.video to get your API key (entry tier, REST API available)
+    # Phase 0: test Reap, OpusClip, and Vizard on Nigerian footage before committing
+    REAP_API_KEY: Optional[str] = None
+    OPUSCLIP_API_KEY: Optional[str] = None   # Phase 0 testing only
+    VIZARD_API_KEY: Optional[str] = None      # Phase 0 testing only
+    # Set to 'reap' | 'opusclip' | 'vizard' after Phase 0 Pidgin test picks a winner
+    CLIPPING_API_PROVIDER: str = "reap"
+
     # Bypass flags for local development
     BYPASS_SUBSCRIPTION_CHECK: bool = False
     BYPASS_FEATURE_LIMIT_CHECK: bool = False
