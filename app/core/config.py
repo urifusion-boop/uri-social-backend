@@ -92,6 +92,10 @@ class Settings(BaseSettings):
     # Leave empty to skip background music (pipeline still runs, just without audio overlay)
     MUSIC_LIBRARY_PATH: str = ""
 
+    # Pixabay API key — used to fetch royalty-free background music by mood at job time
+    # Get a free key at https://pixabay.com/api/docs/
+    PIXABAY_API_KEY: Optional[str] = None
+
     # Bypass flags for local development
     BYPASS_SUBSCRIPTION_CHECK: bool = False
     BYPASS_FEATURE_LIMIT_CHECK: bool = False
