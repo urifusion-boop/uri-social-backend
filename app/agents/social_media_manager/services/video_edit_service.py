@@ -877,51 +877,72 @@ class VideoEditService:
 
     @staticmethod
     async def fetch_music_bytes(mood: str) -> bytes | None:
-        """Fetch a royalty-free track from Pixabay by mood. Returns MP3 bytes or None."""
+        """Fetch a royalty-free CC0 track from Pixabay by mood. Returns MP3 bytes or None."""
         api_key = (settings.PIXABAY_API_KEY or "").strip()
         if not api_key:
             return None
         query = MOOD_TO_QUERY.get(mood, mood)
         try:
-            async with httpx.AsyncClient(timeout=20) as client:
-                r = await client.get(
+            async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+                # Pixabay music has its own endpoint (separate from /api/ which is images only)
+                for endpoint in [
+                    "https://pixabay.com/api/music/",
                     "https://pixabay.com/api/",
-                    params={
-                        "key": api_key,
-                        "q": query,
-                        "media_type": "music",
-                        "per_page": 10,
-                        "safesearch": "true",
-                    },
-                )
-                if r.status_code != 200:
-                    print(f"[VideoEdit] Pixabay API error {r.status_code}: {r.text[:200]}")
-                    return None
+                ]:
+                    r = await client.get(
+                        endpoint,
+                        params={"key": api_key, "q": query, "per_page": 10, "safesearch": "true"},
+                    )
+                    if r.status_code != 200:
+                        print(f"[VideoEdit] Pixabay {endpoint} → HTTP {r.status_code}")
+                        continue
 
-                data = r.json()
-                hits = data.get("hits", [])
-                if not hits:
-                    print(f"[VideoEdit] Pixabay: no music found for '{mood}' (query: {query})")
-                    return None
+                    data = r.json()
+                    hits = data.get("hits", [])
+                    if not hits:
+                        print(f"[VideoEdit] Pixabay {endpoint}: 0 hits for '{query}'")
+                        continue
 
-                track = random.choice(hits[:min(5, len(hits))])
-                # Try common field names — log keys on first miss so we can fix fast
-                audio_url = (
-                    track.get("audio_url")
-                    or track.get("previewURL")
-                    or track.get("mp3")
-                    or track.get("url")
-                )
-                if not audio_url:
-                    print(f"[VideoEdit] Pixabay: no audio URL found. Track keys: {list(track.keys())}")
-                    return None
+                    # Log the first hit's keys once so we can see the structure
+                    print(f"[VideoEdit] Pixabay hit keys: {list(hits[0].keys())}")
 
-                print(f"[VideoEdit] Pixabay music: {audio_url[:80]}")
-                audio_r = await client.get(audio_url, timeout=30)
-                if audio_r.status_code == 200:
-                    print(f"[VideoEdit] Pixabay music downloaded: {len(audio_r.content):,} bytes")
+                    # Find a hit whose URL points to the audio CDN (cdn.pixabay.com/audio/)
+                    # rather than the image CDN (cdn.pixabay.com/photo/)
+                    audio_url = None
+                    for hit in hits[:10]:
+                        for field in ("audio", "audio_url", "mp3", "previewURL", "url", "largeImageURL", "pageURL"):
+                            val = hit.get(field, "")
+                            if val and ("cdn.pixabay.com/audio" in val or val.endswith(".mp3") or val.endswith(".wav")):
+                                audio_url = val
+                                break
+                        if audio_url:
+                            break
+
+                    if not audio_url:
+                        print(f"[VideoEdit] Pixabay: no audio CDN URL in hits. First hit: {hits[0]}")
+                        continue
+
+                    print(f"[VideoEdit] Pixabay music URL: {audio_url[:100]}")
+                    audio_r = await client.get(audio_url, timeout=60)
+                    if audio_r.status_code != 200:
+                        print(f"[VideoEdit] Pixabay audio download failed: HTTP {audio_r.status_code}")
+                        continue
+
+                    content_type = audio_r.headers.get("content-type", "")
+                    size = len(audio_r.content)
+
+                    # Hard guard: reject anything that is clearly not audio
+                    if "image" in content_type or "html" in content_type:
+                        print(f"[VideoEdit] Pixabay: downloaded content is not audio (content-type: {content_type}, {size:,} bytes). Skipping.")
+                        continue
+                    if size < 50_000:
+                        print(f"[VideoEdit] Pixabay: downloaded file too small to be audio ({size:,} bytes). Skipping.")
+                        continue
+
+                    print(f"[VideoEdit] Pixabay music ready: {size:,} bytes ({content_type})")
                     return audio_r.content
-                print(f"[VideoEdit] Pixabay audio download failed: HTTP {audio_r.status_code}")
+
+                print(f"[VideoEdit] Pixabay: could not find valid audio for mood '{mood}'")
                 return None
         except Exception as e:
             print(f"[VideoEdit] Pixabay fetch exception: {e}")
