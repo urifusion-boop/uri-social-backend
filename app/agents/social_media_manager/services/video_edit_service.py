@@ -23,13 +23,13 @@ PLATFORM_TARGETS = {
 
 FILLER_WORDS = {"um", "uh", "ah", "er", "hmm", "mm"}
 
-MOOD_TO_QUERY = {
-    "upbeat":    "upbeat energetic happy",
-    "ambient":   "ambient relaxing calm",
-    "dramatic":  "cinematic dramatic epic",
-    "playful":   "playful fun cheerful",
-    "afrobeats": "afrobeat africa rhythm",
-    "lo-fi":     "lofi chill relaxing",
+MOOD_TO_JAMENDO_TAGS = {
+    "upbeat":    "upbeat",
+    "ambient":   "ambient",
+    "dramatic":  "cinematic",
+    "playful":   "happy",
+    "afrobeats": "afrobeat",
+    "lo-fi":     "lofi",
 }
 
 
@@ -877,75 +877,57 @@ class VideoEditService:
 
     @staticmethod
     async def fetch_music_bytes(mood: str) -> bytes | None:
-        """Fetch a royalty-free CC0 track from Pixabay by mood. Returns MP3 bytes or None."""
-        api_key = (settings.PIXABAY_API_KEY or "").strip()
-        if not api_key:
-            return None
-        query = MOOD_TO_QUERY.get(mood, mood)
+        """Fetch a CC-licensed track from Jamendo by mood. Returns MP3 bytes or None."""
+        client_id = (settings.JAMENDO_CLIENT_ID or "b6747d04").strip()
+        tags = MOOD_TO_JAMENDO_TAGS.get(mood, mood)
         try:
             async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-                # Pixabay music has its own endpoint (separate from /api/ which is images only)
-                for endpoint in [
-                    "https://pixabay.com/api/music/",
-                    "https://pixabay.com/api/",
-                ]:
-                    r = await client.get(
-                        endpoint,
-                        params={"key": api_key, "q": query, "per_page": 10, "safesearch": "true"},
-                    )
-                    if r.status_code != 200:
-                        print(f"[VideoEdit] Pixabay {endpoint} → HTTP {r.status_code}")
-                        continue
+                r = await client.get(
+                    "https://api.jamendo.com/v3.0/tracks/",
+                    params={
+                        "client_id": client_id,
+                        "format": "json",
+                        "limit": 10,
+                        "audioformat": "mp32",
+                        "fuzzytags": tags,
+                        "license_cc": "1",
+                        "order": "popularity_month",
+                    },
+                )
+                if r.status_code != 200:
+                    print(f"[VideoEdit] Jamendo API error {r.status_code}: {r.text[:200]}")
+                    return None
 
-                    data = r.json()
-                    hits = data.get("hits", [])
-                    if not hits:
-                        print(f"[VideoEdit] Pixabay {endpoint}: 0 hits for '{query}'")
-                        continue
+                data = r.json()
+                results = data.get("results", [])
+                if not results:
+                    print(f"[VideoEdit] Jamendo: no tracks found for tags '{tags}'")
+                    return None
 
-                    # Log the first hit's keys once so we can see the structure
-                    print(f"[VideoEdit] Pixabay hit keys: {list(hits[0].keys())}")
+                track = random.choice(results[:min(5, len(results))])
+                # Prefer audiodownload (full track) over audio (stream)
+                audio_url = track.get("audiodownload") or track.get("audio")
+                if not audio_url:
+                    print(f"[VideoEdit] Jamendo: no audio URL in track. Keys: {list(track.keys())}")
+                    return None
 
-                    # Find a hit whose URL points to the audio CDN (cdn.pixabay.com/audio/)
-                    # rather than the image CDN (cdn.pixabay.com/photo/)
-                    audio_url = None
-                    for hit in hits[:10]:
-                        for field in ("audio", "audio_url", "mp3", "previewURL", "url", "largeImageURL", "pageURL"):
-                            val = hit.get(field, "")
-                            if val and ("cdn.pixabay.com/audio" in val or val.endswith(".mp3") or val.endswith(".wav")):
-                                audio_url = val
-                                break
-                        if audio_url:
-                            break
+                print(f"[VideoEdit] Jamendo track: '{track.get('name', '?')}' → {audio_url[:80]}")
+                audio_r = await client.get(audio_url, timeout=60)
+                if audio_r.status_code != 200:
+                    print(f"[VideoEdit] Jamendo download failed: HTTP {audio_r.status_code}")
+                    return None
 
-                    if not audio_url:
-                        print(f"[VideoEdit] Pixabay: no audio CDN URL in hits. First hit: {hits[0]}")
-                        continue
+                content_type = audio_r.headers.get("content-type", "")
+                size = len(audio_r.content)
+                if "image" in content_type or "html" in content_type or size < 50_000:
+                    print(f"[VideoEdit] Jamendo: invalid audio response ({content_type}, {size:,} bytes)")
+                    return None
 
-                    print(f"[VideoEdit] Pixabay music URL: {audio_url[:100]}")
-                    audio_r = await client.get(audio_url, timeout=60)
-                    if audio_r.status_code != 200:
-                        print(f"[VideoEdit] Pixabay audio download failed: HTTP {audio_r.status_code}")
-                        continue
+                print(f"[VideoEdit] Jamendo music ready: {size:,} bytes")
+                return audio_r.content
 
-                    content_type = audio_r.headers.get("content-type", "")
-                    size = len(audio_r.content)
-
-                    # Hard guard: reject anything that is clearly not audio
-                    if "image" in content_type or "html" in content_type:
-                        print(f"[VideoEdit] Pixabay: downloaded content is not audio (content-type: {content_type}, {size:,} bytes). Skipping.")
-                        continue
-                    if size < 50_000:
-                        print(f"[VideoEdit] Pixabay: downloaded file too small to be audio ({size:,} bytes). Skipping.")
-                        continue
-
-                    print(f"[VideoEdit] Pixabay music ready: {size:,} bytes ({content_type})")
-                    return audio_r.content
-
-                print(f"[VideoEdit] Pixabay: could not find valid audio for mood '{mood}'")
-                return None
         except Exception as e:
-            print(f"[VideoEdit] Pixabay fetch exception: {e}")
+            print(f"[VideoEdit] Jamendo fetch exception: {e}")
             return None
 
     @staticmethod

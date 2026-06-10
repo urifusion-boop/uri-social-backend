@@ -92,9 +92,13 @@ class Settings(BaseSettings):
     # Leave empty to skip background music (pipeline still runs, just without audio overlay)
     MUSIC_LIBRARY_PATH: str = ""
 
-    # Pixabay API key — used to fetch royalty-free background music by mood at job time
-    # Get a free key at https://pixabay.com/api/docs/
+    # Pixabay API key — retained in config but Pixabay has no public music API
     PIXABAY_API_KEY: Optional[str] = None
+
+    # Jamendo client ID — used to fetch CC-licensed background music by mood
+    # Default is Jamendo's public demo key (works immediately, rate-limited)
+    # Register a free production key at https://devportal.jamendo.com/
+    JAMENDO_CLIENT_ID: str = "b6747d04"
 
     # Bypass flags for local development
     BYPASS_SUBSCRIPTION_CHECK: bool = False
