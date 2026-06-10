@@ -5499,3 +5499,142 @@ async def get_edit_video_job(
         raise HTTPException(status_code=404, detail="Job not found")
 
     return UriResponse.get_single_data_response("edit_video_job", job)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Video Polish — Clipping-API-first pipeline (Video Polish PRD)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/video-polish-styles")
+async def list_video_polish_styles(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """Return all available style presets for Video Polish."""
+    from app.agents.social_media_manager.services.video_polish_service import VideoPolishService
+    styles = await VideoPolishService.list_styles(db)
+    return UriResponse.get_single_data_response("video_polish_styles", styles)
+
+
+@router.post("/polish-video")
+async def polish_video(
+    background_tasks: BackgroundTasks,
+    video: UploadFile = File(...),
+    style_preset: str = Form("clean_professional"),
+    language: str = Form("en-NG"),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Accept a raw video upload, run the Video Polish clipping-API pipeline
+    (ingest + quality check + Reap), and return a job_id immediately.
+    Poll GET /polish-video-job/{job_id} for status and output clips.
+    """
+    from app.agents.social_media_manager.services.video_polish_service import VideoPolishService
+    from app.core.config import settings
+
+    if not settings.REAP_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="Video Polish is not yet configured. Please add REAP_API_KEY to the server environment."
+        )
+
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    ALLOWED_TYPES = {
+        "video/mp4", "video/quicktime", "video/webm",
+        "video/x-m4v", "video/x-matroska", "video/3gpp",
+    }
+    if video.content_type not in ALLOWED_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported format. Please upload MP4 or MOV."
+        )
+
+    video_bytes = await video.read()
+    if len(video_bytes) > 500 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File too large. Maximum is 500MB.")
+    if len(video_bytes) == 0:
+        raise HTTPException(status_code=400, detail="Empty file received.")
+
+    job_id = await VideoPolishService.create_job(user_id, style_preset, language, db)
+
+    background_tasks.add_task(
+        VideoPolishService.run_job,
+        job_id,
+        user_id,
+        video_bytes,
+        style_preset,
+        language,
+        db,
+    )
+
+    return UriResponse.get_single_data_response(
+        "polish_video", {"job_id": job_id, "status": "ingesting"}
+    )
+
+
+@router.get("/polish-video-job/{job_id}")
+async def get_polish_video_job(
+    job_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """Poll the status of a Video Polish job."""
+    from app.agents.social_media_manager.services.video_polish_service import VideoPolishService
+
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    job = await VideoPolishService.get_job(job_id, user_id, db)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    return UriResponse.get_single_data_response("polish_video_job", job)
+
+
+@router.post("/polish-video-restyle")
+async def restyle_polish_video(
+    background_tasks: BackgroundTasks,
+    original_job_id: str = Form(...),
+    new_style_preset: str = Form(...),
+    language: str = Form("en-NG"),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Re-polish an already-processed video with a different style preset.
+    Costs 0.5 credits (PRD §8.2). Uses the same source video — no re-upload.
+    """
+    from app.agents.social_media_manager.services.video_polish_service import VideoPolishService
+
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    original = await VideoPolishService.get_job(original_job_id, user_id, db)
+    if not original:
+        raise HTTPException(status_code=404, detail="Original job not found")
+    if original["status"] != "ready":
+        raise HTTPException(status_code=400, detail="Original job is not ready yet")
+
+    new_job_id = await VideoPolishService.restyle_job(
+        original_job_id, user_id, new_style_preset, language, db
+    )
+
+    background_tasks.add_task(
+        VideoPolishService.run_restyle_job,
+        new_job_id,
+        user_id,
+        original["source_video_url"],
+        new_style_preset,
+        language,
+        db,
+    )
+
+    return UriResponse.get_single_data_response(
+        "polish_video_restyle", {"job_id": new_job_id, "status": "processing"}
+    )

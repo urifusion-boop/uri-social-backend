@@ -110,6 +110,26 @@ async def _download_twilio_media(media_url: str, content_type: Optional[str] = N
         return None
 
 
+async def _download_twilio_video(media_url: str) -> Optional[bytes]:
+    """
+    Download a video from Twilio's media endpoint (requires HTTP Basic auth).
+    Returns raw video bytes or None on failure. Timeout 120s for large files.
+    """
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            r = await client.get(
+                media_url,
+                auth=(settings.TWILIO_ACCOUNT_SID, settings.TWILIO_AUTH_TOKEN),
+                follow_redirects=True,
+            )
+            r.raise_for_status()
+            return r.content
+    except Exception as e:
+        print(f"[WhatsApp] Failed to download Twilio video {media_url!r}: {e}", flush=True)
+        return None
+
+
 async def _analyze_product_image(image_url: str) -> str:
     """
     Use GPT-4o vision to produce a marketing-ready creative brief from a user-uploaded
@@ -2416,6 +2436,353 @@ class WhatsAppFlowService:
             await _safe_set_state(phone, "idle", {}, db)
         else:
             await _send(phone, "Want to see the ideas? Just say yes or no.")
+
+    # ── Video Polish WhatsApp flow (Video Polish PRD §6) ─────────────────────
+
+    # Style menu shown to users
+    _VIDEO_STYLE_MENU = (
+        "What style do you want?\n\n"
+        "1️⃣ *Naija Bold* — high energy, fast cuts (sales & promos)\n"
+        "2️⃣ *Clean Professional* — steady, minimal (services & B2B)\n"
+        "3️⃣ *Street Casual* — relaxed, authentic (lifestyle)\n"
+        "4️⃣ *Storyteller* — emotional, slower pacing (founder stories)\n"
+        "5️⃣ *Product Pop* — punchy, product-focused (demos)\n"
+        "6️⃣ *Minimal Clean* — simple and elegant (premium brands)\n"
+        "0️⃣ *Let Jane pick* — I'll choose based on your brand"
+    )
+
+    _STYLE_NUMBER_MAP = {
+        "1": "naija_bold",
+        "2": "clean_professional",
+        "3": "street_casual",
+        "4": "storyteller",
+        "5": "product_pop",
+        "6": "minimal_clean",
+        "0": None,  # Jane picks
+    }
+
+    @staticmethod
+    async def _handle_video_polish_upload(
+        phone: str,
+        user_id: str,
+        first_name: str,
+        media_url: str,
+        caption: str,
+        db: AsyncIOMotorDatabase,
+    ) -> None:
+        """
+        Called when a user sends a video to Jane.
+        If quality flags are serious, warn before spending credits.
+        Then ask which style they want.
+        """
+        import asyncio, tempfile
+        from app.agents.social_media_manager.services.video_polish_service import (
+            _download_twilio_media_bytes, _probe, _quality_flags,
+        )
+        from app.core.config import settings
+
+        if not settings.REAP_API_KEY:
+            await _send(
+                phone,
+                "Video polishing is coming soon! For now, I can help you create posts, graphics, and captions. What would you like to create?"
+            )
+            return
+
+        # Download the video to check quality
+        await _send(phone, "Got your video! Give me a second to check it… 📹")
+
+        try:
+            video_bytes = await _download_twilio_video(media_url)
+        except Exception as e:
+            print(f"[WhatsApp] video download failed: {e}")
+            await _send(phone, "I couldn't download that video. Can you try sending it again?")
+            return
+
+        if not video_bytes or len(video_bytes) < 10_000:
+            await _send(phone, "That video seems too small. Can you try sending it again?")
+            return
+
+        if len(video_bytes) > 500 * 1024 * 1024:
+            await _send(phone, "That video is over 500MB — could you trim it down a bit and send it again?")
+            return
+
+        # Quick quality check
+        quality_flags: Dict[str, bool] = {"dark": False, "noisy": False, "short": False}
+        duration = 0.0
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+                f.write(video_bytes)
+                tmp_path = f.name
+            import asyncio
+            loop = asyncio.get_running_loop()
+            probe = await loop.run_in_executor(None, _probe, tmp_path)
+            duration = float(probe.get("format", {}).get("duration", 0))
+            quality_flags = await loop.run_in_executor(None, _quality_flags, tmp_path, duration)
+            import os; os.unlink(tmp_path)
+        except Exception as e:
+            print(f"[WhatsApp] quality check failed: {e}")
+
+        # Store video bytes temporarily in context (as cloudinary URL after upload)
+        # We'll upload in the background after style is confirmed
+        ctx_update: Dict[str, Any] = {
+            "polish_video_bytes_b64": None,  # too large for context — download on job start
+            "polish_video_twilio_url": media_url,
+            "polish_video_duration": duration,
+            "polish_quality_flags": quality_flags,
+            "polish_first_time": True,  # for filming tips on first use
+        }
+
+        # Check if first-time video user → send filming tips
+        prev_jobs_count = await db["video_jobs"].count_documents({"user_id": user_id})
+        if prev_jobs_count == 0:
+            await _send(
+                phone,
+                "✨ *Quick tips for the best results:*\n\n"
+                "📍 Film in a quiet spot\n"
+                "💡 Face a window — natural light is best\n"
+                "📱 Hold your phone steady or prop it up\n\n"
+                "Now let's polish your clip!"
+            )
+
+        # Quality warnings before spending credits (PRD §6.2)
+        problems = []
+        if quality_flags.get("dark"):
+            problems.append("it's a bit dark")
+        if quality_flags.get("noisy"):
+            problems.append("there's a lot of background noise")
+        if quality_flags.get("short") or (0 < duration < 5):
+            await _send(phone, "That clip is very short (under 5 seconds). I need a bit more to work with — can you send a longer one?")
+            await _safe_set_state(phone, "idle", {}, db)
+            return
+
+        if problems:
+            issues = " and ".join(problems)
+            await _send(
+                phone,
+                f"I got your video, but heads up — {issues}. I can still polish it, but it won't look its best.\n\n"
+                f"Want me to go ahead, or would you rather re-film in a quieter, brighter spot? (Facing a window usually helps.)\n\n"
+                f"Reply *polish anyway* or *re-film*"
+            )
+            ctx_update["awaiting_quality_confirm"] = True
+            await _safe_set_state(phone, "awaiting_video_style", ctx_update, db)
+            return
+
+        await _safe_set_state(phone, "awaiting_video_style", ctx_update, db)
+        await _send(phone, WhatsAppFlowService._VIDEO_STYLE_MENU)
+
+    @staticmethod
+    async def _handle_video_style_pick(
+        phone: str,
+        text: str,
+        user_id: str,
+        ctx: Dict[str, Any],
+        db: AsyncIOMotorDatabase,
+    ) -> None:
+        """Handle style number selection (or quality warning confirmation)."""
+        import asyncio
+
+        # Quality warning response
+        if ctx.get("awaiting_quality_confirm"):
+            if any(w in text for w in ("re-film", "refilm", "no", "nope", "later")):
+                await _send(phone, "No problem! Re-film in a brighter, quieter spot and send it back when you're ready 📱")
+                await _safe_set_state(phone, "idle", {}, db)
+                return
+            # "polish anyway" or any affirmative → proceed
+            ctx.pop("awaiting_quality_confirm", None)
+            await _safe_set_state(phone, "awaiting_video_style", ctx, db)
+            await _send(phone, WhatsAppFlowService._VIDEO_STYLE_MENU)
+            return
+
+        # Style number pick
+        style_name = WhatsAppFlowService._STYLE_NUMBER_MAP.get(text.strip())
+        if style_name is None and text.strip() == "0":
+            # Jane picks based on brand
+            style_name = "clean_professional"  # default; could be AI-picked
+
+        if style_name is None:
+            # Try to match by name keyword
+            for key, sname in [
+                ("naija", "naija_bold"), ("bold", "naija_bold"),
+                ("professional", "clean_professional"), ("clean pro", "clean_professional"),
+                ("casual", "street_casual"), ("street", "street_casual"),
+                ("story", "storyteller"), ("storyteller", "storyteller"),
+                ("product", "product_pop"), ("pop", "product_pop"),
+                ("minimal", "minimal_clean"),
+            ]:
+                if key in text:
+                    style_name = sname
+                    break
+
+        if style_name is None:
+            await _send(
+                phone,
+                "Just pick a number 1–6, or reply *0* to let me choose:\n\n"
+                + WhatsAppFlowService._VIDEO_STYLE_MENU
+            )
+            return
+
+        style_display = {
+            "naija_bold": "Naija Bold",
+            "clean_professional": "Clean Professional",
+            "street_casual": "Street Casual",
+            "storyteller": "Storyteller",
+            "product_pop": "Product Pop",
+            "minimal_clean": "Minimal Clean",
+        }.get(style_name, style_name.replace("_", " ").title())
+
+        await _send(phone, f"On it — polishing with *{style_display}* style. Give me about 2 minutes ✨")
+
+        # Start the polish job (re-download video from Twilio URL)
+        twilio_url = ctx.get("polish_video_twilio_url")
+        if not twilio_url:
+            await _send(phone, "Sorry, I lost your video. Can you send it again?")
+            await _safe_set_state(phone, "idle", {}, db)
+            return
+
+        from app.agents.social_media_manager.services.video_polish_service import VideoPolishService
+        job_id = await VideoPolishService.create_job(user_id, style_name, "en-NG", db)
+
+        ctx_update = {**ctx, "polish_job_id": job_id, "polish_style": style_name}
+        await _safe_set_state(phone, "polishing_video", ctx_update, db)
+
+        # Run job in background — downloads video from Twilio URL, processes, updates job
+        asyncio.create_task(
+            WhatsAppFlowService._run_whatsapp_polish_job(
+                phone, user_id, job_id, twilio_url, style_name, db
+            )
+        )
+
+    @staticmethod
+    async def _run_whatsapp_polish_job(
+        phone: str,
+        user_id: str,
+        job_id: str,
+        twilio_url: str,
+        style_name: str,
+        db: AsyncIOMotorDatabase,
+    ) -> None:
+        """Background task: download video, run polish, notify user via WhatsApp."""
+        from app.agents.social_media_manager.services.video_polish_service import VideoPolishService
+        try:
+            video_bytes = await _download_twilio_video(twilio_url)
+            if not video_bytes:
+                await _send(phone, "I couldn't download your video. Please send it again.")
+                await _safe_set_state(phone, "idle", {}, db)
+                return
+
+            await VideoPolishService.run_job(
+                job_id, user_id, video_bytes, style_name, "en-NG", db
+            )
+
+            job = await VideoPolishService.get_job(job_id, user_id, db)
+            if not job or job["status"] == "failed":
+                msg = (job or {}).get("status_message", "Something went wrong.")
+                await _send(phone, f"Sorry, I ran into an issue: {msg}\n\nCan you try sending the video again?")
+                await _safe_set_state(phone, "idle", {}, db)
+                return
+
+            clips = job.get("output_clips", [])
+            if not clips:
+                await _send(phone, "I couldn't generate a clip from this footage. Try different footage or a different style.")
+                await _safe_set_state(phone, "idle", {}, db)
+                return
+
+            clip = clips[0]
+            clip_url = clip.get("url", "")
+            clip_duration = int(clip.get("duration", 0))
+
+            style_display = style_name.replace("_", " ").title()
+            msg = (
+                f"✨ Here's your polished clip!\n\n"
+                f"*Style:* {style_display}\n"
+                f"*Length:* {clip_duration}s\n\n"
+                f"Reply:\n"
+                f"*1* — Approve & schedule\n"
+                f"*2* — Try a different style\n"
+                f"*3* — Skip"
+            )
+            await _send(phone, msg, media_url=clip_url)
+
+            session = await WhatsAppSessionService.get_session(phone, db) or {}
+            ctx = session.get("context", {})
+            ctx_update = {
+                **ctx,
+                "polish_job_id": job_id,
+                "polish_clip_url": clip_url,
+                "polish_clip_duration": clip_duration,
+                "polish_style": style_name,
+            }
+            await _safe_set_state(phone, "video_clip_ready", ctx_update, db)
+
+        except Exception as e:
+            print(f"[WhatsApp] polish job {job_id} failed: {e}")
+            import traceback; traceback.print_exc()
+            await _send(phone, "Something went wrong while polishing your video. Please try again.")
+            await _safe_set_state(phone, "idle", {}, db)
+
+    @staticmethod
+    async def _handle_video_clip_actions(
+        phone: str,
+        text: str,
+        body: str,
+        user_id: str,
+        ctx: Dict[str, Any],
+        db: AsyncIOMotorDatabase,
+    ) -> None:
+        """Handle approve / try another style / skip after clip is delivered."""
+        import asyncio
+        from app.agents.social_media_manager.services.video_polish_service import VideoPolishService
+
+        job_id = ctx.get("polish_job_id", "")
+
+        # Approve → schedule
+        if text in ("1", "approve", "approved", "yes", "looks good", "perfect", "post it"):
+            clip_url = ctx.get("polish_clip_url", "")
+            await _send(
+                phone,
+                "Great! When do you want to post it?\n\n"
+                "Reply with a time like *tomorrow 9am* or *Friday 6pm*.\n"
+                "Or reply *now* to post straight away."
+            )
+            ctx_update = {**ctx, "pending_video_url": clip_url, "polish_job_id": job_id}
+            await _safe_set_state(phone, "awaiting_schedule_time", ctx_update, db)
+            # Update user_action on the job
+            await db["video_jobs"].update_one(
+                {"job_id": job_id}, {"$set": {"user_action": "approved"}}
+            )
+            return
+
+        # Try another style
+        if text in ("2", "different style", "another style", "change style", "try another", "restyle"):
+            await db["video_jobs"].update_one(
+                {"job_id": job_id}, {"$set": {"user_action": "restyled"}}
+            )
+            await _safe_set_state(phone, "awaiting_video_style", ctx, db)
+            await _send(
+                phone,
+                "No problem! Pick a different style:\n\n"
+                + WhatsAppFlowService._VIDEO_STYLE_MENU
+            )
+            return
+
+        # Skip
+        if text in ("3", "skip", "no", "nope", "never mind", "cancel", "forget it"):
+            await db["video_jobs"].update_one(
+                {"job_id": job_id}, {"$set": {"user_action": "skipped"}}
+            )
+            await _send(
+                phone,
+                "Got it — skipped! You can always send another video when you're ready.\n\n"
+                "What else can I help you create? 😊"
+            )
+            await _safe_set_state(phone, "idle", {}, db)
+            return
+
+        # Unrecognised
+        await _send(
+            phone,
+            "Just reply:\n*1* — Approve & schedule\n*2* — Try a different style\n*3* — Skip"
+        )
 
     # ── Daily push ────────────────────────────────────────────────────────────
 
