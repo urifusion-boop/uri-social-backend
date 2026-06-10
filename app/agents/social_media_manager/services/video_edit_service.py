@@ -23,6 +23,15 @@ PLATFORM_TARGETS = {
 
 FILLER_WORDS = {"um", "uh", "ah", "er", "hmm", "mm"}
 
+MOOD_TO_QUERY = {
+    "upbeat":    "upbeat energetic happy",
+    "ambient":   "ambient relaxing calm",
+    "dramatic":  "cinematic dramatic epic",
+    "playful":   "playful fun cheerful",
+    "afrobeats": "afrobeat africa rhythm",
+    "lo-fi":     "lofi chill relaxing",
+}
+
 
 class VideoEditService:
 
@@ -81,6 +90,12 @@ class VideoEditService:
             except Exception as e:
                 print(f"[VideoEdit] logo download exception: {e}")
 
+        # Fetch music from Pixabay async before entering the executor
+        music_bytes: bytes | None = None
+        if enhancements.get("add_music", True):
+            mood = enhancements.get("music_mood", "upbeat")
+            music_bytes = await VideoEditService.fetch_music_bytes(mood)
+
         try:
             await _progress(5, "Archiving original…")
             try:
@@ -99,6 +114,7 @@ class VideoEditService:
                     video_bytes, platform, enhancements,
                     brand_name, brand_cta,
                     brand_colors or [], logo_bytes, logo_position, tagline,
+                    music_bytes=music_bytes,
                 ),
             )
             edited_bytes: bytes = result["bytes"]
@@ -161,6 +177,7 @@ class VideoEditService:
         logo_bytes: bytes | None = None,
         logo_position: str = "bottom_right",
         tagline: str = "",
+        music_bytes: bytes | None = None,
     ) -> dict:
         target = PLATFORM_TARGETS.get(platform, PLATFORM_TARGETS["instagram_reels"])
         target_duration = target["duration"]
@@ -348,12 +365,21 @@ class VideoEditService:
 
             # ── Step 11: background music ──────────────────────────────────
             final_path = assembled_path
+            mood = enhancements.get("music_mood", "upbeat")
             if enhancements.get("add_music", True):
-                mood        = enhancements.get("music_mood", "upbeat")
-                music_track = VideoEditService._find_music_track(mood)
-                if music_track:
-                    final_path = VideoEditService._mix_music(assembled_path, music_track, tmp, has_audio)
+                music_path: str | None = None
+                if music_bytes:
+                    music_path = os.path.join(tmp, "music.mp3")
+                    with open(music_path, "wb") as f:
+                        f.write(music_bytes)
+                else:
+                    # Fallback: local library (MUSIC_LIBRARY_PATH env var)
+                    music_path = VideoEditService._find_music_track(mood)
+                if music_path:
+                    final_path = VideoEditService._mix_music(assembled_path, music_path, tmp, has_audio)
                     edits_applied.append(f"Background music added ({mood})")
+                else:
+                    print(f"[VideoEdit] no music track available for mood '{mood}', skipping")
 
             edits_applied.append("Exported 1080×1920 H.264")
 
@@ -846,8 +872,60 @@ class VideoEditService:
         return out
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Background music
+    # Background music — Pixabay API fetch + local library fallback
     # ─────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    async def fetch_music_bytes(mood: str) -> bytes | None:
+        """Fetch a royalty-free track from Pixabay by mood. Returns MP3 bytes or None."""
+        api_key = (settings.PIXABAY_API_KEY or "").strip()
+        if not api_key:
+            return None
+        query = MOOD_TO_QUERY.get(mood, mood)
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                r = await client.get(
+                    "https://pixabay.com/api/",
+                    params={
+                        "key": api_key,
+                        "q": query,
+                        "media_type": "music",
+                        "per_page": 10,
+                        "safesearch": "true",
+                    },
+                )
+                if r.status_code != 200:
+                    print(f"[VideoEdit] Pixabay API error {r.status_code}: {r.text[:200]}")
+                    return None
+
+                data = r.json()
+                hits = data.get("hits", [])
+                if not hits:
+                    print(f"[VideoEdit] Pixabay: no music found for '{mood}' (query: {query})")
+                    return None
+
+                track = random.choice(hits[:min(5, len(hits))])
+                # Try common field names — log keys on first miss so we can fix fast
+                audio_url = (
+                    track.get("audio_url")
+                    or track.get("previewURL")
+                    or track.get("mp3")
+                    or track.get("url")
+                )
+                if not audio_url:
+                    print(f"[VideoEdit] Pixabay: no audio URL found. Track keys: {list(track.keys())}")
+                    return None
+
+                print(f"[VideoEdit] Pixabay music: {audio_url[:80]}")
+                audio_r = await client.get(audio_url, timeout=30)
+                if audio_r.status_code == 200:
+                    print(f"[VideoEdit] Pixabay music downloaded: {len(audio_r.content):,} bytes")
+                    return audio_r.content
+                print(f"[VideoEdit] Pixabay audio download failed: HTTP {audio_r.status_code}")
+                return None
+        except Exception as e:
+            print(f"[VideoEdit] Pixabay fetch exception: {e}")
+            return None
 
     @staticmethod
     def _find_music_track(mood: str) -> str | None:
