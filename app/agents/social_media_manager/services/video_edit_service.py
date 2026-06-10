@@ -9,6 +9,7 @@ import uuid
 from datetime import datetime
 
 import httpx
+from openai import OpenAI
 
 from app.core.config import settings
 from app.database import get_db
@@ -19,6 +20,8 @@ PLATFORM_TARGETS = {
     "tiktok":          {"duration": 20, "width": 1080, "height": 1920},
     "facebook_reels":  {"duration": 15, "width": 1080, "height": 1920},
 }
+
+FILLER_WORDS = {"um", "uh", "ah", "er", "hmm", "mm"}
 
 
 class VideoEditService:
@@ -32,6 +35,7 @@ class VideoEditService:
             "user_id": user_id,
             "status": "processing",
             "progress": 0,
+            "status_message": "Starting…",
             "original_video_url": original_video_url,
             "platform": platform,
             "enhancements": enhancements,
@@ -60,6 +64,9 @@ class VideoEditService:
         db = get_db()
         col = db["video_edit_jobs"]
 
+        async def _progress(pct: int, msg: str = ""):
+            await col.update_one({"job_id": job_id}, {"$set": {"progress": pct, "status_message": msg}})
+
         # Download logo bytes async before entering the executor
         logo_bytes: bytes | None = None
         if logo_url:
@@ -75,7 +82,7 @@ class VideoEditService:
                 print(f"[VideoEdit] logo download exception: {e}")
 
         try:
-            # Archive the original video now (inside background task, not the request)
+            await _progress(5, "Archiving original…")
             try:
                 original_url = await upload_bytes(
                     video_bytes, folder="uri-social/original-videos", resource_type="video"
@@ -84,6 +91,7 @@ class VideoEditService:
             except Exception:
                 pass  # Archival failure should not block the edit
 
+            await _progress(15, "Running AI pipeline…")
             loop = asyncio.get_running_loop()
             result = await loop.run_in_executor(
                 None,
@@ -96,12 +104,14 @@ class VideoEditService:
             edited_bytes: bytes = result["bytes"]
             edits_applied: list = result["edits_applied"]
 
+            await _progress(88, "Uploading edited reel…")
             edited_url = await upload_bytes(
                 edited_bytes,
                 folder="uri-social/edited-reels",
                 resource_type="video",
             )
 
+            await _progress(95, "Saving to drafts…")
             draft_id = uuid.uuid4().hex
             platform_key = platform.replace("_reels", "")
             await db["content_drafts"].insert_one({
@@ -122,6 +132,7 @@ class VideoEditService:
             await col.update_one({"job_id": job_id}, {"$set": {
                 "status": "complete",
                 "progress": 100,
+                "status_message": "Done!",
                 "edited_video_url": edited_url,
                 "edits_applied": edits_applied,
                 "draft_id": draft_id,
@@ -168,10 +179,22 @@ class VideoEditService:
             has_audio  = meta.get("has_audio", False)
             trim_dur   = min(float(duration), float(target_duration))
 
-            # ── Step 1: stabilise ─────────────────────────────────────────
             working_path = input_path
+
+            # ── Step 0: remove filler words ───────────────────────────────
+            if enhancements.get("remove_fillers", True) and has_audio:
+                print("[VideoEdit] transcribing for filler removal…")
+                filler_words = VideoEditService._transcribe_words(working_path, tmp, "filler")
+                if filler_words:
+                    cleaned = VideoEditService._remove_fillers(working_path, filler_words, tmp, has_audio, trim_dur)
+                    if cleaned:
+                        working_path = cleaned
+                        edits_applied.append("Filler words removed")
+                        print("[VideoEdit] filler words removed")
+
+            # ── Step 1: stabilise ─────────────────────────────────────────
             if enhancements.get("stabilise", True):
-                stabilised = VideoEditService._stabilise(input_path, tmp, trim_dur, has_audio)
+                stabilised = VideoEditService._stabilise(working_path, tmp, trim_dur, has_audio)
                 if stabilised:
                     working_path = stabilised
                     edits_applied.append("Stabilised")
@@ -226,22 +249,25 @@ class VideoEditService:
                     edits_applied.append("Text overlays added")
 
             # ── Step 6: export main clip ───────────────────────────────────
-            # Always include an audio track (silent if source has none) so
-            # all parts share the same stream layout for concat.
             main_path = os.path.join(tmp, "main.mp4")
             vf = ",".join(filters) if filters else None
+            noise_af = "afftdn=nf=-25" if enhancements.get("noise_reduction", True) and has_audio else None
+
             if has_audio:
                 cmd = ["ffmpeg", "-y", "-i", working_path, "-t", str(trim_dur)]
                 if vf:
                     cmd += ["-vf", vf]
+                if noise_af:
+                    cmd += ["-af", noise_af]
                 cmd += [
                     "-c:v", "libx264", "-preset", "fast", "-crf", "23",
                     "-r", "30", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
                     "-c:a", "aac", "-b:a", "128k", "-ar", "48000",
                     main_path,
                 ]
+                if noise_af:
+                    edits_applied.append("Noise reduced")
             else:
-                # No source audio — mix in a silent track so concat works cleanly
                 cmd = [
                     "ffmpeg", "-y",
                     "-i", working_path,
@@ -257,11 +283,31 @@ class VideoEditService:
                     "-shortest", main_path,
                 ]
             VideoEditService._run(cmd)
-            # All parts now have audio — treat as has_audio for concat
-            has_audio = True
+            has_audio = True  # all parts now carry audio for clean concat
 
             if enhancements.get("smart_trim", True):
                 edits_applied.append(f"Trimmed to {int(trim_dur)}s")
+
+            # ── Step 6b: auto-captions (Whisper → brand-styled ASS) ────────
+            if enhancements.get("auto_captions", True):
+                print("[VideoEdit] transcribing for captions…")
+                caption_style = enhancements.get("caption_style", "word_by_word")
+                words = VideoEditService._transcribe_words(main_path, tmp, prefix="cap")
+                if words:
+                    ass_path = VideoEditService._generate_ass(
+                        words, brand_colors or [], caption_style, tmp, trim_dur, target_w, target_h
+                    )
+                    if ass_path:
+                        captioned = VideoEditService._apply_captions(main_path, ass_path, tmp)
+                        if captioned:
+                            main_path = captioned
+                            style_label = caption_style.replace("_", " ").title()
+                            edits_applied.append(f"Auto-captions — {style_label}")
+                            print(f"[VideoEdit] captions applied ({caption_style})")
+                        else:
+                            print("[VideoEdit] captions apply failed, skipping")
+                else:
+                    print("[VideoEdit] no words transcribed, skipping captions")
 
             # ── Step 7: logo overlay on the main clip ─────────────────────
             primary_color = (brand_colors or ["#000000"])[0] if brand_colors else "#000000"
@@ -324,7 +370,6 @@ class VideoEditService:
         stabilised = os.path.join(tmp, "stabilised.mp4")
         audio_args = ["-c:a", "aac", "-b:a", "128k"] if has_audio else ["-an"]
 
-        # Try vidstab (requires libvidstab compiled into ffmpeg)
         transforms = os.path.join(tmp, "transforms.trf")
         try:
             VideoEditService._run([
@@ -342,7 +387,6 @@ class VideoEditService:
         except subprocess.CalledProcessError:
             pass
 
-        # Fallback: deshake (always available in standard ffmpeg builds)
         try:
             VideoEditService._run([
                 "ffmpeg", "-y", "-i", input_path, "-t", str(duration),
@@ -355,7 +399,291 @@ class VideoEditService:
             return None
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Intro / Outro generation (programmatic — no asset files required)
+    # Auto-captions: Whisper transcription → brand-styled ASS subtitles
+    # ─────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _transcribe_words(video_path: str, tmp: str, prefix: str = "tr") -> list:
+        """Extract audio and call Whisper API for word-level timestamps."""
+        try:
+            audio_path = os.path.join(tmp, f"{prefix}_audio.wav")
+            VideoEditService._run([
+                "ffmpeg", "-y", "-i", video_path,
+                "-vn", "-ar", "16000", "-ac", "1", "-f", "wav", audio_path,
+            ])
+            if not os.path.exists(audio_path) or os.path.getsize(audio_path) < 1000:
+                return []
+
+            client = OpenAI(api_key=settings.OPENAI_API_KEY)
+            with open(audio_path, "rb") as f:
+                result = client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=f,
+                    response_format="verbose_json",
+                    timestamp_granularities=["word"],
+                )
+
+            raw_words = result.words if hasattr(result, "words") and result.words else []
+
+            # Normalize to plain dicts with stripped word text
+            normalized = []
+            for w in raw_words:
+                text = str(getattr(w, "word", "") if hasattr(w, "word") else w.get("word", "")).strip()
+                start = float(getattr(w, "start", 0) if hasattr(w, "start") else w.get("start", 0))
+                end = float(getattr(w, "end", 0) if hasattr(w, "end") else w.get("end", start + 0.3))
+                if text:
+                    normalized.append({"word": text, "start": start, "end": end})
+
+            print(f"[VideoEdit] transcribed {len(normalized)} words")
+            return normalized
+
+        except Exception as e:
+            print(f"[VideoEdit] transcription failed: {e}")
+            return []
+
+    @staticmethod
+    def _hex_to_ass_color(hex_color: str) -> str:
+        """Convert CSS hex color (#RRGGBB) to ASS BGR color (&H00BBGGRR)."""
+        h = hex_color.lstrip("#")
+        if len(h) == 3:
+            h = h[0] * 2 + h[1] * 2 + h[2] * 2
+        r = int(h[0:2], 16)
+        g = int(h[2:4], 16)
+        b = int(h[4:6], 16)
+        return f"&H00{b:02X}{g:02X}{r:02X}"
+
+    @staticmethod
+    def _seconds_to_ass_time(seconds: float) -> str:
+        """Convert seconds to ASS timestamp H:MM:SS.CC (centiseconds)."""
+        h = int(seconds // 3600)
+        m = int((seconds % 3600) // 60)
+        s = int(seconds % 60)
+        cs = int((seconds % 1) * 100)
+        return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
+
+    @staticmethod
+    def _generate_ass(
+        words: list,
+        brand_colors: list,
+        caption_style: str,
+        tmp: str,
+        duration: float,
+        w: int,
+        h: int,
+    ) -> str | None:
+        """Generate an ASS subtitle file with brand-styled captions."""
+        if not words:
+            return None
+        try:
+            primary_hex = (brand_colors[0] if brand_colors else "#FFFFFF") or "#FFFFFF"
+            brand_ass   = VideoEditService._hex_to_ass_color(primary_hex)
+            white_ass   = "&H00FFFFFF"
+            shadow_ass  = "&H80000000"
+            outline_ass = "&H00000000"
+
+            # Alignment: 2=bottom-center, 5=mid-center
+            if caption_style == "bold_pop":
+                font_size   = 80
+                alignment   = 5
+                bold        = -1
+                border_style = 3   # opaque box
+                outline_size = 0
+                back_color  = "&HAA000000"
+                primary     = brand_ass
+            elif caption_style == "word_by_word":
+                font_size   = 62
+                alignment   = 2
+                bold        = -1
+                border_style = 1
+                outline_size = 3
+                back_color  = shadow_ass
+                primary     = brand_ass
+            else:  # full_line
+                font_size   = 54
+                alignment   = 2
+                bold        = 0
+                border_style = 1
+                outline_size = 2
+                back_color  = shadow_ass
+                primary     = white_ass
+
+            style_line = (
+                f"Style: Default,Arial,{font_size},{primary},{white_ass},"
+                f"{outline_ass},{back_color},{bold},0,0,0,100,100,0,0,"
+                f"{border_style},{outline_size},1,{alignment},20,20,100,1"
+            )
+
+            ass_lines = [
+                "[Script Info]",
+                "ScriptType: v4.00+",
+                f"PlayResX: {w}",
+                f"PlayResY: {h}",
+                "ScaledBorderAndShadow: yes",
+                "",
+                "[V4+ Styles]",
+                "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+                "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
+                "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+                "Alignment, MarginL, MarginR, MarginV, Encoding",
+                style_line,
+                "",
+                "[Events]",
+                "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+            ]
+
+            def safe(text: str) -> str:
+                return text.replace("{", "").replace("}", "").replace("\\", "")
+
+            if caption_style in ("word_by_word", "bold_pop"):
+                for i, word_data in enumerate(words):
+                    word  = safe(word_data["word"])
+                    start = word_data["start"]
+                    # Extend display to next word start to avoid blank flicker
+                    if i < len(words) - 1:
+                        end = min(word_data["end"] + 0.05, words[i + 1]["start"])
+                    else:
+                        end = word_data["end"]
+                    if caption_style == "bold_pop":
+                        word = word.upper()
+                    t_start = VideoEditService._seconds_to_ass_time(start)
+                    t_end   = VideoEditService._seconds_to_ass_time(end)
+                    ass_lines.append(f"Dialogue: 0,{t_start},{t_end},Default,,0,0,0,,{word}")
+
+            else:  # full_line
+                groups = []
+                current: list = []
+                for i, word_data in enumerate(words):
+                    current.append(word_data)
+                    elapsed  = current[-1]["end"] - current[0]["start"]
+                    next_gap = 0.0
+                    if i < len(words) - 1:
+                        next_gap = words[i + 1]["start"] - word_data["end"]
+                    if len(current) >= 5 or elapsed >= 2.5 or next_gap > 0.4 or i == len(words) - 1:
+                        groups.append(current)
+                        current = []
+
+                for group in groups:
+                    t_start = VideoEditService._seconds_to_ass_time(group[0]["start"])
+                    t_end   = VideoEditService._seconds_to_ass_time(group[-1]["end"])
+                    text    = safe(" ".join(wd["word"] for wd in group))
+                    ass_lines.append(f"Dialogue: 0,{t_start},{t_end},Default,,0,0,0,,{text}")
+
+            ass_path = os.path.join(tmp, "captions.ass")
+            with open(ass_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(ass_lines))
+            return ass_path
+
+        except Exception as e:
+            print(f"[VideoEdit] ASS generation failed: {e}")
+            return None
+
+    @staticmethod
+    def _apply_captions(video_path: str, ass_path: str, tmp: str) -> str | None:
+        """Bake ASS subtitles into the video."""
+        out = os.path.join(tmp, "captioned.mp4")
+        # Escape path for FFmpeg filter syntax (colons and backslashes are special)
+        escaped = ass_path.replace("\\", "/").replace(":", "\\:")
+        try:
+            VideoEditService._run([
+                "ffmpeg", "-y", "-i", video_path,
+                "-vf", f"ass='{escaped}'",
+                "-c:v", "libx264", "-preset", "fast", "-crf", "22",
+                "-c:a", "copy",
+                "-movflags", "+faststart", out,
+            ])
+            return out
+        except subprocess.CalledProcessError as e:
+            stderr = e.stderr.decode(errors="replace")[-500:] if e.stderr else ""
+            print(f"[VideoEdit] caption apply failed:\n{stderr}")
+            return None
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Filler word removal
+    # ─────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _remove_fillers(
+        input_path: str,
+        words: list,
+        tmp: str,
+        has_audio: bool,
+        max_dur: float,
+    ) -> str | None:
+        """Cut filler word segments using FFmpeg trim+concat filter_complex."""
+        fillers = [
+            w for w in words
+            if w["word"].lower().strip(".,!?") in FILLER_WORDS
+            and w["start"] < max_dur
+        ]
+        if not fillers:
+            return None
+
+        PADDING = 0.06  # 60 ms around each filler
+        excluded = [
+            (max(0.0, f["start"] - PADDING), min(max_dur, f["end"] + PADDING))
+            for f in fillers
+        ]
+        # Merge overlapping exclusions
+        excluded.sort()
+        merged: list[list[float]] = []
+        for s, e in excluded:
+            if merged and s <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], e)
+            else:
+                merged.append([s, e])
+
+        # Build keep segments
+        keep = []
+        pos = 0.0
+        for excl_s, excl_e in merged:
+            if pos < excl_s:
+                keep.append((pos, excl_s))
+            pos = excl_e
+        if pos < max_dur:
+            keep.append((pos, max_dur))
+
+        if len(keep) <= 1 and not merged:
+            return None
+
+        n = len(keep)
+        vf_parts, af_parts = [], []
+        for i, (s, e) in enumerate(keep):
+            vf_parts.append(f"[0:v]trim={s:.3f}:{e:.3f},setpts=PTS-STARTPTS[v{i}]")
+            if has_audio:
+                af_parts.append(f"[0:a]atrim={s:.3f}:{e:.3f},asetpts=PTS-STARTPTS[a{i}]")
+
+        v_in = "".join(f"[v{i}]" for i in range(n))
+        a_in = "".join(f"[a{i}]" for i in range(n))
+
+        if has_audio:
+            fc = (
+                ";".join(vf_parts + af_parts)
+                + f";{v_in}{a_in}concat=n={n}:v=1:a=1[vout][aout]"
+            )
+            map_args = ["-map", "[vout]", "-map", "[aout]",
+                        "-c:a", "aac", "-b:a", "128k"]
+        else:
+            fc = ";".join(vf_parts) + f";{v_in}concat=n={n}:v=1:a=0[vout]"
+            map_args = ["-map", "[vout]", "-an"]
+
+        out = os.path.join(tmp, "no_fillers.mp4")
+        try:
+            VideoEditService._run([
+                "ffmpeg", "-y", "-i", input_path,
+                "-filter_complex", fc,
+                *map_args,
+                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                "-movflags", "+faststart", out,
+            ])
+            print(f"[VideoEdit] removed {len(fillers)} filler word(s)")
+            return out
+        except subprocess.CalledProcessError as e:
+            stderr = e.stderr.decode(errors="replace")[-400:] if e.stderr else ""
+            print(f"[VideoEdit] filler removal failed:\n{stderr}")
+            return None
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Logo / Intro / Outro
     # ─────────────────────────────────────────────────────────────────────────
 
     @staticmethod
@@ -366,10 +694,7 @@ class VideoEditService:
         tmp: str,
         out_name: str = "with_logo.mp4",
     ) -> str | None:
-        """Overlay a scaled logo in a corner of the video throughout.
-        Works with PNG, JPEG, and WebP logos. Height is forced even for libx264."""
         out = os.path.join(tmp, out_name)
-        # Scale to 120px wide; trunc(ow/a/2)*2 keeps height even (libx264 requirement)
         logo_scale = "scale=120:trunc(ow/a/2)*2"
         POSITIONS = {
             "top_left":     "10:10",
@@ -378,8 +703,6 @@ class VideoEditService:
             "bottom_right": "W-w-10:H-h-10",
         }
         overlay_xy = POSITIONS.get(position, POSITIONS["bottom_right"])
-        # format=rgba normalises the logo to RGBA (works for PNG, JPEG, WebP).
-        # The overlay filter composites it cleanly without extra alpha manipulation.
         fc = (
             f"[1:v]{logo_scale},format=rgba[logo];"
             f"[0:v][logo]overlay={overlay_xy}:format=auto[vout]"
@@ -415,7 +738,6 @@ class VideoEditService:
         w: int,
         h: int,
     ) -> str | None:
-        """1.5s branded intro — brand color background, logo (if available), brand name + tagline."""
         font = VideoEditService._find_font()
         if not font:
             return None
@@ -424,7 +746,6 @@ class VideoEditService:
         name_label = (brand_name or "URI Social").replace("'", "\\'").replace(":", "\\:")
         tag_label  = (tagline or "").replace("'", "\\'").replace(":", "\\:")
 
-        # Build filter chain on the color source
         filters = [
             f"drawtext=text='{name_label}':fontfile='{font}':"
             f"fontsize=64:fontcolor=white:x=(w-text_w)/2:y=(h-text_h)/2-30:"
@@ -438,7 +759,6 @@ class VideoEditService:
             )
 
         try:
-            # Step 1: generate color + text clip
             base_out = os.path.join(tmp, "intro_base.mp4")
             VideoEditService._run([
                 "ffmpeg", "-y",
@@ -449,13 +769,11 @@ class VideoEditService:
                 "-c:a", "aac", "-b:a", "128k", "-shortest", base_out,
             ])
 
-            # Step 2: overlay logo if available
             if logo_path:
                 logo_out = VideoEditService._apply_logo(base_out, logo_path, "top_right", tmp, "intro_logo.mp4")
                 if logo_out:
                     base_out = logo_out
 
-            # Copy to final name
             VideoEditService._run(["ffmpeg", "-y", "-i", base_out, "-c", "copy", out])
             return out
         except subprocess.CalledProcessError:
@@ -469,7 +787,6 @@ class VideoEditService:
         w: int,
         h: int,
     ) -> str | None:
-        """2s branded outro — brand color background with CTA text."""
         font = VideoEditService._find_font()
         if not font:
             return None
@@ -495,16 +812,13 @@ class VideoEditService:
             return None
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Concatenation — all parts must have video+audio (intro/outro carry silent audio)
+    # Concatenation
     # ─────────────────────────────────────────────────────────────────────────
 
     @staticmethod
     def _concat(parts: list[str], tmp: str, has_audio: bool) -> str:
-        """Concat parts using filter_complex so codec/stream mismatches are always resolved."""
         out = os.path.join(tmp, "assembled.mp4")
         n = len(parts)
-
-        # Build -i args and filter_complex concat
         input_args = []
         for p in parts:
             input_args += ["-i", p]
@@ -532,12 +846,11 @@ class VideoEditService:
         return out
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Background music mixing
+    # Background music
     # ─────────────────────────────────────────────────────────────────────────
 
     @staticmethod
     def _find_music_track(mood: str) -> str | None:
-        """Look for a track in MUSIC_LIBRARY_PATH/{mood}/*.mp3 (or .wav/m4a)."""
         base = (settings.MUSIC_LIBRARY_PATH or "").strip()
         if not base:
             return None
@@ -548,7 +861,6 @@ class VideoEditService:
             glob.glob(os.path.join(mood_dir, "*.m4a"))
         )
         if not tracks:
-            # Try root of music library as fallback
             tracks = (
                 glob.glob(os.path.join(base, "*.mp3")) +
                 glob.glob(os.path.join(base, "*.wav"))
@@ -559,7 +871,6 @@ class VideoEditService:
     def _mix_music(video_path: str, music_path: str, tmp: str, has_original_audio: bool) -> str:
         out = os.path.join(tmp, "with_music.mp4")
         if has_original_audio:
-            # Mix at 18% volume behind original audio
             filter_complex = "[1:a]volume=0.18[bg];[0:a][bg]amix=inputs=2:duration=shortest[aout]"
             cmd = [
                 "ffmpeg", "-y", "-i", video_path, "-i", music_path,
@@ -569,7 +880,6 @@ class VideoEditService:
                 "-shortest", out,
             ]
         else:
-            # No original audio — use music at 25%
             cmd = [
                 "ffmpeg", "-y", "-i", video_path, "-i", music_path,
                 "-filter_complex", "[1:a]volume=0.25,atrim=duration=60[bg]",
@@ -586,7 +896,7 @@ class VideoEditService:
 
     @staticmethod
     def _run(cmd: list[str]) -> None:
-        result = subprocess.run(cmd, capture_output=True, timeout=180)
+        result = subprocess.run(cmd, capture_output=True, timeout=300)
         if result.returncode != 0:
             raise subprocess.CalledProcessError(
                 result.returncode, cmd,
