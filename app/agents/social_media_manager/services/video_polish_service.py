@@ -37,7 +37,7 @@ DEFAULT_STYLE_PRESETS: List[Dict[str, Any]] = [
         "clipping_api_settings": {
             "genre": "talking",
             "prompt": "Select the highest-energy moments. Fast-paced cuts. Bold, dynamic delivery. Perfect for sales, promos, and hype content.",
-            "clipDurations": [{"min": 15, "max": 30}],
+            "clipDurations": [[0, 30]],
             "reframeClips": True,
             "exportOrientation": "portrait",
             "exportResolution": 1080,
@@ -55,7 +55,7 @@ DEFAULT_STYLE_PRESETS: List[Dict[str, Any]] = [
         "clipping_api_settings": {
             "genre": "talking",
             "prompt": "Select clear, authoritative moments. Steady pacing. Professional tone. Good for services, B2B, and announcements.",
-            "clipDurations": [{"min": 30, "max": 60}],
+            "clipDurations": [[30, 60]],
             "reframeClips": True,
             "exportOrientation": "portrait",
             "exportResolution": 1080,
@@ -73,7 +73,7 @@ DEFAULT_STYLE_PRESETS: List[Dict[str, Any]] = [
         "clipping_api_settings": {
             "genre": "talking",
             "prompt": "Relaxed, authentic feel. Keep natural moments. Playful energy. Perfect for lifestyle and behind-the-scenes content.",
-            "clipDurations": [{"min": 20, "max": 45}],
+            "clipDurations": [[30, 60]],
             "reframeClips": True,
             "exportOrientation": "portrait",
             "exportResolution": 1080,
@@ -91,7 +91,7 @@ DEFAULT_STYLE_PRESETS: List[Dict[str, Any]] = [
         "clipping_api_settings": {
             "genre": "talking",
             "prompt": "Select the most emotionally resonant moments. Emphasize key words and pauses. Slow, thoughtful pacing. Perfect for founder stories and testimonials.",
-            "clipDurations": [{"min": 30, "max": 60}],
+            "clipDurations": [[30, 60]],
             "reframeClips": True,
             "exportOrientation": "portrait",
             "exportResolution": 1080,
@@ -109,7 +109,7 @@ DEFAULT_STYLE_PRESETS: List[Dict[str, Any]] = [
         "clipping_api_settings": {
             "genre": "talking",
             "prompt": "Focus on moments where the product is clearly visible and being discussed. Punchy and energetic. Great for product reveals and demos.",
-            "clipDurations": [{"min": 15, "max": 30}],
+            "clipDurations": [[0, 30]],
             "reframeClips": True,
             "exportOrientation": "portrait",
             "exportResolution": 1080,
@@ -127,7 +127,7 @@ DEFAULT_STYLE_PRESETS: List[Dict[str, Any]] = [
         "clipping_api_settings": {
             "genre": "talking",
             "prompt": "Select the most composed, elegant moments. Clean and minimal. No filler. Perfect for premium and luxury brand content.",
-            "clipDurations": [{"min": 30, "max": 60}],
+            "clipDurations": [[30, 60]],
             "reframeClips": True,
             "exportOrientation": "portrait",
             "exportResolution": 1080,
@@ -182,21 +182,27 @@ class ReapProvider(AbstractClippingProvider):
             async with session.post(
                 f"{self.BASE}/get-upload-url",
                 headers=self._headers(),
+                json={"filename": filename},
             ) as resp:
+                if not resp.ok:
+                    body = await resp.text()
+                    print(f"[Reap] get-upload-url {resp.status}: {body}", flush=True)
                 resp.raise_for_status()
                 data = await resp.json()
                 upload_url: str = data["uploadUrl"]
                 upload_id: str = data["id"]
 
             # Step 2: PUT video bytes to the presigned URL
+            print(f"[Reap] S3 PUT — upload_id={upload_id} size={len(video_bytes)} url_prefix={upload_url[:60]}", flush=True)
             async with session.put(
                 upload_url,
                 data=video_bytes,
-                headers={"Content-Type": "video/mp4"},
+                headers={"Content-Type": "video/mp4", "Content-Length": str(len(video_bytes))},
             ) as resp:
+                s3_body = await resp.text()
+                print(f"[Reap] S3 PUT response: status={resp.status} body={s3_body[:200]}", flush=True)
                 if resp.status not in (200, 204):
-                    text = await resp.text()
-                    raise RuntimeError(f"Reap S3 upload failed {resp.status}: {text}")
+                    raise RuntimeError(f"Reap S3 upload failed {resp.status}: {s3_body}")
 
         return upload_id
 
@@ -209,8 +215,9 @@ class ReapProvider(AbstractClippingProvider):
             "exportResolution": style_settings.get("exportResolution", 1080),
             "exportOrientation": style_settings.get("exportOrientation", "portrait"),
             "reframeClips": style_settings.get("reframeClips", True),
-            "clipDurations": style_settings.get("clipDurations", [{"min": 30, "max": 60}]),
+            "clipDurations": style_settings.get("clipDurations", [[30, 60]]),
             "prompt": style_settings.get("prompt", ""),
+            "language": "en",
         }
         if language and language != "en":
             payload["prompt"] = f"[Language context: {language}] " + payload["prompt"]
@@ -221,6 +228,9 @@ class ReapProvider(AbstractClippingProvider):
                 headers=self._headers(),
                 json=payload,
             ) as resp:
+                if not resp.ok:
+                    body = await resp.text()
+                    print(f"[Reap] create-clips {resp.status}: {body}", flush=True)
                 resp.raise_for_status()
                 data = await resp.json()
                 return data["id"]
@@ -235,6 +245,8 @@ class ReapProvider(AbstractClippingProvider):
                 resp.raise_for_status()
                 data = await resp.json()
                 raw = data.get("status", "processing")
+                if raw == "invalid":
+                    return "invalid_content"
                 # Normalise to our vocabulary
                 mapping = {
                     "queued": "processing",
@@ -258,14 +270,17 @@ class ReapProvider(AbstractClippingProvider):
                 clips = data.get("clips", [])
                 return [
                     {
-                        "url": c.get("url", ""),
+                        "clip_url": c.get("clipUrl", ""),
                         "duration": c.get("duration", 0),
-                        "caption_text": c.get("captions", ""),
+                        "caption_text": c.get("caption", ""),
                         "title": c.get("title", ""),
+                        "topic": c.get("topic", ""),
                         "virality_score": c.get("viralityScore", 0),
+                        "hook": c.get("hook", ""),
+                        "thumbnail_url": c.get("clipWithCaptionsUrl") or "",
                     }
                     for c in clips
-                    if c.get("url")
+                    if c.get("clipUrl")
                 ]
 
 
@@ -409,12 +424,15 @@ def _credit_amount(duration_seconds: float) -> float:
 
 async def _upload_to_cloudinary(video_bytes: bytes, filename: str) -> str:
     """Upload to Cloudinary and return the public URL."""
+    import io
     import cloudinary.uploader
     loop = asyncio.get_running_loop()
+    buf = io.BytesIO(video_bytes)
+    buf.name = f"{filename}.mp4"
     result = await loop.run_in_executor(
         None,
         lambda: cloudinary.uploader.upload_large(
-            video_bytes,
+            buf,
             resource_type="video",
             folder="uri_polish_source",
             public_id=filename,
@@ -526,13 +544,13 @@ class VideoPolishService:
                 streams = probe.get("streams", [])
 
                 # Validation — hard stops
-                if duration < 3:
+                if duration < 120:  # Reap requires minimum 2 minutes
                     await update(job_id, db, status="failed",
-                                 status_message="Video is too short (minimum 3 seconds).")
+                                 status_message=f"Video is too short ({int(duration)}s). Minimum is 2 minutes for AI polishing.")
                     return
-                if duration > 600:  # 10 min
+                if duration > 10800:  # 3 hours (Reap max)
                     await update(job_id, db, status="failed",
-                                 status_message="Video is too long (maximum 10 minutes).")
+                                 status_message="Video is too long (maximum 3 hours).")
                     return
 
                 video_stream = next(
@@ -591,13 +609,20 @@ class VideoPolishService:
                          status_message="Sending to polish engine…", progress=35)
 
             # Get style settings
-            from app.core.database import get_db
             style_doc = await db[VideoPolishService.STYLES_COLLECTION].find_one(
                 {"name": style_preset, "is_custom": False}, {"_id": 0}
             )
             if not style_doc:
                 style_doc = DEFAULT_STYLE_PRESETS[1]  # fallback: Clean Professional
-            api_settings = style_doc.get("clipping_api_settings", {})
+            api_settings = dict(style_doc.get("clipping_api_settings", {}))
+
+            # Choose clip duration based on video length — short videos need shorter clips
+            # Reap returns `invalid` if requested clip duration exceeds what source can provide
+            if duration < 300:       # < 5 min → only 0-30s clips
+                api_settings["clipDurations"] = [[0, 30]]
+            elif duration < 600:     # 5-10 min → allow up to 60s
+                api_settings["clipDurations"] = [[30, 60]]
+            # longer videos keep whatever the style specifies
 
             # Upload to Reap (gets its own upload ID)
             await update(job_id, db, progress=40, status_message="Processing with AI…")
@@ -605,16 +630,23 @@ class VideoPolishService:
             provider_job_id = await provider.create_clip_job(upload_id, api_settings, language)
             await update(job_id, db, clipping_api_job_id=provider_job_id)
 
-            # Poll until done (max ~3 minutes)
+            # Poll until done — allow up to 15 min (longer videos need more time)
+            poll_seconds = max(180, int(duration * 1.5))  # at least 3 min, 1.5× video duration
+            poll_interval = 10
+            max_polls = poll_seconds // poll_interval
             await update(job_id, db, progress=50,
                          status_message="Reframing and captioning your clip…")
-            for attempt in range(36):  # 36 × 5s = 3 min
-                await asyncio.sleep(5)
+            for attempt in range(max_polls):
+                await asyncio.sleep(poll_interval)
                 status = await provider.get_job_status(provider_job_id)
-                progress = min(50 + attempt * 1, 88)
+                progress = min(50 + int(attempt * 38 / max_polls), 88)
                 await update(job_id, db, progress=progress)
                 if status == "completed":
                     break
+                if status == "invalid_content":
+                    await update(job_id, db, status="failed",
+                                 status_message="Video not suitable for AI clipping. Please use a video with a person clearly speaking on camera (min 2 minutes of dialogue).")
+                    return
                 if status == "failed":
                     await update(job_id, db, status="failed",
                                  status_message="Clipping engine returned an error. Please try again.")
@@ -645,14 +677,15 @@ class VideoPolishService:
             print(f"[VideoPolish] job {job_id} error: {e}")
             import traceback; traceback.print_exc()
             try:
-                from app.core.database import get_db  # noqa
+                from app.database import get_db
                 await VideoPolishService._update(
-                    job_id, db,
+                    job_id, get_db(),
                     status="failed",
                     status_message="An unexpected error occurred. Please try again.",
+                    progress=0,
                 )
-            except Exception:
-                pass
+            except Exception as inner:
+                print(f"[VideoPolish] failed to mark job {job_id} as failed: {inner}")
 
     # ── Restyle (0.5 credits) ──────────────────────────────────────────────
 

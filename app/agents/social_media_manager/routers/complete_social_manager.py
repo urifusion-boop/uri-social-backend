@@ -5580,6 +5580,7 @@ async def polish_video(
     (ingest + quality check + Reap), and return a job_id immediately.
     Poll GET /polish-video-job/{job_id} for status and output clips.
     """
+    print(f"[PolishVideo] handler entered — content_type={video.content_type} filename={video.filename}", flush=True)
     from app.agents.social_media_manager.services.video_polish_service import VideoPolishService
     from app.core.config import settings
 
