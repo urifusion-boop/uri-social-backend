@@ -630,8 +630,8 @@ class VideoPolishService:
             provider_job_id = await provider.create_clip_job(upload_id, api_settings, language)
             await update(job_id, db, clipping_api_job_id=provider_job_id)
 
-            # Poll until done — allow up to 15 min (longer videos need more time)
-            poll_seconds = max(180, int(duration * 1.5))  # at least 3 min, 1.5× video duration
+            # Poll until done — Reap needs at least 10 min even for short videos
+            poll_seconds = max(600, int(duration * 2))  # at least 10 min, 2× video duration
             poll_interval = 10
             max_polls = poll_seconds // poll_interval
             await update(job_id, db, progress=50,
