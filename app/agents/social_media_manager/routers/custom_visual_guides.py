@@ -207,7 +207,12 @@ async def get_user_guides(
             typography_match = {
                 "has_typography": guide.get("typography_extraction", {}).get("has_typography", False),
                 "match_outcome": guide.get("match_outcome"),
+                "matched_font_id": guide.get("matched_font_id"),
                 "matched_font_name": None,  # TODO: Fetch from fonts collection
+                "match_confidence": guide.get("match_confidence"),
+                "identified_font_name": guide.get("identified_font_name"),
+                "next_step_suggestion": guide.get("next_step_suggestion"),
+                "alternative_matches": guide.get("alternative_font_matches"),
             }
 
             guides_list.append({
