@@ -78,17 +78,25 @@ class AgencyService:
     @staticmethod
     async def add_member(
         agency_id: str,
-        user_id: str,
+        user_id: Optional[str],
         role: AgencyRole,
         invited_by_user_id: Optional[str],
         db: AsyncIOMotorDatabase,
+        email: Optional[str] = None,
     ) -> AgencyMember:
-        existing = await db[AGENCY_MEMBERS].find_one({"agency_id": agency_id, "user_id": user_id})
+        # Dedup by user_id (registered) or by email (pending invite)
+        dedup = {"agency_id": agency_id}
+        if user_id:
+            dedup["user_id"] = user_id
+        elif email:
+            dedup["email"] = email.lower()
+        existing = await db[AGENCY_MEMBERS].find_one(dedup)
         if existing:
             if existing.get("status") == "removed":
                 await db[AGENCY_MEMBERS].update_one(
                     {"_id": existing["_id"]},
-                    {"$set": {"status": "active", "role": role.value if hasattr(role, "value") else role,
+                    {"$set": {"status": "active" if user_id else "invited",
+                              "role": role.value if hasattr(role, "value") else role,
                               "updated_at": datetime.utcnow()}},
                 )
             existing["_id"] = str(existing["_id"])
@@ -98,14 +106,27 @@ class AgencyService:
             agency_member_id=AgencyMember.generate_member_id(),
             agency_id=agency_id,
             user_id=user_id,
+            email=email.lower() if email else None,
             role=role,
             invited_by_user_id=invited_by_user_id,
-            status="active" if invited_by_user_id is None else "invited",
-            joined_at=datetime.utcnow() if invited_by_user_id is None else None,
+            # self-add (owner) is active; registered invite is active; email-only is pending
+            status="active" if (invited_by_user_id is None or user_id) else "invited",
+            joined_at=datetime.utcnow() if (invited_by_user_id is None or user_id) else None,
         )
         result = await db[AGENCY_MEMBERS].insert_one(member.to_dict())
         member.id = str(result.inserted_id)
         return member
+
+    @staticmethod
+    async def bind_pending_invites(user_id: str, email: Optional[str], db: AsyncIOMotorDatabase) -> None:
+        """When a user logs in, claim any pending email invites addressed to them."""
+        if not email:
+            return
+        await db[AGENCY_MEMBERS].update_many(
+            {"email": email.lower(), "user_id": None},
+            {"$set": {"user_id": user_id, "status": "active",
+                      "joined_at": datetime.utcnow(), "updated_at": datetime.utcnow()}},
+        )
 
     @staticmethod
     async def get_member(agency_id: str, user_id: str, db: AsyncIOMotorDatabase) -> Optional[AgencyMember]:

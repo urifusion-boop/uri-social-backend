@@ -47,6 +47,10 @@ def _uid(token: dict) -> str:
     return uid
 
 
+def _email(token: dict) -> Optional[str]:
+    return (token.get("claims") or {}).get("email")
+
+
 async def _require_admin(user_id: str, db: AsyncIOMotorDatabase):
     agency = await AgencyService.get_agency_for_user(user_id, db)
     if not agency:
@@ -77,6 +81,8 @@ async def get_agency(
     token: dict = Depends(JWTBearer()),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
+    # Claim any pending email invites addressed to this user before resolving
+    await AgencyService.bind_pending_invites(_uid(token), _email(token), db)
     agency = await AgencyService.get_agency_for_user(_uid(token), db)
     return UriResponse.get_single_data_response("agency", agency.to_public_dict() if agency else None)
 
@@ -257,14 +263,19 @@ async def invite_member(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     agency = await _require_admin(_uid(token), db)
-    # Resolve invited user by email
+    # If the email already has an account, link immediately; otherwise store a
+    # pending invite that auto-binds when they sign up / log in.
     user = await db["users"].find_one({"email": body.email})
-    if not user:
-        raise HTTPException(status_code=404, detail="No user with that email")
     member = await AgencyService.add_member(
-        agency.agency_id, str(user["_id"]), body.role, _uid(token), db
+        agency.agency_id,
+        str(user["_id"]) if user else None,
+        body.role,
+        _uid(token),
+        db,
+        email=body.email,
     )
-    return UriResponse.create_response("agency_member", member.to_public_dict())
+    msg = "Member added" if user else "Invite sent — they'll get access when they sign up"
+    return UriResponse.create_response("agency_member", {**member.to_public_dict(), "message": msg})
 
 
 @router.delete("/members/{member_id}")

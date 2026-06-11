@@ -80,7 +80,9 @@ class BrandAccountService:
         )
         await db[BRANDS].insert_one(brand.to_dict())
 
-        # Seed an empty brand_profiles doc scoped to the new brand_id
+        # Seed a brand_profiles doc scoped to the new brand_id. Agency brands are
+        # created via the streamlined form (PRD §3.4), not the full onboarding
+        # wizard — so mark onboarding complete and let the playbook be edited later.
         await db["brand_profiles"].update_one(
             {"brand_id": brand.brand_id},
             {"$setOnInsert": {
@@ -88,7 +90,7 @@ class BrandAccountService:
                 "user_id": owner_user_id,
                 "brand_name": name,
                 "industry": industry or "",
-                "onboarding_completed": False,
+                "onboarding_completed": True,
                 "created_at": datetime.utcnow(),
                 "updated_at": datetime.utcnow(),
             }},

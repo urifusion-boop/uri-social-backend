@@ -85,7 +85,8 @@ class AgencyMember(BaseModel):
     id: Optional[str] = Field(default=None, alias="_id")
     agency_member_id: str = Field(..., description="Unique member id (ambr_xxx)")
     agency_id: str = Field(...)
-    user_id: str = Field(...)
+    user_id: Optional[str] = Field(default=None, description="Null until a pending email invite is claimed")
+    email: Optional[str] = Field(default=None, description="Invited email (for pending invites)")
 
     role: AgencyRole = Field(default=AgencyRole.AGENT)
     status: str = Field(default="active", pattern="^(active|invited|suspended|removed)$")
@@ -117,6 +118,7 @@ class AgencyMember(BaseModel):
             "agency_member_id": self.agency_member_id,
             "agency_id": self.agency_id,
             "user_id": self.user_id,
+            "email": self.email,
             "role": self.role,
             "status": self.status,
             "joined_at": self.joined_at.isoformat() if self.joined_at else None,
