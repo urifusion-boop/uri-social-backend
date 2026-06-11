@@ -218,6 +218,8 @@ class ReapProvider(AbstractClippingProvider):
             "clipDurations": style_settings.get("clipDurations", [[30, 60]]),
             "prompt": style_settings.get("prompt", ""),
             "language": "en",
+            "enableCaptions": True,
+            "enableHighlights": True,
         }
         if language and language != "en":
             payload["prompt"] = f"[Language context: {language}] " + payload["prompt"]
