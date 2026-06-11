@@ -1024,6 +1024,24 @@ If has_typography is false, omit other fields. Return ONLY valid JSON."""
     # ========================================================================
 
     @staticmethod
+    async def get_guide_detail(guide_id: str, db: AsyncIOMotorDatabase) -> Optional[Dict[str, Any]]:
+        """
+        Get detailed information for a specific guide
+
+        Returns guide document with all fields including prompt_fragment
+        """
+        from bson import ObjectId
+        try:
+            guide = await db["custom_visual_guides"].find_one({
+                "_id": ObjectId(guide_id),
+                "status": "active",
+            })
+            return guide
+        except Exception as e:
+            print(f"[CVG] Error getting guide detail: {e}")
+            return None
+
+    @staticmethod
     async def get_user_guide_count(user_id: str, db: AsyncIOMotorDatabase) -> int:
         """Get number of active guides for a user"""
         count = await db["custom_visual_guides"].count_documents({
@@ -1038,6 +1056,42 @@ If has_typography is false, omit other fields. Return ONLY valid JSON."""
         current_count = await CustomVisualGuideService.get_user_guide_count(user_id, db)
         limit = CustomVisualGuideService.PLAN_LIMITS.get(user_plan.lower(), 2)
         return current_count < limit
+
+    @staticmethod
+    async def track_guide_usage(guide_id: str, applied_font: bool, db: AsyncIOMotorDatabase) -> None:
+        """
+        Track when a guide is used for content generation
+
+        Updates usage analytics for the guide.
+        """
+        from bson import ObjectId
+        from datetime import datetime
+        try:
+            update_ops = {
+                "$inc": {"times_used": 1},
+                "$set": {"last_used_at": datetime.utcnow()}
+            }
+
+            if applied_font:
+                update_ops["$inc"]["times_font_applied"] = 1
+
+            await db["custom_visual_guides"].update_one(
+                {"_id": ObjectId(guide_id)},
+                update_ops
+            )
+
+            # Also track in guide_usage_events collection
+            usage_event = {
+                "guide_id": guide_id,
+                "applied_matched_font": applied_font,
+                "used_at": datetime.utcnow(),
+            }
+            await db["guide_usage_events"].insert_one(usage_event)
+
+            print(f"[CVG] ✅ Tracked usage for guide {guide_id}")
+
+        except Exception as e:
+            print(f"[CVG] Error tracking guide usage: {e}")
 
     @staticmethod
     async def auto_rematch_guides_for_new_font(
