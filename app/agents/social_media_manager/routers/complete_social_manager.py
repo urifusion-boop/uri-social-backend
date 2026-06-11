@@ -1065,15 +1065,13 @@ async def finalize_social_connection(
 
 @router.get("/connections")
 async def get_user_connections(
+    ctx: dict = Depends(get_active_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
 ):
-    """Get all social media accounts connected by the user (live from Outstand)."""
-    user_id = _get_user_id(token)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="User ID not found in token")
-
-    return await SocialAccountService.get_user_connections(db=db, user_id=user_id)
+    """Get social accounts connected for the active brand (isolated per brand)."""
+    return await SocialAccountService.get_user_connections(
+        db=db, user_id=ctx["user_id"], brand_id=ctx["brand_id"]
+    )
 
 
 @router.delete("/connections/account/{outstand_account_id}")

@@ -207,19 +207,31 @@ class SocialAccountService:
     async def get_user_connections(
         db: AsyncIOMotorDatabase,
         user_id: str,
+        brand_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Return all social accounts connected by the user.
-        Queries Outstand for Outstand-managed accounts, then merges direct
-        connections from the local DB. Outstand failures are isolated so that
-        direct connections (e.g. Instagram) are always returned.
+        Return all social accounts connected for the active brand.
+
+        Agency Accounts isolation: connections are scoped per brand. A solo
+        user's personal brand keeps its legacy connections (tenant_id=user_id);
+        each agency brand has its own isolated set (tenant_id=brand_id).
+        Queries Outstand then merges direct connections from the local DB.
         """
+        from app.models.brand_account import BrandAccount
+
+        is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
+        tenant = user_id if is_personal else brand_id
+        # Local filter: personal → by user (legacy docs have no brand_id);
+        # agency brand → strictly by brand_id (isolated).
+        local_filter: Dict[str, Any] = {"user_id": user_id} if is_personal else {"brand_id": brand_id}
+        local_filter["connection_status"] = "active"
+
         by_platform: Dict[str, list] = {}
 
         # 1. Outstand-managed accounts — failures must not prevent direct connections
         try:
             outstand = OutstandService()
-            result = await outstand.list_accounts(tenant_id=user_id)
+            result = await outstand.list_accounts(tenant_id=tenant)
             for acc in result.get("data", []):
                 platform = acc.get("network", "unknown")
                 by_platform.setdefault(platform, []).append({
@@ -245,10 +257,7 @@ class SocialAccountService:
                 for acc in accs
                 if acc.get("outstand_account_id")
             }
-            local_cursor = db["social_connections"].find({
-                "user_id": user_id,
-                "connection_status": "active",
-            })
+            local_cursor = db["social_connections"].find(local_filter)
             async for doc in local_cursor:
                 platform = doc.get("platform", "unknown")
                 doc_outstand_id = doc.get("outstand_account_id") or doc.get("id")
