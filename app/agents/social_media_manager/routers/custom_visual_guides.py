@@ -3,6 +3,9 @@
 """
 Custom Visual Guides API Router
 Handles reference image upload, analysis, font matching, and guide management.
+
+Fixed: All UriResponse methods now use correct method names
+(create_response, get_list_data_response, etc.) - NO .success()
 """
 
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query
