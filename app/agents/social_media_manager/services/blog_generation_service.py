@@ -19,6 +19,18 @@ from app.agents.social_media_manager.services.writing_dna_service import Writing
 
 BLOG_POSTS_COLLECTION = "blog_posts"
 
+
+def _post_scope(blog_id: str, user_id: str, brand_id: Optional[str]) -> Dict[str, Any]:
+    """Brand-aware filter for a single blog post (brand_id is the boundary)."""
+    if brand_id:
+        return {"id": blog_id, "brand_id": brand_id}
+    return {"id": blog_id, "user_id": user_id}
+
+
+def _list_scope(user_id: str, brand_id: Optional[str]) -> Dict[str, Any]:
+    """Brand-aware filter for listing blog posts."""
+    return {"brand_id": brand_id} if brand_id else {"user_id": user_id}
+
 # ── System prompt template ─────────────────────────────────────────────────
 # Uses __PLACEHOLDER__ style to avoid conflicts with Python str.format().
 
@@ -201,18 +213,21 @@ class BlogGenerationService:
         secondary_keywords: List[str],
         word_count: int,
         db: AsyncIOMotorDatabase,
+        brand_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Generate a blog post that sounds like the brand owner wrote it.
-        Fetches Writing DNA + brand profile from DB, injects into the system prompt.
+        Fetches the active brand's Writing DNA + brand profile, injects into the prompt.
         """
 
-        # Fetch Writing DNA (optional — generation works without it)
-        dna_prompt = await WritingDNAService.get_prompt(user_id, db)
+        # Fetch Writing DNA for the active brand (optional — works without it)
+        dna_prompt = await WritingDNAService.get_prompt(user_id, db, brand_id=brand_id)
 
-        # Fetch brand profile for context
+        # Fetch brand profile for context — scoped to the active brand
         brand_ctx: Dict[str, Any] = {}
-        raw_profile = await db["brand_profiles"].find_one({"user_id": user_id})
+        raw_profile = await db["brand_profiles"].find_one(
+            {"brand_id": brand_id} if brand_id else {"user_id": user_id}
+        )
         if raw_profile:
             raw_profile.pop("_id", None)
             brand_ctx = BrandProfileService.to_brand_context(raw_profile)
@@ -299,6 +314,7 @@ class BlogGenerationService:
         doc = {
             "id": blog_id,
             "user_id": user_id,
+            "brand_id": brand_id,
             "topic": topic,
             "primary_keyword": primary_keyword,
             "secondary_keywords": secondary_keywords,
@@ -342,19 +358,17 @@ class BlogGenerationService:
         })
 
     @staticmethod
-    async def list_posts(user_id: str, db: AsyncIOMotorDatabase) -> Dict[str, Any]:
+    async def list_posts(user_id: str, db: AsyncIOMotorDatabase, brand_id: Optional[str] = None) -> Dict[str, Any]:
         cursor = db[BLOG_POSTS_COLLECTION].find(
-            {"user_id": user_id},
+            _list_scope(user_id, brand_id),
             {"_id": 0, "generated_content": 0, "current_content": 0},
         ).sort("created_at", -1).limit(50)
         posts = await cursor.to_list(length=50)
         return UriResponse.get_list_data_response("blog_post", posts)
 
     @staticmethod
-    async def get_post(blog_id: str, user_id: str, db: AsyncIOMotorDatabase) -> Dict[str, Any]:
-        doc = await db[BLOG_POSTS_COLLECTION].find_one(
-            {"id": blog_id, "user_id": user_id}
-        )
+    async def get_post(blog_id: str, user_id: str, db: AsyncIOMotorDatabase, brand_id: Optional[str] = None) -> Dict[str, Any]:
+        doc = await db[BLOG_POSTS_COLLECTION].find_one(_post_scope(blog_id, user_id, brand_id))
         if not doc:
             return UriResponse.get_single_data_response("blog_post", None)
         doc.pop("_id", None)
@@ -367,12 +381,14 @@ class BlogGenerationService:
         new_content: str,
         new_title: Optional[str],
         db: AsyncIOMotorDatabase,
+        brand_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Save user edits. Appends a snapshot to edit_history so the learning
         pipeline can diff original vs edited.
         """
-        doc = await db[BLOG_POSTS_COLLECTION].find_one({"id": blog_id, "user_id": user_id})
+        scope = _post_scope(blog_id, user_id, brand_id)
+        doc = await db[BLOG_POSTS_COLLECTION].find_one(scope)
         if not doc:
             return UriResponse.get_single_data_response("blog_post", None)
 
@@ -390,14 +406,14 @@ class BlogGenerationService:
             update["current_title"] = new_title
 
         await db[BLOG_POSTS_COLLECTION].update_one(
-            {"id": blog_id},
+            scope,
             {
                 "$set": update,
                 "$push": {"edit_history": history_entry},
             },
         )
 
-        updated = await db[BLOG_POSTS_COLLECTION].find_one({"id": blog_id})
+        updated = await db[BLOG_POSTS_COLLECTION].find_one(scope)
         if updated:
             updated.pop("_id", None)
         return UriResponse.update_response("blog_post", updated)
@@ -409,10 +425,11 @@ class BlogGenerationService:
         rating: str,
         issues: Optional[List[str]],
         db: AsyncIOMotorDatabase,
+        brand_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Record thumbs-up / thumbs-down feedback."""
         result = await db[BLOG_POSTS_COLLECTION].update_one(
-            {"id": blog_id, "user_id": user_id},
+            _post_scope(blog_id, user_id, brand_id),
             {
                 "$set": {
                     "feedback": {
@@ -440,6 +457,7 @@ class BlogGenerationService:
         user_id: str,
         published_url: Optional[str],
         db: AsyncIOMotorDatabase,
+        brand_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         update: Dict[str, Any] = {
             "status": "published",
@@ -450,7 +468,7 @@ class BlogGenerationService:
             update["published_url"] = published_url
 
         result = await db[BLOG_POSTS_COLLECTION].update_one(
-            {"id": blog_id, "user_id": user_id},
+            _post_scope(blog_id, user_id, brand_id),
             {"$set": update},
         )
         if result.matched_count == 0:

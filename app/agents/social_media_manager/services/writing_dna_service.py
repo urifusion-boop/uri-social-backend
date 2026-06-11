@@ -22,6 +22,16 @@ _client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
 
 COLLECTION = "writing_dna"
 
+
+def _scope(user_id: str, brand_id: Optional[str]) -> Dict[str, str]:
+    """
+    Brand-aware filter for the Writing DNA doc. brand_id is the isolation
+    boundary (Agency Accounts); falls back to user_id for legacy/solo callers
+    that haven't passed a brand yet.
+    """
+    return {"brand_id": brand_id} if brand_id else {"user_id": user_id}
+
+
 # ── Answer → key mappings (A/B/C/D → semantic key) ────────────────────────
 
 OPENING_MAP = {
@@ -647,13 +657,16 @@ class WritingDNAService:
         quiz_answers: Dict[str, str],
         writing_sample: Optional[str],
         db: AsyncIOMotorDatabase,
+        brand_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Generate and persist Writing DNA for a user."""
+        """Generate and persist Writing DNA for the active brand."""
         result = await WritingDNAService.generate_dna(quiz_answers, writing_sample)
 
         now = datetime.utcnow()
+        scope = _scope(user_id, brand_id)
         doc = {
             "user_id": user_id,
+            "brand_id": brand_id,
             "quiz_answers": quiz_answers,
             "sample_text": writing_sample or "",
             "sample_analysis": result["sample_analysis"],
@@ -668,43 +681,43 @@ class WritingDNAService:
             "updated_at": now,
         }
 
-        existing = await db[COLLECTION].find_one({"user_id": user_id})
+        existing = await db[COLLECTION].find_one(scope)
         if existing:
-            await db[COLLECTION].update_one({"user_id": user_id}, {"$set": doc})
+            await db[COLLECTION].update_one(scope, {"$set": doc})
         else:
             doc["created_at"] = now
             await db[COLLECTION].insert_one(doc)
 
-        saved = await db[COLLECTION].find_one({"user_id": user_id})
+        saved = await db[COLLECTION].find_one(scope)
         if saved:
             saved.pop("_id", None)
 
-        # Update brand profile with writing_dna_id reference (spec §7)
+        # Link the brand's profile doc to this DNA (spec §7), scoped by brand.
         try:
-            dna_raw = await db[COLLECTION].find_one({"user_id": user_id}, {"_id": 1})
+            dna_raw = await db[COLLECTION].find_one(scope, {"_id": 1})
             if dna_raw:
                 await db["brand_profiles"].update_one(
-                    {"user_id": user_id},
+                    _scope(user_id, brand_id) if brand_id else {"user_id": user_id},
                     {"$set": {"writing_dna_id": str(dna_raw["_id"]), "updated_at": now}},
                 )
         except Exception as e:
             print(f"⚠️ Could not update brand profile writing_dna_id: {e}")
 
-        print(f"✅ Writing DNA saved for user={user_id}")
+        print(f"✅ Writing DNA saved for brand={brand_id or user_id}")
         return UriResponse.create_response("writing_dna", saved)
 
     @staticmethod
-    async def get(user_id: str, db: AsyncIOMotorDatabase) -> Dict[str, Any]:
-        doc = await db[COLLECTION].find_one({"user_id": user_id})
+    async def get(user_id: str, db: AsyncIOMotorDatabase, brand_id: Optional[str] = None) -> Dict[str, Any]:
+        doc = await db[COLLECTION].find_one(_scope(user_id, brand_id))
         if not doc:
             return UriResponse.get_single_data_response("writing_dna", None)
         doc.pop("_id", None)
         return UriResponse.get_single_data_response("writing_dna", doc)
 
     @staticmethod
-    async def get_prompt(user_id: str, db: AsyncIOMotorDatabase) -> Optional[str]:
+    async def get_prompt(user_id: str, db: AsyncIOMotorDatabase, brand_id: Optional[str] = None) -> Optional[str]:
         """Return just the DNA prompt string, or None if not set up."""
-        doc = await db[COLLECTION].find_one({"user_id": user_id}, {"writing_dna_prompt": 1})
+        doc = await db[COLLECTION].find_one(_scope(user_id, brand_id), {"writing_dna_prompt": 1})
         if not doc:
             return None
         return doc.get("writing_dna_prompt") or None
@@ -715,6 +728,7 @@ class WritingDNAService:
         original_content: str,
         edited_content: str,
         db: AsyncIOMotorDatabase,
+        brand_id: Optional[str] = None,
     ) -> None:
         """
         Compare the AI-generated blog with the user's edited version.
@@ -760,40 +774,37 @@ class WritingDNAService:
             adjustments: List[str] = result.get("voice_adjustments", [])
 
             if adjustments:
+                scope = _scope(user_id, brand_id)
                 learned_block = "\n\nLEARNED FROM YOUR EDITS:\n" + "\n".join(
                     f"- {adj}" for adj in adjustments[:5]
                 )
                 await db[COLLECTION].update_one(
-                    {"user_id": user_id},
+                    scope,
                     {"$set": {"updated_at": datetime.utcnow()},
                      "$push": {"learning_history": {
                          "adjustments": adjustments,
                          "learned_at": datetime.utcnow(),
                      }}},
                 )
-                # Append adjustments to the DNA prompt text
-                await db[COLLECTION].update_one(
-                    {"user_id": user_id},
-                    {"$set": {"updated_at": datetime.utcnow()}},
-                )
-                doc = await db[COLLECTION].find_one({"user_id": user_id})
+                doc = await db[COLLECTION].find_one(scope)
                 if doc:
                     existing_prompt = doc.get("writing_dna_prompt", "")
                     updated_prompt = existing_prompt + learned_block
                     await db[COLLECTION].update_one(
-                        {"user_id": user_id},
+                        scope,
                         {"$set": {"writing_dna_prompt": updated_prompt}},
                     )
-                    print(f"🧠 Writing DNA updated with {len(adjustments)} learned adjustment(s) for user={user_id}")
+                    print(f"🧠 Writing DNA updated with {len(adjustments)} learned adjustment(s) for brand={brand_id or user_id}")
 
         except Exception as e:
-            print(f"⚠️ learn_from_edits failed for user={user_id}: {e}")
+            print(f"⚠️ learn_from_edits failed for brand={brand_id or user_id}: {e}")
 
     @staticmethod
     async def accumulate_published_sample(
         user_id: str,
         published_content: str,
         db: AsyncIOMotorDatabase,
+        brand_id: Optional[str] = None,
     ) -> None:
         """
         Spec §8.3 — Sample Accumulation.
@@ -822,11 +833,12 @@ class WritingDNAService:
                 sample_block = "\n\nLEARNED FROM PUBLISHED POST:\n" + "\n".join(
                     f"- {ins}" for ins in insights[:4]
                 )
-                doc = await db[COLLECTION].find_one({"user_id": user_id})
+                scope = _scope(user_id, brand_id)
+                doc = await db[COLLECTION].find_one(scope)
                 if doc:
                     updated_prompt = doc.get("writing_dna_prompt", "") + sample_block
                     await db[COLLECTION].update_one(
-                        {"user_id": user_id},
+                        scope,
                         {
                             "$set": {"writing_dna_prompt": updated_prompt, "updated_at": datetime.utcnow()},
                             "$push": {
@@ -837,7 +849,7 @@ class WritingDNAService:
                             },
                         },
                     )
-                    print(f"📚 DNA enriched from published post for user={user_id} ({len(insights)} insights)")
+                    print(f"📚 DNA enriched from published post for brand={brand_id or user_id} ({len(insights)} insights)")
 
         except Exception as e:
-            print(f"⚠️ accumulate_published_sample failed for user={user_id}: {e}")
+            print(f"⚠️ accumulate_published_sample failed for brand={brand_id or user_id}: {e}")
