@@ -159,11 +159,14 @@ async def upload_reference_image(
             "status": guide.status,
         }
 
-        return UriResponse.create_response("Custom Visual Guide", 
+        return UriResponse.create_response("Custom Visual Guide",
             data=response_data,
             message="Custom visual guide created successfully! Review the preview below.",
         )
 
+    except HTTPException:
+        # Re-raise HTTPException as-is (preserves status codes like 400, 409)
+        raise
     except Exception as e:
         print(f"[API] ❌ Error uploading reference image: {e}")
         raise HTTPException(status_code=500, detail=str(e))
