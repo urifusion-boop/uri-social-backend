@@ -156,7 +156,7 @@ async def upload_reference_image(
             "status": guide.status,
         }
 
-        return UriResponse.success(
+        return UriResponse.create_response("Custom Visual Guide", 
             data=response_data,
             message="Custom visual guide created successfully! Review the preview below.",
         )
@@ -216,7 +216,7 @@ async def get_user_guides(
                 "status": guide["status"],
             })
 
-        return UriResponse.success(
+        return UriResponse.create_response("Custom Visual Guide", 
             data={"guides": guides_list, "count": len(guides_list)},
             message=f"Found {len(guides_list)} custom guides"
         )
@@ -272,7 +272,7 @@ async def get_guide_detail(
             "status": guide["status"],
         }
 
-        return UriResponse.success(data=response_data)
+        return UriResponse.create_response("Custom Visual Guide", data=response_data)
 
     except Exception as e:
         print(f"[API] ❌ Error fetching guide detail: {e}")
@@ -317,7 +317,7 @@ async def update_guide_font(
             {"$set": update_data}
         )
 
-        return UriResponse.success(
+        return UriResponse.create_response("Custom Visual Guide", 
             message="Font selection updated successfully"
         )
 
@@ -353,7 +353,7 @@ async def archive_guide(
         if result.modified_count == 0:
             raise HTTPException(status_code=404, detail="Guide not found")
 
-        return UriResponse.success(
+        return UriResponse.create_response("Custom Visual Guide", 
             message="Custom visual guide archived successfully"
         )
 
@@ -419,7 +419,7 @@ async def rematch_guide_fonts(
             }
         )
 
-        return UriResponse.success(
+        return UriResponse.create_response("Custom Visual Guide", 
             data={
                 "match_outcome": match_outcome["outcome"],
                 "matched_font_id": match_outcome.get("matched_font_id"),
@@ -459,7 +459,7 @@ async def auto_rematch_after_font_upload(
             user_id, new_font_id, db
         )
 
-        return UriResponse.success(
+        return UriResponse.create_response("Custom Visual Guide", 
             data={
                 "updated_guide_ids": updated_guide_ids,
                 "count": len(updated_guide_ids),
@@ -513,7 +513,7 @@ async def track_guide_usage(
         }
         await db["guide_usage_events"].insert_one(usage_event)
 
-        return UriResponse.success(message="Usage tracked")
+        return UriResponse.create_response("Custom Visual Guide", message="Usage tracked")
 
     except Exception as e:
         print(f"[API] ❌ Error tracking usage: {e}")
