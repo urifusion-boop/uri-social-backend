@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any, AsyncGenerator
 from datetime import datetime
 
-from app.dependencies import get_db_dependency
+from app.dependencies import get_db_dependency, get_active_brand_context
 from app.core.auth_bearer import JWTBearer
 from app.core.config import settings
 from app.domain.responses.uri_response import UriResponse
@@ -3825,15 +3825,12 @@ async def trigger_auto_generate(
 
 @router.get("/brand-profile")
 async def get_brand_profile(
+    ctx: dict = Depends(get_active_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
 ):
-    """Get the brand profile (onboarding data) for the current user."""
-    user_id = _get_user_id(token)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="User ID not found in token")
+    """Get the brand profile (onboarding data) for the active brand."""
     try:
-        return await BrandProfileService.get(user_id, db)
+        return await BrandProfileService.get(ctx["user_id"], db, brand_id=ctx["brand_id"])
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -3934,13 +3931,11 @@ async def upload_sample_template(
 @router.post("/brand-profile")
 async def save_brand_profile(
     request: BrandProfileRequest,
+    ctx: dict = Depends(get_active_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
 ):
-    """Save or update the brand profile for the current user."""
-    user_id = _get_user_id(token)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="User ID not found in token")
+    """Save or update the brand profile for the active brand."""
+    user_id = ctx["user_id"]
     try:
         payload = request.dict(exclude_none=True)
         # Serialize nested Pydantic models to plain dicts
@@ -3956,7 +3951,7 @@ async def save_brand_profile(
                 tm.dict() if hasattr(tm, "dict") else tm
                 for tm in payload["team_members"]
             ]
-        return await BrandProfileService.save(user_id, payload, db)
+        return await BrandProfileService.save(user_id, payload, db, brand_id=ctx["brand_id"])
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

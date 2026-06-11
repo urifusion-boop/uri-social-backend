@@ -13,11 +13,13 @@ class BrandProfileService:
         user_id: str,
         data: Dict[str, Any],
         db: AsyncIOMotorDatabase,
+        brand_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         now = datetime.utcnow()
 
         doc = {
             "user_id": user_id,
+            "brand_id": brand_id,
             "brand_name": data.get("brand_name", ""),
             "industry": data.get("industry", ""),
             "website": data.get("website", ""),
@@ -95,7 +97,9 @@ class BrandProfileService:
         if "custom_font_directive" in data:
             doc["custom_font_directive"] = data["custom_font_directive"]
 
-        existing = await db[BrandProfileService.COLLECTION].find_one({"user_id": user_id})
+        # brand_id is the isolation boundary; fall back to user_id for solo/legacy.
+        scope = {"brand_id": brand_id} if brand_id else {"user_id": user_id}
+        existing = await db[BrandProfileService.COLLECTION].find_one(scope)
 
         # OPTION 2: ONBOARDING VALIDATION - Enforce required fields
         # Only validate when user is ACTIVELY TRYING to complete onboarding (transition from False→True)
@@ -116,22 +120,23 @@ class BrandProfileService:
             # Once onboarding_completed is True, never allow it to be reset to False
             if existing.get("onboarding_completed") and not doc.get("onboarding_completed"):
                 doc["onboarding_completed"] = True
-            print(f"🖼️  SAVE DEBUG user={user_id}: saving logo_position={repr(doc.get('logo_position'))}")
+            print(f"🖼️  SAVE DEBUG brand={brand_id or user_id}: saving logo_position={repr(doc.get('logo_position'))}")
             await db[BrandProfileService.COLLECTION].update_one(
-                {"user_id": user_id}, {"$set": doc}
+                scope, {"$set": doc}
             )
         else:
             doc["created_at"] = now
             await db[BrandProfileService.COLLECTION].insert_one(doc)
 
-        result = await db[BrandProfileService.COLLECTION].find_one({"user_id": user_id})
+        result = await db[BrandProfileService.COLLECTION].find_one(scope)
         if result:
             result.pop("_id", None)
         return UriResponse.get_single_data_response("brand_profile", result)
 
     @staticmethod
-    async def get(user_id: str, db: AsyncIOMotorDatabase) -> Dict[str, Any]:
-        profile = await db[BrandProfileService.COLLECTION].find_one({"user_id": user_id})
+    async def get(user_id: str, db: AsyncIOMotorDatabase, brand_id: Optional[str] = None) -> Dict[str, Any]:
+        scope = {"brand_id": brand_id} if brand_id else {"user_id": user_id}
+        profile = await db[BrandProfileService.COLLECTION].find_one(scope)
         if not profile:
             return UriResponse.get_single_data_response("brand_profile", None)
         profile.pop("_id", None)

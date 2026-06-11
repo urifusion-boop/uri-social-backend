@@ -24,6 +24,7 @@ from app.routers.client_router import router as client_router
 from app.routers.workspace_router import router as workspace_router
 from app.routers.workspace_member_router import router as workspace_member_router
 from app.agents.social_media_manager.routers.blog_router import router as blog_router
+from app.routers.agency_router import router as agency_router
 
 # Initialize Sentry
 initialize_sentry()
@@ -172,6 +173,9 @@ app.include_router(blog_router, prefix="/social-media", tags=["Blog Generator"])
 
 # Include custom visual guides router
 app.include_router(custom_guides_router)
+
+# Include Agency Accounts (agency layer wrapping Jane)
+app.include_router(agency_router, prefix="/social-media", tags=["Agency"])
 
 # Include multi-tenant routers (Enterprise/SDK features)
 app.include_router(client_router)

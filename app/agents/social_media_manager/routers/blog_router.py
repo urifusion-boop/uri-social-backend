@@ -18,14 +18,17 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 
-from app.dependencies import get_db_dependency
+from app.dependencies import get_db_dependency, get_active_brand_context
 from app.core.auth_bearer import JWTBearer
 from app.domain.responses.uri_response import UriResponse
 
 from ..services.writing_dna_service import WritingDNAService
 from ..services.blog_generation_service import BlogGenerationService
+from app.services.AgencyCreditService import AgencyCreditService
 
 router = APIRouter(prefix="/blog", tags=["Blog Generator"])
+
+BLOG_CREDIT_COST = 1.0
 
 
 def _user_id(token: dict) -> str:
@@ -96,7 +99,7 @@ class BlogPublishRequest(BaseModel):
 @router.post("/writing-dna/quiz")
 async def submit_writing_dna_quiz(
     body: WritingDNARequest,
-    token: dict = Depends(JWTBearer()),
+    ctx: dict = Depends(get_active_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """
@@ -104,67 +107,85 @@ async def submit_writing_dna_quiz(
     Optionally include a writing sample for even more accurate voice matching.
     Returns the generated Writing DNA prompt (200-400 words of voice directives).
     """
-    user_id = _user_id(token)
-    answers = body.quiz_answers.dict()
     return await WritingDNAService.save(
-        user_id=user_id,
-        quiz_answers=answers,
+        user_id=ctx["user_id"],
+        quiz_answers=body.quiz_answers.dict(),
         writing_sample=body.writing_sample,
         db=db,
+        brand_id=ctx["brand_id"],
     )
 
 
 @router.get("/writing-dna")
 async def get_writing_dna(
-    token: dict = Depends(JWTBearer()),
+    ctx: dict = Depends(get_active_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
-    """Get the current Writing DNA profile for this user."""
-    user_id = _user_id(token)
-    return await WritingDNAService.get(user_id=user_id, db=db)
+    """Get the current Writing DNA profile for the active brand."""
+    return await WritingDNAService.get(user_id=ctx["user_id"], db=db, brand_id=ctx["brand_id"])
 
 
 @router.post("/generate")
 async def generate_blog(
     body: BlogGenerateRequest,
-    token: dict = Depends(JWTBearer()),
+    ctx: dict = Depends(get_active_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """
-    Generate a blog post using the user's Writing DNA voice profile.
-    If no DNA has been set up yet, falls back to a sensible default voice.
+    Generate a blog post using the active brand's Writing DNA voice profile.
+    Credits are billed to the agency wallet (agency brand) or the user wallet (solo).
     Returns title, meta description, and full blog content in Markdown.
     """
-    user_id = _user_id(token)
-    return await BlogGenerationService.generate(
+    brand_id = ctx["brand_id"]
+    user_id = ctx["user_id"]
+
+    # Gate on credit availability before spending compute (PRD §4.5 — never fail silently)
+    avail = await AgencyCreditService.check_availability(brand_id, BLOG_CREDIT_COST, db)
+    if not avail["allowed"]:
+        return UriResponse.error_response(
+            f"Cannot generate: {avail['reason']}. "
+            f"{'Top up the agency wallet' if avail['reason'] == 'agency_wallet_empty' else 'Raise the brand cap or wait for next month'}."
+        )
+
+    result = await BlogGenerationService.generate(
         user_id=user_id,
         topic=body.topic,
         primary_keyword=body.primary_keyword,
         secondary_keywords=body.secondary_keywords,
         word_count=body.word_count,
         db=db,
+        brand_id=brand_id,
     )
+
+    # Deduct only on success
+    if result.get("status"):
+        await AgencyCreditService.deduct_for_brand(
+            brand_id=brand_id, credits=BLOG_CREDIT_COST, operation="blog_generation",
+            user_id=user_id, db=db,
+        )
+
+    return result
 
 
 @router.get("/posts")
 async def list_blog_posts(
-    token: dict = Depends(JWTBearer()),
+    ctx: dict = Depends(get_active_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
-    """List all generated blog posts for this user (content excluded for performance)."""
-    user_id = _user_id(token)
-    return await BlogGenerationService.list_posts(user_id=user_id, db=db)
+    """List all generated blog posts for the active brand (content excluded)."""
+    return await BlogGenerationService.list_posts(user_id=ctx["user_id"], db=db, brand_id=ctx["brand_id"])
 
 
 @router.get("/posts/{blog_id}")
 async def get_blog_post(
     blog_id: str,
-    token: dict = Depends(JWTBearer()),
+    ctx: dict = Depends(get_active_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
-    """Get a single blog post with full content."""
-    user_id = _user_id(token)
-    return await BlogGenerationService.get_post(blog_id=blog_id, user_id=user_id, db=db)
+    """Get a single blog post with full content (scoped to the active brand)."""
+    return await BlogGenerationService.get_post(
+        blog_id=blog_id, user_id=ctx["user_id"], db=db, brand_id=ctx["brand_id"]
+    )
 
 
 @router.patch("/posts/{blog_id}")
@@ -172,36 +193,30 @@ async def update_blog_post(
     blog_id: str,
     body: BlogUpdateRequest,
     background_tasks: BackgroundTasks,
-    token: dict = Depends(JWTBearer()),
+    ctx: dict = Depends(get_active_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """
     Save user edits to a blog post.
     Diffs the original against the edited version in the background and
-    updates the Writing DNA to improve future generations.
+    updates the active brand's Writing DNA to improve future generations.
     """
-    user_id = _user_id(token)
+    brand_id = ctx["brand_id"]
+    user_id = ctx["user_id"]
 
-    # Fetch original before saving the edit
-    original_doc = await db["blog_posts"].find_one({"id": blog_id, "user_id": user_id})
+    original_doc = await db["blog_posts"].find_one({"id": blog_id, "brand_id": brand_id})
     original_content = original_doc.get("current_content", "") if original_doc else ""
 
     result = await BlogGenerationService.update_post(
-        blog_id=blog_id,
-        user_id=user_id,
-        new_content=body.content,
-        new_title=body.title,
-        db=db,
+        blog_id=blog_id, user_id=user_id, new_content=body.content,
+        new_title=body.title, db=db, brand_id=brand_id,
     )
 
-    # Kick off voice learning in the background (never blocks the response)
     if original_content and original_content.strip() != body.content.strip():
         background_tasks.add_task(
             WritingDNAService.learn_from_edits,
-            user_id=user_id,
-            original_content=original_content,
-            edited_content=body.content,
-            db=db,
+            user_id=user_id, original_content=original_content,
+            edited_content=body.content, db=db, brand_id=brand_id,
         )
 
     return result
@@ -211,20 +226,13 @@ async def update_blog_post(
 async def record_blog_feedback(
     blog_id: str,
     body: BlogFeedbackRequest,
-    token: dict = Depends(JWTBearer()),
+    ctx: dict = Depends(get_active_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
-    """
-    Record 'Does this sound like you?' feedback.
-    Thumbs-down with issues helps refine the Writing DNA over time.
-    """
-    user_id = _user_id(token)
+    """Record 'Does this sound like you?' feedback (scoped to active brand)."""
     return await BlogGenerationService.record_feedback(
-        blog_id=blog_id,
-        user_id=user_id,
-        rating=body.rating,
-        issues=body.issues,
-        db=db,
+        blog_id=blog_id, user_id=ctx["user_id"], rating=body.rating,
+        issues=body.issues, db=db, brand_id=ctx["brand_id"],
     )
 
 
@@ -233,34 +241,30 @@ async def publish_blog_post(
     blog_id: str,
     body: BlogPublishRequest,
     background_tasks: BackgroundTasks,
-    token: dict = Depends(JWTBearer()),
+    ctx: dict = Depends(get_active_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """
     Mark a blog post as published.
     Triggers §8.3 sample accumulation in the background — the published content
-    is analysed and appended to the Writing DNA so future posts improve.
+    is analysed and appended to the active brand's Writing DNA.
     """
-    user_id = _user_id(token)
+    brand_id = ctx["brand_id"]
+    user_id = ctx["user_id"]
 
-    # Capture final content before marking published (may include user edits)
-    blog_doc = await db["blog_posts"].find_one({"id": blog_id, "user_id": user_id})
+    blog_doc = await db["blog_posts"].find_one({"id": blog_id, "brand_id": brand_id})
     published_content = (blog_doc or {}).get("current_content", "")
 
     result = await BlogGenerationService.publish_post(
-        blog_id=blog_id,
-        user_id=user_id,
-        published_url=body.published_url,
-        db=db,
+        blog_id=blog_id, user_id=user_id, published_url=body.published_url,
+        db=db, brand_id=brand_id,
     )
 
-    # §8.3 — accumulate this post as a writing sample in the background
     if published_content and result.get("status"):
         background_tasks.add_task(
             WritingDNAService.accumulate_published_sample,
-            user_id=user_id,
-            published_content=published_content,
-            db=db,
+            user_id=user_id, published_content=published_content,
+            db=db, brand_id=brand_id,
         )
 
     return result
