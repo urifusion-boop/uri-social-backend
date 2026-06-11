@@ -202,9 +202,10 @@ class CustomVisualGuideService:
                 image_bytes = response.content
 
             # Run parallel screening
-            safety_ok, copyright_ok, quality_ok = await asyncio.gather(
+            # NOTE: Copyright check temporarily disabled
+            safety_ok, quality_ok = await asyncio.gather(
                 CustomVisualGuideService._check_content_safety(image_bytes),
-                CustomVisualGuideService._check_copyright(image_url),
+                # CustomVisualGuideService._check_copyright(image_url),  # Temporarily disabled
                 CustomVisualGuideService._check_quality(image_bytes),
             )
 
@@ -213,11 +214,12 @@ class CustomVisualGuideService:
                     status_code=400,
                     detail="Image contains inappropriate content (NSFW, violence, or gore)."
                 )
-            if not copyright_ok:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Image appears to contain copyrighted material (commercial ads, celebrities, or trademarks)."
-                )
+            # Temporarily disabled copyright check
+            # if not copyright_ok:
+            #     raise HTTPException(
+            #         status_code=400,
+            #         detail="Image appears to contain copyrighted material (commercial ads, celebrities, or trademarks)."
+            #     )
             if not quality_ok:
                 raise HTTPException(
                     status_code=400,
