@@ -1,6 +1,10 @@
 # Stage 1: Build
 FROM python:3.13.0-bullseye AS build
 
+# Force rebuild: Custom Visual Guides UriResponse fixes - 2026-06-11
+ARG BUILD_DATE=2026-06-11
+ENV BUILD_DATE=${BUILD_DATE}
+
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
