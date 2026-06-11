@@ -112,8 +112,8 @@ async def upload_reference_image(
             current_count = await CustomVisualGuideService.get_user_guide_count(user_id, db)
             limit = CustomVisualGuideService.PLAN_LIMITS.get(user_plan, 2)
             raise HTTPException(
-                status_code=403,
-                detail=f"You've reached your plan limit of {limit} custom guides. Please upgrade or delete an existing guide."
+                status_code=400,
+                detail=f"You've reached the limit of {limit} custom guides. Please delete an existing guide to upload a new one."
             )
 
         # Process reference image
