@@ -659,13 +659,16 @@ class VideoPolishService:
                 return
 
             # ── Retrieve and store output clips ───────────────────────────
-            # Reap generates captioned clip URLs asynchronously after the main
-            # job completes. Poll up to 3 more minutes waiting for them.
+            # Reap renders captioned clip URLs asynchronously after the main job
+            # completes. Poll up to 15 min waiting for at least one captioned URL.
             await update(job_id, db, progress=92, status_message="Finalising captions…")
             clips = await provider.get_output_clips(provider_job_id)
-            for _ in range(18):  # up to 3 min (18 × 10s)
-                if clips and all(c.get("captioned_clip_url") for c in clips):
-                    break
+            for attempt in range(90):  # up to 15 min (90 × 10s)
+                captioned_count = sum(1 for c in clips if c.get("captioned_clip_url"))
+                if clips and captioned_count == len(clips):
+                    break  # all captioned
+                if clips and captioned_count > 0 and attempt >= 12:
+                    break  # some captioned after 2 min — good enough, don't keep waiting
                 await asyncio.sleep(10)
                 clips = await provider.get_output_clips(provider_job_id)
 
