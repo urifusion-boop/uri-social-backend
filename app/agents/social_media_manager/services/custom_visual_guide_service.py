@@ -83,7 +83,11 @@ class CustomVisualGuideService:
                 "status": "active",
             })
             if existing:
-                raise Exception("You've already uploaded this image as a custom guide.")
+                from fastapi import HTTPException
+                raise HTTPException(
+                    status_code=409,
+                    detail="You've already uploaded this image as a custom guide."
+                )
 
             # Steps 2-4: Parallel screening
             print(f"[CVG] Running safety, quality, and copyright screening...")
@@ -159,16 +163,22 @@ class CustomVisualGuideService:
     @staticmethod
     async def _compute_image_hash(image_url: str) -> str:
         """Compute hash of image for deduplication"""
+        from fastapi import HTTPException
         try:
             async with httpx.AsyncClient(timeout=30) as client:
                 response = await client.get(image_url)
                 if response.status_code != 200:
-                    raise Exception(f"Failed to download image: {response.status_code}")
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Failed to download image: {response.status_code}"
+                    )
                 image_bytes = response.content
                 return hashlib.sha256(image_bytes).hexdigest()
+        except HTTPException:
+            raise
         except Exception as e:
             print(f"[CVG] Error computing image hash: {e}")
-            raise
+            raise HTTPException(status_code=500, detail=str(e))
 
     @staticmethod
     async def _screen_image(image_url: str):
@@ -180,11 +190,15 @@ class CustomVisualGuideService:
         2. Copyright detection (ads, celebrities, trademarks)
         3. Quality checks (resolution, blur, watermarks)
         """
+        from fastapi import HTTPException
         try:
             async with httpx.AsyncClient(timeout=30) as client:
                 response = await client.get(image_url)
                 if response.status_code != 200:
-                    raise Exception(f"Failed to download image: {response.status_code}")
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Failed to download image: {response.status_code}"
+                    )
                 image_bytes = response.content
 
             # Run parallel screening
@@ -195,17 +209,28 @@ class CustomVisualGuideService:
             )
 
             if not safety_ok:
-                raise Exception("Image contains inappropriate content (NSFW, violence, or gore).")
+                raise HTTPException(
+                    status_code=400,
+                    detail="Image contains inappropriate content (NSFW, violence, or gore)."
+                )
             if not copyright_ok:
-                raise Exception("Image appears to contain copyrighted material (commercial ads, celebrities, or trademarks).")
+                raise HTTPException(
+                    status_code=400,
+                    detail="Image appears to contain copyrighted material (commercial ads, celebrities, or trademarks)."
+                )
             if not quality_ok:
-                raise Exception("Image quality is too low (resolution, blur, or heavy watermarks).")
+                raise HTTPException(
+                    status_code=400,
+                    detail="Image quality is too low (resolution, blur, or heavy watermarks)."
+                )
 
             print(f"[CVG] ✅ All screening checks passed")
 
+        except HTTPException:
+            raise
         except Exception as e:
             print(f"[CVG] ❌ Screening failed: {e}")
-            raise
+            raise HTTPException(status_code=500, detail=str(e))
 
     @staticmethod
     async def _check_content_safety(image_bytes: bytes) -> bool:
