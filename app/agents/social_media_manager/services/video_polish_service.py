@@ -277,7 +277,7 @@ class ReapProvider(AbstractClippingProvider):
                         "topic": c.get("topic", ""),
                         "virality_score": c.get("viralityScore", 0),
                         "hook": c.get("hook", ""),
-                        "thumbnail_url": c.get("clipWithCaptionsUrl") or "",
+                        "captioned_clip_url": c.get("clipWithCaptionsUrl") or "",
                     }
                     for c in clips
                     if c.get("clipUrl")
