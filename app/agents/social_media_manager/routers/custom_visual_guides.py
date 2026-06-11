@@ -528,3 +528,36 @@ async def track_guide_usage(
     except Exception as e:
         print(f"[API] ❌ Error tracking usage: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/social-media/custom-guides/cleanup-archived")
+async def cleanup_archived_guides(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Cleanup endpoint to permanently delete all archived custom visual guides
+
+    This allows users to re-upload the same images after deletion.
+    Needed because old code archived guides instead of deleting them.
+    """
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    try:
+        # Delete all archived guides for this user
+        result = await db["custom_visual_guides"].delete_many({
+            "user_id": user_id,
+            "status": "archived"
+        })
+
+        return UriResponse.create_response(
+            "Custom Visual Guide",
+            data={"deleted_count": result.deleted_count},
+            message=f"Deleted {result.deleted_count} archived guides. You can now re-upload these images."
+        )
+
+    except Exception as e:
+        print(f"[API] ❌ Error cleaning up archived guides: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
