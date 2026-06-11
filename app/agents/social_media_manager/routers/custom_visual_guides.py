@@ -339,39 +339,36 @@ async def update_guide_font(
 
 
 @router.delete("/social-media/custom-guides/{guide_id}")
-async def archive_guide(
+async def delete_guide(
     guide_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
     token: dict = Depends(JWTBearer()),
 ):
     """
-    Archive (soft delete) a custom visual guide
+    Permanently delete a custom visual guide
+    This allows users to re-upload the same image after deletion
     """
     user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
     try:
-        result = await db["custom_visual_guides"].update_one(
-            {"_id": ObjectId(guide_id), "user_id": user_id},
-            {
-                "$set": {
-                    "status": "archived",
-                    "archived_at": datetime.utcnow(),
-                }
-            }
+        result = await db["custom_visual_guides"].delete_one(
+            {"_id": ObjectId(guide_id), "user_id": user_id}
         )
 
-        if result.modified_count == 0:
+        if result.deleted_count == 0:
             raise HTTPException(status_code=404, detail="Guide not found")
 
         return UriResponse.delete_response("Custom Visual Guide",
             is_deleted=True,
-            message="Custom visual guide archived successfully"
+            message="Custom visual guide deleted successfully"
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"[API] ❌ Error archiving guide: {e}")
+        print(f"[API] ❌ Error deleting guide: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

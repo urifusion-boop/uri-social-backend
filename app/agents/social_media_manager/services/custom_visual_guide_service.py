@@ -21,6 +21,7 @@ import base64
 import io
 from datetime import datetime
 from motor.motor_asyncio import AsyncIOMotorDatabase
+from pymongo.errors import DuplicateKeyError
 from PIL import Image
 import cv2
 import numpy as np
@@ -71,23 +72,12 @@ class CustomVisualGuideService:
         """
         print(f"[CVG] Starting reference image processing: {name}")
 
+        from fastapi import HTTPException
+
         try:
             # Step 1: Upload validation (image_url already validated by caller)
             image_hash = await CustomVisualGuideService._compute_image_hash(image_url)
             print(f"[CVG] Image hash: {image_hash}")
-
-            # Check for duplicate
-            existing = await db["custom_visual_guides"].find_one({
-                "user_id": user_id,
-                "original_image_hash": image_hash,
-                "status": "active",
-            })
-            if existing:
-                from fastapi import HTTPException
-                raise HTTPException(
-                    status_code=409,
-                    detail="You've already uploaded this image as a custom guide."
-                )
 
             # Steps 2-4: Parallel screening
             print(f"[CVG] Running safety, quality, and copyright screening...")
@@ -145,13 +135,23 @@ class CustomVisualGuideService:
                 "updated_at": datetime.utcnow(),
             }
 
-            result = await db["custom_visual_guides"].insert_one(guide_doc)
-            guide_doc["id"] = str(result.inserted_id)
-            guide_doc["_id"] = result.inserted_id
+            try:
+                result = await db["custom_visual_guides"].insert_one(guide_doc)
+                guide_doc["id"] = str(result.inserted_id)
+                guide_doc["_id"] = result.inserted_id
 
-            print(f"[CVG] ✅ Custom visual guide created: {guide_doc['id']}")
-            return CustomVisualGuide(**guide_doc)
+                print(f"[CVG] ✅ Custom visual guide created: {guide_doc['id']}")
+                return CustomVisualGuide(**guide_doc)
 
+            except DuplicateKeyError:
+                print(f"[CVG] ❌ Duplicate image detected: {image_hash}")
+                raise HTTPException(
+                    status_code=409,
+                    detail="You've already uploaded this image as a custom guide."
+                )
+
+        except HTTPException:
+            raise
         except Exception as e:
             print(f"[CVG] ❌ Error processing reference image: {e}")
             raise
