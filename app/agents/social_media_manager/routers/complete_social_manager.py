@@ -252,7 +252,7 @@ class BrandProfileRequest(BaseModel):
     # Visual style
     style_selections: Optional[List[str]] = None
     style_prompt_fragments: Optional[List[str]] = None
-    selected_custom_guide: Optional[str] = None  # Custom visual guide ID
+    selected_custom_guides: Optional[List[str]] = None  # Custom visual guide IDs (array)
     # Typography
     font_style: Optional[str] = None
     font_style_prompt: Optional[str] = None
@@ -4081,18 +4081,22 @@ async def _generate_image_bg(
                 # First slide: pick style and cache it for this carousel
                 _bp = await db["brand_profiles"].find_one(
                     {"user_id": brand_context.get("user_id", "")},
-                    {"style_selections": 1, "style_prompt_fragments": 1, "style_rotation_index": 1, "industry": 1, "selected_custom_guide": 1},
+                    {"style_selections": 1, "style_prompt_fragments": 1, "style_rotation_index": 1, "industry": 1, "selected_custom_guides": 1},
                 ) or {}
 
-                # Check if user has selected a custom guide
-                _custom_guide_id = _bp.get("selected_custom_guide")
-                if _custom_guide_id:
-                    # Use custom visual guide instead of library styles
+                # Check if user has selected custom guides
+                _custom_guide_ids = _bp.get("selected_custom_guides") or []
+                if _custom_guide_ids:
+                    # Rotate through custom guides like library styles
                     from app.agents.social_media_manager.services.custom_visual_guide_service import CustomVisualGuideService
+                    _rotation_index = int(_bp.get("style_rotation_index") or 0)
+                    _custom_guide_id = _custom_guide_ids[_rotation_index % len(_custom_guide_ids)]
+
                     custom_guide = await CustomVisualGuideService.get_guide_detail(_custom_guide_id, db)
                     if custom_guide:
                         _fragment = custom_guide.get("prompt_fragment", "")
                         _slug = f"custom_{_custom_guide_id[:8]}"
+                        _next_index = (_rotation_index + 1) % (len(_custom_guide_ids) + len(_bp.get("style_selections") or []))
                         brand_context = {**brand_context, "style_prompt_fragment": _fragment, "style_slug": _slug, "custom_guide_id": _custom_guide_id}
                         print(f"🎨 Custom guide [{custom_guide.get('name')}] applied for all {total_slides} carousel slides")
 
@@ -4139,26 +4143,36 @@ async def _generate_image_bg(
                         brand_context = {**brand_context, "style_prompt_fragment": _fragment, "style_slug": _slug}
                         print(f"🎨 Reusing carousel style [{_slug}] for slide {slide_index + 1}/{total_slides}")
         else:
-            # Regular post: check for custom guide first, then fallback to style rotation
+            # Regular post: check for custom guides first, then fallback to style rotation
             _bp = await db["brand_profiles"].find_one(
                 {"user_id": brand_context.get("user_id", "")},
-                {"style_selections": 1, "style_prompt_fragments": 1, "style_rotation_index": 1, "industry": 1, "selected_custom_guide": 1},
+                {"style_selections": 1, "style_prompt_fragments": 1, "style_rotation_index": 1, "industry": 1, "selected_custom_guides": 1},
             ) or {}
 
-            # Check if user has selected a custom guide
-            _custom_guide_id = _bp.get("selected_custom_guide")
-            if _custom_guide_id:
-                # Use custom visual guide instead of library styles
+            # Check if user has selected custom guides
+            _custom_guide_ids = _bp.get("selected_custom_guides") or []
+            if _custom_guide_ids:
+                # Rotate through custom guides like library styles
                 from app.agents.social_media_manager.services.custom_visual_guide_service import CustomVisualGuideService
+                _rotation_index = int(_bp.get("style_rotation_index") or 0)
+                _custom_guide_id = _custom_guide_ids[_rotation_index % len(_custom_guide_ids)]
+
                 custom_guide = await CustomVisualGuideService.get_guide_detail(_custom_guide_id, db)
                 if custom_guide:
                     _fragment = custom_guide.get("prompt_fragment", "")
                     _slug = f"custom_{_custom_guide_id[:8]}"
+                    _next_index = (_rotation_index + 1) % (len(_custom_guide_ids) + len(_bp.get("style_selections") or []))
                     brand_context = {**brand_context, "style_prompt_fragment": _fragment, "style_slug": _slug, "custom_guide_id": _custom_guide_id}
-                    print(f"🎨 Custom guide [{custom_guide.get('name')}] applied for this image")
+                    print(f"🎨 Custom guide [{custom_guide.get('name')}] applied for this image (next index: {_next_index})")
 
                     # Track usage
                     await CustomVisualGuideService.track_guide_usage(_custom_guide_id, False, db)
+
+                    # Update rotation index
+                    await db["brand_profiles"].update_one(
+                        {"user_id": brand_context.get("user_id", "")},
+                        {"$set": {"style_rotation_index": _next_index}}
+                    )
             else:
                 # Fallback to library style rotation
                 _style_selections = _bp.get("style_selections") or []
