@@ -216,7 +216,8 @@ async def get_user_guides(
                 "status": guide["status"],
             })
 
-        return UriResponse.create_response("Custom Visual Guide", 
+        return UriResponse.get_list_data_response(
+            "Custom Visual Guide",
             data={"guides": guides_list, "count": len(guides_list)},
             message=f"Found {len(guides_list)} custom guides"
         )
@@ -272,7 +273,7 @@ async def get_guide_detail(
             "status": guide["status"],
         }
 
-        return UriResponse.create_response("Custom Visual Guide", data=response_data)
+        return UriResponse.get_single_data_response("Custom Visual Guide", data=response_data)
 
     except Exception as e:
         print(f"[API] ❌ Error fetching guide detail: {e}")
@@ -317,7 +318,7 @@ async def update_guide_font(
             {"$set": update_data}
         )
 
-        return UriResponse.create_response("Custom Visual Guide", 
+        return UriResponse.update_response("Custom Visual Guide",
             message="Font selection updated successfully"
         )
 
@@ -353,7 +354,8 @@ async def archive_guide(
         if result.modified_count == 0:
             raise HTTPException(status_code=404, detail="Guide not found")
 
-        return UriResponse.create_response("Custom Visual Guide", 
+        return UriResponse.delete_response("Custom Visual Guide",
+            is_deleted=True,
             message="Custom visual guide archived successfully"
         )
 
@@ -419,7 +421,7 @@ async def rematch_guide_fonts(
             }
         )
 
-        return UriResponse.create_response("Custom Visual Guide", 
+        return UriResponse.update_response("Custom Visual Guide",
             data={
                 "match_outcome": match_outcome["outcome"],
                 "matched_font_id": match_outcome.get("matched_font_id"),
@@ -459,7 +461,7 @@ async def auto_rematch_after_font_upload(
             user_id, new_font_id, db
         )
 
-        return UriResponse.create_response("Custom Visual Guide", 
+        return UriResponse.update_response("Custom Visual Guide",
             data={
                 "updated_guide_ids": updated_guide_ids,
                 "count": len(updated_guide_ids),
