@@ -218,6 +218,7 @@ class ReapProvider(AbstractClippingProvider):
             "clipDurations": style_settings.get("clipDurations", [[30, 60]]),
             "prompt": style_settings.get("prompt", ""),
             "language": "en",
+            "captionsPreset": style_settings.get("captionsPreset", "system_beasty"),
             "enableCaptions": True,
             "enableHighlights": True,
         }
@@ -279,7 +280,12 @@ class ReapProvider(AbstractClippingProvider):
                         "topic": c.get("topic", ""),
                         "virality_score": c.get("viralityScore", 0),
                         "hook": c.get("hook", ""),
-                        "captioned_clip_url": c.get("clipWithCaptionsUrl") or "",
+                        # clipWithCaptionsUrl is deprecated — captions are baked into
+                        # clipUrl when captionsPreset is set. Use clipUrl as captioned URL.
+                        "captioned_clip_url": (
+                            c.get("clipWithCaptionsUrl")
+                            or (c.get("clipUrl", "") if c.get("enableCaptions") else "")
+                        ),
                     }
                     for c in clips
                     if c.get("clipUrl")
@@ -659,24 +665,9 @@ class VideoPolishService:
                 return
 
             # ── Retrieve and store output clips ───────────────────────────
-            # Reap renders captioned clip URLs asynchronously after the main job
-            # completes. Poll up to 10 min; update progress so UI doesn't look frozen.
-            await update(job_id, db, progress=92, status_message="Finalising captions…")
+            # Captions are baked into clipUrl synchronously when captionsPreset is set.
+            await update(job_id, db, progress=92, status_message="Fetching your clips…")
             clips = await provider.get_output_clips(provider_job_id)
-            max_caption_attempts = 60  # 10 min (60 × 10s)
-            for attempt in range(max_caption_attempts):
-                captioned_count = sum(1 for c in clips if c.get("captioned_clip_url"))
-                if clips and captioned_count == len(clips):
-                    break  # all captioned
-                if clips and captioned_count > 0 and attempt >= 12:
-                    break  # some captioned after 2 min — proceed
-                if clips and attempt >= 30:
-                    break  # 5 min with no captions — proceed with raw clips
-                # Update progress 92→98% while waiting so UI doesn't look frozen
-                progress = min(92 + int(attempt * 6 / max_caption_attempts), 98)
-                await update(job_id, db, progress=progress)
-                await asyncio.sleep(10)
-                clips = await provider.get_output_clips(provider_job_id)
 
             if not clips:
                 await update(job_id, db, status="failed",
