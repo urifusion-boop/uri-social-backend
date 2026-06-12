@@ -624,13 +624,12 @@ class VideoPolishService:
                 style_doc = DEFAULT_STYLE_PRESETS[1]  # fallback: Clean Professional
             api_settings = dict(style_doc.get("clipping_api_settings", {}))
 
-            # Choose clip duration based on video length — short videos need shorter clips
-            # Reap returns `invalid` if requested clip duration exceeds what source can provide
-            if duration < 300:       # < 5 min → only 0-30s clips
+            # Only force shorter clip durations for videos that can't support 30-60s clips.
+            # A 60s video can yield one 30-60s clip; anything shorter needs the 0-30s range.
+            if duration < 90:
                 api_settings["clipDurations"] = [[0, 30]]
-            elif duration < 600:     # 5-10 min → allow up to 60s
+            else:
                 api_settings["clipDurations"] = [[30, 60]]
-            # longer videos keep whatever the style specifies
 
             # Upload to Reap (gets its own upload ID)
             await update(job_id, db, progress=40, status_message="Processing with AI…")
