@@ -14,9 +14,38 @@ from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+import re as _re
+
 import aiohttp
 
 from app.core.config import settings
+
+
+# ── SRT / transcript utilities ────────────────────────────────────────────────
+
+def _parse_srt(srt_text: str) -> List[Dict[str, Any]]:
+    """Parse SRT text into list of {start, end, text} dicts (times in seconds)."""
+    entries: List[Dict[str, Any]] = []
+    for block in _re.split(r'\n\n+', srt_text.strip()):
+        lines = block.strip().splitlines()
+        if len(lines) < 3:
+            continue
+        m = _re.match(
+            r'(\d+):(\d+):(\d+)[,.](\d+)\s*-->\s*(\d+):(\d+):(\d+)[,.](\d+)',
+            lines[1],
+        )
+        if not m:
+            continue
+        g = [int(x) for x in m.groups()]
+        start = g[0] * 3600 + g[1] * 60 + g[2] + g[3] / 1000
+        end   = g[4] * 3600 + g[5] * 60 + g[6] + g[7] / 1000
+        text  = ' '.join(l.strip() for l in lines[2:] if l.strip())
+        entries.append({'start': start, 'end': end, 'text': text})
+    return entries
+
+
+def _extract_transcript(entries: List[Dict[str, Any]], start: float, end: float) -> str:
+    return ' '.join(e['text'] for e in entries if e['start'] < end and e['end'] > start)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -274,22 +303,143 @@ class ReapProvider(AbstractClippingProvider):
                 return [
                     {
                         "clip_url": c.get("clipUrl", ""),
+                        "start_time": c.get("startTime", 0),
+                        "end_time": c.get("endTime", 0),
                         "duration": c.get("duration", 0),
-                        "caption_text": c.get("caption", ""),
+                        "caption_text": c.get("caption", ""),  # social media caption
                         "title": c.get("title", ""),
                         "topic": c.get("topic", ""),
                         "virality_score": c.get("viralityScore", 0),
                         "hook": c.get("hook", ""),
                         # clipWithCaptionsUrl is deprecated — captions are baked into
-                        # clipUrl when captionsPreset is set. Use clipUrl as captioned URL.
+                        # clipUrl when captionsPreset is set.
                         "captioned_clip_url": (
                             c.get("clipWithCaptionsUrl")
                             or (c.get("clipUrl", "") if c.get("enableCaptions") else "")
                         ),
+                        "transcript": "",  # enriched after transcription completes
                     }
                     for c in clips
                     if c.get("clipUrl")
                 ]
+
+    async def start_transcription(self, upload_id: str, language: str = "en") -> str:
+        """Start a transcription job for the given upload. Returns Reap project ID."""
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{self.BASE}/create-transcription",
+                headers=self._headers(),
+                json={"uploadId": upload_id, "language": language or "en"},
+            ) as resp:
+                if not resp.ok:
+                    print(f"[Reap] create-transcription {resp.status}: {await resp.text()}", flush=True)
+                    return ""
+                data = await resp.json()
+                tid = data.get("id", "")
+                print(f"[Reap] transcription started: {tid}", flush=True)
+                return tid
+
+    async def fetch_srt(self, project_id: str, timeout_seconds: int = 300) -> str:
+        """Poll transcription project and return raw SRT text when done."""
+        poll_interval = 10
+        for _ in range(max(1, timeout_seconds // poll_interval)):
+            await asyncio.sleep(poll_interval)
+            status = await self.get_job_status(project_id)
+            if status == "completed":
+                async with aiohttp.ClientSession() as session:
+                    for endpoint in ("get-project-transcription", "get-project"):
+                        try:
+                            async with session.get(
+                                f"{self.BASE}/{endpoint}",
+                                headers=self._headers(),
+                                params={"projectId": project_id},
+                            ) as resp:
+                                if not resp.ok:
+                                    continue
+                                data = await resp.json()
+                                urls = data.get("urls") or {}
+                                srt_url = urls.get("transcription_srt") or urls.get("srt")
+                                if srt_url:
+                                    async with session.get(srt_url) as r:
+                                        return await r.text()
+                        except Exception as e:
+                            print(f"[Reap] {endpoint} error: {e}", flush=True)
+                return ""
+            if status == "failed":
+                return ""
+        return ""
+
+    async def upload_from_url(self, url: str, filename: str) -> str:
+        """Download a clip from URL and re-upload to Reap. Returns new upload_id."""
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                resp.raise_for_status()
+                video_bytes = await resp.read()
+        return await self.upload_video(video_bytes, filename)
+
+    async def create_reframe(self, upload_id: str, orientation: str = "landscape") -> str:
+        """Start a reframe job. Returns Reap project ID."""
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{self.BASE}/create-reframe",
+                headers=self._headers(),
+                json={"uploadId": upload_id, "orientation": orientation, "genre": "talking"},
+            ) as resp:
+                if not resp.ok:
+                    raise RuntimeError(f"create-reframe {resp.status}: {await resp.text()}")
+                return (await resp.json())["id"]
+
+    async def create_dubbing(self, upload_id: str, source_lang: str, target_lang: str) -> str:
+        """Start a dubbing job. Returns Reap project ID."""
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{self.BASE}/create-dubbing",
+                headers=self._headers(),
+                json={
+                    "uploadId": upload_id,
+                    "sourceLanguage": source_lang,
+                    "targetLanguage": target_lang,
+                },
+            ) as resp:
+                if not resp.ok:
+                    raise RuntimeError(f"create-dubbing {resp.status}: {await resp.text()}")
+                return (await resp.json())["id"]
+
+    async def await_reframe_url(self, project_id: str, timeout_seconds: int = 600) -> str:
+        """Poll a reframe project and return the output video URL when done."""
+        poll_interval = 15
+        for _ in range(max(1, timeout_seconds // poll_interval)):
+            await asyncio.sleep(poll_interval)
+            status = await self.get_job_status(project_id)
+            if status == "completed":
+                # Reframe projects use get-project-clips
+                clips = await self.get_output_clips(project_id)
+                if clips:
+                    return clips[0].get("captioned_clip_url") or clips[0].get("clip_url", "")
+                return ""
+            if status == "failed":
+                return ""
+        return ""
+
+    async def await_dubbing_url(self, project_id: str, timeout_seconds: int = 600) -> str:
+        """Poll a dubbing project and return the dubbed video URL when done."""
+        poll_interval = 15
+        for _ in range(max(1, timeout_seconds // poll_interval)):
+            await asyncio.sleep(poll_interval)
+            status = await self.get_job_status(project_id)
+            if status == "completed":
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        f"{self.BASE}/get-project-status",
+                        headers=self._headers(),
+                        params={"projectId": project_id},
+                    ) as resp:
+                        data = await resp.json() if resp.ok else {}
+                urls = data.get("urls") or {}
+                return urls.get("video") or urls.get("dubbedVideo", "")
+            if status == "failed":
+                return ""
+        return ""
 
 
 def _get_provider() -> AbstractClippingProvider:
@@ -634,7 +784,11 @@ class VideoPolishService:
             # Upload to Reap (gets its own upload ID)
             await update(job_id, db, progress=40, status_message="Processing with AI…")
             upload_id = await provider.upload_video(processed_bytes, f"polish_{job_id}.mp4")
+
+            # Start transcription (uses same upload_id) concurrently with clip job
+            trans_task = asyncio.create_task(provider.start_transcription(upload_id, language or "en"))
             provider_job_id = await provider.create_clip_job(upload_id, api_settings, language)
+            transcription_project_id = await trans_task
             await update(job_id, db, clipping_api_job_id=provider_job_id)
 
             # Poll until done — Reap needs at least 10 min even for short videos
@@ -664,9 +818,21 @@ class VideoPolishService:
                 return
 
             # ── Retrieve and store output clips ───────────────────────────
-            # Captions are baked into clipUrl synchronously when captionsPreset is set.
             await update(job_id, db, progress=92, status_message="Fetching your clips…")
             clips = await provider.get_output_clips(provider_job_id)
+
+            # Enrich clips with actual spoken-word transcript from Reap transcription.
+            # Transcription runs ~2-5 min; clipping runs 15+ min, so it should be ready.
+            if transcription_project_id and clips:
+                await update(job_id, db, progress=95, status_message="Adding transcripts…")
+                srt_text = await provider.fetch_srt(transcription_project_id, timeout_seconds=120)
+                if srt_text:
+                    srt_entries = _parse_srt(srt_text)
+                    for clip in clips:
+                        start = clip.get("start_time", 0)
+                        end = clip.get("end_time") or (start + clip.get("duration", 60))
+                        clip["transcript"] = _extract_transcript(srt_entries, start, end)
+                    print(f"[VideoPolish] transcripts added to {len(clips)} clip(s)", flush=True)
 
             if not clips:
                 await update(job_id, db, status="failed",
@@ -807,6 +973,60 @@ class VideoPolishService:
             import traceback; traceback.print_exc()
             await update(job_id, db, status="failed",
                          status_message="Restyle failed. Please try again.")
+
+    # ── Clip actions (reframe / dub) ───────────────────────────────────────
+
+    @staticmethod
+    async def clip_action(
+        job_id: str,
+        clip_idx: int,
+        action: str,        # "reframe" | "dub"
+        params: Dict[str, Any],
+        user_id: str,
+        db,
+    ) -> Dict[str, Any]:
+        """
+        Download a finished clip and run a secondary Reap operation on it.
+        Returns {"status": "completed"|"failed", "clip_url": "...", "project_id": "..."}.
+        Long-running — call in a background task and poll.
+        """
+        provider = _get_provider()
+        job = await db[VideoPolishService.COLLECTION].find_one(
+            {"job_id": job_id, "user_id": user_id}
+        )
+        if not job:
+            raise ValueError("Job not found")
+        clips: List[Dict] = job.get("output_clips", [])
+        if clip_idx >= len(clips):
+            raise ValueError("Clip index out of range")
+
+        clip = clips[clip_idx]
+        clip_url = clip.get("captioned_clip_url") or clip.get("clip_url", "")
+        if not clip_url:
+            raise ValueError("No clip URL for this clip")
+
+        # Re-upload clip to get a fresh Reap upload_id
+        upload_id = await provider.upload_from_url(
+            clip_url, f"{action}_{job_id}_{clip_idx}.mp4"
+        )
+
+        if action == "reframe":
+            orientation = params.get("orientation", "landscape")
+            project_id = await provider.create_reframe(upload_id, orientation)
+            result_url = await provider.await_reframe_url(project_id)
+        elif action == "dub":
+            source_lang = params.get("source_language", "en")
+            target_lang = params.get("target_language", "es")
+            project_id = await provider.create_dubbing(upload_id, source_lang, target_lang)
+            result_url = await provider.await_dubbing_url(project_id)
+        else:
+            raise ValueError(f"Unknown action: {action}")
+
+        return {
+            "status": "completed" if result_url else "failed",
+            "clip_url": result_url,
+            "project_id": project_id,
+        }
 
     # ── Query ──────────────────────────────────────────────────────────────
 

@@ -5742,3 +5742,73 @@ async def restyle_polish_video(
     return UriResponse.get_single_data_response(
         "polish_video_restyle", {"job_id": new_job_id, "status": "processing"}
     )
+
+
+@router.post("/polish-video-clip-action")
+async def polish_video_clip_action(
+    background_tasks: BackgroundTasks,
+    job_id: str = Form(...),
+    clip_idx: int = Form(...),
+    action: str = Form(...),        # "reframe" | "dub"
+    orientation: str = Form("landscape"),
+    source_language: str = Form("en"),
+    target_language: str = Form("es"),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Trigger a secondary action (reframe or dub) on a specific clip.
+    Long-running — returns an action_job_id to poll via GET /polish-video-clip-action/{id}.
+    """
+    from app.agents.social_media_manager.services.video_polish_service import VideoPolishService
+    import uuid as _uuid
+
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    if action not in ("reframe", "dub"):
+        raise HTTPException(status_code=400, detail="action must be 'reframe' or 'dub'")
+
+    action_job_id = str(_uuid.uuid4())
+    params = {"orientation": orientation, "source_language": source_language, "target_language": target_language}
+
+    async def _run():
+        try:
+            result = await VideoPolishService.clip_action(job_id, clip_idx, action, params, user_id, db)
+            await db["clip_action_jobs"].update_one(
+                {"action_job_id": action_job_id},
+                {"$set": {**result, "action_job_id": action_job_id}},
+                upsert=True,
+            )
+        except Exception as exc:
+            await db["clip_action_jobs"].update_one(
+                {"action_job_id": action_job_id},
+                {"$set": {"status": "failed", "error": str(exc), "action_job_id": action_job_id}},
+                upsert=True,
+            )
+
+    await db["clip_action_jobs"].insert_one({"action_job_id": action_job_id, "status": "processing"})
+    background_tasks.add_task(_run)
+
+    return UriResponse.get_single_data_response(
+        "clip_action", {"action_job_id": action_job_id, "status": "processing"}
+    )
+
+
+@router.get("/polish-video-clip-action/{action_job_id}")
+async def get_polish_video_clip_action(
+    action_job_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """Poll a clip action job (reframe / dub) by its action_job_id."""
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    doc = await db["clip_action_jobs"].find_one({"action_job_id": action_job_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Action job not found")
+
+    return UriResponse.get_single_data_response("clip_action", doc)
