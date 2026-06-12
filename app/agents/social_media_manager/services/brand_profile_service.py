@@ -97,6 +97,20 @@ class BrandProfileService:
         if "custom_font_directive" in data:
             doc["custom_font_directive"] = data["custom_font_directive"]
 
+        # Canvas Editor feature flag
+        if "canvas_editor_enabled" in data:
+            doc["canvas_editor_enabled"] = data["canvas_editor_enabled"]
+
+        # V3 Prompts feature flag
+        if "use_v3_prompts" in data:
+            doc["use_v3_prompts"] = data["use_v3_prompts"]
+
+        # Custom Visual Guides selections
+        if "selected_custom_guides" in data:
+            doc["selected_custom_guides"] = data["selected_custom_guides"]
+        if "style_rotation_index" in data:
+            doc["style_rotation_index"] = data["style_rotation_index"]
+
         # brand_id is the isolation boundary; fall back to user_id for solo/legacy.
         scope = {"brand_id": brand_id} if brand_id else {"user_id": user_id}
         existing = await db[BrandProfileService.COLLECTION].find_one(scope)
