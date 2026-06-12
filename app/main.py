@@ -16,6 +16,7 @@ from app.agents.social_media_manager.routers.linkedin_router import router as li
 from app.agents.social_media_manager.routers.v3_test_router import router as v3_test_router
 from app.agents.social_media_manager.routers.v3_toggle_endpoint import router as v3_toggle_router
 from app.agents.social_media_manager.routers.custom_visual_guides import router as custom_guides_router
+from app.agents.social_media_manager.routers.canvas_editor import router as canvas_editor_router
 from app.routers.auth_router import router as auth_router
 from app.routers.billing_router import router as billing_router
 from app.routers.notification_router import router as notification_router
@@ -173,6 +174,9 @@ app.include_router(blog_router, prefix="/social-media", tags=["Blog Generator"])
 
 # Include custom visual guides router
 app.include_router(custom_guides_router)
+
+# Include Canvas Editor (layered document editing)
+app.include_router(canvas_editor_router, prefix="/social-media", tags=["Canvas Editor"])
 
 # Include Agency Accounts (agency layer wrapping Jane)
 app.include_router(agency_router, prefix="/social-media", tags=["Agency"])

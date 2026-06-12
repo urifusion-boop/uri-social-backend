@@ -4229,23 +4229,83 @@ async def _generate_image_bg(
 
         final_url = stored_url if not stored_url.startswith("data:") else None
         if final_url and db is not None:
+            # ========== CANVAS EDITOR: LAYERED DOCUMENT GENERATION ==========
+            # Check if canvas editor is enabled for this user
+            canvas_doc = None
+            try:
+                _bp = await db["brand_profiles"].find_one(
+                    {"user_id": brand_context.get("user_id", "")},
+                    {"canvas_editor_enabled": 1}
+                )
+                canvas_enabled = _bp.get("canvas_editor_enabled", False) if _bp else False
+
+                if canvas_enabled:
+                    from app.agents.social_media_manager.services.layer_extraction_service import LayerExtractionService
+
+                    print(f"[Canvas Editor] Feature enabled - extracting layers for draft {draft_id}")
+
+                    # Build metadata to help GPT-4 Vision extract layers accurately
+                    prompt_metadata = {
+                        "seed_content": seed_content,
+                        "brand_name": brand_context.get("brand_name", ""),
+                        "logo_position": brand_context.get("logo_position", ""),
+                        "visual_style": brand_context.get("style_slug", ""),
+                    }
+
+                    # Extract layers and create layered document
+                    canvas_doc = await LayerExtractionService.extract_and_create_document(
+                        image_url=final_url,
+                        prompt_metadata=prompt_metadata,
+                        canvas_width=1080,
+                        canvas_height=1080
+                    )
+
+                    print(f"[Canvas Editor] ✅ Extracted {len(canvas_doc.get('layers', []))} layers for draft {draft_id}")
+
+            except Exception as canvas_err:
+                print(f"[Canvas Editor] ⚠️ Layer extraction failed for draft {draft_id}: {canvas_err}")
+                # Continue without canvas document - not a critical failure
+                canvas_doc = None
+
+            # ========== SAVE TO DATABASE ==========
             if post_type == "carousel" and slide_index is not None:
                 # Update the specific slide's image_url in the slides array
+                update_fields = {
+                    f"slides.{slide_index}.image_url": final_url,
+                    f"slides.{slide_index}.image_failed": False,
+                    "has_image": True,
+                }
+
+                # Add canvas document to slide if generated
+                if canvas_doc:
+                    update_fields[f"slides.{slide_index}.document"] = canvas_doc
+                    update_fields[f"slides.{slide_index}.document_version"] = 1
+
                 result = await db["content_drafts"].update_one(
                     {"id": draft_id},
-                    {"$set": {
-                        f"slides.{slide_index}.image_url": final_url,
-                        f"slides.{slide_index}.image_failed": False,
-                        "has_image": True,
-                    }},
+                    {"$set": update_fields}
                 )
                 print(f"✅ BG carousel slide {slide_index} image saved for draft {draft_id}: matched={result.matched_count}")
             else:
+                # Regular post - save both image_url and document
+                update_fields = {
+                    "image_url": final_url,
+                    "has_image": True
+                }
+
+                # Add canvas document if generated
+                if canvas_doc:
+                    update_fields["document"] = canvas_doc
+                    update_fields["document_version"] = 1
+                    update_fields["preview_url"] = final_url  # Use generated image as preview
+
                 result = await db["content_drafts"].update_one(
                     {"id": draft_id},
-                    {"$set": {"image_url": final_url, "has_image": True}},
+                    {"$set": update_fields}
                 )
                 print(f"✅ BG image saved for draft {draft_id}: matched={result.matched_count}")
+                if canvas_doc:
+                    print(f"✅ Canvas document saved for draft {draft_id} with {len(canvas_doc.get('layers', []))} layers")
         else:
             if post_type == "carousel" and slide_index is not None:
                 # Mark slide as failed
