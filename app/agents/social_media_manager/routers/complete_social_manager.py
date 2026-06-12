@@ -5619,12 +5619,23 @@ async def list_video_polish_styles(
     return UriResponse.get_single_data_response("video_polish_styles", styles)
 
 
+@router.get("/video-polish-caption-presets")
+async def list_caption_presets(
+    token: dict = Depends(JWTBearer()),
+):
+    """Return all Reap caption style presets (system + user-created)."""
+    from app.agents.social_media_manager.services.video_polish_service import VideoPolishService
+    presets = await VideoPolishService.list_caption_presets()
+    return UriResponse.get_single_data_response("caption_presets", presets)
+
+
 @router.post("/polish-video")
 async def polish_video(
     background_tasks: BackgroundTasks,
     video: UploadFile = File(...),
     style_preset: str = Form("clean_professional"),
     language: str = Form("en-NG"),
+    captions_preset: str = Form("system_beasty"),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
     token: dict = Depends(JWTBearer()),
 ):
@@ -5673,6 +5684,7 @@ async def polish_video(
         style_preset,
         language,
         db,
+        captions_preset,
     )
 
     return UriResponse.get_single_data_response(

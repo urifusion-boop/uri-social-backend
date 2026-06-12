@@ -238,6 +238,13 @@ class ReapProvider(AbstractClippingProvider):
     async def create_clip_job(
         self, upload_id: str, style_settings: Dict[str, Any], language: str
     ) -> str:
+        base_prompt = style_settings.get("prompt", "")
+        # Always ask for 3-5 clips so Reap doesn't return just 1
+        clip_count_instruction = "Give me exactly 3 to 5 clips."
+        prompt = f"{base_prompt} {clip_count_instruction}".strip()
+        if language and language != "en":
+            prompt = f"[Language context: {language}] " + prompt
+
         payload = {
             "uploadId": upload_id,
             "genre": style_settings.get("genre", "talking"),
@@ -245,14 +252,12 @@ class ReapProvider(AbstractClippingProvider):
             "exportOrientation": style_settings.get("exportOrientation", "portrait"),
             "reframeClips": style_settings.get("reframeClips", True),
             "clipDurations": style_settings.get("clipDurations", [[30, 60]]),
-            "prompt": style_settings.get("prompt", ""),
+            "prompt": prompt,
             "language": "en",
             "captionsPreset": style_settings.get("captionsPreset", "system_beasty"),
             "enableCaptions": True,
             "enableHighlights": True,
         }
-        if language and language != "en":
-            payload["prompt"] = f"[Language context: {language}] " + payload["prompt"]
 
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -325,11 +330,13 @@ class ReapProvider(AbstractClippingProvider):
 
     async def start_transcription(self, upload_id: str, language: str = "en") -> str:
         """Start a transcription job for the given upload. Returns Reap project ID."""
+        # Reap accepts ISO 639-1 codes only (e.g. "en", not "en-NG")
+        lang_code = (language or "en").split("-")[0].split("_")[0]
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 f"{self.BASE}/create-transcription",
                 headers=self._headers(),
-                json={"uploadId": upload_id, "language": language or "en"},
+                json={"uploadId": upload_id, "language": lang_code},
             ) as resp:
                 if not resp.ok:
                     print(f"[Reap] create-transcription {resp.status}: {await resp.text()}", flush=True)
@@ -347,27 +354,42 @@ class ReapProvider(AbstractClippingProvider):
             status = await self.get_job_status(project_id)
             if status == "completed":
                 async with aiohttp.ClientSession() as session:
-                    for endpoint in ("get-project-transcription", "get-project"):
-                        try:
-                            async with session.get(
-                                f"{self.BASE}/{endpoint}",
-                                headers=self._headers(),
-                                params={"projectId": project_id},
-                            ) as resp:
-                                if not resp.ok:
-                                    continue
-                                data = await resp.json()
-                                urls = data.get("urls") or {}
-                                srt_url = urls.get("transcription_srt") or urls.get("srt")
-                                if srt_url:
-                                    async with session.get(srt_url) as r:
-                                        return await r.text()
-                        except Exception as e:
-                            print(f"[Reap] {endpoint} error: {e}", flush=True)
+                    async with session.get(
+                        f"{self.BASE}/get-project-details",
+                        headers=self._headers(),
+                        params={"projectId": project_id},
+                    ) as resp:
+                        if not resp.ok:
+                            print(f"[Reap] get-project-details {resp.status}", flush=True)
+                            return ""
+                        data = await resp.json()
+                    urls = data.get("urls") or {}
+                    srt_url = urls.get("transcription_srt", "")
+                    if srt_url:
+                        async with session.get(srt_url) as r:
+                            srt_text = await r.text()
+                            print(f"[Reap] transcript fetched ({len(srt_text)} chars)", flush=True)
+                            return srt_text
                 return ""
             if status == "failed":
                 return ""
         return ""
+
+    async def get_caption_presets(self) -> List[Dict[str, Any]]:
+        """Return all caption presets from the Reap account (system + user-created)."""
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{self.BASE}/get-all-presets",
+                headers=self._headers(),
+                params={"pageSize": 100},
+            ) as resp:
+                if not resp.ok:
+                    return []
+                data = await resp.json()
+                return [
+                    {"id": p["id"], "name": p["name"], "source": p.get("source", "system")}
+                    for p in data.get("presets", [])
+                ]
 
     async def upload_from_url(self, url: str, filename: str) -> str:
         """Download a clip from URL and re-upload to Reap. Returns new upload_id."""
@@ -682,6 +704,7 @@ class VideoPolishService:
         style_preset: str,
         language: str,
         db,
+        captions_preset: str = "system_beasty",
     ) -> None:
         update = VideoPolishService._update
 
@@ -775,11 +798,13 @@ class VideoPolishService:
             api_settings = dict(style_doc.get("clipping_api_settings", {}))
 
             # Only force shorter clip durations for videos that can't support 30-60s clips.
-            # A 60s video can yield one 30-60s clip; anything shorter needs the 0-30s range.
             if duration < 90:
                 api_settings["clipDurations"] = [[0, 30]]
             else:
                 api_settings["clipDurations"] = [[30, 60]]
+
+            # Override captionsPreset from request (user-chosen or default)
+            api_settings["captionsPreset"] = captions_preset or "system_beasty"
 
             # Upload to Reap (gets its own upload ID)
             await update(job_id, db, progress=40, status_message="Processing with AI…")
@@ -973,6 +998,12 @@ class VideoPolishService:
             import traceback; traceback.print_exc()
             await update(job_id, db, status="failed",
                          status_message="Restyle failed. Please try again.")
+
+    # ── Caption presets ────────────────────────────────────────────────────
+
+    @staticmethod
+    async def list_caption_presets() -> List[Dict[str, Any]]:
+        return await _get_provider().get_caption_presets()
 
     # ── Clip actions (reframe / dub) ───────────────────────────────────────
 
