@@ -5824,3 +5824,76 @@ async def get_polish_video_clip_action(
         raise HTTPException(status_code=404, detail="Action job not found")
 
     return UriResponse.get_single_data_response("clip_action", doc)
+
+
+# ── Video Production (Phase 1 composed pipeline) ──────────────────────────────
+
+@router.post("/produce-video")
+async def produce_video(
+    background_tasks: BackgroundTasks,
+    video: UploadFile = File(...),
+    video_type: str = Form("founder"),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Start a full video production job.
+    video_type: tiktok | product | founder
+    Poll GET /produce-video-job/{job_id} for status and output_url.
+    """
+    import uuid
+    from app.agents.social_media_manager.services.video_production_service import run_production_job
+
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    video_bytes = await video.read()
+    if len(video_bytes) < 1000:
+        raise HTTPException(status_code=400, detail="Invalid video file")
+
+    job_id = str(uuid.uuid4())
+    now = datetime.utcnow().isoformat()
+
+    await db.video_production_jobs.insert_one({
+        "job_id": job_id,
+        "user_id": user_id,
+        "video_type": video_type,
+        "status": "processing",
+        "status_message": "Starting…",
+        "progress": 0,
+        "output_url": None,
+        "render_id": None,
+        "cuts": [],
+        "zooms": [],
+        "pacing_note": "",
+        "srt": "",
+        "created_at": now,
+        "completed_at": None,
+    })
+
+    background_tasks.add_task(run_production_job, job_id, video_bytes, video_type, db)
+
+    return UriResponse.get_single_data_response(
+        "produce_video", {"job_id": job_id, "status": "processing"}
+    )
+
+
+@router.get("/produce-video-job/{job_id}")
+async def get_produce_video_job(
+    job_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """Poll a video production job."""
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    doc = await db.video_production_jobs.find_one(
+        {"job_id": job_id, "user_id": user_id}, {"_id": 0}
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    return UriResponse.get_single_data_response("produce_video_job", doc)
