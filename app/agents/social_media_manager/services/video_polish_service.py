@@ -348,6 +348,14 @@ class ReapProvider(AbstractClippingProvider):
 
     async def fetch_srt(self, project_id: str, timeout_seconds: int = 300) -> str:
         """Poll transcription project and return raw SRT text when done."""
+        srt, _ = await self.fetch_srt_and_source_url(project_id, timeout_seconds)
+        return srt
+
+    async def fetch_srt_and_source_url(
+        self, project_id: str, timeout_seconds: int = 300
+    ) -> tuple[str, str]:
+        """Poll transcription project; return (srt_text, source_video_url).
+        source_video_url may be empty if Reap doesn't expose it."""
         poll_interval = 10
         for _ in range(max(1, timeout_seconds // poll_interval)):
             await asyncio.sleep(poll_interval)
@@ -361,19 +369,28 @@ class ReapProvider(AbstractClippingProvider):
                     ) as resp:
                         if not resp.ok:
                             print(f"[Reap] get-project-details {resp.status}", flush=True)
-                            return ""
+                            return "", ""
                         data = await resp.json()
                     urls = data.get("urls") or {}
+                    print(f"[Reap] project-details urls keys: {list(urls.keys())}", flush=True)
                     srt_url = urls.get("transcription_srt", "")
+                    # Try common Reap field names for the original source video
+                    source_url = (
+                        urls.get("source")
+                        or urls.get("source_video")
+                        or urls.get("video")
+                        or urls.get("original")
+                        or ""
+                    )
+                    srt_text = ""
                     if srt_url:
                         async with session.get(srt_url) as r:
                             srt_text = await r.text()
-                            print(f"[Reap] transcript fetched ({len(srt_text)} chars)", flush=True)
-                            return srt_text
-                return ""
+                            print(f"[Reap] transcript fetched ({len(srt_text)} chars), source_url={bool(source_url)}", flush=True)
+                    return srt_text, source_url
             if status == "failed":
-                return ""
-        return ""
+                return "", ""
+        return "", ""
 
     async def get_caption_presets(self) -> List[Dict[str, Any]]:
         """Return all caption presets from the Reap account (system + user-created)."""
