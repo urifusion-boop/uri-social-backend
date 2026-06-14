@@ -252,10 +252,15 @@ class BrandProfileRequest(BaseModel):
     # Visual style
     style_selections: Optional[List[str]] = None
     style_prompt_fragments: Optional[List[str]] = None
+    style_rotation_index: Optional[int] = None
     selected_custom_guides: Optional[List[str]] = None  # Custom visual guide IDs (array)
     # Typography
     font_style: Optional[str] = None
     font_style_prompt: Optional[str] = None
+    custom_font_enabled: Optional[bool] = None
+    custom_font_files: Optional[List[Dict[str, str]]] = None
+    custom_font_analysis: Optional[Dict[str, Any]] = None
+    custom_font_directive: Optional[str] = None
     # Feature flags
     canvas_editor_enabled: Optional[bool] = None
     use_v3_prompts: Optional[bool] = None
