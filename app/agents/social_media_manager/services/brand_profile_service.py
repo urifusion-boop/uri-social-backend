@@ -99,7 +99,10 @@ class BrandProfileService:
 
         # Canvas Editor feature flag
         if "canvas_editor_enabled" in data:
+            print(f"🎨 Canvas Editor: saving canvas_editor_enabled={data['canvas_editor_enabled']}")
             doc["canvas_editor_enabled"] = data["canvas_editor_enabled"]
+        else:
+            print(f"🎨 Canvas Editor: canvas_editor_enabled NOT in data. Keys: {list(data.keys())[:20]}")
 
         # V3 Prompts feature flag
         if "use_v3_prompts" in data:
