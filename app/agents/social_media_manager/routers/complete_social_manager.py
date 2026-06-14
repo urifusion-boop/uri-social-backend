@@ -256,6 +256,9 @@ class BrandProfileRequest(BaseModel):
     # Typography
     font_style: Optional[str] = None
     font_style_prompt: Optional[str] = None
+    # Feature flags
+    canvas_editor_enabled: Optional[bool] = None
+    use_v3_prompts: Optional[bool] = None
 
 # ==============================================================================
 # CONTENT GENERATION ENDPOINTS
