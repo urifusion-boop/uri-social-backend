@@ -46,6 +46,20 @@ def _get_user_id(token: dict) -> str | None:
     return None
 
 
+def _build_draft_query(draft_id: str, user_id: str = None) -> Dict[str, Any]:
+    """Build MongoDB query for finding drafts by _id (ObjectId) or draft_id field"""
+    from bson import ObjectId
+    try:
+        query = {"_id": ObjectId(draft_id)}
+    except:
+        query = {"draft_id": draft_id}
+
+    if user_id:
+        query["user_id"] = user_id
+
+    return query
+
+
 class UpdateLayerRequest(BaseModel):
     layer_id: str
     updates: Dict[str, Any]
@@ -78,11 +92,15 @@ async def get_draft_document(
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
     try:
-        # Fetch draft from database
-        draft = await db["content_drafts"].find_one(
-            {"id": draft_id, "user_id": user_id},
-            {"_id": 0}
-        )
+        # Fetch draft from database by MongoDB _id (ObjectId)
+        from bson import ObjectId
+        try:
+            query = {"_id": ObjectId(draft_id), "user_id": user_id}
+        except:
+            # If not a valid ObjectId, try draft_id field as fallback
+            query = {"draft_id": draft_id, "user_id": user_id}
+
+        draft = await db["content_drafts"].find_one(query, {"_id": 0})
 
         if not draft:
             return UriResponse.error_response(
@@ -137,10 +155,8 @@ async def update_layer(
 
     try:
         # Fetch current draft
-        draft = await db["content_drafts"].find_one(
-            {"id": draft_id, "user_id": user_id},
-            {"_id": 0}
-        )
+        query = _build_draft_query(draft_id, user_id)
+        draft = await db["content_drafts"].find_one(query, {"_id": 0})
 
         if not draft:
             return UriResponse.error_response(
@@ -202,8 +218,9 @@ async def update_layer(
         )
 
         # Save updated document
+        query = _build_draft_query(draft_id)
         await db["content_drafts"].update_one(
-            {"id": draft_id},
+            query,
             {
                 "$set": {
                     "document": document,
@@ -242,10 +259,8 @@ async def undo_edit(
 
     try:
         # Fetch current draft
-        draft = await db["content_drafts"].find_one(
-            {"id": draft_id, "user_id": user_id},
-            {"_id": 0}
-        )
+        query = _build_draft_query(draft_id, user_id)
+        draft = await db["content_drafts"].find_one(query, {"_id": 0})
 
         if not draft:
             return UriResponse.error_response(
@@ -277,8 +292,9 @@ async def undo_edit(
         updated_document = LayeredDocumentService.increment_version(updated_document)
 
         # Save updated document
+        query = _build_draft_query(draft_id)
         await db["content_drafts"].update_one(
-            {"id": draft_id},
+            query,
             {
                 "$set": {
                     "document": updated_document,
@@ -315,10 +331,8 @@ async def redo_edit(
 
     try:
         # Fetch current draft
-        draft = await db["content_drafts"].find_one(
-            {"id": draft_id, "user_id": user_id},
-            {"_id": 0}
-        )
+        query = _build_draft_query(draft_id, user_id)
+        draft = await db["content_drafts"].find_one(query, {"_id": 0})
 
         if not draft:
             return UriResponse.error_response(
@@ -350,8 +364,9 @@ async def redo_edit(
         updated_document = LayeredDocumentService.increment_version(updated_document)
 
         # Save updated document
+        query = _build_draft_query(draft_id)
         await db["content_drafts"].update_one(
-            {"id": draft_id},
+            query,
             {
                 "$set": {
                     "document": updated_document,
@@ -395,10 +410,8 @@ async def render_document(
 
     try:
         # Fetch current draft
-        draft = await db["content_drafts"].find_one(
-            {"id": draft_id, "user_id": user_id},
-            {"_id": 0}
-        )
+        query = _build_draft_query(draft_id, user_id)
+        draft = await db["content_drafts"].find_one(query, {"_id": 0})
 
         if not draft:
             return UriResponse.error_response(
@@ -479,10 +492,8 @@ async def reorder_layers(
 
     try:
         # Fetch current draft
-        draft = await db["content_drafts"].find_one(
-            {"id": draft_id, "user_id": user_id},
-            {"_id": 0}
-        )
+        query = _build_draft_query(draft_id, user_id)
+        draft = await db["content_drafts"].find_one(query, {"_id": 0})
 
         if not draft:
             return UriResponse.error_response(
@@ -507,8 +518,9 @@ async def reorder_layers(
         document = LayeredDocumentService.increment_version(document)
 
         # Save updated document
+        query = _build_draft_query(draft_id)
         await db["content_drafts"].update_one(
-            {"id": draft_id},
+            query,
             {
                 "$set": {
                     "document": document,
@@ -546,10 +558,8 @@ async def delete_layer(
 
     try:
         # Fetch current draft
-        draft = await db["content_drafts"].find_one(
-            {"id": draft_id, "user_id": user_id},
-            {"_id": 0}
-        )
+        query = _build_draft_query(draft_id, user_id)
+        draft = await db["content_drafts"].find_one(query, {"_id": 0})
 
         if not draft:
             return UriResponse.error_response(
@@ -585,8 +595,9 @@ async def delete_layer(
         document = LayeredDocumentService.increment_version(document)
 
         # Save updated document
+        query = _build_draft_query(draft_id)
         await db["content_drafts"].update_one(
-            {"id": draft_id},
+            query,
             {
                 "$set": {
                     "document": document,
@@ -625,10 +636,8 @@ async def get_edit_history(
 
     try:
         # Verify draft ownership
-        draft = await db["content_drafts"].find_one(
-            {"id": draft_id, "user_id": user_id},
-            {"_id": 0, "id": 1}
-        )
+        query = _build_draft_query(draft_id, user_id)
+        draft = await db["content_drafts"].find_one(query, {"_id": 0, "id": 1})
 
         if not draft:
             return UriResponse.error_response(
