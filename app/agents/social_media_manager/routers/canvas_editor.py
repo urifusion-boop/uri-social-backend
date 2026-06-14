@@ -47,12 +47,14 @@ def _get_user_id(token: dict) -> str | None:
 
 
 def _build_draft_query(draft_id: str, user_id: str = None) -> Dict[str, Any]:
-    """Build MongoDB query for finding drafts by _id (ObjectId) or draft_id field"""
+    """Build MongoDB query for finding drafts by _id (ObjectId), id, or draft_id field"""
     from bson import ObjectId
     try:
+        # Try ObjectId first
         query = {"_id": ObjectId(draft_id)}
     except:
-        query = {"draft_id": draft_id}
+        # Fall back to id field (most common) or draft_id field
+        query = {"id": draft_id}
 
     if user_id:
         query["user_id"] = user_id
