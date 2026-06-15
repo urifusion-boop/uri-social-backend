@@ -39,9 +39,7 @@ async def get_active_brand_context(
 
     requested = brand_id or x_brand_id
 
-    if requested:
-        if not await AgencyService.user_has_access_to_brand(user_id, requested, db):
-            raise HTTPException(status_code=403, detail="Access denied to brand")
+    if requested and await AgencyService.user_has_access_to_brand(user_id, requested, db):
         brand = await BrandAccountService.get_brand(requested, db)
         return {
             "user_id": user_id,
@@ -49,7 +47,12 @@ async def get_active_brand_context(
             "agency_id": brand.agency_id if brand else None,
         }
 
-    # No explicit brand → personal solo brand
+    # No brand requested, OR a stale/forbidden brand id (e.g. left in the browser
+    # from a previous user/session) → fall back to this user's own personal brand.
+    # Safe: we only ever fall back to the caller's OWN brand, never another's, so
+    # there is no cross-brand data leak — it just avoids 403-ing the whole app.
+    if requested:
+        print(f"⚠️ brand context: user {user_id} has no access to brand {requested}; falling back to personal brand")
     personal = await BrandAccountService.get_or_create_personal_brand(user_id, db)
     return {"user_id": user_id, "brand_id": personal.brand_id, "agency_id": None}
 
