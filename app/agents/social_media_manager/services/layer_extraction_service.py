@@ -169,7 +169,9 @@ class LayerExtractionService:
     @staticmethod
     def convert_to_document_layers(
         extraction_result: Dict[str, Any],
-        background_url: str
+        background_url: str,
+        canvas_width: int = 1080,
+        canvas_height: int = 1080
     ) -> List[Dict[str, Any]]:
         """
         Convert GPT-4 Vision extraction result to layered document format
@@ -177,6 +179,8 @@ class LayerExtractionService:
         Args:
             extraction_result: Result from extract_layers()
             background_url: URL of the original generated image
+            canvas_width: Canvas width (default: 1080)
+            canvas_height: Canvas height (default: 1080)
 
         Returns:
             List of layer objects ready for LayeredDocumentService
@@ -189,6 +193,10 @@ class LayerExtractionService:
             "type": "ai_generated_background",
             "z_index": 0,
             "url": background_url,
+            "x": 0,
+            "y": 0,
+            "width": canvas_width,
+            "height": canvas_height,
             "locked": True,
             "visible": True,
             "extraction_metadata": {
@@ -307,7 +315,9 @@ class LayerExtractionService:
         # Convert extraction to layers
         layers = LayerExtractionService.convert_to_document_layers(
             extraction_result,
-            image_url
+            image_url,
+            canvas_width,
+            canvas_height
         )
 
         # Add layers to document
