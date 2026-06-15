@@ -261,13 +261,17 @@ def _build_keep_segments(cuts: List[Dict], duration: float) -> List[Dict[str, fl
     return keep
 
 
-def _original_to_timeline(t: float, keep_segments: List[Dict[str, float]]) -> Optional[float]:
-    """Map a timestamp in the original video to its position in the output timeline."""
+def _original_to_timeline(t: float, keep_segments: List[Dict[str, float]], clamp: bool = False) -> Optional[float]:
+    """Map a timestamp in the original video to its position in the output timeline.
+    If clamp=True and t falls in a cut region, returns the start of the next kept segment
+    rather than None — used so caption end-times straddling a cut don't drop the whole caption."""
     offset = 0.0
     for seg in keep_segments:
         seg_dur = seg["src_end"] - seg["src_start"]
         if seg["src_start"] <= t <= seg["src_end"]:
             return offset + (t - seg["src_start"])
+        if clamp and t < seg["src_start"]:
+            return offset  # t is in a cut before this segment — clamp to segment start
         offset += seg_dur
     return None
 
@@ -310,7 +314,7 @@ def build_shotstack_timeline(
 
         if seg_zooms:
             z = seg_zooms[0]
-            clip["scale"] = 1.08 if z.get("intensity") == "strong" else 1.04
+            clip["scale"] = 1.25 if z.get("intensity") == "strong" else 1.15
 
         video_clips.append(clip)
         timeline_pos += seg_dur
@@ -319,7 +323,7 @@ def build_shotstack_timeline(
     caption_clips: List[Dict] = []
     for entry in srt_entries:
         tl_start = _original_to_timeline(entry["start"], keep_segments)
-        tl_end = _original_to_timeline(entry["end"], keep_segments)
+        tl_end = _original_to_timeline(entry["end"], keep_segments, clamp=True)
 
         if tl_start is None or tl_end is None:
             continue
@@ -357,6 +361,7 @@ def build_shotstack_timeline(
                 ),
                 "width": 600,
                 "height": 220,
+                "background": "transparent",
             },
             "start": round(tl_start, 3),
             "length": round(cap_dur, 3),
