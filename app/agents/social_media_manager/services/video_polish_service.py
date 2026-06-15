@@ -376,7 +376,9 @@ class ReapProvider(AbstractClippingProvider):
                     srt_url = urls.get("transcription_srt", "")
                     # Try common Reap field names for the original source video
                     source_url = (
-                        urls.get("source")
+                        urls.get("videoFile")
+                        or urls.get("transcription_source")
+                        or urls.get("source")
                         or urls.get("source_video")
                         or urls.get("video")
                         or urls.get("original")
