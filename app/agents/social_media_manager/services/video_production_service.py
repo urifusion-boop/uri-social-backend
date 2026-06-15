@@ -242,8 +242,7 @@ def build_shotstack_timeline(
 
         if seg_zooms:
             z = seg_zooms[0]
-            scale_to = 1.08 if z.get("intensity") == "strong" else 1.04
-            clip["transform"] = {"scale": {"from": 1.0, "to": scale_to}}
+            clip["scale"] = 1.08 if z.get("intensity") == "strong" else 1.04
 
         video_clips.append(clip)
         timeline_pos += seg_dur
@@ -295,7 +294,7 @@ def build_shotstack_timeline(
             "length": round(cap_dur, 3),
             "position": "bottom",
             "offset": {"x": 0, "y": -0.12},
-            "transition": {"in": "fadeIn", "out": "fadeOut"},
+            "transition": {"in": "fade", "out": "fade"},
         })
 
     return {
