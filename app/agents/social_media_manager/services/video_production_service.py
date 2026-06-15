@@ -319,16 +319,23 @@ def build_shotstack_timeline(
             "start": round(timeline_pos, 3),
             "length": round(seg_dur, 3),
             "fit": "cover",
+            # Quick opacity punch-in on every cut — feels snappy rather than jarring
+            "opacity": [
+                {"from": 0, "to": 1, "start": 0, "length": 0.12,
+                 "interpolation": "bezier", "easing": "easeOutCubic"},
+            ],
+            "transition": {"in": "fade"},
         }
 
         if seg_zooms:
             z = seg_zooms[0]
-            # effect: "zoomIn" / "zoomOut" are Shotstack's built-in Ken Burns zoom —
-            # clip.scale is not a valid Shotstack property and is silently ignored.
             clip["effect"] = "zoomIn" if z.get("intensity") != "strong" else "zoomOut"
-
-        # Fade-in on every cut for a polished transition
-        clip["transition"] = {"in": "fade"}
+            # Slide up slightly as the zoom starts — gives the punch-in energy
+            clip["offset"] = {
+                "x": [{"from": 0, "to": 0, "start": 0, "length": 0.3}],
+                "y": [{"from": -0.03, "to": 0, "start": 0, "length": 0.3,
+                       "interpolation": "bezier", "easing": "easeOutQuart"}],
+            }
 
         video_clips.append(clip)
         timeline_pos += seg_dur
@@ -374,24 +381,30 @@ def build_shotstack_timeline(
             "src": srt_url,
             "font": {
                 "family": "Montserrat",
-                "size": 52,
+                "size": 46,
                 "color": "#ffffff",
-                "weight": 700,
+                "weight": 800,
             },
             "stroke": {
-                "width": 3,
+                "width": 2,
                 "color": "#000000",
                 "opacity": 1,
             },
-            "animation": {"style": "pop"},
+            "animation": {"style": "karaoke"},
+            # Yellow highlight on the active (currently spoken) word
+            "active": {
+                "font": {"color": "#FFD700"},
+                "stroke": {"width": 2, "color": "#000000", "opacity": 1},
+            },
             "style": {"textTransform": "uppercase"},
+            "padding": {"top": 6, "right": 20, "bottom": 6, "left": 20},
         },
         "start": 0,
         "length": "end",
-        "width": 900,
-        "height": 300,
+        "width": 580,      # ~54% of 1080px — tight block, not edge-to-edge
+        "height": 220,
         "position": "bottom",
-        "offset": {"x": 0, "y": 0.05},
+        "offset": {"x": 0, "y": 0.07},
     }]
 
     # ── SFX audio track ───────────────────────────────────────────────────────
