@@ -261,6 +261,15 @@ def _build_keep_segments(cuts: List[Dict], duration: float) -> List[Dict[str, fl
     return keep
 
 
+def _srt_time(seconds: float) -> str:
+    """Format seconds as SRT timestamp HH:MM:SS,mmm"""
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    ms = int((seconds % 1) * 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
 def _original_to_timeline(t: float, keep_segments: List[Dict[str, float]], clamp: bool = False) -> Optional[float]:
     """Map a timestamp in the original video to its position in the output timeline.
     If clamp=True and t falls in a cut region, returns the start of the next kept segment
@@ -284,6 +293,7 @@ def build_shotstack_timeline(
     srt_entries: List[Dict[str, Any]],
     sound_effects: Optional[List[Dict]] = None,
     aspect_ratio: str = "9:16",
+    job_id: str = "",
 ) -> Dict[str, Any]:
     keep_segments = _build_keep_segments(cuts, video_duration)
     total_duration = sum(s["src_end"] - s["src_start"] for s in keep_segments)
@@ -292,12 +302,11 @@ def build_shotstack_timeline(
     video_clips: List[Dict] = []
     timeline_pos = 0.0
 
-    for seg in keep_segments:
+    for i, seg in enumerate(keep_segments):
         seg_dur = seg["src_end"] - seg["src_start"]
         if seg_dur < 0.1:
             continue
 
-        # Does any zoom land in this segment?
         seg_zooms = [z for z in zooms if seg["src_start"] <= float(z.get("at", -1)) < seg["src_end"]]
 
         clip: Dict[str, Any] = {
@@ -314,61 +323,76 @@ def build_shotstack_timeline(
 
         if seg_zooms:
             z = seg_zooms[0]
-            clip["scale"] = 1.25 if z.get("intensity") == "strong" else 1.15
+            # effect: "zoomIn" / "zoomOut" are Shotstack's built-in Ken Burns zoom —
+            # clip.scale is not a valid Shotstack property and is silently ignored.
+            clip["effect"] = "zoomIn" if z.get("intensity") != "strong" else "zoomOut"
+
+        # Fade-in on every cut for a polished transition
+        clip["transition"] = {"in": "fade"}
 
         video_clips.append(clip)
         timeline_pos += seg_dur
 
     # ── Caption track ─────────────────────────────────────────────────────────
+    # Build a remapped SRT with timeline timestamps (after cuts applied) and
+    # host it on our static server. Shotstack's rich-caption asset reads it
+    # natively — gives us built-in animation, stroke, and font rendering without
+    # the html asset's background/visibility quirks.
     caption_clips: List[Dict] = []
+    srt_dir = "/app/static/srt"
+    os.makedirs(srt_dir, exist_ok=True)
+
+    srt_lines: List[str] = []
+    entry_num = 1
     for entry in srt_entries:
         tl_start = _original_to_timeline(entry["start"], keep_segments)
         tl_end = _original_to_timeline(entry["end"], keep_segments, clamp=True)
-
         if tl_start is None or tl_end is None:
             continue
         tl_start = max(0.0, tl_start)
         tl_end = min(total_duration, tl_end)
-        cap_dur = tl_end - tl_start
-        if cap_dur < 0.1:
+        if tl_end - tl_start < 0.1:
             continue
+        srt_lines += [
+            str(entry_num),
+            f"{_srt_time(tl_start)} --> {_srt_time(tl_end)}",
+            entry["text"],
+            "",
+        ]
+        entry_num += 1
 
-        safe_text = (
-            entry["text"]
-            .replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-            .replace('"', "&quot;")
-        )
+    srt_filename = f"{job_id or 'job'}.srt"
+    with open(f"{srt_dir}/{srt_filename}", "w", encoding="utf-8") as f:
+        f.write("\n".join(srt_lines))
 
-        caption_clips.append({
-            "asset": {
-                "type": "html",
-                "html": f"<p>{safe_text}</p>",
-                "css": (
-                    "p {"
-                    "  font-family: 'Montserrat', sans-serif;"
-                    "  font-size: 54px;"
-                    "  font-weight: 900;"
-                    "  color: #ffffff;"
-                    "  text-align: center;"
-                    "  -webkit-text-stroke: 3px #000000;"
-                    "  text-stroke: 3px #000000;"
-                    "  margin: 0;"
-                    "  padding: 0 24px;"
-                    "  line-height: 1.25;"
-                    "}"
-                ),
-                "width": 600,
-                "height": 220,
-                "background": "transparent",
+    srt_url = f"https://api-staging.urisocial.com/static/srt/{srt_filename}"
+    print(f"[VideoProduction] caption SRT written: {srt_dir}/{srt_filename} ({entry_num - 1} entries) → {srt_url}", flush=True)
+
+    caption_clips = [{
+        "asset": {
+            "type": "rich-caption",
+            "src": srt_url,
+            "font": {
+                "family": "Montserrat",
+                "size": 52,
+                "color": "#ffffff",
+                "weight": 700,
             },
-            "start": round(tl_start, 3),
-            "length": round(cap_dur, 3),
-            "position": "bottom",
-            "offset": {"x": 0, "y": -0.12},
-            "transition": {"in": "fade", "out": "fade"},
-        })
+            "stroke": {
+                "width": 3,
+                "color": "#000000",
+                "opacity": 1,
+            },
+            "animation": {"style": "pop"},
+            "style": {"textTransform": "uppercase"},
+        },
+        "start": 0,
+        "length": "end",
+        "width": 900,
+        "height": 300,
+        "position": "bottom",
+        "offset": {"x": 0, "y": 0.05},
+    }]
 
     # ── SFX audio track ───────────────────────────────────────────────────────
     sfx_clips: List[Dict] = []
@@ -503,6 +527,7 @@ async def run_production_job(
             srt_entries=srt_entries,
             sound_effects=sound_effects,
             aspect_ratio="9:16",
+            job_id=job_id,
         )
 
         await update(65, "Rendering video…")
