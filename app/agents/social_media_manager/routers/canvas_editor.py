@@ -47,14 +47,16 @@ def _get_user_id(token: dict) -> str | None:
 
 
 def _build_draft_query(draft_id: str, user_id: str = None) -> Dict[str, Any]:
-    """Build MongoDB query for finding drafts by _id (ObjectId), id, or draft_id field"""
-    from bson import ObjectId
-    try:
-        # Try ObjectId first
-        query = {"_id": ObjectId(draft_id)}
-    except:
-        # Fall back to id field (most common) or draft_id field
-        query = {"id": draft_id}
+    """
+    Build MongoDB query for finding drafts by id field (string UUID).
+
+    Drafts have both:
+    - _id: MongoDB ObjectId (e.g., 6a2ec0c8cd4ddf7472c57771)
+    - id: String UUID field (e.g., 6a2ec0c8983a0a7072557446)
+
+    The frontend sends draft.id (string UUID), so we always query by 'id' field.
+    """
+    query = {"id": draft_id}
 
     if user_id:
         query["user_id"] = user_id
@@ -94,14 +96,8 @@ async def get_draft_document(
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
     try:
-        # Fetch draft from database by MongoDB _id (ObjectId)
-        from bson import ObjectId
-        try:
-            query = {"_id": ObjectId(draft_id), "user_id": user_id}
-        except:
-            # If not a valid ObjectId, try draft_id field as fallback
-            query = {"draft_id": draft_id, "user_id": user_id}
-
+        # Fetch draft from database by id field
+        query = _build_draft_query(draft_id, user_id)
         draft = await db["content_drafts"].find_one(query, {"_id": 0})
 
         if not draft:
