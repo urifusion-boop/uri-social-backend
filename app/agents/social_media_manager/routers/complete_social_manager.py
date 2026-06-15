@@ -101,6 +101,21 @@ def _get_user_id(token: dict) -> str | None:
 
     return None
 
+
+def _brand_scope(user_id: str, brand_id: Optional[str]) -> Dict[str, Any]:
+    """
+    Brand-aware Mongo filter for Jane data (drafts, performance, etc.).
+
+    - Personal/solo brand (or no brand) → filter by user_id. This matches all of
+      the user's existing data (legacy docs + migration-stamped ones).
+    - Agency brand → filter strictly by brand_id, fully isolating that client.
+    """
+    from app.models.brand_account import BrandAccount
+    if brand_id and brand_id != BrandAccount.personal_brand_id(user_id):
+        return {"brand_id": brand_id}
+    return {"user_id": user_id}
+
+
 # Pydantic models for requests
 class BrandContextRequest(BaseModel):
     brand_name: Optional[str] = None
@@ -274,7 +289,7 @@ async def generate_content(
     request: ContentGenerationRequest,
     background_tasks: BackgroundTasks,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer())
+    ctx: dict = Depends(get_active_brand_context),
 ):
     """
     Generate AI-powered social media content with optional images.
@@ -287,9 +302,8 @@ async def generate_content(
     - Deducts 1 credit per campaign generation
     - Blocks if credits = 0 (PRD 8: Credit Exhaustion Behavior)
     """
-    user_id = _get_user_id(token)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="User ID not found in token")
+    user_id = ctx["user_id"]
+    active_brand_id = ctx["brand_id"]
 
     try:
         # ==================== PRD 7.2 & 8: Credit Check ====================
@@ -318,8 +332,9 @@ async def generate_content(
                 )
 
         # ========== OPTION 1: PROGRESSIVE ENFORCEMENT ==========
-        # Load brand profile from onboarding (source of truth).
-        profile_result = await BrandProfileService.get(user_id, db)
+        # Load the ACTIVE BRAND's profile (source of truth) — scoped by brand_id so
+        # agency brands use their own voice/colors, not the personal brand's.
+        profile_result = await BrandProfileService.get(user_id, db, brand_id=active_brand_id)
         profile_data = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
 
         if not profile_data:
@@ -413,6 +428,23 @@ async def generate_content(
                 db=db,
                 reference_image=request.reference_image,
             )
+
+        # Stamp the ACTIVE BRAND on the request + every draft so content is isolated
+        # per brand (agency brands never show another brand's drafts).
+        if result.get("status"):
+            _rd = result.get("responseData", {})
+            _req_id = _rd.get("request_id")
+            _d_ids = [d["id"] for d in _rd.get("drafts", []) if d.get("id")]
+            if _req_id:
+                await db["content_requests"].update_one(
+                    {"id": _req_id}, {"$set": {"brand_id": active_brand_id}}
+                )
+            if _d_ids:
+                await db["content_drafts"].update_many(
+                    {"id": {"$in": _d_ids}}, {"$set": {"brand_id": active_brand_id}}
+                )
+            for d in _rd.get("drafts", []):
+                d["brand_id"] = active_brand_id
 
         # Tag post_type on all resulting drafts in DB
         if result.get("status") and post_type != "feed":
@@ -1893,14 +1925,13 @@ async def deny_content(
 async def unschedule_draft(
     draft_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    ctx: dict = Depends(get_active_brand_context),
 ):
     """Move a scheduled draft back to draft status."""
-    user_id = _get_user_id(token)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="User ID not found in token")
+    user_id = ctx["user_id"]
+    scope = _brand_scope(user_id, ctx["brand_id"])
 
-    draft = await db["content_drafts"].find_one({"id": draft_id})
+    draft = await db["content_drafts"].find_one({**scope, "id": draft_id})
     if not draft:
         raise HTTPException(status_code=404, detail="Draft not found")
 
@@ -1980,25 +2011,22 @@ async def schedule_content(
 @router.get("/scheduled")
 async def get_scheduled_content(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer())
+    ctx: dict = Depends(get_active_brand_context),
 ):
-    """Get all scheduled content for the user"""
-    user_id = _get_user_id(token)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="User ID not found in token")
-    
+    """Get all scheduled content for the active brand"""
+    user_id = ctx["user_id"]
+    scope = _brand_scope(user_id, ctx["brand_id"])
+
     try:
-        # Query scheduled drafts directly by user_id (same pattern as /content-calendar).
-        # Also fall back to request_id lookup for older drafts that may not have user_id
-        # stored directly on the draft document.
-        requests = await db["content_requests"].find({"user_id": user_id}, {"id": 1}).to_list(length=200)
+        # Scoped to the active brand (agency brands isolated; personal brand by user_id).
+        requests = await db["content_requests"].find(scope, {"id": 1}).to_list(length=200)
         request_ids = [req["id"] for req in requests if req.get("id")]
 
         import os as _os
         _scheduled_statuses = ["scheduled", "staging_scheduled", "publish_failed"]
         scheduled_drafts = await db["content_drafts"].find({
             "$or": [
-                {"user_id": user_id, "status": {"$in": _scheduled_statuses}},
+                {**scope, "status": {"$in": _scheduled_statuses}},
                 {"request_id": {"$in": request_ids}, "status": {"$in": _scheduled_statuses}},
             ]
         }).sort("scheduled_date", 1).to_list(length=100)
@@ -2180,12 +2208,10 @@ async def create_draft_from_calendar_day(
 @router.get("/content-calendar/today")
 async def get_today_suggestion(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    ctx: dict = Depends(get_active_brand_context),
 ):
-    """Return today's content suggestion from the active plan."""
-    user_id = _get_user_id(token)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="User ID not found in token")
+    """Return today's content suggestion from the active brand's plan."""
+    user_id = ctx["user_id"]
     result = await cal_svc.get_today_suggestion(user_id, db)
     return UriResponse.get_single_data_response("today_suggestion", result)
 
@@ -2193,28 +2219,24 @@ async def get_today_suggestion(
 @router.get("/content-calendar/performance")
 async def get_calendar_performance(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    ctx: dict = Depends(get_active_brand_context),
 ):
-    """Return aggregated post performance data used for content scoring."""
-    user_id = _get_user_id(token)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="User ID not found in token")
+    """Return aggregated post performance data for the active brand."""
+    user_id = ctx["user_id"]
     from app.services.PerformanceAnalyticsService import PerformanceAnalyticsService
-    data = await PerformanceAnalyticsService.get_user_performance(user_id, db)
+    data = await PerformanceAnalyticsService.get_user_performance(user_id, db, brand_id=ctx["brand_id"])
     return UriResponse.get_single_data_response("performance", data)
 
 
 @router.get("/content-calendar/trends")
 async def get_calendar_trends(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    ctx: dict = Depends(get_active_brand_context),
 ):
-    """Return trending keywords for the user's industry."""
-    user_id = _get_user_id(token)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="User ID not found in token")
+    """Return trending keywords for the active brand's industry."""
+    user_id = ctx["user_id"]
     from app.services.TrendDataService import TrendDataService
-    brand = await BrandProfileService.get(user_id, db)
+    brand = await BrandProfileService.get(user_id, db, brand_id=ctx["brand_id"])
     if isinstance(brand, dict) and "responseData" in brand:
         brand = brand["responseData"]
     brand = brand or {}
@@ -2246,21 +2268,19 @@ async def get_content_calendar(
     limit: int = 50,
     skip: int = 0,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer())
+    ctx: dict = Depends(get_active_brand_context),
 ):
     """
-    Get user's complete content calendar
+    Get the active brand's complete content calendar
 
     Shows all content across different statuses:
     - draft, pending_approval, approved, scheduled, published
     """
-    user_id = _get_user_id(token)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="User ID not found in token")
+    user_id = ctx["user_id"]
 
     try:
-        # Query drafts directly by user_id (stored on every draft document)
-        query: Dict[str, Any] = {"user_id": user_id}
+        # Brand-scoped: agency brands see only their own drafts
+        query: Dict[str, Any] = _brand_scope(user_id, ctx["brand_id"])
 
         if status:
             query["status"] = status
@@ -2411,15 +2431,15 @@ async def get_content_analytics(
 async def get_performance(
     days: int = 30,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer())
+    ctx: dict = Depends(get_active_brand_context),
 ):
     """
-    Fetch real-time post analytics from Outstand for the user's published drafts.
+    Fetch real-time post analytics from Outstand for the active brand's published drafts.
     Returns aggregated summary + per-post breakdown + per-platform summary.
     """
-    user_id = _get_user_id(token)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="User ID not found in token")
+    user_id = ctx["user_id"]
+    brand_id = ctx["brand_id"]
+    _conn_scope = _brand_scope(user_id, brand_id)
 
     from datetime import timedelta
     import asyncio as _asyncio
@@ -2428,10 +2448,9 @@ async def get_performance(
     try:
         date_filter = datetime.utcnow() - timedelta(days=days)
 
-        # Fetch all published drafts — filter date in Python to handle both
-        # datetime objects (real posts) and ISO strings (seeded/legacy posts)
+        # Fetch published drafts for the ACTIVE BRAND only
         all_published = await db["content_drafts"].find({
-            "user_id": user_id,
+            **_brand_scope(user_id, brand_id),
             "status": "published",
         }).sort("published_date", -1).to_list(length=200)
 
@@ -2461,7 +2480,7 @@ async def get_performance(
 
         # Load direct connections — for platform routing
         direct_conns = await db["social_connections"].find(
-            {"user_id": user_id, "connected_via": {"$ne": "outstand"}},
+            {**_conn_scope, "connected_via": {"$ne": "outstand"}},
             {"_id": 0, "platform": 1, "connected_via": 1, "page_access_token": 1,
              "ig_user_id": 1, "linkedin_access_token": 1},
         ).to_list(length=20)
@@ -2470,14 +2489,14 @@ async def get_performance(
         # Load ANY Instagram connection that has a page_access_token (incl. Outstand-linked)
         # so we can look up media from Instagram even for Outstand-published posts.
         all_ig_conns = await db["social_connections"].find(
-            {"user_id": user_id, "platform": "instagram", "page_access_token": {"$exists": True}},
+            {**_conn_scope, "platform": "instagram", "page_access_token": {"$exists": True}},
             {"_id": 0, "ig_user_id": 1, "page_access_token": 1},
         ).to_list(length=5)
         ig_direct = next((c for c in all_ig_conns if c.get("ig_user_id") and c.get("page_access_token")), None)
 
         # Load Facebook direct connection for per-post analytics (same pattern as ig_direct)
         all_fb_conns = await db["social_connections"].find(
-            {"user_id": user_id, "platform": "facebook", "page_access_token": {"$exists": True}},
+            {**_conn_scope, "platform": "facebook", "page_access_token": {"$exists": True}},
             {"_id": 0, "page_id": 1, "page_access_token": 1},
         ).to_list(length=5)
         fb_direct = next((c for c in all_fb_conns if c.get("page_id") and c.get("page_access_token")), None)
@@ -3065,15 +3084,18 @@ async def get_performance(
 async def get_account_metrics(
     days: int = 30,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer())
+    ctx: dict = Depends(get_active_brand_context),
 ):
     """
-    Fetch account-level metrics (followers, engagement totals) for all of the
-    user's connected social accounts via Outstand.
+    Fetch account-level metrics (followers, engagement totals) for the active brand's
+    connected social accounts via Outstand.
     """
-    user_id = _get_user_id(token)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="User ID not found in token")
+    user_id = ctx["user_id"]
+    brand_id = ctx["brand_id"]
+    # Outstand tenant = brand_id for agency brands, user_id for personal brand
+    from app.models.brand_account import BrandAccount as _BA
+    _outstand_tenant = brand_id if brand_id and brand_id != _BA.personal_brand_id(user_id) else user_id
+    _conn_scope = _brand_scope(user_id, brand_id)
 
     import asyncio as _asyncio
     import time as _time
@@ -3085,9 +3107,9 @@ async def get_account_metrics(
         until_ts = int(_time.time())
         since_ts = int((datetime.utcnow() - timedelta(days=days)).timestamp())
 
-        # ── Outstand accounts ─────────────────────────────────────────────────
+        # ── Outstand accounts (scoped to this brand's tenant) ─────────────────
         try:
-            result = await outstand.list_accounts(tenant_id=user_id)
+            result = await outstand.list_accounts(tenant_id=_outstand_tenant)
             outstand_accounts = result.get("data", [])
         except Exception as _os_err:
             print(f"⚠️ Outstand list_accounts failed in account-metrics (non-fatal): {_os_err}")
@@ -3127,9 +3149,9 @@ async def get_account_metrics(
                 print(f"⚠️ Outstand account metrics failed for {account_id}: {e}")
                 return None
 
-        # ── Direct (non-Outstand) connections ─────────────────────────────────
+        # ── Direct (non-Outstand) connections scoped to active brand ──────────
         direct_conns = await db["social_connections"].find(
-            {"user_id": user_id, "connected_via": {"$ne": "outstand"}},
+            {**_conn_scope, "connected_via": {"$ne": "outstand"}},
             {"_id": 0, "platform": 1, "connected_via": 1, "page_access_token": 1,
              "ig_user_id": 1, "page_name": 1, "page_id": 1, "account_name": 1},
         ).to_list(length=20)
@@ -3643,14 +3665,13 @@ async def get_draft_image(
 async def get_draft(
     draft_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    ctx: dict = Depends(get_active_brand_context),
 ):
-    """Get a single draft by ID — poll this to check if an image has been generated."""
-    user_id = _get_user_id(token)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="User ID not found in token")
+    """Get a single draft by ID — scoped to the active brand."""
+    user_id = ctx["user_id"]
+    scope = _brand_scope(user_id, ctx["brand_id"])
 
-    draft = await db["content_drafts"].find_one({"id": draft_id, "user_id": user_id}, {"_id": 0})
+    draft = await db["content_drafts"].find_one({**scope, "id": draft_id}, {"_id": 0})
     if not draft:
         raise HTTPException(status_code=404, detail="Draft not found")
 
