@@ -1,6 +1,6 @@
 """
-Video Production Service — Phase 1
-Pipeline: Upload → Reap transcription → GPT-4o edit decisions → Shotstack render
+Video Production Service — Phase 2
+Pipeline: Upload → FFmpeg audio cleanup → Reap transcription → GPT-4o edit decisions (cuts/zooms/SFX) → Shotstack render (video + captions + SFX audio)
 """
 from __future__ import annotations
 
@@ -61,6 +61,67 @@ async def _compress_for_shotstack(video_bytes: bytes, duration: float) -> bytes:
         os.unlink(in_path)
         if os.path.exists(out_path):
             os.unlink(out_path)
+
+
+# ── Audio cleanup ─────────────────────────────────────────────────────────────
+
+async def _clean_audio(video_bytes: bytes) -> bytes:
+    """
+    Apply FFmpeg audio cleanup before Reap upload:
+    - highpass=f=80: remove low-frequency rumble
+    - loudnorm: normalize to broadcast spec (-16 LUFS, -1.5 TP)
+    Video stream is copied (no re-encode). Falls back to original bytes on failure.
+    """
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+        f.write(video_bytes)
+        in_path = f.name
+    out_path = in_path + "_clean.mp4"
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-i", in_path,
+            "-c:v", "copy",
+            "-af", "highpass=f=80,loudnorm=I=-16:TP=-1.5:LRA=11",
+            "-y", out_path,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            print(f"[AudioClean] ffmpeg failed: {stderr.decode()[-300:]}", flush=True)
+            return video_bytes
+        with open(out_path, "rb") as f:
+            cleaned = f.read()
+        print(f"[AudioClean] {len(video_bytes)//1024}KB → {len(cleaned)//1024}KB (cleaned)", flush=True)
+        return cleaned
+    except Exception as e:
+        print(f"[AudioClean] error: {e}, using original", flush=True)
+        return video_bytes
+    finally:
+        for p in (in_path, out_path):
+            try:
+                if os.path.exists(p):
+                    os.unlink(p)
+            except Exception:
+                pass
+
+
+# ── SFX library ───────────────────────────────────────────────────────────────
+# Set SFX_ENABLED=true in .env.staging after uploading SFX files to /app/static/sfx/
+# on the container (then accessible via https://api-staging.urisocial.com/static/sfx/)
+
+SFX_ENABLED = os.getenv("SFX_ENABLED", "false").lower() == "true"
+
+_SFX_BASE = "https://api-staging.urisocial.com/static/sfx"
+SFX_LIBRARY: Dict[str, str] = {
+    "whoosh":   f"{_SFX_BASE}/whoosh.mp3",    # fast cuts / transitions
+    "impact":   f"{_SFX_BASE}/impact.mp3",    # emphasis zooms / key claims
+    "boom":     f"{_SFX_BASE}/impact.mp3",    # alias → impact
+    "pop":      f"{_SFX_BASE}/pop.mp3",       # caption word / list item
+    "tick":     f"{_SFX_BASE}/tick.mp3",      # subtle emphasis
+    "ding":     f"{_SFX_BASE}/ding.mp3",      # positive / product feature reveal
+    "sparkle":  f"{_SFX_BASE}/ding.mp3",      # alias → ding
+    "swell":    f"{_SFX_BASE}/swell.mp3",     # section change / emotional peak
+}
 
 
 class ShotstackProvider:
@@ -142,6 +203,9 @@ INSTRUCTIONS:
 - zooms: emphasis punch-ins on key words/claims. "at" must be within [0, {duration:.1f}]. intensity: "subtle" or "strong".
 - Be conservative — cutting real speech is worse than leaving silence.
 - For founder type: max 3 cuts, max 2 zooms.
+- sound_effects: contextual audio punctuation at key moments. "at" in seconds within [0, {duration:.1f}].
+  Types: whoosh (fast cut/transition), impact (strong claim/reveal), pop (list item/name drop), ding (positive outcome/win), swell (emotional peak/section change).
+  Max 5 SFX. Be selective — only add where audio clearly enhances impact. For founder type: max 2 SFX.
 
 Return ONLY valid JSON (no markdown):
 {{
@@ -150,6 +214,9 @@ Return ONLY valid JSON (no markdown):
   ],
   "zooms": [
     {{"at": 12.5, "type": "emphasis", "intensity": "subtle", "reason": "key claim"}}
+  ],
+  "sound_effects": [
+    {{"at": 8.2, "type": "impact", "reason": "product reveal"}}
   ],
   "pacing_note": "tight and energetic"
 }}"""
@@ -211,6 +278,7 @@ def build_shotstack_timeline(
     cuts: List[Dict],
     zooms: List[Dict],
     srt_entries: List[Dict[str, Any]],
+    sound_effects: Optional[List[Dict]] = None,
     aspect_ratio: str = "9:16",
 ) -> Dict[str, Any]:
     keep_segments = _build_keep_segments(cuts, video_duration)
@@ -297,13 +365,37 @@ def build_shotstack_timeline(
             "transition": {"in": "fade", "out": "fade"},
         })
 
+    # ── SFX audio track ───────────────────────────────────────────────────────
+    sfx_clips: List[Dict] = []
+    if SFX_ENABLED and sound_effects:
+        for sfx in sound_effects:
+            sfx_type = sfx.get("type", "").lower()
+            sfx_url = SFX_LIBRARY.get(sfx_type, "")
+            if not sfx_url:
+                continue
+            orig_at = float(sfx.get("at", -1))
+            if orig_at < 0 or orig_at > video_duration:
+                continue
+            tl_at = _original_to_timeline(orig_at, keep_segments)
+            if tl_at is None:
+                continue
+            sfx_clips.append({
+                "asset": {
+                    "type": "audio",
+                    "src": sfx_url,
+                    "volume": 0.65,
+                    "trim": 0,
+                },
+                "start": round(tl_at, 3),
+                "length": 1.5,
+            })
+
+    tracks = [{"clips": caption_clips}, {"clips": video_clips}]
+    if sfx_clips:
+        tracks.append({"clips": sfx_clips})
+
     return {
-        "timeline": {
-            "tracks": [
-                {"clips": caption_clips},
-                {"clips": video_clips},
-            ]
-        },
+        "timeline": {"tracks": tracks},
         "output": {
             "format": "mp4",
             "resolution": "hd",
@@ -356,12 +448,13 @@ async def run_production_job(
         print(f"[VideoProduction] job={job_id} {progress}% {message}", flush=True)
 
     try:
-        # ── Stage 1: probe duration + upload to Reap ─────────────────────────
+        # ── Stage 1: probe duration + audio cleanup + upload to Reap ─────────
         await update(5, "Uploading video…")
         duration = _probe_duration(video_bytes)
         print(f"[VideoProduction] duration={duration:.1f}s", flush=True)
 
-        upload_id = await reap.upload_video(video_bytes, f"{job_id}.mp4")
+        cleaned_bytes = await _clean_audio(video_bytes)
+        upload_id = await reap.upload_video(cleaned_bytes, f"{job_id}.mp4")
         if not upload_id:
             raise RuntimeError("Upload to Reap failed")
 
@@ -390,8 +483,9 @@ async def run_production_job(
         decisions = await get_edit_decisions(srt_text, video_type, duration)
         cuts = decisions.get("cuts", [])
         zooms = decisions.get("zooms", [])
+        sound_effects = decisions.get("sound_effects", [])
         pacing_note = decisions.get("pacing_note", "")
-        print(f"[VideoProduction] cuts={len(cuts)} zooms={len(zooms)} pacing={pacing_note}", flush=True)
+        print(f"[VideoProduction] cuts={len(cuts)} zooms={len(zooms)} sfx={len(sound_effects)} pacing={pacing_note}", flush=True)
 
         # ── Stage 4: Build + submit Shotstack render ──────────────────────────
         await update(58, "Building edit timeline…")
@@ -402,6 +496,7 @@ async def run_production_job(
             cuts=cuts,
             zooms=zooms,
             srt_entries=srt_entries,
+            sound_effects=sound_effects,
             aspect_ratio="9:16",
         )
 
@@ -422,6 +517,7 @@ async def run_production_job(
                              output_url=render_url,
                              render_id=render_id,
                              cuts=cuts, zooms=zooms,
+                             sound_effects=sound_effects,
                              pacing_note=pacing_note,
                              srt=srt_text,
                              completed_at=datetime.now(timezone.utc).isoformat())
