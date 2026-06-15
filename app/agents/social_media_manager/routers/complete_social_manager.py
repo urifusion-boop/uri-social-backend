@@ -3303,9 +3303,9 @@ async def get_account_metrics(
                 print(f"⚠️ Instagram direct account metrics failed: {e}")
                 return None
 
-        # ── LinkedIn direct connections ───────────────────────────────────────
+        # ── LinkedIn direct connections (scoped to active brand) ─────────────
         linkedin_conns = await db["social_connections"].find(
-            {"user_id": user_id, "platform": "linkedin", "connection_status": "active"},
+            {**_conn_scope, "platform": "linkedin", "connection_status": "active"},
             {"_id": 0, "linkedin_access_token": 1, "person_urn": 1, "active_author_urn": 1,
              "account_name": 1, "username": 1, "pages": 1, "followers_count": 1},
         ).to_list(length=5)
@@ -3335,9 +3335,10 @@ async def get_account_metrics(
                 # Use cached value from DB if present, otherwise 0
                 followers_count = int(conn.get("followers_count", 0) or 0)
 
-                # post count from DB (always accurate)
+                # post count from DB (always accurate) — scoped to active brand
                 li_drafts = await db["content_drafts"].find(
-                    {"user_id": user_id, "status": "published", "platform": "linkedin",
+                    {**_brand_scope(user_id, brand_id), "status": "published",
+                     "platform": "linkedin",
                      "platform_post_id": {"$exists": True, "$ne": None}},
                     {"_id": 0, "platform_post_id": 1},
                 ).to_list(length=50)
