@@ -309,6 +309,9 @@ def build_shotstack_timeline(
 
         seg_zooms = [z for z in zooms if seg["src_start"] <= float(z.get("at", -1)) < seg["src_end"]]
 
+        # Entry animation: every clip snaps in with a fast opacity flash +
+        # a y-offset slide-up. No `transition` keyword — it conflicts with
+        # the opacity keyframe when there's no clip overlap in the timeline.
         clip: Dict[str, Any] = {
             "asset": {
                 "type": "video",
@@ -319,21 +322,24 @@ def build_shotstack_timeline(
             "start": round(timeline_pos, 3),
             "length": round(seg_dur, 3),
             "fit": "cover",
-            # Quick opacity punch-in on every cut — feels snappy rather than jarring
             "opacity": [
-                {"from": 0, "to": 1, "start": 0, "length": 0.12,
-                 "interpolation": "bezier", "easing": "easeOutCubic"},
+                {"from": 0, "to": 1, "start": 0, "length": 0.08,
+                 "interpolation": "bezier", "easing": "easeOutQuart"},
             ],
-            "transition": {"in": "fade"},
+            "offset": {
+                "x": [{"from": 0, "to": 0, "start": 0, "length": 0.35}],
+                "y": [{"from": -0.04, "to": 0, "start": 0, "length": 0.35,
+                       "interpolation": "bezier", "easing": "easeOutCubic"}],
+            },
         }
 
         if seg_zooms:
             z = seg_zooms[0]
+            # Ken Burns zoom effect on the whole segment + stronger slide for punch
             clip["effect"] = "zoomIn" if z.get("intensity") != "strong" else "zoomOut"
-            # Slide up slightly as the zoom starts — gives the punch-in energy
             clip["offset"] = {
-                "x": [{"from": 0, "to": 0, "start": 0, "length": 0.3}],
-                "y": [{"from": -0.03, "to": 0, "start": 0, "length": 0.3,
+                "x": [{"from": 0, "to": 0, "start": 0, "length": 0.5}],
+                "y": [{"from": -0.07, "to": 0, "start": 0, "length": 0.5,
                        "interpolation": "bezier", "easing": "easeOutQuart"}],
             }
 
