@@ -4287,11 +4287,16 @@ async def _generate_image_bg(
             # Check if canvas editor is enabled for this user
             canvas_doc = None
             try:
+                user_id = brand_context.get("user_id", "")
+                print(f"[Canvas Editor] Checking if enabled for user: {user_id}")
+
                 _bp = await db["brand_profiles"].find_one(
-                    {"user_id": brand_context.get("user_id", "")},
+                    {"user_id": user_id},
                     {"canvas_editor_enabled": 1}
                 )
                 canvas_enabled = _bp.get("canvas_editor_enabled", False) if _bp else False
+
+                print(f"[Canvas Editor] Profile found: {_bp is not None}, Enabled: {canvas_enabled}")
 
                 if canvas_enabled:
                     from app.agents.social_media_manager.services.layer_extraction_service import LayerExtractionService
