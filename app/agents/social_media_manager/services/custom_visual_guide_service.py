@@ -886,42 +886,83 @@ If has_typography is false, omit other fields. Return ONLY valid JSON."""
 
         Assembles aesthetic profile into a reusable prompt fragment.
         """
+        # Helper to safely get values, replacing None with empty string
+        def safe_get(d: Dict, key: str, default: str = '') -> str:
+            val = d.get(key, default)
+            return val if val is not None else default
+
         parts = []
 
         # Visual genre and quality
-        parts.append(f"{aesthetic_profile.get('visual_genre', '')} aesthetic. {aesthetic_profile.get('quality_benchmark', '')}, {aesthetic_profile.get('camera_style', '')}.")
+        genre_parts = [
+            safe_get(aesthetic_profile, 'visual_genre'),
+            'aesthetic.',
+            safe_get(aesthetic_profile, 'quality_benchmark'),
+            safe_get(aesthetic_profile, 'camera_style')
+        ]
+        genre_parts = [p for p in genre_parts if p and p != 'aesthetic.']
+        if genre_parts:
+            parts.append(' '.join(genre_parts) + ('.' if not genre_parts[-1].endswith('.') else ''))
 
         # Color palette
         palette = aesthetic_profile.get("color_palette", {})
         primary_colors = ", ".join(palette.get("primary_colors", []))
-        parts.append(f"{palette.get('saturation', '')} {palette.get('temperature', '')} palette with {primary_colors}, {palette.get('contrast', '')} contrast.")
+        if primary_colors:
+            palette_parts = [
+                safe_get(palette, 'saturation'),
+                safe_get(palette, 'temperature'),
+                f"palette with {primary_colors}",
+                f"{safe_get(palette, 'contrast')} contrast" if safe_get(palette, 'contrast') else ''
+            ]
+            palette_parts = [p for p in palette_parts if p]
+            parts.append(' '.join(palette_parts) + '.')
 
         # Lighting
         light = aesthetic_profile.get("lighting", {})
-        parts.append(f"{light.get('specific_style', '')}. {light.get('quality', '')} {light.get('temperature', '')} light from {light.get('direction', '')}.")
+        light_parts = [
+            safe_get(light, 'specific_style'),
+            safe_get(light, 'quality'),
+            safe_get(light, 'temperature'),
+            f"light from {safe_get(light, 'direction')}" if safe_get(light, 'direction') else ''
+        ]
+        light_parts = [p for p in light_parts if p]
+        if light_parts:
+            parts.append(' '.join(light_parts) + ('.' if not light_parts[-1].endswith('.') else ''))
 
         # Composition
         comp = aesthetic_profile.get("composition", {})
-        parts.append(f"{comp.get('framing', '')} composition with {comp.get('density', '')} framing, {comp.get('depth_treatment', '')} depth treatment.")
+        comp_parts = [
+            f"{safe_get(comp, 'framing')} composition" if safe_get(comp, 'framing') else '',
+            f"with {safe_get(comp, 'density')} framing" if safe_get(comp, 'density') else '',
+            f"{safe_get(comp, 'depth_treatment')} depth treatment" if safe_get(comp, 'depth_treatment') else ''
+        ]
+        comp_parts = [p for p in comp_parts if p]
+        if comp_parts:
+            parts.append(' '.join(comp_parts) + '.')
 
         # Texture and atmosphere
         tex = aesthetic_profile.get("texture_and_atmosphere", {})
         tex_elements = []
-        if tex.get("grain") != "none":
-            tex_elements.append(f"{tex.get('grain', '')} film grain")
-        if tex.get("haze") != "none":
-            tex_elements.append(f"{tex.get('haze', '')} atmospheric haze")
-        tex_elements.append(f"{tex.get('depth_of_field', '')} depth of field")
-        parts.append(". ".join(tex_elements) + ".")
+        if safe_get(tex, "grain") and safe_get(tex, "grain") != "none":
+            tex_elements.append(f"{safe_get(tex, 'grain')} film grain")
+        if safe_get(tex, "haze") and safe_get(tex, "haze") != "none":
+            tex_elements.append(f"{safe_get(tex, 'haze')} atmospheric haze")
+        if safe_get(tex, "depth_of_field"):
+            tex_elements.append(f"{safe_get(tex, 'depth_of_field')} depth of field")
+        if tex_elements:
+            parts.append(". ".join(tex_elements) + ".")
 
         # Mood
         mood = aesthetic_profile.get("mood", {})
         mood_words = [mood.get("primary"), mood.get("secondary")]
         mood_words = [m for m in mood_words if m]
-        parts.append(f"Mood: {', '.join(mood_words)}.")
+        if mood_words:
+            parts.append(f"Mood: {', '.join(mood_words)}.")
 
         # Subject treatment
-        parts.append(aesthetic_profile.get("subject_treatment", "") + ".")
+        subject_treatment = safe_get(aesthetic_profile, "subject_treatment")
+        if subject_treatment:
+            parts.append(subject_treatment + ('.' if not subject_treatment.endswith('.') else ''))
 
         # Anti-aesthetic
         anti = aesthetic_profile.get("anti_aesthetic", [])
