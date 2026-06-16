@@ -885,14 +885,23 @@ If has_typography is false, omit other fields. Return ONLY valid JSON."""
         PRD Section 5.1: Prompt fragment assembly
 
         Assembles aesthetic profile into a reusable prompt fragment.
+
+        IMPORTANT: GPT-4o-mini Vision sometimes returns literal string "null"
+        instead of JSON null. This function filters out all null/None/empty/"null" values.
         """
-        # Helper to safely get values, replacing None with empty string
+        # Helper to safely get values, filtering out None, empty, and "null" string
         def safe_get(d: Dict, key: str, default: str = '') -> str:
             val = d.get(key, default)
             # Treat None, empty string, and literal "null" string as empty
-            if val is None or val == '' or val == 'null':
+            if val is None or val == '' or (isinstance(val, str) and val.lower() == 'null'):
                 return default
             return val
+
+        # Helper to clean array values (filter out null/"null"/None/empty)
+        def clean_array(arr):
+            if not arr:
+                return []
+            return [item for item in arr if item and item not in [None, '', 'null', 'None']]
 
         parts = []
 
@@ -909,7 +918,9 @@ If has_typography is false, omit other fields. Return ONLY valid JSON."""
 
         # Color palette
         palette = aesthetic_profile.get("color_palette", {})
-        primary_colors = ", ".join(palette.get("primary_colors", []))
+        # Clean primary_colors array
+        primary_colors_list = clean_array(palette.get("primary_colors", []))
+        primary_colors = ", ".join(primary_colors_list)
         if primary_colors:
             palette_parts = [
                 safe_get(palette, 'saturation'),
@@ -946,19 +957,22 @@ If has_typography is false, omit other fields. Return ONLY valid JSON."""
         # Texture and atmosphere
         tex = aesthetic_profile.get("texture_and_atmosphere", {})
         tex_elements = []
-        if safe_get(tex, "grain") and safe_get(tex, "grain") != "none":
-            tex_elements.append(f"{safe_get(tex, 'grain')} film grain")
-        if safe_get(tex, "haze") and safe_get(tex, "haze") != "none":
-            tex_elements.append(f"{safe_get(tex, 'haze')} atmospheric haze")
-        if safe_get(tex, "depth_of_field"):
-            tex_elements.append(f"{safe_get(tex, 'depth_of_field')} depth of field")
+        grain = safe_get(tex, "grain")
+        if grain and grain.lower() != "none":
+            tex_elements.append(f"{grain} film grain")
+        haze = safe_get(tex, "haze")
+        if haze and haze.lower() != "none":
+            tex_elements.append(f"{haze} atmospheric haze")
+        dof = safe_get(tex, "depth_of_field")
+        if dof and dof.lower() != "none":
+            tex_elements.append(f"{dof} depth of field")
         if tex_elements:
             parts.append(". ".join(tex_elements) + ".")
 
         # Mood
         mood = aesthetic_profile.get("mood", {})
         mood_words = [safe_get(mood, "primary"), safe_get(mood, "secondary")]
-        mood_words = [m for m in mood_words if m and m != 'null']
+        mood_words = [m for m in mood_words if m]  # safe_get already filters "null"
         if mood_words:
             parts.append(f"Mood: {', '.join(mood_words)}.")
 
@@ -967,8 +981,8 @@ If has_typography is false, omit other fields. Return ONLY valid JSON."""
         if subject_treatment:
             parts.append(subject_treatment + ('.' if not subject_treatment.endswith('.') else ''))
 
-        # Anti-aesthetic
-        anti = aesthetic_profile.get("anti_aesthetic", [])
+        # Anti-aesthetic (clean array)
+        anti = clean_array(aesthetic_profile.get("anti_aesthetic", []))
         if anti:
             parts.append(f"Avoid: {', '.join(anti)}.")
 
@@ -986,13 +1000,20 @@ If has_typography is false, omit other fields. Return ONLY valid JSON."""
 
         Generates metadata tags from aesthetic profile for recommendation system.
         """
+        # Helper to filter out "null" strings from GPT Vision
+        def safe_get_meta(d: Dict, key: str, default: str) -> str:
+            val = d.get(key, default)
+            if val is None or val == '' or (isinstance(val, str) and val.lower() == 'null'):
+                return default
+            return val
+
         # Extract mood and other characteristics
-        mood_primary = aesthetic_profile.get("mood", {}).get("primary", "calm")
-        palette_temp = aesthetic_profile.get("color_palette", {}).get("temperature", "neutral")
-        palette_sat = aesthetic_profile.get("color_palette", {}).get("saturation", "balanced")
-        visual_genre = aesthetic_profile.get("visual_genre", "")
-        treatment = aesthetic_profile.get("subject_treatment", "")
-        comp_density = aesthetic_profile.get("composition", {}).get("density", "balanced")
+        mood_primary = safe_get_meta(aesthetic_profile.get("mood", {}), "primary", "calm")
+        palette_temp = safe_get_meta(aesthetic_profile.get("color_palette", {}), "temperature", "neutral")
+        palette_sat = safe_get_meta(aesthetic_profile.get("color_palette", {}), "saturation", "balanced")
+        visual_genre = safe_get_meta(aesthetic_profile, "visual_genre", "")
+        treatment = safe_get_meta(aesthetic_profile, "subject_treatment", "")
+        comp_density = safe_get_meta(aesthetic_profile.get("composition", {}), "density", "balanced")
 
         # Map to 11 dimensions
         metadata_tags = {
