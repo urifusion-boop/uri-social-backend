@@ -739,13 +739,21 @@ class ImageContentService:
             color_str = ", ".join(str(c) for c in brand_colors[:4]) if brand_colors else ""
 
             # SECTION 1: ABSOLUTE RULES (READ FIRST)
-            absolute_rules = f"""=== ABSOLUTE RULES (READ FIRST) ===
+            absolute_rules = f"""=== ABSOLUTE RULES (READ FIRST — THESE OVERRIDE ALL OTHER INSTRUCTIONS) ===
 This image is EXCLUSIVELY for the brand "{brand_name}".
 You must follow every instruction below precisely.
 Do NOT include any other brand names, logos, products, or brand-associated imagery.
 Do NOT include any real-world company, product, or trademark other than "{brand_name}".
 Do NOT draw from your training data to add elements not described in this prompt.
-Every element in the image must come from the instructions below. Nothing else."""
+Every element in the image must come from the instructions below. Nothing else.
+
+CANVAS SAFETY — NON-NEGOTIABLE, OVERRIDES ALL STYLE RULES:
+Every letter of every word must be 100% inside the image canvas with no clipping.
+Maintain a minimum 12% safe-zone margin from every edge (top, bottom, left, right).
+Headlines must begin at least 12% from the top edge. CTA text must end at least 12%
+from the bottom edge. If text is too large to fit within these margins, reduce the
+font size — do NOT let any character touch or cross any edge. This rule overrides
+any visual style, typography, or layout instruction that follows."""
 
             # SECTION 2: PROFESSIONAL OUTPUT RULES
             # These rules make AI graphics look professionally designed (not AI-generated)
@@ -855,13 +863,10 @@ Follow these rules precisely for every image. No exceptions.
    photograph, use a subtle semi-transparent dark overlay (rgba(0,0,0,0.4))
    behind the text for readability.
 
-9. MARGINS & SAFE ZONE: Maintain at least 10% padding on ALL four edges —
-   top, bottom, left, and right. Every letter, word, and graphic element must
-   be FULLY VISIBLE and completely inside the canvas. Nothing may be clipped,
-   cut off, or touch the image border. Headlines must begin at least 10% from
-   the top edge. CTA text must sit at least 10% from the bottom edge. If text
-   is large, reduce its font size rather than letting any letter overflow any
-   edge. At least 15-20% of the image should be empty space.
+9. MARGINS & SAFE ZONE: 12% minimum padding on ALL four edges — this repeats
+   the canvas safety rule from the top of this prompt. It is the highest-priority
+   layout constraint and overrides any style, typography, or composition guideline.
+   Every character must be fully inside. Reduce font size if needed. Never clip.
 
 10. NO DECORATIONS: Do NOT add badges, stickers, watermarks, decorative
     borders, corner ornaments, ribbon banners, starburst shapes, or
