@@ -600,7 +600,7 @@ def build_shotstack_timeline(
                  "interpolation": "bezier", "easing": "easeInCubic"}
             )
 
-        # Slow Ken Burns zoom alternates direction each clip — adds motion to static shots
+        # Alternating Ken Burns direction — adds motion to static talking-head shots
         base_effect = "zoomInSlow" if i % 2 == 0 else "zoomOutSlow"
 
         clip: Dict[str, Any] = {
@@ -615,34 +615,22 @@ def build_shotstack_timeline(
             "fit": "cover",
             "effect": base_effect,
             "opacity": opacity_kf,
-            # 18% downward slide with easeOutBack overshoot — obvious punch-in on every cut
-            "offset": {
-                "x": [{"from": 0, "to": 0, "start": 0, "length": 0.3}],
-                "y": [{"from": -0.18, "to": 0, "start": 0, "length": 0.35,
-                       "interpolation": "bezier", "easing": "easeOutBack"}],
-            },
+            # No offset.x / offset.y — with fit:cover on matched aspect ratio the clip
+            # exactly fills the frame; any position offset exposes black at the edges.
         }
 
         if seg_zooms:
             z = seg_zooms[0]
+            # zoomIn Ken Burns is faster than zoomInSlow — makes emphasis clips feel
+            # more energetic. Rotation snaps in then overshoots back to zero for a
+            # kinetic punch. Rotation is around the clip center so no black edges.
             clip["effect"] = "zoomIn" if z.get("intensity") != "strong" else "zoomOut"
-            # Bigger X/Y punch + stronger rotation overshoot — unmissable smash-zoom
-            clip["offset"] = {
-                "x": [
-                    {"from": -0.10, "to": 0.04, "start": 0, "length": 0.35,
-                     "interpolation": "bezier", "easing": "easeOutBack"},
-                    {"from": 0.04, "to": 0, "start": 0.35, "length": 0.25,
-                     "interpolation": "bezier", "easing": "easeOutCubic"},
-                ],
-                "y": [{"from": -0.28, "to": 0, "start": 0, "length": 0.55,
-                       "interpolation": "bezier", "easing": "easeOutBack"}],
-            }
             clip["transform"] = {
                 "rotate": {
                     "angle": [
-                        {"from": 5.0, "to": -2.0, "start": 0, "length": 0.45,
+                        {"from": 4.0, "to": -1.5, "start": 0, "length": 0.4,
                          "interpolation": "bezier", "easing": "easeOutBack"},
-                        {"from": -2.0, "to": 0, "start": 0.45, "length": 0.2,
+                        {"from": -1.5, "to": 0, "start": 0.4, "length": 0.18,
                          "interpolation": "bezier", "easing": "easeOutCubic"},
                     ]
                 }
