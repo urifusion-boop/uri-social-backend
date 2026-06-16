@@ -287,12 +287,12 @@ async def _fetch_broll_url(description: str, concept: str) -> Optional[str]:
 # ── Background music ──────────────────────────────────────────────────────────
 
 _MOOD_TAGS: Dict[str, str] = {
-    "upbeat":     "positive+energetic",
-    "chill":      "relaxing+ambient",
-    "cinematic":  "cinematic+epic",
-    "dramatic":   "dramatic+intense",
-    "acoustic":   "acoustic+guitar",
-    "electronic": "electronic+synth",
+    "upbeat":     "positive",
+    "chill":      "relaxing",
+    "cinematic":  "cinematic",
+    "dramatic":   "dramatic",
+    "acoustic":   "acoustic",
+    "electronic": "electronic",
 }
 
 
@@ -314,6 +314,7 @@ async def _fetch_music_url(mood: str) -> Optional[str]:
                     "vocalinstrumental": "instrumental",
                     "limit": 5,
                     "order": "popularity_total",
+                    "boost": "popularity_total",
                 },
                 timeout=aiohttp.ClientTimeout(total=12),
             ) as resp:
@@ -724,6 +725,11 @@ def build_shotstack_timeline(
             sfx_type = sfx.get("type", "").lower()
             sfx_url = SFX_LIBRARY.get(sfx_type, "")
             if not sfx_url:
+                continue
+            # Guard: skip if the local file is missing — a 404 URL causes Shotstack to fail the entire render
+            sfx_local = f"/app/static/sfx/{sfx_type}.mp3"
+            if not os.path.exists(sfx_local):
+                print(f"[SFX] {sfx_type}.mp3 not found on disk, skipping", flush=True)
                 continue
             orig_at = float(sfx.get("at", -1))
             if orig_at < 0 or orig_at > video_duration:
