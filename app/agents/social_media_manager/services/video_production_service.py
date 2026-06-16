@@ -284,6 +284,53 @@ async def _fetch_broll_url(description: str, concept: str) -> Optional[str]:
     return url
 
 
+# ── Background music ──────────────────────────────────────────────────────────
+
+_MOOD_TAGS: Dict[str, str] = {
+    "upbeat":     "positive+energetic",
+    "chill":      "relaxing+ambient",
+    "cinematic":  "cinematic+epic",
+    "dramatic":   "dramatic+intense",
+    "acoustic":   "acoustic+guitar",
+    "electronic": "electronic+synth",
+}
+
+
+async def _fetch_music_url(mood: str) -> Optional[str]:
+    """Fetch a royalty-free instrumental track from Jamendo by mood. Returns MP3 URL or None."""
+    client_id = settings.JAMENDO_CLIENT_ID
+    if not client_id:
+        return None
+    tags = _MOOD_TAGS.get(mood, "positive")
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://api.jamendo.com/v3.0/tracks/",
+                params={
+                    "client_id": client_id,
+                    "format": "json",
+                    "audiodlformat": "mp32",
+                    "tags": tags,
+                    "vocalinstrumental": "instrumental",
+                    "limit": 5,
+                    "order": "popularity_total",
+                },
+                timeout=aiohttp.ClientTimeout(total=12),
+            ) as resp:
+                if not resp.ok:
+                    print(f"[Music] Jamendo {resp.status}", flush=True)
+                    return None
+                data = await resp.json()
+                tracks = data.get("results", [])
+                if tracks:
+                    url = tracks[0].get("audio")
+                    print(f"[Music] '{tracks[0].get('name')}' ({mood}) → {(url or '')[:70]}", flush=True)
+                    return url
+    except Exception as e:
+        print(f"[Music] Jamendo error: {e}", flush=True)
+    return None
+
+
 class ShotstackProvider:
     def _headers(self) -> Dict[str, str]:
         return {
@@ -423,6 +470,7 @@ INSTRUCTIONS:
   "concept": 1–3 word Pexels search query (e.g. "typing laptop", "smartphone social media", "money cash").
   Max 3 b-roll clips. Only add where a visual genuinely helps — skip if the speaker's face/expression is the key content at that moment.
   Do NOT add b-roll that overlaps a zoom. Space b-roll clips at least 3s apart.
+- music_mood: background music mood. Options: upbeat, chill, cinematic, dramatic, acoustic, electronic. Pick what best fits the video energy and topic.
 
 Return ONLY valid JSON (no markdown):
 {{
@@ -438,7 +486,8 @@ Return ONLY valid JSON (no markdown):
   "broll": [
     {{"at": 6.0, "duration": 3.0, "description": "hands typing on laptop keyboard", "concept": "typing laptop", "reason": "speaker mentions working"}}
   ],
-  "pacing_note": "tight and energetic"
+  "pacing_note": "tight and energetic",
+  "music_mood": "upbeat"
 }}"""
 
     client = openai.AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
@@ -515,6 +564,7 @@ def build_shotstack_timeline(
     broll: Optional[List[Dict]] = None,
     aspect_ratio: str = "9:16",
     job_id: str = "",
+    music_url: Optional[str] = None,
 ) -> Dict[str, Any]:
     # broll items have: at (original ts), duration, url (resolved)
     keep_segments = _build_keep_segments(cuts, video_duration)
@@ -545,6 +595,9 @@ def build_shotstack_timeline(
                  "interpolation": "bezier", "easing": "easeInQuart"}
             )
 
+        # Slow Ken Burns zoom alternates direction each clip — adds motion to static shots
+        base_effect = "zoomInSlow" if i % 2 == 0 else "zoomOutSlow"
+
         clip: Dict[str, Any] = {
             "asset": {
                 "type": "video",
@@ -555,11 +608,12 @@ def build_shotstack_timeline(
             "start": round(timeline_pos, 3),
             "length": round(seg_dur, 3),
             "fit": "cover",
+            "effect": base_effect,
             "opacity": opacity_kf,
-            # easeOutBack overshoots slightly then settles — more dynamic than easeOutCubic
+            # 18% downward slide with easeOutBack overshoot — obvious punch-in on every cut
             "offset": {
-                "x": [{"from": 0, "to": 0, "start": 0, "length": 0.4}],
-                "y": [{"from": -0.05, "to": 0, "start": 0, "length": 0.4,
+                "x": [{"from": 0, "to": 0, "start": 0, "length": 0.3}],
+                "y": [{"from": -0.18, "to": 0, "start": 0, "length": 0.35,
                        "interpolation": "bezier", "easing": "easeOutBack"}],
             },
         }
@@ -567,17 +621,25 @@ def build_shotstack_timeline(
         if seg_zooms:
             z = seg_zooms[0]
             clip["effect"] = "zoomIn" if z.get("intensity") != "strong" else "zoomOut"
-            # Stronger slide + slight rotation snap for punch-in energy
+            # Aggressive lateral swing + rotation overshoot — unmissable punch-in
             clip["offset"] = {
-                "x": [{"from": 0, "to": 0, "start": 0, "length": 0.55}],
-                "y": [{"from": -0.09, "to": 0, "start": 0, "length": 0.55,
+                "x": [
+                    {"from": -0.05, "to": 0.02, "start": 0, "length": 0.3,
+                     "interpolation": "bezier", "easing": "easeOutBack"},
+                    {"from": 0.02, "to": 0, "start": 0.3, "length": 0.2,
+                     "interpolation": "bezier", "easing": "easeOutCubic"},
+                ],
+                "y": [{"from": -0.20, "to": 0, "start": 0, "length": 0.5,
                        "interpolation": "bezier", "easing": "easeOutBack"}],
             }
             clip["transform"] = {
                 "rotate": {
                     "angle": [
-                        {"from": 1.5, "to": 0, "start": 0, "length": 0.45,
-                         "interpolation": "bezier", "easing": "easeOutQuart"},
+                        # Overshoot past zero then snap back — kinetic "smash cut" feel
+                        {"from": 3.5, "to": -0.8, "start": 0, "length": 0.4,
+                         "interpolation": "bezier", "easing": "easeOutBack"},
+                        {"from": -0.8, "to": 0, "start": 0.4, "length": 0.15,
+                         "interpolation": "bezier", "easing": "easeOutCubic"},
                     ]
                 }
             }
@@ -713,14 +775,32 @@ def build_shotstack_timeline(
             ],
         })
 
+    # ── Background music track ────────────────────────────────────────────────
+    music_clips: List[Dict] = []
+    if music_url:
+        fade = min(2.0, total_duration * 0.08)
+        music_clips = [{
+            "asset": {
+                "type": "audio",
+                "src": music_url,
+                "volume": 0.15,   # sits beneath speech; voice stays dominant
+                "trim": 0,
+            },
+            "start": 0,
+            "length": round(total_duration, 3),
+        }]
+        print(f"[Music] added track volume=0.15 length={total_duration:.1f}s fade={fade:.1f}s", flush=True)
+
     # Track order (index 0 = top layer):
-    # 0: captions, 1: b-roll overlays, 2: main video, 3: sfx audio
+    # 0: captions, 1: b-roll overlays, 2: main video, 3: sfx audio, 4: bg music
     tracks = [{"clips": caption_clips}]
     if broll_clips:
         tracks.append({"clips": broll_clips})
     tracks.append({"clips": video_clips})
     if sfx_clips:
         tracks.append({"clips": sfx_clips})
+    if music_clips:
+        tracks.append({"clips": music_clips})
 
     return {
         "timeline": {"tracks": tracks},
@@ -836,6 +916,7 @@ async def run_production_job(
         sound_effects = decisions.get("sound_effects", [])
         broll_decisions = decisions.get("broll", [])[:3]
         pacing_note = decisions.get("pacing_note", "")
+        music_mood = decisions.get("music_mood", "upbeat")
         print(
             f"[VideoProduction] cuts={len(cuts)} zooms={len(zooms)} "
             f"sfx={len(sound_effects)} broll={len(broll_decisions)} pacing={pacing_note}",
@@ -856,6 +937,12 @@ async def run_production_job(
                     broll.append({**br, "url": url})
             print(f"[VideoProduction] broll resolved {len(broll)}/{len(broll_decisions)}", flush=True)
 
+        # ── Stage 4b: Fetch background music from Jamendo ────────────────────────
+        await update(59, "Fetching background music…")
+        music_url = await _fetch_music_url(music_mood)
+        if not music_url:
+            print(f"[Music] no track found for mood={music_mood}, skipping", flush=True)
+
         # ── Stage 5: Shotstack render + mix ──────────────────────────────────────
         await update(62, "Building edit timeline…")
         srt_entries = _parse_srt(srt_text)
@@ -869,6 +956,7 @@ async def run_production_job(
             broll=broll,
             aspect_ratio="9:16",
             job_id=job_id,
+            music_url=music_url,
         )
 
         await update(68, "Rendering video…")
@@ -891,6 +979,7 @@ async def run_production_job(
                              sound_effects=sound_effects,
                              broll=broll,
                              pacing_note=pacing_note,
+                             music_mood=music_mood,
                              srt=srt_text,
                              completed_at=datetime.now(timezone.utc).isoformat())
                 return
