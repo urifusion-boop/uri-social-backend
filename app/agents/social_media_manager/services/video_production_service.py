@@ -5,11 +5,13 @@ Pipeline: Upload → FFmpeg audio cleanup → Reap transcription → GPT-4o edit
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
 import subprocess
 import tempfile
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -123,6 +125,54 @@ SFX_LIBRARY: Dict[str, str] = {
     "sparkle":  f"{_SFX_BASE}/ding.mp3",      # alias → ding
     "swell":    f"{_SFX_BASE}/swell.mp3",     # section change / emotional peak
 }
+
+
+# ── Cloudinary upload ─────────────────────────────────────────────────────────
+
+async def _upload_to_cloudinary(video_bytes: bytes, public_id: str) -> Optional[str]:
+    """
+    Upload video bytes to Cloudinary and return the secure CDN URL.
+    Uses the signed upload API — no SDK required.
+    Returns None if credentials are missing or upload fails.
+    """
+    cloud = settings.CLOUDINARY_CLOUD_NAME
+    api_key = settings.CLOUDINARY_API_KEY
+    api_secret = settings.CLOUDINARY_API_SECRET
+    if not all([cloud, api_key, api_secret]):
+        return None
+
+    folder = "uri-video-production"
+    ts = int(time.time())
+    # Signature = SHA-1 of sorted param string + api_secret (Cloudinary spec)
+    params_str = f"folder={folder}&public_id={public_id}&timestamp={ts}"
+    signature = hashlib.sha1(f"{params_str}{api_secret}".encode()).hexdigest()
+
+    form = aiohttp.FormData()
+    form.add_field("file", video_bytes, filename=f"{public_id}.mp4", content_type="video/mp4")
+    form.add_field("api_key", api_key)
+    form.add_field("timestamp", str(ts))
+    form.add_field("signature", signature)
+    form.add_field("public_id", public_id)
+    form.add_field("folder", folder)
+    form.add_field("resource_type", "video")
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"https://api.cloudinary.com/v1_1/{cloud}/video/upload",
+                data=form,
+                timeout=aiohttp.ClientTimeout(total=120),
+            ) as resp:
+                body = await resp.json(content_type=None)
+                if not resp.ok:
+                    print(f"[Cloudinary] upload failed {resp.status}: {body}", flush=True)
+                    return None
+                url = body.get("secure_url", "")
+                print(f"[Cloudinary] uploaded {len(video_bytes)//1024}KB → {url}", flush=True)
+                return url
+    except Exception as e:
+        print(f"[Cloudinary] error: {e}", flush=True)
+        return None
 
 
 # ── B-roll asset fetch ────────────────────────────────────────────────────────
@@ -751,27 +801,27 @@ async def run_production_job(
         )
 
         # ── Stage 2: Audio cleanup — noise reduction, leveling, de-essing ────────
-        # Serve cleaned video from our own static server so Shotstack can fetch it
-        # via public URL. Shotstack has a ~5MB upload limit but no limit on URLs it
-        # fetches — so we write to /app/static/videos/ and serve at /static/videos/.
         await update(30, "Cleaning audio…")
         cleaned_bytes = await _clean_audio(video_bytes)
 
-        await update(38, "Preparing clean video for render…")
-        video_static_dir = "/app/static/videos"
-        os.makedirs(video_static_dir, exist_ok=True)
-        video_static_path = f"{video_static_dir}/{job_id}.mp4"
-        try:
-            with open(video_static_path, "wb") as vf:
-                vf.write(cleaned_bytes)
-            clean_video_url = f"https://api-staging.urisocial.com/static/videos/{job_id}.mp4"
-            print(
-                f"[VideoProduction] clean video written: {len(cleaned_bytes)//1024}KB → {clean_video_url}",
-                flush=True,
-            )
-        except Exception as e:
-            print(f"[VideoProduction] static write failed ({e}), falling back to Reap URL", flush=True)
-            clean_video_url = _reap_video_url
+        # Host the cleaned video on Cloudinary so Shotstack can fetch it via CDN URL.
+        # Priority: Cloudinary → static server → Reap raw URL (fallback).
+        await update(38, "Uploading clean video…")
+        clean_video_url = await _upload_to_cloudinary(cleaned_bytes, job_id)
+
+        if not clean_video_url:
+            # Cloudinary not configured or failed — write to static server
+            print("[VideoProduction] Cloudinary unavailable, writing to static server", flush=True)
+            video_static_dir = "/app/static/videos"
+            os.makedirs(video_static_dir, exist_ok=True)
+            try:
+                with open(f"{video_static_dir}/{job_id}.mp4", "wb") as vf:
+                    vf.write(cleaned_bytes)
+                clean_video_url = f"https://api-staging.urisocial.com/static/videos/{job_id}.mp4"
+                print(f"[VideoProduction] static fallback: {len(cleaned_bytes)//1024}KB → {clean_video_url}", flush=True)
+            except Exception as e:
+                print(f"[VideoProduction] static write failed ({e}), using Reap URL", flush=True)
+                clean_video_url = _reap_video_url
 
         if not clean_video_url:
             raise RuntimeError("Could not obtain a video URL for rendering")

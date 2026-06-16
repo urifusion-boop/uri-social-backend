@@ -57,6 +57,11 @@ class Settings(BaseSettings):
     # Pexels stock video API (b-roll fetch for video production)
     PEXELS_API_KEY: Optional[str] = None
 
+    # Cloudinary (cleaned video + b-roll hosting for Shotstack rendering)
+    CLOUDINARY_CLOUD_NAME: Optional[str] = None
+    CLOUDINARY_API_KEY: Optional[str] = None
+    CLOUDINARY_API_SECRET: Optional[str] = None
+
     # Google OAuth (Sign in with Google)
     GOOGLE_CLIENT_ID: Optional[str] = None
     GOOGLE_CLIENT_SECRET: Optional[str] = None
