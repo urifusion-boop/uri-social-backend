@@ -855,9 +855,13 @@ Follow these rules precisely for every image. No exceptions.
    photograph, use a subtle semi-transparent dark overlay (rgba(0,0,0,0.4))
    behind the text for readability.
 
-9. MARGINS: Maintain at least 5% margin on all four edges. No element touches
-   the image border. Generous spacing between all text blocks and elements.
-   At least 15-20% of the image should be empty space.
+9. MARGINS & SAFE ZONE: Maintain at least 10% padding on ALL four edges —
+   top, bottom, left, and right. Every letter, word, and graphic element must
+   be FULLY VISIBLE and completely inside the canvas. Nothing may be clipped,
+   cut off, or touch the image border. Headlines must begin at least 10% from
+   the top edge. CTA text must sit at least 10% from the bottom edge. If text
+   is large, reduce its font size rather than letting any letter overflow any
+   edge. At least 15-20% of the image should be empty space.
 
 10. NO DECORATIONS: Do NOT add badges, stickers, watermarks, decorative
     borders, corner ornaments, ribbon banners, starburst shapes, or

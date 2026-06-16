@@ -152,8 +152,47 @@ class BrandProfileService:
 
     @staticmethod
     async def get(user_id: str, db: AsyncIOMotorDatabase, brand_id: Optional[str] = None) -> Dict[str, Any]:
+        from app.models.brand_account import BrandAccount
+        personal_bid = BrandAccount.personal_brand_id(user_id)
+        is_agency_brand = brand_id and brand_id != personal_bid
+
         scope = {"brand_id": brand_id} if brand_id else {"user_id": user_id}
         profile = await db[BrandProfileService.COLLECTION].find_one(scope)
+
+        # For agency brands: if the profile is missing or lacks key playbook fields
+        # (colors, visual style, industry), merge in the personal brand's values so
+        # content generation has a full context rather than using generic defaults.
+        if is_agency_brand:
+            personal_scope_options = [
+                {"brand_id": personal_bid},
+                {"user_id": user_id, "brand_id": {"$exists": False}},
+                {"user_id": user_id},
+            ]
+            personal_profile = None
+            for ps in personal_scope_options:
+                personal_profile = await db[BrandProfileService.COLLECTION].find_one(ps)
+                if personal_profile:
+                    break
+
+            PLAYBOOK_FIELDS = [
+                "brand_colors", "industry", "visual_style", "aesthetic_keywords",
+                "derived_voice", "personality_quiz", "audience_age_range",
+                "audience_interests", "content_tones", "cta_styles", "default_link",
+                "tagline", "region", "font_preference", "logo_url", "logo_position",
+            ]
+            if profile is None and personal_profile:
+                # No agency profile at all — use personal profile as base
+                profile = dict(personal_profile)
+                profile.pop("_id", None)
+                profile["brand_id"] = brand_id  # stamp agency brand_id for context
+            elif profile and personal_profile:
+                # Agency profile exists but may be sparse — fill missing fields from personal
+                profile.pop("_id", None)
+                for field in PLAYBOOK_FIELDS:
+                    if not profile.get(field) and personal_profile.get(field):
+                        profile[field] = personal_profile[field]
+                return UriResponse.get_single_data_response("brand_profile", profile)
+
         if not profile:
             return UriResponse.get_single_data_response("brand_profile", None)
         profile.pop("_id", None)
