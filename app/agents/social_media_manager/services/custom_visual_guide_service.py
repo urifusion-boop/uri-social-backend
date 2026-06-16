@@ -889,7 +889,10 @@ If has_typography is false, omit other fields. Return ONLY valid JSON."""
         # Helper to safely get values, replacing None with empty string
         def safe_get(d: Dict, key: str, default: str = '') -> str:
             val = d.get(key, default)
-            return val if val is not None else default
+            # Treat None, empty string, and literal "null" string as empty
+            if val is None or val == '' or val == 'null':
+                return default
+            return val
 
         parts = []
 
