@@ -412,6 +412,7 @@ async def generate_content(
 
         brand_context_dict = BrandProfileService.to_brand_context(profile_data)
         brand_context_dict["user_id"] = user_id
+        brand_context_dict["brand_id"] = active_brand_id  # needed so style lookup uses correct brand profile
         brand_context_dict["using_fallbacks"] = len(missing_fields) > 0
         brand_context_dict["fallback_fields"] = missing_fields
         print(f"🖼️  LOGO DEBUG user={user_id}: logo_url={repr(profile_data.get('logo_url'))}, logo_position={repr(profile_data.get('logo_position'))} → brand_context logo_position={repr(brand_context_dict.get('logo_position'))}")
@@ -4126,6 +4127,13 @@ async def _generate_image_bg(
     try:
         from app.agents.social_media_manager.services.style_library import pick_next_style
 
+        # Build the correct brand profile scope for style lookups.
+        # Using user_id alone returns the personal brand profile even when an agency
+        # brand is active — use brand_id when available so the right style/font is used.
+        _bc_brand_id = brand_context.get("brand_id", "")
+        _bc_user_id = brand_context.get("user_id", "")
+        _style_profile_scope = {"brand_id": _bc_brand_id} if _bc_brand_id else {"user_id": _bc_user_id}
+
         # ── Visual style rotation ─────────────────────────────────────────────
         # For carousel posts: lock style to first slide, reuse for all subsequent slides
         # For regular posts: rotate style normally
@@ -4133,7 +4141,7 @@ async def _generate_image_bg(
             if slide_index == 0:
                 # First slide: pick style and cache it for this carousel
                 _bp = await db["brand_profiles"].find_one(
-                    {"user_id": brand_context.get("user_id", "")},
+                    _style_profile_scope,
                     {"style_selections": 1, "style_prompt_fragments": 1, "style_rotation_index": 1, "industry": 1, "selected_custom_guides": 1},
                 ) or {}
 
@@ -4180,7 +4188,7 @@ async def _generate_image_bg(
                     if not _custom_guide_id:
                         print(f"🎨 Carousel style [{_slug}] applied for all {total_slides} slides (next index: {_next_index})")
                         await db["brand_profiles"].update_one(
-                            {"user_id": brand_context.get("user_id", "")},
+                            _style_profile_scope,
                             {"$set": {"style_rotation_index": _next_index}},
                         )
             else:
@@ -4198,7 +4206,7 @@ async def _generate_image_bg(
         else:
             # Regular post: check for custom guides first, then fallback to style rotation
             _bp = await db["brand_profiles"].find_one(
-                {"user_id": brand_context.get("user_id", "")},
+                _style_profile_scope,
                 {"style_selections": 1, "style_prompt_fragments": 1, "style_rotation_index": 1, "industry": 1, "selected_custom_guides": 1},
             ) or {}
 
@@ -4223,7 +4231,7 @@ async def _generate_image_bg(
 
                     # Update rotation index
                     await db["brand_profiles"].update_one(
-                        {"user_id": brand_context.get("user_id", "")},
+                        _style_profile_scope,
                         {"$set": {"style_rotation_index": _next_index}}
                     )
             else:
@@ -4242,7 +4250,7 @@ async def _generate_image_bg(
                     print(f"🎨 Style [{_slug}] applied for this image (next index: {_next_index})")
                     # Persist incremented rotation index
                     await db["brand_profiles"].update_one(
-                        {"user_id": brand_context.get("user_id", "")},
+                        _style_profile_scope,
                         {"$set": {"style_rotation_index": _next_index}},
                     )
 
