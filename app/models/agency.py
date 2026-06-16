@@ -181,3 +181,7 @@ class InviteAgencyMemberRequest(BaseModel):
 
 class TopUpWalletRequest(BaseModel):
     credits: float = Field(..., gt=0)
+
+
+class UpdateAgencyRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200)
