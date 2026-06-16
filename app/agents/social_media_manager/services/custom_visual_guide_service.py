@@ -957,8 +957,8 @@ If has_typography is false, omit other fields. Return ONLY valid JSON."""
 
         # Mood
         mood = aesthetic_profile.get("mood", {})
-        mood_words = [mood.get("primary"), mood.get("secondary")]
-        mood_words = [m for m in mood_words if m]
+        mood_words = [safe_get(mood, "primary"), safe_get(mood, "secondary")]
+        mood_words = [m for m in mood_words if m and m != 'null']
         if mood_words:
             parts.append(f"Mood: {', '.join(mood_words)}.")
 
