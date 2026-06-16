@@ -8,6 +8,7 @@ predicate that everything else depends on: user_has_access_to_brand.
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 from motor.motor_asyncio import AsyncIOMotorDatabase
+from bson import ObjectId
 
 from app.models.agency import (
     Agency,
@@ -41,12 +42,14 @@ class AgencyService:
         agency.id = str(result.inserted_id)
 
         # Owner becomes the first admin member
+        owner = await db["users"].find_one({"_id": ObjectId(owner_user_id)}) if ObjectId.is_valid(owner_user_id) else None
         await AgencyService.add_member(
             agency_id=agency.agency_id,
             user_id=owner_user_id,
             role=AgencyRole.ADMIN,
             invited_by_user_id=None,
             db=db,
+            email=(owner or {}).get("email"),
         )
         return agency
 
@@ -76,6 +79,20 @@ class AgencyService:
     # ── Members ───────────────────────────────────────────────────────────
 
     @staticmethod
+    async def _holds_other_active_agency(user_id: str, agency_id: str, db: AsyncIOMotorDatabase) -> bool:
+        """
+        V1 invariant: a user belongs to at most one agency. True if `user_id` is
+        already an active member of some agency other than `agency_id` — binding
+        them into a second agency here would silently break get_agency_for_user
+        (find_one with no tiebreak), leaving the invite active in the DB but the
+        user's dashboard still pinned to their original agency.
+        """
+        other = await db[AGENCY_MEMBERS].find_one(
+            {"user_id": user_id, "status": "active", "agency_id": {"$ne": agency_id}}
+        )
+        return other is not None
+
+    @staticmethod
     async def add_member(
         agency_id: str,
         user_id: Optional[str],
@@ -84,6 +101,13 @@ class AgencyService:
         db: AsyncIOMotorDatabase,
         email: Optional[str] = None,
     ) -> AgencyMember:
+        # An invite into a second agency for someone who already belongs to one
+        # stays "invited" rather than silently activating — see _holds_other_active_agency.
+        blocked = bool(
+            user_id and invited_by_user_id is not None
+            and await AgencyService._holds_other_active_agency(user_id, agency_id, db)
+        )
+
         # Dedup by user_id (registered) or by email (pending invite)
         dedup = {"agency_id": agency_id}
         if user_id:
@@ -93,15 +117,18 @@ class AgencyService:
         existing = await db[AGENCY_MEMBERS].find_one(dedup)
         if existing:
             if existing.get("status") == "removed":
+                new_status = "invited" if blocked else ("active" if user_id else "invited")
                 await db[AGENCY_MEMBERS].update_one(
                     {"_id": existing["_id"]},
-                    {"$set": {"status": "active" if user_id else "invited",
+                    {"$set": {"status": new_status,
                               "role": role.value if hasattr(role, "value") else role,
                               "updated_at": datetime.utcnow()}},
                 )
+                existing["status"] = new_status
             existing["_id"] = str(existing["_id"])
             return AgencyMember(**existing)
 
+        is_active = (invited_by_user_id is None or user_id) and not blocked
         member = AgencyMember(
             agency_member_id=AgencyMember.generate_member_id(),
             agency_id=agency_id,
@@ -110,8 +137,8 @@ class AgencyService:
             role=role,
             invited_by_user_id=invited_by_user_id,
             # self-add (owner) is active; registered invite is active; email-only is pending
-            status="active" if (invited_by_user_id is None or user_id) else "invited",
-            joined_at=datetime.utcnow() if (invited_by_user_id is None or user_id) else None,
+            status="active" if is_active else "invited",
+            joined_at=datetime.utcnow() if is_active else None,
         )
         result = await db[AGENCY_MEMBERS].insert_one(member.to_dict())
         member.id = str(result.inserted_id)
@@ -122,11 +149,14 @@ class AgencyService:
         """When a user logs in, claim any pending email invites addressed to them."""
         if not email:
             return
-        await db[AGENCY_MEMBERS].update_many(
-            {"email": email.lower(), "user_id": None},
-            {"$set": {"user_id": user_id, "status": "active",
-                      "joined_at": datetime.utcnow(), "updated_at": datetime.utcnow()}},
-        )
+        async for invite in db[AGENCY_MEMBERS].find({"email": email.lower(), "user_id": None}):
+            if await AgencyService._holds_other_active_agency(user_id, invite["agency_id"], db):
+                continue  # stays pending — they already belong to another agency
+            await db[AGENCY_MEMBERS].update_one(
+                {"_id": invite["_id"]},
+                {"$set": {"user_id": user_id, "status": "active",
+                          "joined_at": datetime.utcnow(), "updated_at": datetime.utcnow()}},
+            )
 
     @staticmethod
     async def get_member(agency_id: str, user_id: str, db: AsyncIOMotorDatabase) -> Optional[AgencyMember]:

@@ -312,14 +312,21 @@ async def invite_member(
         template_name="agency_invite",
         template_vars={
             "agency_name": agency.name,
-            "inviter_name": (inviter or {}).get("first_name"),
+            "inviter_name": (inviter or {}).get("first_name") or "A teammate",
             "role": body.role.value if hasattr(body.role, "value") else body.role,
             "has_account": bool(user),
             "app_url": settings.WEB_APP_URL or "https://app.urisocial.com",
         },
     ))
 
-    msg = "Member added" if user else "Invite sent — they'll get access when they sign up"
+    if member.status != "active":
+        msg = (
+            "Invite sent — they'll get access once they sign up"
+            if not user
+            else "Invite sent — they already belong to another agency, so they'll need to leave it first"
+        )
+    else:
+        msg = "Member added"
     return UriResponse.create_response("agency_member", {**member.to_public_dict(), "message": msg})
 
 
