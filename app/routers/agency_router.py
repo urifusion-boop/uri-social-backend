@@ -4,6 +4,7 @@ Agency Router — Agency Accounts feature (PRD §3, §4, §5, §7)
 Endpoints (all under /agency):
   POST   /agency                         create agency (caller becomes admin)
   GET    /agency                         get caller's agency
+  PATCH  /agency                         rename agency (admin)
   GET    /agency/roster                  roster: brands + at-a-glance status
   GET    /agency/brands                  brand-switcher list (access-filtered)
   POST   /agency/brands                  add a brand (admin)
@@ -31,7 +32,9 @@ from app.dependencies import get_db_dependency
 from app.core.auth_bearer import JWTBearer
 from app.domain.responses.uri_response import UriResponse
 
-from app.models.agency import CreateAgencyRequest, InviteAgencyMemberRequest, TopUpWalletRequest, AgencyRole
+from app.models.agency import (
+    CreateAgencyRequest, InviteAgencyMemberRequest, TopUpWalletRequest, UpdateAgencyRequest, AgencyRole,
+)
 from app.models.brand_account import CreateBrandRequest, DuplicateBrandRequest, UpdateBrandRequest
 from app.services.AgencyService import AgencyService
 from app.services.BrandAccountService import BrandAccountService
@@ -114,6 +117,21 @@ async def upgrade_solo_to_agency(
         **agency.to_public_dict(),
         "migrated_brand_id": personal.brand_id,
     })
+
+
+@router.patch("")
+async def update_agency(
+    body: UpdateAgencyRequest,
+    token: dict = Depends(JWTBearer()),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    agency = await _require_admin(_uid(token), db)
+    await db["agencies"].update_one(
+        {"agency_id": agency.agency_id},
+        {"$set": {"name": body.name, "updated_at": datetime.utcnow()}},
+    )
+    agency = await AgencyService.get_agency(agency.agency_id, db)
+    return UriResponse.update_response("agency", agency.to_public_dict())
 
 
 @router.patch("/settings")
