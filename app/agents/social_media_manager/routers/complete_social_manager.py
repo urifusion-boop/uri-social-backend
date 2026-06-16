@@ -111,14 +111,26 @@ def _brand_scope(user_id: str, brand_id: Optional[str]) -> Dict[str, Any]:
     """
     Brand-aware Mongo filter for Jane data (drafts, performance, etc.).
 
-    - Personal/solo brand (or no brand) → filter by user_id. This matches all of
-      the user's existing data (legacy docs + migration-stamped ones).
     - Agency brand → filter strictly by brand_id, fully isolating that client.
+    - Personal/solo brand → filter by user_id BUT exclude docs that belong to a
+      different (agency) brand. Without this exclusion, agency brand drafts (which
+      store both user_id and brand_id) leak into the personal brand view.
     """
     from app.models.brand_account import BrandAccount
-    if brand_id and brand_id != BrandAccount.personal_brand_id(user_id):
+    personal_bid = BrandAccount.personal_brand_id(user_id)
+    if brand_id and brand_id != personal_bid:
         return {"brand_id": brand_id}
-    return {"user_id": user_id}
+    # Personal brand: match by user_id, but only docs that are NOT stamped with
+    # an agency brand_id (legacy docs have no brand_id; personal brand docs have
+    # brand_id == personal_bid or brand_id not present).
+    return {
+        "user_id": user_id,
+        "$or": [
+            {"brand_id": {"$exists": False}},
+            {"brand_id": None},
+            {"brand_id": personal_bid},
+        ],
+    }
 
 
 # Pydantic models for requests
