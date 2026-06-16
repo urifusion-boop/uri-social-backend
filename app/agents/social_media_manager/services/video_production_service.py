@@ -581,18 +581,22 @@ def build_shotstack_timeline(
 
         seg_zooms = [z for z in zooms if seg["src_start"] <= float(z.get("at", -1)) < seg["src_end"]]
 
-        # Multi-keyframe opacity: snap in at cut start, flash out just before the
-        # next cut — creates crisp punch-cut rhythm without a transition keyword.
-        snap_dur = 0.06
-        fade_out_start = round(max(seg_dur - snap_dur, snap_dur + 0.01), 3)
+        # Smooth ease-in AND ease-out on every clip.
+        # Cap durations so they never exceed half the clip — prevents black frames on
+        # very short segments where overlapping keyframes drive opacity to 0.
+        max_ease = seg_dur * 0.4       # never use more than 40% of clip per side
+        ease_in  = min(0.35, max_ease)
+        ease_out = min(0.35, max_ease)
         opacity_kf: List[Dict] = [
-            {"from": 0, "to": 1, "start": 0, "length": snap_dur,
-             "interpolation": "bezier", "easing": "easeOutQuart"},
+            {"from": 0, "to": 1, "start": 0, "length": round(ease_in, 3),
+             "interpolation": "bezier", "easing": "easeOutCubic"},
         ]
-        if seg_dur > snap_dur * 3:
+        # Only add fade-out if there is a genuine gap between the two eases
+        if seg_dur > ease_in + ease_out + 0.05:
+            fade_out_start = round(seg_dur - ease_out, 3)
             opacity_kf.append(
-                {"from": 1, "to": 0, "start": fade_out_start, "length": snap_dur,
-                 "interpolation": "bezier", "easing": "easeInQuart"}
+                {"from": 1, "to": 0, "start": fade_out_start, "length": round(ease_out, 3),
+                 "interpolation": "bezier", "easing": "easeInCubic"}
             )
 
         # Slow Ken Burns zoom alternates direction each clip — adds motion to static shots
@@ -621,24 +625,23 @@ def build_shotstack_timeline(
         if seg_zooms:
             z = seg_zooms[0]
             clip["effect"] = "zoomIn" if z.get("intensity") != "strong" else "zoomOut"
-            # Aggressive lateral swing + rotation overshoot — unmissable punch-in
+            # Bigger X/Y punch + stronger rotation overshoot — unmissable smash-zoom
             clip["offset"] = {
                 "x": [
-                    {"from": -0.05, "to": 0.02, "start": 0, "length": 0.3,
+                    {"from": -0.10, "to": 0.04, "start": 0, "length": 0.35,
                      "interpolation": "bezier", "easing": "easeOutBack"},
-                    {"from": 0.02, "to": 0, "start": 0.3, "length": 0.2,
+                    {"from": 0.04, "to": 0, "start": 0.35, "length": 0.25,
                      "interpolation": "bezier", "easing": "easeOutCubic"},
                 ],
-                "y": [{"from": -0.20, "to": 0, "start": 0, "length": 0.5,
+                "y": [{"from": -0.28, "to": 0, "start": 0, "length": 0.55,
                        "interpolation": "bezier", "easing": "easeOutBack"}],
             }
             clip["transform"] = {
                 "rotate": {
                     "angle": [
-                        # Overshoot past zero then snap back — kinetic "smash cut" feel
-                        {"from": 3.5, "to": -0.8, "start": 0, "length": 0.4,
+                        {"from": 5.0, "to": -2.0, "start": 0, "length": 0.45,
                          "interpolation": "bezier", "easing": "easeOutBack"},
-                        {"from": -0.8, "to": 0, "start": 0.4, "length": 0.15,
+                        {"from": -2.0, "to": 0, "start": 0.45, "length": 0.2,
                          "interpolation": "bezier", "easing": "easeOutCubic"},
                     ]
                 }
