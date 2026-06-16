@@ -582,24 +582,6 @@ def build_shotstack_timeline(
 
         seg_zooms = [z for z in zooms if seg["src_start"] <= float(z.get("at", -1)) < seg["src_end"]]
 
-        # Smooth ease-in AND ease-out on every clip.
-        # Cap durations so they never exceed half the clip — prevents black frames on
-        # very short segments where overlapping keyframes drive opacity to 0.
-        max_ease = seg_dur * 0.4       # never use more than 40% of clip per side
-        ease_in  = min(0.35, max_ease)
-        ease_out = min(0.35, max_ease)
-        opacity_kf: List[Dict] = [
-            {"from": 0, "to": 1, "start": 0, "length": round(ease_in, 3),
-             "interpolation": "bezier", "easing": "easeOutCubic"},
-        ]
-        # Only add fade-out if there is a genuine gap between the two eases
-        if seg_dur > ease_in + ease_out + 0.05:
-            fade_out_start = round(seg_dur - ease_out, 3)
-            opacity_kf.append(
-                {"from": 1, "to": 0, "start": fade_out_start, "length": round(ease_out, 3),
-                 "interpolation": "bezier", "easing": "easeInCubic"}
-            )
-
         # Alternating Ken Burns direction — adds motion to static talking-head shots
         base_effect = "zoomInSlow" if i % 2 == 0 else "zoomOutSlow"
 
@@ -614,9 +596,9 @@ def build_shotstack_timeline(
             "length": round(seg_dur, 3),
             "fit": "cover",
             "effect": base_effect,
-            "opacity": opacity_kf,
-            # No offset.x / offset.y — with fit:cover on matched aspect ratio the clip
-            # exactly fills the frame; any position offset exposes black at the edges.
+            # Hard cuts — no opacity keyframes. Shotstack treats an opacity array as
+            # "0 everywhere not covered by a keyframe window", so animated opacity was
+            # making clips black for their entire visible duration.
         }
 
         if seg_zooms:
