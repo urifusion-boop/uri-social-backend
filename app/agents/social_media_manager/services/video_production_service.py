@@ -67,9 +67,10 @@ async def _compress_for_shotstack(video_bytes: bytes, duration: float) -> bytes:
 
 async def _clean_audio(video_bytes: bytes) -> bytes:
     """
-    Apply FFmpeg audio cleanup before Reap upload:
-    - highpass=f=80: remove low-frequency rumble
-    - loudnorm: normalize to broadcast spec (-16 LUFS, -1.5 TP)
+    Stage 2 audio enhancement per PRD:
+    - highpass=f=80: cut low-frequency rumble (mic handling, room boom)
+    - afftdn: FFT-based noise reduction + de-essing (nf=-25 floor, nr=33 reduction)
+    - loudnorm: normalize to broadcast standard (-16 LUFS, -1.5 TP)
     Video stream is copied (no re-encode). Falls back to original bytes on failure.
     """
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
@@ -80,7 +81,7 @@ async def _clean_audio(video_bytes: bytes) -> bytes:
         proc = await asyncio.create_subprocess_exec(
             "ffmpeg", "-i", in_path,
             "-c:v", "copy",
-            "-af", "highpass=f=80,loudnorm=I=-16:TP=-1.5:LRA=11",
+            "-af", "highpass=f=80,afftdn=nf=-25:nr=33:nt=w,loudnorm=I=-16:TP=-1.5:LRA=11",
             "-y", out_path,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
@@ -290,13 +291,63 @@ class ShotstackProvider:
 
 # ── GPT-4o Edit Decisions ─────────────────────────────────────────────────────
 
-async def get_edit_decisions(srt_text: str, video_type: str, duration: float) -> Dict[str, Any]:
+def _summarise_tracking_data(tracking_data: dict, duration: float) -> str:
+    """
+    Compress Reap's trackingData into a compact string for GPT-4o.
+    Extracts detected silences and word-gap pauses. Returns "" if nothing useful.
+    """
+    lines: List[str] = []
+
+    # Format A: {"words": [{"word": "hi", "start": 0.1, "end": 0.4}, ...]}
+    words = (
+        tracking_data.get("words")
+        or tracking_data.get("segments")
+        or tracking_data.get("transcript", {}).get("words")
+        or []
+    )
+    if words and isinstance(words, list):
+        silences = []
+        for i in range(1, len(words)):
+            prev_end = float(words[i - 1].get("end") or words[i - 1].get("endTime") or 0)
+            curr_start = float(words[i].get("start") or words[i].get("startTime") or 0)
+            gap = curr_start - prev_end
+            if gap >= 0.3:
+                silences.append(f"{prev_end:.2f}–{curr_start:.2f}s ({gap:.2f}s)")
+        if silences:
+            lines.append(f"Word-gap silences (≥0.3s): {', '.join(silences[:25])}")
+
+    # Format B: {"silences": [{"start": 1.0, "end": 2.5}, ...]}
+    raw_silences = (
+        tracking_data.get("silences")
+        or tracking_data.get("pauses")
+        or tracking_data.get("silence_segments")
+        or []
+    )
+    if raw_silences and isinstance(raw_silences, list):
+        sil_strs = [
+            f"{float(s.get('start') or s.get('startTime') or 0):.2f}–"
+            f"{float(s.get('end') or s.get('endTime') or 0):.2f}s"
+            for s in raw_silences[:20]
+        ]
+        lines.append(f"Detected silences: {', '.join(sil_strs)}")
+
+    return ("\n" + "\n".join(lines)) if lines else ""
+
+
+async def get_edit_decisions(
+    srt_text: str,
+    video_type: str,
+    duration: float,
+    tracking_data: Optional[dict] = None,
+) -> Dict[str, Any]:
     """Feed transcript + video type to GPT-4o; get structured edit decisions."""
     rules = {
         "tiktok": "Fast pacing, aggressive cuts on silences >0.5s, frequent emphasis zooms, hook in first 2s.",
         "product": "Snappy pacing, cuts on silences >1.0s, zoom on product mentions, moderate overall.",
         "founder": "Gentle pacing, cut only silences >1.5s, minimal zooms, keep natural speech rhythm.",
     }.get(video_type, "Moderate pacing, cut silences >1.0s, subtle zooms on key phrases.")
+
+    tracking_context = _summarise_tracking_data(tracking_data or {}, duration)
 
     prompt = f"""You are an expert short-form video editor. Given a transcript and a video type, produce a contextual edit decision list.
 
@@ -306,7 +357,7 @@ EDITING RULES: {rules}
 
 TRANSCRIPT (SRT):
 {srt_text}
-
+{f"REAP CLIP DETECTION (word-level timing + silences):{tracking_context}" if tracking_context else ""}
 INSTRUCTIONS:
 - cuts: remove ranges of clear silence/dead-space/filler. Each remove_start and remove_end must be within [0, {duration:.1f}].
 - zooms: emphasis punch-ins on key words/claims. "at" must be within [0, {duration:.1f}]. intensity: "subtle" or "strong".
@@ -675,50 +726,66 @@ async def run_production_job(
         print(f"[VideoProduction] job={job_id} {progress}% {message}", flush=True)
 
     try:
-        # ── Stage 1: probe duration + audio cleanup + upload to Reap ─────────
-        await update(5, "Uploading video…")
         duration = _probe_duration(video_bytes)
         print(f"[VideoProduction] duration={duration:.1f}s", flush=True)
 
-        cleaned_bytes = await _clean_audio(video_bytes)
-        upload_id = await reap.upload_video(cleaned_bytes, f"{job_id}.mp4")
+        # ── Stage 1: Reap — word-level transcript + timestamps + clip detection ──
+        await update(5, "Transcribing…")
+        upload_id = await reap.upload_video(video_bytes, f"{job_id}_raw.mp4")
         if not upload_id:
             raise RuntimeError("Upload to Reap failed")
 
-        # ── Stage 2: Reap transcription ───────────────────────────────────────
-        await update(15, "Getting transcript…")
         trans_id = await reap.start_transcription(upload_id, "en")
         if not trans_id:
             raise RuntimeError("Transcription failed to start")
 
-        srt_text, video_url = await reap.fetch_srt_and_source_url(trans_id, timeout_seconds=300)
-
+        srt_text, _reap_video_url, tracking_data = await reap.fetch_full_transcript_data(
+            trans_id, timeout_seconds=300
+        )
         if not srt_text:
             raise RuntimeError("Transcription timed out or returned empty")
 
-        # If Reap didn't expose the source URL, compress + upload to Shotstack as fallback
-        if not video_url:
-            await update(40, "Uploading to render engine…")
-            video_url = await shotstack.upload_asset(video_bytes, f"{job_id}.mp4", duration)
-        if not video_url:
-            raise RuntimeError("Could not obtain a source video URL for rendering")
+        print(
+            f"[VideoProduction] srt={len(srt_text)}ch tracking={bool(tracking_data)}",
+            flush=True,
+        )
 
-        print(f"[VideoProduction] video_url={video_url[:80]}… srt_len={len(srt_text)}", flush=True)
+        # ── Stage 2: Audio cleanup — noise reduction, leveling, de-essing ────────
+        await update(30, "Cleaning audio…")
+        cleaned_bytes = await _clean_audio(video_bytes)
 
-        # ── Stage 3: GPT-4o edit decisions ───────────────────────────────────
-        await update(48, "Analysing transcript with AI…")
-        decisions = await get_edit_decisions(srt_text, video_type, duration)
+        # Upload the cleaned video to Shotstack so the render uses the clean voice track
+        await update(38, "Uploading clean audio for render…")
+        clean_video_url = await shotstack.upload_asset(
+            cleaned_bytes, f"{job_id}_clean.mp4", duration
+        )
+        if not clean_video_url:
+            # Graceful fallback: render with raw audio rather than fail the job
+            print("[VideoProduction] Shotstack upload failed — falling back to Reap URL", flush=True)
+            clean_video_url = _reap_video_url
+        if not clean_video_url:
+            raise RuntimeError("Could not obtain a video URL for rendering")
+
+        print(f"[VideoProduction] render_url={clean_video_url[:80]}…", flush=True)
+
+        # ── Stage 3: GPT-4o edit decisions ───────────────────────────────────────
+        await update(48, "AI making edit decisions…")
+        decisions = await get_edit_decisions(srt_text, video_type, duration, tracking_data)
         cuts = decisions.get("cuts", [])
         zooms = decisions.get("zooms", [])
         sound_effects = decisions.get("sound_effects", [])
         broll_decisions = decisions.get("broll", [])[:3]
         pacing_note = decisions.get("pacing_note", "")
-        print(f"[VideoProduction] cuts={len(cuts)} zooms={len(zooms)} sfx={len(sound_effects)} broll={len(broll_decisions)} pacing={pacing_note}", flush=True)
+        print(
+            f"[VideoProduction] cuts={len(cuts)} zooms={len(zooms)} "
+            f"sfx={len(sound_effects)} broll={len(broll_decisions)} pacing={pacing_note}",
+            flush=True,
+        )
 
-        # ── Stage 4: Fetch b-roll assets ──────────────────────────────────────
+        # ── Stage 4: Fetch assets — b-roll (Pexels → fal.ai) + SFX library ──────
         broll: List[Dict] = []
         if broll_decisions:
-            await update(54, "Fetching b-roll assets…")
+            await update(55, "Fetching b-roll assets…")
             tasks = [
                 _fetch_broll_url(br.get("description", ""), br.get("concept", ""))
                 for br in broll_decisions
@@ -729,11 +796,11 @@ async def run_production_job(
                     broll.append({**br, "url": url})
             print(f"[VideoProduction] broll resolved {len(broll)}/{len(broll_decisions)}", flush=True)
 
-        # ── Stage 5: Build + submit Shotstack render ──────────────────────────
-        await update(58, "Building edit timeline…")
+        # ── Stage 5: Shotstack render + mix ──────────────────────────────────────
+        await update(62, "Building edit timeline…")
         srt_entries = _parse_srt(srt_text)
         timeline = build_shotstack_timeline(
-            video_url=video_url,
+            video_url=clean_video_url,      # cleaned voice track
             video_duration=duration,
             cuts=cuts,
             zooms=zooms,
@@ -744,7 +811,7 @@ async def run_production_job(
             job_id=job_id,
         )
 
-        await update(65, "Rendering video…")
+        await update(68, "Rendering video…")
         render_id = await shotstack.render(timeline)
         print(f"[VideoProduction] render_id={render_id}", flush=True)
 
