@@ -394,6 +394,75 @@ class ReapProvider(AbstractClippingProvider):
                 return "", ""
         return "", ""
 
+    async def fetch_full_transcript_data(
+        self, project_id: str, timeout_seconds: int = 300
+    ) -> tuple[str, str, dict]:
+        """
+        Extended transcript fetch for the production pipeline.
+        Returns (srt_text, video_url, tracking_data).
+        tracking_data is parsed JSON from Reap's trackingData URL — contains
+        word-level timestamps and detected silences. Empty dict on failure.
+        """
+        poll_interval = 10
+        for _ in range(max(1, timeout_seconds // poll_interval)):
+            await asyncio.sleep(poll_interval)
+            status = await self.get_job_status(project_id)
+            if status == "completed":
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        f"{self.BASE}/get-project-details",
+                        headers=self._headers(),
+                        params={"projectId": project_id},
+                    ) as resp:
+                        if not resp.ok:
+                            return "", "", {}
+                        data = await resp.json()
+                    urls = data.get("urls") or {}
+                    print(f"[Reap] project-details keys: {list(urls.keys())}", flush=True)
+
+                    srt_url = urls.get("transcription_srt", "")
+                    source_url = (
+                        urls.get("videoFile")
+                        or urls.get("transcription_source")
+                        or urls.get("source")
+                        or urls.get("source_video")
+                        or urls.get("video")
+                        or urls.get("original")
+                        or ""
+                    )
+                    tracking_url = urls.get("trackingData", "")
+
+                    srt_text = ""
+                    tracking_data: dict = {}
+
+                    if srt_url:
+                        async with session.get(srt_url) as r:
+                            srt_text = await r.text()
+
+                    if tracking_url:
+                        try:
+                            async with session.get(
+                                tracking_url,
+                                timeout=aiohttp.ClientTimeout(total=15),
+                            ) as r:
+                                if r.ok:
+                                    tracking_data = await r.json(content_type=None)
+                                    print(
+                                        f"[Reap] trackingData fetched ({len(str(tracking_data))} chars)",
+                                        flush=True,
+                                    )
+                        except Exception as e:
+                            print(f"[Reap] trackingData fetch failed: {e}", flush=True)
+
+                    print(
+                        f"[Reap] srt={len(srt_text)}ch source={bool(source_url)} tracking={bool(tracking_data)}",
+                        flush=True,
+                    )
+                    return srt_text, source_url, tracking_data
+            if status == "failed":
+                return "", "", {}
+        return "", "", {}
+
     async def get_caption_presets(self) -> List[Dict[str, Any]]:
         """Return all caption presets from the Reap account (system + user-created)."""
         async with aiohttp.ClientSession() as session:
