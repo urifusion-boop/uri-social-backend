@@ -348,7 +348,9 @@ If confidence >= 0.7 that copyrighted content is present, set has_copyright_cont
             # PRD Section 3.2: The complete aesthetic extraction prompt
             prompt = """You are an expert visual analyst. Analyze the uploaded image and extract a structured aesthetic profile. DO NOT describe the literal content. DESCRIBE THE VISUAL STYLE so it can be reproduced in new images with different content.
 
-Use this vocabulary where applicable: tungsten practicals, soft halation, anamorphic, motivated lighting, negative fill, golden hour, Kodak Portra tones, Fuji 400H, controlled specular, edge lighting, soft diffusion bloom, atmospheric haze, film grain, shallow depth of field, foreground occlusion, environmental wrapping, spatial continuity, runway editorial, documentary realism, magazine spread framing, brutalist editorial.
+For PHOTOGRAPHY/REALISTIC images, use this vocabulary where applicable: tungsten practicals, soft halation, anamorphic, motivated lighting, negative fill, golden hour, Kodak Portra tones, Fuji 400H, controlled specular, edge lighting, soft diffusion bloom, atmospheric haze, film grain, shallow depth of field, foreground occlusion, environmental wrapping, spatial continuity, runway editorial, documentary realism, magazine spread framing, brutalist editorial.
+
+For ILLUSTRATIONS/DRAWINGS/SKETCHES, use this vocabulary where applicable: hand-drawn, sketchy, line art, ink drawing, pencil sketch, watercolor, digital illustration, vector art, flat design, minimalist illustration, doodle style, gestural lines, loose linework, controlled linework, crosshatching, stippling, cel-shaded, screenprint aesthetic, editorial illustration, technical drawing, architectural sketch, fashion sketch, comic book style, manga style, charcoal rendering, pen and ink, marker rendering, continuous line, broken line, graphic novel aesthetic.
 
 Return ONLY a JSON object with this structure:
 {
