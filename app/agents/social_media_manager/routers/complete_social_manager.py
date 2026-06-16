@@ -28,6 +28,11 @@ from ..services.voice_sample_analyzer_service import VoiceSampleAnalyzerService
 
 router = APIRouter(tags=["Social Media Manager"])
 
+# Strong references to fire-and-forget background image-generation tasks, so they
+# aren't garbage-collected mid-flight (asyncio only weakly tracks pending tasks).
+# Entries remove themselves via add_done_callback once finished.
+_BG_IMAGE_TASKS: set = set()
+
 
 def _apply_intelligent_fallbacks(profile_data: Dict[str, Any], missing_fields: List[str]) -> Dict[str, Any]:
     """
@@ -504,12 +509,18 @@ async def generate_content(
             if draft_ids:
                 await db["content_drafts"].update_many(
                     {"id": {"$in": draft_ids}},
-                    {"$set": {"has_image": True}},
+                    {"$set": {"has_image": True, "image_failed": False}},
                 )
                 # Mirror the flag in the response so the frontend sees it immediately
                 for d in drafts:
                     d["has_image"] = True
 
+            # FastAPI's BackgroundTasks runs queued tasks one at a time, in order —
+            # with several drafts that serializes their image generation instead of
+            # overlapping it. Fire each draft's (or slide's) generation as its own
+            # asyncio task so they actually run concurrently. Keep references so
+            # nothing gets garbage-collected mid-flight.
+            _bg_image_tasks: List[asyncio.Task] = []
             for draft in drafts:
                 if post_type == "carousel":
                     slides = draft.get("slides") or []
@@ -519,8 +530,7 @@ async def generate_content(
                     for slide_index, slide in enumerate(slides):
                         # Use slide's headline + body as the main content (no seed duplication)
                         slide_content = f"{slide.get('headline', '')} {slide.get('body', '')}".strip()
-                        background_tasks.add_task(
-                            _generate_image_bg,
+                        _bg_image_tasks.append(asyncio.create_task(_generate_image_bg(
                             draft_id=draft["id"],
                             platform=draft["platform"],
                             content=slide_content or draft["content"],
@@ -533,10 +543,9 @@ async def generate_content(
                             image_model=request.image_model,
                             total_slides=total_slides,
                             carousel_id=carousel_id,
-                        )
+                        )))
                 else:
-                    background_tasks.add_task(
-                        _generate_image_bg,
+                    _bg_image_tasks.append(asyncio.create_task(_generate_image_bg(
                         draft_id=draft["id"],
                         platform=draft["platform"],
                         content=draft["content"],
@@ -546,7 +555,10 @@ async def generate_content(
                         reference_image=request.reference_image,
                         post_type=post_type,
                         image_model=request.image_model,
-                    )
+                    )))
+            _BG_IMAGE_TASKS.update(_bg_image_tasks)
+            for t in _bg_image_tasks:
+                t.add_done_callback(_BG_IMAGE_TASKS.discard)
 
         return result
 
@@ -1360,6 +1372,7 @@ async def regenerate_draft_image(
             "$set": {
                 "image_url": None,
                 "has_image": True,
+                "image_failed": False,
                 "updated_at": _dt.utcnow()
             },
             "$inc": {"image_retry_count": 1}  # Track retry count
@@ -2179,14 +2192,14 @@ async def create_draft_from_calendar_day(
                 if draft_ids:
                     await db["content_drafts"].update_many(
                         {"id": {"$in": draft_ids}},
-                        {"$set": {"has_image": True}},
+                        {"$set": {"has_image": True, "image_failed": False}},
                     )
                     for d in drafts:
                         d["has_image"] = True
 
-                for d in drafts:
-                    background_tasks.add_task(
-                        _generate_image_bg,
+                # Fire concurrently — BackgroundTasks would run these one at a time.
+                _bg_image_tasks = [
+                    asyncio.create_task(_generate_image_bg(
                         draft_id=d.get("draft_id") or d.get("id"),
                         platform=d.get("platform", "facebook"),
                         content=d.get("content", seed_content),
@@ -2194,7 +2207,12 @@ async def create_draft_from_calendar_day(
                         brand_context=brand_context,
                         db=db,
                         reference_image=None,
-                    )
+                    ))
+                    for d in drafts
+                ]
+                _BG_IMAGE_TASKS.update(_bg_image_tasks)
+                for t in _bg_image_tasks:
+                    t.add_done_callback(_BG_IMAGE_TASKS.discard)
 
         return result
     except HTTPException:
@@ -4233,11 +4251,17 @@ async def _generate_image_bg(
 
         if not image_result.get("status"):
             print(f"⚠️ BG image gen failed for draft {draft_id}: {image_result.get('responseMessage')}")
-            if db and post_type == "carousel" and slide_index is not None:
-                await db["content_drafts"].update_one(
-                    {"id": draft_id},
-                    {"$set": {f"slides.{slide_index}.image_failed": True}},
-                )
+            if db:
+                if post_type == "carousel" and slide_index is not None:
+                    await db["content_drafts"].update_one(
+                        {"id": draft_id},
+                        {"$set": {f"slides.{slide_index}.image_failed": True}},
+                    )
+                else:
+                    await db["content_drafts"].update_one(
+                        {"id": draft_id},
+                        {"$set": {"image_failed": True, "updated_at": datetime.utcnow()}},
+                    )
             return
 
         raw_url = image_result["responseData"]["image_url"]
@@ -4343,17 +4367,29 @@ async def _generate_image_bg(
                     {"id": draft_id},
                     {"$set": {f"slides.{slide_index}.image_failed": True}},
                 )
+            elif db is not None:
+                await db["content_drafts"].update_one(
+                    {"id": draft_id},
+                    {"$set": {"image_failed": True, "updated_at": datetime.utcnow()}},
+                )
             print(f"⚠️  BG image not saved for draft {draft_id} (no public URL)")
 
     except Exception as e:
-        # Mark slide as failed on exception
-        if db and post_type == "carousel" and slide_index is not None:
+        # Mark slide (or whole draft) as failed on exception, so the UI stops
+        # showing the shimmer forever instead of silently leaving has_image=True.
+        if db:
             try:
-                await db["content_drafts"].update_one(
-                    {"id": draft_id},
-                    {"$set": {f"slides.{slide_index}.image_failed": True}},
-                )
-            except:
+                if post_type == "carousel" and slide_index is not None:
+                    await db["content_drafts"].update_one(
+                        {"id": draft_id},
+                        {"$set": {f"slides.{slide_index}.image_failed": True}},
+                    )
+                else:
+                    await db["content_drafts"].update_one(
+                        {"id": draft_id},
+                        {"$set": {"image_failed": True, "updated_at": datetime.utcnow()}},
+                    )
+            except Exception:
                 pass
         print(f"❌ BG image task error for draft {draft_id}: {e}\n{traceback.format_exc()}")
 
