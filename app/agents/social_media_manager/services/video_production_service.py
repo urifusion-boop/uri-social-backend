@@ -751,22 +751,32 @@ async def run_production_job(
         )
 
         # ── Stage 2: Audio cleanup — noise reduction, leveling, de-essing ────────
+        # Serve cleaned video from our own static server so Shotstack can fetch it
+        # via public URL. Shotstack has a ~5MB upload limit but no limit on URLs it
+        # fetches — so we write to /app/static/videos/ and serve at /static/videos/.
         await update(30, "Cleaning audio…")
         cleaned_bytes = await _clean_audio(video_bytes)
 
-        # Upload the cleaned video to Shotstack so the render uses the clean voice track
-        await update(38, "Uploading clean audio for render…")
-        clean_video_url = await shotstack.upload_asset(
-            cleaned_bytes, f"{job_id}_clean.mp4", duration
-        )
-        if not clean_video_url:
-            # Graceful fallback: render with raw audio rather than fail the job
-            print("[VideoProduction] Shotstack upload failed — falling back to Reap URL", flush=True)
+        await update(38, "Preparing clean video for render…")
+        video_static_dir = "/app/static/videos"
+        os.makedirs(video_static_dir, exist_ok=True)
+        video_static_path = f"{video_static_dir}/{job_id}.mp4"
+        try:
+            with open(video_static_path, "wb") as vf:
+                vf.write(cleaned_bytes)
+            clean_video_url = f"https://api-staging.urisocial.com/static/videos/{job_id}.mp4"
+            print(
+                f"[VideoProduction] clean video written: {len(cleaned_bytes)//1024}KB → {clean_video_url}",
+                flush=True,
+            )
+        except Exception as e:
+            print(f"[VideoProduction] static write failed ({e}), falling back to Reap URL", flush=True)
             clean_video_url = _reap_video_url
+
         if not clean_video_url:
             raise RuntimeError("Could not obtain a video URL for rendering")
 
-        print(f"[VideoProduction] render_url={clean_video_url[:80]}…", flush=True)
+        print(f"[VideoProduction] render source={clean_video_url[:80]}…", flush=True)
 
         # ── Stage 3: GPT-4o edit decisions ───────────────────────────────────────
         await update(48, "AI making edit decisions…")
