@@ -22,7 +22,10 @@ Endpoints (all under /agency):
   GET    /agency/reports/brand/{brand_id}  per-brand client report
 """
 
+import asyncio
 from datetime import datetime
+from bson import ObjectId
+from bson.errors import InvalidId
 from fastapi import APIRouter, Depends, HTTPException
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from pydantic import BaseModel, Field
@@ -30,7 +33,9 @@ from typing import Optional, List, Dict, Any
 
 from app.dependencies import get_db_dependency
 from app.core.auth_bearer import JWTBearer
+from app.core.config import settings
 from app.domain.responses.uri_response import UriResponse
+from app.services.EmailService import email_service
 
 from app.models.agency import (
     CreateAgencyRequest, InviteAgencyMemberRequest, TopUpWalletRequest, UpdateAgencyRequest, AgencyRole,
@@ -52,6 +57,13 @@ def _uid(token: dict) -> str:
 
 def _email(token: dict) -> Optional[str]:
     return (token.get("claims") or {}).get("email")
+
+
+def _object_id_or_none(user_id: str) -> Optional[ObjectId]:
+    try:
+        return ObjectId(user_id)
+    except (InvalidId, TypeError):
+        return None
 
 
 async def _require_admin(user_id: str, db: AsyncIOMotorDatabase):
@@ -292,6 +304,21 @@ async def invite_member(
         db,
         email=body.email,
     )
+
+    inviter = await db["users"].find_one({"_id": _object_id_or_none(_uid(token))})
+    asyncio.ensure_future(email_service.send_email(
+        to_email=body.email,
+        subject=f"You've been invited to join {agency.name} on URI Social",
+        template_name="agency_invite",
+        template_vars={
+            "agency_name": agency.name,
+            "inviter_name": (inviter or {}).get("first_name"),
+            "role": body.role.value if hasattr(body.role, "value") else body.role,
+            "has_account": bool(user),
+            "app_url": settings.WEB_APP_URL or "https://app.urisocial.com",
+        },
+    ))
+
     msg = "Member added" if user else "Invite sent — they'll get access when they sign up"
     return UriResponse.create_response("agency_member", {**member.to_public_dict(), "message": msg})
 
