@@ -309,9 +309,20 @@ def build_shotstack_timeline(
 
         seg_zooms = [z for z in zooms if seg["src_start"] <= float(z.get("at", -1)) < seg["src_end"]]
 
-        # Entry animation: every clip snaps in with a fast opacity flash +
-        # a y-offset slide-up. No `transition` keyword — it conflicts with
-        # the opacity keyframe when there's no clip overlap in the timeline.
+        # Multi-keyframe opacity: snap in at cut start, flash out just before the
+        # next cut — creates crisp punch-cut rhythm without a transition keyword.
+        snap_dur = 0.06
+        fade_out_start = round(max(seg_dur - snap_dur, snap_dur + 0.01), 3)
+        opacity_kf: List[Dict] = [
+            {"from": 0, "to": 1, "start": 0, "length": snap_dur,
+             "interpolation": "bezier", "easing": "easeOutQuart"},
+        ]
+        if seg_dur > snap_dur * 3:
+            opacity_kf.append(
+                {"from": 1, "to": 0, "start": fade_out_start, "length": snap_dur,
+                 "interpolation": "bezier", "easing": "easeInQuart"}
+            )
+
         clip: Dict[str, Any] = {
             "asset": {
                 "type": "video",
@@ -322,25 +333,31 @@ def build_shotstack_timeline(
             "start": round(timeline_pos, 3),
             "length": round(seg_dur, 3),
             "fit": "cover",
-            "opacity": [
-                {"from": 0, "to": 1, "start": 0, "length": 0.08,
-                 "interpolation": "bezier", "easing": "easeOutQuart"},
-            ],
+            "opacity": opacity_kf,
+            # easeOutBack overshoots slightly then settles — more dynamic than easeOutCubic
             "offset": {
-                "x": [{"from": 0, "to": 0, "start": 0, "length": 0.35}],
-                "y": [{"from": -0.04, "to": 0, "start": 0, "length": 0.35,
-                       "interpolation": "bezier", "easing": "easeOutCubic"}],
+                "x": [{"from": 0, "to": 0, "start": 0, "length": 0.4}],
+                "y": [{"from": -0.05, "to": 0, "start": 0, "length": 0.4,
+                       "interpolation": "bezier", "easing": "easeOutBack"}],
             },
         }
 
         if seg_zooms:
             z = seg_zooms[0]
-            # Ken Burns zoom effect on the whole segment + stronger slide for punch
             clip["effect"] = "zoomIn" if z.get("intensity") != "strong" else "zoomOut"
+            # Stronger slide + slight rotation snap for punch-in energy
             clip["offset"] = {
-                "x": [{"from": 0, "to": 0, "start": 0, "length": 0.5}],
-                "y": [{"from": -0.07, "to": 0, "start": 0, "length": 0.5,
-                       "interpolation": "bezier", "easing": "easeOutQuart"}],
+                "x": [{"from": 0, "to": 0, "start": 0, "length": 0.55}],
+                "y": [{"from": -0.09, "to": 0, "start": 0, "length": 0.55,
+                       "interpolation": "bezier", "easing": "easeOutBack"}],
+            }
+            clip["transform"] = {
+                "rotate": {
+                    "angle": [
+                        {"from": 1.5, "to": 0, "start": 0, "length": 0.45,
+                         "interpolation": "bezier", "easing": "easeOutQuart"},
+                    ]
+                }
             }
 
         video_clips.append(clip)
