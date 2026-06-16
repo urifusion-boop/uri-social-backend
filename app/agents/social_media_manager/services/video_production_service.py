@@ -124,6 +124,115 @@ SFX_LIBRARY: Dict[str, str] = {
 }
 
 
+# ── B-roll asset fetch ────────────────────────────────────────────────────────
+
+async def _pexels_search(query: str) -> Optional[str]:
+    """Search Pexels for a short video clip. Returns a direct MP4 URL or None."""
+    key = settings.PEXELS_API_KEY
+    if not key:
+        return None
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://api.pexels.com/videos/search",
+                headers={"Authorization": key},
+                params={"query": query, "per_page": 8, "orientation": "portrait", "size": "medium"},
+                timeout=aiohttp.ClientTimeout(total=12),
+            ) as resp:
+                if not resp.ok:
+                    print(f"[B-roll] Pexels {resp.status} for '{query}'", flush=True)
+                    return None
+                data = await resp.json()
+                videos = data.get("videos", [])
+                if not videos:
+                    # Retry without orientation filter — portrait stock is sparse
+                    async with session.get(
+                        "https://api.pexels.com/videos/search",
+                        headers={"Authorization": key},
+                        params={"query": query, "per_page": 8, "size": "medium"},
+                        timeout=aiohttp.ClientTimeout(total=12),
+                    ) as resp2:
+                        if resp2.ok:
+                            data = await resp2.json()
+                            videos = data.get("videos", [])
+                for video in videos:
+                    files = sorted(
+                        video.get("video_files", []),
+                        key=lambda f: f.get("height", 0), reverse=True,
+                    )
+                    for f in files:
+                        link = f.get("link", "")
+                        if link and f.get("height", 0) >= 720:
+                            return link
+    except Exception as e:
+        print(f"[B-roll] Pexels error for '{query}': {e}", flush=True)
+    return None
+
+
+async def _fal_generate(description: str) -> Optional[str]:
+    """Generate a short video clip with fal.ai Wan T2V. Returns URL or None."""
+    key = settings.FAL_API_KEY
+    if not key:
+        return None
+    model = "fal-ai/wan/t2v-1.3b"
+    headers = {"Authorization": f"Key {key}", "Content-Type": "application/json"}
+    try:
+        async with aiohttp.ClientSession() as session:
+            # Submit job
+            async with session.post(
+                f"https://queue.fal.run/{model}",
+                headers=headers,
+                json={"prompt": description, "duration": "3"},
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if not resp.ok:
+                    print(f"[B-roll] fal.ai submit {resp.status}", flush=True)
+                    return None
+                job = await resp.json()
+                req_id = job.get("request_id")
+                if not req_id:
+                    return None
+
+            # Poll for up to 90s
+            for _ in range(18):
+                await asyncio.sleep(5)
+                async with session.get(
+                    f"https://queue.fal.run/{model}/requests/{req_id}/status",
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as s:
+                    status_data = await s.json()
+                    if status_data.get("status") == "COMPLETED":
+                        break
+                    if status_data.get("status") == "FAILED":
+                        return None
+
+            # Fetch result
+            async with session.get(
+                f"https://queue.fal.run/{model}/requests/{req_id}",
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as res:
+                result = await res.json()
+                return (result.get("video") or {}).get("url")
+    except Exception as e:
+        print(f"[B-roll] fal.ai error: {e}", flush=True)
+    return None
+
+
+async def _fetch_broll_url(description: str, concept: str) -> Optional[str]:
+    """Priority: Pexels stock → fal.ai generate. Returns a public video URL or None."""
+    url = await _pexels_search(concept or description)
+    if url:
+        print(f"[B-roll] Pexels hit: '{concept}' → {url[:70]}…", flush=True)
+        return url
+    print(f"[B-roll] Pexels miss for '{concept}', trying fal.ai…", flush=True)
+    url = await _fal_generate(description)
+    if url:
+        print(f"[B-roll] fal.ai generated for '{description[:40]}' → {url[:70]}…", flush=True)
+    return url
+
+
 class ShotstackProvider:
     def _headers(self) -> Dict[str, str]:
         return {
@@ -184,7 +293,7 @@ class ShotstackProvider:
 async def get_edit_decisions(srt_text: str, video_type: str, duration: float) -> Dict[str, Any]:
     """Feed transcript + video type to GPT-4o; get structured edit decisions."""
     rules = {
-        "tiktok": "Fast pacing, aggressive cuts on silences >0.5s, frequent emphasis zooms, hook visible in first 2s.",
+        "tiktok": "Fast pacing, aggressive cuts on silences >0.5s, frequent emphasis zooms, hook in first 2s.",
         "product": "Snappy pacing, cuts on silences >1.0s, zoom on product mentions, moderate overall.",
         "founder": "Gentle pacing, cut only silences >1.5s, minimal zooms, keep natural speech rhythm.",
     }.get(video_type, "Moderate pacing, cut silences >1.0s, subtle zooms on key phrases.")
@@ -206,6 +315,13 @@ INSTRUCTIONS:
 - sound_effects: contextual audio punctuation at key moments. "at" in seconds within [0, {duration:.1f}].
   Types: whoosh (fast cut/transition), impact (strong claim/reveal), pop (list item/name drop), ding (positive outcome/win), swell (emotional peak/section change).
   Max 5 SFX. Be selective — only add where audio clearly enhances impact. For founder type: max 2 SFX.
+- broll: visual cutaway over the speaker at moments where showing something reinforces the message.
+  "at": when cutaway starts (original video seconds, within [0, {duration:.1f}]).
+  "duration": how long to show it (2.0–4.0 seconds).
+  "description": specific visual to show (e.g. "hands typing on a laptop keyboard", "close-up of a smartphone screen showing social media feed").
+  "concept": 1–3 word Pexels search query (e.g. "typing laptop", "smartphone social media", "money cash").
+  Max 3 b-roll clips. Only add where a visual genuinely helps — skip if the speaker's face/expression is the key content at that moment.
+  Do NOT add b-roll that overlaps a zoom. Space b-roll clips at least 3s apart.
 
 Return ONLY valid JSON (no markdown):
 {{
@@ -217,6 +333,9 @@ Return ONLY valid JSON (no markdown):
   ],
   "sound_effects": [
     {{"at": 8.2, "type": "impact", "reason": "product reveal"}}
+  ],
+  "broll": [
+    {{"at": 6.0, "duration": 3.0, "description": "hands typing on laptop keyboard", "concept": "typing laptop", "reason": "speaker mentions working"}}
   ],
   "pacing_note": "tight and energetic"
 }}"""
@@ -292,9 +411,11 @@ def build_shotstack_timeline(
     zooms: List[Dict],
     srt_entries: List[Dict[str, Any]],
     sound_effects: Optional[List[Dict]] = None,
+    broll: Optional[List[Dict]] = None,
     aspect_ratio: str = "9:16",
     job_id: str = "",
 ) -> Dict[str, Any]:
+    # broll items have: at (original ts), duration, url (resolved)
     keep_segments = _build_keep_segments(cuts, video_duration)
     total_duration = sum(s["src_end"] - s["src_start"] for s in keep_segments)
 
@@ -455,7 +576,48 @@ def build_shotstack_timeline(
                 "length": 1.5,
             })
 
-    tracks = [{"clips": caption_clips}, {"clips": video_clips}]
+    # ── B-roll track ──────────────────────────────────────────────────────────
+    broll_clips: List[Dict] = []
+    for br in (broll or []):
+        br_url = br.get("url")
+        if not br_url:
+            continue
+        orig_at = float(br.get("at", -1))
+        br_dur = min(float(br.get("duration", 3.0)), 4.0)
+        if orig_at < 0 or orig_at >= video_duration:
+            continue
+        tl_at = _original_to_timeline(orig_at, keep_segments)
+        if tl_at is None:
+            continue
+        # Clamp duration so b-roll doesn't run past the timeline end
+        br_dur = min(br_dur, total_duration - tl_at)
+        if br_dur < 0.5:
+            continue
+        fade = min(0.25, br_dur / 4)
+        broll_clips.append({
+            "asset": {
+                "type": "video",
+                "src": br_url,
+                "trim": 0,
+                "volume": 0,  # keep original voice; mute b-roll audio
+            },
+            "start": round(tl_at, 3),
+            "length": round(br_dur, 3),
+            "fit": "cover",
+            "opacity": [
+                {"from": 0, "to": 1, "start": 0, "length": fade,
+                 "interpolation": "bezier", "easing": "easeOutCubic"},
+                {"from": 1, "to": 0, "start": round(br_dur - fade, 3), "length": fade,
+                 "interpolation": "bezier", "easing": "easeInCubic"},
+            ],
+        })
+
+    # Track order (index 0 = top layer):
+    # 0: captions, 1: b-roll overlays, 2: main video, 3: sfx audio
+    tracks = [{"clips": caption_clips}]
+    if broll_clips:
+        tracks.append({"clips": broll_clips})
+    tracks.append({"clips": video_clips})
     if sfx_clips:
         tracks.append({"clips": sfx_clips})
 
@@ -549,10 +711,25 @@ async def run_production_job(
         cuts = decisions.get("cuts", [])
         zooms = decisions.get("zooms", [])
         sound_effects = decisions.get("sound_effects", [])
+        broll_decisions = decisions.get("broll", [])[:3]
         pacing_note = decisions.get("pacing_note", "")
-        print(f"[VideoProduction] cuts={len(cuts)} zooms={len(zooms)} sfx={len(sound_effects)} pacing={pacing_note}", flush=True)
+        print(f"[VideoProduction] cuts={len(cuts)} zooms={len(zooms)} sfx={len(sound_effects)} broll={len(broll_decisions)} pacing={pacing_note}", flush=True)
 
-        # ── Stage 4: Build + submit Shotstack render ──────────────────────────
+        # ── Stage 4: Fetch b-roll assets ──────────────────────────────────────
+        broll: List[Dict] = []
+        if broll_decisions:
+            await update(54, "Fetching b-roll assets…")
+            tasks = [
+                _fetch_broll_url(br.get("description", ""), br.get("concept", ""))
+                for br in broll_decisions
+            ]
+            urls = await asyncio.gather(*tasks, return_exceptions=True)
+            for br, url in zip(broll_decisions, urls):
+                if isinstance(url, str) and url:
+                    broll.append({**br, "url": url})
+            print(f"[VideoProduction] broll resolved {len(broll)}/{len(broll_decisions)}", flush=True)
+
+        # ── Stage 5: Build + submit Shotstack render ──────────────────────────
         await update(58, "Building edit timeline…")
         srt_entries = _parse_srt(srt_text)
         timeline = build_shotstack_timeline(
@@ -562,6 +739,7 @@ async def run_production_job(
             zooms=zooms,
             srt_entries=srt_entries,
             sound_effects=sound_effects,
+            broll=broll,
             aspect_ratio="9:16",
             job_id=job_id,
         )
@@ -584,6 +762,7 @@ async def run_production_job(
                              render_id=render_id,
                              cuts=cuts, zooms=zooms,
                              sound_effects=sound_effects,
+                             broll=broll,
                              pacing_note=pacing_note,
                              srt=srt_text,
                              completed_at=datetime.now(timezone.utc).isoformat())
