@@ -25,31 +25,21 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 from pydantic import BaseModel
 
 from app.agents.social_media_manager.services.x_direct_service import XDirectService
-from app.core.auth_bearer import JWTBearer
 from app.core.config import settings
-from app.dependencies import get_db_dependency
+from app.dependencies import get_db_dependency, get_active_brand_context
 
 router = APIRouter(prefix="/x", tags=["X (Twitter)"])
 
 
-def _extract_user_id(token: dict) -> str:
-    claims = token.get("claims", {}) if isinstance(token, dict) else {}
-    uid = (
-        token.get("userId")
-        or token.get("user_id")
-        or claims.get("userId")
-        or claims.get("user_id")
-    )
-    if not uid:
-        raise HTTPException(status_code=401, detail="Could not resolve user ID from token.")
-    return str(uid)
-
-
-async def _get_x_connection(user_id: str, db: AsyncIOMotorDatabase) -> Optional[dict]:
-    """Return the user's active X connection doc, or None."""
-    return await db["social_connections"].find_one(
-        {"user_id": user_id, "platform": "x", "connection_status": "active"}
-    )
+async def _get_x_connection(user_id: str, db: AsyncIOMotorDatabase, brand_id: Optional[str] = None) -> Optional[dict]:
+    """Return the active X connection doc for the given brand, or None."""
+    from app.models.brand_account import BrandAccount
+    is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
+    if is_personal:
+        query = {"user_id": user_id, "platform": "x", "connection_status": "active"}
+    else:
+        query = {"brand_id": brand_id, "platform": "x", "connection_status": "active"}
+    return await db["social_connections"].find_one(query)
 
 
 def _x_service() -> XDirectService:
@@ -63,7 +53,7 @@ def _x_service() -> XDirectService:
 
 @router.post("/connect")
 async def connect_x(
-    token: dict = Depends(JWTBearer()),
+    ctx: dict = Depends(get_active_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """
@@ -74,14 +64,14 @@ async def connect_x(
     if not settings.X_OAUTH_CALLBACK_URL:
         raise HTTPException(status_code=503, detail="X_OAUTH_CALLBACK_URL not configured.")
 
-    user_id = _extract_user_id(token)
+    user_id = ctx["user_id"]
+    brand_id = ctx["brand_id"]
     svc = _x_service()
 
     oauth_token, oauth_token_secret, auth_url = await svc.get_request_token(
         callback_url=settings.X_OAUTH_CALLBACK_URL
     )
 
-    # Store the request token temporarily (10-minute TTL via expires_at)
     await db["x_oauth_pending"].update_one(
         {"oauth_token": oauth_token},
         {
@@ -89,6 +79,7 @@ async def connect_x(
                 "oauth_token": oauth_token,
                 "oauth_token_secret": oauth_token_secret,
                 "user_id": user_id,
+                "brand_id": brand_id,
                 "expires_at": datetime.utcnow() + timedelta(minutes=10),
             }
         },
@@ -115,7 +106,7 @@ async def x_oauth_callback(
     """
     X redirects the user's browser here after they authorise (or deny) the app.
     No JWT — the user is identified by the oauth_token stored during /connect.
-    Stores per-user OAuth 1.0a tokens then redirects to the frontend.
+    Stores per-brand OAuth 1.0a tokens then redirects to the frontend.
     """
     web_app_url = settings.WEB_APP_URL
 
@@ -124,7 +115,6 @@ async def x_oauth_callback(
             f"{web_app_url}/social-media/brand-setup?connected=false&platform=x&error=access_denied"
         )
 
-    # Look up the pending auth doc
     pending = await db["x_oauth_pending"].find_one({"oauth_token": oauth_token})
     if not pending:
         return RedirectResponse(
@@ -137,6 +127,7 @@ async def x_oauth_callback(
         )
 
     user_id = pending["user_id"]
+    brand_id = pending.get("brand_id")
     oauth_token_secret = pending["oauth_token_secret"]
 
     try:
@@ -150,27 +141,33 @@ async def x_oauth_callback(
     finally:
         await db["x_oauth_pending"].delete_one({"oauth_token": oauth_token})
 
+    from app.models.brand_account import BrandAccount
+    is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
+
     now = datetime.utcnow()
     screen_name = result.get("screen_name", "")
     x_user_id = result.get("user_id", "")
 
+    upsert_filter = {"user_id": user_id, "platform": "x"} if is_personal else {"brand_id": brand_id, "platform": "x"}
+    set_fields = {
+        "user_id": user_id,
+        "platform": "x",
+        "username": screen_name,
+        "account_name": screen_name,
+        "network_unique_id": x_user_id,
+        "connection_status": "active",
+        "connected_via": "x_direct",
+        "x_oauth_token": result["access_token"],
+        "x_oauth_token_secret": result["access_token_secret"],
+        "connected_at": now,
+        "updated_at": now,
+    }
+    if not is_personal:
+        set_fields["brand_id"] = brand_id
+
     await db["social_connections"].update_one(
-        {"user_id": user_id, "platform": "x"},
-        {
-            "$set": {
-                "user_id": user_id,
-                "platform": "x",
-                "username": screen_name,
-                "account_name": screen_name,
-                "network_unique_id": x_user_id,
-                "connection_status": "active",
-                "connected_via": "x_direct",
-                "x_oauth_token": result["access_token"],
-                "x_oauth_token_secret": result["access_token_secret"],
-                "connected_at": now,
-                "updated_at": now,
-            }
-        },
+        upsert_filter,
+        {"$set": set_fields},
         upsert=True,
     )
 
@@ -185,13 +182,11 @@ async def x_oauth_callback(
 
 @router.delete("/connect")
 async def disconnect_x(
-    token: dict = Depends(JWTBearer()),
+    ctx: dict = Depends(get_active_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
-    """Disconnect the authenticated user's X account."""
-    user_id = _extract_user_id(token)
-
-    conn = await _get_x_connection(user_id, db)
+    """Disconnect the active brand's X account."""
+    conn = await _get_x_connection(ctx["user_id"], db, ctx["brand_id"])
     if not conn:
         raise HTTPException(status_code=400, detail="No X account connected.")
 
@@ -209,12 +204,11 @@ async def disconnect_x(
 
 @router.get("/status")
 async def x_status(
-    token: dict = Depends(JWTBearer()),
+    ctx: dict = Depends(get_active_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
-    """Returns whether the authenticated user has an active X account connected."""
-    user_id = _extract_user_id(token)
-    conn = await _get_x_connection(user_id, db)
+    """Returns whether the active brand has an active X account connected."""
+    conn = await _get_x_connection(ctx["user_id"], db, ctx["brand_id"])
 
     linked = conn is not None
     return {
@@ -240,17 +234,15 @@ class PublishRequest(BaseModel):
 @router.post("/publish")
 async def publish_to_x(
     body: PublishRequest,
-    token: dict = Depends(JWTBearer()),
+    ctx: dict = Depends(get_active_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """
-    Publish a tweet (or thread) directly to the authenticated user's X account
+    Publish a tweet (or thread) directly to the active brand's X account
     via OAuth 1.0a — no Outstand, no paid X API tier required.
     Pass tweets as a list to publish a thread.
     """
-    user_id = _extract_user_id(token)
-
-    conn = await _get_x_connection(user_id, db)
+    conn = await _get_x_connection(ctx["user_id"], db, ctx["brand_id"])
     if not conn:
         raise HTTPException(
             status_code=400, detail="No X account connected. Call POST /x/connect first."
