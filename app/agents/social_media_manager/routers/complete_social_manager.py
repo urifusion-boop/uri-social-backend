@@ -611,7 +611,7 @@ async def regenerate_content(
 @router.post("/connect/initiate")
 async def initiate_social_connections(
     request: SocialConnectionRequest,
-    token: dict = Depends(JWTBearer()),
+    ctx: dict = Depends(get_active_brand_context),
 ):
     """
     Step 1 of the social connection flow (onboarding step 2).
@@ -623,14 +623,11 @@ async def initiate_social_connections(
     Supported platforms: facebook, instagram, linkedin, x/twitter,
     tiktok, youtube, pinterest, threads, bluesky, google_business
     """
-    user_id = _get_user_id(token)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="User ID not found in token")
-
     return await SocialAccountService.initiate_connection_flow(
-        user_id=user_id,
+        user_id=ctx["user_id"],
         platforms=request.platforms,
         source=request.source,
+        brand_id=ctx["brand_id"],
     )
 
 
@@ -789,19 +786,24 @@ async def facebook_direct_callback(
 async def facebook_direct_finalize(
     fb_page_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    ctx: dict = Depends(get_active_brand_context),
 ):
     """
     Called by the frontend after the Facebook direct OAuth callback to
-    associate the pending connection with the authenticated user.
+    associate the pending connection with the authenticated user and active brand.
     """
-    user_id = _get_user_id(token)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="User ID not found in token")
+    from app.models.brand_account import BrandAccount
+    user_id = ctx["user_id"]
+    brand_id = ctx["brand_id"]
+    is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
+
+    update_fields: dict = {"user_id": user_id, "connection_status": "active", "updated_at": datetime.utcnow().isoformat()}
+    if not is_personal:
+        update_fields["brand_id"] = brand_id
 
     result = await db["social_connections"].update_one(
         {"id": f"fb_{fb_page_id}"},
-        {"$set": {"user_id": user_id, "connection_status": "active", "updated_at": datetime.utcnow().isoformat()}},
+        {"$set": update_fields},
     )
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Facebook connection not found — try reconnecting")
@@ -1006,19 +1008,24 @@ async def instagram_direct_callback(
 async def instagram_direct_finalize(
     ig_user_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    ctx: dict = Depends(get_active_brand_context),
 ):
     """
     Called by the frontend after the Instagram direct OAuth callback to
-    associate the pending connection with the authenticated user.
+    associate the pending connection with the authenticated user and active brand.
     """
-    user_id = _get_user_id(token)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="User ID not found in token")
+    from app.models.brand_account import BrandAccount
+    user_id = ctx["user_id"]
+    brand_id = ctx["brand_id"]
+    is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
+
+    update_fields: dict = {"user_id": user_id, "connection_status": "active", "updated_at": datetime.utcnow().isoformat()}
+    if not is_personal:
+        update_fields["brand_id"] = brand_id
 
     result = await db["social_connections"].update_one(
         {"ig_user_id": ig_user_id},
-        {"$set": {"user_id": user_id, "connection_status": "active", "updated_at": datetime.utcnow().isoformat()}},
+        {"$set": update_fields},
     )
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Instagram connection not found — try reconnecting")
@@ -1107,7 +1114,7 @@ async def get_pending_connection(
 async def finalize_social_connection(
     request: FinalizeConnectionRequest,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    ctx: dict = Depends(get_active_brand_context),
 ):
     """
     Step 3 of the social connection flow (completes onboarding step 2).
@@ -1116,15 +1123,12 @@ async def finalize_social_connection(
     Stores the connected account IDs locally for publishing.
     Call GET /connections after this to see all connected accounts.
     """
-    user_id = _get_user_id(token)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="User ID not found in token")
-
     return await SocialAccountService.finalize_connection(
         db=db,
-        user_id=user_id,
+        user_id=ctx["user_id"],
         session_token=request.session_token,
         selected_page_ids=request.selected_page_ids,
+        brand_id=ctx["brand_id"],
     )
 
 
@@ -2093,13 +2097,10 @@ class CalendarCreateDraftRequest(BaseModel):
 @router.get("/content-calendar/plan")
 async def get_calendar_plan(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    ctx: dict = Depends(get_active_brand_context),
 ):
     """Return the active 7-day plan for this week, or 404 if none exists."""
-    user_id = _get_user_id(token)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="User ID not found in token")
-    plan = await cal_svc.get_active_plan(user_id, db)
+    plan = await cal_svc.get_active_plan(ctx["user_id"], db, brand_id=ctx["brand_id"])
     if not plan:
         raise HTTPException(status_code=404, detail="No active plan for this week")
     return UriResponse.get_single_data_response("calendar_plan", plan)
@@ -2109,14 +2110,13 @@ async def get_calendar_plan(
 async def generate_calendar_plan(
     request: CalendarGenerateRequest,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    ctx: dict = Depends(get_active_brand_context),
 ):
     """Generate (or force-regenerate) the 7-day content plan for this week."""
-    user_id = _get_user_id(token)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="User ID not found in token")
+    user_id = ctx["user_id"]
+    brand_id = ctx["brand_id"]
     try:
-        profile_result = await BrandProfileService.get(user_id, db)
+        profile_result = await BrandProfileService.get(user_id, db, brand_id=brand_id)
         brand = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
         plan = await cal_svc.generate_plan(
             user_id=user_id,
@@ -2124,6 +2124,7 @@ async def generate_calendar_plan(
             brand=brand,
             db=db,
             force=request.force_regenerate,
+            brand_id=brand_id,
         )
         print(f"[Calendar] plan returned plan_id={plan.get('plan_id')} generation_method={plan.get('generation_method')} force={request.force_regenerate}")
         return UriResponse.get_single_data_response("calendar_plan", {
@@ -2141,14 +2142,11 @@ async def regenerate_calendar_day(
     plan_id: str,
     day_index: int,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    ctx: dict = Depends(get_active_brand_context),
 ):
     """Regenerate the content idea for a single day."""
-    user_id = _get_user_id(token)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="User ID not found in token")
     try:
-        updated_plan = await cal_svc.regenerate_day(plan_id, day_index, user_id, db)
+        updated_plan = await cal_svc.regenerate_day(plan_id, day_index, ctx["user_id"], db, brand_id=ctx["brand_id"])
         return UriResponse.get_single_data_response("calendar_plan", updated_plan)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -2165,15 +2163,15 @@ async def create_draft_from_calendar_day(
     request: CalendarCreateDraftRequest,
     background_tasks: BackgroundTasks,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    ctx: dict = Depends(get_active_brand_context),
 ):
     """Create a full content draft from a calendar day's idea."""
-    user_id = _get_user_id(token)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="User ID not found in token")
+    user_id = ctx["user_id"]
+    brand_id = ctx["brand_id"]
     try:
+        from app.agents.social_media_manager.services.content_calendar_service import _cal_scope
         plan = await db["content_calendar_plans"].find_one(
-            {"plan_id": plan_id, "user_id": user_id}, {"_id": 0}
+            {**_cal_scope(user_id, brand_id), "plan_id": plan_id}, {"_id": 0}
         )
         if not plan:
             raise HTTPException(status_code=404, detail="Plan not found")
@@ -2182,9 +2180,10 @@ async def create_draft_from_calendar_day(
             raise HTTPException(status_code=404, detail=f"Day {day_index} not found")
 
         seed_content = f"{day['title']}. {day['description']}"
-        profile_result = await BrandProfileService.get(user_id, db)
+        profile_result = await BrandProfileService.get(user_id, db, brand_id=brand_id)
         brand = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
         brand_context = BrandProfileService.to_brand_context(brand) if brand else {}
+        brand_context["brand_id"] = brand_id
 
         result = await ContentGenerationService.generate_multi_platform_content(
             user_id=user_id,
@@ -2198,7 +2197,7 @@ async def create_draft_from_calendar_day(
         if result.get("status"):
             drafts = result.get("responseData", {}).get("drafts", [])
             draft_ids = [d.get("draft_id") or d.get("id") for d in drafts if d]
-            await cal_svc.mark_acted_on(plan_id, day_index, draft_ids, user_id, db)
+            await cal_svc.mark_acted_on(plan_id, day_index, draft_ids, user_id, db, brand_id=brand_id)
 
             if request.include_images:
                 draft_ids = [d.get("draft_id") or d.get("id") for d in drafts if d]
@@ -2242,8 +2241,7 @@ async def get_today_suggestion(
     ctx: dict = Depends(get_active_brand_context),
 ):
     """Return today's content suggestion from the active brand's plan."""
-    user_id = ctx["user_id"]
-    result = await cal_svc.get_today_suggestion(user_id, db)
+    result = await cal_svc.get_today_suggestion(ctx["user_id"], db, brand_id=ctx["brand_id"])
     return UriResponse.get_single_data_response("today_suggestion", result)
 
 

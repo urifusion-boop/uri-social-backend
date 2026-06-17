@@ -18,13 +18,17 @@ class SocialAccountService:
         user_id: str,
         platforms: List[str],
         source: str = "onboarding",
+        brand_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Build Outstand OAuth URLs for each requested platform.
-        tenant_id is set to the URI user_id so Outstand can associate the
-        connected account with the correct user.
-        The frontend should open each auth_url for the user to authorise.
+        For agency brands, tenant_id is the brand_id so Outstand keeps
+        each brand's accounts isolated. Personal brands use user_id.
         """
+        from app.models.brand_account import BrandAccount
+        is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
+        tenant_id = user_id if is_personal else brand_id
+
         outstand = OutstandService()
         # Use PUBLIC_API_URL if set (browser-reachable), otherwise fall back to gateway URL
         _base = (settings.PUBLIC_API_URL or settings.URI_GATEWAY_BASE_API_URL).rstrip("/")
@@ -44,7 +48,7 @@ class SocialAccountService:
             try:
                 url = await outstand.get_auth_url(
                     network=network,
-                    tenant_id=user_id,
+                    tenant_id=tenant_id,
                     redirect_uri=callback_url,
                 )
                 auth_urls[platform.lower()] = url
@@ -132,11 +136,15 @@ class SocialAccountService:
         user_id: str,
         session_token: str,
         selected_page_ids: List[str],
+        brand_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Complete the OAuth flow by finalising the selected pages.
         Stores the connected account IDs in our local DB for fast publishing lookups.
         """
+        from app.models.brand_account import BrandAccount
+        is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
+
         outstand = OutstandService()
         try:
             result = await outstand.finalize_connection(session_token, selected_page_ids)
@@ -167,10 +175,15 @@ class SocialAccountService:
                     "connected_at": now,
                     "updated_at": now,
                 }
+                if not is_personal:
+                    doc["brand_id"] = brand_id
+
+                # Scope the delete to this brand so we don't wipe another brand's connection
+                brand_scope = {"user_id": user_id} if is_personal else {"brand_id": brand_id}
                 await db["social_connections"].delete_many({
                     "$or": [
                         {"id": outstand_account_id},
-                        {"user_id": user_id, "platform": network},
+                        {**brand_scope, "platform": network},
                     ]
                 })
                 await db["social_connections"].insert_one(doc)
