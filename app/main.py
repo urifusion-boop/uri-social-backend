@@ -64,6 +64,26 @@ async def startup_event():
     except Exception as e:
         print(f"⚠️  Warning: Failed to create email index: {e}")
 
+    # Migrate social_connections index: old (user_id, platform, page_id) prevented the same
+    # user from connecting the same platform to multiple agency brands. Replace with
+    # (user_id, platform, brand_id, page_id) so each brand gets its own isolated connection.
+    try:
+        from app.database import get_db
+        db = await get_db()
+        existing = await db["social_connections"].index_information()
+        if "user_id_1_platform_1_page_id_1" in existing:
+            await db["social_connections"].drop_index("user_id_1_platform_1_page_id_1")
+            print("✅ Dropped old social_connections unique index (user_id, platform, page_id)")
+        await db["social_connections"].create_index(
+            [("user_id", 1), ("platform", 1), ("brand_id", 1), ("page_id", 1)],
+            unique=True,
+            sparse=True,
+            name="user_id_1_platform_1_brand_id_1_page_id_1",
+        )
+        print("✅ social_connections multi-brand index ensured")
+    except Exception as e:
+        print(f"⚠️  Warning: Failed to migrate social_connections index: {e}")
+
     # Start notification scheduler (PRD 8: Scheduled Jobs)
     try:
         from app.services.notification_scheduler import start_notification_scheduler
