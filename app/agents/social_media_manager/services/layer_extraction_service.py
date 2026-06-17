@@ -43,18 +43,23 @@ class LayerExtractionService:
         analysis_prompt = LayerExtractionService._build_analysis_prompt(prompt_metadata)
 
         try:
-            response = await openai_client.chat.completions.create(
-                model="gpt-4o",
-                messages=[{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": analysis_prompt},
-                        {"type": "image_url", "image_url": {"url": image_url}}
-                    ]
-                }],
-                response_format={"type": "json_object"},
-                max_tokens=2000,
-                temperature=0.1  # Low temperature for consistent analysis
+            import asyncio
+            loop = asyncio.get_running_loop()
+            response = await loop.run_in_executor(
+                None,
+                lambda: openai_client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": analysis_prompt},
+                            {"type": "image_url", "image_url": {"url": image_url}}
+                        ]
+                    }],
+                    response_format={"type": "json_object"},
+                    max_tokens=2000,
+                    temperature=0.1  # Low temperature for consistent analysis
+                )
             )
 
             # Parse response
