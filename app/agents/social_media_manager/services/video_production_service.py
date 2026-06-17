@@ -602,9 +602,9 @@ def build_shotstack_timeline(
             "effect": base_effect,
         }
 
-        # Flash at every cut except the very first clip — crisp TikTok-style
+        # Zoom transition at every cut except the very first clip
         if i > 0:
-            clip["transition"] = {"in": "flash"}
+            clip["transition"] = {"in": "zoom"}
 
         if seg_zooms:
             z = seg_zooms[0]
