@@ -582,8 +582,9 @@ def build_shotstack_timeline(
 
         seg_zooms = [z for z in zooms if seg["src_start"] <= float(z.get("at", -1)) < seg["src_end"]]
 
-        # Alternating Ken Burns direction — adds motion to static talking-head shots
-        base_effect = "zoomInSlow" if i % 2 == 0 else "zoomOutSlow"
+        # Base clips pan left/right (slide Ken Burns) — zero zoom so emphasis zooms
+        # are visually distinct and unmissable by contrast.
+        base_effect = "slideLeft" if i % 2 == 0 else "slideRight"
 
         clip: Dict[str, Any] = {
             "asset": {
@@ -596,23 +597,19 @@ def build_shotstack_timeline(
             "length": round(seg_dur, 3),
             "fit": "cover",
             "effect": base_effect,
-            # Hard cuts — no opacity keyframes. Shotstack treats an opacity array as
-            # "0 everywhere not covered by a keyframe window", so animated opacity was
-            # making clips black for their entire visible duration.
         }
 
         if seg_zooms:
             z = seg_zooms[0]
-            # zoomIn Ken Burns is faster than zoomInSlow — makes emphasis clips feel
-            # more energetic. Rotation snaps in then overshoots back to zero for a
-            # kinetic punch. Rotation is around the clip center so no black edges.
+            # Swap from pan → zoom effect so the audience feels the camera push in.
+            # Strong rotation overshoot (6° → -3° → 0°) adds a kinetic smash-cut feel.
             clip["effect"] = "zoomIn" if z.get("intensity") != "strong" else "zoomOut"
             clip["transform"] = {
                 "rotate": {
                     "angle": [
-                        {"from": 4.0, "to": -1.5, "start": 0, "length": 0.4,
+                        {"from": 6.0, "to": -3.0, "start": 0, "length": 0.35,
                          "interpolation": "bezier", "easing": "easeOutBack"},
-                        {"from": -1.5, "to": 0, "start": 0.4, "length": 0.18,
+                        {"from": -3.0, "to": 0, "start": 0.35, "length": 0.2,
                          "interpolation": "bezier", "easing": "easeOutCubic"},
                     ]
                 }
