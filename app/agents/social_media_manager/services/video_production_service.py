@@ -109,21 +109,17 @@ async def _clean_audio(video_bytes: bytes) -> bytes:
 
 
 # ── SFX library ───────────────────────────────────────────────────────────────
-# Set SFX_ENABLED=true in .env.staging after uploading SFX files to /app/static/sfx/
-# on the container (then accessible via https://api-staging.urisocial.com/static/sfx/)
-
-SFX_ENABLED = os.getenv("SFX_ENABLED", "false").lower() == "true"
-
-_SFX_BASE = "https://api-staging.urisocial.com/static/sfx"
+# SFX files hosted on Cloudinary — permanent CDN URLs, no container dependency
+_SFX_CDN = "https://res.cloudinary.com/df8ckaeam/video/upload/uri-sfx"
 SFX_LIBRARY: Dict[str, str] = {
-    "whoosh":   f"{_SFX_BASE}/whoosh.mp3",    # fast cuts / transitions
-    "impact":   f"{_SFX_BASE}/impact.mp3",    # emphasis zooms / key claims
-    "boom":     f"{_SFX_BASE}/impact.mp3",    # alias → impact
-    "pop":      f"{_SFX_BASE}/pop.mp3",       # caption word / list item
-    "tick":     f"{_SFX_BASE}/tick.mp3",      # subtle emphasis
-    "ding":     f"{_SFX_BASE}/ding.mp3",      # positive / product feature reveal
-    "sparkle":  f"{_SFX_BASE}/ding.mp3",      # alias → ding
-    "swell":    f"{_SFX_BASE}/swell.mp3",     # section change / emotional peak
+    "whoosh":   f"{_SFX_CDN}/whoosh.mp3",    # fast cuts / transitions
+    "impact":   f"{_SFX_CDN}/impact.mp3",    # emphasis zooms / key claims
+    "boom":     f"{_SFX_CDN}/impact.mp3",    # alias → impact
+    "pop":      f"{_SFX_CDN}/pop.mp3",       # caption word / list item
+    "tick":     f"{_SFX_CDN}/tick.mp3",      # subtle emphasis
+    "ding":     f"{_SFX_CDN}/ding.mp3",      # positive / product feature reveal
+    "sparkle":  f"{_SFX_CDN}/ding.mp3",      # alias → ding
+    "swell":    f"{_SFX_CDN}/swell.mp3",     # section change / emotional peak
 }
 
 
@@ -701,16 +697,11 @@ def build_shotstack_timeline(
 
     # ── SFX audio track ───────────────────────────────────────────────────────
     sfx_clips: List[Dict] = []
-    if SFX_ENABLED and sound_effects:
+    if sound_effects:
         for sfx in sound_effects:
             sfx_type = sfx.get("type", "").lower()
             sfx_url = SFX_LIBRARY.get(sfx_type, "")
             if not sfx_url:
-                continue
-            # Guard: skip if the local file is missing — a 404 URL causes Shotstack to fail the entire render
-            sfx_local = f"/app/static/sfx/{sfx_type}.mp3"
-            if not os.path.exists(sfx_local):
-                print(f"[SFX] {sfx_type}.mp3 not found on disk, skipping", flush=True)
                 continue
             orig_at = float(sfx.get("at", -1))
             if orig_at < 0 or orig_at > video_duration:
