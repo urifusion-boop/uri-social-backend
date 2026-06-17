@@ -233,10 +233,22 @@ class SocialAccountService:
         from app.models.brand_account import BrandAccount
 
         is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
+        personal_bid = BrandAccount.personal_brand_id(user_id)
         tenant = user_id if is_personal else brand_id
-        # Local filter: personal → by user (legacy docs have no brand_id);
-        # agency brand → strictly by brand_id (isolated).
-        local_filter: Dict[str, Any] = {"user_id": user_id} if is_personal else {"brand_id": brand_id}
+        # Personal brand: exclude docs that belong to an agency brand (they store
+        # user_id too, so a plain user_id filter would leak them across brands).
+        # Agency brand: match strictly by brand_id only.
+        if is_personal:
+            local_filter: Dict[str, Any] = {
+                "user_id": user_id,
+                "$or": [
+                    {"brand_id": {"$exists": False}},
+                    {"brand_id": None},
+                    {"brand_id": personal_bid},
+                ],
+            }
+        else:
+            local_filter = {"brand_id": brand_id}
         local_filter["connection_status"] = "active"
 
         by_platform: Dict[str, list] = {}
@@ -311,19 +323,34 @@ class SocialAccountService:
         db: AsyncIOMotorDatabase,
         user_id: str,
         outstand_account_id: str,
+        brand_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Permanently disconnect a social account.
+        Permanently disconnect a social account scoped to the active brand.
         outstand_account_id is the ID returned by Outstand (e.g. '9dyJS').
         """
-        # Verify this account belongs to the user (local mirror check)
+        from app.models.brand_account import BrandAccount
+        is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
+        personal_bid = BrandAccount.personal_brand_id(user_id)
+        if is_personal:
+            brand_scope = {
+                "user_id": user_id,
+                "$or": [
+                    {"brand_id": {"$exists": False}},
+                    {"brand_id": None},
+                    {"brand_id": personal_bid},
+                ],
+            }
+        else:
+            brand_scope = {"brand_id": brand_id}
+
         local = await db["social_connections"].find_one({
-            "user_id": user_id,
+            **brand_scope,
             "outstand_account_id": outstand_account_id,
         })
         if not local:
             return UriResponse.error_response(
-                "Account not found or does not belong to this user.", code=404
+                "Account not found or does not belong to this brand.", code=404
             )
 
         outstand = OutstandService()
@@ -332,7 +359,7 @@ class SocialAccountService:
 
             # Remove from local mirror
             await db["social_connections"].delete_one({
-                "user_id": user_id,
+                **brand_scope,
                 "outstand_account_id": outstand_account_id,
             })
 

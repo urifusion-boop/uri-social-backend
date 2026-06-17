@@ -1147,21 +1147,18 @@ async def get_user_connections(
 async def disconnect_social_account(
     outstand_account_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    ctx: dict = Depends(get_active_brand_context),
 ):
     """
-    Permanently disconnect a social account.
+    Permanently disconnect a social account for the active brand.
     Use the outstand_account_id returned by GET /connections.
     This revokes OAuth tokens — the user must reconnect via /connect/initiate.
     """
-    user_id = _get_user_id(token)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="User ID not found in token")
-
     return await SocialAccountService.disconnect_account(
         db=db,
-        user_id=user_id,
+        user_id=ctx["user_id"],
         outstand_account_id=outstand_account_id,
+        brand_id=ctx["brand_id"],
     )
 
 
@@ -1169,19 +1166,31 @@ async def disconnect_social_account(
 async def disconnect_instagram_direct(
     ig_user_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    ctx: dict = Depends(get_active_brand_context),
 ):
     """
-    Disconnect an Instagram account connected via direct OAuth (not Outstand).
+    Disconnect an Instagram account connected via direct OAuth for the active brand.
     """
-    user_id = _get_user_id(token)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="User ID not found in token")
+    from app.models.brand_account import BrandAccount
+    user_id = ctx["user_id"]
+    brand_id = ctx["brand_id"]
+    is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
+    personal_bid = BrandAccount.personal_brand_id(user_id)
 
-    result = await db["social_connections"].delete_one({
-        "ig_user_id": ig_user_id,
-        "user_id": user_id,
-    })
+    if is_personal:
+        delete_filter = {
+            "ig_user_id": ig_user_id,
+            "user_id": user_id,
+            "$or": [
+                {"brand_id": {"$exists": False}},
+                {"brand_id": None},
+                {"brand_id": personal_bid},
+            ],
+        }
+    else:
+        delete_filter = {"ig_user_id": ig_user_id, "brand_id": brand_id}
+
+    result = await db["social_connections"].delete_one(delete_filter)
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Instagram connection not found")
 
@@ -1191,20 +1200,32 @@ async def disconnect_instagram_direct(
 @router.delete("/connections/facebook-direct")
 async def disconnect_facebook_direct(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    ctx: dict = Depends(get_active_brand_context),
 ):
     """
-    Disconnect a Facebook Page connected via direct OAuth (not Outstand).
+    Disconnect a Facebook Page connected via direct OAuth for the active brand.
     """
-    user_id = _get_user_id(token)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="User ID not found in token")
+    from app.models.brand_account import BrandAccount
+    user_id = ctx["user_id"]
+    brand_id = ctx["brand_id"]
+    is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
+    personal_bid = BrandAccount.personal_brand_id(user_id)
 
-    result = await db["social_connections"].delete_one({
-        "user_id": user_id,
-        "platform": "facebook",
-        "connected_via": "facebook_direct_oauth",
-    })
+    if is_personal:
+        delete_filter = {
+            "user_id": user_id,
+            "platform": "facebook",
+            "connected_via": "facebook_direct_oauth",
+            "$or": [
+                {"brand_id": {"$exists": False}},
+                {"brand_id": None},
+                {"brand_id": personal_bid},
+            ],
+        }
+    else:
+        delete_filter = {"brand_id": brand_id, "platform": "facebook", "connected_via": "facebook_direct_oauth"}
+
+    result = await db["social_connections"].delete_one(delete_filter)
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Facebook connection not found")
 
