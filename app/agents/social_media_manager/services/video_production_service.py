@@ -472,6 +472,7 @@ INSTRUCTIONS:
   Max 3 b-roll clips. Only add where a visual genuinely helps — skip if the speaker's face/expression is the key content at that moment.
   Do NOT add b-roll that overlaps a zoom. Space b-roll clips at least 3s apart.
 - music_mood: background music mood. Options: upbeat, chill, cinematic, dramatic, acoustic, electronic. Pick what best fits the video energy and topic.
+- hook_text: A punchy 3–6 word ALL-CAPS hook/title that captures the video's core message or biggest claim. Used as an animated title card in the first 2s. E.g. "HOW I MADE $10K", "STOP DOING THIS WRONG", "THE TRUTH ABOUT AI".
 
 Return ONLY valid JSON (no markdown):
 {{
@@ -488,7 +489,8 @@ Return ONLY valid JSON (no markdown):
     {{"at": 6.0, "duration": 3.0, "description": "hands typing on laptop keyboard", "concept": "typing laptop", "reason": "speaker mentions working"}}
   ],
   "pacing_note": "tight and energetic",
-  "music_mood": "upbeat"
+  "music_mood": "upbeat",
+  "hook_text": "THE REAL SECRET HERE"
 }}"""
 
     client = openai.AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
@@ -566,6 +568,7 @@ def build_shotstack_timeline(
     aspect_ratio: str = "9:16",
     job_id: str = "",
     music_url: Optional[str] = None,
+    hook_text: str = "",
 ) -> Dict[str, Any]:
     # broll items have: at (original ts), duration, url (resolved)
     keep_segments = _build_keep_segments(cuts, video_duration)
@@ -599,10 +602,15 @@ def build_shotstack_timeline(
             "effect": base_effect,
         }
 
+        # Flash at every cut except the very first clip — crisp TikTok-style
+        if i > 0:
+            clip["transition"] = {"in": "flash"}
+
         if seg_zooms:
             z = seg_zooms[0]
             # Swap from pan → zoom effect so the audience feels the camera push in.
             # Strong rotation overshoot (6° → -3° → 0°) adds a kinetic smash-cut feel.
+            # Skew snap (0.07 → 0 in 0.3s) adds perspective warp on zoom entry.
             clip["effect"] = "zoomIn" if z.get("intensity") != "strong" else "zoomOut"
             clip["transform"] = {
                 "rotate": {
@@ -612,7 +620,13 @@ def build_shotstack_timeline(
                         {"from": -3.0, "to": 0, "start": 0.35, "length": 0.2,
                          "interpolation": "bezier", "easing": "easeOutCubic"},
                     ]
-                }
+                },
+                "skew": {
+                    "x": [
+                        {"from": 0.07, "to": 0, "start": 0, "length": 0.3,
+                         "interpolation": "bezier", "easing": "easeOutCubic"},
+                    ]
+                },
             }
 
         video_clips.append(clip)
@@ -669,10 +683,10 @@ def build_shotstack_timeline(
                 "opacity": 1,
             },
             "animation": {"style": "karaoke"},
-            # Yellow highlight on the active (currently spoken) word
+            # Active word: black text on yellow background box (Instagram Reels/TikTok style)
             "active": {
-                "font": {"color": "#FFD700"},
-                "stroke": {"width": 2, "color": "#000000", "opacity": 1},
+                "font": {"color": "#000000", "background": "#FFD700"},
+                "stroke": {"width": 0, "color": "#000000", "opacity": 0},
             },
             "style": {"textTransform": "uppercase"},
             "padding": {"top": 6, "right": 20, "bottom": 6, "left": 20},
@@ -743,6 +757,7 @@ def build_shotstack_timeline(
             "start": round(tl_at, 3),
             "length": round(br_dur, 3),
             "fit": "cover",
+            "effect": "slideUp",
             "opacity": [
                 {"from": 0, "to": 1, "start": 0, "length": fade,
                  "interpolation": "bezier", "easing": "easeOutCubic"},
@@ -767,9 +782,39 @@ def build_shotstack_timeline(
         }]
         print(f"[Music] added track volume=0.15 length={total_duration:.1f}s fade={fade:.1f}s", flush=True)
 
+    # ── Hook title card (rich-text overlay, first 2.5s) ──────────────────────
+    hook_clips: List[Dict] = []
+    if hook_text:
+        hook_css = (
+            "body{margin:0;padding:0;background:transparent;}"
+            "p{font-family:'Montserrat',sans-serif;font-size:74px;font-weight:900;"
+            "color:#FFFFFF;text-align:center;text-transform:uppercase;"
+            "letter-spacing:-2px;"
+            "text-shadow:3px 3px 0 #000,-3px -3px 0 #000,3px -3px 0 #000,-3px 3px 0 #000;"
+            "margin:0;padding:12px 24px;}"
+        )
+        hook_clips = [{
+            "asset": {
+                "type": "html",
+                "html": f"<p>{hook_text.upper()}</p>",
+                "css": hook_css,
+                "width": 960,
+                "height": 320,
+            },
+            "start": 0,
+            "length": round(min(2.5, total_duration * 0.25), 3),
+            "position": "center",
+            "offset": {"y": 0.12},
+            "transition": {"in": "slideUp", "out": "fade"},
+        }]
+        print(f"[VideoProduction] hook title card: '{hook_text}'", flush=True)
+
     # Track order (index 0 = top layer):
-    # 0: captions, 1: b-roll overlays, 2: main video, 3: sfx audio, 4: bg music
-    tracks = [{"clips": caption_clips}]
+    # 0: hook title, 1: captions, 2: b-roll overlays, 3: main video, 4: sfx audio, 5: bg music
+    tracks: List[Dict] = []
+    if hook_clips:
+        tracks.append({"clips": hook_clips})
+    tracks.append({"clips": caption_clips})
     if broll_clips:
         tracks.append({"clips": broll_clips})
     tracks.append({"clips": video_clips})
@@ -893,9 +938,11 @@ async def run_production_job(
         broll_decisions = decisions.get("broll", [])[:3]
         pacing_note = decisions.get("pacing_note", "")
         music_mood = decisions.get("music_mood", "upbeat")
+        hook_text = decisions.get("hook_text", "")
         print(
             f"[VideoProduction] cuts={len(cuts)} zooms={len(zooms)} "
-            f"sfx={len(sound_effects)} broll={len(broll_decisions)} pacing={pacing_note}",
+            f"sfx={len(sound_effects)} broll={len(broll_decisions)} pacing={pacing_note} "
+            f"hook='{hook_text}'",
             flush=True,
         )
 
@@ -933,6 +980,7 @@ async def run_production_job(
             aspect_ratio="9:16",
             job_id=job_id,
             music_url=music_url,
+            hook_text=hook_text,
         )
 
         await update(68, "Rendering video…")
