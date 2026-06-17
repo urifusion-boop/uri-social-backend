@@ -34,9 +34,19 @@ router = APIRouter(prefix="/x", tags=["X (Twitter)"])
 async def _get_x_connection(user_id: str, db: AsyncIOMotorDatabase, brand_id: Optional[str] = None) -> Optional[dict]:
     """Return the active X connection doc for the given brand, or None."""
     from app.models.brand_account import BrandAccount
-    is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
+    personal_bid = BrandAccount.personal_brand_id(user_id)
+    is_personal = (not brand_id) or brand_id == personal_bid
     if is_personal:
-        query = {"user_id": user_id, "platform": "x", "connection_status": "active"}
+        query = {
+            "user_id": user_id,
+            "platform": "x",
+            "connection_status": "active",
+            "$or": [
+                {"brand_id": {"$exists": False}},
+                {"brand_id": None},
+                {"brand_id": personal_bid},
+            ],
+        }
     else:
         query = {"brand_id": brand_id, "platform": "x", "connection_status": "active"}
     return await db["social_connections"].find_one(query)
