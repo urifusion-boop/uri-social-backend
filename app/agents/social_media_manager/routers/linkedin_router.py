@@ -165,7 +165,6 @@ async def linkedin_oauth_callback(
     token_expires_at = now + timedelta(seconds=int(expires_in_seconds))
 
     doc_id = f"linkedin_{user_id}" if is_personal else f"linkedin_{brand_id}"
-    upsert_filter = {"user_id": user_id, "platform": "linkedin"} if is_personal else {"brand_id": brand_id, "platform": "linkedin"}
 
     set_fields = {
         "id": doc_id,
@@ -188,11 +187,19 @@ async def linkedin_oauth_callback(
     if not is_personal:
         set_fields["brand_id"] = brand_id
 
-    await db["social_connections"].update_one(
-        upsert_filter,
-        {"$set": set_fields},
-        upsert=True,
-    )
+    try:
+        await db["social_connections"].update_one(
+            {"id": doc_id},
+            {"$set": set_fields},
+            upsert=True,
+        )
+    except Exception as db_err:
+        import traceback as _tb
+        print(f"[linkedin/callback] DB upsert error: {db_err}\n{_tb.format_exc()}")
+        return RedirectResponse(
+            f"{web_app_url}/settings/social-accounts"
+            f"?connected=false&platform=linkedin&error={urllib.parse.quote(str(db_err))}"
+        )
 
     return RedirectResponse(
         f"{web_app_url}/settings/social-accounts"
