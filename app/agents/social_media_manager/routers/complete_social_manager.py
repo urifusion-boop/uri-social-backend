@@ -4302,6 +4302,11 @@ async def _generate_image_bg(
                 print(f"   ❌ Error: {upload_err}")
 
         final_url = stored_url if not stored_url.startswith("data:") else None
+
+        print(f"[Canvas Editor DEBUG] final_url exists: {final_url is not None}, db exists: {db is not None}")
+        if final_url:
+            print(f"[Canvas Editor DEBUG] final_url value: {final_url[:100]}...")
+
         if final_url and db is not None:
             # ========== CANVAS EDITOR: LAYERED DOCUMENT GENERATION ==========
             # Check if canvas editor is enabled for this user
