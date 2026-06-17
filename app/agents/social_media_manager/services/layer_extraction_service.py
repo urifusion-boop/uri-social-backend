@@ -107,6 +107,7 @@ class LayerExtractionService:
       "fontSize": 72,
       "fontWeight": 400 | 700,
       "color": "#FFFFFF",
+      "backgroundColor": "#000000 | null (the average color BEHIND this text, null if transparent/gradient)",
       "fontFamily": "estimated font name or 'sans-serif'",
       "textAlign": "left" | "center" | "right",
       "confidence": 0.95
@@ -221,8 +222,11 @@ class LayerExtractionService:
                 "font_size": text_layer.get("fontSize", 48),
                 "font_weight": text_layer.get("fontWeight", 400),
                 "color": text_layer.get("color", "#FFFFFF"),
+                "background_color": text_layer.get("backgroundColor"),  # Background color behind text
                 "x": text_layer.get("x", 100),
                 "y": text_layer.get("y", 100),
+                "width": text_layer.get("width"),
+                "height": text_layer.get("height"),
                 "max_width": text_layer.get("width"),
                 "text_align": text_layer.get("textAlign", "left"),
                 "line_height": 1.2,
