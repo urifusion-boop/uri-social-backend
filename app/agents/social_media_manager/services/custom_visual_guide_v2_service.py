@@ -1,0 +1,582 @@
+# app/agents/social_media_manager/services/custom_visual_guide_v2_service.py
+
+"""
+Custom Visual Guide V2 Service
+Advanced style transfer system using meta-prompts and direct image references.
+
+Key Differences from V1:
+- V1: Extracts aesthetic profile → Text prompt fragment → GPT-Image-2 generates
+- V2: Extracts style profile JSON → Meta-prompt → GPT-4o generates smart prompt
+      → Sends prompt + ACTUAL reference image → GPT-Image-2 edit mode
+
+V2 Flow:
+1. Upload: GPT-4o Vision extracts comprehensive style profile JSON
+2. Generation: Art director meta-prompt transforms style + brand + content
+3. GPT-Image-2 edit mode uses reference image + generated prompt
+"""
+
+from typing import Dict, Any, List, Optional
+import asyncio
+import hashlib
+import json
+from datetime import datetime
+from motor.motor_asyncio import AsyncIOMotorDatabase
+from pymongo.errors import DuplicateKeyError
+from fastapi import HTTPException
+
+from app.services.AIService import AIService
+
+
+class CustomVisualGuideV2Service:
+    """Service for Custom Visual Guide V2 - Style transfer with meta-prompts"""
+
+    # Style profile extraction prompt for GPT-4o Vision
+    STYLE_EXTRACTION_PROMPT = """You are an expert visual analyst. Analyze this reference design image and extract a comprehensive STYLE PROFILE that can be used to recreate the AESTHETIC and STRUCTURE (but NOT the specific identity/branding).
+
+Your job is to document HOW this design looks, feels, and is structured — so another designer can apply the same STYLE to completely different content for a different brand.
+
+Return ONLY this JSON structure (no markdown, no code blocks, just raw JSON):
+
+{
+  "medium": "photographic | illustrated | hand_drawn | flat_graphic | 3d_render | mixed_media | collage | typography_driven",
+  "aesthetic_dominance": "low | medium | high",
+  "overall_aesthetic": "minimalist | bold | vintage | modern | organic | industrial | playful | elegant | dramatic | warm | energetic | luxurious | casual | professional | artistic",
+  "mood": "professional | playful | dramatic | warm | energetic | luxurious | calm | serious | friendly | sophisticated | edgy | nostalgic | futuristic | authentic | aspirational",
+
+  "layout_structure": {
+    "composition": "centered | rule_of_thirds | asymmetric | grid | diagonal | circular | layered | split_screen | full_bleed | framed",
+    "information_density": "minimal | moderate | packed | complex",
+    "focal_strategy": "single_hero | split | layered | scattered | hierarchical | balanced",
+    "structural_devices": ["thought_bubble", "split_zones", "overlay_panel", "frame", "badge", "ribbon", "callout_box", "text_panel", "geometric_shapes", "organic_shapes"]
+  },
+
+  "imagery_style": {
+    "subject_type": "person | product | scene | abstract | food | nature | urban | interior | pattern | text_only",
+    "lighting": "soft_natural | dramatic | flat | golden_hour | studio | low_key | high_key | neon | backlit | side_lit | diffused | harsh",
+    "treatment": "realistic | stylized | illustrated | flat | hand_drawn | photographic | painterly | geometric | textured",
+    "realism_level": "photorealistic | semi_realistic | stylized | abstract | iconic | simplified"
+  },
+
+  "color_system": {
+    "dominant_color": "#hexcode (or 'transparent' if no clear dominant)",
+    "accent_strategy": "single_bright_accent | complementary_pair | monochrome | vibrant_multi | pastel_palette | dark_moody | gradient_driven | neon_pops | earth_tones | analogous",
+    "palette_role": "background_dominant | balanced | accent_driven | imagery_dominant",
+    "temperature": "warm | cool | neutral | mixed",
+    "saturation": "highly_saturated | moderate | desaturated | black_and_white",
+    "contrast": "high | medium | low"
+  },
+
+  "graphic_elements": [
+    "line_icons", "badges", "frames", "textures", "geometric_shapes", "organic_elements",
+    "patterns", "gradients", "shadows", "borders", "dividers", "decorative_flourishes",
+    "thought_bubbles", "speech_bubbles", "arrows", "stars", "sparkles", "dots", "lines"
+  ],
+
+  "typography": {
+    "character": "bold_condensed | elegant_serif | playful_rounded | modern_sans | script_handwritten | geometric | retro | futuristic | minimalist | ornate | industrial | organic",
+    "hierarchy": "strong | subtle | flat | extreme",
+    "text_placement": "overlay_center | side_panel | top_banner | bottom_strip | scattered | diagonal | vertical | circular | integrated_in_imagery",
+    "text_treatment": "plain | outlined | shadowed | glowing | textured | gradient_fill | cutout | 3d_effect | handwritten_style"
+  },
+
+  "what_to_leave_behind": [
+    "List ALL identity elements that belong to the ORIGINAL brand/creator:",
+    "- Original brand name (if visible)",
+    "- Original logo or brand marks",
+    "- Phone numbers, websites, social handles",
+    "- Specific person's face/identity (describe as type instead)",
+    "- Specific product packaging (describe as product type instead)",
+    "- Any copyrighted characters, trademarks, or branded elements"
+  ]
+}
+
+CRITICAL RULES:
+1. Focus on STYLE (how it looks) not IDENTITY (whose brand it is)
+2. Be specific about colors (use hex codes where possible)
+3. Identify ALL text placement patterns and graphic devices
+4. List everything in "what_to_leave_behind" that should NOT be copied
+5. The goal is to capture the AESTHETIC DNA so it can be applied to new content
+6. Return ONLY the JSON, no explanations"""
+
+    # Art director meta-prompt template
+    ART_DIRECTOR_TEMPLATE = """You are a senior art director creating a brand-new, original graphic
+for a specific brand. You have been given a STYLE PROFILE extracted
+from a reference design, the TARGET BRAND's own identity, and the
+CONTENT for the new graphic. Your job is to produce a single, detailed
+image-generation prompt that applies the borrowed STYLE to the new
+CONTENT, branded entirely for the TARGET BRAND.
+
+═══════════════════════════════════════════════════════
+INPUTS
+═══════════════════════════════════════════════════════
+
+STYLE PROFILE (extracted from the reference design):
+{style_profile_json}
+
+TARGET BRAND IDENTITY (the brand this graphic is FOR):
+{{
+  "brand_name": "{brand_name}",
+  "primary_color": "{primary_color}",
+  "secondary_color": "{secondary_color}",
+  "accent_color": "{accent_color}",
+  "logo_description": "{logo_description}",
+  "font_preference": "{brand_font}",
+  "tone": "{brand_tone}",
+  "contact_handle": "{brand_handle}"
+}}
+
+NEW CONTENT FOR THIS GRAPHIC:
+{{
+  "purpose": "{purpose}",
+  "headline": "{headline}",
+  "subtext": "{subtext}",
+  "call_to_action": "{cta}",
+  "format": "{format}"
+}}
+
+═══════════════════════════════════════════════════════
+HARD RULES — IDENTITY SEPARATION (NON-NEGOTIABLE)
+═══════════════════════════════════════════════════════
+
+1. BORROW THE STYLE, NOT THE IDENTITY.
+   You are reproducing the reference's AESTHETIC and STRUCTURE only.
+   You must NOT reproduce any identity element belonging to the
+   reference's original creator. The style profile's
+   "what_to_leave_behind" array lists detected identity elements —
+   none of these may appear in the output.
+
+2. THE ONLY BRANDING IS THE TARGET BRAND'S.
+   The output carries ONLY {brand_name}'s identity:
+   - Only {brand_name}'s logo (described, to be composited)
+   - Only {brand_name}'s name and handle
+   - Only {brand_name}'s colors
+   - No other brand's name, logo, mark, tagline, product, watermark,
+     or contact details may appear anywhere.
+
+3. COLORS MAP BY ROLE.
+   Take the reference's color STRATEGY (from color_system.accent_strategy
+   and palette_role) and apply it using the TARGET BRAND's colors.
+   Example: if the reference uses "a single bright accent on key words
+   against a dark background," reproduce that STRATEGY but with
+   {brand_name}'s accent color, not the reference's original color.
+
+4. PEOPLE AND PRODUCTS ARE GENERIC TYPES, NOT COPIES.
+   If the reference shows a specific person or product, reproduce only
+   the TYPE (e.g. "a candid everyday Nigerian woman in a market
+   setting") — never a likeness of the specific individual or the
+   specific product from the reference.
+
+5. NO TEXT BAKED INTO COMPLEX AREAS.
+   Generate the visual with clean space reserved for text overlay.
+   Text will be composited as editable layers afterward. Describe where
+   the text zones should be, but design the image so those zones are
+   uncluttered and overlay-ready.
+
+═══════════════════════════════════════════════════════
+HOW TO BUILD THE PROMPT
+═══════════════════════════════════════════════════════
+
+Construct the image-generation prompt in this layered order, drawing
+the STYLE from the profile and the IDENTITY from the target brand:
+
+A. MEDIUM FIRST. Open by stating the medium from the style profile.
+   If aesthetic_dominance is "high," state the medium emphatically and
+   forbid drifting toward default polished photography.
+
+B. OVERALL AESTHETIC. Translate overall_aesthetic and mood into
+   opening descriptive language that sets the visual register.
+
+C. COMPOSITION & STRUCTURE. Apply layout_structure — the composition,
+   information density, focal strategy, and structural_devices.
+   Reserve the text zones as clean overlay-ready space.
+
+D. IMAGERY. Apply imagery_style as a generic type, populated with the
+   new content's subject. Apply the reference's treatment to the
+   target brand's relevant subject.
+
+E. COLOR. Apply the reference's color STRATEGY using the target brand's
+   palette. State the dominant color, the accent strategy, and where
+   the accent lands — all in the brand's colors.
+
+F. GRAPHIC ELEMENTS. Reproduce the reference's reusable graphic_elements
+   generically, in the brand's colors. Never reproduce the reference's
+   logo or identity marks.
+
+G. TYPOGRAPHY ZONES. Note the typographic character so the composited
+   text will match the borrowed style, and indicate where headline /
+   subtext / CTA zones sit. Keep these areas clean.
+
+H. NEGATIVE CONSTRAINTS. Explicitly exclude: the reference's logo,
+   brand name, contact details, watermarks, specific person/product;
+   any other brand's identity; garbled or baked-in text in the overlay
+   zones; visual clutter in reserved text areas.
+
+═══════════════════════════════════════════════════════
+OUTPUT
+═══════════════════════════════════════════════════════
+
+Return ONLY this JSON (no markdown, no code blocks):
+{{
+  "image_prompt": "<the full, detailed, layered image-generation prompt following A–H above>",
+  "reserved_text_zones": [
+    {{"zone": "headline", "position": "<where>", "text": "{headline}", "style_note": "<typographic character>"}},
+    {{"zone": "subtext", "position": "<where>", "text": "{subtext}", "style_note": "<...>"}},
+    {{"zone": "cta", "position": "<where>", "text": "{cta}", "style_note": "<...>"}}
+  ],
+  "brand_overlay": {{
+    "logo": "composite {brand_name} logo at <position>",
+    "handle": "composite {brand_handle} at <position>",
+    "colors_used": ["<which brand colors and where>"]
+  }},
+  "identity_safety_check": {{
+    "reference_identity_excluded": ["<items from what_to_leave_behind>"],
+    "only_target_brand_present": true,
+    "medium_preserved": "<the medium carried from reference>",
+    "aesthetic_dominance_applied": "<low|medium|high>"
+  }}
+}}
+
+Return only the JSON. No preamble, no explanation."""
+
+    @staticmethod
+    async def _compute_image_hash(image_url: str) -> str:
+        """Compute hash of image for duplicate detection"""
+        import httpx
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.get(image_url)
+            return hashlib.sha256(response.content).hexdigest()
+
+    @staticmethod
+    async def extract_style_profile(image_url: str) -> Dict[str, Any]:
+        """
+        Extract comprehensive style profile from reference image using GPT-4o Vision.
+
+        Args:
+            image_url: URL of uploaded reference image
+
+        Returns:
+            Style profile JSON matching the schema in STYLE_EXTRACTION_PROMPT
+        """
+        try:
+            print(f"[V2] Extracting style profile from: {image_url[:80]}...")
+
+            # Build vision request
+            ai_request = AIService.build_ai_model(
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": image_url}},
+                        {"type": "text", "text": CustomVisualGuideV2Service.STYLE_EXTRACTION_PROMPT}
+                    ]
+                }],
+                model="gpt-4o",  # Use GPT-4o for best vision analysis
+                temperature=0.3,  # Low temperature for consistent extraction
+            )
+
+            ai_response = await AIService.chat_completion(ai_request)
+
+            if isinstance(ai_response, dict) and "error" in ai_response:
+                raise Exception(ai_response["error"])
+
+            raw_content = ai_response.choices[0].message.content.strip()
+
+            # Remove markdown code blocks if present
+            if raw_content.startswith("```"):
+                lines = raw_content.split("\n")
+                json_lines = []
+                in_code_block = False
+                for line in lines:
+                    if line.startswith("```"):
+                        in_code_block = not in_code_block
+                        continue
+                    if in_code_block or (not line.startswith("```") and "{" in line):
+                        json_lines.append(line)
+                raw_content = "\n".join(json_lines)
+
+            # Parse JSON
+            style_profile = json.loads(raw_content)
+
+            print(f"[V2] ✅ Style profile extracted:")
+            print(f"     Medium: {style_profile.get('medium')}")
+            print(f"     Aesthetic: {style_profile.get('overall_aesthetic')}")
+            print(f"     Mood: {style_profile.get('mood')}")
+            print(f"     Identity items to exclude: {len(style_profile.get('what_to_leave_behind', []))}")
+
+            return style_profile
+
+        except json.JSONDecodeError as e:
+            print(f"[V2] ❌ Failed to parse style profile JSON: {e}")
+            print(f"[V2] Raw content: {raw_content[:500]}")
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to extract style profile from image. Please try a different image."
+            )
+        except Exception as e:
+            print(f"[V2] ❌ Style extraction error: {e}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Style extraction failed: {str(e)}"
+            )
+
+    @staticmethod
+    async def process_reference_image_v2(
+        image_url: str,
+        user_id: str,
+        brand_id: Optional[str],
+        name: str,
+        db: AsyncIOMotorDatabase,
+    ) -> Dict[str, Any]:
+        """
+        Process reference image for Custom Visual Guide V2.
+
+        Unlike V1 (which extracts aesthetic profile and creates prompt fragment),
+        V2 extracts a comprehensive style profile JSON for meta-prompt generation.
+
+        Args:
+            image_url: Cloudinary URL of uploaded reference image
+            user_id: User who uploaded
+            brand_id: Brand (optional)
+            name: Guide name
+            db: Database connection
+
+        Returns:
+            Custom visual guide V2 document
+        """
+        print(f"[V2] Starting Custom Visual Guide V2 processing: {name}")
+
+        try:
+            # Step 1: Compute image hash for duplicate detection
+            image_hash = await CustomVisualGuideV2Service._compute_image_hash(image_url)
+            print(f"[V2] Image hash: {image_hash}")
+
+            # Step 2: Extract style profile using GPT-4o Vision
+            print(f"[V2] Extracting style profile with GPT-4o Vision...")
+            style_profile = await CustomVisualGuideV2Service.extract_style_profile(image_url)
+
+            # Step 3: Store in database
+            guide_doc = {
+                "user_id": user_id,
+                "brand_id": brand_id,
+                "name": name,
+                "version": "v2",  # Distinguish from v1
+                "original_image_url": image_url,
+                "original_image_hash": image_hash,
+                "uploaded_at": datetime.utcnow(),
+
+                # V2-specific: comprehensive style profile
+                "style_profile": style_profile,
+
+                "times_used": 0,
+                "status": "active",
+                "updated_at": datetime.utcnow(),
+            }
+
+            try:
+                result = await db["custom_visual_guides"].insert_one(guide_doc)
+                guide_doc["id"] = str(result.inserted_id)
+                guide_doc["_id"] = result.inserted_id
+
+                print(f"[V2] ✅ Custom Visual Guide V2 created: {guide_doc['id']}")
+                return guide_doc
+
+            except DuplicateKeyError:
+                print(f"[V2] ❌ Duplicate image detected: {image_hash}")
+                raise HTTPException(
+                    status_code=409,
+                    detail="You've already uploaded this image as a custom guide."
+                )
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            print(f"[V2] ❌ Error processing reference image: {e}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to process reference image: {str(e)}"
+            )
+
+    @staticmethod
+    async def generate_image_with_v2_guide(
+        guide_id: str,
+        brand_context: Dict[str, Any],
+        seed_content: str,
+        headline: str,
+        subtext: str,
+        cta: str,
+        platform: str,
+        db: AsyncIOMotorDatabase,
+    ) -> Dict[str, Any]:
+        """
+        Generate image using Custom Visual Guide V2 + meta-prompt.
+
+        Flow:
+        1. Load guide (style_profile + reference_image_url)
+        2. Build art director meta-prompt
+        3. GPT-4o generates final image prompt
+        4. Send prompt + reference image → GPT-Image-2 edit mode
+
+        Args:
+            guide_id: Custom guide V2 ID
+            brand_context: Brand profile data
+            seed_content: User's content request
+            headline: Main text
+            subtext: Supporting text
+            cta: Call to action
+            platform: Target platform
+            db: Database connection
+
+        Returns:
+            {
+                "success": bool,
+                "image_url": str,
+                "image_prompt": str,
+                "reserved_text_zones": list,
+                "brand_overlay": dict
+            }
+        """
+        from bson import ObjectId
+        from app.agents.social_media_manager.services.image_content_service import ImageContentService
+
+        try:
+            print(f"\n{'='*70}")
+            print(f"CUSTOM VISUAL GUIDE V2 GENERATION")
+            print(f"{'='*70}")
+
+            # Step 1: Load guide from database
+            guide = await db["custom_visual_guides"].find_one({
+                "_id": ObjectId(guide_id),
+                "version": "v2"
+            })
+
+            if not guide:
+                raise HTTPException(status_code=404, detail="Custom Visual Guide V2 not found")
+
+            style_profile = guide.get("style_profile")
+            reference_image_url = guide.get("original_image_url")
+
+            print(f"[V2] Loaded guide: {guide.get('name')}")
+            print(f"[V2] Style: {style_profile.get('overall_aesthetic')}")
+
+            # Step 2: Build art director meta-prompt
+            purpose = f"{platform} post: {seed_content}"
+            format_map = {
+                "instagram": "1080x1080 square",
+                "facebook": "1200x630 landscape",
+                "twitter": "1200x675 landscape",
+                "x": "1200x675 landscape",
+                "linkedin": "1200x627 landscape",
+            }
+
+            meta_prompt = CustomVisualGuideV2Service.ART_DIRECTOR_TEMPLATE.format(
+                style_profile_json=json.dumps(style_profile, indent=2),
+                brand_name=brand_context.get("brand_name", ""),
+                primary_color=brand_context.get("brand_colors", ["#000000"])[0] if brand_context.get("brand_colors") else "#000000",
+                secondary_color=brand_context.get("brand_colors", ["#FFFFFF"])[1] if len(brand_context.get("brand_colors", [])) > 1 else "#FFFFFF",
+                accent_color=brand_context.get("brand_colors", ["#FF0000"])[2] if len(brand_context.get("brand_colors", [])) > 2 else "#FF0000",
+                logo_description=brand_context.get("logo_description", "brand logo"),
+                brand_font=brand_context.get("font_style", "modern sans-serif"),
+                brand_tone=brand_context.get("tone", "professional"),
+                brand_handle=brand_context.get("default_link", "@brand"),
+                purpose=purpose,
+                headline=headline,
+                subtext=subtext or "",
+                cta=cta or "Learn more",
+                format=format_map.get(platform, "1080x1080 square"),
+            )
+
+            print(f"[V2] Meta-prompt generated ({len(meta_prompt)} chars)")
+
+            # Step 3: GPT-4o generates final image prompt
+            print(f"[V2] Calling GPT-4o to generate art director prompt...")
+
+            ai_request = AIService.build_ai_model(
+                messages=[{
+                    "role": "user",
+                    "content": meta_prompt
+                }],
+                model="gpt-4o",
+                temperature=0.7,
+            )
+
+            ai_response = await AIService.chat_completion(ai_request)
+
+            if isinstance(ai_response, dict) and "error" in ai_response:
+                raise Exception(ai_response["error"])
+
+            raw_content = ai_response.choices[0].message.content.strip()
+
+            # Remove markdown if present
+            if raw_content.startswith("```"):
+                lines = raw_content.split("\n")
+                json_lines = []
+                in_code_block = False
+                for line in lines:
+                    if line.startswith("```"):
+                        in_code_block = not in_code_block
+                        continue
+                    if in_code_block or "{" in line:
+                        json_lines.append(line)
+                raw_content = "\n".join(json_lines)
+
+            art_director_output = json.loads(raw_content)
+            final_prompt = art_director_output["image_prompt"]
+
+            print(f"[V2] ✅ Art director prompt generated ({len(final_prompt)} chars)")
+            print(f"[V2] Preview: {final_prompt[:200]}...")
+
+            # Step 4: Generate image with GPT-Image-2 edit mode
+            print(f"[V2] Calling GPT-Image-2 edit mode with reference image...")
+
+            # Platform-specific dimensions
+            platform_specs = {
+                "instagram": {"width": 1080, "height": 1080},
+                "facebook": {"width": 1200, "height": 630},
+                "twitter": {"width": 1200, "height": 675},
+                "x": {"width": 1200, "height": 675},
+                "linkedin": {"width": 1200, "height": 627},
+            }
+            specs = platform_specs.get(platform, {"width": 1080, "height": 1080})
+
+            image_response = await ImageContentService._call_dalle_api(
+                prompt=final_prompt,
+                size=f"{specs['width']}x{specs['height']}",
+                reference_image=reference_image_url,  # ← ACTUAL reference image
+                image_model="openai/gpt-image-2",
+            )
+
+            if not image_response.get('success'):
+                raise Exception(image_response.get('error', 'Image generation failed'))
+
+            print(f"[V2] ✅ Image generated successfully")
+
+            # Step 5: Update usage counter
+            await db["custom_visual_guides"].update_one(
+                {"_id": ObjectId(guide_id)},
+                {
+                    "$inc": {"times_used": 1},
+                    "$set": {"last_used_at": datetime.utcnow()}
+                }
+            )
+
+            return {
+                "success": True,
+                "image_url": image_response['url'],
+                "image_prompt": final_prompt,
+                "reserved_text_zones": art_director_output.get("reserved_text_zones", []),
+                "brand_overlay": art_director_output.get("brand_overlay", {}),
+                "identity_safety_check": art_director_output.get("identity_safety_check", {}),
+                "style_profile_used": style_profile.get("overall_aesthetic"),
+            }
+
+        except json.JSONDecodeError as e:
+            print(f"[V2] ❌ Failed to parse art director output: {e}")
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to generate image prompt from meta-prompt"
+            )
+        except Exception as e:
+            print(f"[V2] ❌ V2 generation error: {e}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"V2 image generation failed: {str(e)}"
+            )
