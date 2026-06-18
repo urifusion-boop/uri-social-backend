@@ -463,8 +463,15 @@ class ReapProvider(AbstractClippingProvider):
                         flush=True,
                     )
                     return srt_text, source_url, tracking_data
-            if status in ("failed", "invalid_content"):
-                print(f"[Reap] transcription terminal status={status} after {elapsed}s", flush=True)
+            if status == "invalid_content":
+                print(f"[Reap] transcription rejected (invalid_content) after {elapsed}s", flush=True)
+                raise ValueError(
+                    "Reap rejected this video — ensure it contains clear spoken audio "
+                    "in a supported format (MP4/H.264). Silent or non-speech videos "
+                    "cannot be transcribed."
+                )
+            if status == "failed":
+                print(f"[Reap] transcription failed after {elapsed}s", flush=True)
                 return "", "", {}
         print(f"[Reap] transcription timed out after {timeout_seconds}s", flush=True)
         return "", "", {}
