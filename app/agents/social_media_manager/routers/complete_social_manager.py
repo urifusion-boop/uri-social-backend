@@ -4334,7 +4334,8 @@ async def _generate_image_bg(
 
         # Extract V2 reference image from brand_context if present
         v2_reference_image = brand_context.get("custom_guide_v2_reference_image")
-        if v2_reference_image and not reference_image:
+        print(f"[V2 DEBUG] v2_reference_image={v2_reference_image[:100] if v2_reference_image else None}, reference_image={reference_image}")
+        if v2_reference_image:
             reference_image = v2_reference_image
             print(f"📸 Using V2 reference image: {reference_image[:80]}...")
 
