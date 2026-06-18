@@ -179,7 +179,8 @@ _TRANSITION_BY_TYPE: Dict[str, str] = {
     "product":  "fadeblack",   # fade to black — premium/clean
     "founder":  "dissolve",    # soft dissolve — authentic
 }
-_CLD_TRANSITION_DUR = 0.5   # seconds of overlap at each cut
+_CLD_TRANSITION_DUR = 1.2   # seconds of overlap at each cut
+_MIN_SEG_DUR       = 3.0   # minimum keep-segment length; shorter ones are merged
 
 
 def _cloudinary_public_id(url: str) -> str:
@@ -495,10 +496,10 @@ async def get_edit_decisions(
 ) -> Dict[str, Any]:
     """Feed transcript + video type to GPT-4o; get structured edit decisions."""
     rules = {
-        "tiktok": "Fast pacing, aggressive cuts on silences >0.5s, frequent emphasis zooms, hook in first 2s.",
-        "product": "Snappy pacing, cuts on silences >1.0s, zoom on product mentions, moderate overall.",
-        "founder": "Gentle pacing, cut only silences >1.5s, minimal zooms, keep natural speech rhythm.",
-    }.get(video_type, "Moderate pacing, cut silences >1.0s, subtle zooms on key phrases.")
+        "tiktok": "Energetic pacing. Cut silences >1.0s. Each kept segment must be ≥4s. Max 5 cuts.",
+        "product": "Snappy but clean. Cut silences >1.5s. Each kept segment must be ≥5s. Max 4 cuts.",
+        "founder": "Gentle pacing. Cut only clear silences >2.0s. Each kept segment must be ≥6s. Max 3 cuts.",
+    }.get(video_type, "Moderate pacing. Cut silences >1.5s. Each kept segment must be ≥4s. Max 4 cuts.")
 
     tracking_context = _summarise_tracking_data(tracking_data or {}, duration)
 
@@ -512,7 +513,7 @@ TRANSCRIPT (SRT):
 {srt_text}
 {f"REAP CLIP DETECTION (word-level timing + silences):{tracking_context}" if tracking_context else ""}
 INSTRUCTIONS:
-- cuts: remove ranges of clear silence/dead-space/filler. Each remove_start and remove_end must be within [0, {duration:.1f}].
+- cuts: remove ranges of clear silence/dead-space/filler. Each remove_start and remove_end must be within [0, {duration:.1f}]. Every kept segment between cuts must be at least 4 seconds long — do not create short clips.
 - zooms: emphasis punch-ins on key words/claims. "at" must be within [0, {duration:.1f}]. intensity: "subtle" or "strong".
 - Be conservative — cutting real speech is worse than leaving silence.
 - For founder type: max 3 cuts, max 2 zooms.
@@ -585,7 +586,20 @@ def _build_keep_segments(cuts: List[Dict], duration: float) -> List[Dict[str, fl
         keep.append({"src_start": current, "src_end": duration})
     if not keep:
         keep = [{"src_start": 0.0, "src_end": duration}]
-    return keep
+
+    # Merge segments shorter than _MIN_SEG_DUR — a 1-2s segment creates a jarring cut.
+    # First pass: merge short trailing segments backward.
+    merged: List[Dict[str, float]] = []
+    for seg in keep:
+        if merged and (seg["src_end"] - seg["src_start"]) < _MIN_SEG_DUR:
+            merged[-1] = {"src_start": merged[-1]["src_start"], "src_end": seg["src_end"]}
+        else:
+            merged.append(seg)
+    # Second pass: merge short leading segment forward (edge case: first seg is tiny).
+    if len(merged) > 1 and (merged[0]["src_end"] - merged[0]["src_start"]) < _MIN_SEG_DUR:
+        merged[1] = {"src_start": merged[0]["src_start"], "src_end": merged[1]["src_end"]}
+        merged = merged[1:]
+    return merged if merged else keep
 
 
 def _srt_time(seconds: float) -> str:
@@ -1048,9 +1062,20 @@ async def run_production_job(
                     cloudinary_cut_url = _build_cloudinary_cut_url(
                         cld_pid, keep_segs_preview, transition_style, _CLD_TRANSITION_DUR
                     )
+                    # Compute where each transition appears in the OUTPUT video.
+                    # Formula: center of transition N = sum(segs[0..N]) - (N + 0.5) * td
+                    _td = _CLD_TRANSITION_DUR
+                    _cum = 0.0
+                    _marks = []
+                    for _n, _seg in enumerate(keep_segs_preview[:-1]):
+                        _cum += _seg["src_end"] - _seg["src_start"]
+                        _tc = _cum - (_n + 0.5) * _td
+                        _marks.append(f"{int(_tc // 60)}:{int(_tc % 60):02d}")
                     print(
                         f"[CloudinaryEdit] {len(keep_segs_preview)} segments → "
-                        f"{transition_style} transition  {cloudinary_cut_url[:80]}…",
+                        f"{transition_style} ({_CLD_TRANSITION_DUR}s) | "
+                        f"transitions at {', '.join(_marks)} in output | "
+                        f"{cloudinary_cut_url[:70]}…",
                         flush=True,
                     )
 
