@@ -79,6 +79,43 @@ class CustomVisualGuideService:
             image_hash = await CustomVisualGuideService._compute_image_hash(image_url)
             print(f"[CVG] Image hash: {image_hash}")
 
+            # Step 1b: Check if this image already exists
+            existing_guide = await db["custom_visual_guides"].find_one({
+                "user_id": user_id,
+                "original_image_hash": image_hash,
+                "$or": [
+                    {"version": {"$exists": False}},  # V1 guides don't have version field
+                    {"version": "v1"}
+                ]
+            })
+
+            if existing_guide:
+                if existing_guide.get("status") == "archived":
+                    # Restore archived guide to active
+                    print(f"[CVG] 📦 Restoring archived guide to active: {existing_guide['_id']}")
+                    await db["custom_visual_guides"].update_one(
+                        {"_id": existing_guide["_id"]},
+                        {
+                            "$set": {
+                                "status": "active",
+                                "name": name,  # Update name if changed
+                                "updated_at": datetime.utcnow()
+                            }
+                        }
+                    )
+                    existing_guide["id"] = str(existing_guide["_id"])
+                    existing_guide["status"] = "active"
+                    existing_guide["name"] = name
+                    print(f"[CVG] ✅ Guide restored to active: {existing_guide['id']}")
+                    return CustomVisualGuide(**existing_guide)
+                else:
+                    # Already active - show error
+                    print(f"[CVG] ❌ Duplicate active guide detected: {image_hash}")
+                    raise HTTPException(
+                        status_code=409,
+                        detail="You've already uploaded this image. Find it in your Custom Guides."
+                    )
+
             # Steps 2-4: Parallel screening
             print(f"[CVG] Running safety, quality, and copyright screening...")
             await CustomVisualGuideService._screen_image(image_url)
@@ -135,20 +172,12 @@ class CustomVisualGuideService:
                 "updated_at": datetime.utcnow(),
             }
 
-            try:
-                result = await db["custom_visual_guides"].insert_one(guide_doc)
-                guide_doc["id"] = str(result.inserted_id)
-                guide_doc["_id"] = result.inserted_id
+            result = await db["custom_visual_guides"].insert_one(guide_doc)
+            guide_doc["id"] = str(result.inserted_id)
+            guide_doc["_id"] = result.inserted_id
 
-                print(f"[CVG] ✅ Custom visual guide created: {guide_doc['id']}")
-                return CustomVisualGuide(**guide_doc)
-
-            except DuplicateKeyError:
-                print(f"[CVG] ❌ Duplicate image detected: {image_hash}")
-                raise HTTPException(
-                    status_code=409,
-                    detail="You've already uploaded this image as a custom guide."
-                )
+            print(f"[CVG] ✅ Custom visual guide created: {guide_doc['id']}")
+            return CustomVisualGuide(**guide_doc)
 
         except HTTPException:
             raise
