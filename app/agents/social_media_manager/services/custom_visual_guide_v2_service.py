@@ -179,9 +179,21 @@ HOW TO BUILD THE PROMPT
 Construct the image-generation prompt in this layered order, drawing
 the STYLE from the profile and the IDENTITY from the target brand:
 
-A. MEDIUM FIRST. Open by stating the medium from the style profile.
-   If aesthetic_dominance is "high," state the medium emphatically and
-   forbid drifting toward default polished photography.
+A. MEDIUM FIRST - CRITICAL. You MUST match the exact medium from the
+   style profile. Open the prompt by stating the medium EMPHATICALLY.
+
+   Examples:
+   - If medium is "hand_drawn": "Hand-drawn doodle illustration, sketchy
+     linework, casual marker style, NOT photographic, NOT polished"
+   - If medium is "illustrated": "Illustrated graphic design, vector-style
+     artwork, NOT photographic, NOT realistic"
+   - If medium is "flat_graphic": "Flat graphic design, minimalist vector
+     style, simple shapes, NOT photographic, NOT 3D"
+   - If medium is "3d_render": "3D rendered CGI, polished digital modeling"
+   - If medium is "photographic": "Photographic image, realistic photography"
+
+   ALWAYS add "NOT photographic" if the reference is NOT photographic.
+   The medium is NON-NEGOTIABLE - match it exactly.
 
 B. OVERALL AESTHETIC. Translate overall_aesthetic and mood into
    opening descriptive language that sets the visual register.
@@ -191,8 +203,11 @@ C. COMPOSITION & STRUCTURE. Apply layout_structure — the composition,
    Reserve the text zones as clean overlay-ready space.
 
 D. IMAGERY. Apply imagery_style as a generic type, populated with the
-   new content's subject. Apply the reference's treatment to the
-   target brand's relevant subject.
+   new content's subject. CRITICAL: Match the exact "treatment" and
+   "realism_level" from imagery_style. If the reference is "hand_drawn"
+   treatment with "stylized" realism, DO NOT make it photographic or
+   realistic. If it's "flat" and "simplified", DO NOT add depth or
+   realism. Preserve the exact visual execution style.
 
 E. COLOR. Apply the reference's color STRATEGY using the target brand's
    palette. State the dominant color, the accent strategy, and where
@@ -210,6 +225,11 @@ H. NEGATIVE CONSTRAINTS. Explicitly exclude: the reference's logo,
    brand name, contact details, watermarks, specific person/product;
    any other brand's identity; garbled or baked-in text in the overlay
    zones; visual clutter in reserved text areas.
+
+   CRITICAL: If the reference medium is NOT "photographic", you MUST
+   explicitly forbid photorealistic rendering. Add negative constraints
+   like "NOT photographic", "NOT realistic", "NOT polished 3D render"
+   to prevent DALL-E from defaulting to its photorealistic bias.
 
 ═══════════════════════════════════════════════════════
 OUTPUT
