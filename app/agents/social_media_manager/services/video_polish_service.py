@@ -463,8 +463,8 @@ class ReapProvider(AbstractClippingProvider):
                         flush=True,
                     )
                     return srt_text, source_url, tracking_data
-            if status == "failed":
-                print(f"[Reap] transcription failed after {elapsed}s", flush=True)
+            if status in ("failed", "invalid_content"):
+                print(f"[Reap] transcription terminal status={status} after {elapsed}s", flush=True)
                 return "", "", {}
         print(f"[Reap] transcription timed out after {timeout_seconds}s", flush=True)
         return "", "", {}
