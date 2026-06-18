@@ -131,6 +131,7 @@ async def upload_reference_image_v2(
         }
 
         return UriResponse.create_response(
+            entity_name="Custom Visual Guide V2",
             data=response_data,
             message="Custom Visual Guide V2 created successfully! Style profile extracted and ready for use.",
         )
@@ -187,6 +188,7 @@ async def get_user_guides_v2(
             })
 
         return UriResponse.get_list_data_response(
+            entity_name="Custom Visual Guide V2",
             data=guides_list,
             message=f"Found {len(guides_list)} Custom Visual Guides V2"
         )
@@ -238,7 +240,10 @@ async def get_guide_detail_v2(
             "status": guide["status"],
         }
 
-        return UriResponse.create_response(data=response_data)
+        return UriResponse.create_response(
+            entity_name="Custom Visual Guide V2",
+            data=response_data
+        )
 
     except Exception as e:
         print(f"[V2 API] ❌ Error fetching V2 guide detail: {e}")
@@ -273,6 +278,8 @@ async def archive_guide_v2(
             raise HTTPException(status_code=404, detail="Custom Visual Guide V2 not found")
 
         return UriResponse.create_response(
+            entity_name="Custom Visual Guide V2",
+            data={"archived": True},
             message="Custom Visual Guide V2 archived successfully"
         )
 
@@ -346,6 +353,7 @@ async def generate_with_v2_guide(
         )
 
         return UriResponse.create_response(
+            entity_name="Image",
             data=result,
             message="Image generated successfully with Custom Visual Guide V2!"
         )
