@@ -175,12 +175,18 @@ async def _upload_to_cloudinary(video_bytes: bytes, public_id: str) -> Optional[
 
 # Cloudinary transition style per video type — fadewhite is the flash cut Shotstack lacked
 _TRANSITION_BY_TYPE: Dict[str, str] = {
-    "tiktok":   "fadewhite",   # bright flash cut — high energy
+    "tiktok":   "circleopen",  # expanding circle — dramatic, unmissable
     "product":  "fadeblack",   # fade to black — premium/clean
     "founder":  "dissolve",    # soft dissolve — authentic
 }
-_CLD_TRANSITION_DUR = 1.2   # seconds of overlap at each cut
-_MIN_SEG_DUR       = 3.0   # minimum keep-segment length; shorter ones are merged
+# Per-type transition duration (seconds). Must be less than the shortest keep-segment.
+_TRANSITION_DUR_BY_TYPE: Dict[str, float] = {
+    "tiktok":   2.5,
+    "product":  2.0,
+    "founder":  2.0,
+}
+_CLD_TRANSITION_DUR = 2.5   # default fallback
+_MIN_SEG_DUR       = 6.0   # minimum keep-segment length (must exceed max transition_dur)
 
 
 def _cloudinary_public_id(url: str) -> str:
@@ -1052,7 +1058,8 @@ async def run_production_job(
 
         # Build Cloudinary cut URL — cuts + transitions in a single CDN-served video.
         # Shotstack then receives ONE clip and only handles captions, hook, music, SFX.
-        transition_style = _TRANSITION_BY_TYPE.get(video_type, "fadewhite")
+        transition_style = _TRANSITION_BY_TYPE.get(video_type, "circleopen")
+        transition_dur   = _TRANSITION_DUR_BY_TYPE.get(video_type, _CLD_TRANSITION_DUR)
         cloudinary_cut_url = ""
         if "res.cloudinary.com" in (clean_video_url or ""):
             cld_pid = _cloudinary_public_id(clean_video_url)
@@ -1060,11 +1067,11 @@ async def run_production_job(
                 keep_segs_preview = _build_keep_segments(cuts, duration)
                 if len(keep_segs_preview) > 1:
                     cloudinary_cut_url = _build_cloudinary_cut_url(
-                        cld_pid, keep_segs_preview, transition_style, _CLD_TRANSITION_DUR
+                        cld_pid, keep_segs_preview, transition_style, transition_dur
                     )
                     # Compute where each transition appears in the OUTPUT video.
                     # Formula: center of transition N = sum(segs[0..N]) - (N + 0.5) * td
-                    _td = _CLD_TRANSITION_DUR
+                    _td = transition_dur
                     _cum = 0.0
                     _marks = []
                     for _n, _seg in enumerate(keep_segs_preview[:-1]):
@@ -1073,7 +1080,7 @@ async def run_production_job(
                         _marks.append(f"{int(_tc // 60)}:{int(_tc % 60):02d}")
                     print(
                         f"[CloudinaryEdit] {len(keep_segs_preview)} segments → "
-                        f"{transition_style} ({_CLD_TRANSITION_DUR}s) | "
+                        f"{transition_style} ({transition_dur}s) | "
                         f"transitions at {', '.join(_marks)} in output | "
                         f"{cloudinary_cut_url[:70]}…",
                         flush=True,
@@ -1093,7 +1100,7 @@ async def run_production_job(
             music_url=music_url,
             hook_text=hook_text,
             cloudinary_cut_url=cloudinary_cut_url,
-            transition_dur=_CLD_TRANSITION_DUR if cloudinary_cut_url else 0.0,
+            transition_dur=transition_dur if cloudinary_cut_url else 0.0,
         )
 
         await update(68, "Rendering video…")
