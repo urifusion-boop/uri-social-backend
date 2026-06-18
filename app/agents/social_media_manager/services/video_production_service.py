@@ -958,7 +958,7 @@ async def run_production_job(
             raise RuntimeError("Transcription failed to start")
 
         srt_text, _reap_video_url, tracking_data = await reap.fetch_full_transcript_data(
-            trans_id, timeout_seconds=300
+            trans_id, timeout_seconds=600
         )
         if not srt_text:
             raise RuntimeError("Transcription timed out or returned empty")

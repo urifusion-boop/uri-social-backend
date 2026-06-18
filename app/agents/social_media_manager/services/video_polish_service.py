@@ -404,9 +404,13 @@ class ReapProvider(AbstractClippingProvider):
         word-level timestamps and detected silences. Empty dict on failure.
         """
         poll_interval = 10
-        for _ in range(max(1, timeout_seconds // poll_interval)):
+        for tick in range(max(1, timeout_seconds // poll_interval)):
             await asyncio.sleep(poll_interval)
             status = await self.get_job_status(project_id)
+            elapsed = (tick + 1) * poll_interval
+            # Log every 30s so we can see live progress in the container logs
+            if tick % 3 == 0:
+                print(f"[Reap] transcription status={status} elapsed={elapsed}s/{timeout_seconds}s", flush=True)
             if status == "completed":
                 async with aiohttp.ClientSession() as session:
                     async with session.get(
@@ -460,7 +464,9 @@ class ReapProvider(AbstractClippingProvider):
                     )
                     return srt_text, source_url, tracking_data
             if status == "failed":
+                print(f"[Reap] transcription failed after {elapsed}s", flush=True)
                 return "", "", {}
+        print(f"[Reap] transcription timed out after {timeout_seconds}s", flush=True)
         return "", "", {}
 
     async def get_caption_presets(self) -> List[Dict[str, Any]]:
