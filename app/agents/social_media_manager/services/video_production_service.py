@@ -174,16 +174,18 @@ async def _upload_to_cloudinary(video_bytes: bytes, public_id: str) -> Optional[
 # ── B-roll asset fetch ────────────────────────────────────────────────────────
 
 # Cloudinary transition style per video type — fadewhite is the flash cut Shotstack lacked
-_TRANSITION_BY_TYPE: Dict[str, str] = {
-    "tiktok":   "circleopen",  # expanding circle — dramatic, unmissable
-    "product":  "fadeblack",   # fade to black — premium/clean
-    "founder":  "dissolve",    # soft dissolve — authentic
+# Luma matte public IDs uploaded to our Cloudinary account.
+# Black→white wipe: black areas show the base clip, white areas show the next clip.
+_LUMA_MATTE_BY_TYPE: Dict[str, str] = {
+    "tiktok":   "uri-transitions/circle-wipe",    # hard-edge circle expanding from center
+    "product":  "uri-transitions/diagonal-wipe",  # diagonal sweep top-left → bottom-right
+    "founder":  "uri-transitions/circle-wipe",    # same circle but slower (2.5s)
 }
-# Per-type transition duration (seconds). Must be less than the shortest keep-segment.
+# Per-type transition duration (seconds). Must be less than every keep-segment.
 _TRANSITION_DUR_BY_TYPE: Dict[str, float] = {
     "tiktok":   2.5,
     "product":  2.0,
-    "founder":  2.0,
+    "founder":  2.5,
 }
 _CLD_TRANSITION_DUR = 2.5   # default fallback
 _MIN_SEG_DUR       = 6.0   # minimum keep-segment length (must exceed max transition_dur)
@@ -201,23 +203,26 @@ def _cloudinary_public_id(url: str) -> str:
 def _build_cloudinary_cut_url(
     public_id: str,
     keep_segments: List[Dict],
-    transition: str = "fadewhite",
-    transition_dur: float = 0.3,
+    luma_matte_pid: str = "uri-transitions/circle-wipe",
+    transition_dur: float = 2.5,
 ) -> str:
     """
-    Build a Cloudinary transformation URL that trims keep_segments from a single
-    source video and concatenates them with smooth cross-transitions.
+    Build a Cloudinary transformation URL using the custom luma-matte e_transition
+    approach. Each segment of the source video is concatenated with a hard-edge
+    wipe transition visible enough to see clearly in the rendered video.
+
+    Format per additional segment:
+      l_video:{pid}/so_X,eo_Y/e_transition,l_video:{luma}/fl_layer_apply/fl_layer_apply
 
     Cloudinary renders this on first request; subsequent fetches are CDN-cached.
-    The splice flag overlaps adjacent segments by transition_dur seconds, so
-    total_duration = sum(seg_durs) - (N-1) * transition_dur.
+    Total duration = sum of all segment durations (transitions are overlaid, not additive).
     """
     cloud = settings.CLOUDINARY_CLOUD_NAME
     if not cloud or not keep_segments:
         return ""
 
-    pid_enc = public_id.replace("/", ":")      # '/' → ':' for overlay refs
-    td = f"{transition_dur:.2f}".rstrip("0").rstrip(".")  # "0.3" not "0.30"
+    pid_enc   = public_id.replace("/", ":")          # '/' → ':' for overlay refs
+    luma_enc  = luma_matte_pid.replace("/", ":")
 
     first = keep_segments[0]
     parts: List[str] = [
@@ -227,9 +232,12 @@ def _build_cloudinary_cut_url(
     for seg in keep_segments[1:]:
         s = f"{seg['src_start']:.3f}"
         e = f"{seg['src_end']:.3f}"
+        # Open the next segment as an overlay, apply the luma matte transition,
+        # close the transition layer, then close the overlay layer.
         parts.append(
-            f"fl_splice:transition_(name_{transition};du_{td}),"
-            f"l_video:{pid_enc}/so_{s},eo_{e}/fl_layer_apply"
+            f"l_video:{pid_enc}/so_{s},eo_{e}"
+            f"/e_transition,l_video:{luma_enc}/fl_layer_apply"
+            f"/fl_layer_apply"
         )
 
     return (
@@ -1058,8 +1066,8 @@ async def run_production_job(
 
         # Build Cloudinary cut URL — cuts + transitions in a single CDN-served video.
         # Shotstack then receives ONE clip and only handles captions, hook, music, SFX.
-        transition_style = _TRANSITION_BY_TYPE.get(video_type, "circleopen")
-        transition_dur   = _TRANSITION_DUR_BY_TYPE.get(video_type, _CLD_TRANSITION_DUR)
+        luma_pid     = _LUMA_MATTE_BY_TYPE.get(video_type, "uri-transitions/circle-wipe")
+        transition_dur = _TRANSITION_DUR_BY_TYPE.get(video_type, _CLD_TRANSITION_DUR)
         cloudinary_cut_url = ""
         if "res.cloudinary.com" in (clean_video_url or ""):
             cld_pid = _cloudinary_public_id(clean_video_url)
@@ -1067,21 +1075,20 @@ async def run_production_job(
                 keep_segs_preview = _build_keep_segments(cuts, duration)
                 if len(keep_segs_preview) > 1:
                     cloudinary_cut_url = _build_cloudinary_cut_url(
-                        cld_pid, keep_segs_preview, transition_style, transition_dur
+                        cld_pid, keep_segs_preview, luma_pid, transition_dur
                     )
-                    # Compute where each transition appears in the OUTPUT video.
-                    # Formula: center of transition N = sum(segs[0..N]) - (N + 0.5) * td
-                    _td = transition_dur
+                    # Compute where each cut appears in the OUTPUT video.
+                    # With custom luma-matte transitions, total duration = sum(seg_durs).
+                    # (Transitions are overlaid, not additive — cuts happen at segment ends.)
                     _cum = 0.0
                     _marks = []
-                    for _n, _seg in enumerate(keep_segs_preview[:-1]):
+                    for _seg in keep_segs_preview[:-1]:
                         _cum += _seg["src_end"] - _seg["src_start"]
-                        _tc = _cum - (_n + 0.5) * _td
-                        _marks.append(f"{int(_tc // 60)}:{int(_tc % 60):02d}")
+                        _marks.append(f"{int(_cum // 60)}:{int(_cum % 60):02d}")
                     print(
                         f"[CloudinaryEdit] {len(keep_segs_preview)} segments → "
-                        f"{transition_style} ({transition_dur}s) | "
-                        f"transitions at {', '.join(_marks)} in output | "
+                        f"luma-matte {luma_pid.split('/')[-1]} ({transition_dur}s) | "
+                        f"cuts at {', '.join(_marks)} in output | "
                         f"{cloudinary_cut_url[:70]}…",
                         flush=True,
                     )
