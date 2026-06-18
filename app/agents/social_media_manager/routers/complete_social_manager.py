@@ -285,7 +285,8 @@ class BrandProfileRequest(BaseModel):
     style_selections: Optional[List[str]] = None
     style_prompt_fragments: Optional[List[str]] = None
     style_rotation_index: Optional[int] = None
-    selected_custom_guides: Optional[List[str]] = None  # Custom visual guide IDs (array)
+    selected_custom_guides: Optional[List[str]] = None  # Custom visual guide V1 IDs (array)
+    selected_custom_guides_v2: Optional[List[str]] = None  # Custom visual guide V2 IDs (array)
     # Typography
     font_style: Optional[str] = None
     font_style_prompt: Optional[str] = None
