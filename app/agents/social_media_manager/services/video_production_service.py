@@ -173,6 +173,65 @@ async def _upload_to_cloudinary(video_bytes: bytes, public_id: str) -> Optional[
 
 # ── B-roll asset fetch ────────────────────────────────────────────────────────
 
+# Cloudinary transition style per video type — fadewhite is the flash cut Shotstack lacked
+_TRANSITION_BY_TYPE: Dict[str, str] = {
+    "tiktok":   "fadewhite",   # bright flash cut — high energy
+    "product":  "fadeblack",   # fade to black — premium/clean
+    "founder":  "dissolve",    # soft dissolve — authentic
+}
+_CLD_TRANSITION_DUR = 0.3   # seconds of overlap at each cut
+
+
+def _cloudinary_public_id(url: str) -> str:
+    """Extract Cloudinary public_id from a full upload URL.
+    e.g. .../video/upload/v1234567/uri-video-production/abc.mp4 → uri-video-production/abc
+    """
+    import re
+    m = re.search(r"/video/upload/(?:v\d+/)?(.+?)(?:\.\w+)?$", url)
+    return m.group(1) if m else ""
+
+
+def _build_cloudinary_cut_url(
+    public_id: str,
+    keep_segments: List[Dict],
+    transition: str = "fadewhite",
+    transition_dur: float = 0.3,
+) -> str:
+    """
+    Build a Cloudinary transformation URL that trims keep_segments from a single
+    source video and concatenates them with smooth cross-transitions.
+
+    Cloudinary renders this on first request; subsequent fetches are CDN-cached.
+    The splice flag overlaps adjacent segments by transition_dur seconds, so
+    total_duration = sum(seg_durs) - (N-1) * transition_dur.
+    """
+    cloud = settings.CLOUDINARY_CLOUD_NAME
+    if not cloud or not keep_segments:
+        return ""
+
+    pid_enc = public_id.replace("/", ":")      # '/' → ':' for overlay refs
+    td = f"{transition_dur:.2f}".rstrip("0").rstrip(".")  # "0.3" not "0.30"
+
+    first = keep_segments[0]
+    parts: List[str] = [
+        f"so_{first['src_start']:.3f},eo_{first['src_end']:.3f}"
+    ]
+
+    for seg in keep_segments[1:]:
+        s = f"{seg['src_start']:.3f}"
+        e = f"{seg['src_end']:.3f}"
+        parts.append(
+            f"fl_splice:transition_(name_{transition};du_{td}),"
+            f"l_video:{pid_enc}/so_{s},eo_{e}/fl_layer_apply"
+        )
+
+    return (
+        f"https://res.cloudinary.com/{cloud}/video/upload/"
+        + "/".join(parts)
+        + f"/{public_id}"
+    )
+
+
 async def _pexels_search(query: str) -> Optional[str]:
     """Search Pexels for a short video clip. Returns a direct MP4 URL or None."""
     key = settings.PEXELS_API_KEY
@@ -538,18 +597,25 @@ def _srt_time(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
-def _original_to_timeline(t: float, keep_segments: List[Dict[str, float]], clamp: bool = False) -> Optional[float]:
+def _original_to_timeline(
+    t: float,
+    keep_segments: List[Dict[str, float]],
+    clamp: bool = False,
+    transition_dur: float = 0.0,
+) -> Optional[float]:
     """Map a timestamp in the original video to its position in the output timeline.
-    If clamp=True and t falls in a cut region, returns the start of the next kept segment
-    rather than None — used so caption end-times straddling a cut don't drop the whole caption."""
+    transition_dur: when Cloudinary overlaps adjacent segments by this amount, each
+    subsequent segment starts earlier — pass the same value used in _build_cloudinary_cut_url.
+    clamp: if t is in a cut, return the start of the next kept segment instead of None."""
     offset = 0.0
-    for seg in keep_segments:
+    for i, seg in enumerate(keep_segments):
         seg_dur = seg["src_end"] - seg["src_start"]
         if seg["src_start"] <= t <= seg["src_end"]:
             return offset + (t - seg["src_start"])
         if clamp and t < seg["src_start"]:
-            return offset  # t is in a cut before this segment — clamp to segment start
-        offset += seg_dur
+            return offset
+        overlap = transition_dur if i < len(keep_segments) - 1 else 0.0
+        offset += seg_dur - overlap
     return None
 
 
@@ -565,68 +631,78 @@ def build_shotstack_timeline(
     job_id: str = "",
     music_url: Optional[str] = None,
     hook_text: str = "",
+    cloudinary_cut_url: str = "",   # pre-cut + transitioned video from Cloudinary
+    transition_dur: float = 0.0,    # overlap per cut used by Cloudinary (for SRT timing)
 ) -> Dict[str, Any]:
     # broll items have: at (original ts), duration, url (resolved)
     keep_segments = _build_keep_segments(cuts, video_duration)
-    total_duration = sum(s["src_end"] - s["src_start"] for s in keep_segments)
+    raw_total = sum(s["src_end"] - s["src_start"] for s in keep_segments)
+    # Cloudinary transitions overlap adjacent segments, reducing total duration
+    total_duration = raw_total - max(0, len(keep_segments) - 1) * transition_dur
 
     # ── Video track ───────────────────────────────────────────────────────────
     video_clips: List[Dict] = []
-    timeline_pos = 0.0
 
-    for i, seg in enumerate(keep_segments):
-        seg_dur = seg["src_end"] - seg["src_start"]
-        if seg_dur < 0.1:
-            continue
-
-        seg_zooms = [z for z in zooms if seg["src_start"] <= float(z.get("at", -1)) < seg["src_end"]]
-
-        # Base clips pan left/right (slide Ken Burns) — zero zoom so emphasis zooms
-        # are visually distinct and unmissable by contrast.
-        base_effect = "slideLeft" if i % 2 == 0 else "slideRight"
-
-        clip: Dict[str, Any] = {
-            "asset": {
-                "type": "video",
-                "src": video_url,
-                "trim": seg["src_start"],
-                "volume": 1,
-            },
-            "start": round(timeline_pos, 3),
-            "length": round(seg_dur, 3),
+    if cloudinary_cut_url:
+        # Cloudinary pre-rendered the cuts + transitions — Shotstack gets ONE clip.
+        # Apply a global slow zoom so the full video has forward motion.
+        video_clips = [{
+            "asset": {"type": "video", "src": cloudinary_cut_url, "volume": 1},
+            "start": 0,
+            "length": round(total_duration, 3),
             "fit": "cover",
-            "effect": base_effect,
-        }
+            "effect": "zoomInSlow",
+        }]
+        print(f"[VideoProduction] using Cloudinary pre-cut URL ({len(keep_segments)} segments)", flush=True)
+    else:
+        # Fallback: multi-clip Shotstack timeline with per-segment Ken Burns + skew
+        timeline_pos = 0.0
+        for i, seg in enumerate(keep_segments):
+            seg_dur = seg["src_end"] - seg["src_start"]
+            if seg_dur < 0.1:
+                continue
 
-        # Zoom transition at every cut except the very first clip
-        if i > 0:
-            clip["transition"] = {"in": "zoom"}
+            seg_zooms = [z for z in zooms if seg["src_start"] <= float(z.get("at", -1)) < seg["src_end"]]
+            base_effect = "slideLeft" if i % 2 == 0 else "slideRight"
 
-        if seg_zooms:
-            z = seg_zooms[0]
-            # Swap from pan → zoom effect so the audience feels the camera push in.
-            # Strong rotation overshoot (6° → -3° → 0°) adds a kinetic smash-cut feel.
-            # Skew snap (0.07 → 0 in 0.3s) adds perspective warp on zoom entry.
-            clip["effect"] = "zoomIn" if z.get("intensity") != "strong" else "zoomOut"
-            clip["transform"] = {
-                "rotate": {
-                    "angle": [
-                        {"from": 6.0, "to": -3.0, "start": 0, "length": 0.35,
-                         "interpolation": "bezier", "easing": "easeOutBack"},
-                        {"from": -3.0, "to": 0, "start": 0.35, "length": 0.2,
-                         "interpolation": "bezier", "easing": "easeOutCubic"},
-                    ]
+            clip: Dict[str, Any] = {
+                "asset": {
+                    "type": "video",
+                    "src": video_url,
+                    "trim": seg["src_start"],
+                    "volume": 1,
                 },
-                "skew": {
-                    "x": [
-                        {"from": 0.07, "to": 0, "start": 0, "length": 0.3,
-                         "interpolation": "bezier", "easing": "easeOutCubic"},
-                    ]
-                },
+                "start": round(timeline_pos, 3),
+                "length": round(seg_dur, 3),
+                "fit": "cover",
+                "effect": base_effect,
             }
 
-        video_clips.append(clip)
-        timeline_pos += seg_dur
+            if i > 0:
+                clip["transition"] = {"in": "zoom"}
+
+            if seg_zooms:
+                z = seg_zooms[0]
+                clip["effect"] = "zoomIn" if z.get("intensity") != "strong" else "zoomOut"
+                clip["transform"] = {
+                    "rotate": {
+                        "angle": [
+                            {"from": 6.0, "to": -3.0, "start": 0, "length": 0.35,
+                             "interpolation": "bezier", "easing": "easeOutBack"},
+                            {"from": -3.0, "to": 0, "start": 0.35, "length": 0.2,
+                             "interpolation": "bezier", "easing": "easeOutCubic"},
+                        ]
+                    },
+                    "skew": {
+                        "x": [
+                            {"from": 0.07, "to": 0, "start": 0, "length": 0.3,
+                             "interpolation": "bezier", "easing": "easeOutCubic"},
+                        ]
+                    },
+                }
+
+            video_clips.append(clip)
+            timeline_pos += seg_dur
 
     # ── Caption track ─────────────────────────────────────────────────────────
     # Build a remapped SRT with timeline timestamps (after cuts applied) and
@@ -640,8 +716,8 @@ def build_shotstack_timeline(
     srt_lines: List[str] = []
     entry_num = 1
     for entry in srt_entries:
-        tl_start = _original_to_timeline(entry["start"], keep_segments)
-        tl_end = _original_to_timeline(entry["end"], keep_segments, clamp=True)
+        tl_start = _original_to_timeline(entry["start"], keep_segments, transition_dur=transition_dur)
+        tl_end = _original_to_timeline(entry["end"], keep_segments, clamp=True, transition_dur=transition_dur)
         if tl_start is None or tl_end is None:
             continue
         tl_start = max(0.0, tl_start)
@@ -706,7 +782,7 @@ def build_shotstack_timeline(
             orig_at = float(sfx.get("at", -1))
             if orig_at < 0 or orig_at > video_duration:
                 continue
-            tl_at = _original_to_timeline(orig_at, keep_segments)
+            tl_at = _original_to_timeline(orig_at, keep_segments, transition_dur=transition_dur)
             if tl_at is None:
                 continue
             sfx_clips.append({
@@ -730,7 +806,7 @@ def build_shotstack_timeline(
         br_dur = min(float(br.get("duration", 3.0)), 4.0)
         if orig_at < 0 or orig_at >= video_duration:
             continue
-        tl_at = _original_to_timeline(orig_at, keep_segments)
+        tl_at = _original_to_timeline(orig_at, keep_segments, transition_dur=transition_dur)
         if tl_at is None:
             continue
         # Clamp duration so b-roll doesn't run past the timeline end
@@ -959,9 +1035,28 @@ async def run_production_job(
 
         # ── Stage 5: Shotstack render + mix ──────────────────────────────────────
         await update(62, "Building edit timeline…")
+
+        # Build Cloudinary cut URL — cuts + transitions in a single CDN-served video.
+        # Shotstack then receives ONE clip and only handles captions, hook, music, SFX.
+        transition_style = _TRANSITION_BY_TYPE.get(video_type, "fadewhite")
+        cloudinary_cut_url = ""
+        if "res.cloudinary.com" in (clean_video_url or ""):
+            cld_pid = _cloudinary_public_id(clean_video_url)
+            if cld_pid:
+                keep_segs_preview = _build_keep_segments(cuts, duration)
+                if len(keep_segs_preview) > 1:
+                    cloudinary_cut_url = _build_cloudinary_cut_url(
+                        cld_pid, keep_segs_preview, transition_style, _CLD_TRANSITION_DUR
+                    )
+                    print(
+                        f"[CloudinaryEdit] {len(keep_segs_preview)} segments → "
+                        f"{transition_style} transition  {cloudinary_cut_url[:80]}…",
+                        flush=True,
+                    )
+
         srt_entries = _parse_srt(srt_text)
         timeline = build_shotstack_timeline(
-            video_url=clean_video_url,      # cleaned voice track
+            video_url=clean_video_url,      # cleaned voice track (fallback path)
             video_duration=duration,
             cuts=cuts,
             zooms=zooms,
@@ -972,6 +1067,8 @@ async def run_production_job(
             job_id=job_id,
             music_url=music_url,
             hook_text=hook_text,
+            cloudinary_cut_url=cloudinary_cut_url,
+            transition_dur=_CLD_TRANSITION_DUR if cloudinary_cut_url else 0.0,
         )
 
         await update(68, "Rendering video…")
