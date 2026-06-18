@@ -354,11 +354,45 @@ Return only the JSON. No preamble, no explanation."""
             image_hash = await CustomVisualGuideV2Service._compute_image_hash(image_url)
             print(f"[V2] Image hash: {image_hash}")
 
-            # Step 2: Extract style profile using GPT-4o Vision
+            # Step 2: Check if this image already exists
+            existing_guide = await db["custom_visual_guides"].find_one({
+                "user_id": user_id,
+                "original_image_hash": image_hash,
+                "version": "v2"
+            })
+
+            if existing_guide:
+                if existing_guide.get("status") == "archived":
+                    # Restore archived guide to active
+                    print(f"[V2] 📦 Restoring archived guide to active: {existing_guide['_id']}")
+                    await db["custom_visual_guides"].update_one(
+                        {"_id": existing_guide["_id"]},
+                        {
+                            "$set": {
+                                "status": "active",
+                                "name": name,  # Update name if changed
+                                "updated_at": datetime.utcnow()
+                            }
+                        }
+                    )
+                    existing_guide["id"] = str(existing_guide["_id"])
+                    existing_guide["status"] = "active"
+                    existing_guide["name"] = name
+                    print(f"[V2] ✅ Guide restored to active: {existing_guide['id']}")
+                    return existing_guide
+                else:
+                    # Already active - show error
+                    print(f"[V2] ❌ Duplicate active guide detected: {image_hash}")
+                    raise HTTPException(
+                        status_code=409,
+                        detail="You've already uploaded this image. Find it in your V2 Style Guides."
+                    )
+
+            # Step 3: Extract style profile using GPT-4o Vision (only for new uploads)
             print(f"[V2] Extracting style profile with GPT-4o Vision...")
             style_profile = await CustomVisualGuideV2Service.extract_style_profile(image_url)
 
-            # Step 3: Store in database
+            # Step 4: Store in database
             guide_doc = {
                 "user_id": user_id,
                 "brand_id": brand_id,
@@ -376,20 +410,12 @@ Return only the JSON. No preamble, no explanation."""
                 "updated_at": datetime.utcnow(),
             }
 
-            try:
-                result = await db["custom_visual_guides"].insert_one(guide_doc)
-                guide_doc["id"] = str(result.inserted_id)
-                guide_doc["_id"] = result.inserted_id
+            result = await db["custom_visual_guides"].insert_one(guide_doc)
+            guide_doc["id"] = str(result.inserted_id)
+            guide_doc["_id"] = result.inserted_id
 
-                print(f"[V2] ✅ Custom Visual Guide V2 created: {guide_doc['id']}")
-                return guide_doc
-
-            except DuplicateKeyError:
-                print(f"[V2] ❌ Duplicate image detected: {image_hash}")
-                raise HTTPException(
-                    status_code=409,
-                    detail="You've already uploaded this image as a custom guide."
-                )
+            print(f"[V2] ✅ Custom Visual Guide V2 created: {guide_doc['id']}")
+            return guide_doc
 
         except HTTPException:
             raise
