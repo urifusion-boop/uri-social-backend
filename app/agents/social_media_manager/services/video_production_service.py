@@ -179,7 +179,7 @@ _TRANSITION_BY_TYPE: Dict[str, str] = {
     "product":  "fadeblack",   # fade to black — premium/clean
     "founder":  "dissolve",    # soft dissolve — authentic
 }
-_CLD_TRANSITION_DUR = 0.3   # seconds of overlap at each cut
+_CLD_TRANSITION_DUR = 0.5   # seconds of overlap at each cut
 
 
 def _cloudinary_public_id(url: str) -> str:
@@ -228,7 +228,7 @@ def _build_cloudinary_cut_url(
     return (
         f"https://res.cloudinary.com/{cloud}/video/upload/"
         + "/".join(parts)
-        + f"/{public_id}"
+        + f"/{public_id}.mp4"
     )
 
 
