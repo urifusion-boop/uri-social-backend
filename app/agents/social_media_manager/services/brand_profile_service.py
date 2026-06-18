@@ -111,6 +111,8 @@ class BrandProfileService:
         # Custom Visual Guides selections
         if "selected_custom_guides" in data:
             doc["selected_custom_guides"] = data["selected_custom_guides"]
+        if "selected_custom_guides_v2" in data:
+            doc["selected_custom_guides_v2"] = data["selected_custom_guides_v2"]
         if "style_rotation_index" in data:
             doc["style_rotation_index"] = data["style_rotation_index"]
 
