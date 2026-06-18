@@ -88,6 +88,8 @@ _ALLOWED_ORIGINS = [
     "https://www.urisocial.com",
     "https://app.urisocial.com",
     "https://api.urisocial.com",
+    # SDK Gateway
+    "https://sdk-gateway.urisocial.com",
 ]
 app.add_middleware(
     CORSMiddleware,
