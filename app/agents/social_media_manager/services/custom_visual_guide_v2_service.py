@@ -260,20 +260,25 @@ Return only the JSON. No preamble, no explanation."""
         try:
             print(f"[V2] Extracting style profile from: {image_url[:80]}...")
 
-            # Build vision request
-            ai_request = AIService.build_ai_model(
-                messages=[{
-                    "role": "user",
-                    "content": [
-                        {"type": "image_url", "image_url": {"url": image_url}},
-                        {"type": "text", "text": CustomVisualGuideV2Service.STYLE_EXTRACTION_PROMPT}
-                    ]
-                }],
-                model="gpt-4o",  # Use GPT-4o for best vision analysis
-                temperature=0.3,  # Low temperature for consistent extraction
-            )
+            # Call OpenAI directly for vision (bypass ChatModel validation)
+            import asyncio
+            from app.services.AIService import client
 
-            ai_response = await AIService.chat_completion(ai_request)
+            loop = asyncio.get_running_loop()
+            ai_response = await loop.run_in_executor(
+                None,
+                lambda: client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": image_url}},
+                            {"type": "text", "text": CustomVisualGuideV2Service.STYLE_EXTRACTION_PROMPT}
+                        ]
+                    }],
+                    temperature=0.3,
+                )
+            )
 
             if isinstance(ai_response, dict) and "error" in ai_response:
                 raise Exception(ai_response["error"])
