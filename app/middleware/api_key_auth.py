@@ -31,7 +31,7 @@ class APIKeyAuthService:
 
     async def get_sdk_gateway_db(self):
         """Get SDK Gateway database connection for API key lookups"""
-        if not self.sdk_gateway_db:
+        if self.sdk_gateway_db is None:
             self.sdk_gateway_db = await get_sdk_gateway_database()
         return self.sdk_gateway_db
 
