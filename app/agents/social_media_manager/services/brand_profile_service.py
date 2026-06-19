@@ -158,8 +158,22 @@ class BrandProfileService:
         personal_bid = BrandAccount.personal_brand_id(user_id)
         is_agency_brand = brand_id and brand_id != personal_bid
 
-        scope = {"brand_id": brand_id} if brand_id else {"user_id": user_id}
-        profile = await db[BrandProfileService.COLLECTION].find_one(scope)
+        # For personal brands, try multiple query strategies to find legacy profiles
+        # that were saved with user_id only (before brand_id was introduced)
+        if brand_id and not is_agency_brand:
+            scope_options = [
+                {"brand_id": brand_id},
+                {"user_id": user_id, "brand_id": {"$exists": False}},
+                {"user_id": user_id},
+            ]
+            profile = None
+            for scope in scope_options:
+                profile = await db[BrandProfileService.COLLECTION].find_one(scope)
+                if profile:
+                    break
+        else:
+            scope = {"brand_id": brand_id} if brand_id else {"user_id": user_id}
+            profile = await db[BrandProfileService.COLLECTION].find_one(scope)
 
         # For agency brands: if the profile is missing or lacks key playbook fields
         # (colors, visual style, industry), merge in the personal brand's values so
