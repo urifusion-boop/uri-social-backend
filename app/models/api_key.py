@@ -115,7 +115,7 @@ class APIKey(BaseModel):
     status: str = Field(default="active", pattern="^(active|revoked|expired)$")
 
     # Metadata
-    environment: str = Field(default="production", pattern="^(production|development|staging)$")
+    environment: str = Field(default="production", pattern="^(production|development|staging|testing)$")
     allowed_ips: Optional[List[str]] = Field(None, description="Whitelist of allowed IP addresses")
     allowed_origins: Optional[List[str]] = Field(None, description="Whitelist of allowed CORS origins")
 
@@ -233,7 +233,7 @@ class CreateAPIKeyRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=100)
     description: Optional[str] = Field(None, max_length=500)
     scopes: Optional[List[str]] = None
-    environment: str = Field(default="production", pattern="^(production|development|staging)$")
+    environment: str = Field(default="production", pattern="^(production|development|staging|testing)$")
     expires_in_days: Optional[int] = Field(None, ge=1, le=3650, description="Expiration in days (max 10 years)")
     rate_limit_requests_per_hour: Optional[int] = Field(None, ge=1, le=10000)
 
