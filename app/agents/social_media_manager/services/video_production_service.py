@@ -584,6 +584,76 @@ Return ONLY valid JSON (no markdown):
     except json.JSONDecodeError:
         return {"cuts": [], "zooms": []}
 
+# ── Algorithmic silence detection ─────────────────────────────────────────────
+
+_SILENCE_THRESHOLD: Dict[str, float] = {
+    "tiktok":   0.8,
+    "product":  1.2,
+    "founder":  1.8,
+}
+
+
+def _auto_cuts_from_srt(
+    srt_entries: List[Dict[str, Any]],
+    duration: float,
+    video_type: str = "tiktok",
+) -> List[Dict]:
+    """
+    Derive cut decisions directly from SRT entry timing gaps.
+    More reliable than asking GPT to infer silences from text alone.
+    """
+    threshold = _SILENCE_THRESHOLD.get(video_type, 1.0)
+    cuts: List[Dict] = []
+    if not srt_entries:
+        return cuts
+
+    # Leading silence
+    if srt_entries[0]["start"] > threshold:
+        cuts.append({
+            "remove_start": 0.0,
+            "remove_end": round(srt_entries[0]["start"], 3),
+            "reason": f"leading silence {srt_entries[0]['start']:.1f}s",
+        })
+
+    # Gaps between subtitle entries
+    for i in range(1, len(srt_entries)):
+        gap_start = srt_entries[i - 1]["end"]
+        gap_end   = srt_entries[i]["start"]
+        gap       = gap_end - gap_start
+        if gap > threshold:
+            cuts.append({
+                "remove_start": round(gap_start, 3),
+                "remove_end":   round(gap_end, 3),
+                "reason":       f"silence {gap:.1f}s",
+            })
+
+    # Trailing silence
+    if duration - srt_entries[-1]["end"] > threshold:
+        cuts.append({
+            "remove_start": round(srt_entries[-1]["end"], 3),
+            "remove_end":   round(duration, 3),
+            "reason":       f"trailing silence {duration - srt_entries[-1]['end']:.1f}s",
+        })
+
+    return cuts
+
+
+def _merge_cuts(auto: List[Dict], gpt: List[Dict]) -> List[Dict]:
+    """Union of auto and GPT cuts. Where they overlap keep the wider range."""
+    all_cuts = auto + gpt
+    if not all_cuts:
+        return []
+    sorted_cuts = sorted(all_cuts, key=lambda c: float(c.get("remove_start", 0)))
+    merged: List[Dict] = [dict(sorted_cuts[0])]
+    for cut in sorted_cuts[1:]:
+        rs = float(cut.get("remove_start", 0))
+        re = float(cut.get("remove_end", 0))
+        if rs <= float(merged[-1]["remove_end"]):
+            merged[-1]["remove_end"] = max(float(merged[-1]["remove_end"]), re)
+        else:
+            merged.append(dict(cut))
+    return merged
+
 
 # ── Timeline Builder ──────────────────────────────────────────────────────────
 
@@ -1171,16 +1241,24 @@ async def run_production_job(
 
         # ── Stage 3: GPT-4o edit decisions ───────────────────────────────────────
         await update(48, "AI making edit decisions…")
+        # Parse SRT early so we can compute algorithmic silence cuts.
+        srt_entries = _parse_srt(srt_text)
+
         decisions = await get_edit_decisions(srt_text, video_type, duration, tracking_data)
-        cuts = decisions.get("cuts", [])
+        gpt_cuts = decisions.get("cuts", [])
         zooms = decisions.get("zooms", [])
         sound_effects = decisions.get("sound_effects", [])
         broll_decisions = decisions.get("broll", [])[:3]
         pacing_note = decisions.get("pacing_note", "")
         music_mood = decisions.get("music_mood", "upbeat")
         hook_text = decisions.get("hook_text", "")
+
+        # Algorithmic silence cuts from SRT timing gaps (more reliable than GPT inference).
+        auto_cuts = _auto_cuts_from_srt(srt_entries, duration, video_type)
+        cuts = _merge_cuts(auto_cuts, gpt_cuts)
         print(
-            f"[VideoProduction] cuts={len(cuts)} zooms={len(zooms)} "
+            f"[VideoProduction] auto_cuts={len(auto_cuts)} gpt_cuts={len(gpt_cuts)} "
+            f"merged_cuts={len(cuts)} zooms={len(zooms)} "
             f"sfx={len(sound_effects)} broll={len(broll_decisions)} pacing={pacing_note} "
             f"hook='{hook_text}'",
             flush=True,
@@ -1236,7 +1314,6 @@ async def run_production_job(
                         flush=True,
                     )
 
-        srt_entries = _parse_srt(srt_text)
         timeline = build_shotstack_timeline(
             video_url=clean_video_url,      # cleaned voice track (fallback path)
             video_duration=duration,
