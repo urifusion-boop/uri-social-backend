@@ -556,10 +556,14 @@ TRANSCRIPT (SRT — timestamps are original video seconds):
 YOUR EDITING DECISIONS:
 
 cuts — remove dead air, filler, and repetition:
-- Only cut ranges that are SILENT or contain filler ("um", "uh", "like", "you know", false starts, repeated phrases).
+- Pure silence gaps are already handled algorithmically. Focus your cuts on SPOKEN content that adds no value:
+  * Filler phrases: "like", "you know", "I mean", "basically", "kind of", "sort of", "right?", "okay so"
+  * False starts: speaker begins a sentence, stops, restarts — cut the false start
+  * Repetitions: speaker says the same idea twice in a row — keep the cleaner delivery, cut the other
+  * Throat clears, coughs, nervous laughter that interrupts the flow
 - remove_start and remove_end must be within [0, {duration:.1f}].
 - Every kept segment between cuts must be ≥4s. Do not create micro-clips.
-- Cuts are already handled for pure silence gaps — focus on filler WORDS and PHRASES the speaker said that add no value.
+- When a filler phrase is in the MIDDLE of a sentence, cut only that phrase (tight cut). Do not cut the whole sentence.
 
 zooms — punch-in on emotional/impactful words:
 - "at" in original video seconds, within [0, {duration:.1f}].
@@ -617,13 +621,33 @@ Return ONLY valid JSON (no markdown, no explanation):
     except json.JSONDecodeError:
         return {"cuts": [], "zooms": []}
 
-# ── Algorithmic silence detection ─────────────────────────────────────────────
+# ── Algorithmic silence + filler detection ────────────────────────────────────
 
 _SILENCE_THRESHOLD: Dict[str, float] = {
     "tiktok":   0.8,
     "product":  1.2,
     "founder":  1.8,
 }
+
+# SRT entries whose text is ONLY filler words are automatically cut.
+# "like" / "so" / "right" excluded — too often used meaningfully mid-sentence.
+_DEFINITE_FILLER_RE = re.compile(
+    r"^\s*(um+|uh+|ah+|hmm+|er+|erm+|mhm+|uhh+|umm+|huh)\s*[,.]?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _filler_cuts_from_srt(srt_entries: List[Dict[str, Any]]) -> List[Dict]:
+    """Cut SRT entries that consist entirely of a definite filler sound."""
+    cuts = []
+    for entry in srt_entries:
+        if _DEFINITE_FILLER_RE.match(entry["text"]):
+            cuts.append({
+                "remove_start": round(entry["start"], 3),
+                "remove_end":   round(entry["end"],   3),
+                "reason":       f'filler word: "{entry["text"].strip()}"',
+            })
+    return cuts
 
 
 def _auto_cuts_from_srt(
@@ -1020,57 +1044,65 @@ def build_shotstack_timeline(
     # ── Hook title card (rich-text overlay, first 2.5s) ──────────────────────
     hook_clips: List[Dict] = []
     if hook_text:
+        # Split into 2 lines in Python — the only reliable way to prevent overflow
+        # inside Shotstack's HTML renderer (CSS word-break is not always honoured).
+        _hw = hook_text.upper().split()
+        _mid = max(1, len(_hw) // 2)
+        _line1 = " ".join(_hw[:_mid])
+        _line2 = " ".join(_hw[_mid:])
+        hook_html = f"<p>{_line1}<br>{_line2}</p>" if _line2 else f"<p>{_line1}</p>"
+
         hook_css = (
-            "body{margin:0;padding:0;background:transparent;display:flex;"
-            "align-items:center;justify-content:center;}"
-            f"p{{font-family:'Montserrat',sans-serif;font-size:64px;font-weight:900;"
+            "body{margin:0;padding:0;background:transparent;}"
+            f"p{{font-family:'Montserrat',sans-serif;font-size:58px;font-weight:900;"
             f"color:#FFFFFF;text-align:center;text-transform:uppercase;"
-            f"letter-spacing:-1px;line-height:1.1;word-break:break-word;"
+            f"letter-spacing:-1px;line-height:1.15;"
             f"text-shadow:3px 3px 0 {primary_color},-3px -3px 0 {primary_color},"
             f"3px -3px 0 {primary_color},-3px 3px 0 {primary_color};"
-            f"margin:0;padding:10px 20px;}}"
+            f"margin:0;padding:8px 16px;}}"
         )
         hook_clips = [{
             "asset": {
                 "type": "html",
-                "html": f"<p>{hook_text.upper()}</p>",
+                "html": hook_html,
                 "css": hook_css,
-                "width": 1020,   # close to frame width so long hooks don't clip
-                "height": 380,   # tall enough for 2-line wraps
+                "width": 980,
+                "height": 440,  # enough for 2 lines at 58px
             },
             "start": 0,
             "length": round(min(2.5, total_duration * 0.25), 3),
             "position": "center",
-            "offset": {"y": 0.10},
+            "offset": {"y": 0.08},
             "transition": {"in": "slideUp", "out": "fade"},
         }]
-        print(f"[VideoProduction] hook title card: '{hook_text}'", flush=True)
+        print(f"[VideoProduction] hook: '{_line1} / {_line2}'", flush=True)
 
     # ── Lower-third brand name (slides up at start, shown for 3.5s) ──────────
     lower_third_clips: List[Dict] = []
     if brand_name:
         lt_dur = min(3.5, total_duration * 0.20)
+        # display:table shrinks the div to content width in all rendering engines —
+        # more reliable than inline-flex which Shotstack's renderer sometimes ignores.
         lt_css = (
-            "body{margin:0;padding:0;background:transparent;"
-            "display:flex;align-items:flex-end;justify-content:flex-start;}"
-            f"div{{display:inline-flex;align-items:center;background:{primary_color};"
-            f"padding:10px 32px;border-radius:6px;max-width:80%;}}"
-            f"p{{font-family:'Montserrat',sans-serif;font-size:34px;font-weight:700;"
+            "body{margin:0;padding:8px 16px;background:transparent;}"
+            f"div{{display:table;background:{primary_color};"
+            f"padding:10px 28px;border-radius:6px;}}"
+            f"p{{font-family:'Montserrat',sans-serif;font-size:32px;font-weight:700;"
             f"color:{secondary_color};text-transform:uppercase;letter-spacing:2px;"
-            f"margin:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}}"
+            f"margin:0;white-space:nowrap;}}"
         )
         lower_third_clips = [{
             "asset": {
                 "type": "html",
                 "html": f"<div><p>{brand_name}</p></div>",
                 "css": lt_css,
-                "width": 900,
-                "height": 100,
+                "width": 600,   # intentionally narrow — text pill must fit within this
+                "height": 90,
             },
             "start": 0,
             "length": round(lt_dur, 3),
             "position": "bottomLeft",
-            "offset": {"x": 0.02, "y": 0.18},
+            "offset": {"x": 0.01, "y": 0.18},
             "transition": {"in": "slideUp", "out": "fade"},
         }]
         print(f"[VideoProduction] lower-third: '{brand_name}' dur={lt_dur:.1f}s", flush=True)
@@ -1310,12 +1342,14 @@ async def run_production_job(
         music_mood = decisions.get("music_mood", "upbeat")
         hook_text = decisions.get("hook_text", "")
 
-        # Algorithmic silence cuts from SRT timing gaps (more reliable than GPT inference).
-        auto_cuts = _auto_cuts_from_srt(srt_entries, duration, video_type)
-        cuts = _merge_cuts(auto_cuts, gpt_cuts)
+        # Algorithmic cuts: silence gaps + definite filler words (um/uh/ah/hmm).
+        # These are deterministic — no dependency on GPT noticing them.
+        auto_cuts   = _auto_cuts_from_srt(srt_entries, duration, video_type)
+        filler_cuts = _filler_cuts_from_srt(srt_entries)
+        cuts = _merge_cuts(auto_cuts + filler_cuts, gpt_cuts)
         print(
-            f"[VideoProduction] auto_cuts={len(auto_cuts)} gpt_cuts={len(gpt_cuts)} "
-            f"merged_cuts={len(cuts)} zooms={len(zooms)} "
+            f"[VideoProduction] silence_cuts={len(auto_cuts)} filler_cuts={len(filler_cuts)} "
+            f"gpt_cuts={len(gpt_cuts)} merged={len(cuts)} zooms={len(zooms)} "
             f"sfx={len(sound_effects)} broll={len(broll_decisions)} pacing={pacing_note} "
             f"hook='{hook_text}'",
             flush=True,
