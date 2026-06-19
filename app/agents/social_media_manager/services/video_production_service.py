@@ -878,18 +878,19 @@ def build_shotstack_timeline(
     # ── Background music track ────────────────────────────────────────────────
     music_clips: List[Dict] = []
     if music_url:
-        fade = min(2.0, total_duration * 0.08)
+        fade = min(2.5, total_duration * 0.10)
         music_clips = [{
             "asset": {
                 "type": "audio",
                 "src": music_url,
-                "volume": 0.15,   # sits beneath speech; voice stays dominant
+                "volume": 0.08,   # low enough to never compete with speech
                 "trim": 0,
             },
             "start": 0,
             "length": round(total_duration, 3),
+            "transition": {"in": "fade", "out": "fade"},  # smooth fade at both ends
         }]
-        print(f"[Music] added track volume=0.15 length={total_duration:.1f}s fade={fade:.1f}s", flush=True)
+        print(f"[Music] added track volume=0.08 length={total_duration:.1f}s fade={fade:.1f}s", flush=True)
 
     # ── Hook title card (rich-text overlay, first 2.5s) ──────────────────────
     hook_clips: List[Dict] = []
