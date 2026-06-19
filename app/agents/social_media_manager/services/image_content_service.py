@@ -749,11 +749,13 @@ Every element in the image must come from the instructions below. Nothing else.
 
 CANVAS SAFETY — NON-NEGOTIABLE, OVERRIDES ALL STYLE RULES:
 Every letter of every word must be 100% inside the image canvas with no clipping.
-Maintain a minimum 12% safe-zone margin from every edge (top, bottom, left, right).
-Headlines must begin at least 12% from the top edge. CTA text must end at least 12%
-from the bottom edge. If text is too large to fit within these margins, reduce the
-font size — do NOT let any character touch or cross any edge. This rule overrides
-any visual style, typography, or layout instruction that follows."""
+Maintain a minimum 20% safe-zone margin from every edge (top, bottom, left, right).
+Headlines must begin at least 20% from the top edge. CTA text, footers, and any bottom
+text must end at least 20% from the bottom edge. If text is too large to fit within
+these margins, reduce the font size — do NOT let any character touch or cross any edge.
+⚠️ CRITICAL: Text cut off at bottom edges is a CRITICAL FAILURE. Leave generous space
+at the bottom. This rule overrides any visual style, typography, or layout instruction
+that follows."""
 
             # SECTION 2: PROFESSIONAL OUTPUT RULES
             # These rules make AI graphics look professionally designed (not AI-generated)
