@@ -12,6 +12,7 @@ import re
 import subprocess
 import tempfile
 import time
+import urllib.parse
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -200,51 +201,75 @@ def _cloudinary_public_id(url: str) -> str:
     return m.group(1) if m else ""
 
 
+def _cld_encode_text(text: str) -> str:
+    """URL-encode text for a Cloudinary l_text layer. Commas and slashes must be double-encoded."""
+    encoded = urllib.parse.quote(text, safe='')
+    encoded = encoded.replace('%2C', '%252C')
+    encoded = encoded.replace('%2F', '%252F')
+    return encoded
+
+
 def _build_cloudinary_cut_url(
     public_id: str,
     keep_segments: List[Dict],
     luma_matte_pid: str = "uri-transitions/circle-wipe",
     transition_dur: float = 2.5,
+    hook_text: str = "",
+    primary_color: str = "#FFD700",
 ) -> str:
     """
-    Build a Cloudinary transformation URL using the custom luma-matte e_transition
-    approach. Each segment of the source video is concatenated with a hard-edge
-    wipe transition visible enough to see clearly in the rendered video.
+    Build a Cloudinary transformation URL: luma-matte transitions between segments,
+    then a branded hook text overlay baked into the first 2.5s of the video.
 
-    Format per additional segment:
-      l_video:{pid}/so_X,eo_Y/e_transition,l_video:{luma}/fl_layer_apply/fl_layer_apply
-
-    Cloudinary renders this on first request; subsequent fetches are CDN-cached.
-    Total duration = sum of all segment durations (transitions are overlaid, not additive).
+    Hook overlay uses Cloudinary's native l_text layer — rendered server-side at
+    full resolution, completely avoiding Shotstack's unreliable HTML renderer.
     """
     cloud = settings.CLOUDINARY_CLOUD_NAME
     if not cloud or not keep_segments:
         return ""
 
-    pid_enc   = public_id.replace("/", ":")          # '/' → ':' for overlay refs
-    luma_enc  = luma_matte_pid.replace("/", ":")
+    pid_enc  = public_id.replace("/", ":")
+    luma_enc = luma_matte_pid.replace("/", ":")
 
     first = keep_segments[0]
     parts: List[str] = [
         f"so_{first['src_start']:.3f},eo_{first['src_end']:.3f}"
     ]
-
     for seg in keep_segments[1:]:
         s = f"{seg['src_start']:.3f}"
         e = f"{seg['src_end']:.3f}"
-        # Open the next segment as an overlay, apply the luma matte transition,
-        # close the transition layer, then close the overlay layer.
         parts.append(
             f"l_video:{pid_enc}/so_{s},eo_{e}"
             f"/e_transition,l_video:{luma_enc}/fl_layer_apply"
             f"/fl_layer_apply"
         )
 
-    return (
+    url = (
         f"https://res.cloudinary.com/{cloud}/video/upload/"
         + "/".join(parts)
-        + f"/{public_id}.mp4"
     )
+
+    # Hook text overlay — baked into the Cloudinary video, shown for the first 2.5s.
+    # Using Montserrat 900 (Google Fonts), brand primary color background, white text.
+    # Font size scales with text length so it never overflows the 1080px frame.
+    if hook_text:
+        text_upper  = hook_text.upper()
+        encoded     = _cld_encode_text(text_upper)
+        char_count  = len(text_upper)
+        # At Montserrat 900, uppercase chars average ~0.62em wide.
+        # Keep within ~950px usable width on a 1080px frame.
+        font_size   = min(70, max(48, int(950 / max(char_count * 0.62, 1))))
+        primary_hex = primary_color.lstrip("#")
+        bg_hex      = (primary_hex + "D9") if len(primary_hex) == 6 else primary_hex  # 85% opacity
+        url += (
+            f"/b_rgb:{bg_hex},co_rgb:FFFFFF"
+            f",l_text:Montserrat@google_{font_size}_900:{encoded}"
+            f"/eo_2.5,fl_layer_apply,g_north,y_0.10"
+        )
+        print(f"[CloudinaryHook] '{text_upper}' font={font_size}px bg=#{bg_hex}", flush=True)
+
+    url += f"/{public_id}.mp4"
+    return url
 
 
 async def _pexels_search(query: str) -> Optional[str]:
@@ -1070,7 +1095,7 @@ def build_shotstack_timeline(
     # Shotstack's renderer collapses multi-element stacking (both <br> and separate
     # <p> elements render at the same y). Single element only — scale font to fit.
     hook_clips: List[Dict] = []
-    if hook_text:
+    if hook_text and not cloudinary_cut_url:
         _hook_upper = hook_text.upper()
         # Scale font so text stays within ~1000px at ~0.60 width-per-em for Montserrat Black.
         # Clamp 40–62px so it's always readable.
@@ -1412,7 +1437,9 @@ async def run_production_job(
                 keep_segs_preview = _build_keep_segments(cuts, duration)
                 if len(keep_segs_preview) > 1:
                     cloudinary_cut_url = _build_cloudinary_cut_url(
-                        cld_pid, keep_segs_preview, luma_pid, transition_dur
+                        cld_pid, keep_segs_preview, luma_pid, transition_dur,
+                        hook_text=hook_text,
+                        primary_color=primary_color,
                     )
                     # Compute where each cut appears in the OUTPUT video.
                     # With custom luma-matte transitions, total duration = sum(seg_durs).
