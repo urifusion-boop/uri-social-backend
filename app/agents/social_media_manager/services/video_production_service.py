@@ -355,50 +355,58 @@ async def _fetch_broll_url(description: str, concept: str) -> Optional[str]:
 
 
 # ── Background music ──────────────────────────────────────────────────────────
+# Curated CC0 instrumentals uploaded to Cloudinary from archive.org.
+# To add more tracks: download a CC0 MP3, upload via cloudinary.uploader.upload(resource_type="video"),
+# then append the secure_url to the appropriate mood list below.
 
-_MOOD_TAGS: Dict[str, str] = {
-    "upbeat":     "positive",
-    "chill":      "relaxing",
-    "cinematic":  "cinematic",
-    "dramatic":   "dramatic",
-    "acoustic":   "acoustic",
-    "electronic": "electronic",
+import random as _random
+
+_MUSIC_BY_MOOD: Dict[str, List[str]] = {
+    "upbeat": [
+        "https://res.cloudinary.com/df8ckaeam/video/upload/v1781851582/uri-music/upbeat/track-0.mp3",
+        "https://res.cloudinary.com/df8ckaeam/video/upload/v1781851597/uri-music/upbeat/track-1.mp3",
+        "https://res.cloudinary.com/df8ckaeam/video/upload/v1781851609/uri-music/upbeat/track-2.mp3",
+    ],
+    "chill": [
+        "https://res.cloudinary.com/df8ckaeam/video/upload/v1781851623/uri-music/chill/track-0.mp3",
+        "https://res.cloudinary.com/df8ckaeam/video/upload/v1781851634/uri-music/chill/track-1.mp3",
+        "https://res.cloudinary.com/df8ckaeam/video/upload/v1781851652/uri-music/chill/track-2.mp3",
+    ],
+    "cinematic": [
+        "https://res.cloudinary.com/df8ckaeam/video/upload/v1781851665/uri-music/cinematic/track-0.mp3",
+    ],
+    "dramatic": [],  # falls back to cinematic
+    "acoustic": [
+        "https://res.cloudinary.com/df8ckaeam/video/upload/v1781851680/uri-music/acoustic/track-0.mp3",
+        "https://res.cloudinary.com/df8ckaeam/video/upload/v1781851690/uri-music/acoustic/track-1.mp3",
+        "https://res.cloudinary.com/df8ckaeam/video/upload/v1781851704/uri-music/acoustic/track-2.mp3",
+    ],
+    "electronic": [
+        "https://res.cloudinary.com/df8ckaeam/video/upload/v1781851717/uri-music/electronic/track-0.mp3",
+        "https://res.cloudinary.com/df8ckaeam/video/upload/v1781851729/uri-music/electronic/track-1.mp3",
+        "https://res.cloudinary.com/df8ckaeam/video/upload/v1781851740/uri-music/electronic/track-2.mp3",
+    ],
+}
+
+_MOOD_FALLBACK: Dict[str, str] = {
+    "dramatic": "cinematic",
+    "cinematic": "electronic",
 }
 
 
-async def _fetch_music_url(mood: str) -> Optional[str]:
-    """Fetch a royalty-free instrumental track from Jamendo by mood. Returns MP3 URL or None."""
-    client_id = settings.JAMENDO_CLIENT_ID
-    if not client_id:
-        return None
-    tags = _MOOD_TAGS.get(mood, "positive")
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                "https://api.jamendo.com/v3.0/tracks/",
-                params={
-                    "client_id": client_id,
-                    "format": "json",
-                    "audiodlformat": "mp32",
-                    "tags": tags,
-                    "vocalinstrumental": "instrumental",
-                    "limit": 5,
-                    "order": "popularity_total",
-                    "boost": "popularity_total",
-                },
-                timeout=aiohttp.ClientTimeout(total=12),
-            ) as resp:
-                if not resp.ok:
-                    print(f"[Music] Jamendo {resp.status}", flush=True)
-                    return None
-                data = await resp.json()
-                tracks = data.get("results", [])
-                if tracks:
-                    url = tracks[0].get("audio")
-                    print(f"[Music] '{tracks[0].get('name')}' ({mood}) → {(url or '')[:70]}", flush=True)
-                    return url
-    except Exception as e:
-        print(f"[Music] Jamendo error: {e}", flush=True)
+def _pick_music_url(mood: str) -> Optional[str]:
+    """Pick a random track URL for the given mood. Falls back through _MOOD_FALLBACK."""
+    seen: set[str] = set()
+    m = mood
+    while m not in seen:
+        tracks = _MUSIC_BY_MOOD.get(m, [])
+        if tracks:
+            url = _random.choice(tracks)
+            print(f"[Music] mood={mood} → picked {m} track: {url.split('/')[-1]}", flush=True)
+            return url
+        seen.add(m)
+        m = _MOOD_FALLBACK.get(m, "")
+    print(f"[Music] no track found for mood={mood}", flush=True)
     return None
 
 
@@ -1191,11 +1199,9 @@ async def run_production_job(
                     broll.append({**br, "url": url})
             print(f"[VideoProduction] broll resolved {len(broll)}/{len(broll_decisions)}", flush=True)
 
-        # ── Stage 4b: Fetch background music from Jamendo ────────────────────────
-        await update(59, "Fetching background music…")
-        music_url = await _fetch_music_url(music_mood)
-        if not music_url:
-            print(f"[Music] no track found for mood={music_mood}, skipping", flush=True)
+        # ── Stage 4b: Pick background music from Cloudinary library ─────────────
+        await update(59, "Selecting background music…")
+        music_url = _pick_music_url(music_mood)
 
         # ── Stage 5: Shotstack render + mix ──────────────────────────────────────
         await update(62, "Building edit timeline…")
