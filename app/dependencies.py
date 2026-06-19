@@ -144,11 +144,54 @@ async def flexible_auth(
 def extract_user_id_from_auth(auth: dict) -> str:
     """
     Helper function to extract user_id from flexible auth result.
-    
+
     Args:
         auth: Result from flexible_auth dependency
-        
+
     Returns:
         user_id as string
     """
     return auth.get("user_id")
+
+
+async def get_flexible_brand_context(
+    brand_id: Optional[str] = Query(None, description="Active brand id"),
+    x_brand_id: Optional[str] = Header(None, alias="X-Brand-Id"),
+    auth: dict = Depends(flexible_auth),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+) -> dict:
+    """
+    Flexible version of get_active_brand_context that accepts BOTH JWT and API key.
+
+    Priority:
+      1. Explicit brand_id (query param or X-Brand-Id header) — verified for access.
+      2. The user's personal solo brand (auto-created on first use).
+
+    Returns {"user_id", "brand_id", "agency_id", "auth_type"}
+    Raises 403 on denied access.
+    """
+    from app.services.AgencyService import AgencyService
+    from app.services.BrandAccountService import BrandAccountService
+
+    user_id = auth["user_id"]
+    requested = brand_id or x_brand_id
+
+    if requested and await AgencyService.user_has_access_to_brand(user_id, requested, db):
+        brand = await BrandAccountService.get_brand(requested, db)
+        return {
+            "user_id": user_id,
+            "brand_id": requested,
+            "agency_id": brand.agency_id if brand else None,
+            "auth_type": auth["auth_type"],
+        }
+
+    # No brand requested, OR user doesn't have access → fall back to personal brand
+    if requested:
+        print(f"⚠️ brand context: user {user_id} has no access to brand {requested}; falling back to personal brand")
+    personal = await BrandAccountService.get_or_create_personal_brand(user_id, db)
+    return {
+        "user_id": user_id,
+        "brand_id": personal.brand_id,
+        "agency_id": None,
+        "auth_type": auth["auth_type"],
+    }
