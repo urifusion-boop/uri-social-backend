@@ -557,17 +557,21 @@ Create social media content about THIS SPECIFIC PRODUCT based on the image analy
                     upsert=True,
                 )
                 # Save each draft
+                _brand_id = (brand_context or {}).get("brand_id")
                 for draft in drafts:
+                    draft_doc = {
+                        **draft,
+                        "request_id": request_id,
+                        "user_id": user_id,
+                        "approval_status": "pending",
+                        "created_at": generated_at,
+                        "updated_at": generated_at,
+                    }
+                    if _brand_id:
+                        draft_doc["brand_id"] = _brand_id
                     await db["content_drafts"].replace_one(
                         {"id": draft["id"]},
-                        {
-                            **draft,
-                            "request_id": request_id,
-                            "user_id": user_id,
-                            "approval_status": "pending",
-                            "created_at": generated_at,
-                            "updated_at": generated_at,
-                        },
+                        draft_doc,
                         upsert=True,
                     )
             except Exception as db_err:
