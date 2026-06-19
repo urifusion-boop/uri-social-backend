@@ -517,58 +517,91 @@ async def get_edit_decisions(
     tracking_data: Optional[dict] = None,
 ) -> Dict[str, Any]:
     """Feed transcript + video type to GPT-4o; get structured edit decisions."""
-    rules = {
-        "tiktok": "Energetic pacing. Cut silences >1.0s. Each kept segment must be ≥4s. Max 5 cuts.",
-        "product": "Snappy but clean. Cut silences >1.5s. Each kept segment must be ≥5s. Max 4 cuts.",
-        "founder": "Gentle pacing. Cut only clear silences >2.0s. Each kept segment must be ≥6s. Max 3 cuts.",
-    }.get(video_type, "Moderate pacing. Cut silences >1.5s. Each kept segment must be ≥4s. Max 4 cuts.")
+    style_guide = {
+        "tiktok": (
+            "TikTok / Reels — fast, punchy, zero dead air. "
+            "Cut every filler word ('um', 'uh', 'like', 'you know'), every repeated false-start, every breath gap >0.6s. "
+            "Aim for 4–6 cuts. Keep each segment 4–8s. 3–4 zooms on the hardest-hitting words. "
+            "Music: high-energy. Hook must create instant curiosity or shock."
+        ),
+        "product": (
+            "Product demo — clean, confident, benefit-led. "
+            "Cut dead air >1.0s and any filler. Prefer cuts BETWEEN sentences, not mid-phrase. "
+            "3–4 cuts. 2–3 zooms on the key product claim or feature moment. "
+            "B-roll on every product mention. Music: upbeat or electronic. Hook names the transformation."
+        ),
+        "founder": (
+            "Founder story — authentic, warm, credible. "
+            "Cut dead air >1.5s but preserve natural breathing rhythm — don't over-cut. "
+            "2–3 cuts max. 1–2 zooms on the most emotional or definitive statement. "
+            "Music: acoustic or cinematic. Hook is the core insight or mission statement."
+        ),
+    }.get(video_type, (
+        "Short-form social — balanced pacing. Cut dead air >1.0s and filler words. "
+        "3–4 cuts, 2 zooms on key claims. Music matches the energy."
+    ))
 
     tracking_context = _summarise_tracking_data(tracking_data or {}, duration)
 
-    prompt = f"""You are an expert short-form video editor. Given a transcript and a video type, produce a contextual edit decision list.
+    prompt = f"""You are a senior short-form video editor with 10 years of experience cutting viral TikTok, Instagram Reels, and YouTube Shorts content. You edit with surgical precision — every frame earns its place.
 
 VIDEO TYPE: {video_type}
 VIDEO DURATION: {duration:.1f}s
-EDITING RULES: {rules}
+STYLE GUIDE: {style_guide}
 
-TRANSCRIPT (SRT):
+TRANSCRIPT (SRT — timestamps are original video seconds):
 {srt_text}
-{f"REAP CLIP DETECTION (word-level timing + silences):{tracking_context}" if tracking_context else ""}
-INSTRUCTIONS:
-- cuts: remove ranges of clear silence/dead-space/filler. Each remove_start and remove_end must be within [0, {duration:.1f}]. Every kept segment between cuts must be at least 4 seconds long — do not create short clips.
-- zooms: emphasis punch-ins on key words/claims. "at" must be within [0, {duration:.1f}]. intensity: "subtle" or "strong".
-- Be conservative — cutting real speech is worse than leaving silence.
-- For founder type: max 3 cuts, max 2 zooms.
-- sound_effects: contextual audio punctuation at key moments. "at" in seconds within [0, {duration:.1f}].
-  Types: whoosh (fast cut/transition), impact (strong claim/reveal), pop (list item/name drop), ding (positive outcome/win), swell (emotional peak/section change).
-  Max 5 SFX. Be selective — only add where audio clearly enhances impact. For founder type: max 2 SFX.
-- broll: visual cutaway over the speaker at moments where showing something reinforces the message.
-  "at": when cutaway starts (original video seconds, within [0, {duration:.1f}]).
-  "duration": how long to show it (2.0–4.0 seconds).
-  "description": specific visual to show (e.g. "hands typing on a laptop keyboard", "close-up of a smartphone screen showing social media feed").
-  "concept": 1–3 word Pexels search query (e.g. "typing laptop", "smartphone social media", "money cash").
-  Max 3 b-roll clips. Only add where a visual genuinely helps — skip if the speaker's face/expression is the key content at that moment.
-  Do NOT add b-roll that overlaps a zoom. Space b-roll clips at least 3s apart.
-- music_mood: background music mood. Options: upbeat, chill, cinematic, dramatic, acoustic, electronic. Pick what best fits the video energy and topic.
-- hook_text: A punchy 3–6 word ALL-CAPS hook/title that captures the video's core message or biggest claim. Used as an animated title card in the first 2s. E.g. "HOW I MADE $10K", "STOP DOING THIS WRONG", "THE TRUTH ABOUT AI".
+{f"WORD-LEVEL TIMING DATA:{tracking_context}" if tracking_context else ""}
 
-Return ONLY valid JSON (no markdown):
+YOUR EDITING DECISIONS:
+
+cuts — remove dead air, filler, and repetition:
+- Only cut ranges that are SILENT or contain filler ("um", "uh", "like", "you know", false starts, repeated phrases).
+- remove_start and remove_end must be within [0, {duration:.1f}].
+- Every kept segment between cuts must be ≥4s. Do not create micro-clips.
+- Cuts are already handled for pure silence gaps — focus on filler WORDS and PHRASES the speaker said that add no value.
+
+zooms — punch-in on emotional/impactful words:
+- "at" in original video seconds, within [0, {duration:.1f}].
+- intensity: "subtle" (gentle push) or "strong" (dramatic punch-in). Prefer subtle unless it's a climactic claim.
+- Zoom at the exact moment the impactful word begins, not after.
+
+sound_effects — audio punctuation used SPARINGLY:
+- Types: whoosh (cut transition feel), impact (big reveal/claim), pop (list item), ding (win/result), swell (emotional shift).
+- Max 4 SFX total. Only where silence would feel flat. "at" in original video seconds.
+
+broll — show don't tell. Cut to relevant visuals:
+- "at": original video seconds when cutaway starts.
+- "duration": 2.5–4.0 seconds.
+- "description": ultra-specific visual (e.g. "close-up of hands scrolling a phone showing Instagram feed").
+- "concept": 2–3 word Pexels/stock search (e.g. "phone social media").
+- Max 3 clips. Only where a visual would genuinely reinforce the point — never on the most expressive facial moments.
+- Space clips ≥3s apart. Do NOT overlap a zoom.
+
+music_mood — single word from: upbeat, chill, cinematic, dramatic, acoustic, electronic.
+
+hook_text — the SINGLE most gripping line from this video, or a reframe of it.
+- 3–5 words, ALL CAPS. Must make a viewer stop scrolling.
+- Do NOT use generic phrases like "WATCH THIS" or "YOU NEED THIS".
+- Draw from the actual content: a specific number, a bold claim, a surprising fact.
+
+Return ONLY valid JSON (no markdown, no explanation):
 {{
   "cuts": [
-    {{"remove_start": 4.2, "remove_end": 5.8, "reason": "long pause"}}
+    {{"remove_start": 4.2, "remove_end": 5.8, "reason": "filler: speaker said 'um you know'"}}
   ],
   "zooms": [
-    {{"at": 12.5, "type": "emphasis", "intensity": "subtle", "reason": "key claim"}}
+    {{"at": 12.5, "intensity": "strong", "reason": "climactic claim — highest impact word"}}
   ],
   "sound_effects": [
-    {{"at": 8.2, "type": "impact", "reason": "product reveal"}}
+    {{"at": 8.2, "type": "impact", "reason": "product reveal moment"}}
   ],
   "broll": [
-    {{"at": 6.0, "duration": 3.0, "description": "hands typing on laptop keyboard", "concept": "typing laptop", "reason": "speaker mentions working"}}
+    {{"at": 6.0, "duration": 3.0, "description": "close-up of hands scrolling Instagram feed on iPhone", "concept": "phone social media", "reason": "speaker mentions social media"}}
   ],
-  "pacing_note": "tight and energetic",
+  "pacing_note": "tight and punchy with emotional peak at 35s",
   "music_mood": "upbeat",
-  "hook_text": "THE REAL SECRET HERE"
+  "hook_text": "3 POSTS PER WEEK"
 }}"""
 
     client = openai.AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
@@ -825,6 +858,8 @@ def build_shotstack_timeline(
     srt_dir = "/app/static/srt"
     os.makedirs(srt_dir, exist_ok=True)
 
+    _MAX_CAPTION_WORDS = 5  # max words per caption card for readability
+
     srt_lines: List[str] = []
     entry_num = 1
     for entry in srt_entries:
@@ -834,15 +869,35 @@ def build_shotstack_timeline(
             continue
         tl_start = max(0.0, tl_start)
         tl_end = min(total_duration, tl_end)
-        if tl_end - tl_start < 0.1:
+        entry_dur = tl_end - tl_start
+        if entry_dur < 0.1:
             continue
-        srt_lines += [
-            str(entry_num),
-            f"{_srt_time(tl_start)} --> {_srt_time(tl_end)}",
-            entry["text"],
-            "",
-        ]
-        entry_num += 1
+
+        words = entry["text"].split()
+        if len(words) <= _MAX_CAPTION_WORDS:
+            # Short enough — emit as-is
+            srt_lines += [str(entry_num), f"{_srt_time(tl_start)} --> {_srt_time(tl_end)}", entry["text"], ""]
+            entry_num += 1
+        else:
+            # Split into chunks, distributing time proportionally by word count
+            chunks: List[List[str]] = []
+            for j in range(0, len(words), _MAX_CAPTION_WORDS):
+                chunks.append(words[j:j + _MAX_CAPTION_WORDS])
+            per_word_dur = entry_dur / len(words)
+            chunk_start = tl_start
+            for chunk in chunks:
+                chunk_dur = per_word_dur * len(chunk)
+                chunk_end = min(tl_end, round(chunk_start + chunk_dur, 3))
+                if chunk_end - chunk_start < 0.05:
+                    continue
+                srt_lines += [
+                    str(entry_num),
+                    f"{_srt_time(chunk_start)} --> {_srt_time(chunk_end)}",
+                    " ".join(chunk),
+                    "",
+                ]
+                entry_num += 1
+                chunk_start = chunk_end
 
     srt_filename = f"{job_id or 'job'}.srt"
     with open(f"{srt_dir}/{srt_filename}", "w", encoding="utf-8") as f:
@@ -966,26 +1021,27 @@ def build_shotstack_timeline(
     hook_clips: List[Dict] = []
     if hook_text:
         hook_css = (
-            "body{margin:0;padding:0;background:transparent;}"
-            f"p{{font-family:'Montserrat',sans-serif;font-size:74px;font-weight:900;"
+            "body{margin:0;padding:0;background:transparent;display:flex;"
+            "align-items:center;justify-content:center;}"
+            f"p{{font-family:'Montserrat',sans-serif;font-size:64px;font-weight:900;"
             f"color:#FFFFFF;text-align:center;text-transform:uppercase;"
-            f"letter-spacing:-2px;"
+            f"letter-spacing:-1px;line-height:1.1;word-break:break-word;"
             f"text-shadow:3px 3px 0 {primary_color},-3px -3px 0 {primary_color},"
             f"3px -3px 0 {primary_color},-3px 3px 0 {primary_color};"
-            f"margin:0;padding:12px 24px;}}"
+            f"margin:0;padding:10px 20px;}}"
         )
         hook_clips = [{
             "asset": {
                 "type": "html",
                 "html": f"<p>{hook_text.upper()}</p>",
                 "css": hook_css,
-                "width": 960,
-                "height": 320,
+                "width": 1020,   # close to frame width so long hooks don't clip
+                "height": 380,   # tall enough for 2-line wraps
             },
             "start": 0,
             "length": round(min(2.5, total_duration * 0.25), 3),
             "position": "center",
-            "offset": {"y": 0.12},
+            "offset": {"y": 0.10},
             "transition": {"in": "slideUp", "out": "fade"},
         }]
         print(f"[VideoProduction] hook title card: '{hook_text}'", flush=True)
@@ -995,20 +1051,21 @@ def build_shotstack_timeline(
     if brand_name:
         lt_dur = min(3.5, total_duration * 0.20)
         lt_css = (
-            "body{margin:0;padding:0;background:transparent;}"
-            f"div{{display:inline-block;background:{primary_color};padding:8px 28px;"
-            f"border-radius:4px;}}"
-            f"p{{font-family:'Montserrat',sans-serif;font-size:36px;font-weight:700;"
+            "body{margin:0;padding:0;background:transparent;"
+            "display:flex;align-items:flex-end;justify-content:flex-start;}"
+            f"div{{display:inline-flex;align-items:center;background:{primary_color};"
+            f"padding:10px 32px;border-radius:6px;max-width:80%;}}"
+            f"p{{font-family:'Montserrat',sans-serif;font-size:34px;font-weight:700;"
             f"color:{secondary_color};text-transform:uppercase;letter-spacing:2px;"
-            f"margin:0;}}"
+            f"margin:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}}"
         )
         lower_third_clips = [{
             "asset": {
                 "type": "html",
                 "html": f"<div><p>{brand_name}</p></div>",
                 "css": lt_css,
-                "width": 960,
-                "height": 120,
+                "width": 900,
+                "height": 100,
             },
             "start": 0,
             "length": round(lt_dur, 3),
