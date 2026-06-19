@@ -256,15 +256,17 @@ def _build_cloudinary_cut_url(
         text_upper  = hook_text.upper()
         encoded     = _cld_encode_text(text_upper)
         char_count  = len(text_upper)
-        # At Montserrat 900, uppercase chars average ~0.62em wide.
-        # Keep within ~950px usable width on a 1080px frame.
-        font_size   = min(70, max(48, int(950 / max(char_count * 0.62, 1))))
+        # Montserrat 900 uppercase averages ~0.75em per char (wider than regular weight).
+        # Target 980px usable width; clamp 42–60px so it stays bold and readable.
+        # Cloudinary's w_1020,c_fit is a hard backstop — it scales the whole layer
+        # down proportionally if the rendered text still overflows 1020px.
+        font_size   = min(60, max(42, int(980 / max(char_count * 0.75, 1))))
         primary_hex = primary_color.lstrip("#")
         bg_hex      = (primary_hex + "D9") if len(primary_hex) == 6 else primary_hex  # 85% opacity
         url += (
             f"/b_rgb:{bg_hex},co_rgb:FFFFFF"
             f",l_text:Montserrat@google_{font_size}_900:{encoded}"
-            f"/eo_2.5,fl_layer_apply,g_north,y_0.10"
+            f"/w_1020,c_fit,eo_2.5,fl_layer_apply,g_north,y_0.10"
         )
         print(f"[CloudinaryHook] '{text_upper}' font={font_size}px bg=#{bg_hex}", flush=True)
 
@@ -649,9 +651,9 @@ Return ONLY valid JSON (no markdown, no explanation):
 # ── Algorithmic silence + filler + repetition detection ──────────────────────
 
 _SILENCE_THRESHOLD: Dict[str, float] = {
-    "tiktok":   0.5,   # cut any gap ≥0.5s
-    "product":  0.8,
-    "founder":  1.2,
+    "tiktok":   0.3,   # cut any gap ≥0.3s — tight, no dead air
+    "product":  0.5,
+    "founder":  0.9,
 }
 
 # Matches a whole word that is a filler sound (um, uh, etc.)
