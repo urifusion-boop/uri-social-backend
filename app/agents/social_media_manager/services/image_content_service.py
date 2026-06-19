@@ -551,6 +551,19 @@ class ImageContentService:
             if not seed_content:
                 seed_content = content  # last resort
 
+            # REGENERATION FIX: If content is long (multi-paragraph post from calendar),
+            # extract just the first sentence/question to prevent text-heavy images.
+            # Direct generation already uses short content, so this only affects regeneration.
+            if len(content) > 150:
+                # Extract first sentence or first meaningful line
+                import re as _re_sent
+                sentences = _re_sent.split(r'[.!?]\s+', content)
+                if sentences:
+                    content = sentences[0].strip()
+                    if not content.endswith(('.', '!', '?')):
+                        content += '.'
+                    print(f"📝 Regeneration: Shortened content from {len(draft.get('content', ''))} to {len(content)} chars")
+
             # Load brand profile so logo (and its position) are applied during regeneration
             from app.agents.social_media_manager.services.brand_profile_service import BrandProfileService as _BPS
             _profile_doc = await db["brand_profiles"].find_one({"user_id": user_id})
