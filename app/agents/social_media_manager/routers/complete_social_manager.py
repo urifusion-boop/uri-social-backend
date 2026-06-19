@@ -3739,9 +3739,11 @@ async def get_draft_image(
 async def get_draft(
     draft_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
-    """Get a single draft by ID — scoped to the active brand."""
+    """Get a single draft by ID — scoped to the active brand.
+    **Authentication**: Accepts both JWT (Dashboard/Frontend) and API Key (SDK)
+    """
     user_id = ctx["user_id"]
     scope = _brand_scope(user_id, ctx["brand_id"])
 
