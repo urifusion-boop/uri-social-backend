@@ -1067,43 +1067,40 @@ def build_shotstack_timeline(
         print(f"[Music] added track volume=0.08 length={total_duration:.1f}s fade={fade:.1f}s", flush=True)
 
     # ── Hook title card (rich-text overlay, first 2.5s) ──────────────────────
+    # Shotstack's renderer collapses multi-element stacking (both <br> and separate
+    # <p> elements render at the same y). Single element only — scale font to fit.
     hook_clips: List[Dict] = []
     if hook_text:
-        # Shotstack's renderer ignores <br> inside <p>. Use two separate <p> block
-        # elements so lines are guaranteed to stack vertically.
-        _hw = hook_text.upper().split()
-        _mid = max(1, len(_hw) // 2)
-        _line1 = " ".join(_hw[:_mid])
-        _line2 = " ".join(_hw[_mid:])
+        _hook_upper = hook_text.upper()
+        # Scale font so text stays within ~1000px at ~0.60 width-per-em for Montserrat Black.
+        # Clamp 40–62px so it's always readable.
+        _font = min(62, max(40, int(1000 / max(len(_hook_upper) * 0.60, 1))))
         _shadow = (
             f"3px 3px 0 {primary_color},-3px -3px 0 {primary_color},"
             f"3px -3px 0 {primary_color},-3px 3px 0 {primary_color}"
         )
         hook_css = (
             "body{margin:0;padding:0;background:transparent;}"
-            f"p{{font-family:'Montserrat',sans-serif;font-size:60px;font-weight:900;"
+            f"p{{font-family:'Montserrat',sans-serif;font-size:{_font}px;font-weight:900;"
             f"color:#FFFFFF;text-align:center;text-transform:uppercase;"
-            f"letter-spacing:-1px;line-height:1.0;display:block;"
-            f"text-shadow:{_shadow};margin:0;padding:6px 20px;}}"
-        )
-        hook_html = (
-            f"<p>{_line1}</p><p>{_line2}</p>" if _line2 else f"<p>{_line1}</p>"
+            f"letter-spacing:-2px;white-space:nowrap;"
+            f"text-shadow:{_shadow};margin:0;padding:8px 20px;}}"
         )
         hook_clips = [{
             "asset": {
                 "type": "html",
-                "html": hook_html,
+                "html": f"<p>{_hook_upper}</p>",
                 "css": hook_css,
-                "width": 960,
-                "height": 460,  # 2 lines × ~(60px font + 12px padding) × 1.0 line-height
+                "width": 1060,
+                "height": 180,
             },
             "start": 0,
             "length": round(min(2.5, total_duration * 0.25), 3),
             "position": "center",
-            "offset": {"y": 0.08},
+            "offset": {"y": 0.10},
             "transition": {"in": "slideUp", "out": "fade"},
         }]
-        print(f"[VideoProduction] hook: '{_line1} / {_line2}'", flush=True)
+        print(f"[VideoProduction] hook '{_hook_upper}' font={_font}px", flush=True)
 
     # ── Lower-third brand name (slides up at start, shown for 3.5s) ──────────
     lower_third_clips: List[Dict] = []
