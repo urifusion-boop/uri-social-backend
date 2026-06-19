@@ -661,7 +661,12 @@ def build_shotstack_timeline(
     hook_text: str = "",
     cloudinary_cut_url: str = "",   # pre-cut + transitioned video from Cloudinary
     transition_dur: float = 0.0,    # overlap per cut used by Cloudinary (for SRT timing)
-    logo_url: str = "",             # brand logo image; slides in over the last 3s
+    logo_url: str = "",             # brand logo; slides in over the last 3s
+    brand_name: str = "",           # brand name for lower-third and outro
+    primary_color: str = "#FFD700", # caption active-word background + hook accent
+    secondary_color: str = "#000000",
+    tagline: str = "",              # tagline shown on outro card
+    website: str = "",              # website shown on outro card
 ) -> Dict[str, Any]:
     # broll items have: at (original ts), duration, url (resolved)
     keep_segments = _build_keep_segments(cuts, video_duration)
@@ -784,9 +789,9 @@ def build_shotstack_timeline(
                 "opacity": 1,
             },
             "animation": {"style": "karaoke"},
-            # Active word: black text on yellow background box (Instagram Reels/TikTok style)
+            # Active word: contrasting text on brand primary color background
             "active": {
-                "font": {"color": "#000000", "background": "#FFD700"},
+                "font": {"color": secondary_color, "background": primary_color},
                 "stroke": {"width": 0, "color": "#000000", "opacity": 0},
             },
             "style": {"textTransform": "uppercase"},
@@ -883,11 +888,12 @@ def build_shotstack_timeline(
     if hook_text:
         hook_css = (
             "body{margin:0;padding:0;background:transparent;}"
-            "p{font-family:'Montserrat',sans-serif;font-size:74px;font-weight:900;"
-            "color:#FFFFFF;text-align:center;text-transform:uppercase;"
-            "letter-spacing:-2px;"
-            "text-shadow:3px 3px 0 #000,-3px -3px 0 #000,3px -3px 0 #000,-3px 3px 0 #000;"
-            "margin:0;padding:12px 24px;}"
+            f"p{{font-family:'Montserrat',sans-serif;font-size:74px;font-weight:900;"
+            f"color:#FFFFFF;text-align:center;text-transform:uppercase;"
+            f"letter-spacing:-2px;"
+            f"text-shadow:3px 3px 0 {primary_color},-3px -3px 0 {primary_color},"
+            f"3px -3px 0 {primary_color},-3px 3px 0 {primary_color};"
+            f"margin:0;padding:12px 24px;}}"
         )
         hook_clips = [{
             "asset": {
@@ -905,28 +911,111 @@ def build_shotstack_timeline(
         }]
         print(f"[VideoProduction] hook title card: '{hook_text}'", flush=True)
 
+    # ── Lower-third brand name (slides up at start, shown for 3.5s) ──────────
+    lower_third_clips: List[Dict] = []
+    if brand_name:
+        lt_dur = min(3.5, total_duration * 0.20)
+        lt_css = (
+            "body{margin:0;padding:0;background:transparent;}"
+            f"div{{display:inline-block;background:{primary_color};padding:8px 28px;"
+            f"border-radius:4px;}}"
+            f"p{{font-family:'Montserrat',sans-serif;font-size:36px;font-weight:700;"
+            f"color:{secondary_color};text-transform:uppercase;letter-spacing:2px;"
+            f"margin:0;}}"
+        )
+        lower_third_clips = [{
+            "asset": {
+                "type": "html",
+                "html": f"<div><p>{brand_name}</p></div>",
+                "css": lt_css,
+                "width": 960,
+                "height": 120,
+            },
+            "start": 0,
+            "length": round(lt_dur, 3),
+            "position": "bottomLeft",
+            "offset": {"x": 0.02, "y": 0.18},
+            "transition": {"in": "slideUp", "out": "fade"},
+        }]
+        print(f"[VideoProduction] lower-third: '{brand_name}' dur={lt_dur:.1f}s", flush=True)
+
+    # ── Outro card (last 3s — brand color bg + logo + tagline + website) ─────
+    outro_clips: List[Dict] = []
+    if total_duration > 5.0 and (brand_name or logo_url or tagline or website):
+        outro_dur = min(3.0, total_duration * 0.15)
+        outro_start = round(max(0.0, total_duration - outro_dur), 3)
+        tagline_line = f"<p class='tag'>{tagline}</p>" if tagline else ""
+        website_line = f"<p class='web'>{website}</p>" if website else ""
+        name_line    = f"<p class='name'>{brand_name}</p>" if brand_name else ""
+        outro_css = (
+            f"body{{margin:0;padding:0;background:{primary_color};}}"
+            f"div{{display:flex;flex-direction:column;align-items:center;"
+            f"justify-content:center;width:100%;height:100%;padding:40px 60px;box-sizing:border-box;}}"
+            f".name{{font-family:'Montserrat',sans-serif;font-size:56px;font-weight:900;"
+            f"color:{secondary_color};text-transform:uppercase;letter-spacing:-1px;margin:0 0 12px;}}"
+            f".tag{{font-family:'Montserrat',sans-serif;font-size:32px;font-weight:400;"
+            f"color:{secondary_color};opacity:0.85;margin:0 0 8px;text-align:center;}}"
+            f".web{{font-family:'Montserrat',sans-serif;font-size:26px;font-weight:600;"
+            f"color:{secondary_color};opacity:0.7;margin:0;}}"
+        )
+        outro_html_clip: Dict = {
+            "asset": {
+                "type": "html",
+                "html": f"<div>{name_line}{tagline_line}{website_line}</div>",
+                "css": outro_css,
+                "width": 1080,
+                "height": 1920,
+            },
+            "start": outro_start,
+            "length": round(outro_dur, 3),
+            "position": "center",
+            "transition": {"in": "fade", "out": "fade"},
+        }
+        outro_clips.append(outro_html_clip)
+        if logo_url:
+            outro_clips.append({
+                "asset": {"type": "image", "src": logo_url},
+                "start": outro_start,
+                "length": round(outro_dur, 3),
+                "fit": "contain",
+                "scale": 0.30,
+                "position": "center",
+                "offset": {"y": 0.25},
+                "transition": {"in": "slideDown", "out": "fade"},
+            })
+        print(
+            f"[VideoProduction] outro card: start={outro_start}s dur={outro_dur}s "
+            f"brand='{brand_name}'",
+            flush=True,
+        )
+
     # ── Brand logo overlay — slides in from bottom-left for the last 3s ─────────
     logo_clips: List[Dict] = []
-    if logo_url:
-        logo_dur = min(3.0, total_duration * 0.15)   # last 15% of video, max 3s
+    if logo_url and not outro_clips:
+        # Show logo overlay only when there's no full outro card
+        logo_dur = min(3.0, total_duration * 0.15)
         logo_start = round(max(0.0, total_duration - logo_dur), 3)
         logo_clips = [{
             "asset": {"type": "image", "src": logo_url},
             "start": logo_start,
             "length": round(logo_dur, 3),
             "fit": "contain",
-            "scale": 0.25,          # 25% of frame width
+            "scale": 0.25,
             "position": "bottomLeft",
-            "offset": {"x": 0.03, "y": 0.05},  # small padding from corner
+            "offset": {"x": 0.03, "y": 0.05},
             "transition": {"in": "slideRight", "out": "fade"},
         }]
         print(f"[VideoProduction] logo overlay: start={logo_start}s dur={logo_dur}s", flush=True)
 
     # Track order (index 0 = top layer):
-    # 0: hook title, 1: logo, 2: captions, 3: b-roll overlays, 4: main video, 5: sfx audio, 6: bg music
+    # 0: hook, 1: outro, 2: lower-third, 3: logo, 4: captions, 5: b-roll, 6: main video, 7: sfx, 8: music
     tracks: List[Dict] = []
     if hook_clips:
         tracks.append({"clips": hook_clips})
+    if outro_clips:
+        tracks.append({"clips": outro_clips})
+    if lower_third_clips:
+        tracks.append({"clips": lower_third_clips})
     if logo_clips:
         tracks.append({"clips": logo_clips})
     tracks.append({"clips": caption_clips})
@@ -995,15 +1084,32 @@ async def run_production_job(
         duration = _probe_duration(video_bytes)
         print(f"[VideoProduction] duration={duration:.1f}s", flush=True)
 
-        # ── Load brand profile for logo overlay ───────────────────────────────────
+        # ── Load brand profile for branding overlays ──────────────────────────────
         job_doc = await db.video_production_jobs.find_one({"job_id": job_id}, {"user_id": 1})
         user_id = (job_doc or {}).get("user_id", "")
-        logo_url = ""
+        logo_url    = ""
+        brand_name  = ""
+        brand_colors: List[str] = []
+        tagline     = ""
+        website     = ""
         if user_id:
-            bp = await db.brand_profiles.find_one({"user_id": user_id}, {"logo_url": 1})
-            logo_url = ((bp or {}).get("logo_url") or "").strip()
-            if logo_url:
-                print(f"[VideoProduction] brand logo found for user={user_id}", flush=True)
+            bp = await db.brand_profiles.find_one({"user_id": user_id}, {
+                "logo_url": 1, "brand_name": 1, "brand_colors": 1,
+                "tagline": 1, "website": 1,
+            })
+            if bp:
+                logo_url    = (bp.get("logo_url") or "").strip()
+                brand_name  = (bp.get("brand_name") or "").strip()
+                brand_colors = [c.strip() for c in (bp.get("brand_colors") or []) if c]
+                tagline     = (bp.get("tagline") or "").strip()
+                website     = (bp.get("website") or "").strip()
+        primary_color   = brand_colors[0] if brand_colors else "#FFD700"
+        secondary_color = brand_colors[1] if len(brand_colors) > 1 else "#000000"
+        print(
+            f"[VideoProduction] brand={brand_name or 'none'} "
+            f"colors={brand_colors[:2]} logo={bool(logo_url)}",
+            flush=True,
+        )
 
         # ── Stage 1: Reap — word-level transcript + timestamps + clip detection ──
         await update(5, "Transcribing…")
@@ -1139,6 +1245,11 @@ async def run_production_job(
             cloudinary_cut_url=cloudinary_cut_url,
             transition_dur=transition_dur if cloudinary_cut_url else 0.0,
             logo_url=logo_url,
+            brand_name=brand_name,
+            primary_color=primary_color,
+            secondary_color=secondary_color,
+            tagline=tagline,
+            website=website,
         )
 
         await update(68, "Rendering video…")
