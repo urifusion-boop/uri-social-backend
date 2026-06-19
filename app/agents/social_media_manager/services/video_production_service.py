@@ -661,6 +661,7 @@ def build_shotstack_timeline(
     hook_text: str = "",
     cloudinary_cut_url: str = "",   # pre-cut + transitioned video from Cloudinary
     transition_dur: float = 0.0,    # overlap per cut used by Cloudinary (for SRT timing)
+    logo_url: str = "",             # brand logo image; slides in over the last 3s
 ) -> Dict[str, Any]:
     # broll items have: at (original ts), duration, url (resolved)
     keep_segments = _build_keep_segments(cuts, video_duration)
@@ -904,11 +905,30 @@ def build_shotstack_timeline(
         }]
         print(f"[VideoProduction] hook title card: '{hook_text}'", flush=True)
 
+    # ── Brand logo overlay — slides in from bottom-left for the last 3s ─────────
+    logo_clips: List[Dict] = []
+    if logo_url:
+        logo_dur = min(3.0, total_duration * 0.15)   # last 15% of video, max 3s
+        logo_start = round(max(0.0, total_duration - logo_dur), 3)
+        logo_clips = [{
+            "asset": {"type": "image", "src": logo_url},
+            "start": logo_start,
+            "length": round(logo_dur, 3),
+            "fit": "contain",
+            "scale": 0.25,          # 25% of frame width
+            "position": "bottomLeft",
+            "offset": {"x": 0.03, "y": 0.05},  # small padding from corner
+            "transition": {"in": "slideRight", "out": "fade"},
+        }]
+        print(f"[VideoProduction] logo overlay: start={logo_start}s dur={logo_dur}s", flush=True)
+
     # Track order (index 0 = top layer):
-    # 0: hook title, 1: captions, 2: b-roll overlays, 3: main video, 4: sfx audio, 5: bg music
+    # 0: hook title, 1: logo, 2: captions, 3: b-roll overlays, 4: main video, 5: sfx audio, 6: bg music
     tracks: List[Dict] = []
     if hook_clips:
         tracks.append({"clips": hook_clips})
+    if logo_clips:
+        tracks.append({"clips": logo_clips})
     tracks.append({"clips": caption_clips})
     if broll_clips:
         tracks.append({"clips": broll_clips})
@@ -974,6 +994,16 @@ async def run_production_job(
     try:
         duration = _probe_duration(video_bytes)
         print(f"[VideoProduction] duration={duration:.1f}s", flush=True)
+
+        # ── Load brand profile for logo overlay ───────────────────────────────────
+        job_doc = await db.video_production_jobs.find_one({"job_id": job_id}, {"user_id": 1})
+        user_id = (job_doc or {}).get("user_id", "")
+        logo_url = ""
+        if user_id:
+            bp = await db.brand_profiles.find_one({"user_id": user_id}, {"logo_url": 1})
+            logo_url = ((bp or {}).get("logo_url") or "").strip()
+            if logo_url:
+                print(f"[VideoProduction] brand logo found for user={user_id}", flush=True)
 
         # ── Stage 1: Reap — word-level transcript + timestamps + clip detection ──
         await update(5, "Transcribing…")
@@ -1108,6 +1138,7 @@ async def run_production_job(
             hook_text=hook_text,
             cloudinary_cut_url=cloudinary_cut_url,
             transition_dur=transition_dur if cloudinary_cut_url else 0.0,
+            logo_url=logo_url,
         )
 
         await update(68, "Rendering video…")
