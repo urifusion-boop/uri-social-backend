@@ -27,6 +27,7 @@ from app.routers.workspace_router import router as workspace_router
 from app.routers.workspace_member_router import router as workspace_member_router
 from app.agents.social_media_manager.routers.blog_router import router as blog_router
 from app.routers.agency_router import router as agency_router
+from app.agents.social_media_manager.routers.sdk_router import router as sdk_router
 
 # Initialize Sentry
 initialize_sentry()
@@ -205,6 +206,9 @@ app.include_router(canvas_editor_router, prefix="/social-media", tags=["Canvas E
 
 # Include Agency Accounts (agency layer wrapping Jane)
 app.include_router(agency_router, prefix="/social-media", tags=["Agency"])
+
+# Include SDK router (API key authentication for external developers)
+app.include_router(sdk_router, tags=["SDK"])
 
 # Include multi-tenant routers (Enterprise/SDK features)
 app.include_router(client_router)

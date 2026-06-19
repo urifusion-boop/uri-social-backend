@@ -12,7 +12,7 @@ from typing import List, Optional, Dict, Any, AsyncGenerator
 from datetime import datetime
 from bson import ObjectId
 
-from app.dependencies import get_db_dependency, get_active_brand_context
+from app.dependencies import get_db_dependency, get_active_brand_context, get_flexible_brand_context
 from app.core.auth_bearer import JWTBearer
 from app.core.config import settings
 from app.domain.responses.uri_response import UriResponse
@@ -308,10 +308,12 @@ async def generate_content(
     request: ContentGenerationRequest,
     background_tasks: BackgroundTasks,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """
     Generate AI-powered social media content with optional images.
+
+    **Authentication**: Accepts both JWT (Dashboard/Frontend) and API Key (SDK)
 
     Text content is always returned immediately.
     When include_images=True, images are generated in the background and
