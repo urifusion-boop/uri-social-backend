@@ -181,6 +181,7 @@ class BrandProfileService:
                 "derived_voice", "personality_quiz", "audience_age_range",
                 "audience_interests", "content_tones", "cta_styles", "default_link",
                 "tagline", "region", "font_preference", "logo_url", "logo_position",
+                "onboarding_completed",
             ]
             if profile is None and personal_profile:
                 # No agency profile at all — use personal profile as base
