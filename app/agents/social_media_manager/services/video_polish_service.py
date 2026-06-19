@@ -447,12 +447,19 @@ class ReapProvider(AbstractClippingProvider):
                         try:
                             async with session.get(
                                 tracking_url,
-                                timeout=aiohttp.ClientTimeout(total=15),
+                                timeout=aiohttp.ClientTimeout(total=30),
                             ) as r:
-                                if r.ok:
-                                    tracking_data = await r.json(content_type=None)
+                                body = await r.text()
+                                print(
+                                    f"[Reap] trackingData status={r.status} len={len(body)} "
+                                    f"url_prefix={tracking_url[:60]}",
+                                    flush=True,
+                                )
+                                if r.ok and body.strip():
+                                    import json as _json
+                                    tracking_data = _json.loads(body)
                                     print(
-                                        f"[Reap] trackingData fetched ({len(str(tracking_data))} chars)",
+                                        f"[Reap] trackingData keys={list(tracking_data.keys())[:8]}",
                                         flush=True,
                                     )
                         except Exception as e:

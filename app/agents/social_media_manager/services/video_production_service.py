@@ -641,7 +641,6 @@ Return ONLY valid JSON (no markdown, no explanation):
     response = await client.chat.completions.create(
         model="gpt-5",
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.2,
         response_format={"type": "json_object"},
     )
     text = response.choices[0].message.content or "{}"
