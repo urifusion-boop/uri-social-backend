@@ -128,9 +128,8 @@ SFX_LIBRARY: Dict[str, str] = {
 
 async def _upload_to_cloudinary(video_bytes: bytes, public_id: str) -> Optional[str]:
     """
-    Upload video bytes to Cloudinary and return the secure CDN URL.
-    Uses the signed upload API — no SDK required.
-    Returns None if credentials are missing or upload fails.
+    Upload video bytes to Cloudinary (direct byte upload).
+    Only suitable for files under ~95MB. For larger files use _cloudinary_fetch_url.
     """
     cloud = settings.CLOUDINARY_CLOUD_NAME
     api_key = settings.CLOUDINARY_API_KEY
@@ -138,9 +137,12 @@ async def _upload_to_cloudinary(video_bytes: bytes, public_id: str) -> Optional[
     if not all([cloud, api_key, api_secret]):
         return None
 
+    if len(video_bytes) > 95 * 1024 * 1024:
+        print(f"[Cloudinary] file {len(video_bytes)//1024//1024}MB > 95MB limit — skipping direct upload", flush=True)
+        return None
+
     folder = "uri-video-production"
     ts = int(time.time())
-    # Signature = SHA-1 of sorted param string + api_secret (Cloudinary spec)
     params_str = f"folder={folder}&public_id={public_id}&timestamp={ts}"
     signature = hashlib.sha1(f"{params_str}{api_secret}".encode()).hexdigest()
 
@@ -158,9 +160,13 @@ async def _upload_to_cloudinary(video_bytes: bytes, public_id: str) -> Optional[
             async with session.post(
                 f"https://api.cloudinary.com/v1_1/{cloud}/video/upload",
                 data=form,
-                timeout=aiohttp.ClientTimeout(total=120),
+                timeout=aiohttp.ClientTimeout(total=180),
             ) as resp:
-                body = await resp.json(content_type=None)
+                text = await resp.text()
+                if not text.strip():
+                    print(f"[Cloudinary] empty response status={resp.status}", flush=True)
+                    return None
+                body = json.loads(text)
                 if not resp.ok:
                     print(f"[Cloudinary] upload failed {resp.status}: {body}", flush=True)
                     return None
@@ -169,6 +175,54 @@ async def _upload_to_cloudinary(video_bytes: bytes, public_id: str) -> Optional[
                 return url
     except Exception as e:
         print(f"[Cloudinary] error: {e}", flush=True)
+        return None
+
+
+async def _cloudinary_fetch_url(source_url: str, public_id: str) -> Optional[str]:
+    """
+    Tell Cloudinary to fetch a video from source_url — avoids file size limits entirely.
+    Cloudinary downloads from the URL server-side; we never transfer bytes.
+    """
+    cloud = settings.CLOUDINARY_CLOUD_NAME
+    api_key = settings.CLOUDINARY_API_KEY
+    api_secret = settings.CLOUDINARY_API_SECRET
+    if not all([cloud, api_key, api_secret]):
+        return None
+
+    folder = "uri-video-production"
+    ts = int(time.time())
+    params_str = f"folder={folder}&public_id={public_id}&timestamp={ts}"
+    signature = hashlib.sha1(f"{params_str}{api_secret}".encode()).hexdigest()
+
+    form = aiohttp.FormData()
+    form.add_field("file", source_url)   # URL string — Cloudinary fetches it
+    form.add_field("api_key", api_key)
+    form.add_field("timestamp", str(ts))
+    form.add_field("signature", signature)
+    form.add_field("public_id", public_id)
+    form.add_field("folder", folder)
+    form.add_field("resource_type", "video")
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"https://api.cloudinary.com/v1_1/{cloud}/video/upload",
+                data=form,
+                timeout=aiohttp.ClientTimeout(total=300),
+            ) as resp:
+                text = await resp.text()
+                if not text.strip():
+                    print(f"[Cloudinary] fetch-url empty response status={resp.status}", flush=True)
+                    return None
+                body = json.loads(text)
+                if not resp.ok:
+                    print(f"[Cloudinary] fetch-url failed {resp.status}: {body}", flush=True)
+                    return None
+                url = body.get("secure_url", "")
+                print(f"[Cloudinary] fetch-url → {url}", flush=True)
+                return url
+    except Exception as e:
+        print(f"[Cloudinary] fetch-url error: {e}", flush=True)
         return None
 
 
@@ -1493,24 +1547,28 @@ async def run_production_job(
         await update(30, "Cleaning audio…")
         cleaned_bytes = await _clean_audio(video_bytes)
 
-        # Host the cleaned video on Cloudinary so Shotstack can fetch it via CDN URL.
-        # Priority: Cloudinary → static server → Reap raw URL (fallback).
+        # Step 1: always write to static server (reliable, no size limit).
+        # Step 2: tell Cloudinary to fetch from that URL — avoids direct byte upload
+        #         and Cloudinary's 100MB per-request limit entirely.
         await update(38, "Uploading clean video…")
-        clean_video_url = await _upload_to_cloudinary(cleaned_bytes, job_id)
+        video_static_dir = "/app/static/videos"
+        os.makedirs(video_static_dir, exist_ok=True)
+        static_url = ""
+        try:
+            with open(f"{video_static_dir}/{job_id}.mp4", "wb") as vf:
+                vf.write(cleaned_bytes)
+            static_url = f"https://api-staging.urisocial.com/static/videos/{job_id}.mp4"
+            print(f"[VideoProduction] static: {len(cleaned_bytes)//1024}KB → {static_url}", flush=True)
+        except Exception as e:
+            print(f"[VideoProduction] static write failed: {e}", flush=True)
 
+        # Now try to register on Cloudinary via URL fetch (no byte transfer).
+        clean_video_url = None
+        if static_url:
+            clean_video_url = await _cloudinary_fetch_url(static_url, job_id)
+        # Fallback chain: Cloudinary → static → Reap source
         if not clean_video_url:
-            # Cloudinary not configured or failed — write to static server
-            print("[VideoProduction] Cloudinary unavailable, writing to static server", flush=True)
-            video_static_dir = "/app/static/videos"
-            os.makedirs(video_static_dir, exist_ok=True)
-            try:
-                with open(f"{video_static_dir}/{job_id}.mp4", "wb") as vf:
-                    vf.write(cleaned_bytes)
-                clean_video_url = f"https://api-staging.urisocial.com/static/videos/{job_id}.mp4"
-                print(f"[VideoProduction] static fallback: {len(cleaned_bytes)//1024}KB → {clean_video_url}", flush=True)
-            except Exception as e:
-                print(f"[VideoProduction] static write failed ({e}), using Reap URL", flush=True)
-                clean_video_url = _reap_video_url
+            clean_video_url = static_url or _reap_video_url
 
         if not clean_video_url:
             raise RuntimeError("Could not obtain a video URL for rendering")

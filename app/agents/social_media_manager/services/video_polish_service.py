@@ -434,7 +434,8 @@ class ReapProvider(AbstractClippingProvider):
                         or urls.get("original")
                         or ""
                     )
-                    tracking_url = urls.get("trackingData", "")
+                    tracking_url = urls.get("trackingData") or ""
+                    print(f"[Reap] trackingData raw value={repr(tracking_url[:80] if tracking_url else tracking_url)}", flush=True)
 
                     srt_text = ""
                     tracking_data: dict = {}
