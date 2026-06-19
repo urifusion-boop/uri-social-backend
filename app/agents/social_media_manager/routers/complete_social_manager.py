@@ -359,10 +359,28 @@ async def generate_content(
         profile_data = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
 
         if not profile_data:
-            return UriResponse.error_response(
-                f"No brand profile found for user {user_id}. Please complete onboarding first.",
-                code=400
-            )
+            # For API key users, auto-create minimal profile instead of blocking
+            if ctx.get("auth_type") == "api_key":
+                minimal_profile = {
+                    "user_id": user_id,
+                    "brand_id": active_brand_id,
+                    "brand_name": f"API User {user_id[:8]}",
+                    "industry": "general_other",
+                    "brand_colors": ["#C2185B", "#FFFEF2"],
+                    "style_selections": ["lifestyle_natural"],
+                    "region": "Global",
+                    "onboarding_completed": True,
+                    "created_via": "api_key_auto",
+                }
+                await BrandProfileService.save(minimal_profile, db)
+                print(f"✅ Auto-created minimal profile for API key user {user_id}")
+                profile_data = minimal_profile
+            else:
+                # JWT users must complete onboarding
+                return UriResponse.error_response(
+                    f"No brand profile found for user {user_id}. Please complete onboarding first.",
+                    code=400
+                )
 
         # Check for critical missing fields
         # Empty strings should be treated as missing
@@ -388,7 +406,8 @@ async def generate_content(
         # PROGRESSIVE ENFORCEMENT: Warn but allow generation with intelligent fallbacks
         if missing_fields:
             # Check if user acknowledged incomplete profile
-            acknowledged = getattr(request, 'acknowledged_incomplete_profile', False)
+            # API key users auto-acknowledged (they use SDK, not frontend modal)
+            acknowledged = getattr(request, 'acknowledged_incomplete_profile', False) or ctx.get("auth_type") == "api_key"
 
             if not acknowledged:
                 # Return warning response for frontend modal
