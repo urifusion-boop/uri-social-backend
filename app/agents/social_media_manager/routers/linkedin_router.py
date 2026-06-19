@@ -26,31 +26,31 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 from pydantic import BaseModel
 
 from app.agents.social_media_manager.services.linkedin_direct_service import LinkedInDirectService
-from app.core.auth_bearer import JWTBearer
 from app.core.config import settings
-from app.dependencies import get_db_dependency
+from app.dependencies import get_db_dependency, get_active_brand_context
 
 router = APIRouter(prefix="/linkedin", tags=["LinkedIn"])
 
 
-def _extract_user_id(token: dict) -> str:
-    claims = token.get("claims", {}) if isinstance(token, dict) else {}
-    uid = (
-        token.get("userId")
-        or token.get("user_id")
-        or claims.get("userId")
-        or claims.get("user_id")
-    )
-    if not uid:
-        raise HTTPException(status_code=401, detail="Could not resolve user ID from token.")
-    return str(uid)
-
-
-async def _get_linkedin_connection(user_id: str, db: AsyncIOMotorDatabase) -> Optional[dict]:
-    """Return the user's active LinkedIn connection doc, or None."""
-    return await db["social_connections"].find_one(
-        {"user_id": user_id, "platform": "linkedin", "connection_status": "active"}
-    )
+async def _get_linkedin_connection(user_id: str, db: AsyncIOMotorDatabase, brand_id: Optional[str] = None) -> Optional[dict]:
+    """Return the active LinkedIn connection doc for the given brand, or None."""
+    from app.models.brand_account import BrandAccount
+    personal_bid = BrandAccount.personal_brand_id(user_id)
+    is_personal = (not brand_id) or brand_id == personal_bid
+    if is_personal:
+        query = {
+            "user_id": user_id,
+            "platform": "linkedin",
+            "connection_status": "active",
+            "$or": [
+                {"brand_id": {"$exists": False}},
+                {"brand_id": None},
+                {"brand_id": personal_bid},
+            ],
+        }
+    else:
+        query = {"brand_id": brand_id, "platform": "linkedin", "connection_status": "active"}
+    return await db["social_connections"].find_one(query)
 
 
 def _linkedin_service() -> LinkedInDirectService:
@@ -64,7 +64,7 @@ def _linkedin_service() -> LinkedInDirectService:
 
 @router.post("/connect")
 async def connect_linkedin(
-    token: dict = Depends(JWTBearer()),
+    ctx: dict = Depends(get_active_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """
@@ -75,17 +75,18 @@ async def connect_linkedin(
     if not settings.LINKEDIN_OAUTH_CALLBACK_URL:
         raise HTTPException(status_code=503, detail="LINKEDIN_OAUTH_CALLBACK_URL not configured.")
 
-    user_id = _extract_user_id(token)
+    user_id = ctx["user_id"]
+    brand_id = ctx["brand_id"]
     svc = _linkedin_service()
     state = secrets.token_urlsafe(16)
 
-    # Store pending state with user_id (10-minute TTL)
     await db["linkedin_oauth_pending"].update_one(
         {"state": state},
         {
             "$set": {
                 "state": state,
                 "user_id": user_id,
+                "brand_id": brand_id,
                 "expires_at": datetime.utcnow() + timedelta(minutes=10),
             }
         },
@@ -114,7 +115,7 @@ async def linkedin_oauth_callback(
     """
     LinkedIn redirects the user's browser here after they authorise (or deny) the app.
     No JWT — the user is identified by the state token stored during /connect.
-    Stores per-user access token then redirects to the frontend.
+    Stores per-brand access token then redirects to the frontend.
     """
     web_app_url = settings.WEB_APP_URL.strip("'\"")
 
@@ -135,6 +136,7 @@ async def linkedin_oauth_callback(
         )
 
     user_id = pending["user_id"]
+    brand_id = pending.get("brand_id")
 
     try:
         svc = _linkedin_service()
@@ -150,38 +152,54 @@ async def linkedin_oauth_callback(
     finally:
         await db["linkedin_oauth_pending"].delete_one({"state": state})
 
-    sub = profile.get("sub", "")  # OpenID Connect person ID
+    from app.models.brand_account import BrandAccount
+    is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
+
+    sub = profile.get("sub", "")
     person_urn = f"urn:li:person:{sub}"
     name = profile.get("name", "")
     email = profile.get("email", "")
 
     now = datetime.utcnow()
-    expires_in_seconds = token_data.get("expires_in", 5184000)  # default 60 days
+    expires_in_seconds = token_data.get("expires_in", 5184000)
     token_expires_at = now + timedelta(seconds=int(expires_in_seconds))
-    await db["social_connections"].update_one(
-        {"user_id": user_id, "platform": "linkedin"},
-        {
-            "$set": {
-                "id": f"linkedin_{user_id}",
-                "user_id": user_id,
-                "platform": "linkedin",
-                "username": email or name,
-                "account_name": name,
-                "network_unique_id": sub,
-                "person_urn": person_urn,
-                "active_author_urn": person_urn,  # default to personal profile
-                "pages": pages,  # list of admin company pages
-                "connection_status": "active",
-                "connected_via": "linkedin_direct",
-                "linkedin_access_token": access_token,
-                "token_expires_at": token_expires_at,
-                "connected_at": now,
-                "created_at": now,
-                "updated_at": now,
-            }
-        },
-        upsert=True,
-    )
+
+    doc_id = f"linkedin_{user_id}" if is_personal else f"linkedin_{brand_id}"
+
+    set_fields = {
+        "id": doc_id,
+        "user_id": user_id,
+        "platform": "linkedin",
+        "username": email or name,
+        "account_name": name,
+        "network_unique_id": sub,
+        "person_urn": person_urn,
+        "active_author_urn": person_urn,
+        "pages": pages,
+        "connection_status": "active",
+        "connected_via": "linkedin_direct",
+        "linkedin_access_token": access_token,
+        "token_expires_at": token_expires_at,
+        "connected_at": now,
+        "created_at": now,
+        "updated_at": now,
+    }
+    if not is_personal:
+        set_fields["brand_id"] = brand_id
+
+    try:
+        await db["social_connections"].update_one(
+            {"id": doc_id},
+            {"$set": set_fields},
+            upsert=True,
+        )
+    except Exception as db_err:
+        import traceback as _tb
+        print(f"[linkedin/callback] DB upsert error: {db_err}\n{_tb.format_exc()}")
+        return RedirectResponse(
+            f"{web_app_url}/settings/social-accounts"
+            f"?connected=false&platform=linkedin&error={urllib.parse.quote(str(db_err))}"
+        )
 
     return RedirectResponse(
         f"{web_app_url}/settings/social-accounts"
@@ -194,13 +212,11 @@ async def linkedin_oauth_callback(
 
 @router.delete("/connect")
 async def disconnect_linkedin(
-    token: dict = Depends(JWTBearer()),
+    ctx: dict = Depends(get_active_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
-    """Disconnect the authenticated user's LinkedIn account."""
-    user_id = _extract_user_id(token)
-
-    conn = await _get_linkedin_connection(user_id, db)
+    """Disconnect the authenticated user's LinkedIn account for the active brand."""
+    conn = await _get_linkedin_connection(ctx["user_id"], db, ctx["brand_id"])
     if not conn:
         raise HTTPException(status_code=400, detail="No LinkedIn account connected.")
 
@@ -218,20 +234,22 @@ async def disconnect_linkedin(
 
 @router.get("/status")
 async def linkedin_status(
-    token: dict = Depends(JWTBearer()),
+    ctx: dict = Depends(get_active_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
-    """Returns whether the authenticated user has an active LinkedIn account connected."""
-    user_id = _extract_user_id(token)
-    conn = await _get_linkedin_connection(user_id, db)
+    """Returns whether the active brand has an active LinkedIn account connected."""
+    user_id = ctx["user_id"]
+    brand_id = ctx["brand_id"]
+    conn = await _get_linkedin_connection(user_id, db, brand_id)
 
-    # Also check Outstand connection (supports company pages)
-    outstand_conn = await db["social_connections"].find_one(
-        {"user_id": user_id, "platform": "linkedin", "connected_via": "outstand", "connection_status": "active"}
-    )
+    from app.models.brand_account import BrandAccount
+    is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
+    outstand_filter = {"platform": "linkedin", "connected_via": "outstand", "connection_status": "active"}
+    outstand_filter.update({"user_id": user_id} if is_personal else {"brand_id": brand_id})
+    outstand_conn = await db["social_connections"].find_one(outstand_filter)
 
     linked = conn is not None or outstand_conn is not None
-    active = outstand_conn or conn  # prefer Outstand
+    active = outstand_conn or conn
 
     return {
         "status": True,
@@ -258,19 +276,22 @@ class PublishRequest(BaseModel):
 @router.post("/publish")
 async def publish_to_linkedin(
     body: PublishRequest,
-    token: dict = Depends(JWTBearer()),
+    ctx: dict = Depends(get_active_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """
-    Publish a post to LinkedIn.
+    Publish a post to LinkedIn for the active brand.
     Prefers Outstand connection (supports org/company pages) over direct connection.
     """
-    user_id = _extract_user_id(token)
+    user_id = ctx["user_id"]
+    brand_id = ctx["brand_id"]
 
-    # ── Try Outstand connection first (supports company pages) ────────────────
-    outstand_conn = await db["social_connections"].find_one(
-        {"user_id": user_id, "platform": "linkedin", "connected_via": "outstand", "connection_status": "active"}
-    )
+    from app.models.brand_account import BrandAccount
+    is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
+    outstand_filter = {"platform": "linkedin", "connected_via": "outstand", "connection_status": "active"}
+    outstand_filter.update({"user_id": user_id} if is_personal else {"brand_id": brand_id})
+
+    outstand_conn = await db["social_connections"].find_one(outstand_filter)
     if outstand_conn:
         from app.agents.social_media_manager.services.outstand_service import OutstandService
         try:
@@ -289,8 +310,7 @@ async def publish_to_linkedin(
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"Failed to post to LinkedIn: {e}")
 
-    # ── Fall back to direct LinkedIn connection ────────────────────────────────
-    conn = await _get_linkedin_connection(user_id, db)
+    conn = await _get_linkedin_connection(user_id, db, brand_id)
     if not conn:
         raise HTTPException(
             status_code=400,
@@ -328,15 +348,14 @@ async def publish_to_linkedin(
 
 @router.get("/pages")
 async def get_linkedin_pages(
-    token: dict = Depends(JWTBearer()),
+    ctx: dict = Depends(get_active_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """
     Returns the list of LinkedIn company pages the user admins,
     plus the currently active posting target.
     """
-    user_id = _extract_user_id(token)
-    conn = await _get_linkedin_connection(user_id, db)
+    conn = await _get_linkedin_connection(ctx["user_id"], db, ctx["brand_id"])
     if not conn:
         raise HTTPException(status_code=400, detail="No LinkedIn account connected.")
 
@@ -362,15 +381,16 @@ class SelectPageRequest(BaseModel):
 @router.post("/pages/select")
 async def select_linkedin_page(
     body: SelectPageRequest,
-    token: dict = Depends(JWTBearer()),
+    ctx: dict = Depends(get_active_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """
     Set the active posting target to either the personal profile or a company page.
     author_urn must be the person_urn or one of the page URNs returned by GET /linkedin/pages.
     """
-    user_id = _extract_user_id(token)
-    conn = await _get_linkedin_connection(user_id, db)
+    user_id = ctx["user_id"]
+    brand_id = ctx["brand_id"]
+    conn = await _get_linkedin_connection(user_id, db, brand_id)
     if not conn:
         raise HTTPException(status_code=400, detail="No LinkedIn account connected.")
 
@@ -378,8 +398,12 @@ async def select_linkedin_page(
     if body.author_urn not in valid_urns:
         raise HTTPException(status_code=400, detail="Invalid author_urn — not linked to this account.")
 
+    from app.models.brand_account import BrandAccount
+    is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
+    update_filter = {"user_id": user_id, "platform": "linkedin"} if is_personal else {"brand_id": brand_id, "platform": "linkedin"}
+
     await db["social_connections"].update_one(
-        {"user_id": user_id, "platform": "linkedin"},
+        update_filter,
         {"$set": {"active_author_urn": body.author_urn, "updated_at": datetime.utcnow()}},
     )
 

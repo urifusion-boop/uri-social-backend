@@ -13,11 +13,13 @@ class BrandProfileService:
         user_id: str,
         data: Dict[str, Any],
         db: AsyncIOMotorDatabase,
+        brand_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         now = datetime.utcnow()
 
         doc = {
             "user_id": user_id,
+            "brand_id": brand_id,
             "brand_name": data.get("brand_name", ""),
             "industry": data.get("industry", ""),
             "website": data.get("website", ""),
@@ -95,7 +97,28 @@ class BrandProfileService:
         if "custom_font_directive" in data:
             doc["custom_font_directive"] = data["custom_font_directive"]
 
-        existing = await db[BrandProfileService.COLLECTION].find_one({"user_id": user_id})
+        # Canvas Editor feature flag
+        if "canvas_editor_enabled" in data:
+            print(f"🎨 Canvas Editor: saving canvas_editor_enabled={data['canvas_editor_enabled']}")
+            doc["canvas_editor_enabled"] = data["canvas_editor_enabled"]
+        else:
+            print(f"🎨 Canvas Editor: canvas_editor_enabled NOT in data. Keys: {list(data.keys())[:20]}")
+
+        # V3 Prompts feature flag
+        if "use_v3_prompts" in data:
+            doc["use_v3_prompts"] = data["use_v3_prompts"]
+
+        # Custom Visual Guides selections
+        if "selected_custom_guides" in data:
+            doc["selected_custom_guides"] = data["selected_custom_guides"]
+        if "selected_custom_guides_v2" in data:
+            doc["selected_custom_guides_v2"] = data["selected_custom_guides_v2"]
+        if "style_rotation_index" in data:
+            doc["style_rotation_index"] = data["style_rotation_index"]
+
+        # brand_id is the isolation boundary; fall back to user_id for solo/legacy.
+        scope = {"brand_id": brand_id} if brand_id else {"user_id": user_id}
+        existing = await db[BrandProfileService.COLLECTION].find_one(scope)
 
         # OPTION 2: ONBOARDING VALIDATION - Enforce required fields
         # Only validate when user is ACTIVELY TRYING to complete onboarding (transition from False→True)
@@ -116,22 +139,62 @@ class BrandProfileService:
             # Once onboarding_completed is True, never allow it to be reset to False
             if existing.get("onboarding_completed") and not doc.get("onboarding_completed"):
                 doc["onboarding_completed"] = True
-            print(f"🖼️  SAVE DEBUG user={user_id}: saving logo_position={repr(doc.get('logo_position'))}")
+            print(f"🖼️  SAVE DEBUG brand={brand_id or user_id}: saving logo_position={repr(doc.get('logo_position'))}")
             await db[BrandProfileService.COLLECTION].update_one(
-                {"user_id": user_id}, {"$set": doc}
+                scope, {"$set": doc}
             )
         else:
             doc["created_at"] = now
             await db[BrandProfileService.COLLECTION].insert_one(doc)
 
-        result = await db[BrandProfileService.COLLECTION].find_one({"user_id": user_id})
+        result = await db[BrandProfileService.COLLECTION].find_one(scope)
         if result:
             result.pop("_id", None)
         return UriResponse.get_single_data_response("brand_profile", result)
 
     @staticmethod
-    async def get(user_id: str, db: AsyncIOMotorDatabase) -> Dict[str, Any]:
-        profile = await db[BrandProfileService.COLLECTION].find_one({"user_id": user_id})
+    async def get(user_id: str, db: AsyncIOMotorDatabase, brand_id: Optional[str] = None) -> Dict[str, Any]:
+        from app.models.brand_account import BrandAccount
+        personal_bid = BrandAccount.personal_brand_id(user_id)
+        is_agency_brand = brand_id and brand_id != personal_bid
+
+        scope = {"brand_id": brand_id} if brand_id else {"user_id": user_id}
+        profile = await db[BrandProfileService.COLLECTION].find_one(scope)
+
+        # For agency brands: if the profile is missing or lacks key playbook fields
+        # (colors, visual style, industry), merge in the personal brand's values so
+        # content generation has a full context rather than using generic defaults.
+        if is_agency_brand:
+            personal_scope_options = [
+                {"brand_id": personal_bid},
+                {"user_id": user_id, "brand_id": {"$exists": False}},
+                {"user_id": user_id},
+            ]
+            personal_profile = None
+            for ps in personal_scope_options:
+                personal_profile = await db[BrandProfileService.COLLECTION].find_one(ps)
+                if personal_profile:
+                    break
+
+            PLAYBOOK_FIELDS = [
+                "brand_colors", "industry", "visual_style", "aesthetic_keywords",
+                "derived_voice", "personality_quiz", "audience_age_range",
+                "audience_interests", "content_tones", "cta_styles", "default_link",
+                "tagline", "region", "font_preference", "logo_url", "logo_position",
+            ]
+            if profile is None and personal_profile:
+                # No agency profile at all — use personal profile as base
+                profile = dict(personal_profile)
+                profile.pop("_id", None)
+                profile["brand_id"] = brand_id  # stamp agency brand_id for context
+            elif profile and personal_profile:
+                # Agency profile exists but may be sparse — fill missing fields from personal
+                profile.pop("_id", None)
+                for field in PLAYBOOK_FIELDS:
+                    if not profile.get(field) and personal_profile.get(field):
+                        profile[field] = personal_profile[field]
+                return UriResponse.get_single_data_response("brand_profile", profile)
+
         if not profile:
             return UriResponse.get_single_data_response("brand_profile", None)
         profile.pop("_id", None)

@@ -148,7 +148,12 @@ class ApprovalWorkflowService:
                             print(f"🗑️ Cancelled {cancel_result.modified_count} in-flight {draft['platform']} drafts for user {user_id}")
 
                         update_data["scheduled_date"] = scheduled_datetime or (datetime.utcnow() + timedelta(hours=1))
-                        update_data["status"] = "scheduled"
+                        # On non-production environments use a staging-specific status so the
+                        # production cron (which only queries "scheduled") cannot claim and
+                        # double-publish staging drafts. Both staging and prod share a DB.
+                        import os as _os
+                        _app_env = _os.getenv("APP_ENV", "production")
+                        update_data["status"] = "scheduled" if _app_env == "production" else "staging_scheduled"
                         update_data["user_id"] = user_id
                         update_data["platform_post_id"] = None  # reset so cron picks it up fresh
                     elif schedule_option == "immediate":
@@ -162,6 +167,7 @@ class ApprovalWorkflowService:
                     approved_drafts.append({
                         "draft_id": draft_id,
                         "platform": draft["platform"],
+                        "post_type": draft.get("post_type", "feed"),
                         "status": update_data["status"],
                         "scheduled_date": scheduled_datetime.isoformat() if scheduled_datetime else None
                     })
@@ -190,9 +196,15 @@ class ApprovalWorkflowService:
                 _schedule_dt = scheduled_datetime or (datetime.utcnow() + timedelta(hours=1))
                 for _d in approved_drafts:
                     try:
-                        # Instagram always uses direct Graph API + cron; never route via Outstand
-                        if _d["platform"] == "instagram":
-                            print(f"📸 Instagram direct — cron will publish at scheduled_date ({_schedule_dt.isoformat()})")
+                        # Instagram and Facebook carousels always use cron path.
+                        # Instagram: always direct Graph API.
+                        # Facebook carousels: Outstand with scheduled_at + multiple media_urls
+                        # publishes each slide as a separate post; cron handles them correctly
+                        # by calling _publish_to_platform at publish time with scheduled_at=None.
+                        if _d["platform"] == "instagram" or (
+                            _d["platform"] == "facebook" and _d.get("post_type", "feed") == "carousel"
+                        ):
+                            print(f"📸 {_d['platform']} carousel/direct — cron will publish at scheduled_date ({_schedule_dt.isoformat()})")
                             continue
                         _conn = await db["social_connections"].find_one({
                             "user_id": user_id,
@@ -200,6 +212,19 @@ class ApprovalWorkflowService:
                             "connection_status": "active",
                             "connected_via": "outstand",
                         })
+                        # Facebook connected via direct OAuth also routes through Outstand for
+                        # feed posts. Carousels are excluded here — Outstand native scheduling
+                        # with scheduled_at + multiple media_urls publishes each slide as a
+                        # separate post. Carousels use the cron path (same as individual scheduling):
+                        # cron fires at scheduled_date, calls _publish_to_platform with no
+                        # scheduled_at, which handles the carousel as one post correctly.
+                        if not _conn and _d["platform"] == "facebook" and _d.get("post_type", "feed") != "carousel":
+                            _conn = await db["social_connections"].find_one({
+                                "user_id": user_id,
+                                "platform": "facebook",
+                                "connection_status": "active",
+                                "connected_via": "facebook_direct_oauth",
+                            })
                         if _conn:
                             print(f"📅 Outstand native schedule | draft_id={_d['draft_id']} platform={_d['platform']} at={_schedule_dt.isoformat()}")
                             _res = await ApprovalWorkflowService._trigger_immediate_publishing(
@@ -536,8 +561,14 @@ class ApprovalWorkflowService:
         This should be run periodically (e.g., every 5 minutes)
         """
         try:
+            import os as _os
+            _app_env = _os.getenv("APP_ENV", "production")
+            # Staging uses "staging_scheduled" so the prod cron (which only queries
+            # "scheduled") cannot claim and double-publish staging drafts.
+            _sched_status = "staging_scheduled" if _app_env != "production" else "scheduled"
+
             current_time = datetime.utcnow()
-            print(f"📅 publish_scheduled_content | starting at {current_time.isoformat()}")
+            print(f"📅 publish_scheduled_content | starting at {current_time.isoformat()} env={_app_env} status={_sched_status}")
 
             # Clean up stale "publishing" drafts (process crashed mid-publish > 10 min ago).
             # Do NOT clear platform_post_id here — if a post_id was already stored (step 1
@@ -546,7 +577,7 @@ class ApprovalWorkflowService:
             stale_cutoff = current_time - timedelta(minutes=10)
             stale_result = await db["content_drafts"].update_many(
                 {"status": "publishing", "updated_at": {"$lte": stale_cutoff}},
-                {"$set": {"status": "scheduled", "updated_at": current_time}},
+                {"$set": {"status": _sched_status, "updated_at": current_time}},
             )
             if stale_result.modified_count:
                 print(f"⚠️ Stale cleanup: reset {stale_result.modified_count} 'publishing' drafts back to 'scheduled' (were stuck >10min)")
@@ -555,7 +586,7 @@ class ApprovalWorkflowService:
             earliest_allowed = current_time - timedelta(hours=24)
             expired_result = await db["content_drafts"].update_many(
                 {
-                    "status": "scheduled",
+                    "status": _sched_status,
                     "scheduled_date": {"$lte": earliest_allowed},
                     "platform_post_id": None,
                 },
@@ -589,21 +620,21 @@ class ApprovalWorkflowService:
                     "publish_retry_count": {"$not": {"$gte": 3}},
                 },
                 {
-                    "$set": {"status": "scheduled", "updated_at": current_time},
+                    "$set": {"status": _sched_status, "updated_at": current_time},
                     "$inc": {"publish_retry_count": 1},
                 },
             )
             if retry_result.modified_count:
-                print(f"🔄 Reset {retry_result.modified_count} publish_failed draft(s) to scheduled for retry")
+                print(f"🔄 Reset {retry_result.modified_count} publish_failed draft(s) to {_sched_status} for retry")
 
             scheduled_content = await db["content_drafts"].find({
                 "$or": [
                     # Drafts due for publishing (no platform_post_id = not yet sent anywhere)
-                    {"status": "scheduled", "scheduled_date": {"$lte": current_time}, "platform_post_id": {"$exists": False}},
+                    {"status": _sched_status, "scheduled_date": {"$lte": current_time}, "platform_post_id": {"$exists": False}},
                     # Drafts due for publishing with a null platform_post_id
-                    {"status": "scheduled", "scheduled_date": {"$lte": current_time}, "platform_post_id": None},
+                    {"status": _sched_status, "scheduled_date": {"$lte": current_time}, "platform_post_id": None},
                     # Outstand-scheduled drafts: poll for published status
-                    {"status": "scheduled", "platform_post_id": {"$exists": True, "$ne": None}},
+                    {"status": _sched_status, "platform_post_id": {"$exists": True, "$ne": None}},
                     # Recover publish_failed drafts that Outstand may have published
                     {"status": "publish_failed", "platform_post_id": {"$exists": True, "$ne": None}},
                 ]
@@ -620,7 +651,7 @@ class ApprovalWorkflowService:
             # submissions from publishing after a newer draft has already been scheduled.
             _seen_platform_user: dict = {}
             _to_cancel: list = []
-            _all_scheduled = [d for d in scheduled_content if d.get("status") == "scheduled"]
+            _all_scheduled = [d for d in scheduled_content if d.get("status") == _sched_status]
             _all_scheduled.sort(key=lambda d: d.get("created_at") or datetime.min, reverse=True)
             for _dup in _all_scheduled:
                 _key = (str(_dup.get("user_id")), _dup.get("platform"))
@@ -716,7 +747,7 @@ class ApprovalWorkflowService:
                     # claimed it (status changed to "publishing"), skip and move on.
                     print(f"🔒 Claiming draft {draft.get('id')} | current status={draft.get('status')} platform={draft.get('platform')} user_id={draft.get('user_id')} sched={draft.get('scheduled_date')}")
                     claimed = await db["content_drafts"].find_one_and_update(
-                        {"id": draft["id"], "status": "scheduled"},
+                        {"id": draft["id"], "status": _sched_status},
                         {"$set": {"status": "publishing", "updated_at": datetime.utcnow()}},
                     )
                     if not claimed:

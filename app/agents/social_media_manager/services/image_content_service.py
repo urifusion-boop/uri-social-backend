@@ -421,13 +421,13 @@ class ImageContentService:
             if not text_result.get('status') or not include_images:
                 return text_result
             
-            # Generate images for each successful text draft
-            drafts_with_images = []
-            image_errors = []
-            
-            for draft in text_result['responseData']['drafts']:
+            # Generate images for each successful text draft. Each draft's image is
+            # independent I/O (its own provider-fallback chain), so run them
+            # concurrently instead of one-after-another — with several drafts a
+            # sequential loop multiplies the per-image latency by the draft count.
+            async def _gen_one(draft: Dict[str, Any]) -> tuple:
+                error = None
                 try:
-                    # Generate image for this platform/content
                     image_result = await ImageContentService._generate_platform_image(
                         platform=draft['platform'],
                         content=draft['content'],
@@ -435,7 +435,7 @@ class ImageContentService:
                         brand_context=brand_context,
                         reference_image=reference_image,
                     )
-                    
+
                     if image_result.get('status'):
                         raw_image_url = image_result['responseData']['image_url']
                         draft['image_specs'] = image_result['responseData']['specs']
@@ -467,32 +467,49 @@ class ImageContentService:
                                     "image_url": stored_url,
                                     "image_specs": draft['image_specs'],
                                     "has_image": True,
+                                    "image_failed": False,
                                 }}
                             )
                             print(f"🖼️ Image saved to draft {draft['id']}: matched={result.matched_count}, modified={result.modified_count}")
                         draft['image_url'] = stored_url if not stored_url.startswith("data:") else None
                     else:
                         draft['has_image'] = False
-                        image_errors.append({
+                        error = {
                             "platform": draft['platform'],
                             "error": image_result.get('responseMessage', 'Image generation failed')
-                        })
+                        }
+                        if db is not None:
+                            await db["content_drafts"].update_one(
+                                {"id": draft["id"]},
+                                {"$set": {"has_image": False, "image_failed": True}},
+                            )
 
-                    drafts_with_images.append(draft)
-                    
                 except Exception as e:
                     draft['has_image'] = False
-                    drafts_with_images.append(draft)
-                    image_errors.append({
+                    error = {
                         "platform": draft['platform'],
                         "error": f"Image generation error: {str(e)}"
-                    })
-            
+                    }
+                    if db is not None:
+                        try:
+                            await db["content_drafts"].update_one(
+                                {"id": draft["id"]},
+                                {"$set": {"has_image": False, "image_failed": True}},
+                            )
+                        except Exception:
+                            pass
+
+                return draft, error
+
+            results = await asyncio.gather(*(_gen_one(d) for d in text_result['responseData']['drafts']))
+            drafts_with_images = [r[0] for r in results]
+            image_errors = [r[1] for r in results if r[1]]
+
             # Update response with image information
             text_result['responseData']['drafts'] = drafts_with_images
             text_result['responseData']['images_generated'] = len([d for d in drafts_with_images if d.get('has_image')])
             text_result['responseData']['image_errors'] = image_errors
-            
+
             return text_result
             
         except Exception as e:
@@ -551,6 +568,10 @@ class ImageContentService:
 
             if not image_result.get("status"):
                 print(f"❌ regenerate_image: generation failed for {draft_id}: {image_result.get('error')}")
+                await db["content_drafts"].update_one(
+                    {"$or": [{"id": draft_id}, {"draft_id": draft_id}]},
+                    {"$set": {"image_failed": True, "updated_at": datetime.utcnow()}},
+                )
                 return
 
             raw_url = image_result["responseData"]["image_url"]
@@ -584,6 +605,13 @@ class ImageContentService:
 
         except Exception as e:
             print(f"❌ regenerate_image error for {draft_id}: {e}")
+            try:
+                await db["content_drafts"].update_one(
+                    {"$or": [{"id": draft_id}, {"draft_id": draft_id}]},
+                    {"$set": {"image_failed": True, "updated_at": datetime.utcnow()}},
+                )
+            except Exception:
+                pass
 
     @staticmethod
     def _get_dynamic_motion_detail(industry: str) -> str:
@@ -711,13 +739,21 @@ class ImageContentService:
             color_str = ", ".join(str(c) for c in brand_colors[:4]) if brand_colors else ""
 
             # SECTION 1: ABSOLUTE RULES (READ FIRST)
-            absolute_rules = f"""=== ABSOLUTE RULES (READ FIRST) ===
+            absolute_rules = f"""=== ABSOLUTE RULES (READ FIRST — THESE OVERRIDE ALL OTHER INSTRUCTIONS) ===
 This image is EXCLUSIVELY for the brand "{brand_name}".
 You must follow every instruction below precisely.
 Do NOT include any other brand names, logos, products, or brand-associated imagery.
 Do NOT include any real-world company, product, or trademark other than "{brand_name}".
 Do NOT draw from your training data to add elements not described in this prompt.
-Every element in the image must come from the instructions below. Nothing else."""
+Every element in the image must come from the instructions below. Nothing else.
+
+CANVAS SAFETY — NON-NEGOTIABLE, OVERRIDES ALL STYLE RULES:
+Every letter of every word must be 100% inside the image canvas with no clipping.
+Maintain a minimum 12% safe-zone margin from every edge (top, bottom, left, right).
+Headlines must begin at least 12% from the top edge. CTA text must end at least 12%
+from the bottom edge. If text is too large to fit within these margins, reduce the
+font size — do NOT let any character touch or cross any edge. This rule overrides
+any visual style, typography, or layout instruction that follows."""
 
             # SECTION 2: PROFESSIONAL OUTPUT RULES
             # These rules make AI graphics look professionally designed (not AI-generated)
@@ -827,9 +863,10 @@ Follow these rules precisely for every image. No exceptions.
    photograph, use a subtle semi-transparent dark overlay (rgba(0,0,0,0.4))
    behind the text for readability.
 
-9. MARGINS: Maintain at least 5% margin on all four edges. No element touches
-   the image border. Generous spacing between all text blocks and elements.
-   At least 15-20% of the image should be empty space.
+9. MARGINS & SAFE ZONE: 12% minimum padding on ALL four edges — this repeats
+   the canvas safety rule from the top of this prompt. It is the highest-priority
+   layout constraint and overrides any style, typography, or composition guideline.
+   Every character must be fully inside. Reduce font size if needed. Never clip.
 
 10. NO DECORATIONS: Do NOT add badges, stickers, watermarks, decorative
     borders, corner ornaments, ribbon banners, starburst shapes, or
@@ -2181,15 +2218,18 @@ OVERALL:
                     png_buf.seek(0)
 
                     loop = asyncio.get_running_loop()
-                    response = await loop.run_in_executor(
-                        None,
-                        lambda: _ai_client.images.edit(
-                            model="gpt-image-1",
-                            image=("reference.png", png_buf, "image/png"),
-                            prompt=prompt,
-                            n=1,
-                            size=edit_size,
-                        )
+                    response = await asyncio.wait_for(
+                        loop.run_in_executor(
+                            None,
+                            lambda: _ai_client.images.edit(
+                                model="gpt-image-1",
+                                image=("reference.png", png_buf, "image/png"),
+                                prompt=prompt,
+                                n=1,
+                                size=edit_size,
+                            )
+                        ),
+                        timeout=90,
                     )
 
                     b64 = response.data[0].b64_json
@@ -2257,30 +2297,36 @@ OVERALL:
 
                         print(f"🎨 GPT-Image-2 edit with reference ({_gpt2_size})…")
                         loop = asyncio.get_running_loop()
-                        _gpt2_resp = await loop.run_in_executor(
-                            None,
-                            lambda: _oai_client.images.edit(
-                                model="gpt-image-2",
-                                image=("reference.png", _ref_png_buf, "image/png"),
-                                prompt=prompt,
-                                n=1,
-                                size=_gpt2_size,
+                        _gpt2_resp = await asyncio.wait_for(
+                            loop.run_in_executor(
+                                None,
+                                lambda: _oai_client.images.edit(
+                                    model="gpt-image-2",
+                                    image=("reference.png", _ref_png_buf, "image/png"),
+                                    prompt=prompt,
+                                    n=1,
+                                    size=_gpt2_size,
+                                ),
                             ),
+                            timeout=90,
                         )
                         _mode = "gpt-image-2-edit"
                     else:
                         print(f"🎨 GPT-Image-2 direct OpenAI ({_gpt2_size})…")
                         loop = asyncio.get_running_loop()
-                        _gpt2_resp = await loop.run_in_executor(
-                            None,
-                            lambda: _oai_client.images.generate(
-                                model="gpt-image-2",
-                                prompt=prompt,
-                                n=1,
-                                size=_gpt2_size,
-                                quality="high",
-                                output_format="webp",
+                        _gpt2_resp = await asyncio.wait_for(
+                            loop.run_in_executor(
+                                None,
+                                lambda: _oai_client.images.generate(
+                                    model="gpt-image-2",
+                                    prompt=prompt,
+                                    n=1,
+                                    size=_gpt2_size,
+                                    quality="high",
+                                    output_format="webp",
+                                ),
                             ),
+                            timeout=90,
                         )
                         _mode = "gpt-image-2"
 
@@ -2341,9 +2387,12 @@ OVERALL:
                     }
 
                     loop = asyncio.get_running_loop()
-                    _fal_result = await loop.run_in_executor(
-                        None,
-                        lambda: _fal.run(_fal_model, arguments=_fal_args),
+                    _fal_result = await asyncio.wait_for(
+                        loop.run_in_executor(
+                            None,
+                            lambda: _fal.run(_fal_model, arguments=_fal_args),
+                        ),
+                        timeout=90,
                     )
 
                     _fal_images = _fal_result.get("images") or []
@@ -2388,18 +2437,21 @@ OVERALL:
                     client_g = _genai.Client(api_key=_cfg.GOOGLE_GEMINI_API_KEY)
 
                     loop = asyncio.get_running_loop()
-                    response = await loop.run_in_executor(
-                        None,
-                        lambda: client_g.models.generate_images(
-                            model="imagen-4.0-ultra-generate-001",
-                            prompt=prompt,
-                            config=_gtypes.GenerateImagesConfig(
-                                number_of_images=1,
-                                aspect_ratio=aspect_ratio,
-                                safety_filter_level="block_low_and_above",
-                                person_generation="allow_adult",
-                            ),
-                        )
+                    response = await asyncio.wait_for(
+                        loop.run_in_executor(
+                            None,
+                            lambda: client_g.models.generate_images(
+                                model="imagen-4.0-ultra-generate-001",
+                                prompt=prompt,
+                                config=_gtypes.GenerateImagesConfig(
+                                    number_of_images=1,
+                                    aspect_ratio=aspect_ratio,
+                                    safety_filter_level="block_low_and_above",
+                                    person_generation="allow_adult",
+                                ),
+                            )
+                        ),
+                        timeout=90,
                     )
 
                     if not response.generated_images:
@@ -2440,16 +2492,19 @@ OVERALL:
                 image_size = "1024x1024"
 
             loop = asyncio.get_running_loop()
-            response = await loop.run_in_executor(
-                None,
-                lambda: client.images.generate(
-                    model="gpt-image-1.5",
-                    prompt=prompt,
-                    n=1,
-                    size=image_size,
-                    quality="high",
-                    output_format="webp",
-                )
+            response = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None,
+                    lambda: client.images.generate(
+                        model="gpt-image-1.5",
+                        prompt=prompt,
+                        n=1,
+                        size=image_size,
+                        quality="high",
+                        output_format="webp",
+                    )
+                ),
+                timeout=90,
             )
             import base64 as _b64
             b64 = response.data[0].b64_json

@@ -168,6 +168,7 @@ async def google_auth(body: GoogleAuthRequest, db: AsyncIOMotorDatabase = Depend
 
     # 3. Find or create user
     existing = await db["users"].find_one({"email": email})
+    is_new_user = not existing
     trial_status = None
     if existing:
         user_id = existing.get("userId") or str(existing["_id"])
@@ -254,6 +255,7 @@ async def google_auth(body: GoogleAuthRequest, db: AsyncIOMotorDatabase = Depend
             "firstName": first_name,
             "lastName": last_name,
             "trial": trial_status,
+            "is_new_user": is_new_user,
         },
     }
 
