@@ -74,8 +74,8 @@ class TrendDataService:
         """
         resolved_geo = geo or _region_to_geo(region)
         brand_seeds = [s for s in (brand_seeds or []) if s and len(s.strip()) > 2]
-        # v2 prefix in cache key forces a miss when upgrading from pre-brand-seed code
-        cache_key = f"v2:{industry.lower()}:{resolved_geo}:{timeframe}:{','.join(sorted(brand_seeds))}"
+        # v3 prefix forces a miss to pick up interest_over_time fallback
+        cache_key = f"v3:{industry.lower()}:{resolved_geo}:{timeframe}:{','.join(sorted(brand_seeds))}"
 
         # Try to read from cache first
         if db is not None:
@@ -137,7 +137,7 @@ class TrendDataService:
         seeds = extra[:2] + industry_seeds  # brand seeds get first 2 slots
 
         hl = "en-NG" if geo == "NG" else "en-US"
-        pytrend = TrendReq(hl=hl, tz=60, timeout=(10, 25), retries=1, backoff_factor=0.5)
+        pytrend = TrendReq(hl=hl, tz=60, timeout=(10, 25), retries=2, backoff_factor=1.0)
         found: List[Dict[str, Any]] = []
 
         for seed in seeds[:3]:  # max 3 seeds (2 brand + 1 industry)
@@ -171,6 +171,31 @@ class TrendDataService:
             except Exception as exc:
                 print(f"[TrendData] seed '{seed}' failed: {exc}")
                 continue
+
+        # If related_queries returned nothing (common for certain regions/industries),
+        # fall back to interest_over_time on the seed keywords themselves — still real
+        # Google Trends data, just for the seeds rather than their related queries.
+        if not found:
+            kw_batch = (seeds[:5])
+            try:
+                pytrend.build_payload(kw_batch, cat=0, timeframe=timeframe, geo=geo)
+                iot = pytrend.interest_over_time()
+                if iot is not None and not iot.empty:
+                    for kw in kw_batch:
+                        if kw in iot.columns:
+                            recent = iot[kw].tail(4)
+                            avg_score = float(recent.mean())
+                            if avg_score > 0:
+                                found.append({
+                                    "keyword": kw,
+                                    "trend_score": min(100.0, avg_score),
+                                    "growth_rate": avg_score,
+                                    "source": "google_trends",
+                                    "type": "top",
+                                })
+                    print(f"[TrendData] interest_over_time yielded {len(found)} keywords for '{industry}'")
+            except Exception as exc:
+                print(f"[TrendData] interest_over_time fallback failed: {exc}")
 
         # Deduplicate by keyword text, keep highest score per keyword
         # Also strip query-type phrases that produce bad template titles
