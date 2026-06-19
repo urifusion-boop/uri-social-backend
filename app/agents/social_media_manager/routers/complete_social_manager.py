@@ -361,9 +361,7 @@ async def generate_content(
         if not profile_data:
             # For API key users, auto-create minimal profile instead of blocking
             if ctx.get("auth_type") == "api_key":
-                minimal_profile = {
-                    "user_id": user_id,
-                    "brand_id": active_brand_id,
+                minimal_profile_data = {
                     "brand_name": f"API User {user_id[:8]}",
                     "industry": "general_other",
                     "brand_colors": ["#C2185B", "#FFFEF2"],
@@ -372,9 +370,11 @@ async def generate_content(
                     "onboarding_completed": True,
                     "created_via": "api_key_auto",
                 }
-                await BrandProfileService.save(minimal_profile, db)
+                await BrandProfileService.save(user_id, minimal_profile_data, db, brand_id=active_brand_id)
                 print(f"✅ Auto-created minimal profile for API key user {user_id}")
-                profile_data = minimal_profile
+                # Reload profile data
+                profile_result = await BrandProfileService.get(user_id, db, brand_id=active_brand_id)
+                profile_data = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
             else:
                 # JWT users must complete onboarding
                 return UriResponse.error_response(
