@@ -256,17 +256,19 @@ def _build_cloudinary_cut_url(
         text_upper  = hook_text.upper()
         encoded     = _cld_encode_text(text_upper)
         char_count  = len(text_upper)
-        # Montserrat 900 uppercase averages ~0.75em per char (wider than regular weight).
-        # Target 980px usable width; clamp 42–60px so it stays bold and readable.
-        # Cloudinary's w_1020,c_fit is a hard backstop — it scales the whole layer
-        # down proportionally if the rendered text still overflows 1020px.
-        font_size   = min(60, max(42, int(980 / max(char_count * 0.75, 1))))
+        # Montserrat 900 uppercase: real average ~0.88em per char.
+        # Target 900px usable width on a 1080px frame; clamp 36–52px.
+        # w_1020,c_fit is a SEPARATE step — must be its own URL segment before
+        # fl_layer_apply so Cloudinary scales the rendered layer, not the base video.
+        # fl_relative makes y_0.12 mean 12% from top (not 0.12 pixels).
+        font_size   = min(52, max(36, int(900 / max(char_count * 0.88, 1))))
         primary_hex = primary_color.lstrip("#")
         bg_hex      = (primary_hex + "D9") if len(primary_hex) == 6 else primary_hex  # 85% opacity
         url += (
             f"/b_rgb:{bg_hex},co_rgb:FFFFFF"
             f",l_text:Montserrat@google_{font_size}_900:{encoded}"
-            f"/w_1020,c_fit,eo_2.5,fl_layer_apply,g_north,y_0.10"
+            f"/w_1020,c_fit"
+            f"/eo_2.5,fl_layer_apply,g_north,fl_relative,y_0.12"
         )
         print(f"[CloudinaryHook] '{text_upper}' font={font_size}px bg=#{bg_hex}", flush=True)
 
