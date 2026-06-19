@@ -738,6 +738,26 @@ class ImageContentService:
             brand_name = bc.get("brand_name", "")
             color_str = ", ".join(str(c) for c in brand_colors[:4]) if brand_colors else ""
 
+            # Get logo position to reserve space
+            logo_url = bc.get('logo_url')
+            logo_position = bc.get('logo_position', 'bottom_right') if logo_url else None
+
+            # Build logo space reservation instruction
+            logo_space_note = ""
+            if logo_position:
+                if logo_position == "top_center":
+                    logo_space_note = "\n⚠️ LOGO OVERLAY ZONE: The top-center area (10% width × 8% height from top edge) is RESERVED for brand logo overlay. Do NOT place any text, faces, or important elements in this zone. Keep this area clear with plain background only."
+                elif logo_position == "top_left":
+                    logo_space_note = "\n⚠️ LOGO OVERLAY ZONE: The top-left corner (10% width × 8% height) is RESERVED for brand logo overlay. Keep this area clear."
+                elif logo_position == "top_right":
+                    logo_space_note = "\n⚠️ LOGO OVERLAY ZONE: The top-right corner (10% width × 8% height) is RESERVED for brand logo overlay. Keep this area clear."
+                elif logo_position == "bottom_left":
+                    logo_space_note = "\n⚠️ LOGO OVERLAY ZONE: The bottom-left corner (10% width × 8% height) is RESERVED for brand logo overlay. Keep this area clear."
+                elif logo_position == "bottom_center":
+                    logo_space_note = "\n⚠️ LOGO OVERLAY ZONE: The bottom-center area (10% width × 8% height) is RESERVED for brand logo overlay. Keep this area clear."
+                else:  # bottom_right (default)
+                    logo_space_note = "\n⚠️ LOGO OVERLAY ZONE: The bottom-right corner (10% width × 8% height) is RESERVED for brand logo overlay. Keep this area clear."
+
             # SECTION 1: ABSOLUTE RULES (READ FIRST)
             absolute_rules = f"""=== ABSOLUTE RULES (READ FIRST — THESE OVERRIDE ALL OTHER INSTRUCTIONS) ===
 This image is EXCLUSIVELY for the brand "{brand_name}".
@@ -755,7 +775,7 @@ text must end at least 20% from the bottom edge. If text is too large to fit wit
 these margins, reduce the font size — do NOT let any character touch or cross any edge.
 ⚠️ CRITICAL: Text cut off at bottom edges is a CRITICAL FAILURE. Leave generous space
 at the bottom. This rule overrides any visual style, typography, or layout instruction
-that follows."""
+that follows.{logo_space_note}"""
 
             # SECTION 2: PROFESSIONAL OUTPUT RULES
             # These rules make AI graphics look professionally designed (not AI-generated)
