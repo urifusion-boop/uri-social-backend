@@ -15,7 +15,7 @@ import time
 import urllib.parse
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import aiohttp
 import openai
@@ -646,42 +646,223 @@ Return ONLY valid JSON (no markdown, no explanation):
     except json.JSONDecodeError:
         return {"cuts": [], "zooms": []}
 
-# ── Algorithmic silence + filler detection ────────────────────────────────────
+# ── Algorithmic silence + filler + repetition detection ──────────────────────
 
 _SILENCE_THRESHOLD: Dict[str, float] = {
-    "tiktok":   0.6,   # cut any gap ≥0.6s
-    "product":  0.9,
-    "founder":  1.4,
+    "tiktok":   0.5,   # cut any gap ≥0.5s
+    "product":  0.8,
+    "founder":  1.2,
 }
 
-# SRT entries whose text is ONLY filler sounds are automatically cut.
-_DEFINITE_FILLER_RE = re.compile(
-    r"^\s*(um+|uh+|ah+|hmm+|er+|erm+|mhm+|uhh+|umm+|huh|mm+)\s*[,.]?\s*$",
+# Matches a whole word that is a filler sound (um, uh, etc.)
+_FILLER_WORD_RE = re.compile(
+    r"^(um+|uh+|ah+|hmm+|er+|erm+|mhm+|uhh+|umm+|huh|mm+)$",
     re.IGNORECASE,
 )
 
+# Multi-word filler phrases (lowercase, no punctuation). Conservative — only
+# phrases that are unambiguously filler regardless of sentence position.
+_FILLER_NGRAMS: List[Tuple[str, ...]] = [
+    ("you", "know"),
+    ("i", "mean"),
+    ("you", "know", "what", "i", "mean"),
+]
+
+
+def _extract_words(tracking_data: dict) -> List[Dict[str, Any]]:
+    """Normalize Reap trackingData into [{word, start, end}] list."""
+    raw = (
+        tracking_data.get("words")
+        or tracking_data.get("segments")
+        or tracking_data.get("transcript", {}).get("words")
+        or []
+    )
+    out: List[Dict[str, Any]] = []
+    for w in raw:
+        text  = str(w.get("word") or w.get("text") or "").strip()
+        start = float(w.get("start") or w.get("startTime") or 0)
+        end   = float(w.get("end")   or w.get("endTime")   or start + 0.1)
+        if text:
+            out.append({"word": text, "start": start, "end": end})
+    return out
+
+
+def _auto_cuts_from_words(
+    words: List[Dict[str, Any]],
+    duration: float,
+    video_type: str = "tiktok",
+) -> List[Dict]:
+    """
+    Silence detection from word-level timestamps.
+    Catches mid-sentence pauses that SRT entry boundaries miss entirely.
+    """
+    threshold = _SILENCE_THRESHOLD.get(video_type, 1.0)
+    cuts: List[Dict] = []
+    if not words:
+        return cuts
+
+    if words[0]["start"] > threshold:
+        cuts.append({
+            "remove_start": 0.0,
+            "remove_end":   round(words[0]["start"], 3),
+            "reason":       f"leading silence {words[0]['start']:.1f}s",
+        })
+
+    for i in range(1, len(words)):
+        gap_start = words[i - 1]["end"]
+        gap_end   = words[i]["start"]
+        gap       = gap_end - gap_start
+        if gap > threshold:
+            cuts.append({
+                "remove_start": round(gap_start, 3),
+                "remove_end":   round(gap_end, 3),
+                "reason":       f"silence {gap:.1f}s",
+            })
+
+    if duration - words[-1]["end"] > threshold:
+        cuts.append({
+            "remove_start": round(words[-1]["end"], 3),
+            "remove_end":   round(duration, 3),
+            "reason":       f"trailing silence {duration - words[-1]['end']:.1f}s",
+        })
+
+    return cuts
+
+
+def _auto_cuts_from_srt(
+    srt_entries: List[Dict[str, Any]],
+    duration: float,
+    video_type: str = "tiktok",
+) -> List[Dict]:
+    """SRT-entry gap fallback — used only when word-level data is unavailable."""
+    threshold = _SILENCE_THRESHOLD.get(video_type, 1.0)
+    cuts: List[Dict] = []
+    if not srt_entries:
+        return cuts
+
+    if srt_entries[0]["start"] > threshold:
+        cuts.append({
+            "remove_start": 0.0,
+            "remove_end":   round(srt_entries[0]["start"], 3),
+            "reason":       f"leading silence {srt_entries[0]['start']:.1f}s",
+        })
+
+    for i in range(1, len(srt_entries)):
+        gap_start = srt_entries[i - 1]["end"]
+        gap_end   = srt_entries[i]["start"]
+        gap       = gap_end - gap_start
+        if gap > threshold:
+            cuts.append({
+                "remove_start": round(gap_start, 3),
+                "remove_end":   round(gap_end, 3),
+                "reason":       f"silence {gap:.1f}s",
+            })
+
+    if duration - srt_entries[-1]["end"] > threshold:
+        cuts.append({
+            "remove_start": round(srt_entries[-1]["end"], 3),
+            "remove_end":   round(duration, 3),
+            "reason":       f"trailing silence {duration - srt_entries[-1]['end']:.1f}s",
+        })
+
+    return cuts
+
+
+def _filler_cuts_from_words(words: List[Dict[str, Any]]) -> List[Dict]:
+    """
+    Detects filler words and phrases at word level — catches fillers embedded
+    inside sentences ("it was um really good") that SRT-level matching misses.
+    """
+    cuts: List[Dict] = []
+    skip_until = -1
+    for i, w in enumerate(words):
+        if i <= skip_until:
+            continue
+        clean = w["word"].lower().strip(".,!?;:\"'")
+
+        if _FILLER_WORD_RE.match(clean):
+            cuts.append({
+                "remove_start": round(w["start"], 3),
+                "remove_end":   round(w["end"],   3),
+                "reason":       f'filler: "{w["word"].strip()}"',
+            })
+            continue
+
+        for ngram in _FILLER_NGRAMS:
+            n = len(ngram)
+            if i + n > len(words):
+                continue
+            window = tuple(
+                words[k]["word"].lower().strip(".,!?;:\"'") for k in range(i, i + n)
+            )
+            if window == ngram:
+                cuts.append({
+                    "remove_start": round(words[i]["start"], 3),
+                    "remove_end":   round(words[i + n - 1]["end"], 3),
+                    "reason":       f'filler phrase: "{" ".join(ngram)}"',
+                })
+                skip_until = i + n - 1
+                break
+
+    return cuts
+
 
 def _filler_cuts_from_srt(srt_entries: List[Dict[str, Any]]) -> List[Dict]:
-    """Cut SRT entries that consist entirely of a definite filler sound."""
+    """SRT-level filler fallback — only whole-entry fillers."""
     cuts = []
     for entry in srt_entries:
-        if _DEFINITE_FILLER_RE.match(entry["text"]):
+        clean = entry["text"].lower().strip(".,!?;:\"' ")
+        if _FILLER_WORD_RE.match(clean):
             cuts.append({
                 "remove_start": round(entry["start"], 3),
                 "remove_end":   round(entry["end"],   3),
-                "reason":       f'filler word: "{entry["text"].strip()}"',
+                "reason":       f'filler: "{entry["text"].strip()}"',
             })
     return cuts
 
 
-def _repetition_cuts_from_srt(srt_entries: List[Dict[str, Any]]) -> List[Dict]:
+def _repetition_cuts_from_words(words: List[Dict[str, Any]]) -> List[Dict]:
     """
-    Detect when the speaker repeats the same phrase within a short window.
+    Phrase-level repetition detection at word granularity.
+    Scans a 25-word window for repeated sequences of ≥4 words.
     Keeps the first occurrence, cuts the second.
-    Only triggers on ≥3-word matches to avoid false positives.
     """
     cuts: List[Dict] = []
-    already_cut: set = set()
+    already_cut: Set[int] = set()
+    look_ahead = 25
+
+    for i in range(len(words)):
+        if i in already_cut:
+            continue
+        for phrase_len in range(6, 3, -1):  # try longer phrases first
+            if i + phrase_len > len(words):
+                continue
+            phrase = tuple(
+                w["word"].lower().strip(".,!?;:\"'") for w in words[i:i + phrase_len]
+            )
+            for j in range(i + phrase_len, min(i + look_ahead, len(words) - phrase_len + 1)):
+                if j in already_cut:
+                    continue
+                candidate = tuple(
+                    w["word"].lower().strip(".,!?;:\"'") for w in words[j:j + phrase_len]
+                )
+                if phrase == candidate:
+                    cuts.append({
+                        "remove_start": round(words[j]["start"], 3),
+                        "remove_end":   round(words[j + phrase_len - 1]["end"], 3),
+                        "reason":       f'repetition: "{" ".join(phrase)}"',
+                    })
+                    for k in range(j, j + phrase_len):
+                        already_cut.add(k)
+                    break
+
+    return cuts
+
+
+def _repetition_cuts_from_srt(srt_entries: List[Dict[str, Any]]) -> List[Dict]:
+    """SRT-level repetition fallback — whole-entry exact matches."""
+    cuts: List[Dict] = []
+    already_cut: Set[int] = set()
     for i, entry_i in enumerate(srt_entries):
         words_i = entry_i["text"].lower().strip().split()
         if len(words_i) < 3 or i in already_cut:
@@ -697,51 +878,6 @@ def _repetition_cuts_from_srt(srt_entries: List[Dict[str, Any]]) -> List[Dict]:
                     "reason":       f'repetition: "{srt_entries[j]["text"].strip()}"',
                 })
                 already_cut.add(j)
-    return cuts
-
-
-def _auto_cuts_from_srt(
-    srt_entries: List[Dict[str, Any]],
-    duration: float,
-    video_type: str = "tiktok",
-) -> List[Dict]:
-    """
-    Derive cut decisions directly from SRT entry timing gaps.
-    More reliable than asking GPT to infer silences from text alone.
-    """
-    threshold = _SILENCE_THRESHOLD.get(video_type, 1.0)
-    cuts: List[Dict] = []
-    if not srt_entries:
-        return cuts
-
-    # Leading silence
-    if srt_entries[0]["start"] > threshold:
-        cuts.append({
-            "remove_start": 0.0,
-            "remove_end": round(srt_entries[0]["start"], 3),
-            "reason": f"leading silence {srt_entries[0]['start']:.1f}s",
-        })
-
-    # Gaps between subtitle entries
-    for i in range(1, len(srt_entries)):
-        gap_start = srt_entries[i - 1]["end"]
-        gap_end   = srt_entries[i]["start"]
-        gap       = gap_end - gap_start
-        if gap > threshold:
-            cuts.append({
-                "remove_start": round(gap_start, 3),
-                "remove_end":   round(gap_end, 3),
-                "reason":       f"silence {gap:.1f}s",
-            })
-
-    # Trailing silence
-    if duration - srt_entries[-1]["end"] > threshold:
-        cuts.append({
-            "remove_start": round(srt_entries[-1]["end"], 3),
-            "remove_end":   round(duration, 3),
-            "reason":       f"trailing silence {duration - srt_entries[-1]['end']:.1f}s",
-        })
-
     return cuts
 
 
@@ -1392,13 +1528,20 @@ async def run_production_job(
         music_mood = decisions.get("music_mood", "upbeat")
         hook_text = decisions.get("hook_text", "")
 
-        # Algorithmic cuts: silence gaps + filler sounds + exact repetitions.
-        auto_cuts   = _auto_cuts_from_srt(srt_entries, duration, video_type)
-        filler_cuts = _filler_cuts_from_srt(srt_entries)
-        rep_cuts    = _repetition_cuts_from_srt(srt_entries)
+        # Algorithmic cuts — word-level when Reap provides timestamps, SRT fallback otherwise.
+        words = _extract_words(tracking_data)
+        if words:
+            auto_cuts   = _auto_cuts_from_words(words, duration, video_type)
+            filler_cuts = _filler_cuts_from_words(words)
+            rep_cuts    = _repetition_cuts_from_words(words)
+        else:
+            auto_cuts   = _auto_cuts_from_srt(srt_entries, duration, video_type)
+            filler_cuts = _filler_cuts_from_srt(srt_entries)
+            rep_cuts    = _repetition_cuts_from_srt(srt_entries)
         cuts = _merge_cuts(auto_cuts + filler_cuts + rep_cuts, gpt_cuts)
         print(
-            f"[VideoProduction] silence={len(auto_cuts)} filler={len(filler_cuts)} "
+            f"[VideoProduction] mode={'word' if words else 'srt'} words={len(words)} "
+            f"silence={len(auto_cuts)} filler={len(filler_cuts)} "
             f"repetition={len(rep_cuts)} gpt={len(gpt_cuts)} merged={len(cuts)} "
             f"zooms={len(zooms)} sfx={len(sound_effects)} broll={len(broll_decisions)} "
             f"pacing={pacing_note} hook='{hook_text}'",
