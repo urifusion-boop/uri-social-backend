@@ -37,30 +37,35 @@ _TOPIC_KEYWORDS: Dict[str, List[str]] = {
 class PerformanceAnalyticsService:
 
     @staticmethod
-    async def get_user_performance(user_id: str, db: AsyncIOMotorDatabase) -> Dict[str, Any]:
+    async def get_user_performance(
+        user_id: str,
+        db: AsyncIOMotorDatabase,
+        brand_id: str = None,
+    ) -> Dict[str, Any]:
         """
-        Return aggregated performance metrics:
-        {
-            avg_engagement_by_format: {image: 3.2, text: 1.8},
-            avg_engagement_by_topic:  {finance: 4.5, education: 3.1},
-            best_posting_hour: 18,
-            top_formats: [image, text],
-            top_topics:  [finance, education],
-            post_count: 12,
-            has_data: bool,
-        }
+        Return aggregated performance metrics scoped to the active brand.
+        When brand_id is an agency brand, only that brand's drafts are analysed.
+        When brand_id is the user's personal brand (or None), falls back to user_id.
         """
+        from app.models.brand_account import BrandAccount as _BA
+
+        def _draft_scope() -> Dict[str, Any]:
+            if brand_id and brand_id != _BA.personal_brand_id(user_id):
+                return {"brand_id": brand_id, "status": "published"}
+            return {"user_id": user_id, "status": "published"}
+
         try:
-            # Load brand content pillars for brand-specific topic matching
+            # Load brand content pillars — scope to active brand if possible
+            brand_filter = {"brand_id": brand_id} if brand_id else {"user_id": user_id}
             brand_doc = await db["brand_profiles"].find_one(
-                {"user_id": user_id},
+                brand_filter,
                 {"content_pillars": 1, "_id": 0},
             )
             brand_pillars: List[str] = (brand_doc or {}).get("content_pillars") or []
 
             # Fetch published drafts (last 90 days worth, capped at 200)
             drafts_cursor = db["content_drafts"].find(
-                {"user_id": user_id, "status": "published"},
+                _draft_scope(),
                 {"id": 1, "platform": 1, "content": 1, "has_image": 1, "published_date": 1},
             )
             drafts = await drafts_cursor.to_list(length=200)

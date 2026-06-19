@@ -11,6 +11,7 @@ class ChatModel(BaseModel):
     model: str = "gpt-4o-mini"
     messages: List[ChatMessage]
     temperature: float = 0.5
+    max_tokens: Optional[int] = None
 
 
 class EmbeddingModel(BaseModel):

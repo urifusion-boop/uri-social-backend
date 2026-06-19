@@ -13,6 +13,11 @@ from app.agents.social_media_manager.routers.complete_social_manager import rout
 from app.agents.social_media_manager.routers.whatsapp_router import router as whatsapp_router
 from app.agents.social_media_manager.routers.x_router import router as x_router
 from app.agents.social_media_manager.routers.linkedin_router import router as linkedin_router
+from app.agents.social_media_manager.routers.v3_test_router import router as v3_test_router
+from app.agents.social_media_manager.routers.v3_toggle_endpoint import router as v3_toggle_router
+from app.agents.social_media_manager.routers.custom_visual_guides import router as custom_guides_router
+from app.agents.social_media_manager.routers.custom_visual_guides_v2 import router as custom_guides_v2_router
+from app.agents.social_media_manager.routers.canvas_editor import router as canvas_editor_router
 from app.routers.auth_router import router as auth_router
 from app.routers.billing_router import router as billing_router
 from app.routers.notification_router import router as notification_router
@@ -20,6 +25,8 @@ from app.routers.bug_report_router import router as bug_report_router
 from app.routers.client_router import router as client_router
 from app.routers.workspace_router import router as workspace_router
 from app.routers.workspace_member_router import router as workspace_member_router
+from app.agents.social_media_manager.routers.blog_router import router as blog_router
+from app.routers.agency_router import router as agency_router
 
 # Initialize Sentry
 initialize_sentry()
@@ -58,6 +65,26 @@ async def startup_event():
         print("✅ Unique email index ensured on users collection")
     except Exception as e:
         print(f"⚠️  Warning: Failed to create email index: {e}")
+
+    # Migrate social_connections index: old (user_id, platform, page_id) prevented the same
+    # user from connecting the same platform to multiple agency brands. Replace with
+    # (user_id, platform, brand_id, page_id) so each brand gets its own isolated connection.
+    try:
+        from app.database import get_db
+        db = await get_db()
+        existing = await db["social_connections"].index_information()
+        if "user_id_1_platform_1_page_id_1" in existing:
+            await db["social_connections"].drop_index("user_id_1_platform_1_page_id_1")
+            print("✅ Dropped old social_connections unique index (user_id, platform, page_id)")
+        await db["social_connections"].create_index(
+            [("user_id", 1), ("platform", 1), ("brand_id", 1), ("page_id", 1)],
+            unique=True,
+            sparse=True,
+            name="user_id_1_platform_1_brand_id_1_page_id_1",
+        )
+        print("✅ social_connections multi-brand index ensured")
+    except Exception as e:
+        print(f"⚠️  Warning: Failed to migrate social_connections index: {e}")
 
     # Start notification scheduler (PRD 8: Scheduled Jobs)
     try:
@@ -159,6 +186,25 @@ app.include_router(
 app.include_router(whatsapp_router)
 app.include_router(x_router)
 app.include_router(linkedin_router)
+
+# Include V3 testing router (isolated for A/B testing)
+app.include_router(v3_test_router, prefix="/social-media", tags=["V3 Testing"])
+
+# Include V3 toggle router (production integration with frontend toggle)
+app.include_router(v3_toggle_router, prefix="/social-media", tags=["V3 Production Toggle"])
+
+# Include Blog Generator (Writing DNA + blog generation)
+app.include_router(blog_router, prefix="/social-media", tags=["Blog Generator"])
+
+# Include custom visual guides routers
+app.include_router(custom_guides_router)  # V1
+app.include_router(custom_guides_v2_router)  # V2 - Advanced style transfer
+
+# Include Canvas Editor (layered document editing)
+app.include_router(canvas_editor_router, prefix="/social-media", tags=["Canvas Editor"])
+
+# Include Agency Accounts (agency layer wrapping Jane)
+app.include_router(agency_router, prefix="/social-media", tags=["Agency"])
 
 # Include multi-tenant routers (Enterprise/SDK features)
 app.include_router(client_router)

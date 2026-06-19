@@ -51,8 +51,16 @@ class Settings(BaseSettings):
     # Google Gemini (Nano Banana 2 image generation)
     GOOGLE_GEMINI_API_KEY: Optional[str] = None
 
-    # fal.ai image generation (staging model testing)
+    # fal.ai image/video generation
     FAL_API_KEY: Optional[str] = None
+
+    # Pexels stock video API (b-roll fetch for video production)
+    PEXELS_API_KEY: Optional[str] = None
+
+    # Cloudinary (cleaned video + b-roll hosting for Shotstack rendering)
+    CLOUDINARY_CLOUD_NAME: Optional[str] = None
+    CLOUDINARY_API_KEY: Optional[str] = None
+    CLOUDINARY_API_SECRET: Optional[str] = None
 
     # Google OAuth (Sign in with Google)
     GOOGLE_CLIENT_ID: Optional[str] = None
@@ -86,6 +94,31 @@ class Settings(BaseSettings):
     # Public-facing API base URL used for OAuth callbacks (must be reachable by browsers)
     # e.g. https://api-staging.urisocial.com  or  http://localhost:9003
     PUBLIC_API_URL: str = ""
+
+    # Video editing — path to royalty-free music library on the server
+    # Expected layout: {MUSIC_LIBRARY_PATH}/{mood}/*.mp3  e.g. /opt/uri-music/upbeat/track1.mp3
+    # Leave empty to skip background music (pipeline still runs, just without audio overlay)
+    MUSIC_LIBRARY_PATH: str = ""
+
+    # Pixabay API key — retained in config but Pixabay has no public music API
+    PIXABAY_API_KEY: Optional[str] = None
+
+    # Jamendo client ID — used to fetch CC-licensed background music by mood
+    # Default is Jamendo's public demo key (works immediately, rate-limited)
+    # Register a free production key at https://devportal.jamendo.com/
+    JAMENDO_CLIENT_ID: str = "b6747d04"
+
+    # ── Video Polish — Clipping API (PRD §4) ─────────────────────────────
+    # Sign up at https://reap.video to get your API key (entry tier, REST API available)
+    # Phase 0: test Reap, OpusClip, and Vizard on Nigerian footage before committing
+    REAP_API_KEY: Optional[str] = None
+
+    # ── Video Production — Render Engine ─────────────────────────────────
+    SHOTSTACK_API_KEY: Optional[str] = None
+    OPUSCLIP_API_KEY: Optional[str] = None   # Phase 0 testing only
+    VIZARD_API_KEY: Optional[str] = None      # Phase 0 testing only
+    # Set to 'reap' | 'opusclip' | 'vizard' after Phase 0 Pidgin test picks a winner
+    CLIPPING_API_PROVIDER: str = "reap"
 
     # Bypass flags for local development
     BYPASS_SUBSCRIPTION_CHECK: bool = False

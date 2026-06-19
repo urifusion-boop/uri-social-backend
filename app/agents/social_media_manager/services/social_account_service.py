@@ -18,13 +18,17 @@ class SocialAccountService:
         user_id: str,
         platforms: List[str],
         source: str = "onboarding",
+        brand_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Build Outstand OAuth URLs for each requested platform.
-        tenant_id is set to the URI user_id so Outstand can associate the
-        connected account with the correct user.
-        The frontend should open each auth_url for the user to authorise.
+        For agency brands, tenant_id is the brand_id so Outstand keeps
+        each brand's accounts isolated. Personal brands use user_id.
         """
+        from app.models.brand_account import BrandAccount
+        is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
+        tenant_id = user_id if is_personal else brand_id
+
         outstand = OutstandService()
         # Use PUBLIC_API_URL if set (browser-reachable), otherwise fall back to gateway URL
         _base = (settings.PUBLIC_API_URL or settings.URI_GATEWAY_BASE_API_URL).rstrip("/")
@@ -44,7 +48,7 @@ class SocialAccountService:
             try:
                 url = await outstand.get_auth_url(
                     network=network,
-                    tenant_id=user_id,
+                    tenant_id=tenant_id,
                     redirect_uri=callback_url,
                 )
                 auth_urls[platform.lower()] = url
@@ -132,11 +136,15 @@ class SocialAccountService:
         user_id: str,
         session_token: str,
         selected_page_ids: List[str],
+        brand_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Complete the OAuth flow by finalising the selected pages.
         Stores the connected account IDs in our local DB for fast publishing lookups.
         """
+        from app.models.brand_account import BrandAccount
+        is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
+
         outstand = OutstandService()
         try:
             result = await outstand.finalize_connection(session_token, selected_page_ids)
@@ -167,10 +175,15 @@ class SocialAccountService:
                     "connected_at": now,
                     "updated_at": now,
                 }
+                if not is_personal:
+                    doc["brand_id"] = brand_id
+
+                # Scope the delete to this brand so we don't wipe another brand's connection
+                brand_scope = {"user_id": user_id} if is_personal else {"brand_id": brand_id}
                 await db["social_connections"].delete_many({
                     "$or": [
                         {"id": outstand_account_id},
-                        {"user_id": user_id, "platform": network},
+                        {**brand_scope, "platform": network},
                     ]
                 })
                 await db["social_connections"].insert_one(doc)
@@ -207,19 +220,43 @@ class SocialAccountService:
     async def get_user_connections(
         db: AsyncIOMotorDatabase,
         user_id: str,
+        brand_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Return all social accounts connected by the user.
-        Queries Outstand for Outstand-managed accounts, then merges direct
-        connections from the local DB. Outstand failures are isolated so that
-        direct connections (e.g. Instagram) are always returned.
+        Return all social accounts connected for the active brand.
+
+        Agency Accounts isolation: connections are scoped per brand. A solo
+        user's personal brand keeps its legacy connections (tenant_id=user_id);
+        each agency brand has its own isolated set (tenant_id=brand_id).
+        Queries Outstand then merges direct connections from the local DB.
         """
+        from app.models.brand_account import BrandAccount
+
+        is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
+        personal_bid = BrandAccount.personal_brand_id(user_id)
+        tenant = user_id if is_personal else brand_id
+        # Personal brand: exclude docs that belong to an agency brand (they store
+        # user_id too, so a plain user_id filter would leak them across brands).
+        # Agency brand: match strictly by brand_id only.
+        if is_personal:
+            local_filter: Dict[str, Any] = {
+                "user_id": user_id,
+                "$or": [
+                    {"brand_id": {"$exists": False}},
+                    {"brand_id": None},
+                    {"brand_id": personal_bid},
+                ],
+            }
+        else:
+            local_filter = {"brand_id": brand_id}
+        local_filter["connection_status"] = "active"
+
         by_platform: Dict[str, list] = {}
 
         # 1. Outstand-managed accounts — failures must not prevent direct connections
         try:
             outstand = OutstandService()
-            result = await outstand.list_accounts(tenant_id=user_id)
+            result = await outstand.list_accounts(tenant_id=tenant)
             for acc in result.get("data", []):
                 platform = acc.get("network", "unknown")
                 by_platform.setdefault(platform, []).append({
@@ -245,10 +282,7 @@ class SocialAccountService:
                 for acc in accs
                 if acc.get("outstand_account_id")
             }
-            local_cursor = db["social_connections"].find({
-                "user_id": user_id,
-                "connection_status": "active",
-            })
+            local_cursor = db["social_connections"].find(local_filter)
             async for doc in local_cursor:
                 platform = doc.get("platform", "unknown")
                 doc_outstand_id = doc.get("outstand_account_id") or doc.get("id")
@@ -257,6 +291,7 @@ class SocialAccountService:
                 by_platform.setdefault(platform, []).append({
                     "platform": platform,
                     "connected_via": doc.get("connected_via"),
+                    "outstand_account_id": doc.get("outstand_account_id"),
                     "username": doc.get("username"),
                     "account_name": doc.get("account_name"),
                     "profile_picture_url": doc.get("profile_picture_url"),
@@ -288,19 +323,34 @@ class SocialAccountService:
         db: AsyncIOMotorDatabase,
         user_id: str,
         outstand_account_id: str,
+        brand_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Permanently disconnect a social account.
+        Permanently disconnect a social account scoped to the active brand.
         outstand_account_id is the ID returned by Outstand (e.g. '9dyJS').
         """
-        # Verify this account belongs to the user (local mirror check)
+        from app.models.brand_account import BrandAccount
+        is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
+        personal_bid = BrandAccount.personal_brand_id(user_id)
+        if is_personal:
+            brand_scope = {
+                "user_id": user_id,
+                "$or": [
+                    {"brand_id": {"$exists": False}},
+                    {"brand_id": None},
+                    {"brand_id": personal_bid},
+                ],
+            }
+        else:
+            brand_scope = {"brand_id": brand_id}
+
         local = await db["social_connections"].find_one({
-            "user_id": user_id,
+            **brand_scope,
             "outstand_account_id": outstand_account_id,
         })
         if not local:
             return UriResponse.error_response(
-                "Account not found or does not belong to this user.", code=404
+                "Account not found or does not belong to this brand.", code=404
             )
 
         outstand = OutstandService()
@@ -309,7 +359,7 @@ class SocialAccountService:
 
             # Remove from local mirror
             await db["social_connections"].delete_one({
-                "user_id": user_id,
+                **brand_scope,
                 "outstand_account_id": outstand_account_id,
             })
 

@@ -28,6 +28,22 @@ from app.services.IdeaScoringService import IdeaScoringService
 
 COLLECTION = "content_calendar_plans"
 
+
+def _cal_scope(user_id: str, brand_id: Optional[str]) -> Dict[str, Any]:
+    """Return a MongoDB filter that isolates calendar plans to the active brand."""
+    from app.models.brand_account import BrandAccount
+    personal_bid = BrandAccount.personal_brand_id(user_id)
+    if brand_id and brand_id != personal_bid:
+        return {"brand_id": brand_id}
+    return {
+        "user_id": user_id,
+        "$or": [
+            {"brand_id": {"$exists": False}},
+            {"brand_id": None},
+            {"brand_id": personal_bid},
+        ],
+    }
+
 CONTENT_TYPES = ["educational", "relatable", "promotional", "behind_the_scenes", "engagement"]
 
 # Four default mix variants — different type distributions so the shown
@@ -521,11 +537,13 @@ async def get_active_plan(
     user_id: str,
     db: AsyncIOMotorDatabase,
     week_start: Optional[str] = None,
+    brand_id: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     if week_start is None:
         week_start = _get_monday(datetime.utcnow()).strftime("%Y-%m-%d")
+    scope = _cal_scope(user_id, brand_id)
     doc = await db[COLLECTION].find_one(
-        {"user_id": user_id, "week_start": week_start, "status": "active"},
+        {**scope, "week_start": week_start, "status": "active"},
         {"_id": 0},
     )
     return doc
@@ -537,20 +555,22 @@ async def generate_plan(
     brand: Dict[str, Any],
     db: AsyncIOMotorDatabase,
     force: bool = False,
+    brand_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     now = datetime.utcnow()
     monday = _get_monday(now)
     week_start = monday.strftime("%Y-%m-%d")
+    scope = _cal_scope(user_id, brand_id)
 
     previous_titles: List[str] = []
 
     if force:
         # Grab current week's titles so AI doesn't regenerate the same ideas
-        existing_active = await get_active_plan(user_id, db, week_start)
+        existing_active = await get_active_plan(user_id, db, week_start, brand_id=brand_id)
         if existing_active:
             previous_titles = [d.get("title", "") for d in existing_active.get("days", []) if d.get("title")]
         await db[COLLECTION].update_many(
-            {"user_id": user_id, "week_start": week_start, "status": "active"},
+            {**scope, "week_start": week_start, "status": "active"},
             {"$set": {"status": "archived"}},
         )
         # Bust all v2 trend cache entries for this industry so we get fresh keywords
@@ -564,7 +584,7 @@ async def generate_plan(
             except Exception:
                 pass
     else:
-        existing = await get_active_plan(user_id, db, week_start)
+        existing = await get_active_plan(user_id, db, week_start, brand_id=brand_id)
         if existing:
             return existing
 
@@ -574,7 +594,7 @@ async def generate_plan(
     for weeks_ago in range(1, 5):
         past_monday = (monday - timedelta(days=7 * weeks_ago)).strftime("%Y-%m-%d")
         past_plan = await db[COLLECTION].find_one(
-            {"user_id": user_id, "week_start": past_monday},
+            {**scope, "week_start": past_monday},
             {"_id": 0, "days": 1},
         )
         if past_plan:
@@ -659,7 +679,7 @@ async def generate_plan(
     if not days:
         print(f"[Calendar] Both pipelines failed for user {user_id} — restoring previous plan")
         restored = await db[COLLECTION].find_one_and_update(
-            {"user_id": user_id, "week_start": week_start, "status": "archived"},
+            {**scope, "week_start": week_start, "status": "archived"},
             {"$set": {"status": "active"}},
             sort=[("generated_at", -1)],
             return_document=True,
@@ -674,6 +694,7 @@ async def generate_plan(
     doc = {
         "plan_id":          plan_id,
         "user_id":          user_id,
+        "brand_id":         brand_id,
         "week_start":       week_start,
         "generated_at":     now.isoformat(),
         "status":           "active",
@@ -736,9 +757,11 @@ async def regenerate_day(
     day_index: int,
     user_id: str,
     db: AsyncIOMotorDatabase,
+    brand_id: Optional[str] = None,
 ) -> Dict[str, Any]:
+    scope = _cal_scope(user_id, brand_id)
     plan = await db[COLLECTION].find_one(
-        {"plan_id": plan_id, "user_id": user_id},
+        {**scope, "plan_id": plan_id},
         {"_id": 0},
     )
     if not plan:
@@ -831,7 +854,7 @@ Title: max 10 words. Description: 2-3 sentences with a concrete, specific angle.
 
     now = datetime.utcnow()
     await db[COLLECTION].update_one(
-        {"plan_id": plan_id, "user_id": user_id},
+        {**scope, "plan_id": plan_id},
         {
             "$set": {
                 f"days.{day_index}.title": new_idea.get("title", ""),
@@ -842,7 +865,7 @@ Title: max 10 words. Description: 2-3 sentences with a concrete, specific angle.
         },
     )
 
-    updated = await db[COLLECTION].find_one({"plan_id": plan_id, "user_id": user_id}, {"_id": 0})
+    updated = await db[COLLECTION].find_one({**scope, "plan_id": plan_id}, {"_id": 0})
     return updated
 
 
@@ -852,9 +875,11 @@ async def mark_acted_on(
     draft_ids: List[str],
     user_id: str,
     db: AsyncIOMotorDatabase,
+    brand_id: Optional[str] = None,
 ) -> None:
+    scope = _cal_scope(user_id, brand_id)
     await db[COLLECTION].update_one(
-        {"plan_id": plan_id, "user_id": user_id},
+        {**scope, "plan_id": plan_id},
         {
             "$set": {f"days.{day_index}.acted_on": True},
             "$push": {f"days.{day_index}.acted_on_draft_ids": {"$each": draft_ids}},
@@ -865,10 +890,11 @@ async def mark_acted_on(
 async def get_today_suggestion(
     user_id: str,
     db: AsyncIOMotorDatabase,
+    brand_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     now = datetime.utcnow()
     week_start = _get_monday(now).strftime("%Y-%m-%d")
-    plan = await get_active_plan(user_id, db, week_start)
+    plan = await get_active_plan(user_id, db, week_start, brand_id=brand_id)
     if not plan:
         return {"has_plan": False}
 
