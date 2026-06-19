@@ -624,15 +624,14 @@ Return ONLY valid JSON (no markdown, no explanation):
 # ── Algorithmic silence + filler detection ────────────────────────────────────
 
 _SILENCE_THRESHOLD: Dict[str, float] = {
-    "tiktok":   0.8,
-    "product":  1.2,
-    "founder":  1.8,
+    "tiktok":   0.6,   # cut any gap ≥0.6s
+    "product":  0.9,
+    "founder":  1.4,
 }
 
-# SRT entries whose text is ONLY filler words are automatically cut.
-# "like" / "so" / "right" excluded — too often used meaningfully mid-sentence.
+# SRT entries whose text is ONLY filler sounds are automatically cut.
 _DEFINITE_FILLER_RE = re.compile(
-    r"^\s*(um+|uh+|ah+|hmm+|er+|erm+|mhm+|uhh+|umm+|huh)\s*[,.]?\s*$",
+    r"^\s*(um+|uh+|ah+|hmm+|er+|erm+|mhm+|uhh+|umm+|huh|mm+)\s*[,.]?\s*$",
     re.IGNORECASE,
 )
 
@@ -647,6 +646,32 @@ def _filler_cuts_from_srt(srt_entries: List[Dict[str, Any]]) -> List[Dict]:
                 "remove_end":   round(entry["end"],   3),
                 "reason":       f'filler word: "{entry["text"].strip()}"',
             })
+    return cuts
+
+
+def _repetition_cuts_from_srt(srt_entries: List[Dict[str, Any]]) -> List[Dict]:
+    """
+    Detect when the speaker repeats the same phrase within a short window.
+    Keeps the first occurrence, cuts the second.
+    Only triggers on ≥3-word matches to avoid false positives.
+    """
+    cuts: List[Dict] = []
+    already_cut: set = set()
+    for i, entry_i in enumerate(srt_entries):
+        words_i = entry_i["text"].lower().strip().split()
+        if len(words_i) < 3 or i in already_cut:
+            continue
+        for j in range(i + 1, min(i + 6, len(srt_entries))):
+            if j in already_cut:
+                continue
+            words_j = srt_entries[j]["text"].lower().strip().split()
+            if words_i == words_j:
+                cuts.append({
+                    "remove_start": round(srt_entries[j]["start"], 3),
+                    "remove_end":   round(srt_entries[j]["end"],   3),
+                    "reason":       f'repetition: "{srt_entries[j]["text"].strip()}"',
+                })
+                already_cut.add(j)
     return cuts
 
 
@@ -1044,30 +1069,33 @@ def build_shotstack_timeline(
     # ── Hook title card (rich-text overlay, first 2.5s) ──────────────────────
     hook_clips: List[Dict] = []
     if hook_text:
-        # Split into 2 lines in Python — the only reliable way to prevent overflow
-        # inside Shotstack's HTML renderer (CSS word-break is not always honoured).
+        # Shotstack's renderer ignores <br> inside <p>. Use two separate <p> block
+        # elements so lines are guaranteed to stack vertically.
         _hw = hook_text.upper().split()
         _mid = max(1, len(_hw) // 2)
         _line1 = " ".join(_hw[:_mid])
         _line2 = " ".join(_hw[_mid:])
-        hook_html = f"<p>{_line1}<br>{_line2}</p>" if _line2 else f"<p>{_line1}</p>"
-
+        _shadow = (
+            f"3px 3px 0 {primary_color},-3px -3px 0 {primary_color},"
+            f"3px -3px 0 {primary_color},-3px 3px 0 {primary_color}"
+        )
         hook_css = (
             "body{margin:0;padding:0;background:transparent;}"
-            f"p{{font-family:'Montserrat',sans-serif;font-size:58px;font-weight:900;"
+            f"p{{font-family:'Montserrat',sans-serif;font-size:60px;font-weight:900;"
             f"color:#FFFFFF;text-align:center;text-transform:uppercase;"
-            f"letter-spacing:-1px;line-height:1.15;"
-            f"text-shadow:3px 3px 0 {primary_color},-3px -3px 0 {primary_color},"
-            f"3px -3px 0 {primary_color},-3px 3px 0 {primary_color};"
-            f"margin:0;padding:8px 16px;}}"
+            f"letter-spacing:-1px;line-height:1.0;display:block;"
+            f"text-shadow:{_shadow};margin:0;padding:6px 20px;}}"
+        )
+        hook_html = (
+            f"<p>{_line1}</p><p>{_line2}</p>" if _line2 else f"<p>{_line1}</p>"
         )
         hook_clips = [{
             "asset": {
                 "type": "html",
                 "html": hook_html,
                 "css": hook_css,
-                "width": 980,
-                "height": 440,  # enough for 2 lines at 58px
+                "width": 960,
+                "height": 460,  # 2 lines × ~(60px font + 12px padding) × 1.0 line-height
             },
             "start": 0,
             "length": round(min(2.5, total_duration * 0.25), 3),
@@ -1081,31 +1109,31 @@ def build_shotstack_timeline(
     lower_third_clips: List[Dict] = []
     if brand_name:
         lt_dur = min(3.5, total_duration * 0.20)
-        # display:table shrinks the div to content width in all rendering engines —
-        # more reliable than inline-flex which Shotstack's renderer sometimes ignores.
+        # The BODY itself is the pill — no inner div needed.
+        # Canvas width is calculated to match the text so the pill can't be wider than the text.
+        # ~26px per uppercase char at 32px Montserrat + 64px padding.
+        lt_canvas_w = max(180, min(560, len(brand_name) * 26 + 80))
         lt_css = (
-            "body{margin:0;padding:8px 16px;background:transparent;}"
-            f"div{{display:table;background:{primary_color};"
-            f"padding:10px 28px;border-radius:6px;}}"
+            f"body{{margin:0;padding:12px 32px;background:{primary_color};}}"
             f"p{{font-family:'Montserrat',sans-serif;font-size:32px;font-weight:700;"
-            f"color:{secondary_color};text-transform:uppercase;letter-spacing:2px;"
-            f"margin:0;white-space:nowrap;}}"
+            f"color:{secondary_color};text-transform:uppercase;letter-spacing:3px;"
+            f"margin:0;white-space:nowrap;text-align:center;}}"
         )
         lower_third_clips = [{
             "asset": {
                 "type": "html",
-                "html": f"<div><p>{brand_name}</p></div>",
+                "html": f"<p>{brand_name}</p>",
                 "css": lt_css,
-                "width": 600,   # intentionally narrow — text pill must fit within this
-                "height": 90,
+                "width": lt_canvas_w,
+                "height": 76,
             },
             "start": 0,
             "length": round(lt_dur, 3),
             "position": "bottomLeft",
-            "offset": {"x": 0.01, "y": 0.18},
+            "offset": {"x": 0.02, "y": 0.18},
             "transition": {"in": "slideUp", "out": "fade"},
         }]
-        print(f"[VideoProduction] lower-third: '{brand_name}' dur={lt_dur:.1f}s", flush=True)
+        print(f"[VideoProduction] lower-third: '{brand_name}' w={lt_canvas_w}px dur={lt_dur:.1f}s", flush=True)
 
     # ── Outro card (last 3s — brand color bg + logo + tagline + website) ─────
     outro_clips: List[Dict] = []
@@ -1342,16 +1370,16 @@ async def run_production_job(
         music_mood = decisions.get("music_mood", "upbeat")
         hook_text = decisions.get("hook_text", "")
 
-        # Algorithmic cuts: silence gaps + definite filler words (um/uh/ah/hmm).
-        # These are deterministic — no dependency on GPT noticing them.
+        # Algorithmic cuts: silence gaps + filler sounds + exact repetitions.
         auto_cuts   = _auto_cuts_from_srt(srt_entries, duration, video_type)
         filler_cuts = _filler_cuts_from_srt(srt_entries)
-        cuts = _merge_cuts(auto_cuts + filler_cuts, gpt_cuts)
+        rep_cuts    = _repetition_cuts_from_srt(srt_entries)
+        cuts = _merge_cuts(auto_cuts + filler_cuts + rep_cuts, gpt_cuts)
         print(
-            f"[VideoProduction] silence_cuts={len(auto_cuts)} filler_cuts={len(filler_cuts)} "
-            f"gpt_cuts={len(gpt_cuts)} merged={len(cuts)} zooms={len(zooms)} "
-            f"sfx={len(sound_effects)} broll={len(broll_decisions)} pacing={pacing_note} "
-            f"hook='{hook_text}'",
+            f"[VideoProduction] silence={len(auto_cuts)} filler={len(filler_cuts)} "
+            f"repetition={len(rep_cuts)} gpt={len(gpt_cuts)} merged={len(cuts)} "
+            f"zooms={len(zooms)} sfx={len(sound_effects)} broll={len(broll_decisions)} "
+            f"pacing={pacing_note} hook='{hook_text}'",
             flush=True,
         )
 
