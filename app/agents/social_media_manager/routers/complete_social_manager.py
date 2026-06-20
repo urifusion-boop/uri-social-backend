@@ -4,7 +4,7 @@ import asyncio
 import json
 import subprocess
 import traceback
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query, Request, UploadFile, File, Form
+from fastapi import APIRouter, Body, Depends, HTTPException, BackgroundTasks, Query, Request, UploadFile, File, Form
 from fastapi.responses import RedirectResponse, StreamingResponse, JSONResponse
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from pydantic import BaseModel, Field
@@ -6075,3 +6075,52 @@ async def get_produce_video_job(
         raise HTTPException(status_code=404, detail="Job not found")
 
     return UriResponse.get_single_data_response("produce_video_job", doc)
+
+
+@router.post("/produce-video-job/{job_id}/start-render")
+async def start_produce_video_render(
+    job_id: str,
+    background_tasks: BackgroundTasks,
+    payload: dict = Body(default={}),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Approve AI decisions and start the render phase.
+    Called after GET /produce-video-job returns status=awaiting_review.
+    Body: { "decisions": { "cuts": [...], "zooms": [...], "sound_effects": [...],
+                           "broll": [...], "hook_text": "...", "music_mood": "..." } }
+    Omit or send empty body to use the AI decisions as-is.
+    """
+    from app.agents.social_media_manager.services.video_production_service import run_render_phase
+
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    doc = await db.video_production_jobs.find_one(
+        {"job_id": job_id, "user_id": user_id}, {"_id": 0, "status": 1, "ai_decisions": 1}
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if doc.get("status") != "awaiting_review":
+        raise HTTPException(status_code=409, detail=f"Job is not awaiting review (status={doc.get('status')})")
+
+    # Merge user edits on top of the stored AI decisions (user can remove/edit items)
+    approved = payload.get("decisions") if payload else None
+    if approved:
+        await db.video_production_jobs.update_one(
+            {"job_id": job_id},
+            {"$set": {"ai_decisions": approved}}
+        )
+
+    await db.video_production_jobs.update_one(
+        {"job_id": job_id},
+        {"$set": {"status": "processing", "status_message": "Rendering…", "progress": 56}}
+    )
+
+    background_tasks.add_task(run_render_phase, job_id, db)
+
+    return UriResponse.get_single_data_response(
+        "start_render", {"job_id": job_id, "status": "processing"}
+    )
