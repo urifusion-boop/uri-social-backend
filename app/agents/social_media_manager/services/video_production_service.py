@@ -548,7 +548,7 @@ class ShotstackProvider:
                 return r.get("status", "failed"), r.get("url", "")
 
 
-# ── GPT-4o Edit Decisions ─────────────────────────────────────────────────────
+# ── Phase 1: Content Analysis Engine — Phase 2: Editing Rules Engine ─────────
 
 def _summarise_tracking_data(tracking_data: dict, duration: float) -> str:
     """
@@ -593,102 +593,111 @@ def _summarise_tracking_data(tracking_data: dict, duration: float) -> str:
     return ("\n" + "\n".join(lines)) if lines else ""
 
 
-async def get_edit_decisions(
+_STYLE_GUIDES: Dict[str, str] = {
+    "tiktok":       "TikTok / Reels — fast, punchy, zero dead air. Hook in first 3s. High energy throughout.",
+    "product":      "Product demo — clean, confident, benefit-led. Show the transformation. Data-driven.",
+    "founder":      "Founder story — authentic, warm, credible. Preserve natural rhythm, don't over-cut.",
+    "educational":  "Educational — clear structure, highlight key insights and stats. Build understanding step by step.",
+    "podcast":      "Podcast clip — conversational energy, let ideas breathe but cut all dead air.",
+    "professional": "Professional — polished, confident, data-driven. Corporate credibility.",
+    "social_media": "Social Media — high energy, relatable, trend-aware. Optimised for feed scroll-stop.",
+}
+
+_CONFIDENCE_THRESHOLD = 0.80  # below this, skip the decision
+
+
+async def analyze_content(
     srt_text: str,
     video_type: str,
     duration: float,
     tracking_data: Optional[dict] = None,
 ) -> Dict[str, Any]:
-    """Feed transcript + video type to GPT-4o; get structured edit decisions."""
-    style_guide = {
-        "tiktok": (
-            "TikTok / Reels — fast, punchy, zero dead air. "
-            "Cut every filler word ('um', 'uh', 'like', 'you know'), every repeated false-start, every breath gap >0.6s. "
-            "Aim for 4–6 cuts. Keep each segment 4–8s. 3–4 zooms on the hardest-hitting words. "
-            "Music: high-energy. Hook must create instant curiosity or shock."
-        ),
-        "product": (
-            "Product demo — clean, confident, benefit-led. "
-            "Cut dead air >1.0s and any filler. Prefer cuts BETWEEN sentences, not mid-phrase. "
-            "3–4 cuts. 2–3 zooms on the key product claim or feature moment. "
-            "B-roll on every product mention. Music: upbeat or electronic. Hook names the transformation."
-        ),
-        "founder": (
-            "Founder story — authentic, warm, credible. "
-            "Cut dead air >1.5s but preserve natural breathing rhythm — don't over-cut. "
-            "2–3 cuts max. 1–2 zooms on the most emotional or definitive statement. "
-            "Music: acoustic or cinematic. Hook is the core insight or mission statement."
-        ),
-    }.get(video_type, (
-        "Short-form social — balanced pacing. Cut dead air >1.0s and filler words. "
-        "3–4 cuts, 2 zooms on key claims. Music matches the energy."
-    ))
-
+    """
+    Phase 1 — Content Analysis Engine.
+    GPT understands the content BEFORE any editing decisions are made.
+    Returns structured analysis: hook, main_points, cta, topic_changes,
+    emphasis_moments (with strength 1–10), keywords, cuts, music_mood.
+    """
+    style = _STYLE_GUIDES.get(video_type, "Short-form social video.")
     tracking_context = _summarise_tracking_data(tracking_data or {}, duration)
 
-    prompt = f"""You are a senior short-form video editor with 10 years of experience cutting viral TikTok, Instagram Reels, and YouTube Shorts content. You edit with surgical precision — every frame earns its place.
+    prompt = f"""You are an expert content analyst for short-form social video.
+Your job is to UNDERSTAND the content structure and identify what matters — before any editing decisions are made.
 
 VIDEO TYPE: {video_type}
-VIDEO DURATION: {duration:.1f}s
-STYLE GUIDE: {style_guide}
+DURATION: {duration:.1f}s
+STYLE: {style}
 
 TRANSCRIPT (SRT — timestamps are original video seconds):
 {srt_text}
-{f"WORD-LEVEL TIMING DATA:{tracking_context}" if tracking_context else ""}
+{f"WORD TIMING DATA:{tracking_context}" if tracking_context else ""}
 
-YOUR EDITING DECISIONS:
+ANALYSIS TASKS:
 
-cuts — remove dead air, filler, and repetition:
-- Pure silence gaps are already handled algorithmically. Focus your cuts on SPOKEN content that adds no value:
-  * Filler phrases: "like", "you know", "I mean", "basically", "kind of", "sort of", "right?", "okay so"
-  * False starts: speaker begins a sentence, stops, restarts — cut the false start
-  * Repetitions: speaker says the same idea twice in a row — keep the cleaner delivery, cut the other
-  * Throat clears, coughs, nervous laughter that interrupts the flow
-- remove_start and remove_end must be within [0, {duration:.1f}].
-- Every kept segment between cuts must be ≥4s. Do not create micro-clips.
-- When a filler phrase is in the MIDDLE of a sentence, cut only that phrase (tight cut). Do not cut the whole sentence.
+1. HOOK — The opening moment that earns the viewer's attention (usually 0–5s).
+   hook_type: curiosity | shock | question | story | stat
+   strength 1–10: how scroll-stopping is it?
 
-zooms — punch-in on emotional/impactful words:
-- "at" in original video seconds, within [0, {duration:.1f}].
-- intensity: "subtle" (gentle push) or "strong" (dramatic punch-in). Prefer subtle unless it's a climactic claim.
-- Zoom at the exact moment the impactful word begins, not after.
+2. MAIN POINTS — Map the content into 2–5 segments. What topic does each section cover?
 
-sound_effects — audio punctuation used SPARINGLY:
-- Types: whoosh (cut transition feel), impact (big reveal/claim), pop (list item), ding (win/result), swell (emotional shift).
-- Max 4 SFX total. Only where silence would feel flat. "at" in original video seconds.
+3. CTA — Any call to action near the end (follow, subscribe, comment, buy, etc.)
 
-broll — show don't tell. Cut to relevant visuals:
-- "at": original video seconds when cutaway starts.
-- "duration": 2.5–4.0 seconds.
-- "description": ultra-specific visual (e.g. "close-up of hands scrolling a phone showing Instagram feed").
-- "concept": 2–3 word Pexels/stock search (e.g. "phone social media").
-- Max 3 clips. Only where a visual would genuinely reinforce the point — never on the most expressive facial moments.
-- Space clips ≥3s apart. Do NOT overlap a zoom.
+4. TOPIC CHANGES — Moments where the speaker shifts to a distinctly new topic.
+   confidence 0.0–1.0.
 
-music_mood — single word from: upbeat, chill, cinematic, dramatic, acoustic, electronic.
+5. EMPHASIS MOMENTS — Strong claims, statistics, surprising facts, emotional peaks.
+   STRENGTH SCALE (be precise — this drives the editing engine):
+   8–10: Peak moment. Specific number, boldest claim, most surprising statement. Use sparingly (1–2 max).
+   4–7: Important supporting point worth a subtle punch.
+   1–3: Minor detail — skip it.
+   Include confidence 0.0–1.0.
 
-hook_text — the SINGLE most gripping line from this video, or a reframe of it.
-- 3–5 words, ALL CAPS. Must make a viewer stop scrolling.
-- Do NOT use generic phrases like "WATCH THIS" or "YOU NEED THIS".
-- Draw from the actual content: a specific number, a bold claim, a surprising fact.
+6. KEYWORDS — Brands, platforms, products, metrics, important nouns. Max 5.
+   These feed the visual asset search engine for b-roll and icons.
 
-Return ONLY valid JSON (no markdown, no explanation):
+7. CUTS — Remove only spoken content with zero value:
+   - Filler words/phrases: "um", "uh", "like", "you know", "I mean", "basically", "right?", "okay so"
+   - False starts: speaker begins, stops, restarts the same sentence
+   - Exact repetitions: same idea said twice in a row
+   - remove_start and remove_end within [0, {duration:.1f}]
+   - Every segment kept between cuts must be ≥4s
+   - confidence 0.0–1.0
+
+8. MUSIC MOOD — One word: upbeat | chill | cinematic | dramatic | acoustic | electronic
+
+Return ONLY valid JSON, no markdown:
 {{
+  "hook": {{
+    "start": 0,
+    "end": 4.5,
+    "text": "3 POSTS PER WEEK",
+    "hook_type": "curiosity",
+    "strength": 9
+  }},
+  "main_points": [
+    {{"start": 5, "end": 18, "summary": "Why consistency matters on social media"}},
+    {{"start": 19, "end": 35, "summary": "How content generates leads"}},
+    {{"start": 36, "end": 52, "summary": "Real-world example with results"}}
+  ],
+  "cta": {{
+    "start": 53,
+    "end": 60,
+    "text": "Follow for daily content tips"
+  }},
+  "topic_changes": [
+    {{"at": 18.5, "confidence": 0.94}},
+    {{"at": 35.2, "confidence": 0.91}}
+  ],
+  "emphasis_moments": [
+    {{"at": 12.5, "text": "This changed everything", "strength": 8, "confidence": 0.92}},
+    {{"at": 29.8, "text": "500 leads in 30 days", "strength": 10, "confidence": 0.98}}
+  ],
+  "keywords": ["Instagram", "leads", "content strategy"],
   "cuts": [
-    {{"remove_start": 4.2, "remove_end": 5.8, "reason": "filler: speaker said 'um you know'"}}
+    {{"remove_start": 4.2, "remove_end": 5.8, "reason": "filler: um you know", "confidence": 0.98}}
   ],
-  "zooms": [
-    {{"at": 12.5, "intensity": "strong", "reason": "climactic claim — highest impact word"}}
-  ],
-  "sound_effects": [
-    {{"at": 8.2, "type": "impact", "reason": "product reveal moment"}}
-  ],
-  "broll": [
-    {{"at": 6.0, "duration": 3.0, "description": "close-up of hands scrolling Instagram feed on iPhone", "concept": "phone social media", "reason": "speaker mentions social media"}}
-  ],
-  "pacing_note": "tight and punchy with emotional peak at 35s",
   "music_mood": "upbeat",
-  "hook_text": "3 POSTS PER WEEK"
+  "pacing_note": "tight with emotional peak at 30s"
 }}"""
 
     client = openai.AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
@@ -699,9 +708,111 @@ Return ONLY valid JSON (no markdown, no explanation):
     )
     text = response.choices[0].message.content or "{}"
     try:
-        return json.loads(text)
+        result = json.loads(text)
+        print(
+            f"[ContentAnalysis] hook='{result.get('hook', {}).get('text', '')}' "
+            f"main_points={len(result.get('main_points', []))} "
+            f"emphasis={len(result.get('emphasis_moments', []))} "
+            f"topic_changes={len(result.get('topic_changes', []))} "
+            f"keywords={result.get('keywords', [])} "
+            f"cuts={len(result.get('cuts', []))}",
+            flush=True,
+        )
+        return result
     except json.JSONDecodeError:
-        return {"cuts": [], "zooms": []}
+        return {}
+
+
+def apply_editing_rules(analysis: Dict[str, Any], duration: float) -> Dict[str, Any]:
+    """
+    Phase 2 — Editing Rules Engine.
+    Deterministic conversion of content analysis into render decisions.
+    GPT does NOT invent effects — this engine selects from the approved action library.
+
+    Strength mapping (from PRD):
+      8–10: zoom_in (strong) + impact_sound + caption_highlight
+      4–7:  zoom_in (subtle)
+      1–3:  no action
+    """
+    # ── Cuts: only high-confidence decisions apply automatically ─────────────
+    cuts = [
+        c for c in analysis.get("cuts", [])
+        if float(c.get("confidence", 1.0)) >= _CONFIDENCE_THRESHOLD
+    ]
+
+    zooms: List[Dict] = []
+    sound_effects: List[Dict] = []
+    used_times: List[float] = []
+
+    def _time_clear(at: float, min_gap: float = 4.0) -> bool:
+        return all(abs(at - t) >= min_gap for t in used_times)
+
+    # ── Emphasis rules ───────────────────────────────────────────────────────
+    for moment in sorted(
+        analysis.get("emphasis_moments", []), key=lambda m: -int(m.get("strength", 0))
+    ):
+        strength = int(moment.get("strength", 0))
+        at = float(moment.get("at", 0))
+        conf = float(moment.get("confidence", 1.0))
+
+        if conf < _CONFIDENCE_THRESHOLD or at >= duration or not _time_clear(at):
+            continue
+
+        if strength >= 8:
+            zooms.append({"at": at, "intensity": "strong", "reason": moment.get("text", "")})
+            sound_effects.append({"at": at, "type": "impact", "reason": "emphasis ≥8"})
+            used_times.append(at)
+        elif strength >= 4:
+            zooms.append({"at": at, "intensity": "subtle", "reason": moment.get("text", "")})
+            used_times.append(at)
+
+    # ── Topic change rules: whoosh SFX at each shift ─────────────────────────
+    for change in analysis.get("topic_changes", []):
+        at = float(change.get("at", 0))
+        conf = float(change.get("confidence", 1.0))
+        if conf >= _CONFIDENCE_THRESHOLD and at < duration and _time_clear(at, min_gap=2.0):
+            sound_effects.append({"at": at, "type": "whoosh", "reason": "topic change"})
+
+    # ── B-roll from main_points + keywords ───────────────────────────────────
+    keywords = analysis.get("keywords", [])
+    broll: List[Dict] = []
+    for i, point in enumerate(analysis.get("main_points", [])[:3]):
+        at = float(point.get("start", 0)) + 2.0
+        if at >= duration:
+            continue
+        # Use keyword matching the point index, fall back to summary
+        concept = keywords[i] if i < len(keywords) else ""
+        description = point.get("summary", concept)
+        if concept or description:
+            broll.append({
+                "at": round(at, 2),
+                "duration": 3.0,
+                "description": description,
+                "concept": concept or description,
+                "reason": f"visual for: {description}",
+            })
+
+    # ── Hook ─────────────────────────────────────────────────────────────────
+    hook = analysis.get("hook", {})
+    hook_text = hook.get("text", "").upper().strip() if hook else ""
+
+    return {
+        "cuts":             cuts,
+        "zooms":            zooms[:4],
+        "sound_effects":    sound_effects[:4],
+        "broll":            broll[:3],
+        "hook_text":        hook_text,
+        "music_mood":       analysis.get("music_mood", "upbeat"),
+        "topic_changes":    analysis.get("topic_changes", []),
+        "emphasis_moments": analysis.get("emphasis_moments", []),
+        "keywords":         keywords,
+        "content_structure": {
+            "hook":        hook,
+            "main_points": analysis.get("main_points", []),
+            "cta":         analysis.get("cta", {}),
+        },
+        "pacing_note": analysis.get("pacing_note", ""),
+    }
 
 # ── Algorithmic silence + filler + repetition detection ──────────────────────
 
@@ -1575,19 +1686,20 @@ async def run_production_job(
 
         print(f"[VideoProduction] render source={clean_video_url[:80]}…", flush=True)
 
-        # ── Stage 3: GPT-4o edit decisions ───────────────────────────────────────
-        await update(48, "AI making edit decisions…")
-        # Parse SRT early so we can compute algorithmic silence cuts.
+        # ── Stage 3: Content Analysis (Phase 1) + Editing Rules (Phase 2) ────────
+        await update(48, "AI analyzing content…")
         srt_entries = _parse_srt(srt_text)
 
-        decisions = await get_edit_decisions(srt_text, video_type, duration, tracking_data)
-        gpt_cuts = decisions.get("cuts", [])
-        zooms = decisions.get("zooms", [])
-        sound_effects = decisions.get("sound_effects", [])
-        broll_decisions = decisions.get("broll", [])[:3]
-        pacing_note = decisions.get("pacing_note", "")
-        music_mood = decisions.get("music_mood", "upbeat")
-        hook_text = decisions.get("hook_text", "")
+        analysis  = await analyze_content(srt_text, video_type, duration, tracking_data)
+        decisions = apply_editing_rules(analysis, duration)
+
+        gpt_cuts       = decisions["cuts"]
+        zooms          = decisions["zooms"]
+        sound_effects  = decisions["sound_effects"]
+        broll_decisions = decisions["broll"]
+        hook_text      = decisions["hook_text"]
+        music_mood     = decisions["music_mood"]
+        pacing_note    = decisions["pacing_note"]
 
         # Algorithmic cuts — word-level when Reap provides timestamps, SRT fallback otherwise.
         words = _extract_words(tracking_data)
