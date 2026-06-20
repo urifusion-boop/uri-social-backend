@@ -1721,6 +1721,45 @@ async def run_production_job(
             flush=True,
         )
 
+        # ── REVIEW PAUSE — store decisions + render context, wait for user approval ─
+        await db.video_production_jobs.update_one(
+            {"job_id": job_id},
+            {"$set": {
+                "status": "awaiting_review",
+                "status_message": "Review AI decisions before rendering",
+                "progress": 55,
+                "ai_decisions": {
+                    "cuts": cuts,
+                    "zooms": zooms,
+                    "sound_effects": sound_effects,
+                    "broll": broll_decisions,
+                    "hook_text": hook_text,
+                    "music_mood": music_mood,
+                    "pacing_note": pacing_note,
+                },
+                "render_context": {
+                    "static_url": static_url,
+                    "cloudinary_url": clean_video_url,
+                    "srt_text": srt_text,
+                    "duration": duration,
+                    "video_type": video_type,
+                    "logo_url": logo_url,
+                    "brand_name": brand_name,
+                    "primary_color": primary_color,
+                    "secondary_color": secondary_color,
+                    "tagline": tagline,
+                    "website": website,
+                },
+            }}
+        )
+        print(
+            f"[VideoProduction] job={job_id} awaiting_review — "
+            f"{len(cuts)} cuts {len(zooms)} zooms {len(sound_effects)} sfx "
+            f"hook='{hook_text}'",
+            flush=True,
+        )
+        return  # pipeline resumes via POST /produce-video-job/{id}/start-render
+
         # ── Stage 4: Fetch assets — b-roll (Pexels → fal.ai) + SFX library ──────
         broll: List[Dict] = []
         if broll_decisions:
@@ -1832,6 +1871,148 @@ async def run_production_job(
 
     except Exception as exc:
         print(f"[VideoProduction] FAILED job={job_id}: {exc}", flush=True)
+        await db.video_production_jobs.update_one(
+            {"job_id": job_id},
+            {"$set": {"status": "failed", "status_message": str(exc), "progress": 0}},
+        )
+
+
+async def run_render_phase(job_id: str, db) -> None:
+    """
+    Resume a production job from the render phase.
+    Reads ai_decisions + render_context saved at the review pause point.
+    Called after the user approves (or modifies) decisions via /start-render.
+    """
+    shotstack = ShotstackProvider()
+
+    async def update(progress: int, message: str, status: str = "processing", **extra):
+        doc: Dict[str, Any] = {"progress": progress, "status_message": message, "status": status}
+        doc.update(extra)
+        await db.video_production_jobs.update_one({"job_id": job_id}, {"$set": doc})
+        print(f"[VideoProduction:render] job={job_id} {progress}% {message}", flush=True)
+
+    try:
+        job_doc = await db.video_production_jobs.find_one({"job_id": job_id})
+        if not job_doc:
+            raise RuntimeError("Job not found")
+
+        decisions       = job_doc.get("ai_decisions", {})
+        ctx             = job_doc.get("render_context", {})
+
+        cuts            = decisions.get("cuts", [])
+        zooms           = decisions.get("zooms", [])
+        sound_effects   = decisions.get("sound_effects", [])
+        broll_decisions = decisions.get("broll", [])
+        hook_text       = decisions.get("hook_text", "")
+        music_mood      = decisions.get("music_mood", "upbeat")
+        pacing_note     = decisions.get("pacing_note", "")
+
+        clean_video_url = ctx.get("cloudinary_url") or ctx.get("static_url", "")
+        srt_text        = ctx.get("srt_text", "")
+        duration        = float(ctx.get("duration", 120.0))
+        video_type      = ctx.get("video_type", "founder")
+        logo_url        = ctx.get("logo_url", "")
+        brand_name      = ctx.get("brand_name", "")
+        primary_color   = ctx.get("primary_color", "#FFD700")
+        secondary_color = ctx.get("secondary_color", "#000000")
+        tagline         = ctx.get("tagline", "")
+        website         = ctx.get("website", "")
+
+        srt_entries = _parse_srt(srt_text)
+
+        # ── Stage 4a: B-roll ──────────────────────────────────────────────────────
+        broll: List[Dict] = []
+        if broll_decisions:
+            await update(58, "Fetching b-roll assets…")
+            tasks = [
+                _fetch_broll_url(br.get("description", ""), br.get("concept", ""))
+                for br in broll_decisions
+            ]
+            urls = await asyncio.gather(*tasks, return_exceptions=True)
+            for br, url in zip(broll_decisions, urls):
+                if isinstance(url, str) and url:
+                    broll.append({**br, "url": url})
+            print(f"[VideoProduction:render] broll {len(broll)}/{len(broll_decisions)}", flush=True)
+
+        # ── Stage 4b: Music ───────────────────────────────────────────────────────
+        await update(62, "Selecting background music…")
+        music_url = _pick_music_url(music_mood)
+
+        # ── Stage 5: Build Cloudinary cut URL + Shotstack timeline ───────────────
+        await update(65, "Building edit timeline…")
+
+        luma_pid       = _LUMA_MATTE_BY_TYPE.get(video_type, "uri-transitions/circle-wipe")
+        transition_dur = _TRANSITION_DUR_BY_TYPE.get(video_type, _CLD_TRANSITION_DUR)
+        cloudinary_cut_url = ""
+        if "res.cloudinary.com" in (clean_video_url or ""):
+            cld_pid = _cloudinary_public_id(clean_video_url)
+            if cld_pid:
+                keep_segs = _build_keep_segments(cuts, duration)
+                if len(keep_segs) > 1:
+                    cloudinary_cut_url = _build_cloudinary_cut_url(
+                        cld_pid, keep_segs, luma_pid, transition_dur,
+                        hook_text=hook_text,
+                        primary_color=primary_color,
+                    )
+
+        timeline = build_shotstack_timeline(
+            video_url=clean_video_url,
+            video_duration=duration,
+            cuts=cuts,
+            zooms=zooms,
+            srt_entries=srt_entries,
+            sound_effects=sound_effects,
+            broll=broll,
+            aspect_ratio="9:16",
+            job_id=job_id,
+            music_url=music_url,
+            hook_text=hook_text,
+            cloudinary_cut_url=cloudinary_cut_url,
+            transition_dur=transition_dur if cloudinary_cut_url else 0.0,
+            logo_url=logo_url,
+            brand_name=brand_name,
+            primary_color=primary_color,
+            secondary_color=secondary_color,
+            tagline=tagline,
+            website=website,
+        )
+
+        await update(68, "Rendering video…")
+        render_id = await shotstack.render(timeline)
+        print(f"[VideoProduction:render] render_id={render_id}", flush=True)
+
+        progress_steps = [70, 75, 80, 85, 88, 90, 92, 94, 96, 97, 98]
+        step_i = 0
+        for _ in range(90):
+            await asyncio.sleep(10)
+            render_status, render_url = await shotstack.get_render(render_id)
+            print(f"[VideoProduction:render] status={render_status}", flush=True)
+
+            if render_status == "done" and render_url:
+                await update(100, "Done!", status="ready",
+                             output_url=render_url,
+                             render_id=render_id,
+                             cuts=cuts, zooms=zooms,
+                             sound_effects=sound_effects,
+                             broll=broll,
+                             pacing_note=pacing_note,
+                             music_mood=music_mood,
+                             srt=srt_text,
+                             completed_at=datetime.now(timezone.utc).isoformat())
+                return
+            if render_status == "failed":
+                raise RuntimeError("Shotstack render failed")
+
+            p = progress_steps[min(step_i, len(progress_steps) - 1)]
+            step_i += 1
+            msg = {"queued": "Queued…", "fetching": "Fetching assets…",
+                   "rendering": "Rendering…", "saving": "Saving…"}.get(render_status, "Rendering…")
+            await update(p, msg)
+
+        raise RuntimeError("Render timed out after 15 minutes")
+
+    except Exception as exc:
+        print(f"[VideoProduction:render] FAILED job={job_id}: {exc}", flush=True)
         await db.video_production_jobs.update_one(
             {"job_id": job_id},
             {"$set": {"status": "failed", "status_message": str(exc), "progress": 0}},
