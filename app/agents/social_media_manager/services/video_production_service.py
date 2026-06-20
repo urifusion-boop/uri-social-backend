@@ -796,6 +796,31 @@ def apply_editing_rules(analysis: Dict[str, Any], duration: float) -> Dict[str, 
     hook = analysis.get("hook", {})
     hook_text = hook.get("text", "").upper().strip() if hook else ""
 
+    # ── Caption cues — time windows that get styled caption tracks ────────────
+    # emphasis_moments with strength ≥7 → "emphasis" style (bigger, bolder)
+    # CTA section → "cta" style (brand color, higher position)
+    # SRT entries with 3+ digit numbers/metrics → auto-detected as "metric"
+    caption_cues: List[Dict[str, Any]] = []
+    for moment in analysis.get("emphasis_moments", []):
+        conf     = float(moment.get("confidence", 0))
+        strength = int(moment.get("strength", 0))
+        at       = float(moment.get("at", 0))
+        if conf >= _CONFIDENCE_THRESHOLD and at < duration and strength >= 7:
+            caption_cues.append({
+                "start": max(0.0, at - 0.5),
+                "end":   min(duration, at + 3.5),
+                "type":  "emphasis",
+            })
+    cta = analysis.get("cta") or {}
+    cta_start = cta.get("start")
+    cta_end   = cta.get("end")
+    if cta_start is not None and cta_end is not None:
+        caption_cues.append({
+            "start": float(cta_start),
+            "end":   float(cta_end),
+            "type":  "cta",
+        })
+
     return {
         "cuts":             cuts,
         "zooms":            zooms[:4],
@@ -806,6 +831,7 @@ def apply_editing_rules(analysis: Dict[str, Any], duration: float) -> Dict[str, 
         "topic_changes":    analysis.get("topic_changes", []),
         "emphasis_moments": analysis.get("emphasis_moments", []),
         "keywords":         keywords,
+        "caption_cues":     caption_cues,
         "content_structure": {
             "hook":        hook,
             "main_points": analysis.get("main_points", []),
@@ -813,6 +839,32 @@ def apply_editing_rules(analysis: Dict[str, Any], duration: float) -> Dict[str, 
         },
         "pacing_note": analysis.get("pacing_note", ""),
     }
+
+# ── Caption type detection ────────────────────────────────────────────────────
+
+# Auto-detect metric captions: 3+ digit numbers, multipliers, currency
+_METRIC_PATTERN = re.compile(
+    r'(?:'
+    r'\b\d{3,}[\d,.]*\b'          # 500, 5000, 5,000
+    r'|\b\d+\s*[kKmMbB%x]\b'     # 5k, 3M, 50%, 3x
+    r'|[£$₦€]\s*\d+'              # $50, £100, ₦5000
+    r')',
+)
+
+
+def _get_caption_type(
+    orig_start: float,
+    caption_cues: List[Dict[str, Any]],
+    entry_text: str,
+) -> str:
+    """Assign an SRT entry to a caption style type based on time-based cues or text content."""
+    for cue in caption_cues:
+        if float(cue.get("start", -1)) <= orig_start < float(cue.get("end", -1)):
+            return cue.get("type", "standard")
+    if _METRIC_PATTERN.search(entry_text):
+        return "metric"
+    return "standard"
+
 
 # ── Algorithmic silence + filler + repetition detection ──────────────────────
 
@@ -1156,6 +1208,7 @@ def build_shotstack_timeline(
     secondary_color: str = "#000000",
     tagline: str = "",              # tagline shown on outro card
     website: str = "",              # website shown on outro card
+    caption_cues: Optional[List[Dict[str, Any]]] = None,  # time windows for styled captions
 ) -> Dict[str, Any]:
     # broll items have: at (original ts), duration, url (resolved)
     keep_segments = _build_keep_segments(cuts, video_duration)
@@ -1227,94 +1280,130 @@ def build_shotstack_timeline(
             video_clips.append(clip)
             timeline_pos += seg_dur
 
-    # ── Caption track ─────────────────────────────────────────────────────────
-    # Build a remapped SRT with timeline timestamps (after cuts applied) and
-    # host it on our static server. Shotstack's rich-caption asset reads it
-    # natively — gives us built-in animation, stroke, and font rendering without
-    # the html asset's background/visibility quirks.
-    caption_clips: List[Dict] = []
-    srt_dir = "/app/static/srt"
-    os.makedirs(srt_dir, exist_ok=True)
+    # ── Caption track — 4 style types ────────────────────────────────────────
+    # Each SRT entry is routed to exactly one type (standard / emphasis / metric / cta).
+    # Each type gets its own SRT file + rich-caption clip with distinct styling.
+    # All clips run for the full video duration; only entries in their SRT are shown.
+    _cues = caption_cues or []
+    _MAX_CAPTION_WORDS = 5
+    _CAP_TYPES = ("standard", "emphasis", "metric", "cta")
+    type_srt_lines: Dict[str, List[str]] = {t: [] for t in _CAP_TYPES}
+    type_entry_num: Dict[str, int]       = {t: 1    for t in _CAP_TYPES}
 
-    _MAX_CAPTION_WORDS = 5  # max words per caption card for readability
-
-    srt_lines: List[str] = []
-    entry_num = 1
     for entry in srt_entries:
         tl_start = _original_to_timeline(entry["start"], keep_segments, transition_dur=transition_dur)
-        tl_end = _original_to_timeline(entry["end"], keep_segments, clamp=True, transition_dur=transition_dur)
+        tl_end   = _original_to_timeline(entry["end"],   keep_segments, clamp=True, transition_dur=transition_dur)
         if tl_start is None or tl_end is None:
             continue
         tl_start = max(0.0, tl_start)
-        tl_end = min(total_duration, tl_end)
+        tl_end   = min(total_duration, tl_end)
         entry_dur = tl_end - tl_start
         if entry_dur < 0.1:
             continue
 
+        cap_type = _get_caption_type(entry["start"], _cues, entry["text"])
+
         words = entry["text"].split()
         if len(words) <= _MAX_CAPTION_WORDS:
-            # Short enough — emit as-is
-            srt_lines += [str(entry_num), f"{_srt_time(tl_start)} --> {_srt_time(tl_end)}", entry["text"], ""]
-            entry_num += 1
+            n = type_entry_num[cap_type]
+            type_srt_lines[cap_type] += [
+                str(n), f"{_srt_time(tl_start)} --> {_srt_time(tl_end)}", entry["text"], ""
+            ]
+            type_entry_num[cap_type] += 1
         else:
-            # Split into chunks, distributing time proportionally by word count
-            chunks: List[List[str]] = []
-            for j in range(0, len(words), _MAX_CAPTION_WORDS):
-                chunks.append(words[j:j + _MAX_CAPTION_WORDS])
+            chunks = [words[j:j + _MAX_CAPTION_WORDS] for j in range(0, len(words), _MAX_CAPTION_WORDS)]
             per_word_dur = entry_dur / len(words)
-            chunk_start = tl_start
+            chunk_start  = tl_start
             for chunk in chunks:
                 chunk_dur = per_word_dur * len(chunk)
                 chunk_end = min(tl_end, round(chunk_start + chunk_dur, 3))
                 if chunk_end - chunk_start < 0.05:
                     continue
-                srt_lines += [
-                    str(entry_num),
-                    f"{_srt_time(chunk_start)} --> {_srt_time(chunk_end)}",
-                    " ".join(chunk),
-                    "",
+                n = type_entry_num[cap_type]
+                type_srt_lines[cap_type] += [
+                    str(n), f"{_srt_time(chunk_start)} --> {_srt_time(chunk_end)}", " ".join(chunk), ""
                 ]
-                entry_num += 1
+                type_entry_num[cap_type] += 1
                 chunk_start = chunk_end
 
-    srt_filename = f"{job_id or 'job'}.srt"
-    with open(f"{srt_dir}/{srt_filename}", "w", encoding="utf-8") as f:
-        f.write("\n".join(srt_lines))
+    srt_dir = "/app/static/srt"
+    os.makedirs(srt_dir, exist_ok=True)
 
-    srt_url = f"https://api-staging.urisocial.com/static/srt/{srt_filename}"
-    print(f"[VideoProduction] caption SRT written: {srt_dir}/{srt_filename} ({entry_num - 1} entries) → {srt_url}", flush=True)
-
-    caption_clips = [{
-        "asset": {
-            "type": "rich-caption",
-            "src": srt_url,
-            "font": {
-                "family": "Montserrat",
-                "size": 46,
-                "color": "#ffffff",
-                "weight": 800,
-            },
-            "stroke": {
-                "width": 2,
-                "color": "#000000",
-                "opacity": 1,
-            },
-            "animation": {"style": "karaoke"},
-            # Active word: contrasting text on brand primary color background
-            "active": {
-                "font": {"color": secondary_color, "background": primary_color},
-                "stroke": {"width": 0, "color": "#000000", "opacity": 0},
-            },
-            "style": {"textTransform": "uppercase"},
-            "padding": {"top": 6, "right": 20, "bottom": 6, "left": 20},
+    # Per-type Shotstack rich-caption styling
+    _cap_style_map: Dict[str, Dict] = {
+        "standard": {
+            "font":    {"family": "Montserrat", "size": 46, "color": "#ffffff", "weight": 800},
+            "stroke":  {"width": 2, "color": "#000000", "opacity": 1},
+            "active":  {"font": {"color": secondary_color, "background": primary_color},
+                        "stroke": {"width": 0, "color": "#000000", "opacity": 0}},
+            "width":   580, "height": 220, "y": 0.07,
         },
-        "start": 0,
-        "length": "end",
-        "width": 580,      # ~54% of 1080px — tight block, not edge-to-edge
-        "height": 220,
-        "position": "bottom",
-        "offset": {"x": 0, "y": 0.07},
-    }]
+        "emphasis": {
+            # Bigger, heavier — reserved for high-strength emphasis moments
+            "font":    {"family": "Montserrat", "size": 58, "color": "#ffffff", "weight": 900},
+            "stroke":  {"width": 3, "color": "#000000", "opacity": 1},
+            "active":  {"font": {"color": "#ffffff", "background": primary_color},
+                        "stroke": {"width": 0, "color": "#000000", "opacity": 0}},
+            "width":   640, "height": 260, "y": 0.09,
+        },
+        "metric": {
+            # Gold text so numbers/stats stand out visually
+            "font":    {"family": "Montserrat", "size": 52, "color": "#FFE566", "weight": 900},
+            "stroke":  {"width": 2, "color": "#000000", "opacity": 1},
+            "active":  {"font": {"color": "#000000", "background": "#FFE566"},
+                        "stroke": {"width": 0, "color": "#000000", "opacity": 0}},
+            "width":   580, "height": 220, "y": 0.07,
+        },
+        "cta": {
+            # Slightly higher position + brand accent to feel like a call-to-action
+            "font":    {"family": "Montserrat", "size": 44, "color": "#ffffff", "weight": 800},
+            "stroke":  {"width": 2, "color": "#000000", "opacity": 0.8},
+            "active":  {"font": {"color": "#ffffff", "background": primary_color},
+                        "stroke": {"width": 0, "color": "#000000", "opacity": 0}},
+            "width":   580, "height": 220, "y": 0.12,
+        },
+    }
+
+    caption_clips: List[Dict] = []
+    total_cap_entries = 0
+    for cap_type in _CAP_TYPES:
+        lines = type_srt_lines[cap_type]
+        if not lines:
+            continue
+        n_entries = type_entry_num[cap_type] - 1
+        total_cap_entries += n_entries
+        srt_filename = f"{job_id or 'job'}_{cap_type}.srt"
+        with open(f"{srt_dir}/{srt_filename}", "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+        srt_url = f"https://api-staging.urisocial.com/static/srt/{srt_filename}"
+        print(
+            f"[VideoProduction] caption:{cap_type} {n_entries} entries → {srt_url}",
+            flush=True,
+        )
+        st = _cap_style_map[cap_type]
+        caption_clips.append({
+            "asset": {
+                "type":      "rich-caption",
+                "src":       srt_url,
+                "font":      st["font"],
+                "stroke":    st["stroke"],
+                "animation": {"style": "karaoke"},
+                "active":    st["active"],
+                "style":     {"textTransform": "uppercase"},
+                "padding":   {"top": 6, "right": 20, "bottom": 6, "left": 20},
+            },
+            "start":    0,
+            "length":   "end",
+            "width":    st["width"],
+            "height":   st["height"],
+            "position": "bottom",
+            "offset":   {"x": 0, "y": st["y"]},
+        })
+    print(
+        f"[VideoProduction] captions: {total_cap_entries} total entries "
+        f"across {len(caption_clips)} style track(s)",
+        flush=True,
+    )
 
     # ── SFX audio track ───────────────────────────────────────────────────────
     sfx_clips: List[Dict] = []
@@ -1906,6 +1995,7 @@ async def run_render_phase(job_id: str, db) -> None:
         hook_text       = decisions.get("hook_text", "")
         music_mood      = decisions.get("music_mood", "upbeat")
         pacing_note     = decisions.get("pacing_note", "")
+        caption_cues    = decisions.get("caption_cues", [])
 
         clean_video_url = ctx.get("cloudinary_url") or ctx.get("static_url", "")
         srt_text        = ctx.get("srt_text", "")
@@ -1975,6 +2065,7 @@ async def run_render_phase(job_id: str, db) -> None:
             secondary_color=secondary_color,
             tagline=tagline,
             website=website,
+            caption_cues=caption_cues,
         )
 
         await update(68, "Rendering video…")
