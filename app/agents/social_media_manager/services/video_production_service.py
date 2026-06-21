@@ -245,6 +245,132 @@ _TRANSITION_DUR_BY_TYPE: Dict[str, float] = {
 _CLD_TRANSITION_DUR = 2.5   # default fallback
 _MIN_SEG_DUR       = 6.0   # minimum keep-segment length (must exceed max transition_dur)
 
+# Shotstack overlay style per video type for topic-change transitions.
+# "color: None" → falls back to the brand primary_color at render time.
+_TRANSITION_STYLE_BY_VIDEO_TYPE: Dict[str, Dict] = {
+    "tiktok":       {"type": "flash", "color": "#ffffff", "duration": 0.15, "opacity": 0.65},
+    "product":      {"type": "flash", "color": None,      "duration": 0.20, "opacity": 0.40},
+    "founder":      {"type": "swipe", "color": None,      "duration": 0.40, "opacity": 0.55},
+    "educational":  {"type": "flash", "color": "#ffffff", "duration": 0.20, "opacity": 0.45},
+    "podcast":      {"type": "flash", "color": "#ffffff", "duration": 0.15, "opacity": 0.35},
+    "professional": {"type": "swipe", "color": None,      "duration": 0.35, "opacity": 0.50},
+    "social_media": {"type": "flash", "color": "#ffffff", "duration": 0.12, "opacity": 0.70},
+}
+_DEFAULT_TRANSITION_STYLE: Dict[str, Any] = {
+    "type": "flash", "color": "#ffffff", "duration": 0.20, "opacity": 0.50,
+}
+
+
+# ── Icon overlay asset library ────────────────────────────────────────────────
+# Each category has an emoji fallback and an optional Lottie JSON URL.
+# Set LOTTIEFILES_API_KEY env var to enable dynamic search (free account suffices).
+# Lottie URLs can also be replaced with Cloudinary-hosted .json raw assets.
+_CDN = "https://res.cloudinary.com/df8ckaeam/raw/upload"
+_ICON_OVERLAY_LIBRARY: Dict[str, Dict[str, Any]] = {
+    "fire":      {"emoji": "🔥", "lottie": f"{_CDN}/uri-lottie/fire.json", "position": "topRight",     "size": 150},
+    "star":      {"emoji": "⭐", "lottie": f"{_CDN}/uri-lottie/star.json", "position": "topRight",     "size": 140},
+    "money":     {"emoji": "💰", "lottie": None,                            "position": "topRight",     "size": 140},
+    "chart":     {"emoji": "📈", "lottie": None,                            "position": "topRight",     "size": 130},
+    "celebrate": {"emoji": "🎉", "lottie": None,                            "position": "topCenter",    "size": 180},
+    "arrow_up":  {"emoji": "👆", "lottie": f"{_CDN}/uri-lottie/idea.json", "position": "bottomCenter", "size": 130},
+    "heart":     {"emoji": "❤️", "lottie": None,                            "position": "topRight",     "size": 130},
+    "rocket":    {"emoji": "🚀", "lottie": None,                            "position": "topRight",     "size": 150},
+}
+_LOTTIEFILES_API_URL = "https://graphql.lottiefiles.com/2022-08"
+
+
+async def _search_lottiefiles_api(keyword: str, api_key: str) -> Optional[str]:
+    """
+    Query the LottieFiles GraphQL API for a public animation matching `keyword`.
+    Returns the JSON download URL of the first result, or None on failure.
+    """
+    gql = """
+    query Search($q: String!) {
+      searchPublicAnimations(query: $q, first: 1) {
+        edges { node { jsonUrl } }
+      }
+    }
+    """
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                _LOTTIEFILES_API_URL,
+                json={"query": gql, "variables": {"q": keyword}},
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=6),
+            ) as resp:
+                if resp.status == 200:
+                    body = await resp.json()
+                    edges = (
+                        body.get("data", {})
+                            .get("searchPublicAnimations", {})
+                            .get("edges", [])
+                    )
+                    if edges:
+                        url = edges[0]["node"].get("jsonUrl", "")
+                        if url:
+                            return url
+    except Exception as exc:
+        print(f"[LottieFiles] API search failed keyword={keyword!r}: {exc}", flush=True)
+    return None
+
+
+async def _resolve_icon_html(category: str) -> str:
+    """
+    Build a Shotstack-ready HTML string for an icon overlay.
+    If a LottieFiles API key is available (env: LOTTIEFILES_API_KEY), attempts to fetch
+    an animated Lottie JSON and inlines it; otherwise falls back to a bouncing emoji.
+    """
+    cfg  = _ICON_OVERLAY_LIBRARY.get(category, _ICON_OVERLAY_LIBRARY["star"])
+    size = int(cfg["size"])
+
+    lottie_json_str: Optional[str] = None
+    lottie_url: Optional[str] = cfg.get("lottie")
+
+    # If no pre-configured URL, try the API
+    if not lottie_url:
+        api_key = os.getenv("LOTTIEFILES_API_KEY", "")
+        if api_key:
+            lottie_url = await _search_lottiefiles_api(category.replace("_", " "), api_key)
+
+    # Fetch the Lottie JSON so we can inline it (headless Chrome may not reach external URLs)
+    if lottie_url:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(lottie_url, timeout=aiohttp.ClientTimeout(total=6)) as resp:
+                    if resp.status == 200:
+                        lottie_json_str = await resp.text()
+        except Exception as exc:
+            print(f"[IconOverlay] Lottie fetch failed url={lottie_url!r}: {exc}", flush=True)
+
+    if lottie_json_str:
+        return (
+            f"<!DOCTYPE html><html><head><meta charset='UTF-8'>"
+            f"<style>*{{margin:0;padding:0;box-sizing:border-box;}}"
+            f"body{{width:{size}px;height:{size}px;overflow:hidden;background:transparent;}}"
+            f"</style></head><body>"
+            f"<div id='a' style='width:{size}px;height:{size}px;'></div>"
+            f"<script src='https://cdnjs.cloudflare.com/ajax/libs/bodymovin/5.12.2/lottie.min.js'></script>"
+            f"<script>lottie.loadAnimation({{container:document.getElementById('a'),"
+            f"renderer:'svg',loop:true,autoplay:true,animationData:{lottie_json_str}}});</script>"
+            f"</body></html>"
+        )
+
+    # Emoji fallback with a CSS bounce animation (Shotstack renders HTML as video so it animates)
+    emoji   = cfg.get("emoji", "⭐")
+    fs      = int(size * 0.62)
+    return (
+        f"<!DOCTYPE html><html><head><meta charset='UTF-8'>"
+        f"<style>*{{margin:0;padding:0;}}"
+        f"@keyframes pop{{0%,100%{{transform:scale(1) rotate(-5deg);}}"
+        f"50%{{transform:scale(1.18) rotate(5deg);}}}}"
+        f"body{{width:{size}px;height:{size}px;display:flex;align-items:center;"
+        f"justify-content:center;background:transparent;overflow:hidden;}}"
+        f"span{{font-size:{fs}px;line-height:1;filter:drop-shadow(2px 3px 6px rgba(0,0,0,0.35));"
+        f"animation:pop 0.55s ease-in-out infinite;}}</style></head>"
+        f"<body><span>{emoji}</span></body></html>"
+    )
+
 
 def _cloudinary_public_id(url: str) -> str:
     """Extract Cloudinary public_id from a full upload URL.
@@ -773,6 +899,21 @@ def apply_editing_rules(analysis: Dict[str, Any], duration: float) -> Dict[str, 
         if conf >= _CONFIDENCE_THRESHOLD and at < duration and _time_clear(at, min_gap=2.0):
             sound_effects.append({"at": at, "type": "whoosh", "reason": "topic change"})
 
+    # ── Icon overlays — animated emoji / Lottie at emphasis + CTA moments ───────
+    icon_overlays: List[Dict[str, Any]] = []
+    for moment in analysis.get("emphasis_moments", []):
+        conf     = float(moment.get("confidence", 0))
+        strength = int(moment.get("strength", 0))
+        at       = float(moment.get("at", 0))
+        if conf >= _CONFIDENCE_THRESHOLD and strength >= 8 and at < duration and _time_clear(at, min_gap=2.0):
+            category = "fire" if strength >= 9 else "star"
+            icon_overlays.append({"at": round(at, 2), "duration": 1.5, "category": category})
+
+    cta_section = analysis.get("cta") or {}
+    cta_start = cta_section.get("start")
+    if cta_start is not None and float(cta_start) < duration:
+        icon_overlays.append({"at": round(float(cta_start) + 1.0, 2), "duration": 3.0, "category": "arrow_up"})
+
     # ── B-roll from main_points + keywords ───────────────────────────────────
     keywords = analysis.get("keywords", [])
     broll: List[Dict] = []
@@ -832,6 +973,7 @@ def apply_editing_rules(analysis: Dict[str, Any], duration: float) -> Dict[str, 
         "emphasis_moments": analysis.get("emphasis_moments", []),
         "keywords":         keywords,
         "caption_cues":     caption_cues,
+        "icon_overlays":    icon_overlays[:5],  # cap at 5 so the timeline doesn't get crowded
         "content_structure": {
             "hook":        hook,
             "main_points": analysis.get("main_points", []),
@@ -1209,6 +1351,9 @@ def build_shotstack_timeline(
     tagline: str = "",              # tagline shown on outro card
     website: str = "",              # website shown on outro card
     caption_cues: Optional[List[Dict[str, Any]]] = None,  # time windows for styled captions
+    topic_changes: Optional[List[Dict[str, Any]]] = None, # topic shift timestamps for transitions
+    video_type: str = "founder",                          # drives flash vs. swipe style
+    icon_overlays: Optional[List[Dict[str, Any]]] = None, # resolved: [{at, duration, category, html, ...}]
 ) -> Dict[str, Any]:
     # broll items have: at (original ts), duration, url (resolved)
     keep_segments = _build_keep_segments(cuts, video_duration)
@@ -1430,6 +1575,89 @@ def build_shotstack_timeline(
                 "length": 1.5,
             })
 
+    # ── Topic-change transition overlays ─────────────────────────────────────
+    # A short Shotstack HTML clip (flash = white fade, swipe = coloured slide)
+    # is placed on top of the video at each topic-change timestamp.
+    transition_overlay_clips: List[Dict] = []
+    _tc_style = _TRANSITION_STYLE_BY_VIDEO_TYPE.get(video_type, _DEFAULT_TRANSITION_STYLE)
+    _tc_color  = _tc_style["color"] or primary_color
+    _tc_dur    = float(_tc_style["duration"])
+    _tc_op     = float(_tc_style["opacity"])
+    _tc_type   = _tc_style["type"]  # "flash" | "swipe"
+
+    for change in (topic_changes or []):
+        orig_at = float(change.get("at", -1))
+        conf    = float(change.get("confidence", 1.0))
+        if orig_at < 0 or orig_at >= video_duration or conf < _CONFIDENCE_THRESHOLD:
+            continue
+        tl_at = _original_to_timeline(orig_at, keep_segments, transition_dur=transition_dur)
+        if tl_at is None:
+            continue
+        clip_start  = max(0.0, round(tl_at - _tc_dur / 2, 3))
+        actual_dur  = min(_tc_dur, total_duration - clip_start)
+        if actual_dur < 0.05:
+            continue
+        if _tc_type == "swipe":
+            tr_in, tr_out = "slideLeft", "slideRight"
+        else:
+            tr_in, tr_out = "fade", "fade"
+        transition_overlay_clips.append({
+            "asset": {
+                "type":   "html",
+                "html":   f"<div style='width:100%;height:100%;background:{_tc_color};'></div>",
+                "width":  1080,
+                "height": 1920,
+            },
+            "start":      clip_start,
+            "length":     round(actual_dur, 3),
+            "opacity":    _tc_op,
+            "transition": {"in": tr_in, "out": tr_out},
+            "position":   "fill",
+        })
+        print(
+            f"[VideoProduction] topic-change {_tc_type} at orig={orig_at:.1f}s → tl={tl_at:.1f}s",
+            flush=True,
+        )
+
+    # ── Icon overlay clips (emoji / Lottie) ──────────────────────────────────
+    icon_clips: List[Dict] = []
+    for ov in (icon_overlays or []):
+        html = ov.get("html", "")
+        if not html:
+            continue
+        orig_at = float(ov.get("at", -1))
+        ov_dur  = float(ov.get("duration", 1.5))
+        if orig_at < 0 or orig_at >= video_duration:
+            continue
+        tl_at = _original_to_timeline(orig_at, keep_segments, transition_dur=transition_dur)
+        if tl_at is None:
+            continue
+        actual_dur = min(ov_dur, total_duration - tl_at)
+        if actual_dur < 0.3:
+            continue
+        category = ov.get("category", "star")
+        cfg      = _ICON_OVERLAY_LIBRARY.get(category, _ICON_OVERLAY_LIBRARY["star"])
+        size     = int(cfg["size"])
+        position = cfg.get("position", "topRight")
+        icon_clips.append({
+            "asset": {
+                "type":   "html",
+                "html":   html,
+                "width":  size,
+                "height": size,
+            },
+            "start":      round(tl_at, 3),
+            "length":     round(actual_dur, 3),
+            "position":   position,
+            "offset":     {"x": -0.04, "y": -0.06} if "Right" in position else {"x": 0.0, "y": 0.15},
+            "opacity":    0.92,
+            "transition": {"in": "fade", "out": "fade"},
+        })
+        print(
+            f"[VideoProduction] icon {category} ({cfg['emoji']}) at orig={orig_at:.1f}s → tl={tl_at:.1f}s",
+            flush=True,
+        )
+
     # ── B-roll track ──────────────────────────────────────────────────────────
     broll_clips: List[Dict] = []
     for br in (broll or []):
@@ -1619,7 +1847,8 @@ def build_shotstack_timeline(
         print(f"[VideoProduction] logo overlay: start={logo_start}s dur={logo_dur}s", flush=True)
 
     # Track order (index 0 = top layer):
-    # 0: hook, 1: outro, 2: lower-third, 3: logo, 4: captions, 5: b-roll, 6: main video, 7: sfx, 8: music
+    # 0: hook  1: outro  2: lower-third  3: logo  4: icons  5: transitions
+    # 6: captions  7: b-roll  8: main video  9: sfx  10: music
     tracks: List[Dict] = []
     if hook_clips:
         tracks.append({"clips": hook_clips})
@@ -1629,6 +1858,10 @@ def build_shotstack_timeline(
         tracks.append({"clips": lower_third_clips})
     if logo_clips:
         tracks.append({"clips": logo_clips})
+    if icon_clips:
+        tracks.append({"clips": icon_clips})
+    if transition_overlay_clips:
+        tracks.append({"clips": transition_overlay_clips})
     tracks.append({"clips": caption_clips})
     if broll_clips:
         tracks.append({"clips": broll_clips})
@@ -1782,13 +2015,16 @@ async def run_production_job(
         analysis  = await analyze_content(srt_text, video_type, duration, tracking_data)
         decisions = apply_editing_rules(analysis, duration)
 
-        gpt_cuts       = decisions["cuts"]
-        zooms          = decisions["zooms"]
-        sound_effects  = decisions["sound_effects"]
+        gpt_cuts        = decisions["cuts"]
+        zooms           = decisions["zooms"]
+        sound_effects   = decisions["sound_effects"]
         broll_decisions = decisions["broll"]
-        hook_text      = decisions["hook_text"]
-        music_mood     = decisions["music_mood"]
-        pacing_note    = decisions["pacing_note"]
+        hook_text       = decisions["hook_text"]
+        music_mood      = decisions["music_mood"]
+        pacing_note     = decisions["pacing_note"]
+        topic_changes   = decisions.get("topic_changes", [])
+        caption_cues    = decisions.get("caption_cues", [])
+        icon_overlays   = decisions.get("icon_overlays", [])
 
         # Algorithmic cuts — word-level when Reap provides timestamps, SRT fallback otherwise.
         words = _extract_words(tracking_data)
@@ -1818,13 +2054,16 @@ async def run_production_job(
                 "status_message": "Review AI decisions before rendering",
                 "progress": 55,
                 "ai_decisions": {
-                    "cuts": cuts,
-                    "zooms": zooms,
-                    "sound_effects": sound_effects,
-                    "broll": broll_decisions,
-                    "hook_text": hook_text,
-                    "music_mood": music_mood,
-                    "pacing_note": pacing_note,
+                    "cuts":           cuts,
+                    "zooms":          zooms,
+                    "sound_effects":  sound_effects,
+                    "broll":          broll_decisions,
+                    "hook_text":      hook_text,
+                    "music_mood":     music_mood,
+                    "pacing_note":    pacing_note,
+                    "topic_changes":  topic_changes,
+                    "caption_cues":   caption_cues,
+                    "icon_overlays":  icon_overlays,
                 },
                 "render_context": {
                     "static_url": static_url,
@@ -1921,6 +2160,9 @@ async def run_production_job(
             secondary_color=secondary_color,
             tagline=tagline,
             website=website,
+            caption_cues=decisions.get("caption_cues", []),
+            topic_changes=decisions.get("topic_changes", []),
+            video_type=video_type,
         )
 
         await update(68, "Rendering video…")
@@ -1996,6 +2238,8 @@ async def run_render_phase(job_id: str, db) -> None:
         music_mood      = decisions.get("music_mood", "upbeat")
         pacing_note     = decisions.get("pacing_note", "")
         caption_cues    = decisions.get("caption_cues", [])
+        topic_changes   = decisions.get("topic_changes", [])
+        icon_overlays   = decisions.get("icon_overlays", [])
 
         clean_video_url = ctx.get("cloudinary_url") or ctx.get("static_url", "")
         srt_text        = ctx.get("srt_text", "")
@@ -2045,6 +2289,21 @@ async def run_render_phase(job_id: str, db) -> None:
                         primary_color=primary_color,
                     )
 
+        # ── Resolve icon overlays — fetch Lottie JSON (or build emoji HTML) ────────
+        resolved_icon_overlays: List[Dict[str, Any]] = []
+        if icon_overlays:
+            await update(66, "Resolving icon overlays…")
+            html_tasks = [_resolve_icon_html(ov["category"]) for ov in icon_overlays]
+            html_results = await asyncio.gather(*html_tasks, return_exceptions=True)
+            for ov, html in zip(icon_overlays, html_results):
+                if isinstance(html, str) and html:
+                    resolved_icon_overlays.append({**ov, "html": html})
+            print(
+                f"[VideoProduction:render] icon_overlays resolved "
+                f"{len(resolved_icon_overlays)}/{len(icon_overlays)}",
+                flush=True,
+            )
+
         timeline = build_shotstack_timeline(
             video_url=clean_video_url,
             video_duration=duration,
@@ -2066,6 +2325,9 @@ async def run_render_phase(job_id: str, db) -> None:
             tagline=tagline,
             website=website,
             caption_cues=caption_cues,
+            topic_changes=topic_changes,
+            video_type=video_type,
+            icon_overlays=resolved_icon_overlays,
         )
 
         await update(68, "Rendering video…")
