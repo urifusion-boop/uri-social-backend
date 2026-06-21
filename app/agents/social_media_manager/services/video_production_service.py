@@ -238,26 +238,26 @@ _LUMA_MATTE_BY_TYPE: Dict[str, str] = {
 }
 # Per-type transition duration (seconds). Must be less than every keep-segment.
 _TRANSITION_DUR_BY_TYPE: Dict[str, float] = {
-    "tiktok":   2.5,
-    "product":  2.0,
-    "founder":  2.5,
+    "tiktok":   0.8,
+    "product":  0.8,
+    "founder":  1.0,
 }
-_CLD_TRANSITION_DUR = 2.5   # default fallback
-_MIN_SEG_DUR       = 6.0   # minimum keep-segment length (must exceed max transition_dur)
+_CLD_TRANSITION_DUR = 1.0   # default fallback
+_MIN_SEG_DUR       = 4.0   # minimum keep-segment length (must exceed max transition_dur)
 
 # Shotstack overlay style per video type for topic-change transitions.
 # "color: None" → falls back to the brand primary_color at render time.
 _TRANSITION_STYLE_BY_VIDEO_TYPE: Dict[str, Dict] = {
-    "tiktok":       {"type": "flash", "color": "#ffffff", "duration": 0.15, "opacity": 0.65},
-    "product":      {"type": "flash", "color": None,      "duration": 0.20, "opacity": 0.40},
-    "founder":      {"type": "swipe", "color": None,      "duration": 0.40, "opacity": 0.55},
-    "educational":  {"type": "flash", "color": "#ffffff", "duration": 0.20, "opacity": 0.45},
-    "podcast":      {"type": "flash", "color": "#ffffff", "duration": 0.15, "opacity": 0.35},
-    "professional": {"type": "swipe", "color": None,      "duration": 0.35, "opacity": 0.50},
-    "social_media": {"type": "flash", "color": "#ffffff", "duration": 0.12, "opacity": 0.70},
+    "tiktok":       {"type": "flash", "color": "#ffffff", "duration": 0.08, "opacity": 0.70},
+    "product":      {"type": "flash", "color": None,      "duration": 0.10, "opacity": 0.45},
+    "founder":      {"type": "swipe", "color": None,      "duration": 0.20, "opacity": 0.55},
+    "educational":  {"type": "flash", "color": "#ffffff", "duration": 0.10, "opacity": 0.45},
+    "podcast":      {"type": "flash", "color": "#ffffff", "duration": 0.08, "opacity": 0.35},
+    "professional": {"type": "swipe", "color": None,      "duration": 0.18, "opacity": 0.50},
+    "social_media": {"type": "flash", "color": "#ffffff", "duration": 0.06, "opacity": 0.75},
 }
 _DEFAULT_TRANSITION_STYLE: Dict[str, Any] = {
-    "type": "flash", "color": "#ffffff", "duration": 0.20, "opacity": 0.50,
+    "type": "flash", "color": "#ffffff", "duration": 0.10, "opacity": 0.50,
 }
 
 
