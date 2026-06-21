@@ -392,8 +392,8 @@ def _cld_encode_text(text: str) -> str:
 def _build_cloudinary_cut_url(
     public_id: str,
     keep_segments: List[Dict],
-    luma_matte_pid: str = "uri-transitions/circle-wipe",
-    transition_dur: float = 2.5,
+    luma_matte_pid: Optional[str] = "uri-transitions/circle-wipe",
+    transition_dur: float = 1.0,
     hook_text: str = "",
     primary_color: str = "#FFD700",
 ) -> str:
@@ -401,6 +401,7 @@ def _build_cloudinary_cut_url(
     Build a Cloudinary transformation URL: luma-matte transitions between segments,
     then a branded hook text overlay baked into the first 2.5s of the video.
 
+    Pass luma_matte_pid=None for hard cuts (no transition effect between segments).
     Hook overlay uses Cloudinary's native l_text layer — rendered server-side at
     full resolution, completely avoiding Shotstack's unreliable HTML renderer.
     """
@@ -408,8 +409,7 @@ def _build_cloudinary_cut_url(
     if not cloud or not keep_segments:
         return ""
 
-    pid_enc  = public_id.replace("/", ":")
-    luma_enc = luma_matte_pid.replace("/", ":")
+    pid_enc = public_id.replace("/", ":")
 
     first = keep_segments[0]
     parts: List[str] = [
@@ -418,11 +418,18 @@ def _build_cloudinary_cut_url(
     for seg in keep_segments[1:]:
         s = f"{seg['src_start']:.3f}"
         e = f"{seg['src_end']:.3f}"
-        parts.append(
-            f"l_video:{pid_enc}/so_{s},eo_{e}"
-            f"/e_transition,l_video:{luma_enc}/fl_layer_apply"
-            f"/fl_layer_apply"
-        )
+        if luma_matte_pid:
+            luma_enc = luma_matte_pid.replace("/", ":")
+            parts.append(
+                f"l_video:{pid_enc}/so_{s},eo_{e}"
+                f"/e_transition,l_video:{luma_enc}/fl_layer_apply"
+                f"/fl_layer_apply"
+            )
+        else:
+            # Hard cut — just concatenate the segment with no transition layer
+            parts.append(
+                f"l_video:{pid_enc}/so_{s},eo_{e}/fl_layer_apply"
+            )
 
     url = (
         f"https://res.cloudinary.com/{cloud}/video/upload/"
@@ -849,7 +856,7 @@ Return ONLY valid JSON, no markdown:
         return {}
 
 
-def apply_editing_rules(analysis: Dict[str, Any], duration: float) -> Dict[str, Any]:
+def apply_editing_rules(analysis: Dict[str, Any], duration: float, enable_sfx: bool = True) -> Dict[str, Any]:
     """
     Phase 2 — Editing Rules Engine.
     Deterministic conversion of content analysis into render decisions.
@@ -893,11 +900,12 @@ def apply_editing_rules(analysis: Dict[str, Any], duration: float) -> Dict[str, 
             used_times.append(at)
 
     # ── Topic change rules: whoosh SFX at each shift ─────────────────────────
-    for change in analysis.get("topic_changes", []):
-        at = float(change.get("at", 0))
-        conf = float(change.get("confidence", 1.0))
-        if conf >= _CONFIDENCE_THRESHOLD and at < duration and _time_clear(at, min_gap=2.0):
-            sound_effects.append({"at": at, "type": "whoosh", "reason": "topic change"})
+    if enable_sfx:
+        for change in analysis.get("topic_changes", []):
+            at = float(change.get("at", 0))
+            conf = float(change.get("confidence", 1.0))
+            if conf >= _CONFIDENCE_THRESHOLD and at < duration and _time_clear(at, min_gap=2.0):
+                sound_effects.append({"at": at, "type": "whoosh", "reason": "topic change"})
 
     # ── Icon overlays — animated emoji / Lottie at emphasis + CTA moments ───────
     icon_overlays: List[Dict[str, Any]] = []
@@ -1354,6 +1362,7 @@ def build_shotstack_timeline(
     topic_changes: Optional[List[Dict[str, Any]]] = None, # topic shift timestamps for transitions
     video_type: str = "founder",                          # drives flash vs. swipe style
     icon_overlays: Optional[List[Dict[str, Any]]] = None, # resolved: [{at, duration, category, html, ...}]
+    transition_style: str = "auto",  # overrides video_type-based flash/swipe selection
 ) -> Dict[str, Any]:
     # broll items have: at (original ts), duration, url (resolved)
     keep_segments = _build_keep_segments(cuts, video_duration)
@@ -1576,16 +1585,26 @@ def build_shotstack_timeline(
             })
 
     # ── Topic-change transition overlays ─────────────────────────────────────
-    # A short Shotstack HTML clip (flash = white fade, swipe = coloured slide)
-    # is placed on top of the video at each topic-change timestamp.
+    # transition_style "none" disables overlays entirely.
+    # "flash" / "swipe" force that style regardless of video_type.
+    # "auto", "circle_wipe", "diagonal_wipe", "hard_cut" fall back to video_type lookup.
     transition_overlay_clips: List[Dict] = []
-    _tc_style = _TRANSITION_STYLE_BY_VIDEO_TYPE.get(video_type, _DEFAULT_TRANSITION_STYLE)
-    _tc_color  = _tc_style["color"] or primary_color
-    _tc_dur    = float(_tc_style["duration"])
-    _tc_op     = float(_tc_style["opacity"])
-    _tc_type   = _tc_style["type"]  # "flash" | "swipe"
+    if transition_style == "none":
+        _tc_style = None
+    elif transition_style == "flash":
+        _tc_style = {"type": "flash", "color": "#ffffff", "duration": 0.10, "opacity": 0.65}
+    elif transition_style == "swipe":
+        _tc_style = {"type": "swipe", "color": None, "duration": 0.20, "opacity": 0.55}
+    else:
+        _tc_style = _TRANSITION_STYLE_BY_VIDEO_TYPE.get(video_type, _DEFAULT_TRANSITION_STYLE)
 
-    for change in (topic_changes or []):
+    if _tc_style is not None:
+      _tc_color  = _tc_style["color"] or primary_color
+      _tc_dur    = float(_tc_style["duration"])
+      _tc_op     = float(_tc_style["opacity"])
+      _tc_type   = _tc_style["type"]  # "flash" | "swipe"
+
+    for change in (topic_changes or []) if _tc_style is not None else []:
         orig_at = float(change.get("at", -1))
         conf    = float(change.get("confidence", 1.0))
         if orig_at < 0 or orig_at >= video_duration or conf < _CONFIDENCE_THRESHOLD:
@@ -1910,6 +1929,9 @@ async def run_production_job(
     video_bytes: bytes,
     video_type: str,
     db,
+    enable_music: bool = True,
+    enable_sfx: bool = True,
+    transition_style: str = "auto",  # auto | circle_wipe | diagonal_wipe | flash | swipe | hard_cut | none
 ) -> None:
     reap = ReapProvider()
     shotstack = ShotstackProvider()
@@ -2013,7 +2035,7 @@ async def run_production_job(
         srt_entries = _parse_srt(srt_text)
 
         analysis  = await analyze_content(srt_text, video_type, duration, tracking_data)
-        decisions = apply_editing_rules(analysis, duration)
+        decisions = apply_editing_rules(analysis, duration, enable_sfx=enable_sfx)
 
         gpt_cuts        = decisions["cuts"]
         zooms           = decisions["zooms"]
@@ -2077,6 +2099,8 @@ async def run_production_job(
                     "secondary_color": secondary_color,
                     "tagline": tagline,
                     "website": website,
+                    "enable_music": enable_music,
+                    "transition_style": transition_style,
                 },
             }}
         )
@@ -2103,8 +2127,10 @@ async def run_production_job(
             print(f"[VideoProduction] broll resolved {len(broll)}/{len(broll_decisions)}", flush=True)
 
         # ── Stage 4b: Pick background music from Cloudinary library ─────────────
-        await update(59, "Selecting background music…")
-        music_url = _pick_music_url(music_mood)
+        music_url = ""
+        if enable_music:
+            await update(59, "Selecting background music…")
+            music_url = _pick_music_url(music_mood)
 
         # ── Stage 5: Shotstack render + mix ──────────────────────────────────────
         await update(62, "Building edit timeline…")
@@ -2241,10 +2267,12 @@ async def run_render_phase(job_id: str, db) -> None:
         topic_changes   = decisions.get("topic_changes", [])
         icon_overlays   = decisions.get("icon_overlays", [])
 
-        clean_video_url = ctx.get("cloudinary_url") or ctx.get("static_url", "")
-        srt_text        = ctx.get("srt_text", "")
-        duration        = float(ctx.get("duration", 120.0))
-        video_type      = ctx.get("video_type", "founder")
+        clean_video_url   = ctx.get("cloudinary_url") or ctx.get("static_url", "")
+        srt_text          = ctx.get("srt_text", "")
+        duration          = float(ctx.get("duration", 120.0))
+        video_type        = ctx.get("video_type", "founder")
+        enable_music      = ctx.get("enable_music", True)
+        transition_style  = ctx.get("transition_style", "auto")
         logo_url        = ctx.get("logo_url", "")
         brand_name      = ctx.get("brand_name", "")
         primary_color   = ctx.get("primary_color", "#FFD700")
@@ -2275,8 +2303,19 @@ async def run_render_phase(job_id: str, db) -> None:
         # ── Stage 5: Build Cloudinary cut URL + Shotstack timeline ───────────────
         await update(65, "Building edit timeline…")
 
-        luma_pid       = _LUMA_MATTE_BY_TYPE.get(video_type, "uri-transitions/circle-wipe")
-        transition_dur = _TRANSITION_DUR_BY_TYPE.get(video_type, _CLD_TRANSITION_DUR)
+        # Resolve luma-matte PID from transition_style
+        _LUMA_BY_STYLE: Dict[str, Optional[str]] = {
+            "auto":          _LUMA_MATTE_BY_TYPE.get(video_type, "uri-transitions/circle-wipe"),
+            "circle_wipe":   "uri-transitions/circle-wipe",
+            "diagonal_wipe": "uri-transitions/diagonal-wipe",
+            "flash":         None,   # hard cut; flash overlay handled by Shotstack
+            "swipe":         None,   # hard cut; swipe overlay handled by Shotstack
+            "hard_cut":      None,
+            "none":          None,
+        }
+        luma_pid       = _LUMA_BY_STYLE.get(transition_style, _LUMA_MATTE_BY_TYPE.get(video_type, "uri-transitions/circle-wipe"))
+        transition_dur = _TRANSITION_DUR_BY_TYPE.get(video_type, _CLD_TRANSITION_DUR) if luma_pid else 0.0
+
         cloudinary_cut_url = ""
         if "res.cloudinary.com" in (clean_video_url or ""):
             cld_pid = _cloudinary_public_id(clean_video_url)
@@ -2328,6 +2367,7 @@ async def run_render_phase(job_id: str, db) -> None:
             topic_changes=topic_changes,
             video_type=video_type,
             icon_overlays=resolved_icon_overlays,
+            transition_style=transition_style,
         )
 
         await update(68, "Rendering video…")

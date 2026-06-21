@@ -6011,6 +6011,9 @@ async def produce_video(
     background_tasks: BackgroundTasks,
     video: UploadFile = File(...),
     video_type: str = Form("founder"),
+    enable_music: str = Form("true"),
+    enable_sfx: str = Form("true"),
+    transition_style: str = Form("auto"),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
     token: dict = Depends(JWTBearer()),
 ):
@@ -6050,7 +6053,12 @@ async def produce_video(
         "completed_at": None,
     })
 
-    background_tasks.add_task(run_production_job, job_id, video_bytes, video_type, db)
+    background_tasks.add_task(
+        run_production_job, job_id, video_bytes, video_type, db,
+        enable_music=(enable_music.lower() != "false"),
+        enable_sfx=(enable_sfx.lower() != "false"),
+        transition_style=transition_style,
+    )
 
     return UriResponse.get_single_data_response(
         "produce_video", {"job_id": job_id, "status": "processing"}
