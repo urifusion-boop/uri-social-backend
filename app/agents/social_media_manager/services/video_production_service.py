@@ -43,7 +43,7 @@ async def _compress_for_shotstack(video_bytes: bytes, duration: float) -> bytes:
     out_path = in_path + "_c.mp4"
     try:
         target_kbps = int((SHOTSTACK_ASSET_LIMIT * 8) / max(duration, 1) / 1024)
-        audio_kbps = 64
+        audio_kbps = 128
         video_kbps = max(150, target_kbps - audio_kbps)
         print(f"[Shotstack] compressing {len(video_bytes)//1024}KB → target {target_kbps}kbps (v={video_kbps} a={audio_kbps})", flush=True)
         proc = await asyncio.create_subprocess_exec(
@@ -460,7 +460,8 @@ def _build_cloudinary_cut_url(
         )
         print(f"[CloudinaryHook] '{text_upper}' font={font_size}px bg=#{bg_hex}", flush=True)
 
-    url += f"/{public_id}.mp4"
+    # Request high-quality audio from Cloudinary when delivering the cut video.
+    url += f"/ac_aac,br_192k/{public_id}.mp4"
     return url
 
 
@@ -1896,6 +1897,7 @@ def build_shotstack_timeline(
         "output": {
             "format": "mp4",
             "resolution": "hd",
+            "quality": "high",
             "aspectRatio": aspect_ratio,
             "fps": 30,
         },
