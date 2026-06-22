@@ -2297,8 +2297,10 @@ async def run_render_phase(job_id: str, db) -> None:
             print(f"[VideoProduction:render] broll {len(broll)}/{len(broll_decisions)}", flush=True)
 
         # ── Stage 4b: Music ───────────────────────────────────────────────────────
-        await update(62, "Selecting background music…")
-        music_url = _pick_music_url(music_mood)
+        music_url = ""
+        if enable_music:
+            await update(62, "Selecting background music…")
+            music_url = _pick_music_url(music_mood)
 
         # ── Stage 5: Build Cloudinary cut URL + Shotstack timeline ───────────────
         await update(65, "Building edit timeline…")
