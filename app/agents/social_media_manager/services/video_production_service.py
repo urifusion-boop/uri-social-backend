@@ -84,7 +84,8 @@ async def _clean_audio(video_bytes: bytes) -> bytes:
         proc = await asyncio.create_subprocess_exec(
             "ffmpeg", "-i", in_path,
             "-c:v", "copy",
-            "-af", "highpass=f=80,afftdn=nf=-25:nr=33:nt=w,loudnorm=I=-16:TP=-1.5:LRA=11",
+            "-c:a", "aac", "-b:a", "192k",
+            "-af", "highpass=f=80,loudnorm=I=-14:TP=-1.0:LRA=11",
             "-y", out_path,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
