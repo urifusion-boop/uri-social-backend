@@ -112,6 +112,7 @@ class CreditService:
             user_id=user_id,
             bonus_credits=0,
             subscription_credits=total_credits,
+            frozen_credits=0,
             total_credits=total_credits,
             credits_used=0,
             credits_remaining=total_credits,
@@ -142,6 +143,7 @@ class CreditService:
                 user_id=user_id,
                 bonus_credits=bonus_amount,
                 subscription_credits=0,
+                frozen_credits=0,
                 total_credits=bonus_amount,
                 credits_used=0,
                 credits_remaining=bonus_amount,
@@ -325,9 +327,11 @@ class CreditService:
         Allocate credits to user after successful payment
         PRD 6.3: On success: Assign credits, Activate subscription
 
-        CHANGED: Subscription credits now ROLL OVER on renewal.
-        Unused subscription credits are preserved and added to new allocation.
-        Bonus credits are always preserved and consumed first.
+        Credit Rollover Logic (like mobile data):
+        - On RENEWAL (before expiry): Unused subscription credits roll over + new credits added
+        - On RE-SUBSCRIPTION (after expiry): Old credits frozen, only new credits allocated
+        - Frozen credits remain visible but unusable
+        - Bonus credits always preserved (never freeze)
         """
         existing_wallet = await self.get_user_wallet(user_id)
 
@@ -335,27 +339,46 @@ class CreditService:
             # Existing subscriber - renewal or upgrade
             balance_before = existing_wallet.credits_remaining
 
-            # Get current bonus and subscription credits
+            # Get current credits breakdown
             current_bonus = getattr(existing_wallet, 'bonus_credits', 0)
             current_subscription = getattr(existing_wallet, 'subscription_credits', 0)
+            current_frozen = getattr(existing_wallet, 'frozen_credits', 0)
             current_used = existing_wallet.credits_used
+
+            # Check if subscription expired (next_renewal date passed)
+            now = datetime.utcnow()
+            next_renewal = existing_wallet.next_renewal or now
+            subscription_expired = now > next_renewal
 
             # Check if this is a renewal (same tier) or new purchase
             is_renewal = existing_wallet.subscription_tier == tier_id
 
-            if is_renewal:
-                # Monthly renewal: ROLL OVER unused subscription credits + add new credits
-                new_bonus = current_bonus
-                new_subscription = current_subscription + credits  # ADD to existing, don't replace
+            if subscription_expired:
+                # Subscription LAPSED - freeze old subscription credits, start fresh
+                # Like mobile data: expired credits become unusable but visible
+                frozen_amount = current_subscription  # Move unused subscription credits to frozen
+                new_frozen = current_frozen + frozen_amount
+                new_subscription = credits  # Only new credits, no rollover
+                new_bonus = current_bonus  # Bonus never freezes
                 new_used = 0  # Reset usage counter
-            else:
-                # New purchase/upgrade: Keep bonus, add new subscription credits
+                print(f"⚠️ Subscription expired for {user_id}. Froze {frozen_amount} credits. New allocation: {credits}")
+            elif is_renewal:
+                # On-time RENEWAL - roll over unused subscription credits + add new
+                new_frozen = current_frozen  # Keep existing frozen (doesn't unfreeze)
+                new_subscription = current_subscription + credits  # Rollover + new credits
                 new_bonus = current_bonus
-                new_subscription = current_subscription + credits  # ADD to existing
+                new_used = 0  # Reset usage counter
+                print(f"✅ On-time renewal for {user_id}. Rolled over {current_subscription} + added {credits} = {new_subscription}")
+            else:
+                # UPGRADE/DOWNGRADE - keep current subscription credits + add new
+                new_frozen = current_frozen
+                new_subscription = current_subscription + credits
+                new_bonus = current_bonus
                 new_used = current_used  # Keep existing usage
+                print(f"🔄 Plan change for {user_id}. Current {current_subscription} + new {credits} = {new_subscription}")
 
-            # Calculate totals
-            new_total = new_bonus + new_subscription
+            # Calculate totals (frozen credits NOT included in usable credits)
+            new_total = new_bonus + new_subscription  # Frozen not counted
             new_remaining = new_total - new_used
 
             await self.user_credits_collection.update_one(
@@ -364,6 +387,7 @@ class CreditService:
                     "$set": {
                         "bonus_credits": new_bonus,
                         "subscription_credits": new_subscription,
+                        "frozen_credits": new_frozen,
                         "total_credits": new_total,
                         "credits_used": new_used,
                         "credits_remaining": new_remaining,
