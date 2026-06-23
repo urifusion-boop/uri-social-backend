@@ -445,25 +445,7 @@ def _build_cloudinary_cut_url(
     # Hook text overlay — baked into the Cloudinary video, shown for the first 2.5s.
     # Using Montserrat 900 (Google Fonts), brand primary color background, white text.
     # Font size scales with text length so it never overflows the 1080px frame.
-    if hook_text:
-        text_upper  = hook_text.upper()
-        # Wrap at 20 chars so each line is ~1080px wide at 100px font.
-        # \n encodes to %0A in the Cloudinary URL → multi-line text layer.
-        # At 100px, a 20-char line is ~1300px; c_fit scales it to 1080px
-        # (effective ~83px) and the background fills the full frame width.
-        wrapped     = _wrap_hook_text(text_upper, max_chars=20)
-        encoded     = _cld_encode_text(wrapped)
-        primary_hex = primary_color.lstrip("#")
-        url += (
-            f"/b_rgb:{primary_hex},co_rgb:FFFFFF"
-            f",l_text:Montserrat@google_100_900:{encoded}"
-            f"/w_1080,c_fit"
-            f"/eo_2.5,fl_layer_apply,g_north,fl_relative,y_0.05"
-        )
-        print(f"[CloudinaryHook] '{text_upper}' 100px wrapped #{primary_hex}", flush=True)
-
-    # Request high-quality audio from Cloudinary when delivering the cut video.
-    url += f"/ac_aac,br_192k/{public_id}.mp4"
+    url += f"/{public_id}.mp4"
     return url
 
 
@@ -1654,6 +1636,12 @@ def build_shotstack_timeline(
             continue
         tl_at = _original_to_timeline(orig_at, keep_segments, transition_dur=transition_dur)
         if tl_at is None:
+            # Timestamp landed in a cut — try up to 3s later to find a kept segment
+            for nudge in (1.0, 2.0, 3.0):
+                tl_at = _original_to_timeline(min(orig_at + nudge, video_duration - 0.1), keep_segments, transition_dur=transition_dur)
+                if tl_at is not None:
+                    break
+        if tl_at is None:
             continue
         actual_dur = min(ov_dur, total_duration - tl_at)
         if actual_dur < 0.3:
@@ -1739,37 +1727,35 @@ def build_shotstack_timeline(
     # Shotstack's renderer collapses multi-element stacking (both <br> and separate
     # <p> elements render at the same y). Single element only — scale font to fit.
     hook_clips: List[Dict] = []
-    if hook_text and not cloudinary_cut_url:
+    if hook_text:
         _hook_upper = hook_text.upper()
-        # Scale font so text stays within ~1000px at ~0.60 width-per-em for Montserrat Black.
-        # Clamp 40–62px so it's always readable.
-        _font = min(62, max(40, int(1000 / max(len(_hook_upper) * 0.60, 1))))
-        _shadow = (
-            f"3px 3px 0 {primary_color},-3px -3px 0 {primary_color},"
-            f"3px -3px 0 {primary_color},-3px 3px 0 {primary_color}"
-        )
-        hook_css = (
-            "body{margin:0;padding:0;background:transparent;}"
-            f"p{{font-family:'Montserrat',sans-serif;font-size:{_font}px;font-weight:900;"
-            f"color:#FFFFFF;text-align:center;text-transform:uppercase;"
-            f"letter-spacing:-2px;white-space:nowrap;"
-            f"text-shadow:{_shadow};margin:0;padding:8px 20px;}}"
+        # Full-width colored banner with CSS word-wrap — works regardless of whether
+        # Cloudinary handles cuts. Width=720 matches Shotstack hd 9:16 canvas.
+        _hook_html = (
+            "<!DOCTYPE html><html><head><meta charset='UTF-8'>"
+            "<style>"
+            "*{margin:0;padding:0;box-sizing:border-box;}"
+            f"body{{width:720px;background:{primary_color};overflow:hidden;}}"
+            f"p{{font-family:'Arial Black',Arial,sans-serif;font-size:52px;"
+            f"font-weight:900;color:#fff;text-align:center;text-transform:uppercase;"
+            f"line-height:1.15;word-wrap:break-word;padding:24px 28px;}}"
+            "</style></head>"
+            f"<body><p>{_hook_upper}</p></body></html>"
         )
         hook_clips = [{
             "asset": {
                 "type": "html",
-                "html": f"<p>{_hook_upper}</p>",
-                "css": hook_css,
-                "width": 1060,
-                "height": 180,
+                "html": _hook_html,
+                "width": 720,
+                "height": 400,
             },
             "start": 0,
             "length": round(min(2.5, total_duration * 0.25), 3),
-            "position": "center",
-            "offset": {"y": 0.10},
-            "transition": {"in": "slideUp", "out": "fade"},
+            "position": "top",
+            "offset": {"x": 0.0, "y": 0.0},
+            "transition": {"out": "fade"},
         }]
-        print(f"[VideoProduction] hook '{_hook_upper}' font={_font}px", flush=True)
+        print(f"[VideoProduction] hook '{_hook_upper}' Shotstack HTML banner", flush=True)
 
     # ── Lower-third brand name (slides up at start, shown for 3.5s) ──────────
     lower_third_clips: List[Dict] = []
