@@ -21,7 +21,7 @@ from app.domain.models.billing_models import (
 )
 
 # Trial configuration constants (PRD Section 2)
-TRIAL_DURATION_DAYS = 3
+TRIAL_DURATION_DAYS = 7  # Extended from 3 to 7 days
 TRIAL_CREDITS = 10
 LOW_CREDIT_THRESHOLD = 2  # PRD 6.2: Warning when credits ≤ 2
 
@@ -149,11 +149,13 @@ class TrialService:
         user_id: str,
         campaign_id: str,
         reason: str = "campaign_generation",
+        amount: int = 1,  # NEW: Support deducting multiple credits (for carousel)
     ) -> bool:
         """
-        Deduct 1 trial credit.
+        Deduct N trial credits (default 1).
         PRD 5.2: Works same as paid users — deduct 1 credit per campaign.
-        Returns False if trial expired or no credits left.
+        For carousels: deduct 1 credit per image.
+        Returns False if trial expired or insufficient credits.
         """
         trial_doc = await self.trials_collection.find_one({"user_id": user_id})
         if not trial_doc:
@@ -163,12 +165,12 @@ class TrialService:
         end_date = trial_doc["trial_end_date"]
         credits_remaining = trial_doc["credits_remaining"]
 
-        # PRD 2.3: Trial ends when 3 days elapsed OR credits = 0
-        if now >= end_date or credits_remaining <= 0:
+        # PRD 2.3: Trial ends when 7 days elapsed OR credits = 0
+        if now >= end_date or credits_remaining < amount:
             return False
 
         balance_before = credits_remaining
-        new_remaining = credits_remaining - 1
+        new_remaining = credits_remaining - amount
 
         await self.trials_collection.update_one(
             {"user_id": user_id},
@@ -180,7 +182,7 @@ class TrialService:
             CreditTransaction(
                 user_id=user_id,
                 type="deduction",
-                amount=-1,
+                amount=-amount,  # Log actual amount deducted
                 balance_before=balance_before,
                 balance_after=new_remaining,
                 reason=reason,

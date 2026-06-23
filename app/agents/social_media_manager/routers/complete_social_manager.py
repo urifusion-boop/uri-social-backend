@@ -479,26 +479,38 @@ async def generate_content(
                     d["post_type"] = post_type
 
         # ==================== PRD 7.2: Credit Deduction ====================
-        # Deduct 1 credit after successful generation
-        # PRD 3.1: First campaign generation = 1 credit
+        # Deduct credits after successful generation
+        # PRD 3.1: Text-only posts = 1 credit, Carousel = 1 credit per image
         if result.get("status"):
             request_id = result.get("responseData", {}).get("request_id")
+            drafts = result.get("responseData", {}).get("drafts", [])
+
+            # Calculate credits to deduct based on content type
+            if post_type == "carousel":
+                # Carousel: 1 credit per slide/image (default 3 slides if not specified)
+                credits_to_deduct = len(drafts) if drafts else num_slides
+            else:
+                # Text-only posts (feed, story): 1 credit total
+                credits_to_deduct = 1
+
             if request_id:
                 if is_trial_user:
                     await trial_service.deduct_trial_credit(
                         user_id=user_id,
                         campaign_id=request_id,
                         reason="campaign_generation",
+                        amount=credits_to_deduct,
                     )
-                    print(f"✅ Deducted 1 trial credit from user {user_id} for campaign {request_id}")
+                    print(f"✅ Deducted {credits_to_deduct} trial credit(s) from user {user_id} for campaign {request_id} (post_type={post_type})")
                 else:
                     await credit_service.deduct_credit(
                         user_id=user_id,
                         campaign_id=request_id,
                         reason="campaign_generation",
-                        retry_count=0  # Initial generation (not a retry)
+                        retry_count=0,  # Initial generation (not a retry)
+                        amount=credits_to_deduct,
                     )
-                    print(f"✅ Deducted 1 credit from user {user_id} for campaign {request_id}")
+                    print(f"✅ Deducted {credits_to_deduct} credit(s) from user {user_id} for campaign {request_id} (post_type={post_type})")
 
             # Notification PRD 4.2: Content created notification
             try:

@@ -225,10 +225,11 @@ class CreditService:
         user_id: str,
         campaign_id: str,
         reason: str = "campaign_generation",
-        retry_count: int = 0
+        retry_count: int = 0,
+        amount: int = 1  # NEW: Support deducting multiple credits (for carousel)
     ) -> bool:
         """
-        Deduct 1 credit from user balance
+        Deduct N credits from user balance (default 1)
         PRD 7.2: Deduction Logic
         PRD 11: Must log all credit usage events
 
@@ -240,6 +241,9 @@ class CreditService:
 
         Legacy users (without wallet) are not deducted - backward compatibility
 
+        Args:
+            amount: Number of credits to deduct (default=1, for carousel can be N slides)
+
         Returns:
             bool: True if deduction successful, False if insufficient credits
         """
@@ -249,7 +253,7 @@ class CreditService:
             # Legacy user from before billing system - skip deduction
             return True
 
-        if wallet.credits_remaining < 1:
+        if wallet.credits_remaining < amount:
             return False
 
         # Get current credit breakdown
@@ -257,19 +261,21 @@ class CreditService:
         current_subscription = getattr(wallet, 'subscription_credits', 0)
         balance_before = wallet.credits_remaining
 
+        remaining_to_deduct = amount
+
         # Deduct from subscription first (use before expiry), then bonus (never expires)
-        if current_subscription > 0:
-            # Deduct from subscription credits first (use before monthly reset)
-            new_subscription = current_subscription - 1
+        if current_subscription >= remaining_to_deduct:
+            # Deduct all from subscription credits
+            new_subscription = current_subscription - remaining_to_deduct
             new_bonus = current_bonus
         else:
-            # Deduct from bonus credits (only when subscription is depleted)
+            # Deduct all subscription, then from bonus
             new_subscription = 0
-            new_bonus = current_bonus - 1
+            new_bonus = current_bonus - (remaining_to_deduct - current_subscription)
 
         # Calculate new totals
         new_total = new_bonus + new_subscription
-        new_credits_used = wallet.credits_used + 1
+        new_credits_used = wallet.credits_used + amount
         new_credits_remaining = new_total
 
         # Update wallet
@@ -291,7 +297,7 @@ class CreditService:
         transaction = CreditTransaction(
             user_id=user_id,
             type="deduction",
-            amount=-1,
+            amount=-amount,  # Log actual amount deducted
             balance_before=balance_before,
             balance_after=new_credits_remaining,
             reason=reason,
@@ -318,8 +324,10 @@ class CreditService:
         """
         Allocate credits to user after successful payment
         PRD 6.3: On success: Assign credits, Activate subscription
-        PRD 5.2: Subscription credits reset every billing cycle (no rollover)
-        Bonus credits are preserved and consumed first
+
+        CHANGED: Subscription credits now ROLL OVER on renewal.
+        Unused subscription credits are preserved and added to new allocation.
+        Bonus credits are always preserved and consumed first.
         """
         existing_wallet = await self.get_user_wallet(user_id)
 
@@ -336,14 +344,14 @@ class CreditService:
             is_renewal = existing_wallet.subscription_tier == tier_id
 
             if is_renewal:
-                # Monthly renewal: Reset subscription credits, preserve bonus credits
+                # Monthly renewal: ROLL OVER unused subscription credits + add new credits
                 new_bonus = current_bonus
-                new_subscription = credits
+                new_subscription = current_subscription + credits  # ADD to existing, don't replace
                 new_used = 0  # Reset usage counter
             else:
                 # New purchase/upgrade: Keep bonus, add new subscription credits
                 new_bonus = current_bonus
-                new_subscription = credits
+                new_subscription = current_subscription + credits  # ADD to existing
                 new_used = current_used  # Keep existing usage
 
             # Calculate totals
