@@ -344,31 +344,21 @@ async def _resolve_icon_html(category: str) -> str:
         except Exception as exc:
             print(f"[IconOverlay] Lottie fetch failed url={lottie_url!r}: {exc}", flush=True)
 
-    if lottie_json_str:
-        return (
-            f"<!DOCTYPE html><html><head><meta charset='UTF-8'>"
-            f"<style>*{{margin:0;padding:0;box-sizing:border-box;}}"
-            f"body{{width:{size}px;height:{size}px;overflow:hidden;background:transparent;}}"
-            f"</style></head><body>"
-            f"<div id='a' style='width:{size}px;height:{size}px;'></div>"
-            f"<script src='https://cdnjs.cloudflare.com/ajax/libs/bodymovin/5.12.2/lottie.min.js'></script>"
-            f"<script>lottie.loadAnimation({{container:document.getElementById('a'),"
-            f"renderer:'svg',loop:true,autoplay:true,animationData:{lottie_json_str}}});</script>"
-            f"</body></html>"
-        )
-
-    # Emoji fallback with a CSS bounce animation (Shotstack renders HTML as video so it animates)
-    emoji   = cfg.get("emoji", "⭐")
-    fs      = int(size * 0.62)
+    # Pure CSS emoji animation — no external scripts, always works in Shotstack's renderer.
+    # Lottie JSON is fetched above but we rely on CSS-only rendering for reliability;
+    # the Lottie bodymovin player needs an external CDN script that may not load in time.
+    emoji = cfg.get("emoji", "⭐")
+    fs    = int(size * 0.72)
     return (
         f"<!DOCTYPE html><html><head><meta charset='UTF-8'>"
         f"<style>*{{margin:0;padding:0;}}"
-        f"@keyframes pop{{0%,100%{{transform:scale(1) rotate(-5deg);}}"
-        f"50%{{transform:scale(1.18) rotate(5deg);}}}}"
+        f"@keyframes pop{{0%,100%{{transform:scale(1) rotate(-8deg);}}"
+        f"50%{{transform:scale(1.25) rotate(8deg);}}}}"
         f"body{{width:{size}px;height:{size}px;display:flex;align-items:center;"
         f"justify-content:center;background:transparent;overflow:hidden;}}"
-        f"span{{font-size:{fs}px;line-height:1;filter:drop-shadow(2px 3px 6px rgba(0,0,0,0.35));"
-        f"animation:pop 0.55s ease-in-out infinite;}}</style></head>"
+        f"span{{font-size:{fs}px;line-height:1;"
+        f"filter:drop-shadow(0 4px 8px rgba(0,0,0,0.5));"
+        f"animation:pop 0.6s ease-in-out infinite;}}</style></head>"
         f"<body><span>{emoji}</span></body></html>"
     )
 
@@ -380,6 +370,21 @@ def _cloudinary_public_id(url: str) -> str:
     import re
     m = re.search(r"/video/upload/(?:v\d+/)?(.+?)(?:\.\w+)?$", url)
     return m.group(1) if m else ""
+
+
+def _wrap_hook_text(text: str, max_chars: int = 20) -> str:
+    """Split text at word boundaries for multi-line Cloudinary text overlay."""
+    words = text.split()
+    lines, line = [], ""
+    for word in words:
+        if line and len(line) + 1 + len(word) > max_chars:
+            lines.append(line)
+            line = word
+        else:
+            line = (line + " " + word).strip()
+    if line:
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def _cld_encode_text(text: str) -> str:
@@ -442,20 +447,20 @@ def _build_cloudinary_cut_url(
     # Font size scales with text length so it never overflows the 1080px frame.
     if hook_text:
         text_upper  = hook_text.upper()
-        encoded     = _cld_encode_text(text_upper)
+        # Wrap at 20 chars so each line is ~1080px wide at 100px font.
+        # \n encodes to %0A in the Cloudinary URL → multi-line text layer.
+        # At 100px, a 20-char line is ~1300px; c_fit scales it to 1080px
+        # (effective ~83px) and the background fills the full frame width.
+        wrapped     = _wrap_hook_text(text_upper, max_chars=20)
+        encoded     = _cld_encode_text(wrapped)
         primary_hex = primary_color.lstrip("#")
-        # 72px bold text on 1000px text area.
-        # 40px same-color border on each side acts as padding and brings the
-        # total layer width to 1080px — flush with the frame edges.
-        # c_fit lets Cloudinary word-wrap across multiple lines; font never
-        # needs to shrink because 1000px easily fits 21 chars per line at 72px.
         url += (
-            f"/b_rgb:{primary_hex},co_rgb:FFFFFF,bo_40px_solid_rgb:{primary_hex}"
-            f",l_text:Montserrat@google_72_900:{encoded}"
-            f"/w_1000,c_fit"
-            f"/eo_2.5,fl_layer_apply,g_north,fl_relative,y_0.08"
+            f"/b_rgb:{primary_hex},co_rgb:FFFFFF"
+            f",l_text:Montserrat@google_100_900:{encoded}"
+            f"/w_1080,c_fit"
+            f"/eo_2.5,fl_layer_apply,g_north,fl_relative,y_0.05"
         )
-        print(f"[CloudinaryHook] '{text_upper}' 72px full-width #{primary_hex}", flush=True)
+        print(f"[CloudinaryHook] '{text_upper}' 100px wrapped #{primary_hex}", flush=True)
 
     # Request high-quality audio from Cloudinary when delivering the cut video.
     url += f"/ac_aac,br_192k/{public_id}.mp4"
@@ -912,7 +917,7 @@ def apply_editing_rules(analysis: Dict[str, Any], duration: float, enable_sfx: b
         conf     = float(moment.get("confidence", 0))
         strength = int(moment.get("strength", 0))
         at       = float(moment.get("at", 0))
-        if conf >= _CONFIDENCE_THRESHOLD and strength >= 8 and at < duration and _time_clear(at, min_gap=2.0):
+        if conf >= _CONFIDENCE_THRESHOLD and strength >= 7 and at < duration and _time_clear(at, min_gap=2.0):
             category = "fire" if strength >= 9 else "star"
             icon_overlays.append({"at": round(at, 2), "duration": 1.5, "category": category})
 
@@ -2107,7 +2112,7 @@ async def run_production_job(
         print(
             f"[VideoProduction] job={job_id} awaiting_review — "
             f"{len(cuts)} cuts {len(zooms)} zooms {len(sound_effects)} sfx "
-            f"hook='{hook_text}'",
+            f"{len(icon_overlays)} icons hook='{hook_text}'",
             flush=True,
         )
         return  # pipeline resumes via POST /produce-video-job/{id}/start-render
