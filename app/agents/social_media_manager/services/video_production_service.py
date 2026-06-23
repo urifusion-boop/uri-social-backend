@@ -443,22 +443,19 @@ def _build_cloudinary_cut_url(
     if hook_text:
         text_upper  = hook_text.upper()
         encoded     = _cld_encode_text(text_upper)
-        char_count  = len(text_upper)
-        # Montserrat 900 uppercase: real average ~0.88em per char.
-        # Target 900px usable width on a 1080px frame; clamp 36–52px.
-        # w_1020,c_fit is a SEPARATE step — must be its own URL segment before
-        # fl_layer_apply so Cloudinary scales the rendered layer, not the base video.
-        # fl_relative makes y_0.12 mean 12% from top (not 0.12 pixels).
-        font_size   = min(52, max(36, int(900 / max(char_count * 0.88, 1))))
         primary_hex = primary_color.lstrip("#")
-        bg_hex      = (primary_hex + "D9") if len(primary_hex) == 6 else primary_hex  # 85% opacity
+        # 72px bold text on 1000px text area.
+        # 40px same-color border on each side acts as padding and brings the
+        # total layer width to 1080px — flush with the frame edges.
+        # c_fit lets Cloudinary word-wrap across multiple lines; font never
+        # needs to shrink because 1000px easily fits 21 chars per line at 72px.
         url += (
-            f"/b_rgb:{bg_hex},co_rgb:FFFFFF"
-            f",l_text:Montserrat@google_{font_size}_900:{encoded}"
-            f"/w_1020,c_fit"
-            f"/eo_2.5,fl_layer_apply,g_north,fl_relative,y_0.12"
+            f"/b_rgb:{primary_hex},co_rgb:FFFFFF,bo_40px_solid_rgb:{primary_hex}"
+            f",l_text:Montserrat@google_72_900:{encoded}"
+            f"/w_1000,c_fit"
+            f"/eo_2.5,fl_layer_apply,g_north,fl_relative,y_0.08"
         )
-        print(f"[CloudinaryHook] '{text_upper}' font={font_size}px bg=#{bg_hex}", flush=True)
+        print(f"[CloudinaryHook] '{text_upper}' 72px full-width #{primary_hex}", flush=True)
 
     # Request high-quality audio from Cloudinary when delivering the cut video.
     url += f"/ac_aac,br_192k/{public_id}.mp4"
