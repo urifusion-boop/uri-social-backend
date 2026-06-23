@@ -48,6 +48,9 @@ class UserCreditWallet(BaseModel):
     # Subscription credits (consumed first, reset on renewal)
     subscription_credits: int = Field(default=0, description="Subscription credits (consumed first)")
 
+    # Frozen credits (expired/unusable until resubscription, but visible)
+    frozen_credits: int = Field(default=0, description="Credits frozen due to subscription lapse (visible but unusable)")
+
     # Legacy/computed fields (for backwards compatibility)
     total_credits: int = Field(default=0, description="Total credits: bonus + subscription")
     credits_used: int = Field(default=0, description="Credits consumed in current cycle")
