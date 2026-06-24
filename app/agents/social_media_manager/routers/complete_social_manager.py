@@ -4814,6 +4814,73 @@ class SaveVideoDraftRequest(BaseModel):
     platforms: List[str] = Field(default_factory=list)
 
 
+class GenerateVideoCaptionRequest(BaseModel):
+    storyboard: Dict[str, Any]
+    platform: str = "instagram"  # instagram | facebook | tiktok | linkedin
+
+
+@router.post("/generate-video-caption")
+async def generate_video_caption(
+    request: GenerateVideoCaptionRequest,
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Generate a platform-optimised social media caption for a merged video
+    using the storyboard's scene descriptions and brand context.
+    """
+    import openai as _openai
+
+    _get_user_id(token)
+
+    scenes = request.storyboard.get("scenes", [])
+    brand_context = request.storyboard.get("brand_context", {})
+    brand_name = brand_context.get("brand_name", "")
+    target_platform = request.platform or request.storyboard.get("target_platform", "instagram")
+    target_audience = request.storyboard.get("target_audience", "")
+    total_duration = request.storyboard.get("total_duration_seconds", 0)
+
+    scene_lines = "\n".join(
+        f"Scene {s.get('scene_number', i + 1)}: {s.get('scene_description', s.get('description', ''))}"
+        for i, s in enumerate(scenes)
+    )
+
+    platform_guides = {
+        "instagram": "Instagram — max 2200 chars, conversational, 3–5 relevant hashtags at the end, 1–2 emojis in the body.",
+        "facebook":  "Facebook — max 500 chars, warm and conversational, 0–2 hashtags, no emoji overload.",
+        "tiktok":    "TikTok — punchy, max 150 chars, 3–5 trending hashtags, high-energy tone.",
+        "linkedin":  "LinkedIn — professional tone, 1–3 paragraphs, 3–5 industry hashtags, no excessive emojis.",
+    }
+    guide = platform_guides.get(target_platform, platform_guides["instagram"])
+
+    prompt = f"""You are a social media copywriter. Write a single ready-to-post caption for a video.
+
+PLATFORM: {target_platform.upper()}
+GUIDE: {guide}
+
+VIDEO INFO:
+- Brand: {brand_name or "the brand"}
+- Audience: {target_audience or "general"}
+- Duration: {total_duration}s
+- Scenes:
+{scene_lines}
+
+Rules:
+- Write ONLY the caption text — no labels, no explanation, no markdown wrapper.
+- Make it feel native to {target_platform}, not copy-paste generic.
+- Hashtags go at the very end, on a new line.
+- Do not include a trailing newline."""
+
+    client = _openai.AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+    response = await client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=600,
+        temperature=0.8,
+    )
+    caption = (response.choices[0].message.content or "").strip()
+    return UriResponse.get_single_data_response("caption", {"caption": caption})
+
+
 @router.post("/video-drafts")
 async def save_video_draft(
     request: SaveVideoDraftRequest,
