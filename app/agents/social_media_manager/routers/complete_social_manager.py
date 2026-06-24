@@ -555,8 +555,8 @@ async def generate_content(
             # all read the same rotation_index simultaneously. Each draft gets a unique style,
             # then they can generate images concurrently without conflicts.
             from app.agents.social_media_manager.services.style_library import pick_next_style
-            _bc_brand_id = brand_context.get("brand_id", "")
-            _bc_user_id = brand_context.get("user_id", "")
+            _bc_brand_id = brand_context_dict.get("brand_id", "")
+            _bc_user_id = brand_context_dict.get("user_id", "")
             _style_profile_scope = {"brand_id": _bc_brand_id} if _bc_brand_id else {"user_id": _bc_user_id}
 
             _style_profile = await db["brand_profiles"].find_one(
@@ -568,7 +568,7 @@ async def generate_content(
             _current_rotation_index = int(_style_profile.get("style_rotation_index") or 0)
             _style_selections = _style_profile.get("style_selections") or []
             _style_prompt_fragments = _style_profile.get("style_prompt_fragments") or []
-            _industry = _style_profile.get("industry") or brand_context.get("industry", "")
+            _industry = _style_profile.get("industry") or brand_context_dict.get("industry", "")
 
             # Pre-assign styles to each non-carousel draft
             _assigned_styles = {}  # draft_id -> (slug, fragment)
