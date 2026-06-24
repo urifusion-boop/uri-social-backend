@@ -93,17 +93,18 @@ class PaymentService:
         tier_id: str,
         user_email: str,
         billing_cycle: str = "monthly",
+        currency: str = "NGN",
         test_amount: int = None,
         test_credits: int = None
     ) -> InitializePaymentResponse:
         """
-        Initialize SQUAD payment checkout with billing cycle support
+        Initialize SQUAD payment checkout with billing cycle and currency support
         PRD: Subscription Plan Upgrade (Multi-Duration with 5% Bulk Discount)
-        Sections 6.3 & 8.2: Payment Flow + Payment Logic
+        Sections 6.3 & 8.2: Payment Flow + Payment Logic + Multi-currency
 
-        1. User selects plan and billing cycle
+        1. User selects plan, billing cycle, and currency
         2. Calculate price with 5% discount for multi-month
-        3. Payment processed via SQUAD
+        3. Payment processed via SQUAD in selected currency (NGN or USD)
         4. On success: Assign credits, Activate subscription
 
         Args:
@@ -111,17 +112,20 @@ class PaymentService:
             tier_id: Subscription tier to purchase
             user_email: User email for payment
             billing_cycle: "monthly"|"3_months"|"6_months"|"12_months"
+            currency: "NGN" or "USD" (default: "NGN")
             test_amount: Custom test amount (only for tier_id='test')
             test_credits: Custom test credits (only for tier_id='test')
         """
         # Handle test tier with custom amounts (temporary testing feature)
         if tier_id == 'test':
-            print(f"🧪 TEST PAYMENT: amount={test_amount}, credits={test_credits}, user={user_id}")
+            print(f"🧪 TEST PAYMENT: amount={test_amount}, credits={test_credits}, currency={currency}, user={user_id}")
             if not test_amount or not test_credits:
                 raise ValueError(f"test_amount and test_credits required for test tier (received: amount={test_amount}, credits={test_credits})")
 
             amount = test_amount
             credits = test_credits
+            currency_symbol = "$" if currency == "USD" else "₦"
+            print(f"💰 Test Payment: {currency_symbol}{amount:,} {currency} ({credits} credits)")
         else:
             # Validate tier
             validation = await subscription_service.validate_tier_purchase(user_id, tier_id)
@@ -130,21 +134,27 @@ class PaymentService:
 
             tier = validation["tier"]
 
-            # Calculate price and credits based on billing cycle (PRD Section 6 & 8.2)
-            amount = subscription_service.calculate_price(tier.price_ngn_monthly, billing_cycle)
+            # Calculate price and credits based on billing cycle and currency (PRD Section 6 & 8.2)
+            if currency == "USD":
+                base_price = tier.price_usd_monthly
+            else:
+                base_price = tier.price_ngn_monthly
+
+            amount = subscription_service.calculate_price(base_price, billing_cycle)
             credits = subscription_service.calculate_credits(tier.credits_monthly, billing_cycle)
 
-            print(f"💰 Payment: {tier.name} - {billing_cycle} - ₦{amount:,} ({credits} credits)")
+            currency_symbol = "$" if currency == "USD" else "₦"
+            print(f"💰 Payment: {tier.name} - {billing_cycle} - {currency_symbol}{amount:,} {currency} ({credits} credits)")
 
         # Generate unique transaction reference
-        transaction_ref = f"URI_{user_id[:8]}_{tier_id.upper()}_{billing_cycle.upper()}_{int(datetime.utcnow().timestamp())}"
+        transaction_ref = f"URI_{user_id[:8]}_{tier_id.upper()}_{billing_cycle.upper()}_{currency}_{int(datetime.utcnow().timestamp())}"
 
         # Create pending payment transaction (PRD Section 8.1 & 8.2)
         payment = PaymentTransaction(
             user_id=user_id,
             transaction_ref=transaction_ref,
             amount=amount,
-            currency="NGN",
+            currency=currency,
             status="pending",
             gateway="squad",
             subscription_tier=tier_id,
@@ -171,12 +181,12 @@ class PaymentService:
 
                 # SQUAD API payload structure (per official docs)
                 # Note: Sandbox doesn't accept "meta" field, only live does
-                # IMPORTANT: SQUAD expects amount in KOBO (smallest unit), not Naira
-                # 1 Naira = 100 Kobo, so ₦15,000 = 1,500,000 kobo
+                # IMPORTANT: SQUAD expects amount in smallest unit (Kobo for NGN, Cents for USD)
+                # 1 Naira = 100 Kobo, 1 Dollar = 100 Cents
                 payload = {
                     "email": user_email,
-                    "amount": amount * 100,  # Convert Naira to Kobo (multiply by 100)
-                    "currency": "NGN",
+                    "amount": amount * 100,  # Convert to smallest unit (Kobo/Cents)
+                    "currency": currency,  # NGN or USD
                     "initiate_type": "inline",  # Required: opens payment modal
                     "transaction_ref": transaction_ref,
                     "callback_url": self.callback_url
@@ -205,7 +215,7 @@ class PaymentService:
                         transaction_ref=transaction_ref,
                         amount=amount,
                         email=user_email,
-                        currency="NGN",
+                        currency=currency,
                         public_key=creds['public_key']
                     )
                 else:

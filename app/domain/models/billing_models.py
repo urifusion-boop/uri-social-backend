@@ -132,14 +132,20 @@ class SubscriptionTier(BaseModel):
     tier_id: str = Field(..., description="starter|growth|pro|agency|custom")
     name: str = Field(..., description="Display name")
 
-    # Monthly pricing (base price)
+    # Monthly pricing (base price) - NGN
     price_ngn_monthly: int = Field(..., description="Monthly price in Nigerian Naira")
     credits_monthly: int = Field(..., description="Monthly credit allocation")
 
-    # Multi-duration pricing (calculated with 5% discount)
+    # Multi-duration pricing - NGN (calculated with 5% discount)
     price_ngn_3months: int = Field(..., description="3-month price with 5% discount")
     price_ngn_6months: int = Field(..., description="6-month price with 5% discount")
     price_ngn_12months: int = Field(..., description="12-month price with 5% discount")
+
+    # USD pricing (multi-currency support)
+    price_usd_monthly: int = Field(..., description="Monthly price in US Dollars")
+    price_usd_3months: int = Field(..., description="3-month price with 5% discount in USD")
+    price_usd_6months: int = Field(..., description="6-month price with 5% discount in USD")
+    price_usd_12months: int = Field(..., description="12-month price with 5% discount in USD")
 
     # Legacy fields for backward compatibility
     price_ngn: int = Field(..., description="Alias for price_ngn_monthly (backward compatibility)")
@@ -297,12 +303,13 @@ class TrialStatusResponse(BaseModel):
 
 class InitializePaymentRequest(BaseModel):
     """
-    Request to start payment flow with billing cycle support
+    Request to start payment flow with billing cycle and currency support
     PRD: Subscription Plan Upgrade (Multi-Duration with 5% Bulk Discount)
-    Section 8.1: Billing cycle selection
+    Section 8.1: Billing cycle selection + Multi-currency support
     """
     tier_id: str = Field(..., description="Subscription tier to purchase")
     billing_cycle: str = Field(default="monthly", description="monthly|3_months|6_months|12_months")
+    currency: str = Field(default="NGN", description="NGN or USD")
     test_amount: Optional[int] = Field(None, description="Custom test amount in NGN (only for tier_id='test')")
     test_credits: Optional[int] = Field(None, description="Custom test credits (only for tier_id='test')")
 
@@ -310,7 +317,8 @@ class InitializePaymentRequest(BaseModel):
         schema_extra = {
             "example": {
                 "tier_id": "growth",
-                "billing_cycle": "3_months"
+                "billing_cycle": "3_months",
+                "currency": "NGN"
             }
         }
 
