@@ -52,6 +52,10 @@ async def seed_subscription_tiers():
             "price_ngn_3months": int(15000 * 3 * DISCOUNT_RATE),  # ₦42,750
             "price_ngn_6months": int(15000 * 6 * DISCOUNT_RATE),  # ₦85,500
             "price_ngn_12months": int(15000 * 12 * DISCOUNT_RATE),  # ₦171,000
+            "price_usd_monthly": 12,
+            "price_usd_3months": int(12 * 3 * DISCOUNT_RATE),  # $34
+            "price_usd_6months": int(12 * 6 * DISCOUNT_RATE),  # $68
+            "price_usd_12months": int(12 * 12 * DISCOUNT_RATE),  # $136
             "credits_monthly": 20,
             "price_ngn": 15000,  # Legacy
             "credits": 20,  # Legacy
@@ -71,6 +75,10 @@ async def seed_subscription_tiers():
             "price_ngn_3months": int(25000 * 3 * DISCOUNT_RATE),  # ₦71,250
             "price_ngn_6months": int(25000 * 6 * DISCOUNT_RATE),  # ₦142,500
             "price_ngn_12months": int(25000 * 12 * DISCOUNT_RATE),  # ₦285,000
+            "price_usd_monthly": 20,
+            "price_usd_3months": int(20 * 3 * DISCOUNT_RATE),  # $57
+            "price_usd_6months": int(20 * 6 * DISCOUNT_RATE),  # $114
+            "price_usd_12months": int(20 * 12 * DISCOUNT_RATE),  # $228
             "credits_monthly": 35,
             "price_ngn": 25000,  # Legacy
             "credits": 35,  # Legacy
@@ -91,6 +99,10 @@ async def seed_subscription_tiers():
             "price_ngn_3months": int(40000 * 3 * DISCOUNT_RATE),  # ₦114,000
             "price_ngn_6months": int(40000 * 6 * DISCOUNT_RATE),  # ₦228,000
             "price_ngn_12months": int(40000 * 12 * DISCOUNT_RATE),  # ₦456,000
+            "price_usd_monthly": 30,
+            "price_usd_3months": int(30 * 3 * DISCOUNT_RATE),  # $85
+            "price_usd_6months": int(30 * 6 * DISCOUNT_RATE),  # $171
+            "price_usd_12months": int(30 * 12 * DISCOUNT_RATE),  # $342
             "credits_monthly": 50,
             "price_ngn": 40000,  # Legacy
             "credits": 50,  # Legacy
@@ -112,6 +124,10 @@ async def seed_subscription_tiers():
             "price_ngn_3months": int(80000 * 3 * DISCOUNT_RATE),  # ₦228,000
             "price_ngn_6months": int(80000 * 6 * DISCOUNT_RATE),  # ₦456,000
             "price_ngn_12months": int(80000 * 12 * DISCOUNT_RATE),  # ₦912,000
+            "price_usd_monthly": 60,
+            "price_usd_3months": int(60 * 3 * DISCOUNT_RATE),  # $171
+            "price_usd_6months": int(60 * 6 * DISCOUNT_RATE),  # $342
+            "price_usd_12months": int(60 * 12 * DISCOUNT_RATE),  # $684
             "credits_monthly": 100,
             "price_ngn": 80000,  # Legacy
             "credits": 100,  # Legacy
@@ -134,13 +150,17 @@ async def seed_subscription_tiers():
             "price_ngn_3months": 750,
             "price_ngn_6months": 750,
             "price_ngn_12months": 750,
+            "price_usd_monthly": 1,
+            "price_usd_3months": 1,
+            "price_usd_6months": 1,
+            "price_usd_12months": 1,
             "credits_monthly": 1,
             "price_ngn": 750,  # Legacy
             "credits": 1,  # Legacy
             "price_per_credit": 750,
             "features": [
                 "Pay Per Credit",
-                "₦750 per Campaign",
+                "₦750 / $1 per Campaign",
                 "All Features Included",
                 "No Monthly Commitment"
             ],

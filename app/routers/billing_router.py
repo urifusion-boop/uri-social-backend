@@ -74,6 +74,7 @@ async def initialize_payment(
             tier_id=body.tier_id,
             user_email=user_email,
             billing_cycle=body.billing_cycle,  # PRD 8.1: Pass billing cycle
+            currency=body.currency,  # Multi-currency support (NGN or USD)
             test_amount=body.test_amount,
             test_credits=body.test_credits
         )
