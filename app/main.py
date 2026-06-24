@@ -61,7 +61,7 @@ async def startup_event():
     # Ensure unique email index on users collection (prevents duplicate signups)
     try:
         from app.database import get_db
-        db = await get_db()
+        db = get_db()
         await db["users"].create_index("email", unique=True)
         print("✅ Unique email index ensured on users collection")
     except Exception as e:
@@ -72,7 +72,7 @@ async def startup_event():
     # (user_id, platform, brand_id, page_id) so each brand gets its own isolated connection.
     try:
         from app.database import get_db
-        db = await get_db()
+        db = get_db()
         existing = await db["social_connections"].index_information()
         if "user_id_1_platform_1_page_id_1" in existing:
             await db["social_connections"].drop_index("user_id_1_platform_1_page_id_1")
