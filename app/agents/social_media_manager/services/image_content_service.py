@@ -2348,7 +2348,7 @@ OVERALL:
                                     size=_gpt2_size,
                                 ),
                             ),
-                            timeout=180,
+                            timeout=300,
                         )
                         _mode = "gpt-image-2-edit"
                     else:
@@ -2366,7 +2366,7 @@ OVERALL:
                                     output_format="webp",
                                 ),
                             ),
-                            timeout=180,
+                            timeout=300,
                         )
                         _mode = "gpt-image-2"
 
