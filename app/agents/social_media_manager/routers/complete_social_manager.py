@@ -4376,7 +4376,7 @@ async def _generate_image_bg(
 
         if not image_result.get("status"):
             print(f"⚠️ BG image gen failed for draft {draft_id}: {image_result.get('responseMessage')}")
-            if db:
+            if db is not None:
                 if post_type == "carousel" and slide_index is not None:
                     await db["content_drafts"].update_one(
                         {"id": draft_id},
@@ -4512,7 +4512,7 @@ async def _generate_image_bg(
     except Exception as e:
         # Mark slide (or whole draft) as failed on exception, so the UI stops
         # showing the shimmer forever instead of silently leaving has_image=True.
-        if db:
+        if db is not None:
             try:
                 if post_type == "carousel" and slide_index is not None:
                     await db["content_drafts"].update_one(
