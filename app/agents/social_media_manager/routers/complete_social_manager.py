@@ -6211,3 +6211,211 @@ async def start_produce_video_render(
     return UriResponse.get_single_data_response(
         "start_render", {"job_id": job_id, "status": "processing"}
     )
+
+
+# ── Multi-Clip Composition (Phase 1 — Founder Story) ─────────────────────────
+
+@router.post("/multi-clip/start")
+async def multi_clip_start(
+    background_tasks: BackgroundTasks,
+    clips: List[UploadFile] = File(...),
+    story_type: str = Form("founder"),
+    target_duration: int = Form(30),
+    orientation: str = Form("9:16"),
+    enable_music: str = Form("true"),
+    music_mood: str = Form("chill"),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Start a multi-clip composition job.
+    Upload 2–10 video clips; system transcribes each, suggests order, then stitches.
+    story_type: founder | product
+    Poll GET /multi-clip/job/{job_id} for status.
+    """
+    import uuid as _uuid
+    from app.agents.social_media_manager.services.multi_clip_service import run_multi_clip_ingest
+
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    if len(clips) < 1:
+        raise HTTPException(status_code=400, detail="At least 1 clip is required")
+    if len(clips) > 10:
+        raise HTTPException(status_code=400, detail="Maximum 10 clips allowed")
+
+    # Read all clip bytes upfront before the background task starts
+    clips_data: List[tuple] = []
+    for clip in clips:
+        raw = await clip.read()
+        if len(raw) < 1000:
+            raise HTTPException(status_code=400, detail=f"Clip '{clip.filename}' appears invalid or empty")
+        clips_data.append((clip.filename or "clip.mp4", raw))
+
+    job_id = str(_uuid.uuid4())
+    now = datetime.utcnow().isoformat()
+
+    await db.multi_clip_jobs.insert_one({
+        "job_id": job_id,
+        "user_id": user_id,
+        "story_type": story_type,
+        "status": "analyzing",
+        "status_message": "Starting…",
+        "progress": 0,
+        "clips": [],
+        "suggested_order": [],
+        "target_duration_seconds": target_duration,
+        "orientation": orientation,
+        "enable_music": enable_music.lower() != "false",
+        "music_mood": music_mood,
+        "output_url": None,
+        "render_id": None,
+        "created_at": now,
+        "updated_at": now,
+        "completed_at": None,
+    })
+
+    background_tasks.add_task(run_multi_clip_ingest, job_id, clips_data, db)
+
+    return UriResponse.get_single_data_response(
+        "multi_clip_start", {"job_id": job_id, "status": "analyzing"}
+    )
+
+
+@router.get("/multi-clip/job/{job_id}")
+async def get_multi_clip_job(
+    job_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """Poll a multi-clip composition job."""
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    doc = await db.multi_clip_jobs.find_one(
+        {"job_id": job_id, "user_id": user_id}, {"_id": 0}
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    return UriResponse.get_single_data_response("multi_clip_job", doc)
+
+
+@router.post("/multi-clip/job/{job_id}/reorder")
+async def reorder_multi_clip_job(
+    job_id: str,
+    payload: dict = Body(...),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Set the user's chosen clip order.
+    Body: { "clip_ids": ["clip_abc", "clip_def", ...] }
+    """
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    doc = await db.multi_clip_jobs.find_one(
+        {"job_id": job_id, "user_id": user_id}, {"_id": 0, "clips": 1, "status": 1}
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if doc.get("status") not in ("awaiting_order", "ready"):
+        raise HTTPException(status_code=409, detail=f"Cannot reorder in status={doc.get('status')}")
+
+    clip_ids: List[str] = payload.get("clip_ids", [])
+    clips: List[Dict] = doc.get("clips", [])
+
+    # Update order_index per clip
+    id_to_rank = {cid: rank for rank, cid in enumerate(clip_ids)}
+    updated_clips = []
+    for c in clips:
+        c = dict(c)
+        if c["clip_id"] in id_to_rank:
+            c["order_index"] = id_to_rank[c["clip_id"]]
+        updated_clips.append(c)
+
+    await db.multi_clip_jobs.update_one(
+        {"job_id": job_id},
+        {"$set": {"clips": updated_clips, "updated_at": datetime.utcnow().isoformat()}}
+    )
+
+    return UriResponse.get_single_data_response("reorder", {"accepted": True})
+
+
+@router.post("/multi-clip/job/{job_id}/drop-clip")
+async def drop_multi_clip(
+    job_id: str,
+    payload: dict = Body(...),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Mark a clip as dropped (excluded from stitch).
+    Body: { "clip_id": "clip_abc", "dropped": true }
+    """
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    doc = await db.multi_clip_jobs.find_one(
+        {"job_id": job_id, "user_id": user_id}, {"_id": 0, "clips": 1}
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    clip_id = payload.get("clip_id")
+    dropped = bool(payload.get("dropped", True))
+    clips = [dict(c) for c in doc.get("clips", [])]
+    for c in clips:
+        if c["clip_id"] == clip_id:
+            c["dropped"] = dropped
+
+    await db.multi_clip_jobs.update_one(
+        {"job_id": job_id},
+        {"$set": {"clips": clips, "updated_at": datetime.utcnow().isoformat()}}
+    )
+
+    return UriResponse.get_single_data_response("drop_clip", {"clip_id": clip_id, "dropped": dropped})
+
+
+@router.post("/multi-clip/job/{job_id}/stitch")
+async def stitch_multi_clip_job(
+    job_id: str,
+    background_tasks: BackgroundTasks,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Trigger the render/stitch phase after the user has reviewed clip order and drops.
+    """
+    from app.agents.social_media_manager.services.multi_clip_service import run_multi_clip_stitch
+
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    doc = await db.multi_clip_jobs.find_one(
+        {"job_id": job_id, "user_id": user_id}, {"_id": 0, "status": 1}
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    allowed = ("awaiting_order", "ready", "failed")
+    if doc.get("status") not in allowed:
+        raise HTTPException(status_code=409, detail=f"Cannot stitch in status={doc.get('status')}")
+
+    await db.multi_clip_jobs.update_one(
+        {"job_id": job_id},
+        {"$set": {"status": "stitching", "status_message": "Rendering…", "progress": 70,
+                  "output_url": None, "updated_at": datetime.utcnow().isoformat()}}
+    )
+
+    background_tasks.add_task(run_multi_clip_stitch, job_id, db)
+
+    return UriResponse.get_single_data_response(
+        "stitch", {"job_id": job_id, "status": "stitching"}
+    )
