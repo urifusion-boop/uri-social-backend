@@ -2392,7 +2392,9 @@ OVERALL:
                         "model": _mode,
                     }
                 except Exception as _gpt2_err:
-                    print(f"⚠️ GPT-Image-2 failed: {_gpt2_err} — falling back to Imagen/GPT")
+                    import traceback
+                    print(f"⚠️ GPT-Image-2 failed: {type(_gpt2_err).__name__}: {_gpt2_err} — falling back to Imagen/GPT")
+                    print(f"   Traceback: {traceback.format_exc()}")
 
             # ── fal.ai path (model explicitly chosen from frontend) ────────────
             _fal_model = image_model or ""
