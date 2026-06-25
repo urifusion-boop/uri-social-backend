@@ -796,6 +796,7 @@ that follows.{logo_space_note}"""
             # These rules make AI graphics look professionally designed (not AI-generated)
             primary_color = brand_colors[0] if brand_colors else "#000000"
             secondary_color = brand_colors[1] if len(brand_colors) > 1 else "#FFFFFF"
+            tertiary_color = brand_colors[2] if len(brand_colors) > 2 else None
 
             # Use CTA from brand playbook's cta_styles
             # If user has multiple CTAs, vary them randomly for diversity
@@ -891,7 +892,7 @@ Follow these rules precisely for every image. No exceptions.
 6. NO HASHTAGS: Do NOT render any hashtags on the image. Hashtags go in
    the caption text only.
 
-7. COLOUR LIMIT: Use only these colours: {primary_color}, {secondary_color},
+7. COLOUR LIMIT: Use only these colours: {primary_color}, {secondary_color}{', ' + tertiary_color if tertiary_color else ''},
    and one neutral (black #000000, white #FFFFFF, or grey #888888). No other
    colours unless specified in VISUAL STYLE.
 
