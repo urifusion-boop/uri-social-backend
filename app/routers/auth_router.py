@@ -683,7 +683,7 @@ async def change_password(
 
 class MagicLinkRequest(BaseModel):
     user_id: str
-    redirect_url: str = "/dashboard"  # Where to redirect after auth
+    redirect_url: str = "/workspace"  # Where to redirect after auth
 
 
 class MagicLinkResponse(BaseModel):
@@ -950,7 +950,7 @@ async def verify_magic_link(
                 "email": user.get("email", ""),
                 "firstName": user.get("first_name", ""),
                 "lastName": user.get("last_name", ""),
-                "redirect_url": magic_token_doc.get("redirect_url", "/dashboard")
+                "redirect_url": magic_token_doc.get("redirect_url", "/workspace")
             }
         }
     except HTTPException:
