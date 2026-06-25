@@ -6224,6 +6224,7 @@ async def multi_clip_start(
     orientation: str = Form("9:16"),
     enable_music: str = Form("true"),
     music_mood: str = Form("chill"),
+    music_volume: float = Form(0.12),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
     token: dict = Depends(JWTBearer()),
 ):
@@ -6231,6 +6232,7 @@ async def multi_clip_start(
     Start a multi-clip composition job.
     Upload 2–10 video clips; system transcribes each, suggests order, then stitches.
     story_type: founder | product
+    music_volume: Shotstack track volume 0.0-0.30 (0.06=quiet, 0.12=medium, 0.25=loud)
     Poll GET /multi-clip/job/{job_id} for status.
     """
     import uuid as _uuid
@@ -6269,6 +6271,7 @@ async def multi_clip_start(
         "orientation": orientation,
         "enable_music": enable_music.lower() != "false",
         "music_mood": music_mood,
+        "music_volume": max(0.0, min(0.30, float(music_volume))),
         "output_url": None,
         "render_id": None,
         "created_at": now,
@@ -6280,6 +6283,43 @@ async def multi_clip_start(
 
     return UriResponse.get_single_data_response(
         "multi_clip_start", {"job_id": job_id, "status": "analyzing"}
+    )
+
+
+@router.post("/multi-clip/job/{job_id}/reset")
+async def reset_multi_clip_job(
+    job_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Reset a completed (ready/failed) job back to awaiting_order so the user can
+    reorder clips and re-stitch without starting a new job.
+    Clips, script, and settings are preserved.
+    """
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    doc = await db.multi_clip_jobs.find_one({"job_id": job_id, "user_id": user_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if doc.get("status") not in ("ready", "failed"):
+        raise HTTPException(status_code=400, detail="Only ready or failed jobs can be reset")
+
+    await db.multi_clip_jobs.update_one(
+        {"job_id": job_id},
+        {"$set": {
+            "status": "awaiting_order",
+            "status_message": "Ready to review",
+            "output_url": None,
+            "render_id": None,
+            "completed_at": None,
+            "updated_at": datetime.utcnow().isoformat(),
+        }},
+    )
+    return UriResponse.get_single_data_response(
+        "multi_clip_reset", {"job_id": job_id, "status": "awaiting_order"}
     )
 
 
@@ -6344,6 +6384,44 @@ async def reorder_multi_clip_job(
     )
 
     return UriResponse.get_single_data_response("reorder", {"accepted": True})
+
+
+class UpdateClipPositionRequest(BaseModel):
+    subject_position: str  # left | center | right
+
+
+@router.patch("/multi-clip/job/{job_id}/clip/{clip_id}/position")
+async def update_clip_position(
+    job_id: str,
+    clip_id: str,
+    req: UpdateClipPositionRequest,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Override the auto-detected subject_position for one clip.
+    Persisted to DB so it's used at stitch time.
+    """
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if req.subject_position not in ("left", "center", "right"):
+        raise HTTPException(status_code=400, detail="subject_position must be left, center, or right")
+
+    result = await db.multi_clip_jobs.update_one(
+        {"job_id": job_id, "user_id": user_id, "clips.clip_id": clip_id},
+        {"$set": {
+            "clips.$.subject_position": req.subject_position,
+            "updated_at": datetime.utcnow().isoformat(),
+        }},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Job or clip not found")
+
+    return UriResponse.get_single_data_response(
+        "update_clip_position",
+        {"clip_id": clip_id, "subject_position": req.subject_position},
+    )
 
 
 @router.post("/multi-clip/job/{job_id}/drop-clip")
@@ -6418,4 +6496,105 @@ async def stitch_multi_clip_job(
 
     return UriResponse.get_single_data_response(
         "stitch", {"job_id": job_id, "status": "stitching"}
+    )
+
+
+class DraftScriptRequest(BaseModel):
+    description: str
+
+
+@router.post("/multi-clip/job/{job_id}/draft-script")
+async def draft_product_script(
+    job_id: str,
+    req: DraftScriptRequest,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Draft a short product video script from a user description using GPT-4o.
+    Synchronous — returns the draft immediately.
+    Also saves it to the job doc as script_draft / script_lines_draft.
+    """
+    from app.agents.social_media_manager.services.multi_clip_service import _draft_product_script
+
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    doc = await db.multi_clip_jobs.find_one(
+        {"job_id": job_id, "user_id": user_id}, {"_id": 0, "clips": 1, "story_type": 1}
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if doc.get("story_type") != "product":
+        raise HTTPException(status_code=409, detail="Script drafting is only for Product Story jobs")
+
+    clip_count = len(doc.get("clips", []))
+    result = await _draft_product_script(req.description, clip_count)
+
+    await db.multi_clip_jobs.update_one(
+        {"job_id": job_id},
+        {"$set": {
+            "story_description": req.description,
+            "script_draft": result["draft"],
+            "script_lines_draft": result["lines"],
+            "updated_at": datetime.utcnow().isoformat(),
+        }}
+    )
+
+    return UriResponse.get_single_data_response("draft_script", result)
+
+
+class ApproveScriptRequest(BaseModel):
+    script: str
+    lines: List[str]
+
+
+@router.post("/multi-clip/job/{job_id}/approve-script")
+async def approve_product_script(
+    job_id: str,
+    req: ApproveScriptRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Save the approved script and kick off the vision-describe + ordering phase.
+    Job moves from awaiting_script → analyzing → awaiting_order.
+    """
+    from app.agents.social_media_manager.services.multi_clip_service import run_product_vision_phase
+
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    doc = await db.multi_clip_jobs.find_one(
+        {"job_id": job_id, "user_id": user_id}, {"_id": 0, "status": 1, "story_type": 1}
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if doc.get("story_type") != "product":
+        raise HTTPException(status_code=409, detail="Script approval is only for Product Story jobs")
+
+    if doc.get("status") != "awaiting_script":
+        raise HTTPException(status_code=409, detail=f"Job is not in awaiting_script status")
+
+    await db.multi_clip_jobs.update_one(
+        {"job_id": job_id},
+        {"$set": {
+            "script": req.script,
+            "script_lines": req.lines,
+            "status": "analyzing",
+            "status_message": "Describing clips with AI vision…",
+            "progress": 60,
+            "updated_at": datetime.utcnow().isoformat(),
+        }}
+    )
+
+    background_tasks.add_task(run_product_vision_phase, job_id, db)
+
+    return UriResponse.get_single_data_response(
+        "approve_script", {"job_id": job_id, "status": "analyzing"}
     )
