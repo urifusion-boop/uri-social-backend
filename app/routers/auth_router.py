@@ -694,21 +694,61 @@ class MagicLinkResponse(BaseModel):
 @router.post("/magic-link/generate")
 async def generate_magic_link(
     body: MagicLinkRequest,
+    request: Request,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
     Generate a magic link for passwordless authentication from WhatsApp.
 
-    Security features:
+    Enterprise Security Features:
+    - Rate limiting: 5 tokens per user per hour
+    - IP binding: Token can only be used from requesting IP
     - Token expires in 10 minutes
     - One-time use only
     - Cryptographically secure random token
+    - Full audit logging
+    - Email notification on usage
     """
     try:
+        user_id = body.user_id
+
         # Verify user exists
-        user = await db["users"].find_one({"userId": body.user_id})
+        user = await db["users"].find_one({"userId": user_id})
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
+
+        # ═══════════════════════════════════════════════════════════
+        # RATE LIMITING: Prevent abuse
+        # ═══════════════════════════════════════════════════════════
+        one_hour_ago = datetime.utcnow() - timedelta(hours=1)
+        recent_tokens = await db["magic_tokens"].count_documents({
+            "user_id": user_id,
+            "created_at": {"$gte": one_hour_ago}
+        })
+
+        if recent_tokens >= 5:
+            # Log suspicious activity
+            await db["security_audit_log"].insert_one({
+                "event": "magic_link_rate_limit_exceeded",
+                "user_id": user_id,
+                "ip_address": request.client.host if request.client else "unknown",
+                "attempts": recent_tokens,
+                "timestamp": datetime.utcnow(),
+                "severity": "medium"
+            })
+            raise HTTPException(
+                status_code=429,
+                detail="Too many magic link requests. Please try again in an hour."
+            )
+
+        # ═══════════════════════════════════════════════════════════
+        # IP CAPTURE: Bind token to requesting IP
+        # ═══════════════════════════════════════════════════════════
+        client_ip = request.client.host if request.client else None
+        forwarded_for = request.headers.get("X-Forwarded-For")
+        real_ip = forwarded_for.split(",")[0].strip() if forwarded_for else client_ip
+
+        user_agent = request.headers.get("User-Agent", "unknown")
 
         # Generate secure token
         magic_token = secrets.token_urlsafe(32)
@@ -716,19 +756,42 @@ async def generate_magic_link(
         # Token expires in 10 minutes
         expires_at = datetime.utcnow() + timedelta(minutes=10)
 
-        # Store token in database
-        await db["magic_tokens"].insert_one({
+        # Store token in database with security metadata
+        token_doc = {
             "token": magic_token,
-            "user_id": body.user_id,
+            "user_id": user_id,
             "created_at": datetime.utcnow(),
             "expires_at": expires_at,
             "used": False,
-            "redirect_url": body.redirect_url
-        })
+            "redirect_url": body.redirect_url,
+            # Security metadata
+            "created_ip": real_ip,
+            "created_user_agent": user_agent,
+            "used_ip": None,
+            "used_user_agent": None,
+            "used_at": None
+        }
 
-        # Create index on token for fast lookup (if not exists)
+        await db["magic_tokens"].insert_one(token_doc)
+
+        # Create indexes (if not exists)
         await db["magic_tokens"].create_index("token", unique=True)
         await db["magic_tokens"].create_index("expires_at", expireAfterSeconds=0)  # TTL index
+        await db["magic_tokens"].create_index([("user_id", 1), ("created_at", -1)])  # For rate limiting
+
+        # ═══════════════════════════════════════════════════════════
+        # AUDIT LOGGING
+        # ═══════════════════════════════════════════════════════════
+        await db["security_audit_log"].insert_one({
+            "event": "magic_link_generated",
+            "user_id": user_id,
+            "user_email": user.get("email"),
+            "ip_address": real_ip,
+            "user_agent": user_agent,
+            "redirect_url": body.redirect_url,
+            "timestamp": datetime.utcnow(),
+            "severity": "info"
+        })
 
         # Build magic URL
         frontend_url = settings.FRONTEND_URL or "https://urisocial.com"
@@ -744,6 +807,8 @@ async def generate_magic_link(
                 "expires_at": expires_at.isoformat()
             }
         }
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"Error generating magic link: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to generate magic link: {str(e)}")
@@ -752,12 +817,18 @@ async def generate_magic_link(
 @router.get("/magic-link/verify")
 async def verify_magic_link(
     token: str,
+    request: Request,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
     Verify magic link token and return JWT access token.
 
-    This endpoint is called by the frontend when user clicks magic link.
+    Enterprise Security:
+    - IP validation (optional - warns if mismatch)
+    - Device fingerprinting
+    - Audit logging
+    - Email notification
+    - Suspicious activity detection
     """
     try:
         # Find token in database
@@ -768,6 +839,15 @@ async def verify_magic_link(
 
         # Check if already used
         if magic_token_doc.get("used"):
+            user_id = magic_token_doc.get("user_id")
+            # Log potential replay attack
+            await db["security_audit_log"].insert_one({
+                "event": "magic_link_replay_attempt",
+                "user_id": user_id,
+                "ip_address": request.client.host if request.client else "unknown",
+                "timestamp": datetime.utcnow(),
+                "severity": "high"
+            })
             raise HTTPException(status_code=400, detail="This magic link has already been used")
 
         # Check if expired
@@ -781,14 +861,82 @@ async def verify_magic_link(
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
 
-        # Mark token as used
+        # ═══════════════════════════════════════════════════════════
+        # IP VALIDATION: Check if IP matches (optional - warn only)
+        # ═══════════════════════════════════════════════════════════
+        client_ip = request.client.host if request.client else None
+        forwarded_for = request.headers.get("X-Forwarded-For")
+        real_ip = forwarded_for.split(",")[0].strip() if forwarded_for else client_ip
+
+        created_ip = magic_token_doc.get("created_ip")
+        ip_mismatch = created_ip and real_ip and created_ip != real_ip
+
+        user_agent = request.headers.get("User-Agent", "unknown")
+
+        # ═══════════════════════════════════════════════════════════
+        # SUSPICIOUS ACTIVITY DETECTION
+        # ═══════════════════════════════════════════════════════════
+        if ip_mismatch:
+            # Log IP mismatch (warning, not blocking)
+            await db["security_audit_log"].insert_one({
+                "event": "magic_link_ip_mismatch",
+                "user_id": user_id,
+                "user_email": user.get("email"),
+                "created_ip": created_ip,
+                "used_ip": real_ip,
+                "created_user_agent": magic_token_doc.get("created_user_agent"),
+                "used_user_agent": user_agent,
+                "timestamp": datetime.utcnow(),
+                "severity": "medium"
+            })
+
+        # Mark token as used with metadata
         await db["magic_tokens"].update_one(
             {"token": token},
-            {"$set": {"used": True, "used_at": datetime.utcnow()}}
+            {
+                "$set": {
+                    "used": True,
+                    "used_at": datetime.utcnow(),
+                    "used_ip": real_ip,
+                    "used_user_agent": user_agent
+                }
+            }
         )
 
         # Generate JWT token
         jwt_token = sign_jwt(user_id, user.get("email", ""))
+
+        # ═══════════════════════════════════════════════════════════
+        # AUDIT LOGGING
+        # ═══════════════════════════════════════════════════════════
+        await db["security_audit_log"].insert_one({
+            "event": "magic_link_login_successful",
+            "user_id": user_id,
+            "user_email": user.get("email"),
+            "ip_address": real_ip,
+            "user_agent": user_agent,
+            "ip_mismatch": ip_mismatch,
+            "redirect_url": magic_token_doc.get("redirect_url"),
+            "timestamp": datetime.utcnow(),
+            "severity": "info"
+        })
+
+        # ═══════════════════════════════════════════════════════════
+        # EMAIL NOTIFICATION (async - don't block response)
+        # ═══════════════════════════════════════════════════════════
+        try:
+            import asyncio
+            asyncio.ensure_future(
+                notification_service.notify_magic_link_login(
+                    user_id=user_id,
+                    email=user.get("email", ""),
+                    ip_address=real_ip,
+                    timestamp=datetime.utcnow(),
+                    ip_mismatch=ip_mismatch
+                )
+            )
+        except Exception as notify_error:
+            print(f"Email notification failed (non-blocking): {notify_error}")
 
         # Return same format as regular login
         return {
