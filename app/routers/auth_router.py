@@ -674,3 +674,138 @@ async def change_password(
         "responseMessage": "Password changed successfully.",
         "responseData": {},
     }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Magic Link Authentication (for WhatsApp users)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class MagicLinkRequest(BaseModel):
+    user_id: str
+    redirect_url: str = "/dashboard"  # Where to redirect after auth
+
+
+class MagicLinkResponse(BaseModel):
+    magic_token: str
+    magic_url: str
+    expires_at: datetime
+
+
+@router.post("/magic-link/generate")
+async def generate_magic_link(
+    body: MagicLinkRequest,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency)
+):
+    """
+    Generate a magic link for passwordless authentication from WhatsApp.
+
+    Security features:
+    - Token expires in 10 minutes
+    - One-time use only
+    - Cryptographically secure random token
+    """
+    try:
+        # Verify user exists
+        user = await db["users"].find_one({"userId": body.user_id})
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        # Generate secure token
+        magic_token = secrets.token_urlsafe(32)
+
+        # Token expires in 10 minutes
+        expires_at = datetime.utcnow() + timedelta(minutes=10)
+
+        # Store token in database
+        await db["magic_tokens"].insert_one({
+            "token": magic_token,
+            "user_id": body.user_id,
+            "created_at": datetime.utcnow(),
+            "expires_at": expires_at,
+            "used": False,
+            "redirect_url": body.redirect_url
+        })
+
+        # Create index on token for fast lookup (if not exists)
+        await db["magic_tokens"].create_index("token", unique=True)
+        await db["magic_tokens"].create_index("expires_at", expireAfterSeconds=0)  # TTL index
+
+        # Build magic URL
+        frontend_url = settings.FRONTEND_URL or "https://urisocial.com"
+        magic_url = f"{frontend_url}/auth/magic?token={magic_token}"
+
+        return {
+            "status": True,
+            "responseCode": 200,
+            "responseMessage": "Magic link generated successfully",
+            "responseData": {
+                "magic_token": magic_token,
+                "magic_url": magic_url,
+                "expires_at": expires_at.isoformat()
+            }
+        }
+    except Exception as e:
+        print(f"Error generating magic link: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to generate magic link: {str(e)}")
+
+
+@router.get("/magic-link/verify")
+async def verify_magic_link(
+    token: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency)
+):
+    """
+    Verify magic link token and return JWT access token.
+
+    This endpoint is called by the frontend when user clicks magic link.
+    """
+    try:
+        # Find token in database
+        magic_token_doc = await db["magic_tokens"].find_one({"token": token})
+
+        if not magic_token_doc:
+            raise HTTPException(status_code=404, detail="Invalid or expired magic link")
+
+        # Check if already used
+        if magic_token_doc.get("used"):
+            raise HTTPException(status_code=400, detail="This magic link has already been used")
+
+        # Check if expired
+        if datetime.utcnow() > magic_token_doc.get("expires_at"):
+            raise HTTPException(status_code=400, detail="This magic link has expired")
+
+        # Get user
+        user_id = magic_token_doc.get("user_id")
+        user = await db["users"].find_one({"userId": user_id})
+
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        # Mark token as used
+        await db["magic_tokens"].update_one(
+            {"token": token},
+            {"$set": {"used": True, "used_at": datetime.utcnow()}}
+        )
+
+        # Generate JWT token
+        jwt_token = sign_jwt(user_id, user.get("email", ""))
+
+        # Return same format as regular login
+        return {
+            "status": True,
+            "responseCode": 200,
+            "responseMessage": "Authentication successful",
+            "responseData": {
+                "accessToken": jwt_token,
+                "userId": user_id,
+                "email": user.get("email", ""),
+                "firstName": user.get("first_name", ""),
+                "lastName": user.get("last_name", ""),
+                "redirect_url": magic_token_doc.get("redirect_url", "/dashboard")
+            }
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error verifying magic link: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to verify magic link: {str(e)}")
