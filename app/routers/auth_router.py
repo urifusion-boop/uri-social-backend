@@ -795,7 +795,7 @@ async def generate_magic_link(
         })
 
         # Build magic URL
-        frontend_url = settings.FRONTEND_URL or "https://urisocial.com"
+        frontend_url = getattr(settings, 'FRONTEND_URL', 'https://urisocial.com')
         magic_url = f"{frontend_url}/auth/magic?token={magic_token}"
 
         return {
