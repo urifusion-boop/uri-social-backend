@@ -6,6 +6,7 @@ Pipeline: Upload clips → probe + quality check → Whisper transcription per c
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import os
@@ -36,6 +37,13 @@ _CLOUDINARY_FOLDER = "uri-multi-clip"
 _MIN_CLIP_DURATION = 2.0   # clips shorter than this get flagged
 _MAX_CLIPS = 10
 _CROSSFADE_DURATION = 0.6  # seconds overlap between clips in Shotstack
+_STILL_DEFAULT_DURATION = 2.5  # seconds a still image holds on screen
+_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
+_IMAGE_CONTENT_TYPES = {
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".png": "image/png", ".webp": "image/webp",
+    ".gif": "image/gif", ".bmp": "image/bmp",
+}
 
 
 # ── FFprobe ───────────────────────────────────────────────────────────────────
@@ -55,7 +63,7 @@ async def _probe_clip(path: str) -> Dict[str, Any]:
         stdout, _ = await proc.communicate()
         data = json.loads(stdout.decode())
         duration = float(data.get("format", {}).get("duration", 0))
-        has_audio = False
+        has_audio = has_subtitles = False
         width = height = 0
         for s in data.get("streams", []):
             if s.get("codec_type") == "video":
@@ -63,20 +71,42 @@ async def _probe_clip(path: str) -> Dict[str, Any]:
                 height = s.get("height", 0)
             if s.get("codec_type") == "audio":
                 has_audio = True
-        return {"duration": duration, "width": width, "height": height, "has_audio": has_audio}
+            if s.get("codec_type") == "subtitle":
+                has_subtitles = True
+        return {
+            "duration": duration, "width": width, "height": height,
+            "has_audio": has_audio, "has_subtitles": has_subtitles,
+        }
     except Exception as e:
         print(f"[MultiClip] probe error: {e}", flush=True)
-        return {"duration": 0, "width": 0, "height": 0, "has_audio": False}
+        return {"duration": 0, "width": 0, "height": 0, "has_audio": False, "has_subtitles": False}
 
 
 # ── Quality flags ─────────────────────────────────────────────────────────────
 
-async def _check_quality(path: str, probe: Dict) -> List[str]:
-    """Return list of quality flag strings for a clip."""
+_AUDIO_TARGET_LUFS = -16.0  # target mean loudness for leveling
+
+
+def _compute_volume_boost(mean_db: float) -> float:
+    """Convert a measured mean dBFS to a linear boost factor targeting -16 dBFS."""
+    if mean_db < -70 or mean_db > -5:
+        return 1.0  # silent or already loud — don't touch
+    diff_db = _AUDIO_TARGET_LUFS - mean_db
+    boost = 10 ** (diff_db / 20.0)
+    return max(0.3, min(2.5, round(boost, 3)))
+
+
+async def _check_quality(path: str, probe: Dict) -> Tuple[List[str], float]:
+    """Return (quality_flags, mean_volume_db). mean_volume_db is 0.0 if not measured."""
     flags: List[str] = []
+    mean_db = 0.0
 
     if probe["duration"] < _MIN_CLIP_DURATION:
         flags.append("too_short")
+
+    # Baked subtitle stream → already edited
+    if probe.get("has_subtitles"):
+        flags.append("pre_edited")
 
     # Brightness: sample one frame, check mean luminance via ffmpeg
     try:
@@ -92,14 +122,13 @@ async def _check_quality(path: str, probe: Dict) -> List[str]:
         )
         _, stderr = await proc.communicate()
         err_text = stderr.decode()
-        # YAVG line: YAVG:12.3
         m = re.search(r"YAVG:(\d+\.?\d*)", err_text)
         if m and float(m.group(1)) < 20:
             flags.append("too_dark")
     except Exception:
         pass
 
-    # Audio energy: if has_audio, measure mean volume
+    # Audio energy: measure mean volume for quality flags AND leveling
     if probe["has_audio"]:
         try:
             vol_cmd = [
@@ -113,12 +142,14 @@ async def _check_quality(path: str, probe: Dict) -> List[str]:
             )
             _, stderr = await proc.communicate()
             m = re.search(r"mean_volume:\s*(-?\d+\.?\d*)", stderr.decode())
-            if m and float(m.group(1)) < -50:
-                flags.append("too_quiet")
+            if m:
+                mean_db = float(m.group(1))
+                if mean_db < -50:
+                    flags.append("too_quiet")
         except Exception:
             pass
 
-    return flags
+    return flags, mean_db
 
 
 # ── Speech detection ──────────────────────────────────────────────────────────
@@ -174,16 +205,95 @@ async def _extract_frame_bytes(path: str, t: float = 1.0) -> Optional[bytes]:
     return None
 
 
+# ── Subject-aware crop position ───────────────────────────────────────────────
+
+async def _detect_subject_position(path: str) -> str:
+    """
+    Extract a frame and ask GPT-4o-vision where the main subject sits.
+    Returns 'left', 'center', or 'right'. Falls back to 'center' on any error.
+    Used to set Shotstack clip position so the crop keeps the subject in frame.
+    """
+    try:
+        frame_bytes = await _extract_frame_bytes(path, t=1.0)
+        if not frame_bytes:
+            return "center"
+        frame_b64 = base64.b64encode(frame_bytes).decode()
+        client = openai.AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+        resp = await client.chat.completions.create(
+            model="gpt-4o",
+            max_tokens=5,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{frame_b64}",
+                            "detail": "low",
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": (
+                            "Where is the main subject (person or product) in this frame? "
+                            "Answer with only one word: left, center, or right."
+                        ),
+                    },
+                ],
+            }],
+        )
+        result = resp.choices[0].message.content.strip().lower()
+        if result in ("left", "center", "right"):
+            return result
+    except Exception as e:
+        print(f"[MultiClip] subject position detection error: {e}", flush=True)
+    return "center"
+
+
+# ── Audio extraction for Whisper ──────────────────────────────────────────────
+
+async def _extract_audio_mp3(video_path: str) -> Optional[str]:
+    """
+    Extract audio from any video format to a temp mp3 file.
+    Returns the path of the mp3 file, or None on failure.
+    Whisper supports mp3 universally; this handles .mov, .avi, .mkv etc.
+    """
+    audio_path = video_path + "_audio.mp3"
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-i", video_path,
+            "-vn",                   # no video
+            "-ar", "16000",          # 16kHz sample rate (Whisper prefers)
+            "-ac", "1",              # mono
+            "-b:a", "64k",           # small file
+            "-y", audio_path,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.wait()
+        if os.path.exists(audio_path) and os.path.getsize(audio_path) > 100:
+            return audio_path
+    except Exception as e:
+        print(f"[MultiClip] audio extract error: {e}", flush=True)
+    return None
+
+
 # ── Whisper transcription ─────────────────────────────────────────────────────
 
 async def _transcribe_clip(path: str) -> Dict[str, Any]:
     """
     Transcribe a video clip using OpenAI Whisper.
+    Extracts audio to mp3 first so any video format is accepted.
     Returns {text, srt, words:[{word, start, end}]}
     """
     client = openai.AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+
+    # Extract audio — Whisper rejects .mov/.avi/.mkv natively
+    audio_path = await _extract_audio_mp3(path)
+    use_path = audio_path if audio_path else path
+
     try:
-        with open(path, "rb") as f:
+        with open(use_path, "rb") as f:
             # verbose_json gives word-level timestamps
             response = await client.audio.transcriptions.create(
                 model="whisper-1",
@@ -222,6 +332,12 @@ async def _transcribe_clip(path: str) -> Dict[str, Any]:
     except Exception as e:
         print(f"[MultiClip] transcription error: {e}", flush=True)
         return {"text": "", "srt": "", "words": []}
+    finally:
+        if audio_path and os.path.exists(audio_path):
+            try:
+                os.unlink(audio_path)
+            except Exception:
+                pass
 
 
 # ── AI ordering (Founder Story) ───────────────────────────────────────────────
@@ -291,7 +407,19 @@ Rules:
 
 # ── Cloudinary upload (clip) ──────────────────────────────────────────────────
 
-async def _upload_clip_to_cloudinary(video_bytes: bytes, clip_id: str) -> Optional[str]:
+_CONTENT_TYPE_MAP = {
+    ".mp4": "video/mp4",
+    ".mov": "video/quicktime",
+    ".avi": "video/x-msvideo",
+    ".mkv": "video/x-matroska",
+    ".webm": "video/webm",
+    ".m4v": "video/x-m4v",
+}
+
+
+async def _upload_clip_to_cloudinary(
+    video_bytes: bytes, clip_id: str, original_filename: str = ""
+) -> Optional[str]:
     """Upload a single clip to Cloudinary under the multi-clip folder."""
     cloud = settings.CLOUDINARY_CLOUD_NAME
     api_key = settings.CLOUDINARY_API_KEY
@@ -299,13 +427,25 @@ async def _upload_clip_to_cloudinary(video_bytes: bytes, clip_id: str) -> Option
     if not all([cloud, api_key, api_secret]):
         return None
 
+    ext = os.path.splitext(original_filename)[1].lower() if original_filename else ".mp4"
+    if not ext:
+        ext = ".mp4"
+
+    is_image = ext in _IMAGE_EXTS
+    if is_image:
+        content_type = _IMAGE_CONTENT_TYPES.get(ext, "image/jpeg")
+        resource_type = "image"
+    else:
+        content_type = _CONTENT_TYPE_MAP.get(ext, "video/mp4")
+        resource_type = "video"
+
     public_id = f"clip_{clip_id}"
     ts = int(time.time())
     params_str = f"folder={_CLOUDINARY_FOLDER}&public_id={public_id}&timestamp={ts}"
     signature = hashlib.sha1(f"{params_str}{api_secret}".encode()).hexdigest()
 
     form = aiohttp.FormData()
-    form.add_field("file", video_bytes, filename=f"{public_id}.mp4", content_type="video/mp4")
+    form.add_field("file", video_bytes, filename=f"{public_id}{ext}", content_type=content_type)
     form.add_field("api_key", api_key)
     form.add_field("timestamp", str(ts))
     form.add_field("signature", signature)
@@ -316,7 +456,7 @@ async def _upload_clip_to_cloudinary(video_bytes: bytes, clip_id: str) -> Option
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                f"https://api.cloudinary.com/v1_1/{cloud}/video/upload",
+                f"https://api.cloudinary.com/v1_1/{cloud}/{resource_type}/upload",
                 data=form,
                 timeout=aiohttp.ClientTimeout(total=300),
             ) as resp:
@@ -400,39 +540,75 @@ def _build_founder_timeline(
     music_url: str = "",
     primary_color: str = "#CD1B78",
     job_id: str = "",
+    mute_clips: bool = False,
+    target_duration: float = 0,
+    music_volume: float = 0.12,
 ) -> Dict:
     """
-    Build a Shotstack timeline for a multi-clip Founder Story stitch.
+    Build a Shotstack timeline for a multi-clip stitch.
 
     Each clip occupies its own segment. Crossfade transitions connect them.
     Captions come from the merged SRT across all clips.
     Optional music track spans the full duration.
+    When target_duration > 0 and mute_clips (Product Story), clips are center-cut
+    proportionally to fit the target.
     """
     tracks: List[Dict] = []
-    total_duration = sum(c["duration_seconds"] for c in clips_ordered)
+    total_footage = sum(c["duration_seconds"] for c in clips_ordered)
+
+    # Trimming applies to Product Story only (mute_clips=True) when over budget
+    trim_ratio = 1.0
+    if mute_clips and target_duration > 0 and total_footage > 0:
+        trim_ratio = min(1.0, target_duration / total_footage)
+
+    total_duration = round(total_footage * trim_ratio, 3)
 
     # ── Track: video clips ────────────────────────────────────────────────────
     video_clips: List[Dict] = []
     cursor = 0.0
     for i, clip in enumerate(clips_ordered):
-        dur = clip["duration_seconds"]
-        clip_entry: Dict = {
-            "asset": {
+        orig_dur = clip["duration_seconds"]
+        new_dur = round(orig_dur * trim_ratio, 3)
+        # Center-cut: skip the first (and last) trim_start seconds of the source clip
+        trim_start = round((orig_dur - new_dur) / 2.0, 3) if trim_ratio < 1.0 else 0.0
+
+        position = clip.get("subject_position", "center")
+
+        if clip.get("clip_type") == "still":
+            clip_entry: Dict = {
+                "asset": {
+                    "type": "image",
+                    "src": clip["cloudinary_url"],
+                },
+                "start": round(cursor, 3),
+                "length": new_dur,
+                "effect": "zoomIn",
+                "fit": "crop",
+                "position": position,
+            }
+        else:
+            clip_vol = 0.0 if mute_clips else clip.get("volume_boost", 1.0)
+            asset: Dict = {
                 "type": "video",
                 "src": clip["cloudinary_url"],
-                "volume": 1.0,
-            },
-            "start": round(cursor, 3),
-            "length": round(dur, 3),
-            "fit": "crop",
-        }
+                "volume": round(clip_vol, 3),
+            }
+            if trim_start > 0:
+                asset["trim"] = trim_start
+            clip_entry = {
+                "asset": asset,
+                "start": round(cursor, 3),
+                "length": new_dur,
+                "fit": "crop",
+                "position": position,
+            }
         # Crossfade into next clip (not the last one)
         if i < len(clips_ordered) - 1:
             clip_entry["transition"] = {
                 "out": "fade",
             }
         video_clips.append(clip_entry)
-        cursor += dur
+        cursor += new_dur
 
     tracks.append({"clips": video_clips})
 
@@ -490,7 +666,7 @@ def _build_founder_timeline(
     if music_url:
         tracks.append({
             "clips": [{
-                "asset": {"type": "audio", "src": music_url, "volume": 0.12},
+                "asset": {"type": "audio", "src": music_url, "volume": round(music_volume, 3)},
                 "start": 0,
                 "length": round(total_duration, 3),
             }]
@@ -506,6 +682,247 @@ def _build_founder_timeline(
             "fps": 30,
         },
     }
+
+
+# ── Product Story: Vision description ────────────────────────────────────────
+
+async def _vision_describe_clip(tmp_path: str, clip_id: str) -> Dict[str, Any]:
+    """
+    Extract a frame and ask GPT-4o-vision what this product clip shows.
+    Returns {clip_id, shows, shot_type, role}
+    shot_type: attention_shot | detail_closeup | benefit_context | packaging | cta_shot | general
+    """
+    frame_bytes = await _extract_frame_bytes(tmp_path, t=1.0)
+    if not frame_bytes:
+        return {"clip_id": clip_id, "shows": "product footage", "shot_type": "general", "role": "general"}
+
+    frame_b64 = base64.b64encode(frame_bytes).decode()
+    client = openai.AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+
+    prompt = """Analyze this product video frame. Return JSON only:
+{
+  "shows": "brief 1-sentence description of what this clip shows",
+  "shot_type": "one of: attention_shot | detail_closeup | benefit_context | packaging | cta_shot | general",
+  "role": "one of: hook | detail | benefit | social_proof | cta | general"
+}
+
+Shot type guide:
+- attention_shot: eye-catching hero / overview of the product
+- detail_closeup: tight close-up of texture, feature, or label detail
+- benefit_context: product in use or showing a clear benefit
+- packaging: packaging, unboxing, or label shot
+- cta_shot: price tag, sale sign, or call-to-action element visible
+- general: anything else"""
+
+    try:
+        resp = await client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{frame_b64}", "detail": "low"}},
+                    {"type": "text", "text": prompt},
+                ],
+            }],
+            max_tokens=200,
+            temperature=0.2,
+            response_format={"type": "json_object"},
+        )
+        raw = resp.choices[0].message.content or "{}"
+        parsed = json.loads(raw)
+        return {
+            "clip_id": clip_id,
+            "shows": parsed.get("shows", "product footage"),
+            "shot_type": parsed.get("shot_type", "general"),
+            "role": parsed.get("role", "general"),
+        }
+    except Exception as e:
+        print(f"[MultiClip] vision describe error clip={clip_id}: {e}", flush=True)
+        return {"clip_id": clip_id, "shows": "product footage", "shot_type": "general", "role": "general"}
+
+
+# ── Product Story: Script drafting ───────────────────────────────────────────
+
+async def _draft_product_script(description: str, clip_count: int) -> Dict[str, Any]:
+    """
+    Draft a short product video script from a user description.
+    Returns {draft: str, lines: List[str]}
+    """
+    client = openai.AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+    n = max(2, min(clip_count, 6))
+
+    prompt = f"""You are Jane, URI Social's AI social media manager.
+A business owner wants a short product video with {n} clip(s).
+Their description: "{description}"
+
+Write a punchy social media video script for this product.
+The script lines will be shown as captions on the video AND guide the voiceover.
+
+Rules:
+- Write exactly {n} lines — one per clip
+- Each line is 5-10 words — short, readable as an on-screen caption
+- Brand voice: direct, energetic, confident
+- Structure: attention/hook → feature/detail → benefit → price or CTA
+- Do NOT include stage directions, clip numbers, labels, or colons — just the script text
+
+Return JSON only:
+{{
+  "draft": "full script with each line separated by \\n",
+  "lines": ["line 1", "line 2", ...]
+}}"""
+
+    try:
+        resp = await client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=300,
+            temperature=0.7,
+            response_format={"type": "json_object"},
+        )
+        raw = resp.choices[0].message.content or "{}"
+        parsed = json.loads(raw)
+        lines = parsed.get("lines", [])
+        draft = parsed.get("draft", "\n".join(lines))
+        return {"draft": draft, "lines": lines}
+    except Exception as e:
+        print(f"[MultiClip] script draft error: {e}", flush=True)
+        return {"draft": "", "lines": []}
+
+
+# ── Product Story: Vision-based ordering ─────────────────────────────────────
+
+def _suggest_product_order_from_vision(clips: List[Dict]) -> List[str]:
+    """Order product clips along showcase arc using their shot_type."""
+    SHOT_RANK = {
+        "attention_shot": 0,
+        "detail_closeup": 2,
+        "benefit_context": 3,
+        "packaging": 4,
+        "cta_shot": 5,
+        "general": 3,
+    }
+    sorted_clips = sorted(clips, key=lambda c: SHOT_RANK.get(c.get("shot_type", "general"), 3))
+    return [c["clip_id"] for c in sorted_clips]
+
+
+# ── Product Story: Script lines → SRT ────────────────────────────────────────
+
+def _script_to_srt(script_lines: List[str], clips_ordered: List[Dict]) -> str:
+    """
+    Distribute script lines as SRT entries — one line per clip.
+    Each caption spans the full duration of its assigned clip.
+    """
+    if not script_lines or not clips_ordered:
+        return ""
+
+    def _fmt(t: float) -> str:
+        t = max(0.0, t)
+        h = int(t // 3600)
+        m = int((t % 3600) // 60)
+        s = int(t % 60)
+        ms = int(round((t % 1) * 1000))
+        return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+    srt_parts: List[str] = []
+    cursor = 0.0
+    n_lines = len(script_lines)
+
+    for i, clip in enumerate(clips_ordered):
+        line_idx = min(i, n_lines - 1)
+        text = script_lines[line_idx].strip()
+        dur = clip["duration_seconds"]
+        if text:
+            t_start = cursor
+            t_end = cursor + dur
+            srt_parts.append(str(i + 1))
+            srt_parts.append(f"{_fmt(t_start)} --> {_fmt(t_end)}")
+            srt_parts.append(text)
+            srt_parts.append("")
+        cursor += dur
+
+    return "\n".join(srt_parts)
+
+
+# ── Product Story: Vision phase background task ───────────────────────────────
+
+async def run_product_vision_phase(job_id: str, db) -> None:
+    """
+    Background task called after the user approves the script.
+    Vision-describes each clip, suggests order, sets status=awaiting_order.
+    Clips are fetched from Cloudinary by re-extracting frames from existing temp files
+    — but we don't have them anymore, so we download from Cloudinary instead.
+    """
+    print(f"[MultiClip] vision phase start job={job_id}", flush=True)
+
+    async def update(progress: int, msg: str, **extra):
+        await _update_job(db, job_id, progress=progress, status_message=msg, **extra)
+
+    try:
+        doc = await db.multi_clip_jobs.find_one({"job_id": job_id})
+        if not doc:
+            raise RuntimeError("Job not found")
+
+        clips: List[Dict] = doc.get("clips", [])
+        if not clips:
+            raise RuntimeError("No clips to describe")
+
+        await update(62, "Describing clips with AI vision…")
+
+        # Download each clip from Cloudinary and vision-describe it
+        async with aiohttp.ClientSession() as session:
+            for i, clip in enumerate(clips):
+                pct = 62 + int((i / len(clips)) * 20)
+                await update(pct, f"Analysing clip {i + 1} of {len(clips)} with vision…")
+
+                cloud_url = clip.get("cloudinary_url") or clip.get("original_url")
+                if not cloud_url:
+                    continue
+
+                try:
+                    async with session.get(cloud_url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                        if not resp.ok:
+                            continue
+                        video_bytes = await resp.read()
+
+                    suffix = ".mp4"
+                    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tf:
+                        tf.write(video_bytes)
+                        tmp_path = tf.name
+
+                    try:
+                        vision_data = await _vision_describe_clip(tmp_path, clip["clip_id"])
+                        clip["vision_description"] = vision_data["shows"]
+                        clip["shot_type"] = vision_data["shot_type"]
+                        clip["vision_role"] = vision_data["role"]
+                        print(f"[MultiClip] vision clip={clip['clip_id']} type={vision_data['shot_type']}", flush=True)
+                    finally:
+                        try:
+                            os.unlink(tmp_path)
+                        except Exception:
+                            pass
+                except Exception as e:
+                    print(f"[MultiClip] vision download error clip={clip['clip_id']}: {e}", flush=True)
+
+        # Order clips by vision shot type
+        await update(83, "Ordering clips by visual arc…")
+        suggested_ids = _suggest_product_order_from_vision(clips)
+        for rank, cid in enumerate(suggested_ids):
+            for c in clips:
+                if c["clip_id"] == cid:
+                    c["order_index"] = rank
+
+        await update(
+            88,
+            "Ready to review",
+            status="awaiting_order",
+            clips=clips,
+            suggested_order=suggested_ids,
+        )
+        print(f"[MultiClip] vision phase done job={job_id} suggested_order={suggested_ids}", flush=True)
+
+    except Exception as exc:
+        print(f"[MultiClip] vision phase FAILED job={job_id}: {exc}", flush=True)
+        await _update_job(db, job_id, status="failed", status_message=str(exc), progress=0)
 
 
 # ── DB update helper ──────────────────────────────────────────────────────────
@@ -534,6 +951,10 @@ async def run_multi_clip_ingest(job_id: str, clips_bytes: List[Tuple[str, bytes]
         await _update_job(db, job_id, progress=progress, status_message=msg, **extra)
 
     try:
+        # Fetch story_type from DB
+        job_doc = await db.multi_clip_jobs.find_one({"job_id": job_id})
+        story_type = job_doc.get("story_type", "founder") if job_doc else "founder"
+
         await update(5, "Uploading clips…")
         clip_docs: List[Dict] = []
 
@@ -542,27 +963,75 @@ async def run_multi_clip_ingest(job_id: str, clips_bytes: List[Tuple[str, bytes]
             pct_base = 5 + int((i / len(clips_bytes)) * 50)
             await update(pct_base, f"Analysing clip {i + 1} of {len(clips_bytes)}…")
 
-            # Write to tmp file
+            ext = os.path.splitext(filename)[1].lower()
+            is_image_file = ext in _IMAGE_EXTS
+
+            if is_image_file:
+                # Still image — no probe/quality/transcription needed
+                probe = {
+                    "duration": _STILL_DEFAULT_DURATION,
+                    "width": 0, "height": 0,
+                    "has_audio": False, "has_subtitles": False,
+                }
+                quality_flags: List[str] = []
+                clip_type = "still"
+                transcript_data: Dict = {"text": "", "srt": "", "words": []}
+                cloud_url = await _upload_clip_to_cloudinary(raw_bytes, clip_id, filename)
+                if not cloud_url:
+                    quality_flags.append("upload_failed")
+
+                clip_doc = {
+                    "clip_id": clip_id,
+                    "filename": filename,
+                    "original_url": cloud_url or "",
+                    "cloudinary_url": cloud_url or "",
+                    "order_index": i,
+                    "duration_seconds": _STILL_DEFAULT_DURATION,
+                    "width": 0,
+                    "height": 0,
+                    "clip_type": "still",
+                    "has_face": False,
+                    "quality_flags": quality_flags,
+                    "recommended_drop": False,
+                    "drop_reason": None,
+                    "transcript": "",
+                    "srt": "",
+                    "words": [],
+                    "frame_url": None,
+                    "vision_description": None,
+                    "vision_role": None,
+                }
+                clip_docs.append(clip_doc)
+                print(f"[MultiClip] clip {clip_id}: type=still (image) url={cloud_url}", flush=True)
+                continue
+
+            # Write video to tmp file
             suffix = ".mp4"
             if filename.lower().endswith((".mov", ".avi", ".mkv", ".webm")):
-                suffix = os.path.splitext(filename)[1]
+                suffix = ext
             with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tf:
                 tf.write(raw_bytes)
                 tmp_path = tf.name
 
             try:
                 probe = await _probe_clip(tmp_path)
-                quality_flags = await _check_quality(tmp_path, probe)
+                quality_flags, mean_db = await _check_quality(tmp_path, probe)
                 clip_type = await _detect_clip_type(tmp_path, probe)
 
-                # Upload to Cloudinary
-                cloud_url = await _upload_clip_to_cloudinary(raw_bytes, clip_id)
+                # Compute audio leveling boost for Founder Story speech clips
+                volume_boost = _compute_volume_boost(mean_db) if clip_type == "speech" else 1.0
+
+                # Subject position for smart crop (safe fallback: center)
+                subject_position = await _detect_subject_position(tmp_path)
+
+                # Upload to Cloudinary (pass original filename for correct content-type)
+                cloud_url = await _upload_clip_to_cloudinary(raw_bytes, clip_id, filename)
                 if not cloud_url:
                     quality_flags.append("upload_failed")
 
-                # Transcribe if speech
+                # Transcribe if speech (Founder Story only)
                 transcript_data = {"text": "", "srt": "", "words": []}
-                if clip_type == "speech" and cloud_url:
+                if story_type == "founder" and clip_type == "speech" and cloud_url:
                     await update(pct_base + 3, f"Transcribing clip {i + 1}…")
                     transcript_data = await _transcribe_clip(tmp_path)
 
@@ -576,14 +1045,16 @@ async def run_multi_clip_ingest(job_id: str, clips_bytes: List[Tuple[str, bytes]
                     "width": probe["width"],
                     "height": probe["height"],
                     "clip_type": clip_type,
-                    "has_face": False,  # Phase 3 will detect
+                    "has_face": False,
                     "quality_flags": quality_flags,
+                    "volume_boost": volume_boost,
+                    "subject_position": subject_position,
                     "recommended_drop": "too_dark" in quality_flags,
                     "drop_reason": "Clip is too dark — it may drag down the overall video quality." if "too_dark" in quality_flags else None,
                     "transcript": transcript_data["text"],
                     "srt": transcript_data["srt"],
                     "words": transcript_data["words"],
-                    "frame_url": None,       # Product Story (Phase 2)
+                    "frame_url": None,
                     "vision_description": None,
                     "vision_role": None,
                 }
@@ -596,28 +1067,102 @@ async def run_multi_clip_ingest(job_id: str, clips_bytes: List[Tuple[str, bytes]
                 except Exception:
                     pass
 
-        # Suggest ordering
-        await update(60, "Suggesting clip order…")
-        speech_clips = [c for c in clip_docs if c["clip_type"] == "speech"]
-        if len(speech_clips) > 1:
-            suggested_ids = await _suggest_founder_order(clip_docs)
+        # ── Length budget ─────────────────────────────────────────────────────────
+        target_seconds = float(job_doc.get("target_duration_seconds", 30) if job_doc else 30)
+        total_footage = sum(c["duration_seconds"] for c in clip_docs)
+        budget_ratio = total_footage / max(target_seconds, 1.0)
+
+        if budget_ratio > 2.5:
+            budget_rec = "trim_heavy"
+            budget_msg = (
+                f"You gave me {total_footage:.0f}s of footage for a {int(target_seconds)}s video. "
+                "I'll keep the best part of each clip — want a longer target instead?"
+            )
+        elif budget_ratio > 1.2:
+            budget_rec = "trim_light"
+            budget_msg = (
+                f"You have {total_footage:.0f}s of footage for a {int(target_seconds)}s target — "
+                "I'll trim each clip lightly."
+            )
+        elif budget_ratio < 0.5:
+            budget_rec = "short"
+            budget_msg = (
+                f"You only have {total_footage:.0f}s of footage for a {int(target_seconds)}s target. "
+                "The video will be shorter — consider adding more clips."
+            )
         else:
-            suggested_ids = [c["clip_id"] for c in clip_docs]
+            budget_rec = "ok"
+            budget_msg = ""
 
-        # Assign order_index from suggestion
-        for rank, cid in enumerate(suggested_ids):
-            for c in clip_docs:
-                if c["clip_id"] == cid:
-                    c["order_index"] = rank
+        length_budget_info: Dict = {
+            "total_footage_seconds": round(total_footage, 1),
+            "target_seconds": int(target_seconds),
+            "ratio": round(budget_ratio, 2),
+            "recommendation": budget_rec,
+            "message": budget_msg,
+        }
 
-        await update(
-            70,
-            "Ready to review",
-            status="awaiting_order",
-            clips=clip_docs,
-            suggested_order=suggested_ids,
-        )
-        print(f"[MultiClip] ingest done job={job_id} suggested_order={suggested_ids}", flush=True)
+        # ── Mismatch detection ────────────────────────────────────────────────────
+        speech_count = sum(1 for c in clip_docs if c["clip_type"] == "speech")
+        silent_count = sum(1 for c in clip_docs if c["clip_type"] == "silent")
+        still_count  = sum(1 for c in clip_docs if c["clip_type"] == "still")
+        total_count  = len(clip_docs)
+
+        mismatch_info: Optional[Dict] = None
+        if story_type == "founder" and speech_count == 0 and silent_count + still_count == total_count:
+            mismatch_info = {
+                "type": "no_speech_for_founder",
+                "message": (
+                    "None of your clips have speech. Founder Story works best with you talking. "
+                    "Consider switching to Product Story — it uses a written script instead."
+                ),
+            }
+        elif story_type == "product" and speech_count > 0:
+            mismatch_info = {
+                "type": "speech_in_product",
+                "message": (
+                    f"{speech_count} of your clips contain spoken audio. "
+                    "Product Story mutes all clips and uses your script as captions. "
+                    "The existing audio can be added as a voiceover after stitching."
+                ),
+            }
+
+        if story_type == "product":
+            # Product Story: stop here and wait for user to provide a script description
+            await update(
+                60,
+                "Clips ready — write your script",
+                status="awaiting_script",
+                clips=clip_docs,
+                suggested_order=[c["clip_id"] for c in clip_docs],
+                mismatch_info=mismatch_info,
+                length_budget_info=length_budget_info,
+            )
+            print(f"[MultiClip] ingest done (product) job={job_id} — awaiting script", flush=True)
+        else:
+            # Founder Story: suggest narrative ordering from transcripts
+            await update(60, "Suggesting clip order…")
+            speech_clips = [c for c in clip_docs if c["clip_type"] == "speech"]
+            if len(speech_clips) > 1:
+                suggested_ids = await _suggest_founder_order(clip_docs)
+            else:
+                suggested_ids = [c["clip_id"] for c in clip_docs]
+
+            for rank, cid in enumerate(suggested_ids):
+                for c in clip_docs:
+                    if c["clip_id"] == cid:
+                        c["order_index"] = rank
+
+            await update(
+                70,
+                "Ready to review",
+                status="awaiting_order",
+                clips=clip_docs,
+                suggested_order=suggested_ids,
+                mismatch_info=mismatch_info,
+                length_budget_info=length_budget_info,
+            )
+            print(f"[MultiClip] ingest done job={job_id} suggested_order={suggested_ids}", flush=True)
 
     except Exception as exc:
         print(f"[MultiClip] ingest FAILED job={job_id}: {exc}", flush=True)
@@ -655,8 +1200,28 @@ async def run_multi_clip_stitch(job_id: str, db) -> None:
             if not c.get("cloudinary_url"):
                 raise RuntimeError(f"Clip {c['clip_id']} has no URL — upload may have failed")
 
-        await update(72, "Merging transcripts…")
-        merged_srt = _merge_srts(active_clips)
+        story_type = doc.get("story_type", "founder")
+        target_duration = float(doc.get("target_duration_seconds", 0))
+
+        if story_type == "product":
+            await update(72, "Applying script captions…")
+            script_lines = doc.get("script_lines", [])
+            # Build SRT using trimmed durations so captions match the output timing
+            if target_duration > 0:
+                total_footage = sum(c["duration_seconds"] for c in active_clips)
+                trim_ratio = min(1.0, target_duration / max(total_footage, 1.0))
+                srt_clips = [
+                    {**c, "duration_seconds": round(c["duration_seconds"] * trim_ratio, 3)}
+                    for c in active_clips
+                ]
+            else:
+                srt_clips = active_clips
+            merged_srt = _script_to_srt(script_lines, srt_clips)
+            mute_clips = True
+        else:
+            await update(72, "Merging transcripts…")
+            merged_srt = _merge_srts(active_clips)
+            mute_clips = False
 
         await update(75, "Selecting music…")
         music_url = ""
@@ -667,6 +1232,7 @@ async def run_multi_clip_stitch(job_id: str, db) -> None:
         await update(78, "Building timeline…")
         aspect_ratio = doc.get("orientation", "9:16")
         primary_color = doc.get("primary_color", "#CD1B78")
+        music_volume = float(doc.get("music_volume", 0.12))
         timeline = _build_founder_timeline(
             clips_ordered=active_clips,
             merged_srt=merged_srt,
@@ -674,6 +1240,9 @@ async def run_multi_clip_stitch(job_id: str, db) -> None:
             music_url=music_url,
             primary_color=primary_color,
             job_id=job_id,
+            mute_clips=mute_clips,
+            target_duration=target_duration,
+            music_volume=music_volume,
         )
 
         await update(82, "Rendering…")
