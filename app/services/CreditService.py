@@ -210,13 +210,13 @@ class CreditService:
         Check if user has sufficient credits
         PRD 7.2: if credits_remaining >= 1: allow, else: block action
 
-        Legacy users (without wallet) get unlimited access for backward compatibility
+        Users without wallet are blocked (must have trial or subscription)
         """
         wallet = await self.get_user_wallet(user_id)
 
         if not wallet:
-            # Legacy user from before billing system - allow unlimited access
-            return True
+            # No wallet = never subscribed = blocked
+            return False
 
         return wallet.credits_remaining >= required
 
@@ -238,7 +238,7 @@ class CreditService:
 
         This ensures subscription credits are used before expiry.
 
-        Legacy users (without wallet) are not deducted - backward compatibility
+        Users without wallet are blocked (must have trial or subscription)
 
         Returns:
             bool: True if deduction successful, False if insufficient credits
@@ -246,8 +246,8 @@ class CreditService:
         wallet = await self.get_user_wallet(user_id)
 
         if not wallet:
-            # Legacy user from before billing system - skip deduction
-            return True
+            # No wallet = never subscribed = blocked
+            return False
 
         if wallet.credits_remaining < 1:
             return False
