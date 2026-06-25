@@ -118,7 +118,13 @@ class BrandProfileService:
 
         # brand_id is the isolation boundary; fall back to user_id for solo/legacy.
         scope = {"brand_id": brand_id} if brand_id else {"user_id": user_id}
-        existing = await db[BrandProfileService.COLLECTION].find_one(scope)
+
+        # Always check by user_id first to prevent duplicates (unique index on user_id)
+        existing = await db[BrandProfileService.COLLECTION].find_one({"user_id": user_id})
+
+        # If not found by user_id and we have brand_id, try brand_id (for legacy data)
+        if not existing and brand_id:
+            existing = await db[BrandProfileService.COLLECTION].find_one({"brand_id": brand_id})
 
         # OPTION 2: ONBOARDING VALIDATION - Enforce required fields
         # Only validate when user is ACTIVELY TRYING to complete onboarding (transition from False→True)
@@ -140,12 +146,33 @@ class BrandProfileService:
             if existing.get("onboarding_completed") and not doc.get("onboarding_completed"):
                 doc["onboarding_completed"] = True
             print(f"🖼️  SAVE DEBUG brand={brand_id or user_id}: saving logo_position={repr(doc.get('logo_position'))}")
-            await db[BrandProfileService.COLLECTION].update_one(
-                scope, {"$set": doc}
-            )
+
+            # Update existing profile - always use user_id to ensure we update the right document
+            try:
+                result = await db[BrandProfileService.COLLECTION].update_one(
+                    {"user_id": user_id}, {"$set": doc}
+                )
+                print(f"✅ Updated brand profile for user {user_id}: matched={result.matched_count}, modified={result.modified_count}")
+            except Exception as e:
+                print(f"❌ Error updating brand profile for user {user_id}: {e}")
+                raise
         else:
             doc["created_at"] = now
-            await db[BrandProfileService.COLLECTION].insert_one(doc)
+            try:
+                await db[BrandProfileService.COLLECTION].insert_one(doc)
+                print(f"✅ Created new brand profile for user {user_id}")
+            except Exception as e:
+                # Handle duplicate key error (unique index on user_id)
+                if "duplicate key" in str(e).lower():
+                    print(f"⚠️  Duplicate profile detected for user {user_id}, updating instead")
+                    # Profile was created by another request, update it instead
+                    result = await db[BrandProfileService.COLLECTION].update_one(
+                        {"user_id": user_id}, {"$set": doc}
+                    )
+                    print(f"✅ Updated via fallback for user {user_id}: matched={result.matched_count}, modified={result.modified_count}")
+                else:
+                    print(f"❌ Error creating brand profile for user {user_id}: {e}")
+                    raise
 
         result = await db[BrandProfileService.COLLECTION].find_one(scope)
         if result:
