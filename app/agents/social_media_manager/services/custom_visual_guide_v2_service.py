@@ -569,10 +569,25 @@ Reserve clean space for text overlay if the reference image does so."""
             if logo_url:
                 print(f"[V2] Overlaying logo at position: {logo_position}")
 
-                # Download generated image
-                async with httpx.AsyncClient(timeout=20) as client:
-                    img_response = await client.get(generated_image_url)
-                    base_image = Image.open(io.BytesIO(img_response.content)).convert("RGBA")
+                # Handle data URLs (base64) vs regular URLs
+                if generated_image_url.startswith("data:"):
+                    # Decode base64 data URL
+                    import base64
+                    import re
+                    # Extract base64 data from data URL
+                    match = re.match(r'data:image/\w+;base64,(.+)', generated_image_url)
+                    if match:
+                        image_data = base64.b64decode(match.group(1))
+                        base_image = Image.open(io.BytesIO(image_data)).convert("RGBA")
+                        print(f"[V2] Decoded base64 data URL")
+                    else:
+                        raise Exception("Invalid data URL format")
+                else:
+                    # Download from regular URL
+                    async with httpx.AsyncClient(timeout=20) as client:
+                        img_response = await client.get(generated_image_url)
+                        base_image = Image.open(io.BytesIO(img_response.content)).convert("RGBA")
+                        print(f"[V2] Downloaded image from URL")
 
                 # Overlay logo using ImageContentService
                 final_image = await ImageContentService._overlay_logo(
