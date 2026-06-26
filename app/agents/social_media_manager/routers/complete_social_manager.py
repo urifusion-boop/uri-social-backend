@@ -6088,7 +6088,8 @@ async def get_polish_video_clip_action(
 @router.post("/produce-video")
 async def produce_video(
     background_tasks: BackgroundTasks,
-    video: UploadFile = File(...),
+    video: Optional[UploadFile] = File(None),
+    source_url: Optional[str] = Form(None),
     video_type: str = Form("founder"),
     enable_music: str = Form("true"),
     enable_sfx: str = Form("true"),
@@ -6098,17 +6099,31 @@ async def produce_video(
 ):
     """
     Start a full video production job.
+    Supply either a binary `video` file OR a `source_url` (e.g. from Multi-Clip Composer).
     video_type: tiktok | product | founder
     Poll GET /produce-video-job/{job_id} for status and output_url.
     """
     import uuid
+    import httpx
     from app.agents.social_media_manager.services.video_production_service import run_production_job
 
     user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    video_bytes = await video.read()
+    if video is not None:
+        video_bytes = await video.read()
+    elif source_url:
+        try:
+            async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+                r = await client.get(source_url)
+                r.raise_for_status()
+                video_bytes = r.content
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Could not fetch source_url: {exc}") from exc
+    else:
+        raise HTTPException(status_code=400, detail="Provide either a video file or source_url")
+
     if len(video_bytes) < 1000:
         raise HTTPException(status_code=400, detail="Invalid video file")
 
