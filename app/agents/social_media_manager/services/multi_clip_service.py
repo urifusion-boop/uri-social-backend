@@ -587,7 +587,7 @@ def _build_founder_timeline(
                 "position": position,
             }
         else:
-            clip_vol = 0.0 if mute_clips else clip.get("volume_boost", 1.0)
+            clip_vol = 0.0 if mute_clips else min(1.0, clip.get("volume_boost", 1.0))
             asset: Dict = {
                 "type": "video",
                 "src": clip["cloudinary_url"],
@@ -934,16 +934,109 @@ async def _update_job(db, job_id: str, **fields) -> None:
 
 # ── Phase 1: Ingest background task ──────────────────────────────────────────
 
+async def _ingest_one_clip(
+    filename: str,
+    raw_bytes: bytes,
+    clip_id: str,
+    order_index: int,
+    story_type: str,
+) -> Dict:
+    """Process a single clip end-to-end. Safe to run concurrently."""
+    ext = os.path.splitext(filename)[1].lower()
+
+    if ext in _IMAGE_EXTS:
+        cloud_url = await _upload_clip_to_cloudinary(raw_bytes, clip_id, filename)
+        return {
+            "clip_id": clip_id,
+            "filename": filename,
+            "original_url": cloud_url or "",
+            "cloudinary_url": cloud_url or "",
+            "order_index": order_index,
+            "duration_seconds": _STILL_DEFAULT_DURATION,
+            "width": 0, "height": 0,
+            "clip_type": "still",
+            "has_face": False,
+            "quality_flags": [] if cloud_url else ["upload_failed"],
+            "volume_boost": 1.0,
+            "subject_position": "center",
+            "recommended_drop": False,
+            "drop_reason": None,
+            "transcript": "", "srt": "", "words": [],
+            "frame_url": None,
+            "vision_description": None,
+            "vision_role": None,
+        }
+
+    suffix = ext if filename.lower().endswith((".mov", ".avi", ".mkv", ".webm")) else ".mp4"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tf:
+        tf.write(raw_bytes)
+        tmp_path = tf.name
+
+    try:
+        probe = await _probe_clip(tmp_path)
+        quality_flags, mean_db = await _check_quality(tmp_path, probe)
+        clip_type = await _detect_clip_type(tmp_path, probe)
+        volume_boost = _compute_volume_boost(mean_db) if clip_type == "speech" else 1.0
+
+        # Run subject detection + cloudinary upload in parallel (independent)
+        if story_type == "founder" and clip_type == "speech":
+            subject_pos, cloud_url, transcript_data = await asyncio.gather(
+                _detect_subject_position(tmp_path),
+                _upload_clip_to_cloudinary(raw_bytes, clip_id, filename),
+                _transcribe_clip(tmp_path),
+            )
+        else:
+            subject_pos, cloud_url = await asyncio.gather(
+                _detect_subject_position(tmp_path),
+                _upload_clip_to_cloudinary(raw_bytes, clip_id, filename),
+            )
+            transcript_data = {"text": "", "srt": "", "words": []}
+
+        if not cloud_url:
+            quality_flags.append("upload_failed")
+
+        print(
+            f"[MultiClip] clip {clip_id}: type={clip_type} dur={probe['duration']:.1f}s "
+            f"pos={subject_pos} flags={quality_flags}",
+            flush=True,
+        )
+        return {
+            "clip_id": clip_id,
+            "filename": filename,
+            "original_url": cloud_url or "",
+            "cloudinary_url": cloud_url or "",
+            "order_index": order_index,
+            "duration_seconds": round(probe["duration"], 2),
+            "width": probe["width"],
+            "height": probe["height"],
+            "clip_type": clip_type,
+            "has_face": False,
+            "quality_flags": quality_flags,
+            "volume_boost": volume_boost,
+            "subject_position": subject_pos,
+            "recommended_drop": "too_dark" in quality_flags,
+            "drop_reason": (
+                "Clip is too dark — it may drag down the overall video quality."
+                if "too_dark" in quality_flags else None
+            ),
+            "transcript": transcript_data["text"],
+            "srt": transcript_data["srt"],
+            "words": transcript_data["words"],
+            "frame_url": None,
+            "vision_description": None,
+            "vision_role": None,
+        }
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+
 async def run_multi_clip_ingest(job_id: str, clips_bytes: List[Tuple[str, bytes]], db) -> None:
     """
-    Background task: for each clip —
-      1. Write to tmp file
-      2. Probe (duration, dimensions, has_audio)
-      3. Quality check
-      4. Detect clip type (speech | silent | still)
-      5. Upload to Cloudinary
-      6. Transcribe with Whisper (if speech)
-    Then suggest ordering via GPT-4o and save to DB.
+    Background task: probe + analyse + upload all clips in parallel,
+    then suggest ordering via GPT-4o and save to DB.
     """
     print(f"[MultiClip] ingest start job={job_id} clips={len(clips_bytes)}", flush=True)
 
@@ -951,121 +1044,27 @@ async def run_multi_clip_ingest(job_id: str, clips_bytes: List[Tuple[str, bytes]
         await _update_job(db, job_id, progress=progress, status_message=msg, **extra)
 
     try:
-        # Fetch story_type from DB
         job_doc = await db.multi_clip_jobs.find_one({"job_id": job_id})
         story_type = job_doc.get("story_type", "founder") if job_doc else "founder"
+        n = len(clips_bytes)
 
-        await update(5, "Uploading clips…")
-        clip_docs: List[Dict] = []
+        await update(10, f"Analysing {n} clip{'s' if n > 1 else ''}…")
 
-        for i, (filename, raw_bytes) in enumerate(clips_bytes):
-            clip_id = str(uuid.uuid4())[:8]
-            pct_base = 5 + int((i / len(clips_bytes)) * 50)
-            await update(pct_base, f"Analysing clip {i + 1} of {len(clips_bytes)}…")
+        clip_ids = [str(uuid.uuid4())[:8] for _ in clips_bytes]
+        done_count = 0
 
-            ext = os.path.splitext(filename)[1].lower()
-            is_image_file = ext in _IMAGE_EXTS
+        async def _tracked(filename: str, raw_bytes: bytes, clip_id: str, idx: int) -> Dict:
+            nonlocal done_count
+            result = await _ingest_one_clip(filename, raw_bytes, clip_id, idx, story_type)
+            done_count += 1
+            pct = 10 + int((done_count / n) * 55)
+            await update(pct, f"Analysed {done_count} of {n} clip{'s' if n > 1 else ''}…")
+            return result
 
-            if is_image_file:
-                # Still image — no probe/quality/transcription needed
-                probe = {
-                    "duration": _STILL_DEFAULT_DURATION,
-                    "width": 0, "height": 0,
-                    "has_audio": False, "has_subtitles": False,
-                }
-                quality_flags: List[str] = []
-                clip_type = "still"
-                transcript_data: Dict = {"text": "", "srt": "", "words": []}
-                cloud_url = await _upload_clip_to_cloudinary(raw_bytes, clip_id, filename)
-                if not cloud_url:
-                    quality_flags.append("upload_failed")
-
-                clip_doc = {
-                    "clip_id": clip_id,
-                    "filename": filename,
-                    "original_url": cloud_url or "",
-                    "cloudinary_url": cloud_url or "",
-                    "order_index": i,
-                    "duration_seconds": _STILL_DEFAULT_DURATION,
-                    "width": 0,
-                    "height": 0,
-                    "clip_type": "still",
-                    "has_face": False,
-                    "quality_flags": quality_flags,
-                    "recommended_drop": False,
-                    "drop_reason": None,
-                    "transcript": "",
-                    "srt": "",
-                    "words": [],
-                    "frame_url": None,
-                    "vision_description": None,
-                    "vision_role": None,
-                }
-                clip_docs.append(clip_doc)
-                print(f"[MultiClip] clip {clip_id}: type=still (image) url={cloud_url}", flush=True)
-                continue
-
-            # Write video to tmp file
-            suffix = ".mp4"
-            if filename.lower().endswith((".mov", ".avi", ".mkv", ".webm")):
-                suffix = ext
-            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tf:
-                tf.write(raw_bytes)
-                tmp_path = tf.name
-
-            try:
-                probe = await _probe_clip(tmp_path)
-                quality_flags, mean_db = await _check_quality(tmp_path, probe)
-                clip_type = await _detect_clip_type(tmp_path, probe)
-
-                # Compute audio leveling boost for Founder Story speech clips
-                volume_boost = _compute_volume_boost(mean_db) if clip_type == "speech" else 1.0
-
-                # Subject position for smart crop (safe fallback: center)
-                subject_position = await _detect_subject_position(tmp_path)
-
-                # Upload to Cloudinary (pass original filename for correct content-type)
-                cloud_url = await _upload_clip_to_cloudinary(raw_bytes, clip_id, filename)
-                if not cloud_url:
-                    quality_flags.append("upload_failed")
-
-                # Transcribe if speech (Founder Story only)
-                transcript_data = {"text": "", "srt": "", "words": []}
-                if story_type == "founder" and clip_type == "speech" and cloud_url:
-                    await update(pct_base + 3, f"Transcribing clip {i + 1}…")
-                    transcript_data = await _transcribe_clip(tmp_path)
-
-                clip_doc = {
-                    "clip_id": clip_id,
-                    "filename": filename,
-                    "original_url": cloud_url or "",
-                    "cloudinary_url": cloud_url or "",
-                    "order_index": i,
-                    "duration_seconds": round(probe["duration"], 2),
-                    "width": probe["width"],
-                    "height": probe["height"],
-                    "clip_type": clip_type,
-                    "has_face": False,
-                    "quality_flags": quality_flags,
-                    "volume_boost": volume_boost,
-                    "subject_position": subject_position,
-                    "recommended_drop": "too_dark" in quality_flags,
-                    "drop_reason": "Clip is too dark — it may drag down the overall video quality." if "too_dark" in quality_flags else None,
-                    "transcript": transcript_data["text"],
-                    "srt": transcript_data["srt"],
-                    "words": transcript_data["words"],
-                    "frame_url": None,
-                    "vision_description": None,
-                    "vision_role": None,
-                }
-                clip_docs.append(clip_doc)
-                print(f"[MultiClip] clip {clip_id}: type={clip_type} dur={probe['duration']:.1f}s flags={quality_flags}", flush=True)
-
-            finally:
-                try:
-                    os.unlink(tmp_path)
-                except Exception:
-                    pass
+        clip_docs: List[Dict] = list(await asyncio.gather(*[
+            _tracked(filename, raw_bytes, clip_id, i)
+            for i, ((filename, raw_bytes), clip_id) in enumerate(zip(clips_bytes, clip_ids))
+        ]))
 
         # ── Length budget ─────────────────────────────────────────────────────────
         target_seconds = float(job_doc.get("target_duration_seconds", 30) if job_doc else 30)
