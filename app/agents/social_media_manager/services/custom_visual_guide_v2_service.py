@@ -537,15 +537,16 @@ Reserve clean space for text overlay if the reference image does so."""
             print(f"[V2] Preview: {final_prompt[:200]}...")
 
             # Step 4: Get platform-specific dimensions (same as other visual guides)
+            # Uses platform defaults: Instagram/Facebook = 1080x1350 portrait, LinkedIn/Twitter = landscape
             print(f"[V2] Getting platform specs for {platform}...")
             import httpx
             from PIL import Image
             import io
 
-            specs = ImageContentService._get_platform_image_specs(platform, image_type="post_image")
+            specs = ImageContentService._get_platform_image_specs(platform)  # Let it choose platform default
             image_width = specs.get("width", 1200)
             image_height = specs.get("height", 630)
-            print(f"[V2] Platform dimensions: {image_width}x{image_height}")
+            print(f"[V2] Platform dimensions: {image_width}x{image_height} ({specs.get('format', 'unknown')})")
 
             # Generate with platform-specific dimensions + reference image for style
             image_response = await ImageContentService._call_dalle_api(
