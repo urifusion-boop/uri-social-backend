@@ -171,6 +171,7 @@ async def get_user_guides_v2(
         guides_list = []
         for guide in guides:
             style_profile = guide.get("style_profile", {})
+            identity_protection = guide.get("identity_protection", {})
 
             guides_list.append({
                 "id": str(guide["_id"]),
@@ -183,6 +184,7 @@ async def get_user_guides_v2(
                     "overall_aesthetic": style_profile.get("overall_aesthetic"),
                     "mood": style_profile.get("mood"),
                 },
+                "identity_elements_excluded": len(identity_protection.get("excluded_elements", [])),
                 "times_used": guide.get("times_used", 0),
                 "status": guide["status"],
             })
