@@ -4344,24 +4344,57 @@ async def _generate_image_bg(
         # For story posts pass image_type="story" so we get 1080x1920 dimensions
         image_type = "story" if post_type == "story" else "post_image"
 
-        # Extract V2 reference image from brand_context if present
-        v2_reference_image = brand_context.get("custom_guide_v2_reference_image")
-        print(f"[V2 DEBUG] v2_reference_image={v2_reference_image[:100] if v2_reference_image else None}, reference_image={reference_image}")
-        if v2_reference_image:
-            reference_image = v2_reference_image
-            print(f"📸 Using V2 reference image: {reference_image[:80]}...")
+        # ========== CUSTOM VISUAL GUIDE V2 ROUTING ==========
+        # If V2 guide is selected, use V2 pure style cloning (ignore brand profile)
+        v2_guide_id = brand_context.get("custom_guide_v2_id")
 
-        image_result = await ImageContentService._generate_platform_image(
-            platform=platform,
-            content=content,
-            seed_content=seed_content,
-            brand_context=brand_context,
-            reference_image=reference_image,
-            image_type=image_type,
-            image_model=image_model,
-            slide_index=slide_index,
-            total_slides=total_slides,
-        )
+        if v2_guide_id:
+            print(f"🎨 V2 CUSTOM GUIDE DETECTED - Using pure style cloning")
+            print(f"V2 Guide ID: {v2_guide_id}")
+
+            from app.agents.social_media_manager.services.custom_visual_guide_v2_service import CustomVisualGuideV2Service
+
+            # Pure style cloning - minimal brand context (no colors, no styles)
+            minimal_brand_context = {
+                "brand_name": brand_context.get("brand_name", ""),
+                "logo_url": brand_context.get("logo_url", ""),
+                "logo_position": brand_context.get("logo_position", "bottom_right"),
+            }
+
+            # Extract headline/subtext/cta from content if available
+            headline = content.split("\n")[0] if content else seed_content[:50]
+            subtext = content.split("\n")[1] if "\n" in content else ""
+            cta = brand_context.get("default_link", "Learn more")
+
+            image_result = await CustomVisualGuideV2Service.generate_with_v2_guide(
+                guide_id=v2_guide_id,
+                seed_content=seed_content,
+                brand_context=minimal_brand_context,  # Minimal context for pure cloning
+                platform=platform,
+                headline=headline,
+                subtext=subtext,
+                cta=cta,
+                db=db,
+            )
+        else:
+            # Standard generation flow (V1 guides or no custom guide)
+            # Extract V2 reference image from brand_context if present (legacy fallback)
+            v2_reference_image = brand_context.get("custom_guide_v2_reference_image")
+            if v2_reference_image:
+                reference_image = v2_reference_image
+                print(f"📸 Using V2 reference image (legacy): {reference_image[:80]}...")
+
+            image_result = await ImageContentService._generate_platform_image(
+                platform=platform,
+                content=content,
+                seed_content=seed_content,
+                brand_context=brand_context,
+                reference_image=reference_image,
+                image_type=image_type,
+                image_model=image_model,
+                slide_index=slide_index,
+                total_slides=total_slides,
+            )
 
         if not image_result.get("status"):
             print(f"⚠️ BG image gen failed for draft {draft_id}: {image_result.get('responseMessage')}")
