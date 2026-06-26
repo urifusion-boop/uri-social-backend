@@ -536,22 +536,22 @@ Reserve clean space for text overlay if the reference image does so."""
             print(f"[V2] ✅ Pure style cloning prompt generated ({len(final_prompt)} chars)")
             print(f"[V2] Preview: {final_prompt[:200]}...")
 
-            # Step 4: Generate image with GPT-Image-2 edit mode
-            print(f"[V2] Calling GPT-Image-2 edit mode with reference image...")
+            # Step 4: Get reference image dimensions (match reference size exactly)
+            print(f"[V2] Getting reference image dimensions...")
+            import httpx
+            from PIL import Image
+            import io
 
-            # Platform-specific dimensions
-            platform_specs = {
-                "instagram": {"width": 1080, "height": 1080},
-                "facebook": {"width": 1200, "height": 630},
-                "twitter": {"width": 1200, "height": 675},
-                "x": {"width": 1200, "height": 675},
-                "linkedin": {"width": 1200, "height": 627},
-            }
-            specs = platform_specs.get(platform, {"width": 1080, "height": 1080})
+            async with httpx.AsyncClient(timeout=20) as client:
+                img_response = await client.get(reference_image_url)
+                img = Image.open(io.BytesIO(img_response.content))
+                ref_width, ref_height = img.size
+                print(f"[V2] Reference image size: {ref_width}x{ref_height}")
 
+            # Use reference image dimensions for exact style matching
             image_response = await ImageContentService._call_dalle_api(
                 prompt=final_prompt,
-                size=f"{specs['width']}x{specs['height']}",
+                size=f"{ref_width}x{ref_height}",
                 reference_image=reference_image_url,  # ← ACTUAL reference image
                 image_model="openai/gpt-image-2",
             )
@@ -559,9 +559,46 @@ Reserve clean space for text overlay if the reference image does so."""
             if not image_response.get('success'):
                 raise Exception(image_response.get('error', 'Image generation failed'))
 
-            print(f"[V2] ✅ Image generated successfully")
+            generated_image_url = image_response['url']
+            print(f"[V2] ✅ Image generated successfully: {generated_image_url[:80]}...")
 
-            # Step 5: Update usage counter
+            # Step 5: Overlay logo on generated image
+            logo_url = brand_context.get("logo_url")
+            logo_position = brand_context.get("logo_position", "bottom_right")
+
+            if logo_url:
+                print(f"[V2] Overlaying logo at position: {logo_position}")
+
+                # Download generated image
+                async with httpx.AsyncClient(timeout=20) as client:
+                    img_response = await client.get(generated_image_url)
+                    base_image = Image.open(io.BytesIO(img_response.content)).convert("RGBA")
+
+                # Overlay logo using ImageContentService
+                final_image = await ImageContentService._overlay_logo(
+                    base_image=base_image,
+                    logo_url=logo_url,
+                    logo_position=logo_position,
+                )
+
+                # Upload final image with logo
+                import cloudinary.uploader
+                buffer = io.BytesIO()
+                final_image.save(buffer, format="PNG")
+                buffer.seek(0)
+
+                upload_result = cloudinary.uploader.upload(
+                    buffer,
+                    folder="uri-social/generated-images",
+                    resource_type="image",
+                )
+                final_image_url = upload_result['secure_url']
+                print(f"[V2] ✅ Logo overlaid and uploaded: {final_image_url[:80]}...")
+            else:
+                final_image_url = generated_image_url
+                print(f"[V2] ⚠️ No logo URL provided, skipping logo overlay")
+
+            # Step 6: Update usage counter
             await db["custom_visual_guides"].update_one(
                 {"_id": ObjectId(guide_id)},
                 {
@@ -573,12 +610,14 @@ Reserve clean space for text overlay if the reference image does so."""
             return {
                 "success": True,
                 "status": True,  # For UriResponse compatibility
-                "image_url": image_response['url'],
-                "responseData": {"image_url": image_response['url']},  # For UriResponse compatibility
+                "image_url": final_image_url,
+                "responseData": {"image_url": final_image_url},  # For UriResponse compatibility
                 "image_prompt": final_prompt,
                 "style_profile_used": style_profile.get("overall_aesthetic"),
                 "medium_used": medium,
                 "mood_used": mood,
+                "reference_dimensions": f"{ref_width}x{ref_height}",
+                "logo_applied": bool(logo_url),
             }
 
         except json.JSONDecodeError as e:
