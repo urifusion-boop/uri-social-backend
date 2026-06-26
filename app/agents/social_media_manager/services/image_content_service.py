@@ -2060,19 +2060,49 @@ OVERALL:
                 bx = bw - badge_w - edge_pad
                 by = bh - badge_h - edge_pad
 
-            # Draw semi-transparent white rounded-rectangle badge behind logo
-            badge = Image.new("RGBA", (badge_w, badge_h), (0, 0, 0, 0))
+            # Create glass-morphism effect: blur background + subtle overlay
             try:
+                # Extract the region where badge will be placed
+                badge_region = base_img.crop((bx, by, bx + badge_w, by + badge_h))
+
+                # Apply blur to background region for glass effect
+                blurred_bg = badge_region.filter(ImageFilter.GaussianBlur(radius=8))
+
+                # Create semi-transparent overlay for glass effect
+                # Analyze background brightness to choose overlay color
+                from PIL import ImageStat
+                stat = ImageStat.Stat(badge_region.convert('L'))
+                avg_brightness = stat.mean[0]  # 0-255
+
+                # Adaptive overlay: lighter overlay on dark backgrounds, darker on light
+                if avg_brightness < 128:
+                    # Dark background → use light overlay with subtle tint
+                    overlay_color = (255, 255, 255, 100)  # white at ~39% opacity
+                else:
+                    # Light background → use darker overlay for better contrast
+                    overlay_color = (240, 240, 240, 120)  # light gray at ~47% opacity
+
+                # Create rounded rectangle overlay
                 from PIL import ImageDraw
-                draw = ImageDraw.Draw(badge)
+                overlay = Image.new("RGBA", (badge_w, badge_h), (0, 0, 0, 0))
+                draw = ImageDraw.Draw(overlay)
                 radius = max(6, badge_h // 5)
-                draw.rounded_rectangle(
-                    [(0, 0), (badge_w - 1, badge_h - 1)],
-                    radius=radius,
-                    fill=(255, 255, 255, 210)  # white at 82% opacity
-                )
-            except Exception:
-                # Fallback: plain white rectangle if rounded_rectangle unavailable
+                try:
+                    draw.rounded_rectangle(
+                        [(0, 0), (badge_w - 1, badge_h - 1)],
+                        radius=radius,
+                        fill=overlay_color
+                    )
+                except Exception:
+                    # Fallback for older Pillow versions
+                    overlay = Image.new("RGBA", (badge_w, badge_h), overlay_color)
+
+                # Composite: blurred background + overlay
+                badge = Image.alpha_composite(blurred_bg.convert('RGBA'), overlay)
+
+            except Exception as e:
+                print(f"⚠️ Glass effect failed, using simple badge: {e}")
+                # Fallback: simple semi-transparent white badge
                 badge = Image.new("RGBA", (badge_w, badge_h), (255, 255, 255, 210))
 
             base_img.paste(badge, (bx, by), badge)
