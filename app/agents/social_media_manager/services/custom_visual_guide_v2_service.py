@@ -570,40 +570,39 @@ Reserve clean space for text overlay if the reference image does so."""
                 print(f"[V2] Overlaying logo at position: {logo_position}")
 
                 # Handle data URLs (base64) vs regular URLs
+                import base64
+                import re
+
                 if generated_image_url.startswith("data:"):
-                    # Decode base64 data URL
-                    import base64
-                    import re
-                    # Extract base64 data from data URL
+                    # Extract base64 from data URL
                     match = re.match(r'data:image/\w+;base64,(.+)', generated_image_url)
                     if match:
-                        image_data = base64.b64decode(match.group(1))
-                        base_image = Image.open(io.BytesIO(image_data)).convert("RGBA")
-                        print(f"[V2] Decoded base64 data URL")
+                        base64_image = match.group(1)
+                        print(f"[V2] Extracted base64 from data URL")
                     else:
                         raise Exception("Invalid data URL format")
                 else:
-                    # Download from regular URL
+                    # Download from regular URL and convert to base64
                     async with httpx.AsyncClient(timeout=20) as client:
                         img_response = await client.get(generated_image_url)
-                        base_image = Image.open(io.BytesIO(img_response.content)).convert("RGBA")
-                        print(f"[V2] Downloaded image from URL")
+                        base64_image = base64.b64encode(img_response.content).decode('utf-8')
+                        print(f"[V2] Downloaded image from URL and converted to base64")
 
-                # Overlay logo using ImageContentService
-                final_image = await ImageContentService._overlay_logo(
-                    base_image=base_image,
+                # Overlay logo using ImageContentService (expects base64 string)
+                logo_result_b64 = ImageContentService._overlay_logo(
+                    b64=base64_image,
                     logo_url=logo_url,
-                    logo_position=logo_position,
+                    position=logo_position,
                 )
 
-                # Upload final image with logo
+                # Upload final image with logo to Cloudinary
                 import cloudinary.uploader
-                buffer = io.BytesIO()
-                final_image.save(buffer, format="PNG")
-                buffer.seek(0)
+
+                # Decode base64 back to bytes for upload
+                final_image_bytes = base64.b64decode(logo_result_b64)
 
                 upload_result = cloudinary.uploader.upload(
-                    buffer,
+                    final_image_bytes,
                     folder="uri-social/generated-images",
                     resource_type="image",
                 )
