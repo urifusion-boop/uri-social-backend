@@ -516,22 +516,28 @@ Return only the JSON. No preamble, no explanation."""
             mood = style_profile.get("mood", "professional")
 
             # Build simple, direct prompt that respects the reference style
-            final_prompt = f"""Create a {platform} social media graphic with the following content:
+            # Use seed_content as the main theme/message
+            final_prompt = f"""Create a {platform} social media graphic about: {seed_content}
 
-HEADLINE: {headline}
-{f'SUBTEXT: {subtext}' if subtext else ''}
-{f'CTA: {cta}' if cta else ''}
+REQUIRED TEXT CONTENT (MUST include this exact messaging):
+- Main headline/message: {headline}
+{f'- Supporting text: {subtext}' if subtext else ''}
+{f'- Call-to-action: {cta}' if cta else ''}
 
-STYLE REQUIREMENTS:
-- Match the exact visual style, layout, and aesthetic of the provided reference image
-- Use the same medium: {medium}
-- Maintain the same mood and feel: {mood}, {aesthetic}
-- Copy the composition structure and graphic elements from the reference
-- DO NOT copy any logos, brand names, or specific identity elements from the reference
-- DO NOT add any brand colors or styles beyond what's in the reference image
+VISUAL STYLE (match the reference image):
+- Use the EXACT same visual style, layout, and aesthetic as the provided reference image
+- Medium: {medium}
+- Mood and feel: {mood}, {aesthetic}
+- Composition: Copy the structure, graphic elements, and decorative style from the reference
+- Colors: Use the same color palette as the reference (especially the accent colors)
 
-Keep the same visual language, but apply it to the new content above.
-Reserve clean space for text overlay if the reference image does so."""
+CRITICAL RULES:
+- The text content MUST match the theme: {seed_content}
+- DO NOT copy logos, brand names, or specific identity elements from the reference
+- DO NOT use generic or placeholder text - use the actual content specified above
+- The visual style should match the reference, but the MESSAGE is about: {seed_content}
+
+Generate an image in the same visual style as the reference, but with content about: {seed_content}"""
 
             print(f"[V2] ✅ Pure style cloning prompt generated ({len(final_prompt)} chars)")
             print(f"[V2] Preview: {final_prompt[:200]}...")
