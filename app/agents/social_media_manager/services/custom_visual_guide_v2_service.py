@@ -536,23 +536,22 @@ Reserve clean space for text overlay if the reference image does so."""
             print(f"[V2] ✅ Pure style cloning prompt generated ({len(final_prompt)} chars)")
             print(f"[V2] Preview: {final_prompt[:200]}...")
 
-            # Step 4: Get reference image dimensions (match reference size exactly)
-            print(f"[V2] Getting reference image dimensions...")
+            # Step 4: Get platform-specific dimensions (same as other visual guides)
+            print(f"[V2] Getting platform specs for {platform}...")
             import httpx
             from PIL import Image
             import io
 
-            async with httpx.AsyncClient(timeout=20) as client:
-                img_response = await client.get(reference_image_url)
-                img = Image.open(io.BytesIO(img_response.content))
-                ref_width, ref_height = img.size
-                print(f"[V2] Reference image size: {ref_width}x{ref_height}")
+            specs = ImageContentService._get_platform_image_specs(platform, image_type="post_image")
+            image_width = specs.get("width", 1200)
+            image_height = specs.get("height", 630)
+            print(f"[V2] Platform dimensions: {image_width}x{image_height}")
 
-            # Use reference image dimensions for exact style matching
+            # Generate with platform-specific dimensions + reference image for style
             image_response = await ImageContentService._call_dalle_api(
                 prompt=final_prompt,
-                size=f"{ref_width}x{ref_height}",
-                reference_image=reference_image_url,  # ← ACTUAL reference image
+                size=f"{image_width}x{image_height}",
+                reference_image=reference_image_url,  # ← ACTUAL reference image for style
                 image_model="openai/gpt-image-2",
             )
 
@@ -616,7 +615,8 @@ Reserve clean space for text overlay if the reference image does so."""
                 "style_profile_used": style_profile.get("overall_aesthetic"),
                 "medium_used": medium,
                 "mood_used": mood,
-                "reference_dimensions": f"{ref_width}x{ref_height}",
+                "generated_dimensions": f"{image_width}x{image_height}",
+                "platform": platform,
                 "logo_applied": bool(logo_url),
             }
 
