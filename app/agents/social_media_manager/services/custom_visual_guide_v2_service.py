@@ -508,71 +508,32 @@ Return only the JSON. No preamble, no explanation."""
             print(f"[V2] Loaded guide: {guide.get('name')}")
             print(f"[V2] Style: {style_profile.get('overall_aesthetic')}")
 
-            # Step 2: Build art director meta-prompt
-            purpose = f"{platform} post: {seed_content}"
-            format_map = {
-                "instagram": "1080x1080 square",
-                "facebook": "1200x630 landscape",
-                "twitter": "1200x675 landscape",
-                "x": "1200x675 landscape",
-                "linkedin": "1200x627 landscape",
-            }
+            # Step 2: PURE STYLE CLONING - Simple direct prompt (no brand interference)
+            # Just tell GPT-Image-2: "Make an image like the reference, but with this content"
 
-            meta_prompt = CustomVisualGuideV2Service.ART_DIRECTOR_TEMPLATE.format(
-                style_profile_json=json.dumps(style_profile, indent=2),
-                brand_name=brand_context.get("brand_name", ""),
-                primary_color=brand_context.get("brand_colors", ["#000000"])[0] if brand_context.get("brand_colors") else "#000000",
-                secondary_color=brand_context.get("brand_colors", ["#FFFFFF"])[1] if len(brand_context.get("brand_colors", [])) > 1 else "#FFFFFF",
-                accent_color=brand_context.get("brand_colors", ["#FF0000"])[2] if len(brand_context.get("brand_colors", [])) > 2 else "#FF0000",
-                logo_description=brand_context.get("logo_description", "brand logo"),
-                brand_font=brand_context.get("font_style", "modern sans-serif"),
-                brand_tone=brand_context.get("tone", "professional"),
-                brand_handle=brand_context.get("default_link", "@brand"),
-                purpose=purpose,
-                headline=headline,
-                subtext=subtext or "",
-                cta=cta or "Learn more",
-                format=format_map.get(platform, "1080x1080 square"),
-            )
+            medium = style_profile.get("medium", "photographic")
+            aesthetic = style_profile.get("overall_aesthetic", "modern")
+            mood = style_profile.get("mood", "professional")
 
-            print(f"[V2] Meta-prompt generated ({len(meta_prompt)} chars)")
+            # Build simple, direct prompt that respects the reference style
+            final_prompt = f"""Create a {platform} social media graphic with the following content:
 
-            # Step 3: GPT-4o generates final image prompt
-            print(f"[V2] Calling GPT-4o to generate art director prompt...")
+HEADLINE: {headline}
+{f'SUBTEXT: {subtext}' if subtext else ''}
+{f'CTA: {cta}' if cta else ''}
 
-            ai_request = AIService.build_ai_model(
-                messages=[{
-                    "role": "user",
-                    "content": meta_prompt
-                }],
-                model="gpt-4o",
-                temperature=0.7,
-            )
+STYLE REQUIREMENTS:
+- Match the exact visual style, layout, and aesthetic of the provided reference image
+- Use the same medium: {medium}
+- Maintain the same mood and feel: {mood}, {aesthetic}
+- Copy the composition structure and graphic elements from the reference
+- DO NOT copy any logos, brand names, or specific identity elements from the reference
+- DO NOT add any brand colors or styles beyond what's in the reference image
 
-            ai_response = await AIService.chat_completion(ai_request)
+Keep the same visual language, but apply it to the new content above.
+Reserve clean space for text overlay if the reference image does so."""
 
-            if isinstance(ai_response, dict) and "error" in ai_response:
-                raise Exception(ai_response["error"])
-
-            raw_content = ai_response.choices[0].message.content.strip()
-
-            # Remove markdown if present
-            if raw_content.startswith("```"):
-                lines = raw_content.split("\n")
-                json_lines = []
-                in_code_block = False
-                for line in lines:
-                    if line.startswith("```"):
-                        in_code_block = not in_code_block
-                        continue
-                    if in_code_block or "{" in line:
-                        json_lines.append(line)
-                raw_content = "\n".join(json_lines)
-
-            art_director_output = json.loads(raw_content)
-            final_prompt = art_director_output["image_prompt"]
-
-            print(f"[V2] ✅ Art director prompt generated ({len(final_prompt)} chars)")
+            print(f"[V2] ✅ Pure style cloning prompt generated ({len(final_prompt)} chars)")
             print(f"[V2] Preview: {final_prompt[:200]}...")
 
             # Step 4: Generate image with GPT-Image-2 edit mode
@@ -611,12 +572,13 @@ Return only the JSON. No preamble, no explanation."""
 
             return {
                 "success": True,
+                "status": True,  # For UriResponse compatibility
                 "image_url": image_response['url'],
+                "responseData": {"image_url": image_response['url']},  # For UriResponse compatibility
                 "image_prompt": final_prompt,
-                "reserved_text_zones": art_director_output.get("reserved_text_zones", []),
-                "brand_overlay": art_director_output.get("brand_overlay", {}),
-                "identity_safety_check": art_director_output.get("identity_safety_check", {}),
                 "style_profile_used": style_profile.get("overall_aesthetic"),
+                "medium_used": medium,
+                "mood_used": mood,
             }
 
         except json.JSONDecodeError as e:
