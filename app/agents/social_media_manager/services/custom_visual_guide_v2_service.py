@@ -515,33 +515,14 @@ Return only the JSON. No preamble, no explanation."""
             aesthetic = style_profile.get("overall_aesthetic", "modern")
             mood = style_profile.get("mood", "professional")
 
-            # Build simple, direct prompt that respects the reference style
-            # Use minimal text like the reference image does
+            # Build concise prompt for GPT-Image-2 (keep it short to avoid API errors)
             final_prompt = f"""Create a {platform} social media graphic about: {seed_content}
 
-TEXT CONTENT (keep it minimal like the reference):
-- Include only a short, impactful text headline based on: {seed_content}
-- Text should be concise and minimal - DO NOT include full paragraphs or long captions
-- The reference image shows minimal text - follow that approach
-- Include small call-to-action text: {cta}
+Match the visual style of the reference image exactly - same illustration style, colors, layout, and composition.
 
-VISUAL STYLE (match the reference image exactly):
-- Use the EXACT same visual style, illustration approach, and aesthetic as the provided reference image
-- Medium: {medium}
-- Mood and feel: {mood}, {aesthetic}
-- Composition: Copy the layout structure, graphic elements, decorative elements, and spacing from the reference
-- Colors: Use the same color palette as the reference (especially accent colors)
-- Text placement: Match the reference's text positioning and sizing approach
+Include minimal text on the image (like the reference shows): just a short headline about {seed_content} and small CTA: {cta}
 
-CRITICAL RULES:
-- MINIMAL TEXT ON IMAGE - the reference shows minimal text, follow that pattern
-- DO NOT include the full social media caption on the image
-- DO NOT copy logos, brand names, or specific identity elements from the reference
-- The MESSAGE theme is: {seed_content}
-- Keep visual elements dominant, text secondary (like the reference)
-
-Generate an image in the same visual style as the reference (illustration approach, colors, layout),
-with minimal text about: {seed_content}"""
+Do not copy any logos or brand names from the reference. Keep it clean and simple."""
 
             print(f"[V2] ✅ Pure style cloning prompt generated ({len(final_prompt)} chars)")
             print(f"[V2] Preview: {final_prompt[:200]}...")
