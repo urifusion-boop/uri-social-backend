@@ -513,6 +513,7 @@ Return only the JSON. No preamble, no explanation."""
 
             medium = style_profile.get("medium", "photographic")
             aesthetic = style_profile.get("overall_aesthetic", "modern")
+            mood = style_profile.get("mood", "professional")
 
             # Layout structure
             layout = style_profile.get("layout_structure", {})
