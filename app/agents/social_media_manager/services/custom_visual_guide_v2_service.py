@@ -516,28 +516,32 @@ Return only the JSON. No preamble, no explanation."""
             mood = style_profile.get("mood", "professional")
 
             # Build simple, direct prompt that respects the reference style
-            # Use seed_content as the main theme/message
+            # Use minimal text like the reference image does
             final_prompt = f"""Create a {platform} social media graphic about: {seed_content}
 
-REQUIRED TEXT CONTENT (MUST include this exact messaging):
-- Main headline/message: {headline}
-{f'- Supporting text: {subtext}' if subtext else ''}
-{f'- Call-to-action: {cta}' if cta else ''}
+TEXT CONTENT (keep it minimal like the reference):
+- Include only a short, impactful text headline based on: {seed_content}
+- Text should be concise and minimal - DO NOT include full paragraphs or long captions
+- The reference image shows minimal text - follow that approach
+- Include small call-to-action text: {cta}
 
-VISUAL STYLE (match the reference image):
-- Use the EXACT same visual style, layout, and aesthetic as the provided reference image
+VISUAL STYLE (match the reference image exactly):
+- Use the EXACT same visual style, illustration approach, and aesthetic as the provided reference image
 - Medium: {medium}
 - Mood and feel: {mood}, {aesthetic}
-- Composition: Copy the structure, graphic elements, and decorative style from the reference
-- Colors: Use the same color palette as the reference (especially the accent colors)
+- Composition: Copy the layout structure, graphic elements, decorative elements, and spacing from the reference
+- Colors: Use the same color palette as the reference (especially accent colors)
+- Text placement: Match the reference's text positioning and sizing approach
 
 CRITICAL RULES:
-- The text content MUST match the theme: {seed_content}
+- MINIMAL TEXT ON IMAGE - the reference shows minimal text, follow that pattern
+- DO NOT include the full social media caption on the image
 - DO NOT copy logos, brand names, or specific identity elements from the reference
-- DO NOT use generic or placeholder text - use the actual content specified above
-- The visual style should match the reference, but the MESSAGE is about: {seed_content}
+- The MESSAGE theme is: {seed_content}
+- Keep visual elements dominant, text secondary (like the reference)
 
-Generate an image in the same visual style as the reference, but with content about: {seed_content}"""
+Generate an image in the same visual style as the reference (illustration approach, colors, layout),
+with minimal text about: {seed_content}"""
 
             print(f"[V2] ✅ Pure style cloning prompt generated ({len(final_prompt)} chars)")
             print(f"[V2] Preview: {final_prompt[:200]}...")
