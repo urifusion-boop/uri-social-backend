@@ -2011,7 +2011,7 @@ OVERALL:
         import base64 as _b64
         import io
         import requests as _req
-        from PIL import Image
+        from PIL import Image, ImageFilter
 
         try:
             # Decode generated image
