@@ -508,21 +508,40 @@ Return only the JSON. No preamble, no explanation."""
             print(f"[V2] Loaded guide: {guide.get('name')}")
             print(f"[V2] Style: {style_profile.get('overall_aesthetic')}")
 
-            # Step 2: PURE STYLE CLONING - Simple direct prompt (no brand interference)
-            # Just tell GPT-Image-2: "Make an image like the reference, but with this content"
+            # Step 2: Build structured style description from extracted profile
+            # Extract key attributes for precise style matching
 
             medium = style_profile.get("medium", "photographic")
             aesthetic = style_profile.get("overall_aesthetic", "modern")
-            mood = style_profile.get("mood", "professional")
 
-            # Build concise prompt for GPT-Image-2 (keep it short to avoid API errors)
+            # Layout structure
+            layout = style_profile.get("layout_structure", {})
+            composition = layout.get("composition", "centered")
+
+            # Color system
+            color_system = style_profile.get("color_system", {})
+            accent_strategy = color_system.get("accent_strategy", "")
+
+            # Graphic elements (decorative details)
+            graphic_elements = style_profile.get("graphic_elements", [])
+            decorative_elements = ", ".join(graphic_elements[:4]) if graphic_elements else "none"
+
+            # Typography
+            typography = style_profile.get("typography", {})
+            text_placement = typography.get("text_placement", "overlay_center")
+            text_treatment = typography.get("text_treatment", "plain")
+
+            # Build concise but structured prompt for GPT-Image-2
             final_prompt = f"""Create a {platform} social media graphic about: {seed_content}
 
-Match the visual style of the reference image exactly - same illustration style, colors, layout, and composition.
+Style: {medium}, {aesthetic} aesthetic
+Layout: {composition} composition
+Colors: {accent_strategy if accent_strategy else 'match reference colors'}
+Graphics: Include {decorative_elements}
+Text: Minimal text with {text_placement} placement, {text_treatment} treatment
+Content: Short headline about {seed_content}, small CTA: {cta}
 
-Include minimal text on the image (like the reference shows): just a short headline about {seed_content} and small CTA: {cta}
-
-Do not copy any logos or brand names from the reference. Keep it clean and simple."""
+Match the reference image's visual style exactly. Do not copy any logos or brand names."""
 
             print(f"[V2] ✅ Pure style cloning prompt generated ({len(final_prompt)} chars)")
             print(f"[V2] Preview: {final_prompt[:200]}...")
