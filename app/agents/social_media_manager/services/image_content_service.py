@@ -2060,54 +2060,47 @@ OVERALL:
                 bx = bw - badge_w - edge_pad
                 by = bh - badge_h - edge_pad
 
-            # Create glass-morphism effect: blur background + subtle overlay
+            # Natural blending: add subtle shadow/glow for visibility without badge
             try:
-                # Extract the region where badge will be placed
+                from PIL import ImageStat, ImageDraw
+
+                # Analyze background region to determine visibility strategy
                 badge_region = base_img.crop((bx, by, bx + badge_w, by + badge_h))
-
-                # Apply blur to background region for glass effect
-                blurred_bg = badge_region.filter(ImageFilter.GaussianBlur(radius=8))
-
-                # Create semi-transparent overlay for glass effect
-                # Analyze background brightness to choose overlay color
-                from PIL import ImageStat
                 stat = ImageStat.Stat(badge_region.convert('L'))
                 avg_brightness = stat.mean[0]  # 0-255
 
-                # Adaptive overlay: lighter overlay on dark backgrounds, darker on light
+                # Create a soft shadow/glow layer for logo visibility
+                shadow_layer = Image.new("RGBA", (badge_w, badge_h), (0, 0, 0, 0))
+
+                # Add subtle drop shadow or glow based on background
+                shadow_offset = 2
+                shadow_blur_radius = 4
+
                 if avg_brightness < 128:
-                    # Dark background → use light overlay with subtle tint
-                    overlay_color = (255, 255, 255, 100)  # white at ~39% opacity
+                    # Dark background → add subtle white glow
+                    glow_color = (255, 255, 255, 60)
+                    for i in range(3):  # Multiple passes for softer glow
+                        glow = Image.new("RGBA", logo_img.size, (0, 0, 0, 0))
+                        draw = ImageDraw.Draw(glow)
+                        # Draw a slightly enlarged version of logo shape as glow
+                        glow.paste((255, 255, 255, 40), (0, 0), logo_img)
+                        glow = glow.filter(ImageFilter.GaussianBlur(radius=shadow_blur_radius))
+                        shadow_layer.paste(glow, (badge_pad_inner - i, badge_pad_inner - i), glow)
                 else:
-                    # Light background → use darker overlay for better contrast
-                    overlay_color = (240, 240, 240, 120)  # light gray at ~47% opacity
+                    # Light background → add subtle dark shadow
+                    shadow_color = (0, 0, 0, 80)
+                    shadow = Image.new("RGBA", logo_img.size, (0, 0, 0, 0))
+                    shadow.paste((0, 0, 0, 60), (0, 0), logo_img)
+                    shadow = shadow.filter(ImageFilter.GaussianBlur(radius=shadow_blur_radius))
+                    shadow_layer.paste(shadow, (badge_pad_inner + shadow_offset, badge_pad_inner + shadow_offset), shadow)
 
-                # Create rounded rectangle overlay
-                from PIL import ImageDraw
-                overlay = Image.new("RGBA", (badge_w, badge_h), (0, 0, 0, 0))
-                draw = ImageDraw.Draw(overlay)
-                radius = max(6, badge_h // 5)
-                try:
-                    draw.rounded_rectangle(
-                        [(0, 0), (badge_w - 1, badge_h - 1)],
-                        radius=radius,
-                        fill=overlay_color
-                    )
-                except Exception:
-                    # Fallback for older Pillow versions
-                    overlay = Image.new("RGBA", (badge_w, badge_h), overlay_color)
-
-                # Composite: blurred background + overlay
-                badge = Image.alpha_composite(blurred_bg.convert('RGBA'), overlay)
+                # Composite shadow layer onto base image
+                base_img.paste(shadow_layer, (bx, by), shadow_layer)
 
             except Exception as e:
-                print(f"⚠️ Glass effect failed, using simple badge: {e}")
-                # Fallback: simple semi-transparent white badge
-                badge = Image.new("RGBA", (badge_w, badge_h), (255, 255, 255, 210))
+                print(f"⚠️ Shadow effect failed, using plain logo: {e}")
 
-            base_img.paste(badge, (bx, by), badge)
-
-            # Paste logo on top of badge
+            # Paste logo directly on image (no badge background)
             logo_x = bx + badge_pad_inner
             logo_y = by + badge_pad_inner
             base_img.paste(logo_img, (logo_x, logo_y), logo_img)
