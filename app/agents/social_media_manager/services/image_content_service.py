@@ -2331,7 +2331,7 @@ OVERALL:
                                     size=_gpt2_size,
                                 ),
                             ),
-                            timeout=90,
+                            timeout=180,  # Increased from 90 to 180 seconds (3 minutes)
                         )
                         _mode = "gpt-image-2-edit"
                     else:
@@ -2351,7 +2351,7 @@ OVERALL:
                                     output_format="webp",
                                 ),
                             ),
-                            timeout=90,
+                            timeout=180,  # Increased from 90 to 180 seconds (3 minutes)
                         )
                         _mode = "gpt-image-2"
 
