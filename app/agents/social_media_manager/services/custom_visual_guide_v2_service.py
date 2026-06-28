@@ -532,17 +532,12 @@ Return only the JSON. No preamble, no explanation."""
             text_placement = typography.get("text_placement", "overlay_center")
             text_treatment = typography.get("text_treatment", "plain")
 
-            # Build concise but structured prompt for GPT-Image-2
-            final_prompt = f"""Create a {platform} social media graphic about: {seed_content}
+            # Build natural language prompt (not structured list to avoid verbatim rendering)
+            # Convert structured attributes into narrative form
+            color_instruction = f"using {accent_strategy} color approach" if accent_strategy else "matching the reference color palette"
+            graphics_instruction = f"with {decorative_elements} as decorative elements" if decorative_elements != "none" else "with minimal decorative elements"
 
-Style: {medium}, {aesthetic} aesthetic
-Layout: {composition} composition
-Colors: {accent_strategy if accent_strategy else 'match reference colors'}
-Graphics: Include {decorative_elements}
-Text: Minimal text with {text_placement} placement, {text_treatment} treatment
-Content: Short headline about {seed_content}, small CTA: {cta}
-
-Match the reference image's visual style exactly. Do not copy any logos or brand names."""
+            final_prompt = f"""Design a {medium} style {platform} graphic about {seed_content}. Use {composition} composition {graphics_instruction}, {color_instruction}. Include minimal text - just a short headline about {seed_content} with {text_placement} placement and {text_treatment} style, plus small CTA "{cta}". Match the reference image's {aesthetic} aesthetic exactly but don't copy logos or brand names."""
 
             print(f"[V2] ✅ Pure style cloning prompt generated ({len(final_prompt)} chars)")
             print(f"[V2] Preview: {final_prompt[:200]}...")
