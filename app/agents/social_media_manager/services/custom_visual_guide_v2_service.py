@@ -549,9 +549,18 @@ Do NOT copy logos or brand names from the reference."""
             content_section = f"""=== CONTENT ===
 {seed_content.strip()}"""
 
+            # CTA instruction (same format as regular generation)
+            cta_instruction = f"""=== CALL-TO-ACTION ===
+Display the following CTA text at the bottom of the image in small clean sans-serif text: "{cta}"
+Style it subtle but legible, approximately 30% the size of the headline.
+Position: bottom-centre or bottom-right within safe zone.
+Do NOT style it as a button or banner."""
+
             final_prompt = f"""{style_instructions}
 
-{content_section}"""
+{content_section}
+
+{cta_instruction}"""
 
             print(f"[V2] ✅ Pure style cloning prompt generated ({len(final_prompt)} chars)")
             print(f"[V2] Preview: {final_prompt[:200]}...")
