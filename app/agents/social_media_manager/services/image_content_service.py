@@ -2031,9 +2031,9 @@ OVERALL:
             logo_img = logo_img.resize((target_w, int(lh * scale)), Image.LANCZOS)
             lw, lh = logo_img.size
 
-            # Badge padding (inner: 5px each side, outer edge: 1.5% of width)
+            # Badge padding (inner: 5px each side, outer edge: 3% of width for better spacing)
             badge_pad_inner = max(5, int(bw * 0.005))
-            edge_pad = max(12, int(bw * 0.015))
+            edge_pad = max(20, int(bw * 0.03))  # Increased from 1.5% to 3% to avoid text overlap
 
             badge_w = lw + badge_pad_inner * 2
             badge_h = lh + badge_pad_inner * 2
