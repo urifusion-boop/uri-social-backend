@@ -532,15 +532,26 @@ Return only the JSON. No preamble, no explanation."""
             text_placement = typography.get("text_placement", "overlay_center")
             text_treatment = typography.get("text_treatment", "plain")
 
-            # Build natural language prompt - AVOID using seed_content directly to prevent verbatim rendering
-            # Convert structured attributes into narrative form
-            color_instruction = f"using {accent_strategy} color approach" if accent_strategy else "matching the reference color palette"
-            graphics_instruction = f"with {decorative_elements} as decorative elements" if decorative_elements != "none" else "with minimal decorative elements"
+            # Build structured prompt similar to standard generation
+            # Use sections to separate style instructions from content (prevents verbatim rendering)
 
-            # Extract theme essence without literal phrase
-            theme_words = seed_content.lower().replace("create", "").replace("post", "").strip()
+            style_instructions = f"""=== VISUAL STYLE (MATCH REFERENCE) ===
+Design style: {medium}, {aesthetic} aesthetic
+Composition: {composition}
+Decorative elements: {decorative_elements if decorative_elements != "none" else "minimal"}
+Color approach: {accent_strategy if accent_strategy else "match reference palette"}
+Typography: {text_placement} placement, {text_treatment} style
 
-            final_prompt = f"""Design a {medium} style {platform} social media graphic. Use {composition} composition {graphics_instruction}, {color_instruction}. Match the reference image's {aesthetic} aesthetic exactly. Include minimal text with {text_placement} placement and {text_treatment} style. Do not copy logos or brand names from the reference."""
+Match the reference image's visual style exactly.
+Include MINIMAL text - just a short headline and small CTA.
+Do NOT copy logos or brand names from the reference."""
+
+            content_section = f"""=== CONTENT ===
+{seed_content.strip()}"""
+
+            final_prompt = f"""{style_instructions}
+
+{content_section}"""
 
             print(f"[V2] ✅ Pure style cloning prompt generated ({len(final_prompt)} chars)")
             print(f"[V2] Preview: {final_prompt[:200]}...")
