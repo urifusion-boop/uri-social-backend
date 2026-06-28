@@ -2336,6 +2336,8 @@ OVERALL:
                         _mode = "gpt-image-2-edit"
                     else:
                         print(f"🎨 GPT-Image-2 direct OpenAI ({_gpt2_size})…")
+                        print(f"📝 Prompt length: {len(prompt)} chars")
+                        print(f"📝 Prompt preview: {prompt[:300]}...")
                         loop = asyncio.get_running_loop()
                         _gpt2_resp = await asyncio.wait_for(
                             loop.run_in_executor(
@@ -2375,7 +2377,12 @@ OVERALL:
                         "model": _mode,
                     }
                 except Exception as _gpt2_err:
+                    import traceback
                     print(f"⚠️ GPT-Image-2 failed: {_gpt2_err} — falling back to Imagen/GPT")
+                    print(f"⚠️ GPT-Image-2 Error Details:")
+                    print(f"   Error Type: {type(_gpt2_err).__name__}")
+                    print(f"   Error Message: {str(_gpt2_err)}")
+                    traceback.print_exc()
 
             # ── fal.ai path (model explicitly chosen from frontend) ────────────
             _fal_model = image_model or ""
