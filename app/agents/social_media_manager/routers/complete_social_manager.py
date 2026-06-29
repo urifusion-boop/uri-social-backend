@@ -560,13 +560,16 @@ async def generate_content(
                     total_slides = len(slides)
                     carousel_id = draft["id"]  # All slides share same carousel_id
                     for slide_index, slide in enumerate(slides):
-                        # Use slide's headline + body as the main content (no seed duplication)
+                        # Combine slide-specific content with original seed for richer context
                         slide_content = f"{slide.get('headline', '')} {slide.get('body', '')}".strip()
+                        # Preserve original seed content for elegant, contextual image generation
+                        # Format: "Original context: {seed}. This slide focuses on: {slide headline and body}"
+                        enriched_seed = f"{request.seed_content}. This slide: {slide_content}"
                         _bg_image_tasks.append(asyncio.create_task(_generate_image_bg(
                             draft_id=draft["id"],
                             platform=draft["platform"],
                             content=slide_content or draft["content"],
-                            seed_content=slide_content,  # Use slide content instead of original seed to avoid duplication
+                            seed_content=enriched_seed,  # Use enriched seed with both original context and slide-specific focus
                             brand_context=brand_context_dict,
                             db=db,
                             reference_image=request.reference_image,
@@ -4187,6 +4190,7 @@ async def _generate_image_bg(
                 _custom_guide_ids_v1 = _bp.get("selected_custom_guides") or []
                 _custom_guide_ids_v2 = _bp.get("selected_custom_guides_v2") or []
                 _all_custom_guide_ids = _custom_guide_ids_v1 + _custom_guide_ids_v2
+                _custom_guide_id = None  # Initialize to avoid UnboundLocalError
 
                 if _all_custom_guide_ids:
                     # Rotate through custom guides (V1 + V2) like library styles
@@ -4276,6 +4280,7 @@ async def _generate_image_bg(
             _custom_guide_ids_v1 = _bp.get("selected_custom_guides") or []
             _custom_guide_ids_v2 = _bp.get("selected_custom_guides_v2") or []
             _all_custom_guide_ids = _custom_guide_ids_v1 + _custom_guide_ids_v2
+            _custom_guide_id = None  # Initialize to avoid UnboundLocalError
 
             if _all_custom_guide_ids:
                 # Rotate through custom guides (V1 + V2) like library styles
