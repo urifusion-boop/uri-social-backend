@@ -800,13 +800,19 @@ that follows.{logo_space_note}"""
 
             # Use CTA from brand playbook's cta_styles
             # If user has multiple CTAs, vary them randomly for diversity
-            cta_styles_list = bc.get("cta_styles", [])
-            if isinstance(cta_styles_list, list) and cta_styles_list:
-                import random
-                cta_text = random.choice(cta_styles_list)
+            # Check for one-time override CTA first
+            override_cta = bc.get("override_cta")
+            if override_cta:
+                cta_text = override_cta
             else:
-                # Fallback to default_link if cta_styles is empty
-                cta_text = bc.get("default_link", "Link in bio")
+                # Use normal brand playbook CTAs
+                cta_styles_list = bc.get("cta_styles", [])
+                if isinstance(cta_styles_list, list) and cta_styles_list:
+                    import random
+                    cta_text = random.choice(cta_styles_list)
+                else:
+                    # Fallback to default_link if cta_styles is empty
+                    cta_text = bc.get("default_link", "Link in bio")
 
             # Brand name display logic (PRD Section 4)
             # Art-piece posters ALWAYS include brand logo + tagline + badges
