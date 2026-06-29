@@ -177,6 +177,7 @@ class ContentGenerationRequest(BaseModel):
     post_type: str = "feed"   # feed | carousel | story
     num_slides: int = 3        # carousel only (2–5)
     acknowledged_incomplete_profile: bool = False  # OPTION 1: User acknowledged incomplete profile warning
+    override_cta: Optional[str] = None  # One-time CTA for this generation only (not saved to brand playbook)
 
 class SocialConnectionRequest(BaseModel):
     platforms: List[str] = Field(..., min_items=1, max_items=10)
@@ -418,6 +419,10 @@ async def generate_content(
         brand_context_dict["using_fallbacks"] = len(missing_fields) > 0
         brand_context_dict["fallback_fields"] = missing_fields
         print(f"🖼️  LOGO DEBUG user={user_id}: logo_url={repr(profile_data.get('logo_url'))}, logo_position={repr(profile_data.get('logo_position'))} → brand_context logo_position={repr(brand_context_dict.get('logo_position'))}")
+
+        # Add one-time CTA override if provided (doesn't save to brand playbook)
+        if request.override_cta:
+            brand_context_dict["override_cta"] = request.override_cta
 
         # Allow explicit overrides from the request (legacy / power-user path)
         if request.brand_context:
