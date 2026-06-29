@@ -1913,6 +1913,52 @@ def _probe_duration(video_bytes: bytes) -> float:
     return 120.0
 
 
+def _probe_has_speech(video_bytes: bytes, silence_threshold_db: float = -45.0) -> bool:
+    """
+    Returns True if the video contains audible speech-level audio.
+    Uses ffmpeg volumedetect — if mean_volume is below silence_threshold_db
+    (or there's no audio stream at all) we treat it as silent/music-only.
+    """
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+            f.write(video_bytes)
+            tmp = f.name
+
+        # First check: does an audio stream exist?
+        probe = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", tmp],
+            capture_output=True, text=True, timeout=30,
+        )
+        info = json.loads(probe.stdout)
+        has_audio_stream = any(
+            s.get("codec_type") == "audio" for s in info.get("streams", [])
+        )
+        if not has_audio_stream:
+            os.unlink(tmp)
+            return False
+
+        # Second check: is there any audible level?
+        result = subprocess.run(
+            [
+                "ffmpeg", "-i", tmp, "-af", "volumedetect",
+                "-vn", "-f", "null", "-",
+            ],
+            capture_output=True, text=True, timeout=60,
+        )
+        os.unlink(tmp)
+        for line in result.stderr.splitlines():
+            if "mean_volume" in line:
+                # e.g. "mean_volume: -38.2 dB"
+                parts = line.split("mean_volume:")
+                if len(parts) == 2:
+                    db_val = float(parts[1].strip().split()[0])
+                    return db_val > silence_threshold_db
+        # No mean_volume line → treat as silent
+        return False
+    except Exception:
+        return True  # safe fallback: try Reap anyway
+
+
 # ── Main pipeline ─────────────────────────────────────────────────────────────
 
 async def run_production_job(
@@ -1969,25 +2015,37 @@ async def run_production_job(
         )
 
         # ── Stage 1: Reap — word-level transcript + timestamps + clip detection ──
-        await update(5, "Transcribing…")
-        upload_id = await reap.upload_video(video_bytes, f"{job_id}_raw.mp4")
-        if not upload_id:
-            raise RuntimeError("Upload to Reap failed")
+        await update(5, "Checking audio…")
+        has_speech = _probe_has_speech(video_bytes)
+        print(f"[VideoProduction] has_speech={has_speech}", flush=True)
 
-        trans_id = await reap.start_transcription(upload_id, "en")
-        if not trans_id:
-            raise RuntimeError("Transcription failed to start")
+        srt_text: str = ""
+        _reap_video_url: str = ""
+        tracking_data: Dict[str, Any] = {}
 
-        srt_text, _reap_video_url, tracking_data = await reap.fetch_full_transcript_data(
-            trans_id, timeout_seconds=600
-        )
-        if not srt_text:
-            raise RuntimeError("Transcription timed out or returned empty")
+        if has_speech:
+            await update(8, "Transcribing…")
+            upload_id = await reap.upload_video(video_bytes, f"{job_id}_raw.mp4")
+            if not upload_id:
+                raise RuntimeError("Upload to Reap failed")
 
-        print(
-            f"[VideoProduction] srt={len(srt_text)}ch tracking={bool(tracking_data)}",
-            flush=True,
-        )
+            trans_id = await reap.start_transcription(upload_id, "en")
+            if not trans_id:
+                raise RuntimeError("Transcription failed to start")
+
+            srt_text, _reap_video_url, tracking_data = await reap.fetch_full_transcript_data(
+                trans_id, timeout_seconds=600
+            )
+            if not srt_text:
+                raise RuntimeError("Transcription timed out or returned empty")
+
+            print(
+                f"[VideoProduction] srt={len(srt_text)}ch tracking={bool(tracking_data)}",
+                flush=True,
+            )
+        else:
+            print("[VideoProduction] no speech detected — skipping Reap transcription", flush=True)
+            await update(30, "No speech detected — skipping transcription…")
 
         # ── Stage 2: Audio cleanup — noise reduction, leveling, de-essing ────────
         await update(30, "Cleaning audio…")
