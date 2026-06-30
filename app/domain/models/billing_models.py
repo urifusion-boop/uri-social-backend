@@ -138,6 +138,12 @@ class SubscriptionTier(BaseModel):
     price_ngn_6months: int = Field(..., description="6-month price with 5% discount")
     price_ngn_12months: int = Field(..., description="12-month price with 5% discount")
 
+    # USD pricing (multi-currency support)
+    price_usd_monthly: Optional[int] = Field(default=None, description="Monthly price in US Dollars")
+    price_usd_3months: Optional[int] = Field(default=None, description="3-month price with 5% discount in USD")
+    price_usd_6months: Optional[int] = Field(default=None, description="6-month price with 5% discount in USD")
+    price_usd_12months: Optional[int] = Field(default=None, description="12-month price with 5% discount in USD")
+
     # Legacy fields for backward compatibility
     price_ngn: int = Field(..., description="Alias for price_ngn_monthly (backward compatibility)")
     credits: int = Field(..., description="Alias for credits_monthly (backward compatibility)")
