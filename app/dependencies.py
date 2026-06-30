@@ -81,25 +81,32 @@ async def get_current_user(token: dict = Depends(JWTBearer())) -> dict:
 
 async def flexible_auth(
     request: Request,
-    x_api_key: Optional[str] = Header(None, alias="X-API-Key")
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+    x_end_user_id: Optional[str] = Header(None, alias="X-End-User-ID"),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ) -> dict:
     """
     Accept EITHER JWT token OR API key for authentication.
-    
+    Supports optional multi-tenant mode via X-End-User-ID header.
+
     Priority:
     1. X-API-Key header (SDK authentication)
+       - If X-End-User-ID provided → Multi-tenant mode (SDK client with end-users)
+       - If X-End-User-ID missing → Single-tenant mode (developer's own account)
     2. Authorization: Bearer header (Dashboard JWT authentication)
-    
+
     Returns:
         dict with 'user_id' and 'auth_type' keys
         - auth_type: "api_key" or "jwt"
-    
+        - If multi-tenant: includes 'sdk_client_id', 'end_user_id', 'is_multi_tenant'
+
     Raises:
         HTTPException 401 if neither auth method is provided or both are invalid
     """
     from fastapi import Request, Header
     from app.middleware.api_key_auth import api_key_auth_service
-    
+    from app.services.MultiTenantService import MultiTenantService
+
     # Try API key first (for SDK users)
     if x_api_key:
         try:
@@ -107,15 +114,75 @@ async def flexible_auth(
                 api_key=x_api_key,
                 request=request
             )
-            return {
-                "user_id": api_key_obj.user_id,
-                "auth_type": "api_key",
-                "api_key_obj": api_key_obj  # Full object for scope checking if needed
-            }
+
+            # Check for multi-tenant mode (X-End-User-ID header present)
+            if x_end_user_id:
+                # Multi-tenant mode: SDK client with end-users
+                # Get or create SDK client profile
+                sdk_client = await MultiTenantService.get_or_create_sdk_client(
+                    api_key_hash=api_key_obj.key_hash,
+                    api_key_prefix=api_key_obj.key_prefix,
+                    developer_id=api_key_obj.user_id,
+                    company_name=api_key_obj.name or "SDK Client",
+                    db=db
+                )
+
+                if not sdk_client:
+                    raise HTTPException(
+                        status_code=500,
+                        detail="Failed to create SDK client profile"
+                    )
+
+                # Check if SDK client can create more end-users
+                if not await MultiTenantService.can_create_end_user(sdk_client.sdk_client_id, db):
+                    raise HTTPException(
+                        status_code=403,
+                        detail=f"SDK client has reached maximum end-user limit ({sdk_client.limits.max_end_users})"
+                    )
+
+                # Get or create end-user
+                end_user = await MultiTenantService.get_or_create_end_user(
+                    sdk_client_id=sdk_client.sdk_client_id,
+                    external_user_id=x_end_user_id,
+                    external_email=None,  # Can be passed via request body if needed
+                    external_name=None,   # Can be passed via request body if needed
+                    db=db
+                )
+
+                if not end_user:
+                    raise HTTPException(
+                        status_code=500,
+                        detail="Failed to create end-user profile"
+                    )
+
+                # Update activity timestamps
+                await MultiTenantService.update_sdk_client_activity(sdk_client.sdk_client_id, db)
+                await MultiTenantService.update_end_user_activity(end_user.end_user_id, db)
+
+                return {
+                    "user_id": api_key_obj.user_id,  # Developer ID (for credit checks)
+                    "auth_type": "api_key",
+                    "api_key_obj": api_key_obj,
+                    # Multi-tenant context
+                    "is_multi_tenant": True,
+                    "sdk_client_id": sdk_client.sdk_client_id,
+                    "end_user_id": end_user.end_user_id,
+                    "external_user_id": x_end_user_id,
+                    "sdk_client": sdk_client,
+                    "end_user": end_user
+                }
+            else:
+                # Single-tenant mode: Developer's own account (backward compatible)
+                return {
+                    "user_id": api_key_obj.user_id,
+                    "auth_type": "api_key",
+                    "api_key_obj": api_key_obj,
+                    "is_multi_tenant": False
+                }
         except HTTPException:
             # API key failed, re-raise the error
             raise
-    
+
     # Fallback to JWT (for dashboard users)
     authorization = request.headers.get("authorization", "")
     if authorization.startswith("Bearer "):
@@ -129,11 +196,12 @@ async def flexible_auth(
             return {
                 "user_id": user_id,
                 "auth_type": "jwt",
-                "jwt_payload": jwt_payload  # Full payload for backwards compatibility
+                "jwt_payload": jwt_payload,
+                "is_multi_tenant": False
             }
         except HTTPException:
             raise
-    
+
     # No valid authentication provided
     raise HTTPException(
         status_code=401,
