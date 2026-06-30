@@ -4354,9 +4354,16 @@ async def _generate_image_bg(
         # For story posts pass image_type="story" so we get 1080x1920 dimensions
         image_type = "story" if post_type == "story" else "post_image"
 
-        # ========== CUSTOM VISUAL GUIDE V2 ROUTING ==========
-        # If V2 guide is selected, use V2 pure style cloning (ignore brand profile)
+        # ========== REFERENCE IMAGE vs V2 GUIDE PRIORITY ==========
+        # Priority: User-uploaded reference image > V2 guide > Standard generation
+        # If user explicitly uploaded a reference image, use it (ignore V2 guide)
         v2_guide_id = brand_context.get("custom_guide_v2_id")
+
+        if reference_image:
+            # User explicitly uploaded reference image - highest priority
+            # Use standard generation flow with reference image (skip V2 guide)
+            print(f"📸 User reference image detected - using standard generation (V2 guide ignored)")
+            v2_guide_id = None  # Override V2 guide when reference image is provided
 
         if v2_guide_id:
             print(f"🎨 V2 CUSTOM GUIDE DETECTED - Using pure style cloning")
