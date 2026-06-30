@@ -266,6 +266,7 @@ async def archive_guide_v2(
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
     try:
+        # 1. Archive the guide in database
         result = await db["custom_visual_guides"].update_one(
             {"_id": ObjectId(guide_id), "user_id": user_id, "version": "v2"},
             {
@@ -278,6 +279,13 @@ async def archive_guide_v2(
 
         if result.modified_count == 0:
             raise HTTPException(status_code=404, detail="Custom Visual Guide V2 not found")
+
+        # 2. Remove from brand profile's selected_custom_guides_v2 array
+        await db["brand_profiles"].update_one(
+            {"user_id": user_id},
+            {"$pull": {"selected_custom_guides_v2": guide_id}}
+        )
+        print(f"[V2] Removed guide {guide_id} from user {user_id}'s selected_custom_guides_v2")
 
         return UriResponse.create_response(
             entity_name="Custom Visual Guide V2",
