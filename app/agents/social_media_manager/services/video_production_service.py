@@ -2033,19 +2033,27 @@ async def run_production_job(
             if not trans_id:
                 raise RuntimeError("Transcription failed to start")
 
-            srt_text, _reap_video_url, tracking_data = await reap.fetch_full_transcript_data(
-                trans_id, timeout_seconds=600
-            )
-            if not srt_text:
-                raise RuntimeError("Transcription timed out or returned empty")
-
-            print(
-                f"[VideoProduction] srt={len(srt_text)}ch tracking={bool(tracking_data)}",
-                flush=True,
-            )
+            try:
+                srt_text, _reap_video_url, tracking_data = await reap.fetch_full_transcript_data(
+                    trans_id, timeout_seconds=600
+                )
+                if srt_text:
+                    print(
+                        f"[VideoProduction] srt={len(srt_text)}ch tracking={bool(tracking_data)}",
+                        flush=True,
+                    )
+                else:
+                    print("[VideoProduction] Reap returned empty transcript — continuing without captions", flush=True)
+            except ValueError:
+                # Reap returned invalid_content — audio present but no clear speech (music-only)
+                # Fall through gracefully; pipeline still produces cuts/zooms/music without captions
+                print("[VideoProduction] Reap: no speech in audio — continuing without transcript", flush=True)
+                srt_text = ""
+                _reap_video_url = ""
+                tracking_data = {}
         else:
-            print("[VideoProduction] no speech detected — skipping Reap transcription", flush=True)
-            await update(30, "No speech detected — skipping transcription…")
+            print("[VideoProduction] ffmpeg: no audio stream — skipping Reap", flush=True)
+            await update(30, "No audio detected — skipping transcription…")
 
         # ── Stage 2: Audio cleanup — noise reduction, leveling, de-essing ────────
         await update(30, "Cleaning audio…")
