@@ -14,12 +14,17 @@ class BrandProfileService:
         data: Dict[str, Any],
         db: AsyncIOMotorDatabase,
         brand_id: Optional[str] = None,
+        sdk_client_id: Optional[str] = None,
+        end_user_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         now = datetime.utcnow()
 
         doc = {
             "user_id": user_id,
             "brand_id": brand_id,
+            # Multi-tenant fields (optional, for SDK end-users)
+            "sdk_client_id": sdk_client_id,
+            "end_user_id": end_user_id,
             "brand_name": data.get("brand_name", ""),
             "industry": data.get("industry", ""),
             "website": data.get("website", ""),
@@ -116,15 +121,22 @@ class BrandProfileService:
         if "style_rotation_index" in data:
             doc["style_rotation_index"] = data["style_rotation_index"]
 
-        # brand_id is the isolation boundary; fall back to user_id for solo/legacy.
-        scope = {"brand_id": brand_id} if brand_id else {"user_id": user_id}
-
-        # Always check by user_id first to prevent duplicates (unique index on user_id)
-        existing = await db[BrandProfileService.COLLECTION].find_one({"user_id": user_id})
-
-        # If not found by user_id and we have brand_id, try brand_id (for legacy data)
-        if not existing and brand_id:
-            existing = await db[BrandProfileService.COLLECTION].find_one({"brand_id": brand_id})
+        # Multi-tenant isolation: end_user_id is the primary isolation boundary
+        # Priority: end_user_id > brand_id > user_id (for backward compatibility)
+        if end_user_id:
+            # Multi-tenant mode: query by end_user_id (SDK end-user's profile)
+            scope = {"end_user_id": end_user_id}
+            existing = await db[BrandProfileService.COLLECTION].find_one({"end_user_id": end_user_id})
+        elif brand_id:
+            # Agency mode: query by brand_id (team brand)
+            scope = {"brand_id": brand_id}
+            existing = await db[BrandProfileService.COLLECTION].find_one({"user_id": user_id})
+            if not existing:
+                existing = await db[BrandProfileService.COLLECTION].find_one({"brand_id": brand_id})
+        else:
+            # Single-user mode: query by user_id (personal brand)
+            scope = {"user_id": user_id}
+            existing = await db[BrandProfileService.COLLECTION].find_one({"user_id": user_id})
 
         # OPTION 2: ONBOARDING VALIDATION - Enforce required fields
         # Only validate when user is ACTIVELY TRYING to complete onboarding (transition from False→True)
@@ -145,31 +157,35 @@ class BrandProfileService:
             # Once onboarding_completed is True, never allow it to be reset to False
             if existing.get("onboarding_completed") and not doc.get("onboarding_completed"):
                 doc["onboarding_completed"] = True
-            print(f"🖼️  SAVE DEBUG brand={brand_id or user_id}: saving logo_position={repr(doc.get('logo_position'))}")
 
-            # Update existing profile - always use user_id to ensure we update the right document
+            identifier = end_user_id or brand_id or user_id
+            print(f"🖼️  SAVE DEBUG identifier={identifier}: saving logo_position={repr(doc.get('logo_position'))}")
+
+            # Update existing profile using the scope (respects multi-tenant isolation)
             try:
                 result = await db[BrandProfileService.COLLECTION].update_one(
-                    {"user_id": user_id}, {"$set": doc}
+                    scope, {"$set": doc}
                 )
-                print(f"✅ Updated brand profile for user {user_id}: matched={result.matched_count}, modified={result.modified_count}")
+                print(f"✅ Updated brand profile for {scope}: matched={result.matched_count}, modified={result.modified_count}")
             except Exception as e:
-                print(f"❌ Error updating brand profile for user {user_id}: {e}")
+                print(f"❌ Error updating brand profile for {scope}: {e}")
                 raise
         else:
             doc["created_at"] = now
             try:
                 await db[BrandProfileService.COLLECTION].insert_one(doc)
-                print(f"✅ Created new brand profile for user {user_id}")
+                identifier = end_user_id or brand_id or user_id
+                print(f"✅ Created new brand profile for {identifier}")
             except Exception as e:
-                # Handle duplicate key error (unique index on user_id)
+                # Handle duplicate key error
                 if "duplicate key" in str(e).lower():
-                    print(f"⚠️  Duplicate profile detected for user {user_id}, updating instead")
+                    identifier = end_user_id or brand_id or user_id
+                    print(f"⚠️  Duplicate profile detected for {identifier}, updating instead")
                     # Profile was created by another request, update it instead
                     result = await db[BrandProfileService.COLLECTION].update_one(
-                        {"user_id": user_id}, {"$set": doc}
+                        scope, {"$set": doc}
                     )
-                    print(f"✅ Updated via fallback for user {user_id}: matched={result.matched_count}, modified={result.modified_count}")
+                    print(f"✅ Updated via fallback for {identifier}: matched={result.matched_count}, modified={result.modified_count}")
                 else:
                     print(f"❌ Error creating brand profile for user {user_id}: {e}")
                     raise
@@ -180,7 +196,21 @@ class BrandProfileService:
         return UriResponse.get_single_data_response("brand_profile", result)
 
     @staticmethod
-    async def get(user_id: str, db: AsyncIOMotorDatabase, brand_id: Optional[str] = None) -> Dict[str, Any]:
+    async def get(
+        user_id: str,
+        db: AsyncIOMotorDatabase,
+        brand_id: Optional[str] = None,
+        end_user_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        # Multi-tenant mode: query by end_user_id (highest priority)
+        if end_user_id:
+            profile = await db[BrandProfileService.COLLECTION].find_one({"end_user_id": end_user_id})
+            if not profile:
+                return UriResponse.get_single_data_response("brand_profile", None)
+            profile.pop("_id", None)
+            return UriResponse.get_single_data_response("brand_profile", profile)
+
+        # Agency/personal brand mode (backward compatible)
         from app.models.brand_account import BrandAccount
         personal_bid = BrandAccount.personal_brand_id(user_id)
         is_agency_brand = brand_id and brand_id != personal_bid
