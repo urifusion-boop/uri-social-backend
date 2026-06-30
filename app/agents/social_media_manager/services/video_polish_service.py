@@ -227,6 +227,7 @@ class ReapProvider(AbstractClippingProvider):
                 upload_url,
                 data=video_bytes,
                 headers={"Content-Type": "video/mp4", "Content-Length": str(len(video_bytes))},
+                timeout=aiohttp.ClientTimeout(total=600, connect=30),
             ) as resp:
                 s3_body = await resp.text()
                 print(f"[Reap] S3 PUT response: status={resp.status} body={s3_body[:200]}", flush=True)
