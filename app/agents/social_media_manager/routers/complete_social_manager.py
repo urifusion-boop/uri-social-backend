@@ -4407,10 +4407,12 @@ async def _generate_image_bg(
         else:
             # Standard generation flow (V1 guides or no custom guide)
             # Extract V2 reference image from brand_context if present (legacy fallback)
-            v2_reference_image = brand_context.get("custom_guide_v2_reference_image")
-            if v2_reference_image:
-                reference_image = v2_reference_image
-                print(f"📸 Using V2 reference image (legacy): {reference_image[:80]}...")
+            # BUT: Don't override user's uploaded reference image
+            if not reference_image:
+                v2_reference_image = brand_context.get("custom_guide_v2_reference_image")
+                if v2_reference_image:
+                    reference_image = v2_reference_image
+                    print(f"📸 Using V2 reference image (legacy): {reference_image[:80]}...")
 
             image_result = await ImageContentService._generate_platform_image(
                 platform=platform,
