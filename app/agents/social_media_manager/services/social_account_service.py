@@ -354,27 +354,31 @@ class SocialAccountService:
             )
 
         outstand = OutstandService()
+
+        # Always remove from local DB first — user must always be able to disconnect
+        # even if the Outstand API is unreachable.
+        await db["social_connections"].delete_one({
+            **brand_scope,
+            "outstand_account_id": outstand_account_id,
+        })
+
+        # Best-effort Outstand delete — log failures but don't surface them to the user.
         try:
             await outstand.delete_account(outstand_account_id)
-
-            # Remove from local mirror
-            await db["social_connections"].delete_one({
-                **brand_scope,
-                "outstand_account_id": outstand_account_id,
-            })
-
-            return UriResponse.get_single_data_response("disconnection", {
-                "outstand_account_id": outstand_account_id,
-                "platform": local.get("platform"),
-                "username": local.get("username"),
-                "status": "disconnected",
-                "disconnected_at": datetime.utcnow().isoformat(),
-            })
-
         except Exception as e:
-            return UriResponse.error_response(
-                f"Disconnection failed: {str(e)}", code=500
+            print(
+                f"[Disconnect] Outstand delete failed for {outstand_account_id}: {e} "
+                "(local record already removed)",
+                flush=True,
             )
+
+        return UriResponse.get_single_data_response("disconnection", {
+            "outstand_account_id": outstand_account_id,
+            "platform": local.get("platform"),
+            "username": local.get("username"),
+            "status": "disconnected",
+            "disconnected_at": datetime.utcnow().isoformat(),
+        })
 
     # -------------------------------------------------------------------------
     # 6. Onboarding status — step 2 completion check
