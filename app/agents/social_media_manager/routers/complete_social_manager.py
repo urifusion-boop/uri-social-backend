@@ -4375,13 +4375,17 @@ async def _generate_image_bg(
             headline = content.split("\n")[0] if content else seed_content[:50]
             subtext = content.split("\n")[1] if "\n" in content else ""
 
-            # Get CTA from cta_styles (same as regular generation)
-            cta_styles_list = brand_context.get("cta_styles", [])
-            if isinstance(cta_styles_list, list) and cta_styles_list:
-                import random
-                cta = random.choice(cta_styles_list)
+            # Get CTA - check override_cta first, then cta_styles, then default_link
+            override_cta = brand_context.get("override_cta")
+            if override_cta:
+                cta = override_cta
             else:
-                cta = brand_context.get("default_link", "Learn more")
+                cta_styles_list = brand_context.get("cta_styles", [])
+                if isinstance(cta_styles_list, list) and cta_styles_list:
+                    import random
+                    cta = random.choice(cta_styles_list)
+                else:
+                    cta = brand_context.get("default_link", "Learn more")
 
             image_result = await CustomVisualGuideV2Service.generate_image_with_v2_guide(
                 guide_id=v2_guide_id,
