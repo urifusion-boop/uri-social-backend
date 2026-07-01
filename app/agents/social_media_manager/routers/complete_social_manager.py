@@ -330,6 +330,8 @@ async def generate_content(
         # ==================== PRD 7.2 & 8: Credit Check ====================
         # Skip credit check for API key authentication (SDK Gateway handles request limits)
         # Only check credits for JWT/dashboard users
+        is_trial_user = False
+
         if ctx.get("auth_type") != "api_key":
             # Check trial credits first, then paid credits
             from app.services.CreditService import credit_service
