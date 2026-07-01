@@ -328,29 +328,32 @@ async def generate_content(
 
     try:
         # ==================== PRD 7.2 & 8: Credit Check ====================
-        # Check trial credits first, then paid credits
-        from app.services.CreditService import credit_service
-        from app.services.TrialService import trial_service
+        # Skip credit check for API key authentication (SDK Gateway handles request limits)
+        # Only check credits for JWT/dashboard users
+        if ctx.get("auth_type") != "api_key":
+            # Check trial credits first, then paid credits
+            from app.services.CreditService import credit_service
+            from app.services.TrialService import trial_service
 
-        is_trial_user = await trial_service.has_active_trial(user_id)
+            is_trial_user = await trial_service.has_active_trial(user_id)
 
-        if not is_trial_user:
-            # Paid user path — check subscription/bonus credits
-            has_credits = await credit_service.check_sufficient_credits(user_id)
-            if not has_credits:
-                # PRD 8: "You've run out of credits. Upgrade to continue."
-                return JSONResponse(
-                    status_code=402,
-                    content={
-                        "status": False,
-                        "responseCode": 402,
-                        "responseMessage": "You've run out of credits. Upgrade to continue.",
-                        "responseData": {
-                            "credits_remaining": 0,
-                            "upgrade_url": "/pricing"
+            if not is_trial_user:
+                # Paid user path — check subscription/bonus credits
+                has_credits = await credit_service.check_sufficient_credits(user_id)
+                if not has_credits:
+                    # PRD 8: "You've run out of credits. Upgrade to continue."
+                    return JSONResponse(
+                        status_code=402,
+                        content={
+                            "status": False,
+                            "responseCode": 402,
+                            "responseMessage": "You've run out of credits. Upgrade to continue.",
+                            "responseData": {
+                                "credits_remaining": 0,
+                                "upgrade_url": "/pricing"
+                            }
                         }
-                    }
-                )
+                    )
 
         # ========== OPTION 1: PROGRESSIVE ENFORCEMENT ==========
         # Load the ACTIVE BRAND's profile (source of truth) — scoped by brand_id so
