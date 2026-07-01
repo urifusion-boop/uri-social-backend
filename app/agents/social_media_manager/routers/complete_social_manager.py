@@ -328,15 +328,16 @@ async def generate_content(
 
     try:
         # ==================== PRD 7.2 & 8: Credit Check ====================
+        # Import services (needed later for credit deduction even if check is skipped)
+        from app.services.CreditService import credit_service
+        from app.services.TrialService import trial_service
+
         # Skip credit check for API key authentication (SDK Gateway handles request limits)
         # Only check credits for JWT/dashboard users
         is_trial_user = False
 
         if ctx.get("auth_type") != "api_key":
             # Check trial credits first, then paid credits
-            from app.services.CreditService import credit_service
-            from app.services.TrialService import trial_service
-
             is_trial_user = await trial_service.has_active_trial(user_id)
 
             if not is_trial_user:
@@ -505,9 +506,9 @@ async def generate_content(
                     d["post_type"] = post_type
 
         # ==================== PRD 7.2: Credit Deduction ====================
-        # Deduct 1 credit after successful generation
+        # Deduct 1 credit after successful generation (skip for API key users)
         # PRD 3.1: First campaign generation = 1 credit
-        if result.get("status"):
+        if result.get("status") and ctx.get("auth_type") != "api_key":
             request_id = result.get("responseData", {}).get("request_id")
             if request_id:
                 if is_trial_user:
