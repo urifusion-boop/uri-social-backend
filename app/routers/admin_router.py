@@ -84,8 +84,24 @@ async def get_all_users(
 
         # Get credits info from user_credits collection
         user_credits = await db["user_credits"].find_one({"user_id": user_id})
-        credits_balance = user_credits.get("credits_remaining", 0) if user_credits else 0
-        subscription_tier = user_credits.get("subscription_tier", "free") if user_credits else "free"
+
+        # Check if user has trial credits
+        user_trial = await db["user_trials"].find_one({"user_id": user_id})
+
+        # Calculate total credits (subscription credits + trial credits)
+        if user_credits:
+            credits_balance = user_credits.get("credits_remaining", 0)
+            subscription_tier = user_credits.get("subscription_tier", "free")
+        else:
+            credits_balance = 0
+            subscription_tier = "free"
+
+        # Add trial credits if user is on trial and hasn't exhausted them
+        if user_trial and user_trial.get("is_trial") and not user_trial.get("trial_used"):
+            trial_credits = user_trial.get("credits_remaining", 0)
+            credits_balance += trial_credits
+            if subscription_tier == "free":
+                subscription_tier = "trial"
 
         # Build full name from first_name and last_name
         first_name = user.get("first_name", "")
@@ -144,7 +160,17 @@ async def get_recent_users(
 
         # Get credits info from user_credits collection
         user_credits = await db["user_credits"].find_one({"user_id": user_id})
+
+        # Check if user has trial credits
+        user_trial = await db["user_trials"].find_one({"user_id": user_id})
+
+        # Get subscription tier
         subscription_tier = user_credits.get("subscription_tier", "free") if user_credits else "free"
+
+        # Override to "trial" if user is on active trial
+        if user_trial and user_trial.get("is_trial") and not user_trial.get("trial_used"):
+            if subscription_tier == "free":
+                subscription_tier = "trial"
 
         # Build full name
         first_name = user.get("first_name", "")
@@ -188,8 +214,24 @@ async def get_user_details(
 
     # Get credits info from user_credits collection
     user_credits = await db["user_credits"].find_one({"user_id": user_id})
-    credits_balance = user_credits.get("credits_remaining", 0) if user_credits else 0
-    subscription_tier = user_credits.get("subscription_tier", "free") if user_credits else "free"
+
+    # Check if user has trial credits
+    user_trial = await db["user_trials"].find_one({"user_id": user_id})
+
+    # Calculate total credits (subscription credits + trial credits)
+    if user_credits:
+        credits_balance = user_credits.get("credits_remaining", 0)
+        subscription_tier = user_credits.get("subscription_tier", "free")
+    else:
+        credits_balance = 0
+        subscription_tier = "free"
+
+    # Add trial credits if user is on trial and hasn't exhausted them
+    if user_trial and user_trial.get("is_trial") and not user_trial.get("trial_used"):
+        trial_credits = user_trial.get("credits_remaining", 0)
+        credits_balance += trial_credits
+        if subscription_tier == "free":
+            subscription_tier = "trial"
 
     # Build full name
     first_name = user.get("first_name", "")
