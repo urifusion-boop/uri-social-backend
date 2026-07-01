@@ -217,12 +217,31 @@ async def list_drafts(
     drafts = await drafts_cursor.to_list(length=per_page)
     total = await db.content_drafts.count_documents({"user_id": api_key.user_id})
 
-    # Convert ObjectId to string
+    # Convert ObjectId and datetime to string for JSON serialization
+    import json
+    from bson import ObjectId
+    from datetime import datetime
+
+    def serialize_doc(doc):
+        """Convert MongoDB document to JSON-serializable dict"""
+        if isinstance(doc, dict):
+            return {k: serialize_doc(v) for k, v in doc.items()}
+        elif isinstance(doc, list):
+            return [serialize_doc(item) for item in doc]
+        elif isinstance(doc, ObjectId):
+            return str(doc)
+        elif isinstance(doc, datetime):
+            return doc.isoformat()
+        else:
+            return doc
+
+    serialized_drafts = []
     for draft in drafts:
         draft["id"] = str(draft.pop("_id"))
+        serialized_drafts.append(serialize_doc(draft))
 
     return JSONResponse(content={
-        "data": drafts,
+        "data": serialized_drafts,
         "total": total,
         "page": page,
         "per_page": per_page,
