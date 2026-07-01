@@ -3969,7 +3969,7 @@ async def trigger_auto_generate(
 
 @router.get("/brand-profile")
 async def get_brand_profile(
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """Get the brand profile (onboarding data) for the active brand."""
@@ -3983,7 +3983,7 @@ async def get_brand_profile(
 async def upload_brand_logo(
     file: UploadFile = File(...),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """
     Upload a brand logo image. Saves to local static storage and stores the URL
@@ -3991,9 +3991,7 @@ async def upload_brand_logo(
     """
     import os, uuid
 
-    user_id = _get_user_id(token)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="User ID not found in token")
+    user_id = ctx["user_id"]
 
     allowed_types = {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/svg+xml"}
     if file.content_type not in allowed_types:
@@ -4025,7 +4023,7 @@ async def upload_brand_logo(
 async def upload_sample_template(
     file: UploadFile = File(...),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """
     Upload a sample design or content template. Saves to local static storage and
@@ -4034,9 +4032,7 @@ async def upload_sample_template(
     """
     import os, uuid
 
-    user_id = _get_user_id(token)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="User ID not found in token")
+    user_id = ctx["user_id"]
 
     allowed_types = {"image/png", "image/jpeg", "image/jpg", "image/webp", "application/pdf"}
     if file.content_type not in allowed_types:
@@ -4075,7 +4071,7 @@ async def upload_sample_template(
 @router.post("/brand-profile")
 async def save_brand_profile(
     request: BrandProfileRequest,
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """Save or update the brand profile for the active brand."""
@@ -4104,7 +4100,7 @@ async def save_brand_profile(
 async def analyze_voice_samples(
     request: Dict[str, Any],
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """
     Analyze sample captions to extract voice patterns.
@@ -4120,9 +4116,7 @@ async def analyze_voice_samples(
     Returns the analysis and optionally updates the user's brand profile
     with merged voice settings.
     """
-    user_id = _get_user_id(token)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="User ID not found in token")
+    user_id = ctx["user_id"]
 
     try:
         sample_captions = request.get("sample_captions", [])
