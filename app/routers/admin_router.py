@@ -91,17 +91,19 @@ async def get_all_users(
         # Calculate total credits (subscription credits + trial credits)
         if user_credits:
             credits_balance = user_credits.get("credits_remaining", 0)
-            subscription_tier = user_credits.get("subscription_tier", "free")
+            subscription_tier = user_credits.get("subscription_tier") or "free"
         else:
             credits_balance = 0
             subscription_tier = "free"
 
-        # Add trial credits if user is on trial and hasn't exhausted them
-        if user_trial and user_trial.get("is_trial") and not user_trial.get("trial_used"):
+        # Add trial credits if user has trial and still has credits remaining
+        if user_trial and user_trial.get("is_trial"):
             trial_credits = user_trial.get("credits_remaining", 0)
-            credits_balance += trial_credits
-            if subscription_tier == "free":
-                subscription_tier = "trial"
+            if trial_credits > 0:
+                credits_balance += trial_credits
+                # Show as "trial" if they don't have a paid subscription
+                if subscription_tier in ["free", None]:
+                    subscription_tier = "trial"
 
         # Build full name from first_name and last_name
         first_name = user.get("first_name", "")
@@ -165,11 +167,12 @@ async def get_recent_users(
         user_trial = await db["user_trials"].find_one({"user_id": user_id})
 
         # Get subscription tier
-        subscription_tier = user_credits.get("subscription_tier", "free") if user_credits else "free"
+        subscription_tier = user_credits.get("subscription_tier") or "free" if user_credits else "free"
 
-        # Override to "trial" if user is on active trial
-        if user_trial and user_trial.get("is_trial") and not user_trial.get("trial_used"):
-            if subscription_tier == "free":
+        # Override to "trial" if user has trial credits remaining
+        if user_trial and user_trial.get("is_trial"):
+            trial_credits = user_trial.get("credits_remaining", 0)
+            if trial_credits > 0 and subscription_tier in ["free", None]:
                 subscription_tier = "trial"
 
         # Build full name
@@ -221,17 +224,19 @@ async def get_user_details(
     # Calculate total credits (subscription credits + trial credits)
     if user_credits:
         credits_balance = user_credits.get("credits_remaining", 0)
-        subscription_tier = user_credits.get("subscription_tier", "free")
+        subscription_tier = user_credits.get("subscription_tier") or "free"
     else:
         credits_balance = 0
         subscription_tier = "free"
 
-    # Add trial credits if user is on trial and hasn't exhausted them
-    if user_trial and user_trial.get("is_trial") and not user_trial.get("trial_used"):
+    # Add trial credits if user has trial and still has credits remaining
+    if user_trial and user_trial.get("is_trial"):
         trial_credits = user_trial.get("credits_remaining", 0)
-        credits_balance += trial_credits
-        if subscription_tier == "free":
-            subscription_tier = "trial"
+        if trial_credits > 0:
+            credits_balance += trial_credits
+            # Show as "trial" if they don't have a paid subscription
+            if subscription_tier in ["free", None]:
+                subscription_tier = "trial"
 
     # Build full name
     first_name = user.get("first_name", "")
