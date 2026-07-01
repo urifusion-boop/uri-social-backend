@@ -53,9 +53,8 @@ async def get_all_users(
     if search:
         query["$or"] = [
             {"email": {"$regex": search, "$options": "i"}},
-            {"firstName": {"$regex": search, "$options": "i"}},
-            {"lastName": {"$regex": search, "$options": "i"}},
-            {"name": {"$regex": search, "$options": "i"}},
+            {"first_name": {"$regex": search, "$options": "i"}},
+            {"last_name": {"$regex": search, "$options": "i"}},
         ]
 
     # Count total users
@@ -68,22 +67,42 @@ async def get_all_users(
     # Sort order
     sort_direction = -1 if sort_order == "desc" else 1
 
+    # Map frontend sort_by to actual DB field names
+    sort_field_map = {
+        "createdAt": "created_at",
+        "email": "email",
+        "name": "first_name"  # Sort by first_name when sorting by name
+    }
+    db_sort_field = sort_field_map.get(sort_by, "created_at")
+
     # Fetch users
-    cursor = db["users"].find(query).sort(sort_by, sort_direction).skip(skip).limit(limit)
+    cursor = db["users"].find(query).sort(db_sort_field, sort_direction).skip(skip).limit(limit)
     users = []
 
     async for user in cursor:
+        user_id = str(user.get("_id"))
+
+        # Get credits info from user_credits collection
+        user_credits = await db["user_credits"].find_one({"user_id": user_id})
+        credits_balance = user_credits.get("credits_remaining", 0) if user_credits else 0
+        subscription_tier = user_credits.get("subscription_tier", "free") if user_credits else "free"
+
+        # Build full name from first_name and last_name
+        first_name = user.get("first_name", "")
+        last_name = user.get("last_name", "")
+        full_name = f"{first_name} {last_name}".strip() if first_name or last_name else None
+
         user_data = {
-            "id": str(user.get("_id")),
+            "id": user_id,
             "email": user.get("email"),
-            "firstName": user.get("firstName"),
-            "lastName": user.get("lastName"),
-            "name": user.get("name"),
-            "createdAt": user.get("createdAt"),
-            "subscription_tier": user.get("subscription_tier"),
+            "firstName": first_name,
+            "lastName": last_name,
+            "name": full_name,
+            "createdAt": user.get("created_at"),
+            "subscription_tier": subscription_tier,
             "trial_start": user.get("trial_start"),
             "trial_end": user.get("trial_end"),
-            "credits_balance": user.get("credits_balance", 0),
+            "credits_balance": credits_balance,
             "phone": user.get("phone"),
         }
         users.append(user_data)
@@ -114,21 +133,32 @@ async def get_recent_users(
     cutoff_date = datetime.utcnow() - timedelta(days=days)
 
     query = {
-        "createdAt": {"$gte": cutoff_date}
+        "created_at": {"$gte": cutoff_date}
     }
 
-    cursor = db["users"].find(query).sort("createdAt", -1)
+    cursor = db["users"].find(query).sort("created_at", -1)
     users = []
 
     async for user in cursor:
+        user_id = str(user.get("_id"))
+
+        # Get credits info from user_credits collection
+        user_credits = await db["user_credits"].find_one({"user_id": user_id})
+        subscription_tier = user_credits.get("subscription_tier", "free") if user_credits else "free"
+
+        # Build full name
+        first_name = user.get("first_name", "")
+        last_name = user.get("last_name", "")
+        full_name = f"{first_name} {last_name}".strip() if first_name or last_name else None
+
         user_data = {
-            "id": str(user.get("_id")),
+            "id": user_id,
             "email": user.get("email"),
-            "firstName": user.get("firstName"),
-            "lastName": user.get("lastName"),
-            "name": user.get("name"),
-            "createdAt": user.get("createdAt"),
-            "subscription_tier": user.get("subscription_tier"),
+            "firstName": first_name,
+            "lastName": last_name,
+            "name": full_name,
+            "createdAt": user.get("created_at"),
+            "subscription_tier": subscription_tier,
             "trial_end": user.get("trial_end"),
         }
         users.append(user_data)
@@ -156,6 +186,16 @@ async def get_user_details(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
+    # Get credits info from user_credits collection
+    user_credits = await db["user_credits"].find_one({"user_id": user_id})
+    credits_balance = user_credits.get("credits_remaining", 0) if user_credits else 0
+    subscription_tier = user_credits.get("subscription_tier", "free") if user_credits else "free"
+
+    # Build full name
+    first_name = user.get("first_name", "")
+    last_name = user.get("last_name", "")
+    full_name = f"{first_name} {last_name}".strip() if first_name or last_name else None
+
     # Get user's brand profiles
     brand_profiles = []
     async for profile in db["brand_profiles"].find({"user_id": user_id}):
@@ -179,17 +219,17 @@ async def get_user_details(
         })
 
     user_data = {
-        "id": str(user.get("_id")),
+        "id": user_id,
         "email": user.get("email"),
-        "firstName": user.get("firstName"),
-        "lastName": user.get("lastName"),
-        "name": user.get("name"),
+        "firstName": first_name,
+        "lastName": last_name,
+        "name": full_name,
         "phone": user.get("phone"),
-        "createdAt": user.get("createdAt"),
-        "subscription_tier": user.get("subscription_tier"),
+        "createdAt": user.get("created_at"),
+        "subscription_tier": subscription_tier,
         "trial_start": user.get("trial_start"),
         "trial_end": user.get("trial_end"),
-        "credits_balance": user.get("credits_balance", 0),
+        "credits_balance": credits_balance,
         "brand_profiles": brand_profiles,
         "content_count": content_count,
         "workspaces": workspaces,
@@ -214,15 +254,15 @@ async def get_admin_stats(
 
     # Users in last 7 days
     seven_days_ago = datetime.utcnow() - timedelta(days=7)
-    new_users_7d = await db["users"].count_documents({"createdAt": {"$gte": seven_days_ago}})
+    new_users_7d = await db["users"].count_documents({"created_at": {"$gte": seven_days_ago}})
 
     # Users in last 30 days
     thirty_days_ago = datetime.utcnow() - timedelta(days=30)
-    new_users_30d = await db["users"].count_documents({"createdAt": {"$gte": thirty_days_ago}})
+    new_users_30d = await db["users"].count_documents({"created_at": {"$gte": thirty_days_ago}})
 
-    # Users by subscription tier
+    # Users by subscription tier (from user_credits collection)
     subscription_stats = {}
-    async for doc in db["users"].aggregate([
+    async for doc in db["user_credits"].aggregate([
         {"$group": {"_id": "$subscription_tier", "count": {"$sum": 1}}}
     ]):
         tier = doc["_id"] or "free"
@@ -257,14 +297,14 @@ async def export_user_emails(
     Export all user emails
     Admin only endpoint
     """
-    cursor = db["users"].find({}, {"email": 1, "firstName": 1, "lastName": 1, "createdAt": 1}).sort("createdAt", -1)
+    cursor = db["users"].find({}, {"email": 1, "first_name": 1, "last_name": 1, "created_at": 1}).sort("created_at", -1)
     emails = []
 
     async for user in cursor:
         emails.append({
             "email": user.get("email"),
-            "name": f"{user.get('firstName', '')} {user.get('lastName', '')}".strip() or "N/A",
-            "registered_at": user.get("createdAt"),
+            "name": f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or "N/A",
+            "registered_at": user.get("created_at"),
         })
 
     return {
