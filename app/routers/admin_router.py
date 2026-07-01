@@ -7,7 +7,6 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 from typing import List, Optional
 from datetime import datetime
 from app.core.auth_bearer import JWTBearer
-from app.core.auth_handler import decode_jwt
 from app.database import get_db
 
 router = APIRouter(
@@ -17,17 +16,22 @@ router = APIRouter(
 
 ADMIN_EMAIL = "urisocialingsight@gmail.com"
 
-async def verify_admin(token: str = Depends(JWTBearer())) -> dict:
+async def verify_admin(jwt_payload: dict = Depends(JWTBearer())) -> dict:
     """Verify that the user is an admin"""
-    payload = decode_jwt(token)
-    if not payload:
+    if not jwt_payload:
         raise HTTPException(status_code=401, detail="Invalid authentication token")
 
-    user_email = payload.get("user_email")
+    # Extract email from JWT claims
+    claims = jwt_payload.get("claims", {})
+    user_email = claims.get("email")
+
+    if not user_email:
+        raise HTTPException(status_code=401, detail="Invalid token: email not found")
+
     if user_email != ADMIN_EMAIL:
         raise HTTPException(status_code=403, detail="Access denied. Admin only.")
 
-    return payload
+    return jwt_payload
 
 
 @router.get("/users")
