@@ -155,15 +155,15 @@ class APIKey(BaseModel):
 
     def has_scope(self, required_scope: str) -> bool:
         """Check if API key has the required scope"""
-        # Admin has all permissions
-        if APIKeyScope.ADMIN_ALL in self.scopes:
+        # Admin has all permissions (support both admin:all and admin:* from SDK Gateway)
+        if APIKeyScope.ADMIN_ALL in self.scopes or "admin:*" in self.scopes:
             return True
 
         return required_scope in self.scopes
 
     def has_any_scope(self, required_scopes: List[str]) -> bool:
         """Check if API key has any of the required scopes"""
-        if APIKeyScope.ADMIN_ALL in self.scopes:
+        if APIKeyScope.ADMIN_ALL in self.scopes or "admin:*" in self.scopes:
             return True
 
         return any(scope in self.scopes for scope in required_scopes)
