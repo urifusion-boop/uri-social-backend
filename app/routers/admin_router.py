@@ -7,7 +7,7 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 from typing import List, Optional
 from datetime import datetime
 from app.core.auth_bearer import JWTBearer
-from app.core.auth_handler import decodeJWT
+from app.core.auth_handler import decode_jwt
 from app.database import get_db
 
 router = APIRouter(
@@ -19,7 +19,7 @@ ADMIN_EMAIL = "urisocialingsight@gmail.com"
 
 async def verify_admin(token: str = Depends(JWTBearer())) -> dict:
     """Verify that the user is an admin"""
-    payload = decodeJWT(token)
+    payload = decode_jwt(token)
     if not payload:
         raise HTTPException(status_code=401, detail="Invalid authentication token")
 
