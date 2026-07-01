@@ -675,7 +675,7 @@ async def regenerate_content(
 @router.post("/connect/initiate")
 async def initiate_social_connections(
     request: SocialConnectionRequest,
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """
     Step 1 of the social connection flow (onboarding step 2).
@@ -850,7 +850,7 @@ async def facebook_direct_callback(
 async def facebook_direct_finalize(
     fb_page_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """
     Called by the frontend after the Facebook direct OAuth callback to
@@ -1072,7 +1072,7 @@ async def instagram_direct_callback(
 async def instagram_direct_finalize(
     ig_user_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """
     Called by the frontend after the Instagram direct OAuth callback to
@@ -1178,7 +1178,7 @@ async def get_pending_connection(
 async def finalize_social_connection(
     request: FinalizeConnectionRequest,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """
     Step 3 of the social connection flow (completes onboarding step 2).
@@ -1198,7 +1198,7 @@ async def finalize_social_connection(
 
 @router.get("/connections")
 async def get_user_connections(
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """Get social accounts connected for the active brand (isolated per brand)."""
@@ -1211,7 +1211,7 @@ async def get_user_connections(
 async def disconnect_social_account(
     outstand_account_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """
     Permanently disconnect a social account for the active brand.
@@ -1230,7 +1230,7 @@ async def disconnect_social_account(
 async def disconnect_instagram_direct(
     ig_user_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """
     Disconnect an Instagram account connected via direct OAuth for the active brand.
@@ -1264,7 +1264,7 @@ async def disconnect_instagram_direct(
 @router.delete("/connections/facebook-direct")
 async def disconnect_facebook_direct(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """
     Disconnect a Facebook Page connected via direct OAuth for the active brand.
@@ -2040,7 +2040,7 @@ async def deny_content(
 async def unschedule_draft(
     draft_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """Move a scheduled draft back to draft status."""
     user_id = ctx["user_id"]
@@ -2126,7 +2126,7 @@ async def schedule_content(
 @router.get("/scheduled")
 async def get_scheduled_content(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """Get all scheduled content for the active brand"""
     user_id = ctx["user_id"]
@@ -2182,7 +2182,7 @@ class CalendarCreateDraftRequest(BaseModel):
 @router.get("/content-calendar/plan")
 async def get_calendar_plan(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """Return the active 7-day plan for this week, or 404 if none exists."""
     plan = await cal_svc.get_active_plan(ctx["user_id"], db, brand_id=ctx["brand_id"])
@@ -2195,7 +2195,7 @@ async def get_calendar_plan(
 async def generate_calendar_plan(
     request: CalendarGenerateRequest,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """Generate (or force-regenerate) the 7-day content plan for this week."""
     user_id = ctx["user_id"]
@@ -2227,7 +2227,7 @@ async def regenerate_calendar_day(
     plan_id: str,
     day_index: int,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """Regenerate the content idea for a single day."""
     try:
@@ -2248,7 +2248,7 @@ async def create_draft_from_calendar_day(
     request: CalendarCreateDraftRequest,
     background_tasks: BackgroundTasks,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """Create a full content draft from a calendar day's idea."""
     user_id = ctx["user_id"]
@@ -2323,7 +2323,7 @@ async def create_draft_from_calendar_day(
 @router.get("/content-calendar/today")
 async def get_today_suggestion(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """Return today's content suggestion from the active brand's plan."""
     result = await cal_svc.get_today_suggestion(ctx["user_id"], db, brand_id=ctx["brand_id"])
@@ -2333,7 +2333,7 @@ async def get_today_suggestion(
 @router.get("/content-calendar/performance")
 async def get_calendar_performance(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """Return aggregated post performance data for the active brand."""
     user_id = ctx["user_id"]
@@ -2345,7 +2345,7 @@ async def get_calendar_performance(
 @router.get("/content-calendar/trends")
 async def get_calendar_trends(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """Return trending keywords for the active brand's industry."""
     user_id = ctx["user_id"]
@@ -2382,7 +2382,7 @@ async def get_content_calendar(
     limit: int = 50,
     skip: int = 0,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """
     Get the active brand's complete content calendar
@@ -2545,7 +2545,7 @@ async def get_content_analytics(
 async def get_performance(
     days: int = 30,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """
     Fetch real-time post analytics from Outstand for the active brand's published drafts.
@@ -3198,7 +3198,7 @@ async def get_performance(
 async def get_account_metrics(
     days: int = 30,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """
     Fetch account-level metrics (followers, engagement totals) for the active brand's
