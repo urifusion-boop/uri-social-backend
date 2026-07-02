@@ -210,12 +210,18 @@ async def list_drafts(
 
     skip = (page - 1) * per_page
 
+    print(f"📋 SDK /api/v1/drafts request - API key user_id: {api_key.user_id}")
+
     drafts_cursor = db.content_drafts.find(
         {"user_id": api_key.user_id}
     ).sort("created_at", -1).skip(skip).limit(per_page)
 
     drafts = await drafts_cursor.to_list(length=per_page)
     total = await db.content_drafts.count_documents({"user_id": api_key.user_id})
+
+    print(f"📋 Found {len(drafts)} drafts (total: {total}) for user {api_key.user_id[:12]}...")
+    if drafts:
+        print(f"📋 Recent draft IDs: {[d.get('id', 'no-id')[:12] + '...' for d in drafts[:3]]}")
 
     # Convert ObjectId and datetime to string for JSON serialization
     import json
