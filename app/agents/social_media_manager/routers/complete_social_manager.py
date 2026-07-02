@@ -325,6 +325,17 @@ async def generate_content(
     """
     user_id = ctx["user_id"]
     active_brand_id = ctx["brand_id"]
+    auth_type = ctx.get("auth_type", "jwt")
+
+    # Log auth type for debugging
+    print(f"\n{'='*80}")
+    print(f"📝 CONTENT GENERATION REQUEST")
+    print(f"   Auth Type: {auth_type}")
+    print(f"   User ID: {user_id[:12]}...")
+    print(f"   Brand ID: {active_brand_id[:12] if active_brand_id else 'None'}...")
+    print(f"   Platforms: {request.platforms}")
+    print(f"   Include Images: {request.include_images}")
+    print(f"{'='*80}\n")
 
     try:
         # ==================== PRD 7.2 & 8: Credit Check ====================
@@ -336,7 +347,7 @@ async def generate_content(
         # Only check credits for JWT/dashboard users
         is_trial_user = False
 
-        if ctx.get("auth_type") != "api_key":
+        if auth_type != "api_key":
             # Check trial credits first, then paid credits
             is_trial_user = await trial_service.has_active_trial(user_id)
 
@@ -627,6 +638,7 @@ async def generate_content(
                 else:
                     # Get pre-assigned style for this draft
                     _preassigned_style = _assigned_styles.get(draft["id"])
+                    print(f"🎨 Creating background image task for draft {draft['id'][:12]}... (auth_type={auth_type})")
                     _bg_image_tasks.append(asyncio.create_task(_generate_image_bg(
                         draft_id=draft["id"],
                         platform=draft["platform"],
@@ -4210,6 +4222,8 @@ async def _generate_image_bg(
     import os
     import base64
 
+    print(f"🚀 BG IMAGE TASK STARTED for draft {draft_id[:12]}... platform={platform}")
+
     try:
         from app.agents.social_media_manager.services.style_library import pick_next_style
 
@@ -4543,7 +4557,8 @@ async def _generate_image_bg(
                     {"id": draft_id},
                     {"$set": update_fields}
                 )
-                print(f"✅ BG image saved for draft {draft_id}: matched={result.matched_count}")
+                print(f"✅ BG IMAGE TASK COMPLETED for draft {draft_id[:12]}... matched={result.matched_count}")
+                print(f"   Image URL: {final_url[:80]}...")
                 if canvas_doc:
                     print(f"✅ Canvas document saved for draft {draft_id} with {len(canvas_doc.get('layers', []))} layers")
         else:
