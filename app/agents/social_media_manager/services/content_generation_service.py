@@ -345,7 +345,13 @@ Write as if you're sharing hard-won business wisdom with fellow African entrepre
                 parts.append(f'- Compliance requirement: {guardrails["compliance_notes"]}.')
 
         # ── CTAs & links ─────────────────────────────────────────────────────
-        if brand_context.get("cta_styles"):
+        # Check for one-time override CTA first
+        override_cta = brand_context.get("override_cta")
+        if override_cta:
+            parts.append(
+                f'- Call-to-action: End the post with this exact CTA: "{override_cta}"'
+            )
+        elif brand_context.get("cta_styles"):
             ctas = brand_context["cta_styles"]
             if isinstance(ctas, list) and ctas:
                 parts.append(
