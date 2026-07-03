@@ -4333,24 +4333,41 @@ async def _generate_image_bg(
                             {"$set": {"style_rotation_index": _next_index}}
                         )
             else:
-                # Fallback to library style rotation
+                # Fallback to library style rotation with atomic increment to avoid race condition
                 _style_selections = _bp.get("style_selections") or []
                 _style_prompt_fragments = _bp.get("style_prompt_fragments") or []
-                _rotation_index = int(_bp.get("style_rotation_index") or 0)
                 _industry = _bp.get("industry") or brand_context.get("industry", "")
 
-                _slug, _fragment, _next_index = pick_next_style(
-                    _style_selections, _rotation_index, _industry, _style_prompt_fragments
-                )
-
-                if _fragment:
-                    brand_context = {**brand_context, "style_prompt_fragment": _fragment, "style_slug": _slug}
-                    print(f"🎨 Style [{_slug}] applied for this image (next index: {_next_index})")
-                    # Persist incremented rotation index
-                    await db["brand_profiles"].update_one(
+                if _style_selections:
+                    # Use findOneAndUpdate with $inc for atomic increment
+                    # This ensures each parallel task gets a unique rotation index
+                    result = await db["brand_profiles"].find_one_and_update(
                         _style_profile_scope,
-                        {"$set": {"style_rotation_index": _next_index}},
+                        {"$inc": {"style_rotation_index": 1}},
+                        return_document=True,  # Return document AFTER update
+                        projection={"style_rotation_index": 1}
                     )
+
+                    # The returned index is already incremented, so subtract 1 to get the index to use
+                    _rotation_index = int(result.get("style_rotation_index", 1)) - 1 if result else 0
+
+                    print(f"🔍 ATOMIC INCREMENT - draft_id={draft_id[:12]}, platform={platform}, got_rotation_index={_rotation_index}")
+
+                    _slug, _fragment, _next_index = pick_next_style(
+                        _style_selections, _rotation_index, _industry, _style_prompt_fragments
+                    )
+
+                    if _fragment:
+                        brand_context = {**brand_context, "style_prompt_fragment": _fragment, "style_slug": _slug}
+                        print(f"🎨 Style [{_slug}] applied for this image (index: {_rotation_index})")
+                else:
+                    # No styles selected, use default
+                    _rotation_index = 0
+                    _slug, _fragment, _next_index = pick_next_style(
+                        _style_selections, _rotation_index, _industry, _style_prompt_fragments
+                    )
+                    if _fragment:
+                        brand_context = {**brand_context, "style_prompt_fragment": _fragment, "style_slug": _slug}
 
         # For story posts pass image_type="story" so we get 1080x1920 dimensions
         image_type = "story" if post_type == "story" else "post_image"
