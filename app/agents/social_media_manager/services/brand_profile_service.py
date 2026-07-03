@@ -128,18 +128,29 @@ class BrandProfileService:
             scope = {"end_user_id": end_user_id}
             existing = await db[BrandProfileService.COLLECTION].find_one({"end_user_id": end_user_id})
         elif brand_id:
-            # Agency mode: query by brand_id (team brand)
-            # Try to find by brand_id first, then by user_id (for migration from old profiles)
-            existing = await db[BrandProfileService.COLLECTION].find_one({"brand_id": brand_id})
-            if not existing:
-                # Fallback: old profile created before brand_id was added
-                existing = await db[BrandProfileService.COLLECTION].find_one({"user_id": user_id, "brand_id": {"$exists": False}})
+            # Check if this is a personal brand or agency brand
+            from app.models.brand_account import BrandAccount
+            personal_bid = BrandAccount.personal_brand_id(user_id)
+            is_personal_brand = (brand_id == personal_bid)
 
-            # Set scope: if existing profile has no brand_id, update by user_id; otherwise by brand_id
-            if existing and not existing.get("brand_id"):
-                scope = {"user_id": user_id, "brand_id": {"$exists": False}}
+            if is_personal_brand:
+                # Personal brand: query by user_id (ignore brand_id field entirely)
+                # This handles migration from old profiles without brand_id AND profiles with mismatched brand_id
+                scope = {"user_id": user_id}
+                existing = await db[BrandProfileService.COLLECTION].find_one(scope)
             else:
-                scope = {"brand_id": brand_id}
+                # Agency mode: query by brand_id (team brand)
+                # Try to find by brand_id first, then by user_id (for migration from old profiles)
+                existing = await db[BrandProfileService.COLLECTION].find_one({"brand_id": brand_id})
+                if not existing:
+                    # Fallback: old profile created before brand_id was added
+                    existing = await db[BrandProfileService.COLLECTION].find_one({"user_id": user_id, "brand_id": {"$exists": False}})
+
+                # Set scope: if existing profile has no brand_id, update by user_id; otherwise by brand_id
+                if existing and not existing.get("brand_id"):
+                    scope = {"user_id": user_id, "brand_id": {"$exists": False}}
+                else:
+                    scope = {"brand_id": brand_id}
         else:
             # Single-user mode: query by user_id (personal brand)
             scope = {"user_id": user_id, "brand_id": {"$exists": False}}
