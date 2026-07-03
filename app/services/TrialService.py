@@ -23,7 +23,7 @@ from app.domain.models.billing_models import (
 )
 
 # Trial configuration constants (PRD Section 2)
-TRIAL_DURATION_DAYS = 3
+TRIAL_DURATION_DAYS = 7  # Extended from 3 to 7 days
 TRIAL_CREDITS = 10
 LOW_CREDIT_THRESHOLD = 2  # PRD 6.2: Warning when credits ≤ 2
 
