@@ -4275,6 +4275,7 @@ async def _generate_image_bg(
                 _style_profile_scope,
                 {"style_selections": 1, "style_prompt_fragments": 1, "style_rotation_index": 1, "industry": 1, "selected_custom_guides": 1, "selected_custom_guides_v2": 1},
             ) or {}
+            print(f"🔍 STYLE ROTATION - draft_id={draft_id[:12]}, platform={platform}, rotation_index={_bp.get('style_rotation_index')}, style_selections={_bp.get('style_selections')}")
 
             # Check if user has selected custom guides (V1 or V2)
             _custom_guide_ids_v1 = _bp.get("selected_custom_guides") or []
