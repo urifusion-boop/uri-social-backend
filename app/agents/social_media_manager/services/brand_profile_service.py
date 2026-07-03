@@ -129,14 +129,21 @@ class BrandProfileService:
             existing = await db[BrandProfileService.COLLECTION].find_one({"end_user_id": end_user_id})
         elif brand_id:
             # Agency mode: query by brand_id (team brand)
-            scope = {"brand_id": brand_id}
-            existing = await db[BrandProfileService.COLLECTION].find_one({"user_id": user_id})
+            # Try to find by brand_id first, then by user_id (for migration from old profiles)
+            existing = await db[BrandProfileService.COLLECTION].find_one({"brand_id": brand_id})
             if not existing:
-                existing = await db[BrandProfileService.COLLECTION].find_one({"brand_id": brand_id})
+                # Fallback: old profile created before brand_id was added
+                existing = await db[BrandProfileService.COLLECTION].find_one({"user_id": user_id, "brand_id": {"$exists": False}})
+
+            # Set scope: if existing profile has no brand_id, update by user_id; otherwise by brand_id
+            if existing and not existing.get("brand_id"):
+                scope = {"user_id": user_id, "brand_id": {"$exists": False}}
+            else:
+                scope = {"brand_id": brand_id}
         else:
             # Single-user mode: query by user_id (personal brand)
-            scope = {"user_id": user_id}
-            existing = await db[BrandProfileService.COLLECTION].find_one({"user_id": user_id})
+            scope = {"user_id": user_id, "brand_id": {"$exists": False}}
+            existing = await db[BrandProfileService.COLLECTION].find_one(scope)
 
         # OPTION 2: ONBOARDING VALIDATION - Enforce required fields
         # Only validate when user is ACTIVELY TRYING to complete onboarding (transition from False→True)
