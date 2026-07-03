@@ -617,6 +617,17 @@ _BROLL_BAD_TAGS = {
     "suit", "necktie", "formal", "businessman",
     "ai generated",
     "portrait", "lifestyle", "fashion", "model", "headshot",
+    "food", "meal", "breakfast", "lunch", "dinner", "flatlay", "flat lay",
+    "waffle", "pancake", "cake", "cooking", "recipe",
+    "engineering", "blueprint", "cad", "architecture drawing",
+    "clock", "alarm", "alarm clock", "watch", "timepiece", "stopwatch", "timer",
+    "paper", "blank paper", "notebook paper", "document", "stationery",
+    # Off-topic physical scenes that pass a loose "is it a scene?" check but
+    # have zero connection to a social-media/business testimonial.
+    "skyscraper", "architecture", "building exterior", "tower", "facade",
+    "telephone", "phone booth", "booth", "payphone",
+    "street", "landmark", "monument", "landscape", "mountain", "nature",
+    "beach", "sunset", "forest",
 }
 _BROLL_GENERIC_SUBJ = {"woman", "man", "person", "people", "female", "male", "human"}
 
@@ -714,42 +725,91 @@ async def _stock_video_search(
     return candidates
 
 
+async def _fetch_image_b64(image_url: str) -> Optional[Tuple[str, str]]:
+    """Download an image with Pixabay-friendly headers and return (base64_str, mime).
+    OpenAI's servers cannot fetch Pixabay URLs directly (hotlink block), so we fetch
+    the bytes ourselves and hand GPT a data: URL. Returns None on failure."""
+    import base64
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; URISocial/1.0)",
+        "Referer": "https://pixabay.com/",
+    }
+    try:
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.get(image_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if not resp.ok:
+                    return None
+                ct = resp.headers.get("Content-Type", "").split(";")[0].strip()
+                if "image" not in ct:
+                    return None  # video or non-image — can't verify a still frame
+                data = await resp.read()
+                if len(data) > 18 * 1024 * 1024:  # OpenAI ~20MB base64 limit
+                    return None
+                return base64.b64encode(data).decode("ascii"), (ct or "image/jpeg")
+    except Exception:
+        return None
+
+
 async def _verify_broll_image(image_url: str, speech: str, query: str) -> bool:
     """
     Ask GPT-4o-mini (vision) whether this image is contextually appropriate
     for the given speech moment. Returns True = use it, False = skip it.
-    Falls back to True on any error so a bad network day doesn't kill b-roll.
+    Defaults to False (skip) on any error — an unverifiable image is never worth
+    the risk of showing something irrelevant; generic fallbacks cover the gap.
     """
+    fetched = await _fetch_image_b64(image_url)
+    if fetched is None:
+        # Couldn't download it as an image (hotlink block, video URL, too large).
+        print(f"[BrollVision] q='{query}' → could not fetch image — FAIL | {image_url[:60]}…", flush=True)
+        return False
+    b64, mime = fetched
+    data_url = f"data:{mime};base64,{b64}"
     try:
         client = openai.AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
         resp = await client.chat.completions.create(
             model="gpt-4o-mini",
             max_tokens=10,
-            timeout=8,
+            timeout=12,
             messages=[{
                 "role": "user",
                 "content": [
                     {
                         "type": "text",
                         "text": (
-                            "You are reviewing a b-roll stock photo for a social media video.\n"
-                            f'The speaker says: "{speech}"\n'
-                            f'Search query used: "{query}"\n\n'
-                            "Answer PASS only if the image shows a real SCENE, ENVIRONMENT, or OBJECT "
-                            "directly relevant to the speech — e.g. a workspace, product, warehouse, "
-                            "computer screen, outdoor setting, or physical activity.\n"
-                            "Answer FAIL if ANY of these are true:\n"
-                            "- The image is primarily a person/portrait (even if they're holding something)\n"
-                            "- It is a lifestyle or fashion photo where a person is the main focus\n"
-                            "- It is a close-up face or headshot\n"
-                            "- The content is clearly off-topic to the speech\n"
-                            "- The image appears AI-generated or contains garbled/unreadable text\n"
+                            "You are choosing b-roll for a talking-head testimonial about a social "
+                            "media management product. It will briefly appear while the speaker says:\n"
+                            f'  "{speech}"\n\n'
+                            "PASS if the image is ON-THEME for a modern social-media / business / "
+                            "work story — for example: someone working at a laptop or phone (seen "
+                            "candidly, from behind, side, or over-the-shoulder), a social media or "
+                            "app screen, content being created, an office or home-office desk, a "
+                            "workspace, or a real meeting. The link can be general; it just has to "
+                            "fit the world of the video and look like a genuine moment.\n\n"
+                            "FAIL if the image is OFF-THEME or in any of these banned categories:\n"
+                            "- A person looking at or smiling for the camera, or any posed/staged "
+                            "'stock model' shot (even at a desk with a laptop)\n"
+                            "- Primarily a person's face/portrait, headshot, or a fashion/lifestyle pose\n"
+                            "- A decorative lifestyle flat-lay: a laptop or desk styled with flowers, "
+                            "candles, coffee cups, pastries, or pretty props arranged for aesthetics\n"
+                            "- A food or drink photo, or any overhead flat-lay of objects on a surface\n"
+                            "- A building, skyscraper, architecture exterior, street, city, or landmark\n"
+                            "- A telephone booth, payphone, or an object matched by a keyword rather "
+                            "than meaning (e.g. 'phone' returning a red phone booth)\n"
+                            "- Scenery: landscape, nature, beach, sky, mountains, sunset, forest\n"
+                            "- Engineering drawings, CAD diagrams, or blueprints\n"
+                            "- A clock, alarm, watch, or timer\n"
+                            "- Blank paper, empty notebooks, or plain stationery\n"
+                            "- A cartoon, illustration, vector graphic, clip-art, icon set, or "
+                            "flat-design drawing — b-roll MUST be a real photograph\n"
+                            "- Anything showing app or brand logos (YouTube, TikTok, Facebook, etc.)\n"
+                            "- Anything that appears AI-generated or has garbled/unreadable text\n"
+                            "- Anything clearly unrelated to social media, business, or work\n"
                             "Reply with exactly one word: PASS or FAIL"
                         ),
                     },
                     {
                         "type": "image_url",
-                        "image_url": {"url": image_url, "detail": "low"},
+                        "image_url": {"url": data_url, "detail": "low"},
                     },
                 ],
             }],
@@ -759,13 +819,10 @@ async def _verify_broll_image(image_url: str, speech: str, query: str) -> bool:
         print(f"[BrollVision] q='{query}' → {verdict} | {image_url[:60]}…", flush=True)
         return passed
     except Exception as e:
-        err_str = str(e)
-        if "invalid_image_format" in err_str or "unsupported image" in err_str.lower():
-            # URL is a video file — GPT Vision can't verify it, reject it so we try photos instead
-            print(f"[BrollVision] video URL rejected (not verifiable) — FAIL", flush=True)
-            return False
-        print(f"[BrollVision] error ({e}) — defaulting PASS", flush=True)
-        return True  # only default PASS on network/timeout errors, never on format errors
+        # Vision unavailable (timeout, rate limit, API error) — skip rather than risk
+        # showing an irrelevant image. Fallbacks fill any gap.
+        print(f"[BrollVision] error ({e}) — FAIL | {image_url[:60]}…", flush=True)
+        return False
 
 
 async def _fal_generate(description: str) -> Optional[str]:
@@ -799,6 +856,90 @@ async def _fal_generate(description: str) -> Optional[str]:
     except Exception as e:
         print(f"[B-roll] fal.ai error: {e}", flush=True)
     return None
+
+
+async def _upload_image_bytes_to_cloudinary(img_bytes: bytes, public_id: str) -> Optional[str]:
+    """Upload raw image bytes to Cloudinary and return the secure_url."""
+    cloud = settings.CLOUDINARY_CLOUD_NAME
+    api_key = settings.CLOUDINARY_API_KEY
+    api_secret = settings.CLOUDINARY_API_SECRET
+    if not all([cloud, api_key, api_secret]):
+        return None
+    folder = "uri-broll"
+    ts = int(time.time())
+    params_str = f"folder={folder}&public_id={public_id}&timestamp={ts}"
+    signature = hashlib.sha1(f"{params_str}{api_secret}".encode()).hexdigest()
+    form = aiohttp.FormData()
+    form.add_field("file", img_bytes, filename=f"{public_id}.png", content_type="image/png")
+    form.add_field("api_key", api_key)
+    form.add_field("timestamp", str(ts))
+    form.add_field("signature", signature)
+    form.add_field("public_id", public_id)
+    form.add_field("folder", folder)
+    form.add_field("resource_type", "image")
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"https://api.cloudinary.com/v1_1/{cloud}/image/upload",
+                data=form, timeout=aiohttp.ClientTimeout(total=60),
+            ) as resp:
+                body = json.loads(await resp.text())
+                if not resp.ok:
+                    print(f"[Cloudinary:gen] upload failed {resp.status}: {body}", flush=True)
+                    return None
+                return body.get("secure_url", "") or None
+    except Exception as e:
+        print(f"[Cloudinary:gen] error: {e}", flush=True)
+        return None
+
+
+async def _generate_broll_image(image_prompt: str) -> Optional[str]:
+    """
+    Generate a photorealistic 9:16 b-roll still with gpt-image-1 and host it on
+    Cloudinary. Returns the CDN URL, or None on failure.
+
+    The image is CREATED to match the moment, so relevance no longer depends on a
+    stock library happening to have the right shot. We always append hard constraints
+    (photoreal, no text, no logos, not an illustration) to keep results on-brand.
+    """
+    import base64
+    import uuid as _uuid
+    if not settings.OPENAI_API_KEY or not (image_prompt or "").strip():
+        return None
+    # Fixed art direction so every clip shares one cohesive, branded cinematic look.
+    _STYLE = (
+        "Shot on a 35mm cinema camera, cinematic color grade with soft warm highlights "
+        "and gentle teal shadows, filmic contrast, shallow depth of field, natural "
+        "lighting, subtle film grain, consistent muted palette across the frame."
+    )
+    full_prompt = (
+        f"{image_prompt.strip()}. "
+        f"{_STYLE} Vertical 9:16 framing, photorealistic candid documentary photograph. "
+        "It must look like a real photo — NOT an illustration, cartoon, 3D render, or "
+        "clip-art. Absolutely no text, no words, no captions, no watermarks, no logos, "
+        "no brand marks, and no on-screen UI text."
+    )
+    try:
+        client = openai.AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+        resp = await client.images.generate(
+            model="gpt-image-1",
+            prompt=full_prompt,
+            size="1024x1536",   # portrait, cover-fits 9:16
+            quality="high",
+            n=1,
+        )
+        b64 = resp.data[0].b64_json if resp.data else None
+        if not b64:
+            return None
+        img_bytes = base64.b64decode(b64)
+        pid = f"broll-gen-{_uuid.uuid4().hex[:12]}"
+        cdn = await _upload_image_bytes_to_cloudinary(img_bytes, pid)
+        if cdn:
+            print(f"[B-roll:gen] generated → {cdn[:80]}", flush=True)
+        return cdn
+    except Exception as e:
+        print(f"[B-roll:gen] error: {e}", flush=True)
+        return None
 
 
 def _clean_pexels_query(concept: str, description: str) -> str:
@@ -862,6 +1003,15 @@ _ABSTRACT_TO_VISUAL = {
     "niche": "entrepreneur success laptop",
     "started": "warehouse boxes stacked",
     "beginning": "warehouse boxes stacked",
+    "minutes": "laptop screen typing",
+    "seconds": "phone screen app",
+    "quickly": "laptop screen typing",
+    "instantly": "phone setup screen",
+    "clock": "laptop workspace desk",
+    "alarm": "laptop workspace desk",
+    "watch": "laptop workspace desk",
+    "paper": "laptop workspace office",
+    "notebook": "laptop workspace office",
 }
 
 
@@ -997,25 +1147,11 @@ async def _fetch_broll_url(
         cdn_url, hit_id = await _find_verified(alt_query)
         if cdn_url:
             return cdn_url, hit_id
-        print(f"[B-roll] both queries failed vision check, trying generic fallbacks…", flush=True)
-    else:
-        print(f"[B-roll] primary query failed vision check, trying generic fallbacks…", flush=True)
 
-    # Safe fallback queries that reliably return scene photos (not portraits) on Pixabay.
-    # fal.ai is intentionally NOT used — AI-generated video contains garbled text artifacts.
-    _GENERIC_FALLBACKS = [
-        "office desk laptop workspace",
-        "laptop computer screen workspace",
-        "warehouse boxes stacked shelves",
-        "graph chart growth business",
-        "coffee shop table laptop",
-    ]
-    for fallback_q in _GENERIC_FALLBACKS:
-        cdn_url, hit_id = await _find_verified(fallback_q)
-        if cdn_url:
-            print(f"[B-roll] generic fallback '{fallback_q}' succeeded", flush=True)
-            return cdn_url, hit_id
-
+    # NO generic fallbacks. If we can't find a photo of the actual concrete thing the
+    # speaker named, show nothing — the talking head + captions carry the moment. A
+    # generic office/laptop stand-in is exactly the disconnect we're avoiding.
+    print(f"[B-roll] no on-topic photo for '{query}' — skipping this clip (no filler)", flush=True)
     return None, None
 
 
@@ -1237,76 +1373,39 @@ ANALYSIS TASKS:
 6. KEYWORDS — Brands, platforms, products, metrics, important nouns. Max 5.
    These feed the visual asset search engine for b-roll and icons.
 
-7. B-ROLL — 7–8 cutaway moments where a stock photo/video would reinforce what the speaker is saying.
-   Spread them evenly across the video — every 8–12 seconds is ideal. DO NOT cluster them together.
-   Cover ALL key moments: product mentions, money claims, action descriptions, location references, emotions.
-   The b-roll must be IN SYNC — it should appear on screen at the EXACT moment the speaker says the keyword or phrase.
-   Set "at" to the timestamp when the speaker first says the relevant word — NOT after they finish the sentence.
-   Example: if speaker says "I bought 12,000 products" at 3.5s, set at=3.5 so the b-roll of packages appears right as they say it.
+7. B-ROLL — 4–6 cutaway moments. For each you will WRITE A PHOTOREALISTIC IMAGE DESCRIPTION
+   that an image model will generate. You are NOT limited to stock footage — describe exactly
+   the scene that fits the moment, and it will be created. This means relevance is on you:
+   every image must clearly depict what the speaker is talking about at that timestamp.
+
+   Spread clips across the video (roughly every 8–12 seconds). Pick the moments where a visual
+   genuinely strengthens the message: an action, a place, a device or screen, a product, a
+   situation, or a clear before/after feeling. Ground every image in the actual words spoken.
 
    For each clip provide:
-   - "at": the exact second the speaker STARTS saying the relevant word/phrase (use the SRT transcript to be precise)
+   - "at": the second the speaker STARTS the relevant phrase (use the SRT transcript to be precise)
    - "duration": 4
-   - "description": one sentence quoting or paraphrasing what the speaker says at that moment
-   - "search_query": the PRIMARY Pixabay search term (2–3 words, see rules below)
-   - "search_query_alt": a BACKUP search term in case the first returns nothing (different words, same visual idea)
-   - "reason": why this visual helps
+   - "image_prompt": a vivid one–two sentence PHOTOREALISTIC scene description for the image model.
+     Describe subject, setting, action, mood, and lighting. It must read like a real candid photo.
+     Show the SITUATION the speaker describes. Examples:
+       speech "clients kept rejecting our content" →
+         "A frustrated marketing team in a dim office looking dejected at a laptop screen showing rejected drafts, moody lighting, over-the-shoulder angle"
+       speech "I spoke to her for just five minutes" →
+         "A relaxed businesswoman having a quick friendly chat at a bright modern desk, laptop open, warm daylight"
+       speech "I don't think about what to post anymore" →
+         "Over-the-shoulder view of a calm person scrolling a social media feed on a phone in a sunlit cafe"
+   - "description": the exact words the speaker says at that moment
+   - "reason": what about the speech this image depicts
 
-   CONTEXTUAL MEANING RULE — THE MOST IMPORTANT RULE:
-   Never visualise the literal words. Visualise the EMOTION or SITUATION the speaker is conveying.
-   Ask yourself: "What does the viewer need to FEEL at this moment?" — then find an image for that feeling.
-
-   NEGATION RULE: When the speaker says "no X" or "without X", they are celebrating the ABSENCE of X.
-   Show the POSITIVE ALTERNATIVE, never X itself:
-   • "No bus, no office, no boss" → speaker means FREEDOM — show: "person working laptop cafe" or "remote work home relaxed". NEVER show traffic, a bus, or an office.
-   • "No more 9-to-5" → show someone relaxed at home with laptop, not a clock or office.
-   • "No commute" → show freedom, not traffic.
-
-   TURNING POINT RULE: "Once I found…", "That's when I realised…", "Everything changed when…" → show DISCOVERY / EXCITEMENT:
-   • Use: "person excited laptop screen", "woman smiling phone success"
-   • NEVER use lightbulbs, lamps, or literal "found/discovery" imagery.
-
-   INCOME / MONEY RULE: Dollar amounts = small wins or milestones. Show the ACTIVITY that earned it:
-   • "First month I made $300" → early small win → "shipping boxes warehouse" or "packages delivery boxes"
-   • "Making $5,000 a month" → established income → "person laptop working home"
-   • NEVER use tablets, generic devices, or stock "business person" photos for money claims.
-
-   SEARCH QUERY RULES:
-   • Use CONCRETE NOUNS + ADJECTIVES only. Think: what physical scene would appear in the stock photo?
-   • NO abstract words: never use "success", "growth", "strategy", "journey", "impact", "results", "process"
-   • NO verbs, gerunds, articles, or brand/person names
-   • 2–3 words max — shorter is better on Pixabay
-
-   SEARCH QUERY GOLDEN RULE: visualise the EMOTION or SITUATION, not the literal words spoken.
-   • For income claims → visualise WHERE the money comes from (the product, platform, or activity),
-     NOT money itself. "shipping boxes warehouse" beats "money cash hands".
-   • For dollar amounts → DO NOT search "dollar bill" or "cash". Search the product/context instead.
-   • For platforms → describe the ACTIVITY visually, not the brand name: "shipping boxes warehouse", "packages delivery boxes"
-   • NEVER use brand names (Amazon, Netflix, Shopify, YouTube) in search queries — Pixabay returns wildlife/nature photos for "Amazon" (it's a rainforest), logos for "Netflix", etc.
-
-   TOPIC → CONTEXTUAL QUERY mapping (always ask: what does the viewer need to FEEL?):
-     "no bus / no commute / no office"        → "person working laptop home"  (alt: "freelancer home relaxed") — freedom, NOT traffic
-     "no boss / own business / freedom"       → "woman laptop smiling outdoor"  (alt: "entrepreneur home coffee")
-     "first month / started / beginning"      → "warehouse boxes stacked"  (alt: "packages boxes delivery")
-     "made $X / earned / income milestone"    → "warehouse boxes stacked"  (alt: "packages boxes delivery")
-     "found my niche / product / system"      → "entrepreneur success laptop"  (alt: "woman laptop smiling business")
-     "selling products online / ecommerce"    → "shipping boxes warehouse"  (alt: "shipping boxes stack")
-     "amazon FBA / reselling"                 → "warehouse shelves boxes"  (alt: "shipping packaging boxes")
-     WRONG: "amazon warehouse" → returns Amazon parrot (the bird). Never use brand names.
-     "earning money / passive income"         → "person laptop working home"  (alt: "freelancer home office")
-     "posting on social media"                → "woman phone scrolling"  (alt: "phone social media screen")
-     "content creation / filming"             → "camera tripod studio"  (alt: "creator recording video")
-     "tired / burnout / overwhelmed"          → "laptop desk office"  (alt: "office computer screen")
-     "turned it around / breakthrough"        → "person excited phone success"  (alt: "woman celebrating laptop")
-     "business growth / results / scale"      → "graph chart upward"  (alt: "analytics screen laptop")
-     "team / collaboration"                   → "office team meeting"  (alt: "colleagues whiteboard")
-     "email / marketing / outreach"           → "laptop email inbox"  (alt: "business email screen")
-     "client / customer / sales"              → "handshake business deal"  (alt: "customer smiling")
-     "running ads / digital marketing"        → "phone ads dashboard"  (alt: "computer analytics screen")
-     "crypto / bitcoin / investing"           → ONLY use if speaker is literally talking about crypto;
-                                                for general "making money" claims use the PRODUCT context instead
-
-   NEVER use these words in search_query: "seller", "vendor", "ecommerce", "bus", "traffic", "commute", "lightbulb", "lamp", "work hard", "be consistent", "dollar bill", "bitcoin" (unless literally about crypto). "seller" returns market/street vendors; "ecommerce" returns zero results. Use "shipping", "warehouse", "packages", "boxes" instead.
+   IMAGE_PROMPT RULES (critical):
+   • Photorealistic, candid, documentary style — like a real photograph. NEVER illustration,
+     cartoon, 3D render, clip-art, or icon graphics.
+   • NO text, NO words, NO captions, NO logos, NO brand names, NO on-screen UI text in the scene.
+   • Show real people naturally (candid, from behind / side / over-the-shoulder), real workspaces,
+     real devices, real environments.
+   • Match the EMOTION and SITUATION of the speech — not random imagery.
+   • Do NOT name brands (no "Instagram logo", "Amazon warehouse"). Describe the generic activity.
+   • For money/metrics, show the PRODUCT or ACTIVITY that earned it — never cash or dollar bills.
 
 8. CUTS — ONLY remove silence gaps or pure filler with NO meaningful speech:
    - Silent pauses ≥1s where the speaker says nothing
@@ -1349,8 +1448,8 @@ Return ONLY valid JSON, no markdown:
   ],
   "keywords": ["Instagram", "leads", "content strategy"],
   "broll": [
-    {{"at": 5.5, "duration": 4, "description": "Speaker says posting three times a week builds trust", "search_query": "woman phone scrolling", "search_query_alt": "phone instagram screen", "reason": "visualises the daily posting habit"}},
-    {{"at": 22.0, "duration": 4, "description": "Mentions selling products online to earn $5000/month", "search_query": "warehouse boxes stacked", "search_query_alt": "packages boxes delivery", "reason": "visualises the ecommerce activity without brand names"}}
+    {{"at": 5.5, "duration": 4, "image_prompt": "Over-the-shoulder view of a calm young woman scrolling a colourful social media feed on her phone while sitting in a sunlit modern cafe, candid, shallow depth of field", "description": "posting three times a week on social media", "reason": "depicts the daily social posting she describes"}},
+    {{"at": 22.0, "duration": 4, "image_prompt": "A focused entrepreneur in a warehouse sealing and stacking cardboard shipping boxes on a trolley, natural warehouse light, candid documentary photo", "description": "I ship twelve thousand packages a month", "reason": "shows the packages being shipped that she mentions"}}
   ],
   "cuts": [
     {{"remove_start": 4.2, "remove_end": 5.8, "reason": "filler: um you know", "confidence": 0.98}}
@@ -1477,6 +1576,13 @@ def apply_editing_rules(
         at = float(br.get("at", 0))
         if at >= duration:
             continue
+
+        # Each clip must carry an image_prompt — that's what we generate the b-roll from.
+        image_prompt = str(br.get("image_prompt", "")).strip()
+        if not image_prompt:
+            print(f"[B-roll] skipping at={at:.1f}s — no image_prompt", flush=True)
+            continue
+
         br_dur = float(br.get("duration", 4.0))
 
         # Snap GPT's rough timestamp to the nearest SRT word boundary for precise sync
@@ -1487,20 +1593,23 @@ def apply_editing_rules(
             print(f"[B-roll] skipping at={snapped_at:.1f}s — too close to previous clip end={_broll_end_time:.1f}s", flush=True)
             continue
 
-        gpt_concept = br.get("search_query") or br.get("concept") or ""
-        gpt_alt     = br.get("search_query_alt", "")
         description = br.get("description", "")
 
+        # Legacy stock-search fallback fields (kept for backward-compat); generation
+        # from image_prompt is the primary path.
+        gpt_concept   = br.get("search_query") or br.get("concept") or ""
+        gpt_alt       = br.get("search_query_alt", "")
         primary_query = _sanitise_broll_query(gpt_concept, description)
         alt_query     = _sanitise_broll_query(gpt_alt, description) if gpt_alt else primary_query
 
         speech = _srt_text_at(srt_entries or [], snapped_at, window=3.0)
-        print(f"[B-roll] gpt_at={at:.1f}s → srt_at={snapped_at:.2f}s speech='{speech[:60]}' q='{primary_query}'", flush=True)
+        print(f"[B-roll] gpt_at={at:.1f}s → srt_at={snapped_at:.2f}s speech='{speech[:50]}' prompt='{image_prompt[:60]}'", flush=True)
 
         broll.append({
             "at": round(snapped_at, 2),
             "duration": br_dur,
             "description": description,
+            "image_prompt": image_prompt,
             "concept": primary_query,
             "concept_alt": alt_query,
             "reason": br.get("reason", ""),
@@ -2105,11 +2214,13 @@ def build_shotstack_timeline(
             tl_at = _original_to_timeline(orig_at, keep_segments, transition_dur=transition_dur)
             if tl_at is None:
                 continue
+            # Keep SFX subtle — voice always dominant. Impact is the loudest so needs most reduction.
+            sfx_volume = 0.18 if sfx_type == "impact" else 0.28
             sfx_clips.append({
                 "asset": {
                     "type": "audio",
                     "src": sfx_url,
-                    "volume": 0.65,
+                    "volume": sfx_volume,
                     "trim": 0,
                 },
                 "start": round(tl_at, 3),
@@ -2215,7 +2326,10 @@ def build_shotstack_timeline(
         )
 
     # ── B-roll track ──────────────────────────────────────────────────────────
+    # Ken Burns: alternate a slow zoom in/out per clip so generated stills feel alive.
+    _KEN_BURNS = ["zoomIn", "zoomOut"]
     broll_clips: List[Dict] = []
+    _br_idx = 0
     for br in (broll or []):
         br_url = br.get("url")
         if not br_url:
@@ -2227,13 +2341,10 @@ def build_shotstack_timeline(
         tl_at = _original_to_timeline(orig_at, keep_segments, transition_dur=transition_dur)
         if tl_at is None:
             continue
-        # Tiny lead so the cut feels instant, not late (SRT already gives exact word boundary)
-        tl_at = max(0.0, tl_at - 0.2)
         # Clamp duration so b-roll doesn't run past the timeline end
         br_dur = min(br_dur, total_duration - tl_at)
         if br_dur < 0.5:
             continue
-        fade = min(0.25, br_dur / 4)
         url_lower = br_url.lower().split("?")[0]
         is_image = (
             any(url_lower.endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".webp"))
@@ -2243,21 +2354,20 @@ def build_shotstack_timeline(
             asset = {"type": "image", "src": br_url}
         else:
             asset = {"type": "video", "src": br_url, "trim": 0, "volume": 0}
-        fit = "cover"
 
-        broll_clips.append({
+        clip: Dict[str, Any] = {
             "asset": asset,
             "start": round(tl_at, 3),
             "length": round(br_dur, 3),
-            "fit": fit,
-            # Simple fade in/out — no slide effect which distorts images mid-animation
-            "opacity": [
-                {"from": 0, "to": 1, "start": 0, "length": fade,
-                 "interpolation": "bezier", "easing": "easeOutCubic"},
-                {"from": 1, "to": 0, "start": round(br_dur - fade, 3), "length": fade,
-                 "interpolation": "bezier", "easing": "easeInCubic"},
-            ],
-        })
+            "fit": "cover",
+            # Quick cross-fade in/out — smooths the b-roll's entrance/exit. This is a
+            # short boundary fade, not an opacity keyframe blend (which caused ghosting).
+            "transition": {"in": "fade", "out": "fade"},
+        }
+        if is_image:
+            clip["effect"] = _KEN_BURNS[_br_idx % len(_KEN_BURNS)]  # slow zoom motion
+        broll_clips.append(clip)
+        _br_idx += 1
 
     # ── Background music track ────────────────────────────────────────────────
     music_clips: List[Dict] = []
@@ -2522,7 +2632,7 @@ async def run_production_job(
     video_type: str,
     db,
     enable_music: bool = True,
-    enable_sfx: bool = True,
+    enable_sfx: bool = False,
     transition_style: str = "auto",  # auto | circle_wipe | diagonal_wipe | flash | swipe | hard_cut | none
 ) -> None:
     reap = ReapProvider()
@@ -2694,12 +2804,12 @@ async def run_production_job(
             flush=True,
         )
 
-        # ── REVIEW PAUSE — store decisions + render context, wait for user approval ─
+        # ── Store decisions + render context, then immediately proceed to render ─
         await db.video_production_jobs.update_one(
             {"job_id": job_id},
             {"$set": {
-                "status": "awaiting_review",
-                "status_message": "Review AI decisions before rendering",
+                "status": "processing",
+                "status_message": "Fetching b-roll assets…",
                 "progress": 55,
                 "ai_decisions": {
                     "cuts":           cuts,
@@ -2731,12 +2841,13 @@ async def run_production_job(
             }}
         )
         print(
-            f"[VideoProduction] job={job_id} awaiting_review — "
+            f"[VideoProduction] job={job_id} decisions saved, proceeding to render — "
             f"{len(cuts)} cuts {len(zooms)} zooms {len(sound_effects)} sfx "
             f"{len(icon_overlays)} icons hook='{hook_text}'",
             flush=True,
         )
-        return  # pipeline resumes via POST /produce-video-job/{id}/start-render
+        await run_render_phase(job_id, db)
+        return
 
         # ── Stage 4: Fetch assets — b-roll (Pixabay → fal.ai) + SFX library ──────
         broll: List[Dict] = []
@@ -2918,21 +3029,26 @@ async def run_render_phase(job_id: str, db) -> None:
 
         srt_entries = _parse_srt(srt_text)
 
-        # ── Stage 4a: B-roll ──────────────────────────────────────────────────────
+        # ── Stage 4a: B-roll — generate a photorealistic still per moment ─────────
+        # Images are generated to match the exact speech, so relevance is guaranteed
+        # rather than depending on a stock library. Generate concurrently to save time.
         broll: List[Dict] = []
         if broll_decisions:
-            await update(58, "Fetching b-roll assets…")
-            used_pixabay_ids: set = set()
-            for br in broll_decisions:
-                cdn_url, hit_id = await _fetch_broll_url(
-                    br.get("description", ""), br.get("concept", ""), br.get("concept_alt", ""),
-                    exclude_ids=used_pixabay_ids,
-                )
-                if cdn_url:
-                    broll.append({**br, "url": cdn_url})
-                    if hit_id is not None:
-                        used_pixabay_ids.add(hit_id)
-            print(f"[VideoProduction:render] broll {len(broll)}/{len(broll_decisions)}", flush=True)
+            await update(58, "Generating b-roll visuals…")
+
+            async def _resolve(br: Dict) -> Optional[Dict]:
+                prompt = br.get("image_prompt", "")
+                cdn_url = await _generate_broll_image(prompt) if prompt else None
+                # Legacy jobs (no image_prompt) fall back to stock search.
+                if not cdn_url and not prompt:
+                    cdn_url, _ = await _fetch_broll_url(
+                        br.get("description", ""), br.get("concept", ""), br.get("concept_alt", ""),
+                    )
+                return {**br, "url": cdn_url} if cdn_url else None
+
+            results = await asyncio.gather(*[_resolve(br) for br in broll_decisions])
+            broll = [r for r in results if r]
+            print(f"[VideoProduction:render] broll {len(broll)}/{len(broll_decisions)} generated", flush=True)
 
         # ── Stage 4b: Music ───────────────────────────────────────────────────────
         music_url = ""
