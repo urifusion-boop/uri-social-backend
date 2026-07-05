@@ -222,7 +222,7 @@ async def get_user_guides(
                 "uploaded_at": guide["uploaded_at"].isoformat(),
                 "aesthetic_summary": aesthetic_summary,
                 "typography_match": typography_match,
-                "match_outcome": guide["match_outcome"],
+                "match_outcome": guide.get("match_outcome", "no_typography"),
                 "times_used": guide.get("times_used", 0),
                 "status": guide["status"],
             })
