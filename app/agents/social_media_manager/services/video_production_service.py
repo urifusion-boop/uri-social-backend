@@ -35,53 +35,6 @@ SHOTSTACK_CREATE_BASE = "https://api.shotstack.io/create/stage"
 SHOTSTACK_ASSET_LIMIT = 9 * 1024 * 1024  # 9MB — stay under the 10MB hard limit
 
 
-async def _ensure_h264_mp4(video_bytes: bytes) -> bytes:
-    """Re-encode to H.264/AAC MP4 if needed — handles .mov/HEVC from iPhone.
-    If the input is already H.264 MP4 this is a fast stream-copy, not a full re-encode."""
-    with tempfile.NamedTemporaryFile(suffix=".input", delete=False) as inf:
-        inf.write(video_bytes)
-        in_path = inf.name
-    out_path = in_path + "_h264.mp4"
-    try:
-        # Probe codec first — skip re-encode if already H.264
-        probe = await asyncio.create_subprocess_exec(
-            "ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", in_path,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await probe.communicate()
-        streams = json.loads(stdout).get("streams", [])
-        video_codec = next((s.get("codec_name") for s in streams if s.get("codec_type") == "video"), "")
-        audio_codec = next((s.get("codec_name") for s in streams if s.get("codec_type") == "audio"), "")
-
-        if video_codec == "h264" and audio_codec in ("aac", "mp3"):
-            print(f"[VideoNorm] already H.264/AAC — skipping re-encode", flush=True)
-            return video_bytes
-
-        print(f"[VideoNorm] re-encoding {video_codec}/{audio_codec} → H.264/AAC", flush=True)
-        proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-i", in_path,
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-            "-c:a", "aac", "-b:a", "128k",
-            # BT.709 flags prevent HEVC/BT.2020 wide-gamut → washed-out brightness shift
-            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
-            "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
-            "-movflags", "+faststart", "-y", out_path,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        )
-        _, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            print(f"[VideoNorm] ffmpeg failed: {stderr.decode()[-300:]}", flush=True)
-            return video_bytes  # fall back to original
-        with open(out_path, "rb") as f:
-            result = f.read()
-        print(f"[VideoNorm] {len(video_bytes)//1024}KB → {len(result)//1024}KB", flush=True)
-        return result
-    finally:
-        for p in (in_path, out_path):
-            try: os.unlink(p)
-            except OSError: pass
-
-
 async def _compress_for_shotstack(video_bytes: bytes, duration: float) -> bytes:
     """Compress video to fit under Shotstack's 10MB asset limit using FFmpeg."""
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as inf:
@@ -117,36 +70,92 @@ async def _compress_for_shotstack(video_bytes: bytes, duration: float) -> bytes:
 
 async def _clean_audio(video_bytes: bytes) -> bytes:
     """
-    Stage 2 audio enhancement per PRD:
-    - highpass=f=80: cut low-frequency rumble (mic handling, room boom)
-    - afftdn: FFT-based noise reduction + de-essing (nf=-25 floor, nr=33 reduction)
-    - loudnorm: normalize to broadcast standard (-16 LUFS, -1.5 TP)
-    Video stream is copied (no re-encode). Falls back to original bytes on failure.
+    Two-pass loudness normalisation so gain is flat from frame 0.
+
+    Single-pass loudnorm fills a ~3-second lookahead buffer before its gain
+    stabilises, which makes audio start quiet and ramp up — the classic
+    "gets louder as the video goes on" artefact.  Two-pass avoids this:
+      Pass 1  — analyse integrated loudness, true peak, LRA (audio only, fast).
+      Pass 2  — apply linear gain derived from Pass 1 measurements (constant
+                from the very first sample, no ramp).
+
+    If Pass 1 analysis fails we fall back to a static +3 dB highpass boost
+    (no adaptive ramp, still better than single-pass loudnorm).
+    Video stream is always stream-copied (no re-encode).
     """
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
         f.write(video_bytes)
         in_path = f.name
     out_path = in_path + "_clean.mp4"
+
     try:
+        # ── Pass 1: measure loudness ──────────────────────────────────────────
+        analyse = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-i", in_path,
+            "-af", "loudnorm=I=-14:TP=-1.0:LRA=11:print_format=json",
+            "-f", "null", "-",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, analyse_stderr = await analyse.communicate()
+        stderr_str = analyse_stderr.decode(errors="replace")
+
+        # Extract the JSON block loudnorm writes to stderr
+        import re as _re
+        _m = _re.search(r'\{[^{}]*"input_i"[^{}]*\}', stderr_str, _re.DOTALL)
+        if _m:
+            import json as _json
+            ln = _json.loads(_m.group())
+            measured_I      = ln.get("input_i",      "-70")
+            measured_TP     = ln.get("input_tp",     "-70")
+            measured_LRA    = ln.get("input_lra",    "0")
+            measured_thresh = ln.get("input_thresh", "-70")
+            offset          = ln.get("target_offset", "0")
+            af = (
+                f"highpass=f=80,"
+                f"loudnorm=I=-14:TP=-1.0:LRA=11:"
+                f"measured_I={measured_I}:measured_TP={measured_TP}:"
+                f"measured_LRA={measured_LRA}:measured_thresh={measured_thresh}:"
+                f"offset={offset}:linear=true"
+            )
+            print(
+                f"[AudioClean] pass1 I={measured_I} TP={measured_TP} "
+                f"LRA={measured_LRA} → applying linear gain",
+                flush=True,
+            )
+        else:
+            # Fallback: static highpass + modest gain — no ramp, no lookahead
+            af = "highpass=f=80,volume=3dB"
+            print("[AudioClean] pass1 parse failed — using static fallback", flush=True)
+
+        # ── Pass 2: apply ─────────────────────────────────────────────────────
+        # Explicit stream mapping (-map 0:v:0 -map 0:a:0) ensures only one video
+        # and one audio track are written. Re-encoding video (-c:v libx264) resets
+        # PTS so video and audio stay in sync; stream-copy (-c:v copy) can cause
+        # the video to freeze while audio plays when the original has PTS gaps.
         proc = await asyncio.create_subprocess_exec(
             "ffmpeg", "-i", in_path,
-            "-c:v", "copy",
+            "-map", "0:v:0", "-map", "0:a:0",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "18",
             "-c:a", "aac", "-b:a", "192k",
-            "-af", "highpass=f=80,loudnorm=I=-14:TP=-1.0:LRA=11",
+            "-af", af,
+            "-movflags", "+faststart",
             "-y", out_path,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
         _, stderr = await proc.communicate()
         if proc.returncode != 0:
-            print(f"[AudioClean] ffmpeg failed: {stderr.decode()[-300:]}", flush=True)
+            print(f"[AudioClean] pass2 failed: {stderr.decode()[-300:]}", flush=True)
             return video_bytes
+
         with open(out_path, "rb") as f:
             cleaned = f.read()
-        print(f"[AudioClean] {len(video_bytes)//1024}KB → {len(cleaned)//1024}KB (cleaned)", flush=True)
+        print(f"[AudioClean] {len(video_bytes)//1024}KB → {len(cleaned)//1024}KB", flush=True)
         return cleaned
+
     except Exception as e:
-        print(f"[AudioClean] error: {e}, using original", flush=True)
+        print(f"[AudioClean] error: {e} — using original", flush=True)
         return video_bytes
     finally:
         for p in (in_path, out_path):
@@ -226,6 +235,48 @@ async def _upload_to_cloudinary(video_bytes: bytes, public_id: str) -> Optional[
         return None
 
 
+async def _upload_audio_to_cloudinary(audio_bytes: bytes, public_id: str) -> Optional[str]:
+    """
+    Upload an MP3 to Cloudinary under uri-music/custom/ using resource_type=raw.
+    Raw resources are served byte-for-byte as uploaded (no transcoding), which is
+    required for Shotstack to receive a valid audio/mpeg stream.
+    """
+    cloud = settings.CLOUDINARY_CLOUD_NAME
+    api_key = settings.CLOUDINARY_API_KEY
+    api_secret = settings.CLOUDINARY_API_SECRET
+    if not all([cloud, api_key, api_secret]):
+        return None
+    folder = "uri-music/custom"
+    ts = int(time.time())
+    params_str = f"folder={folder}&public_id={public_id}&timestamp={ts}"
+    signature = hashlib.sha1(f"{params_str}{api_secret}".encode()).hexdigest()
+    form = aiohttp.FormData()
+    form.add_field("file", audio_bytes, filename=f"{public_id}.mp3", content_type="audio/mpeg")
+    form.add_field("api_key", api_key)
+    form.add_field("timestamp", str(ts))
+    form.add_field("signature", signature)
+    form.add_field("public_id", public_id)
+    form.add_field("folder", folder)
+    form.add_field("resource_type", "raw")
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"https://api.cloudinary.com/v1_1/{cloud}/raw/upload",
+                data=form,
+                timeout=aiohttp.ClientTimeout(total=120),
+            ) as resp:
+                body = json.loads(await resp.text())
+                if not resp.ok:
+                    print(f"[CustomMusic] Cloudinary upload failed {resp.status}: {body}", flush=True)
+                    return None
+                url = body.get("secure_url", "")
+                print(f"[CustomMusic] Cloudinary → {url}", flush=True)
+                return url
+    except Exception as e:
+        print(f"[CustomMusic] Cloudinary error: {e}", flush=True)
+        return None
+
+
 async def _cloudinary_fetch_url(source_url: str, public_id: str) -> Optional[str]:
     """
     Tell Cloudinary to fetch a video from source_url — avoids file size limits entirely.
@@ -274,119 +325,6 @@ async def _cloudinary_fetch_url(source_url: str, public_id: str) -> Optional[str
         return None
 
 
-async def _upload_srt_to_cloudinary(srt_content: str, filename: str) -> Optional[str]:
-    """Upload a plain-text SRT file to Cloudinary raw storage. Returns the public URL."""
-    cloud = settings.CLOUDINARY_CLOUD_NAME
-    ak    = settings.CLOUDINARY_API_KEY
-    asec  = settings.CLOUDINARY_API_SECRET
-    if not all([cloud, ak, asec]):
-        return None
-    # public_id WITHOUT folder prefix — we set folder separately
-    pid = filename.replace(".srt", "")
-    ts  = int(time.time())
-    ps  = f"folder=uri-srt&public_id={pid}&timestamp={ts}"
-    sig = hashlib.sha1(f"{ps}{asec}".encode()).hexdigest()
-    form = aiohttp.FormData()
-    form.add_field("file", srt_content.encode(), filename=filename, content_type="text/plain")
-    form.add_field("api_key", ak); form.add_field("timestamp", str(ts))
-    form.add_field("signature", sig); form.add_field("public_id", pid)
-    form.add_field("folder", "uri-srt"); form.add_field("resource_type", "raw")
-    try:
-        async with aiohttp.ClientSession() as sess:
-            async with sess.post(
-                f"https://api.cloudinary.com/v1_1/{cloud}/raw/upload",
-                data=form, timeout=aiohttp.ClientTimeout(total=30)
-            ) as r:
-                body = await r.json()
-                url = body.get("secure_url", "")
-                if url:
-                    print(f"[SRT] uploaded {filename} → {url[:70]}", flush=True)
-                return url or None
-    except Exception as e:
-        print(f"[SRT] Cloudinary upload error: {e}", flush=True)
-        return None
-
-
-async def _cloudinary_proxy_asset(source_url: str, public_id: str) -> Optional[str]:
-    """
-    Download asset bytes from source_url (bypassing hotlink blocks), then upload to Cloudinary.
-    Returns the Cloudinary secure_url so Shotstack can always access it.
-    """
-    cloud = settings.CLOUDINARY_CLOUD_NAME
-    api_key = settings.CLOUDINARY_API_KEY
-    api_secret = settings.CLOUDINARY_API_SECRET
-    if not all([cloud, api_key, api_secret]):
-        return source_url
-
-    url_lower = source_url.lower().split("?")[0]
-    is_image = any(url_lower.endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".webp", ".gif"))
-    resource_type = "image" if is_image else "video"
-
-    # Detect content-type from URL if no extension (e.g. Pixabay image API URLs)
-    if not is_image and not any(url_lower.endswith(ext) for ext in (".mp4", ".mov", ".webm", ".avi")):
-        # Treat unknown extension as image (Pixabay largeImageURL has no extension sometimes)
-        resource_type = "image"
-        is_image = True
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; URISocial/1.0)",
-        "Referer": "https://pixabay.com/",
-    }
-
-    try:
-        async with aiohttp.ClientSession(headers=headers) as session:
-            # Step 1: download bytes
-            async with session.get(source_url, timeout=aiohttp.ClientTimeout(total=30)) as dl:
-                if not dl.ok:
-                    print(f"[Cloudinary:broll] download failed {dl.status} for {source_url[:60]}", flush=True)
-                    return None
-                # Detect actual content type from response
-                ct = dl.headers.get("Content-Type", "")
-                if "image" in ct:
-                    resource_type = "image"
-                    is_image = True
-                elif "video" in ct:
-                    resource_type = "video"
-                    is_image = False
-                asset_bytes = await dl.read()
-
-            print(f"[Cloudinary:broll] downloaded {len(asset_bytes)//1024}KB, type={resource_type}", flush=True)
-
-            # Step 2: upload bytes to Cloudinary
-            ext = "jpg" if is_image else "mp4"
-            folder = "uri-broll"
-            ts = int(time.time())
-            params_str = f"folder={folder}&public_id={public_id}&timestamp={ts}"
-            signature = hashlib.sha1(f"{params_str}{api_secret}".encode()).hexdigest()
-
-            form = aiohttp.FormData()
-            form.add_field("file", asset_bytes,
-                           filename=f"{public_id}.{ext}",
-                           content_type=ct or (f"image/{ext}" if is_image else "video/mp4"))
-            form.add_field("api_key", api_key)
-            form.add_field("timestamp", str(ts))
-            form.add_field("signature", signature)
-            form.add_field("public_id", public_id)
-            form.add_field("folder", folder)
-            form.add_field("resource_type", resource_type)
-
-            async with session.post(
-                f"https://api.cloudinary.com/v1_1/{cloud}/{resource_type}/upload",
-                data=form,
-                timeout=aiohttp.ClientTimeout(total=60),
-            ) as resp:
-                body = json.loads(await resp.text())
-                if not resp.ok:
-                    print(f"[Cloudinary:broll] upload failed {resp.status}: {body}", flush=True)
-                    return None
-                cdn_url = body.get("secure_url", "")
-                print(f"[Cloudinary:broll] → {cdn_url[:80]}", flush=True)
-                return cdn_url
-    except Exception as e:
-        print(f"[Cloudinary:broll] error: {e}", flush=True)
-        return None
-
-
 # ── B-roll asset fetch ────────────────────────────────────────────────────────
 
 # Cloudinary transition style per video type — fadewhite is the flash cut Shotstack lacked
@@ -397,7 +335,9 @@ _LUMA_MATTE_BY_TYPE: Dict[str, str] = {
     "product":  "uri-transitions/diagonal-wipe",  # diagonal sweep top-left → bottom-right
     "founder":  "uri-transitions/circle-wipe",    # same circle but slower (2.5s)
 }
-# Per-type transition duration (seconds). Must be less than every keep-segment.
+# Per-type transition duration (seconds) — must match the actual luma-matte video's length
+# uploaded to Cloudinary, because that determines how many seconds of overlap occur.
+# Used only when luma_pid is not None; hard-cut paths use transition_dur=0.0.
 _TRANSITION_DUR_BY_TYPE: Dict[str, float] = {
     "tiktok":   0.8,
     "product":  0.8,
@@ -432,8 +372,8 @@ _ICON_OVERLAY_LIBRARY: Dict[str, Dict[str, Any]] = {
     "star":      {"emoji": "⭐", "lottie": f"{_CDN}/uri-lottie/star.json", "position": "topRight",     "size": 140},
     "money":     {"emoji": "💰", "lottie": None,                            "position": "topRight",     "size": 140},
     "chart":     {"emoji": "📈", "lottie": None,                            "position": "topRight",     "size": 130},
-    "celebrate": {"emoji": "🎉", "lottie": None,                            "position": "top",          "size": 180},
-    "arrow_up":  {"emoji": "👆", "lottie": f"{_CDN}/uri-lottie/idea.json", "position": "bottom",       "size": 130},
+    "celebrate": {"emoji": "🎉", "lottie": None,                            "position": "topCenter",    "size": 180},
+    "arrow_up":  {"emoji": "👆", "lottie": f"{_CDN}/uri-lottie/idea.json", "position": "bottomCenter", "size": 130},
     "heart":     {"emoji": "❤️", "lottie": None,                            "position": "topRight",     "size": 130},
     "rocket":    {"emoji": "🚀", "lottie": None,                            "position": "topRight",     "size": 150},
 }
@@ -592,9 +532,11 @@ def _build_cloudinary_cut_url(
                 f"/fl_layer_apply"
             )
         else:
-            # Hard cut — just concatenate the segment with no transition layer
+            # Hard cut — fl_splice appends the segment sequentially (end-to-end).
+            # Without fl_splice, l_video/fl_layer_apply would OVERLAY both segments
+            # simultaneously, causing all audio tracks to play at the same time.
             parts.append(
-                f"l_video:{pid_enc}/so_{s},eo_{e}/fl_layer_apply"
+                f"fl_splice,l_video:{pid_enc}/so_{s},eo_{e}/fl_layer_apply"
             )
 
     url = (
@@ -609,550 +551,111 @@ def _build_cloudinary_cut_url(
     return url
 
 
-_BROLL_BAD_TAGS = {
-    "isolated", "cutout", "transparent",
-    "children", "child", "kids", "boy", "girl", "baby", "toddler",
-    "cartoon", "illustration", "vector", "icon", "logo",
-    "monochrome", "glamour", "black and white", "grayscale",
-    "suit", "necktie", "formal", "businessman",
-    "ai generated",
-    "portrait", "lifestyle", "fashion", "model", "headshot",
-    "food", "meal", "breakfast", "lunch", "dinner", "flatlay", "flat lay",
-    "waffle", "pancake", "cake", "cooking", "recipe",
-    "engineering", "blueprint", "cad", "architecture drawing",
-    "clock", "alarm", "alarm clock", "watch", "timepiece", "stopwatch", "timer",
-    "paper", "blank paper", "notebook paper", "document", "stationery",
-    # Off-topic physical scenes that pass a loose "is it a scene?" check but
-    # have zero connection to a social-media/business testimonial.
-    "skyscraper", "architecture", "building exterior", "tower", "facade",
-    "telephone", "phone booth", "booth", "payphone",
-    "street", "landmark", "monument", "landscape", "mountain", "nature",
-    "beach", "sunset", "forest",
-}
-_BROLL_GENERIC_SUBJ = {"woman", "man", "person", "people", "female", "male", "human"}
-
-
-async def _stock_video_search(
-    query: str,
-    exclude_ids: Optional[set] = None,
-    max_candidates: int = 4,
-) -> List[Tuple[str, Any]]:
-    """Search Pixabay for stock photos/videos that pass tag filters.
-    Returns up to max_candidates (url, hit_id) tuples — caller vision-verifies each one.
-    """
-    key = settings.PIXABAY_API_KEY
+async def _pexels_search(query: str) -> Optional[str]:
+    """Search Pexels for a short video clip. Returns a direct MP4 URL or None."""
+    key = settings.PEXELS_API_KEY
     if not key:
-        return []
-    exclude_ids = exclude_ids or set()
-    candidates: List[Tuple[str, Any]] = []
-
-    def _tag_passes(tag_str: str, query_words: set) -> bool:
-        tags = set(tag_str.lower().replace(",", " ").split())
-        if any(bt in tag_str.lower() for bt in _BROLL_BAD_TAGS):
-            return False
-        scene_q = query_words - _BROLL_GENERIC_SUBJ
-        scene_t = tags - _BROLL_GENERIC_SUBJ
-        if scene_q:
-            return bool(scene_q.intersection(scene_t))
-        return bool(query_words.intersection(tags))
-
+        return None
     try:
         async with aiohttp.ClientSession() as session:
-            # Portrait photos
             async with session.get(
-                "https://pixabay.com/api/",
-                params={
-                    "key": key, "q": query, "per_page": 20,
-                    "image_type": "photo", "safesearch": "true",
-                    "order": "popular", "orientation": "vertical",
-                },
+                "https://api.pexels.com/videos/search",
+                headers={"Authorization": key},
+                params={"query": query, "per_page": 8, "orientation": "portrait", "size": "medium"},
                 timeout=aiohttp.ClientTimeout(total=12),
             ) as resp:
-                if resp.ok:
-                    data = await resp.json()
-                    qw = set(query.lower().split())
-                    for hit in data.get("hits", []):
-                        if len(candidates) >= max_candidates:
-                            break
-                        if hit.get("views", 0) < 5000:
-                            continue
-                        hit_id = hit.get("id")
-                        if hit_id in exclude_ids:
-                            continue
-                        w = hit.get("imageWidth", 0) or hit.get("webformatWidth", 0)
-                        h = hit.get("imageHeight", 0) or hit.get("webformatHeight", 0)
-                        if w > 0 and h > 0 and (w / h) > 1.5:
-                            continue
-                        if not _tag_passes(hit.get("tags") or "", qw):
-                            continue
-                        url = hit.get("largeImageURL") or hit.get("webformatURL")
-                        if url:
-                            candidates.append((url, hit_id))
-
-            if len(candidates) >= max_candidates:
-                return candidates
-
-            # Video fallback with same tag filter
-            async with session.get(
-                "https://pixabay.com/api/videos/",
-                params={
-                    "key": key, "q": query, "per_page": 20,
-                    "video_type": "film", "order": "popular",
-                },
-                timeout=aiohttp.ClientTimeout(total=12),
-            ) as resp:
-                if resp.ok:
-                    data = await resp.json()
-                    qw = set(query.lower().split())
-                    for hit in data.get("hits", []):
-                        if len(candidates) >= max_candidates:
-                            break
-                        if hit.get("views", 0) < 1000:
-                            continue
-                        hit_id = hit.get("id")
-                        if hit_id in exclude_ids:
-                            continue
-                        if not _tag_passes(hit.get("tags") or "", qw):
-                            continue
-                        videos = hit.get("videos", {})
-                        for quality in ("medium", "large", "small"):
-                            url = (videos.get(quality) or {}).get("url")
-                            if url:
-                                candidates.append((url, hit_id))
-                                break
-    except Exception as e:
-        print(f"[B-roll] Pixabay error for '{query}': {e}", flush=True)
-    return candidates
-
-
-async def _fetch_image_b64(image_url: str) -> Optional[Tuple[str, str]]:
-    """Download an image with Pixabay-friendly headers and return (base64_str, mime).
-    OpenAI's servers cannot fetch Pixabay URLs directly (hotlink block), so we fetch
-    the bytes ourselves and hand GPT a data: URL. Returns None on failure."""
-    import base64
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; URISocial/1.0)",
-        "Referer": "https://pixabay.com/",
-    }
-    try:
-        async with aiohttp.ClientSession(headers=headers) as session:
-            async with session.get(image_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                 if not resp.ok:
+                    print(f"[B-roll] Pexels {resp.status} for '{query}'", flush=True)
                     return None
-                ct = resp.headers.get("Content-Type", "").split(";")[0].strip()
-                if "image" not in ct:
-                    return None  # video or non-image — can't verify a still frame
-                data = await resp.read()
-                if len(data) > 18 * 1024 * 1024:  # OpenAI ~20MB base64 limit
-                    return None
-                return base64.b64encode(data).decode("ascii"), (ct or "image/jpeg")
-    except Exception:
-        return None
-
-
-async def _verify_broll_image(image_url: str, speech: str, query: str) -> bool:
-    """
-    Ask GPT-4o-mini (vision) whether this image is contextually appropriate
-    for the given speech moment. Returns True = use it, False = skip it.
-    Defaults to False (skip) on any error — an unverifiable image is never worth
-    the risk of showing something irrelevant; generic fallbacks cover the gap.
-    """
-    fetched = await _fetch_image_b64(image_url)
-    if fetched is None:
-        # Couldn't download it as an image (hotlink block, video URL, too large).
-        print(f"[BrollVision] q='{query}' → could not fetch image — FAIL | {image_url[:60]}…", flush=True)
-        return False
-    b64, mime = fetched
-    data_url = f"data:{mime};base64,{b64}"
-    try:
-        client = openai.AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
-        resp = await client.chat.completions.create(
-            model="gpt-4o-mini",
-            max_tokens=10,
-            timeout=12,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": (
-                            "You are choosing b-roll for a talking-head testimonial about a social "
-                            "media management product. It will briefly appear while the speaker says:\n"
-                            f'  "{speech}"\n\n'
-                            "PASS if the image is ON-THEME for a modern social-media / business / "
-                            "work story — for example: someone working at a laptop or phone (seen "
-                            "candidly, from behind, side, or over-the-shoulder), a social media or "
-                            "app screen, content being created, an office or home-office desk, a "
-                            "workspace, or a real meeting. The link can be general; it just has to "
-                            "fit the world of the video and look like a genuine moment.\n\n"
-                            "FAIL if the image is OFF-THEME or in any of these banned categories:\n"
-                            "- A person looking at or smiling for the camera, or any posed/staged "
-                            "'stock model' shot (even at a desk with a laptop)\n"
-                            "- Primarily a person's face/portrait, headshot, or a fashion/lifestyle pose\n"
-                            "- A decorative lifestyle flat-lay: a laptop or desk styled with flowers, "
-                            "candles, coffee cups, pastries, or pretty props arranged for aesthetics\n"
-                            "- A food or drink photo, or any overhead flat-lay of objects on a surface\n"
-                            "- A building, skyscraper, architecture exterior, street, city, or landmark\n"
-                            "- A telephone booth, payphone, or an object matched by a keyword rather "
-                            "than meaning (e.g. 'phone' returning a red phone booth)\n"
-                            "- Scenery: landscape, nature, beach, sky, mountains, sunset, forest\n"
-                            "- Engineering drawings, CAD diagrams, or blueprints\n"
-                            "- A clock, alarm, watch, or timer\n"
-                            "- Blank paper, empty notebooks, or plain stationery\n"
-                            "- A cartoon, illustration, vector graphic, clip-art, icon set, or "
-                            "flat-design drawing — b-roll MUST be a real photograph\n"
-                            "- Anything showing app or brand logos (YouTube, TikTok, Facebook, etc.)\n"
-                            "- Anything that appears AI-generated or has garbled/unreadable text\n"
-                            "- Anything clearly unrelated to social media, business, or work\n"
-                            "Reply with exactly one word: PASS or FAIL"
-                        ),
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": data_url, "detail": "low"},
-                    },
-                ],
-            }],
-        )
-        verdict = (resp.choices[0].message.content or "").strip().upper()
-        passed = verdict.startswith("PASS")
-        print(f"[BrollVision] q='{query}' → {verdict} | {image_url[:60]}…", flush=True)
-        return passed
+                data = await resp.json()
+                videos = data.get("videos", [])
+                if not videos:
+                    # Retry without orientation filter — portrait stock is sparse
+                    async with session.get(
+                        "https://api.pexels.com/videos/search",
+                        headers={"Authorization": key},
+                        params={"query": query, "per_page": 8, "size": "medium"},
+                        timeout=aiohttp.ClientTimeout(total=12),
+                    ) as resp2:
+                        if resp2.ok:
+                            data = await resp2.json()
+                            videos = data.get("videos", [])
+                for video in videos:
+                    files = sorted(
+                        video.get("video_files", []),
+                        key=lambda f: f.get("height", 0), reverse=True,
+                    )
+                    for f in files:
+                        link = f.get("link", "")
+                        if link and f.get("height", 0) >= 720:
+                            return link
     except Exception as e:
-        # Vision unavailable (timeout, rate limit, API error) — skip rather than risk
-        # showing an irrelevant image. Fallbacks fill any gap.
-        print(f"[BrollVision] error ({e}) — FAIL | {image_url[:60]}…", flush=True)
-        return False
+        print(f"[B-roll] Pexels error for '{query}': {e}", flush=True)
+    return None
 
 
 async def _fal_generate(description: str) -> Optional[str]:
-    """Generate a short video clip with fal.ai LTX-Video. Returns URL or None."""
+    """Generate a short video clip with fal.ai Wan T2V. Returns URL or None."""
     key = settings.FAL_API_KEY
     if not key:
         return None
+    model = "fal-ai/wan/t2v-1.3b"
+    headers = {"Authorization": f"Key {key}", "Content-Type": "application/json"}
     try:
-        import fal_client
-        import os
-        os.environ["FAL_KEY"] = key
+        async with aiohttp.ClientSession() as session:
+            # Submit job
+            async with session.post(
+                f"https://queue.fal.run/{model}",
+                headers=headers,
+                json={"prompt": description, "duration": "3"},
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if not resp.ok:
+                    print(f"[B-roll] fal.ai submit {resp.status}", flush=True)
+                    return None
+                job = await resp.json()
+                req_id = job.get("request_id")
+                if not req_id:
+                    return None
 
-        handler = await fal_client.submit_async(
-            "fal-ai/ltx-video",
-            arguments={
-                "prompt": description,
-                "num_frames": 65,
-                "fps": 24,
-                "width": 512,
-                "height": 896,
-            },
-        )
-        result = await handler.get()
-        video = (result.get("video") or result.get("videos") or [{}])
-        if isinstance(video, list):
-            video = video[0] if video else {}
-        url = video.get("url") if isinstance(video, dict) else None
-        if url:
-            print(f"[B-roll] fal.ai generated → {url[:70]}…", flush=True)
-        return url
+            # Poll for up to 90s
+            for _ in range(18):
+                await asyncio.sleep(5)
+                async with session.get(
+                    f"https://queue.fal.run/{model}/requests/{req_id}/status",
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as s:
+                    status_data = await s.json()
+                    if status_data.get("status") == "COMPLETED":
+                        break
+                    if status_data.get("status") == "FAILED":
+                        return None
+
+            # Fetch result
+            async with session.get(
+                f"https://queue.fal.run/{model}/requests/{req_id}",
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as res:
+                result = await res.json()
+                return (result.get("video") or {}).get("url")
     except Exception as e:
         print(f"[B-roll] fal.ai error: {e}", flush=True)
     return None
 
 
-async def _upload_image_bytes_to_cloudinary(img_bytes: bytes, public_id: str) -> Optional[str]:
-    """Upload raw image bytes to Cloudinary and return the secure_url."""
-    cloud = settings.CLOUDINARY_CLOUD_NAME
-    api_key = settings.CLOUDINARY_API_KEY
-    api_secret = settings.CLOUDINARY_API_SECRET
-    if not all([cloud, api_key, api_secret]):
-        return None
-    folder = "uri-broll"
-    ts = int(time.time())
-    params_str = f"folder={folder}&public_id={public_id}&timestamp={ts}"
-    signature = hashlib.sha1(f"{params_str}{api_secret}".encode()).hexdigest()
-    form = aiohttp.FormData()
-    form.add_field("file", img_bytes, filename=f"{public_id}.png", content_type="image/png")
-    form.add_field("api_key", api_key)
-    form.add_field("timestamp", str(ts))
-    form.add_field("signature", signature)
-    form.add_field("public_id", public_id)
-    form.add_field("folder", folder)
-    form.add_field("resource_type", "image")
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"https://api.cloudinary.com/v1_1/{cloud}/image/upload",
-                data=form, timeout=aiohttp.ClientTimeout(total=60),
-            ) as resp:
-                body = json.loads(await resp.text())
-                if not resp.ok:
-                    print(f"[Cloudinary:gen] upload failed {resp.status}: {body}", flush=True)
-                    return None
-                return body.get("secure_url", "") or None
-    except Exception as e:
-        print(f"[Cloudinary:gen] error: {e}", flush=True)
-        return None
-
-
-async def _generate_broll_image(image_prompt: str) -> Optional[str]:
-    """
-    Generate a photorealistic 9:16 b-roll still with gpt-image-1 and host it on
-    Cloudinary. Returns the CDN URL, or None on failure.
-
-    The image is CREATED to match the moment, so relevance no longer depends on a
-    stock library happening to have the right shot. We always append hard constraints
-    (photoreal, no text, no logos, not an illustration) to keep results on-brand.
-    """
-    import base64
-    import uuid as _uuid
-    if not settings.OPENAI_API_KEY or not (image_prompt or "").strip():
-        return None
-    # Fixed art direction so every clip shares one cohesive, branded cinematic look.
-    _STYLE = (
-        "Shot on a 35mm cinema camera, cinematic color grade with soft warm highlights "
-        "and gentle teal shadows, filmic contrast, shallow depth of field, natural "
-        "lighting, subtle film grain, consistent muted palette across the frame."
-    )
-    full_prompt = (
-        f"{image_prompt.strip()}. "
-        f"{_STYLE} Vertical 9:16 framing, photorealistic candid documentary photograph. "
-        "It must look like a real photo — NOT an illustration, cartoon, 3D render, or "
-        "clip-art. Absolutely no text, no words, no captions, no watermarks, no logos, "
-        "no brand marks, and no on-screen UI text."
-    )
-    try:
-        client = openai.AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
-        resp = await client.images.generate(
-            model="gpt-image-1",
-            prompt=full_prompt,
-            size="1024x1536",   # portrait, cover-fits 9:16
-            quality="high",
-            n=1,
-        )
-        b64 = resp.data[0].b64_json if resp.data else None
-        if not b64:
-            return None
-        img_bytes = base64.b64decode(b64)
-        pid = f"broll-gen-{_uuid.uuid4().hex[:12]}"
-        cdn = await _upload_image_bytes_to_cloudinary(img_bytes, pid)
-        if cdn:
-            print(f"[B-roll:gen] generated → {cdn[:80]}", flush=True)
-        return cdn
-    except Exception as e:
-        print(f"[B-roll:gen] error: {e}", flush=True)
-        return None
-
-
-def _clean_pexels_query(concept: str, description: str) -> str:
-    """Return a clean Pixabay search term from the b-roll concept/description."""
-    import re
-    text = concept or description
-    text = re.sub(r'\$[\d,]+k?', 'money finance', text)
-    text = re.sub(r'[^\w\s]', ' ', text)
-    return ' '.join(text.split()[:5]).strip() or 'business person'
-
-
-_BROLL_STOP_WORDS = {
-    "a","an","the","is","are","was","were","be","been","being","have","has","had",
-    "do","does","did","will","would","could","should","may","might","and","or",
-    "but","in","on","at","to","for","of","with","by","from","as","about","that",
-    "this","what","how","watch","build","demo","framing","opener","admits","tease",
-    "actually","affords","transparency","lets","who","its","their","just","like",
-    "really","very","so","get","got","one","two","three","four","five","six",
-    "seven","eight","nine","ten","also","even","then","than","when","here","there",
-    "going","thing","things","people","said","tell","told","say","know","want","need",
-    "make","made","take","took","come","came","see","saw","think","thought","feel",
-    "felt","way","time","year","day","week","month","back","right","left","now",
-    "still","only","more","most","some","many","much","every","all","any","both",
-}
-
-# Abstract filler words that produce bad stock photo results — replace with visuals
-_ABSTRACT_TO_VISUAL = {
-    "success": "trophy winner podium",
-    "growth": "graph chart upward",
-    "money": "dollar bills stack",
-    "income": "person laptop working home",
-    "revenue": "money cash wallet",
-    "sales": "handshake business deal",
-    "results": "graph chart upward",
-    "strategy": "whiteboard planning office",
-    "content": "camera creator filming",
-    "posting": "woman phone social media",
-    "social": "phone app screen",
-    "brand": "logo design computer",
-    "marketing": "laptop analytics screen",
-    "audience": "people crowd event",
-    "followers": "phone screen followers",
-    "engagement": "phone likes comments",
-    "business": "office desk laptop",
-    "entrepreneur": "woman laptop working",
-    "tired": "laptop desk office",
-    "burnout": "office desk computer",
-    "consistent": "calendar planner schedule",
-    "stress": "stressed woman hands",
-    "overwhelmed": "woman head hands stress",
-    "freedom": "woman laptop smiling outdoor",
-    "commute": "person working laptop home",
-    "passive": "person laptop home coffee",
-    "bus": "person working laptop home",
-    "office": "home office desk setup",
-    "phone": "person phone online shopping",
-    "call": "person headset working",
-    "earn": "warehouse boxes stacked",
-    "earning": "person laptop working home",
-    "found": "entrepreneur success laptop",
-    "niche": "entrepreneur success laptop",
-    "started": "warehouse boxes stacked",
-    "beginning": "warehouse boxes stacked",
-    "minutes": "laptop screen typing",
-    "seconds": "phone screen app",
-    "quickly": "laptop screen typing",
-    "instantly": "phone setup screen",
-    "clock": "laptop workspace desk",
-    "alarm": "laptop workspace desk",
-    "watch": "laptop workspace desk",
-    "paper": "laptop workspace office",
-    "notebook": "laptop workspace office",
-}
-
-
-# Brand names that Pixabay misinterprets (amazon → parrot, netflix → logo art, etc.)
-_PIXABAY_BRAND_STRIP = {
-    "amazon", "netflix", "shopify", "instagram", "facebook", "tiktok",
-    "youtube", "twitter", "google", "apple", "uber", "airbnb", "stripe",
-}
-
-
-def _sanitise_broll_query(concept: str, description: str) -> str:
-    """Return a clean 2–3 word Pixabay search term from concept or description."""
-    import re
-    text = concept or description
-    # Exact-match on full concept → use visual phrase directly
-    clean_full = text.strip().lower()
-    if clean_full in _ABSTRACT_TO_VISUAL:
-        return _ABSTRACT_TO_VISUAL[clean_full]
-    # Replace dollar/number notation with visual tag
-    text = re.sub(r'\$[\d,]+k?', 'income', text)
-    text = re.sub(r'[\d,]+k\b', 'income', text)
-    # Strip negation words so "no bus no office" → "bus office"
-    text = re.sub(r'\bno\b|\bnot\b|\bnever\b', '', text, flags=re.IGNORECASE)
-    raw_words = [
-        w for w in re.sub(r'[^\w\s]', ' ', text).lower().split()
-        if w not in _BROLL_STOP_WORDS and w not in _PIXABAY_BRAND_STRIP and len(w) > 2
-    ]
-    if not raw_words:
-        return 'business person working'
-    # Multi-word query: GPT already chose contextual words — trust them as-is.
-    # Per-word substitution breaks good queries (e.g. "phone" in "person phone payment"
-    # would hijack the whole query to "person phone online shopping").
-    if len(raw_words) >= 2:
-        return ' '.join(raw_words[:3])
-    # Single abstract word: apply visual mapping
-    w = raw_words[0]
-    return _ABSTRACT_TO_VISUAL.get(w, w) or 'business person working'
-
-
-def _speech_to_broll_query(speech_text: str, gpt_concept: str) -> str:
-    """
-    Build a Pixabay-ready search query grounded in the literal speech.
-    Uses the actual words being spoken as primary signal, GPT concept as fallback.
-    """
-    import re
-
-    raw = speech_text.lower()
-
-    # Check if any single abstract word in gpt_concept maps to a richer visual
-    for word, visual in _ABSTRACT_TO_VISUAL.items():
-        if word in raw or word in gpt_concept.lower():
-            # Still use GPT concept if it's more specific (more than 1 word)
-            if len(gpt_concept.split()) >= 2:
-                return _sanitise_broll_query(gpt_concept, "")
-            return visual
-
-    # Extract concrete nouns/adjectives from the speech itself
-    raw = re.sub(r'\$[\d,]+k?', 'money', raw)
-    raw = re.sub(r'[\d,]+k\b', 'money', raw)
-    raw = re.sub(r'[^\w\s]', ' ', raw)
-    words = [w for w in raw.split()
-             if w not in _BROLL_STOP_WORDS and len(w) > 2]
-
-    speech_query = ' '.join(words[:3])
-
-    if speech_query:
-        return speech_query
-
-    # Fallback to GPT's concept
-    return _sanitise_broll_query(gpt_concept, "")
-
-
-def _srt_text_at(srt_entries: List[Dict[str, Any]], at: float, window: float = 3.0) -> str:
-    """Return transcript words spoken in the window [at, at+window]."""
-    return ' '.join(
-        e['text'] for e in srt_entries
-        if e['start'] < at + window and e['end'] > at
-    )
-
-
-def _snap_to_srt_start(srt_entries: List[Dict[str, Any]], at: float, window: float = 4.0) -> float:
-    """Snap `at` to the nearest SRT entry start within ±window seconds.
-    Returns the SRT word boundary so b-roll lands exactly when speech begins."""
-    best_t = at
-    best_dist = float("inf")
-    for e in srt_entries:
-        dist = abs(e["start"] - at)
-        if dist < window and dist < best_dist:
-            best_dist = dist
-            best_t = e["start"]
-    return best_t
-
-
-async def _fetch_broll_url(
-    description: str,
-    concept: str,
-    concept_alt: str = "",
-    exclude_ids: Optional[set] = None,
-) -> tuple:
-    """
-    Priority: Pixabay primary → Pixabay alt → fal.ai generate.
-    All results are proxied through Cloudinary so Shotstack can access them.
-    Returns (cloudinary_url, pixabay_id) — pixabay_id is None for fal.ai results.
-    """
-    import uuid as _uuid
-
-    exclude_ids = exclude_ids or set()
-
-    async def _proxied(raw_url: str) -> Optional[str]:
-        pid = f"broll-{_uuid.uuid4().hex[:12]}"
-        return await _cloudinary_proxy_asset(raw_url, pid)
-
-    async def _find_verified(q: str) -> tuple:
-        """Return (proxied_url, hit_id) for the first candidate that passes vision check."""
-        candidates = await _stock_video_search(q, exclude_ids=exclude_ids)
-        for raw_url, hit_id in candidates:
-            if await _verify_broll_image(raw_url, description, q):
-                print(f"[B-roll] vision PASS '{q}' → proxying…", flush=True)
-                cdn = await _proxied(raw_url)
-                if cdn:
-                    return cdn, hit_id
-            else:
-                print(f"[B-roll] vision FAIL — skipping candidate", flush=True)
-        return None, None
-
-    query = _sanitise_broll_query(concept, description)
-    cdn_url, hit_id = await _find_verified(query)
-    if cdn_url:
-        return cdn_url, hit_id
-
-    if concept_alt:
-        alt_query = _sanitise_broll_query(concept_alt, description)
-        cdn_url, hit_id = await _find_verified(alt_query)
-        if cdn_url:
-            return cdn_url, hit_id
-
-    # NO generic fallbacks. If we can't find a photo of the actual concrete thing the
-    # speaker named, show nothing — the talking head + captions carry the moment. A
-    # generic office/laptop stand-in is exactly the disconnect we're avoiding.
-    print(f"[B-roll] no on-topic photo for '{query}' — skipping this clip (no filler)", flush=True)
-    return None, None
+async def _fetch_broll_url(description: str, concept: str) -> Optional[str]:
+    """Priority: Pexels stock → fal.ai generate. Returns a public video URL or None."""
+    url = await _pexels_search(concept or description)
+    if url:
+        print(f"[B-roll] Pexels hit: '{concept}' → {url[:70]}…", flush=True)
+        return url
+    print(f"[B-roll] Pexels miss for '{concept}', trying fal.ai…", flush=True)
+    url = await _fal_generate(description)
+    if url:
+        print(f"[B-roll] fal.ai generated for '{description[:40]}' → {url[:70]}…", flush=True)
+    return url
 
 
 # ── Background music ──────────────────────────────────────────────────────────
@@ -1373,49 +876,13 @@ ANALYSIS TASKS:
 6. KEYWORDS — Brands, platforms, products, metrics, important nouns. Max 5.
    These feed the visual asset search engine for b-roll and icons.
 
-7. B-ROLL — 4–6 cutaway moments. For each you will WRITE A PHOTOREALISTIC IMAGE DESCRIPTION
-   that an image model will generate. You are NOT limited to stock footage — describe exactly
-   the scene that fits the moment, and it will be created. This means relevance is on you:
-   every image must clearly depict what the speaker is talking about at that timestamp.
-
-   Spread clips across the video (roughly every 8–12 seconds). Pick the moments where a visual
-   genuinely strengthens the message: an action, a place, a device or screen, a product, a
-   situation, or a clear before/after feeling. Ground every image in the actual words spoken.
-
-   For each clip provide:
-   - "at": the second the speaker STARTS the relevant phrase (use the SRT transcript to be precise)
-   - "duration": 4
-   - "image_prompt": a vivid one–two sentence PHOTOREALISTIC scene description for the image model.
-     Describe subject, setting, action, mood, and lighting. It must read like a real candid photo.
-     Show the SITUATION the speaker describes. Examples:
-       speech "clients kept rejecting our content" →
-         "A frustrated marketing team in a dim office looking dejected at a laptop screen showing rejected drafts, moody lighting, over-the-shoulder angle"
-       speech "I spoke to her for just five minutes" →
-         "A relaxed businesswoman having a quick friendly chat at a bright modern desk, laptop open, warm daylight"
-       speech "I don't think about what to post anymore" →
-         "Over-the-shoulder view of a calm person scrolling a social media feed on a phone in a sunlit cafe"
-   - "description": the exact words the speaker says at that moment
-   - "reason": what about the speech this image depicts
-
-   IMAGE_PROMPT RULES (critical):
-   • Photorealistic, candid, documentary style — like a real photograph. NEVER illustration,
-     cartoon, 3D render, clip-art, or icon graphics.
-   • NO text, NO words, NO captions, NO logos, NO brand names, NO on-screen UI text in the scene.
-   • Show real people naturally (candid, from behind / side / over-the-shoulder), real workspaces,
-     real devices, real environments.
-   • Match the EMOTION and SITUATION of the speech — not random imagery.
-   • Do NOT name brands (no "Instagram logo", "Amazon warehouse"). Describe the generic activity.
-   • For money/metrics, show the PRODUCT or ACTIVITY that earned it — never cash or dollar bills.
-
-8. CUTS — ONLY remove silence gaps or pure filler with NO meaningful speech:
-   - Silent pauses ≥1s where the speaker says nothing
-   - Isolated filler words with silence around them: "um", "uh", "like", "you know"
-   - NEVER cut while the speaker is actively talking — even filler mid-sentence must stay
-   - NEVER cut a segment where the speaker is making a point, even if the delivery is imperfect
+7. CUTS — Remove only spoken content with zero value:
+   - Filler words/phrases: "um", "uh", "like", "you know", "I mean", "basically", "right?", "okay so"
+   - False starts: speaker begins, stops, restarts the same sentence
+   - Exact repetitions: same idea said twice in a row
    - remove_start and remove_end within [0, {duration:.1f}]
    - Every segment kept between cuts must be ≥4s
    - confidence 0.0–1.0
-   - If unsure whether there is speech in a region, DO NOT include it as a cut
 
 8. MUSIC MOOD — One word: upbeat | chill | cinematic | dramatic | acoustic | electronic
 
@@ -1447,10 +914,6 @@ Return ONLY valid JSON, no markdown:
     {{"at": 29.8, "text": "500 leads in 30 days", "strength": 10, "confidence": 0.98}}
   ],
   "keywords": ["Instagram", "leads", "content strategy"],
-  "broll": [
-    {{"at": 5.5, "duration": 4, "image_prompt": "Over-the-shoulder view of a calm young woman scrolling a colourful social media feed on her phone while sitting in a sunlit modern cafe, candid, shallow depth of field", "description": "posting three times a week on social media", "reason": "depicts the daily social posting she describes"}},
-    {{"at": 22.0, "duration": 4, "image_prompt": "A focused entrepreneur in a warehouse sealing and stacking cardboard shipping boxes on a trolley, natural warehouse light, candid documentary photo", "description": "I ship twelve thousand packages a month", "reason": "shows the packages being shipped that she mentions"}}
-  ],
   "cuts": [
     {{"remove_start": 4.2, "remove_end": 5.8, "reason": "filler: um you know", "confidence": 0.98}}
   ],
@@ -1460,7 +923,7 @@ Return ONLY valid JSON, no markdown:
 
     client = openai.AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
     response = await client.chat.completions.create(
-        model="o3",
+        model="gpt-5",
         messages=[{"role": "user", "content": prompt}],
         response_format={"type": "json_object"},
     )
@@ -1481,12 +944,7 @@ Return ONLY valid JSON, no markdown:
         return {}
 
 
-def apply_editing_rules(
-    analysis: Dict[str, Any],
-    duration: float,
-    enable_sfx: bool = True,
-    srt_entries: Optional[List[Dict[str, Any]]] = None,
-) -> Dict[str, Any]:
+def apply_editing_rules(analysis: Dict[str, Any], duration: float, enable_sfx: bool = True) -> Dict[str, Any]:
     """
     Phase 2 — Editing Rules Engine.
     Deterministic conversion of content analysis into render decisions.
@@ -1497,23 +955,10 @@ def apply_editing_rules(
       4–7:  zoom_in (subtle)
       1–3:  no action
     """
-    # ── Cuts: only remove silence/gaps — never cut over real speech ──────────
-    _srt = srt_entries or []
-    def _has_speech(start: float, end: float) -> bool:
-        """Return True if any SRT word/phrase overlaps this time range by >0.1s."""
-        for e in _srt:
-            e_start = float(e.get("start", 0))
-            e_end   = float(e.get("end", 0))
-            overlap = min(end, e_end) - max(start, e_start)
-            if overlap > 0.1:
-                return True
-        return False
-
+    # ── Cuts: only high-confidence decisions apply automatically ─────────────
     cuts = [
         c for c in analysis.get("cuts", [])
-        if float(c.get("confidence", 1.0)) >= 0.95            # very high bar — only certain silences
-        and (float(c.get("remove_end", 0)) - float(c.get("remove_start", 0))) <= 5.0  # max 5s cut
-        and not _has_speech(float(c.get("remove_start", 0)), float(c.get("remove_end", 0)))
+        if float(c.get("confidence", 1.0)) >= _CONFIDENCE_THRESHOLD
     ]
 
     zooms: List[Dict] = []
@@ -1565,56 +1010,24 @@ def apply_editing_rules(
     if cta_start is not None and float(cta_start) < duration:
         icon_overlays.append({"at": round(float(cta_start) + 1.0, 2), "duration": 3.0, "category": "arrow_up"})
 
-    # ── B-roll ────────────────────────────────────────────────────────────────
-    # Minimum gap between end of one clip and start of next — keeps the speaker's
-    # face visible for at least MIN_FACE_TIME seconds between b-roll moments.
-    _MIN_FACE_TIME = 5.0
+    # ── B-roll from main_points + keywords ───────────────────────────────────
     keywords = analysis.get("keywords", [])
     broll: List[Dict] = []
-    _broll_end_time = -999.0  # tracks when the last b-roll clip will end
-    for br in sorted(analysis.get("broll", [])[:8], key=lambda x: float(x.get("at", 0))):
-        at = float(br.get("at", 0))
+    for i, point in enumerate(analysis.get("main_points", [])[:3]):
+        at = float(point.get("start", 0)) + 2.0
         if at >= duration:
             continue
-
-        # Each clip must carry an image_prompt — that's what we generate the b-roll from.
-        image_prompt = str(br.get("image_prompt", "")).strip()
-        if not image_prompt:
-            print(f"[B-roll] skipping at={at:.1f}s — no image_prompt", flush=True)
-            continue
-
-        br_dur = float(br.get("duration", 4.0))
-
-        # Snap GPT's rough timestamp to the nearest SRT word boundary for precise sync
-        snapped_at = _snap_to_srt_start(srt_entries or [], at, window=4.0)
-
-        # Enforce minimum face-time gap: skip if previous b-roll clip hasn't ended + gap
-        if snapped_at < _broll_end_time + _MIN_FACE_TIME:
-            print(f"[B-roll] skipping at={snapped_at:.1f}s — too close to previous clip end={_broll_end_time:.1f}s", flush=True)
-            continue
-
-        description = br.get("description", "")
-
-        # Legacy stock-search fallback fields (kept for backward-compat); generation
-        # from image_prompt is the primary path.
-        gpt_concept   = br.get("search_query") or br.get("concept") or ""
-        gpt_alt       = br.get("search_query_alt", "")
-        primary_query = _sanitise_broll_query(gpt_concept, description)
-        alt_query     = _sanitise_broll_query(gpt_alt, description) if gpt_alt else primary_query
-
-        speech = _srt_text_at(srt_entries or [], snapped_at, window=3.0)
-        print(f"[B-roll] gpt_at={at:.1f}s → srt_at={snapped_at:.2f}s speech='{speech[:50]}' prompt='{image_prompt[:60]}'", flush=True)
-
-        broll.append({
-            "at": round(snapped_at, 2),
-            "duration": br_dur,
-            "description": description,
-            "image_prompt": image_prompt,
-            "concept": primary_query,
-            "concept_alt": alt_query,
-            "reason": br.get("reason", ""),
-        })
-        _broll_end_time = snapped_at + br_dur
+        # Use keyword matching the point index, fall back to summary
+        concept = keywords[i] if i < len(keywords) else ""
+        description = point.get("summary", concept)
+        if concept or description:
+            broll.append({
+                "at": round(at, 2),
+                "duration": 3.0,
+                "description": description,
+                "concept": concept or description,
+                "reason": f"visual for: {description}",
+            })
 
     # ── Hook ─────────────────────────────────────────────────────────────────
     hook = analysis.get("hook", {})
@@ -1649,7 +1062,7 @@ def apply_editing_rules(
         "cuts":             cuts,
         "zooms":            zooms[:4],
         "sound_effects":    sound_effects[:4],
-        "broll":            broll[:7],
+        "broll":            broll[:3],
         "hook_text":        hook_text,
         "music_mood":       analysis.get("music_mood", "upbeat"),
         "topic_changes":    analysis.get("topic_changes", []),
@@ -1926,6 +1339,49 @@ def _repetition_cuts_from_srt(srt_entries: List[Dict[str, Any]]) -> List[Dict]:
     return cuts
 
 
+_HALLUCINATED_CAPTION_PHRASES: List[str] = [
+    "thanks for watching",
+    "thank you for watching",
+    "thanks for tuning in",
+    "thank you for tuning in",
+    "please like and subscribe",
+    "like and subscribe",
+    "don't forget to subscribe",
+    "do not forget to subscribe",
+    "hit the notification bell",
+    "smash the like button",
+    "comment below",
+    "see you in the next video",
+    "see you next time",
+    "subscribe for more",
+    "follow for more",
+    "don't forget to like",
+    "if you enjoyed this video",
+    "if you liked this video",
+    "until next time",
+]
+
+
+def _filter_hallucinated_captions(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Remove SRT entries whose text matches known AI-hallucinated phrases."""
+    filtered = []
+    for entry in entries:
+        clean = entry["text"].lower().strip(" .,!?;:\"'")
+        is_hallucination = any(
+            phrase in clean
+            for phrase in _HALLUCINATED_CAPTION_PHRASES
+        )
+        if is_hallucination:
+            print(
+                f"[Captions] dropped hallucinated entry: \"{entry['text'].strip()}\" "
+                f"({entry['start']:.2f}s–{entry['end']:.2f}s)",
+                flush=True,
+            )
+        else:
+            filtered.append(entry)
+    return filtered
+
+
 def _merge_cuts(auto: List[Dict], gpt: List[Dict]) -> List[Dict]:
     """Union of auto and GPT cuts. Where they overlap keep the wider range."""
     all_cuts = auto + gpt
@@ -2038,9 +1494,9 @@ def build_shotstack_timeline(
     video_type: str = "founder",                          # drives flash vs. swipe style
     icon_overlays: Optional[List[Dict[str, Any]]] = None, # resolved: [{at, duration, category, html, ...}]
     transition_style: str = "auto",  # overrides video_type-based flash/swipe selection
-    srt_url_overrides: Optional[Dict[str, str]] = None,  # filename → public URL (for local dev)
+    music_volume: float = 0.08,
+    mute_original_audio: bool = False,
 ) -> Dict[str, Any]:
-    srt_url_overrides = srt_url_overrides or {}
     # broll items have: at (original ts), duration, url (resolved)
     keep_segments = _build_keep_segments(cuts, video_duration)
     raw_total = sum(s["src_end"] - s["src_start"] for s in keep_segments)
@@ -2048,18 +1504,25 @@ def build_shotstack_timeline(
     total_duration = raw_total - max(0, len(keep_segments) - 1) * transition_dur
 
     # ── Video track ───────────────────────────────────────────────────────────
-    # cover-fit fills the portrait frame naturally (slight crop on edges is normal
-    # for vertical social content — exactly what TikTok/Reels do).
     video_clips: List[Dict] = []
 
+    _orig_volume = 0 if mute_original_audio else 1
+
     if cloudinary_cut_url:
+        # Cloudinary pre-rendered the cuts + transitions — Shotstack gets ONE clip.
+        # Apply a global slow zoom so the full video has forward motion.
         video_clips = [{
-            "asset": {"type": "video", "src": cloudinary_cut_url, "volume": 1},
+            "asset": {"type": "video", "src": cloudinary_cut_url, "volume": _orig_volume},
             "start": 0,
             "length": round(total_duration, 3),
             "fit": "cover",
+            "effect": "zoomInSlow",
         }]
-        print(f"[VideoProduction] using Cloudinary pre-cut URL ({len(keep_segments)} segments)", flush=True)
+        print(
+            f"[VideoProduction] using Cloudinary pre-cut URL ({len(keep_segments)} segments) "
+            f"orig_volume={_orig_volume}",
+            flush=True,
+        )
     else:
         # Fallback: multi-clip Shotstack timeline with per-segment Ken Burns + skew
         timeline_pos = 0.0
@@ -2069,22 +1532,43 @@ def build_shotstack_timeline(
                 continue
 
             seg_zooms = [z for z in zooms if seg["src_start"] <= float(z.get("at", -1)) < seg["src_end"]]
+            base_effect = "slideLeft" if i % 2 == 0 else "slideRight"
 
             clip: Dict[str, Any] = {
                 "asset": {
                     "type": "video",
                     "src": video_url,
                     "trim": seg["src_start"],
-                    "volume": 1,
+                    "volume": _orig_volume,
                 },
                 "start": round(timeline_pos, 3),
                 "length": round(seg_dur, 3),
                 "fit": "cover",
+                "effect": base_effect,
             }
+
+            if i > 0:
+                clip["transition"] = {"in": "zoom"}
 
             if seg_zooms:
                 z = seg_zooms[0]
                 clip["effect"] = "zoomIn" if z.get("intensity") != "strong" else "zoomOut"
+                clip["transform"] = {
+                    "rotate": {
+                        "angle": [
+                            {"from": 6.0, "to": -3.0, "start": 0, "length": 0.35,
+                             "interpolation": "bezier", "easing": "easeOutBack"},
+                            {"from": -3.0, "to": 0, "start": 0.35, "length": 0.2,
+                             "interpolation": "bezier", "easing": "easeOutCubic"},
+                        ]
+                    },
+                    "skew": {
+                        "x": [
+                            {"from": 0.07, "to": 0, "start": 0, "length": 0.3,
+                             "interpolation": "bezier", "easing": "easeOutCubic"},
+                        ]
+                    },
+                }
 
             video_clips.append(clip)
             timeline_pos += seg_dur
@@ -2095,31 +1579,48 @@ def build_shotstack_timeline(
     # All clips run for the full video duration; only entries in their SRT are shown.
     _cues = caption_cues or []
     _MAX_CAPTION_WORDS = 5
+    # How far to extend a short entry's display window into a trailing gap.
+    # Only applied when no next entry starts within this window, so no overlaps occur.
+    _MIN_DISPLAY_DUR = 0.5
     _CAP_TYPES = ("standard", "emphasis", "metric", "cta")
     type_srt_lines: Dict[str, List[str]] = {t: [] for t in _CAP_TYPES}
     type_entry_num: Dict[str, int]       = {t: 1    for t in _CAP_TYPES}
 
+    # ── Pass 1: map every SRT entry to timeline positions ────────────────────
+    _mapped: List[tuple] = []   # (tl_start, tl_end, entry)
     for entry in srt_entries:
-        tl_start = _original_to_timeline(entry["start"], keep_segments, transition_dur=transition_dur)
-        tl_end   = _original_to_timeline(entry["end"],   keep_segments, clamp=True, transition_dur=transition_dur)
-        if tl_start is None or tl_end is None:
+        ts = _original_to_timeline(entry["start"], keep_segments, transition_dur=transition_dur)
+        te = _original_to_timeline(entry["end"],   keep_segments, clamp=True, transition_dur=transition_dur)
+        if ts is None or te is None:
             continue
-        tl_start = max(0.0, tl_start)
-        tl_end   = min(total_duration, tl_end)
+        ts = max(0.0, ts)
+        te = min(total_duration, te)
+        if te - ts < 0.05:
+            continue
+        _mapped.append((ts, te, entry))
+
+    # ── Pass 2: emit SRT lines with gap-aware extension ──────────────────────
+    for i, (tl_start, tl_end, entry) in enumerate(_mapped):
         entry_dur = tl_end - tl_start
-        if entry_dur < 0.1:
-            continue
+        cap_type  = _get_caption_type(entry["start"], _cues, entry["text"])
+        words     = entry["text"].split()
 
-        cap_type = _get_caption_type(entry["start"], _cues, entry["text"])
-
-        words = entry["text"].split()
         if len(words) <= _MAX_CAPTION_WORDS:
+            # Extend display into any REAL gap after this entry.
+            # Cap at the next entry's start so we never push into it and cause drift.
+            next_tl_start = _mapped[i + 1][0] if i + 1 < len(_mapped) else total_duration
+            display_end = max(
+                tl_end,
+                min(tl_start + _MIN_DISPLAY_DUR, next_tl_start - 0.03, total_duration),
+            )
             n = type_entry_num[cap_type]
             type_srt_lines[cap_type] += [
-                str(n), f"{_srt_time(tl_start)} --> {_srt_time(tl_end)}", entry["text"], ""
+                str(n), f"{_srt_time(tl_start)} --> {_srt_time(display_end)}", entry["text"], ""
             ]
             type_entry_num[cap_type] += 1
         else:
+            # Multi-word entry: chunk using NATURAL timing only.
+            # Never stretch beyond tl_end — that pushes later chunks past the audio.
             chunks = [words[j:j + _MAX_CAPTION_WORDS] for j in range(0, len(words), _MAX_CAPTION_WORDS)]
             per_word_dur = entry_dur / len(words)
             chunk_start  = tl_start
@@ -2135,30 +1636,41 @@ def build_shotstack_timeline(
                 type_entry_num[cap_type] += 1
                 chunk_start = chunk_end
 
-    srt_dir = "/app/static/srt" if os.path.isdir("/app") else os.path.join(tempfile.gettempdir(), "uri_static_srt")
+    srt_dir = "/app/static/srt"
     os.makedirs(srt_dir, exist_ok=True)
 
-    # Per-type Shotstack caption styling — clean social-media style (Poppins, no heavy stroke)
+    # Per-type Shotstack rich-caption styling
     _cap_style_map: Dict[str, Dict] = {
         "standard": {
-            "font":   {"family": "Poppins", "size": 46, "color": "#ffffff", "stroke": "#000000", "strokeWidth": 1},
-            "bg":     {"color": "#000000", "opacity": 0.55, "padding": 16, "borderRadius": 16},
-            "width":  560, "height": 220, "y": 0.07,
+            "font":    {"family": "Montserrat", "size": 46, "color": "#ffffff", "weight": 800},
+            "stroke":  {"width": 2, "color": "#000000", "opacity": 1},
+            "active":  {"font": {"color": secondary_color, "background": primary_color},
+                        "stroke": {"width": 0, "color": "#000000", "opacity": 0}},
+            "width":   580, "height": 220, "y": 0.07,
         },
         "emphasis": {
-            "font":   {"family": "Poppins", "size": 52, "color": "#ffffff", "stroke": "#000000", "strokeWidth": 1},
-            "bg":     {"color": "#000000", "opacity": 0.6, "padding": 18, "borderRadius": 16},
-            "width":  600, "height": 240, "y": 0.09,
+            # Bigger, heavier — reserved for high-strength emphasis moments
+            "font":    {"family": "Montserrat", "size": 58, "color": "#ffffff", "weight": 900},
+            "stroke":  {"width": 3, "color": "#000000", "opacity": 1},
+            "active":  {"font": {"color": "#ffffff", "background": primary_color},
+                        "stroke": {"width": 0, "color": "#000000", "opacity": 0}},
+            "width":   640, "height": 260, "y": 0.09,
         },
         "metric": {
-            "font":   {"family": "Poppins", "size": 50, "color": "#FFE566", "stroke": "#000000", "strokeWidth": 1},
-            "bg":     {"color": "#000000", "opacity": 0.6, "padding": 16, "borderRadius": 16},
-            "width":  560, "height": 220, "y": 0.07,
+            # Gold text so numbers/stats stand out visually
+            "font":    {"family": "Montserrat", "size": 52, "color": "#FFE566", "weight": 900},
+            "stroke":  {"width": 2, "color": "#000000", "opacity": 1},
+            "active":  {"font": {"color": "#000000", "background": "#FFE566"},
+                        "stroke": {"width": 0, "color": "#000000", "opacity": 0}},
+            "width":   580, "height": 220, "y": 0.07,
         },
         "cta": {
-            "font":   {"family": "Poppins", "size": 44, "color": "#ffffff", "stroke": "#000000", "strokeWidth": 1},
-            "bg":     {"color": "#000000", "opacity": 0.55, "padding": 16, "borderRadius": 16},
-            "width":  560, "height": 220, "y": 0.12,
+            # Slightly higher position + brand accent to feel like a call-to-action
+            "font":    {"family": "Montserrat", "size": 44, "color": "#ffffff", "weight": 800},
+            "stroke":  {"width": 2, "color": "#000000", "opacity": 0.8},
+            "active":  {"font": {"color": "#ffffff", "background": primary_color},
+                        "stroke": {"width": 0, "color": "#000000", "opacity": 0}},
+            "width":   580, "height": 220, "y": 0.12,
         },
     }
 
@@ -2173,8 +1685,7 @@ def build_shotstack_timeline(
         srt_filename = f"{job_id or 'job'}_{cap_type}.srt"
         with open(f"{srt_dir}/{srt_filename}", "w", encoding="utf-8") as f:
             f.write("\n".join(lines))
-        base = getattr(settings, "PUBLIC_API_URL", "https://api-staging.urisocial.com")
-        srt_url = srt_url_overrides.get(srt_filename) or f"{base}/static/srt/{srt_filename}"
+        srt_url = f"https://api-staging.urisocial.com/static/srt/{srt_filename}"
         print(
             f"[VideoProduction] caption:{cap_type} {n_entries} entries → {srt_url}",
             flush=True,
@@ -2182,13 +1693,17 @@ def build_shotstack_timeline(
         st = _cap_style_map[cap_type]
         caption_clips.append({
             "asset": {
-                "type":       "caption",
-                "src":        srt_url,
-                "font":       st["font"],
-                "background": st["bg"],
+                "type":      "rich-caption",
+                "src":       srt_url,
+                "font":      st["font"],
+                "stroke":    st["stroke"],
+                "animation": {"style": "karaoke"},
+                "active":    st["active"],
+                "style":     {"textTransform": "uppercase"},
+                "padding":   {"top": 6, "right": 20, "bottom": 6, "left": 20},
             },
             "start":    0,
-            "length":   video_duration,
+            "length":   "end",
             "width":    st["width"],
             "height":   st["height"],
             "position": "bottom",
@@ -2214,13 +1729,11 @@ def build_shotstack_timeline(
             tl_at = _original_to_timeline(orig_at, keep_segments, transition_dur=transition_dur)
             if tl_at is None:
                 continue
-            # Keep SFX subtle — voice always dominant. Impact is the loudest so needs most reduction.
-            sfx_volume = 0.18 if sfx_type == "impact" else 0.28
             sfx_clips.append({
                 "asset": {
                     "type": "audio",
                     "src": sfx_url,
-                    "volume": sfx_volume,
+                    "volume": 0.65,
                     "trim": 0,
                 },
                 "start": round(tl_at, 3),
@@ -2274,6 +1787,7 @@ def build_shotstack_timeline(
             "length":     round(actual_dur, 3),
             "opacity":    _tc_op,
             "transition": {"in": tr_in, "out": tr_out},
+            "position":   "fill",
         })
         print(
             f"[VideoProduction] topic-change {_tc_type} at orig={orig_at:.1f}s → tl={tl_at:.1f}s",
@@ -2326,10 +1840,7 @@ def build_shotstack_timeline(
         )
 
     # ── B-roll track ──────────────────────────────────────────────────────────
-    # Ken Burns: alternate a slow zoom in/out per clip so generated stills feel alive.
-    _KEN_BURNS = ["zoomIn", "zoomOut"]
     broll_clips: List[Dict] = []
-    _br_idx = 0
     for br in (broll or []):
         br_url = br.get("url")
         if not br_url:
@@ -2345,29 +1856,25 @@ def build_shotstack_timeline(
         br_dur = min(br_dur, total_duration - tl_at)
         if br_dur < 0.5:
             continue
-        url_lower = br_url.lower().split("?")[0]
-        is_image = (
-            any(url_lower.endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".webp"))
-            or "/image/upload/" in url_lower
-        )
-        if is_image:
-            asset = {"type": "image", "src": br_url}
-        else:
-            asset = {"type": "video", "src": br_url, "trim": 0, "volume": 0}
-
-        clip: Dict[str, Any] = {
-            "asset": asset,
+        fade = min(0.25, br_dur / 4)
+        broll_clips.append({
+            "asset": {
+                "type": "video",
+                "src": br_url,
+                "trim": 0,
+                "volume": 0,  # keep original voice; mute b-roll audio
+            },
             "start": round(tl_at, 3),
             "length": round(br_dur, 3),
             "fit": "cover",
-            # Quick cross-fade in/out — smooths the b-roll's entrance/exit. This is a
-            # short boundary fade, not an opacity keyframe blend (which caused ghosting).
-            "transition": {"in": "fade", "out": "fade"},
-        }
-        if is_image:
-            clip["effect"] = _KEN_BURNS[_br_idx % len(_KEN_BURNS)]  # slow zoom motion
-        broll_clips.append(clip)
-        _br_idx += 1
+            "effect": "slideUp",
+            "opacity": [
+                {"from": 0, "to": 1, "start": 0, "length": fade,
+                 "interpolation": "bezier", "easing": "easeOutCubic"},
+                {"from": 1, "to": 0, "start": round(br_dur - fade, 3), "length": fade,
+                 "interpolation": "bezier", "easing": "easeInCubic"},
+            ],
+        })
 
     # ── Background music track ────────────────────────────────────────────────
     music_clips: List[Dict] = []
@@ -2377,14 +1884,14 @@ def build_shotstack_timeline(
             "asset": {
                 "type": "audio",
                 "src": music_url,
-                "volume": 0.04,   # background only — voice always dominant
+                "volume": music_volume,
                 "trim": 0,
             },
             "start": 0,
             "length": round(total_duration, 3),
             "transition": {"in": "fade", "out": "fade"},  # smooth fade at both ends
         }]
-        print(f"[Music] added track volume=0.08 length={total_duration:.1f}s fade={fade:.1f}s", flush=True)
+        print(f"[Music] added track volume={music_volume} length={total_duration:.1f}s fade={fade:.1f}s", flush=True)
 
     # ── Hook title card (rich-text overlay, first 2.5s) ──────────────────────
     # Shotstack's renderer collapses multi-element stacking (both <br> and separate
@@ -2538,8 +2045,7 @@ def build_shotstack_timeline(
         tracks.append({"clips": caption_clips})
     if broll_clips:
         tracks.append({"clips": broll_clips})
-    if video_clips:
-        tracks.append({"clips": video_clips})
+    tracks.append({"clips": video_clips})
     if sfx_clips:
         tracks.append({"clips": sfx_clips})
     if music_clips:
@@ -2632,7 +2138,10 @@ async def run_production_job(
     video_type: str,
     db,
     enable_music: bool = True,
-    enable_sfx: bool = False,
+    mute_original_audio: bool = False,
+    enable_sfx: bool = True,
+    enable_captions: bool = True,
+    custom_music_bytes: bytes = b"",
     transition_style: str = "auto",  # auto | circle_wipe | diagonal_wipe | flash | swipe | hard_cut | none
 ) -> None:
     reap = ReapProvider()
@@ -2645,15 +2154,7 @@ async def run_production_job(
             "status": status,
         }
         doc.update(extra)
-        for attempt in range(4):
-            try:
-                await db.video_production_jobs.update_one({"job_id": job_id}, {"$set": doc})
-                break
-            except Exception as db_err:
-                if attempt == 3:
-                    print(f"[VideoProduction] DB write failed after 4 attempts: {db_err}", flush=True)
-                else:
-                    await asyncio.sleep(3 * (attempt + 1))
+        await db.video_production_jobs.update_one({"job_id": job_id}, {"$set": doc})
         print(f"[VideoProduction] job={job_id} {progress}% {message}", flush=True)
 
     try:
@@ -2687,79 +2188,99 @@ async def run_production_job(
             flush=True,
         )
 
-        # ── Normalise to H.264 MP4 before Reap (handles .mov / HEVC from iPhone) ──
-        video_bytes = await _ensure_h264_mp4(video_bytes)
+        # ── Save custom music to static server (if provided) ─────────────────────
+        # Static server is the same host Shotstack already fetches SRT files from —
+        # guaranteed reachable during the render window.
+        # A background Cloudinary upload follows for long-term CDN storage.
+        custom_music_url: str = ""
+        if custom_music_bytes:
+            try:
+                _music_dir = "/app/static/music"
+                os.makedirs(_music_dir, exist_ok=True)
+                with open(f"{_music_dir}/{job_id}.mp3", "wb") as _mf:
+                    _mf.write(custom_music_bytes)
+                custom_music_url = f"https://api-staging.urisocial.com/static/music/{job_id}.mp3"
+                print(
+                    f"[CustomMusic] static {len(custom_music_bytes)//1024}KB → {custom_music_url}",
+                    flush=True,
+                )
+                # Best-effort Cloudinary backup (non-blocking).
+                asyncio.ensure_future(
+                    _upload_audio_to_cloudinary(custom_music_bytes, f"custom-{job_id}")
+                )
+            except Exception as _e:
+                print(f"[CustomMusic] static save failed: {_e} — AI music will be used", flush=True)
 
         # ── Stage 1: Reap — word-level transcript + timestamps + clip detection ──
-        await update(5, "Checking audio…")
-        has_speech = _probe_has_speech(video_bytes)
-        print(f"[VideoProduction] has_speech={has_speech}", flush=True)
-
         srt_text: str = ""
         _reap_video_url: str = ""
         tracking_data: Dict[str, Any] = {}
 
-        if has_speech:
-            await update(8, "Transcribing…")
-            upload_id = await reap.upload_video(video_bytes, f"{job_id}_raw.mp4")
-            if not upload_id:
-                raise RuntimeError("Upload to Reap failed")
-
-            trans_id = await reap.start_transcription(upload_id, "en")
-            if not trans_id:
-                raise RuntimeError("Transcription failed to start")
-
-            try:
-                srt_text, _reap_video_url, tracking_data = await reap.fetch_full_transcript_data(
-                    trans_id, timeout_seconds=600
-                )
-                if srt_text:
-                    print(
-                        f"[VideoProduction] srt={len(srt_text)}ch tracking={bool(tracking_data)}",
-                        flush=True,
-                    )
-                else:
-                    print("[VideoProduction] Reap returned empty transcript — continuing without captions", flush=True)
-            except ValueError:
-                # Reap returned invalid_content — audio present but no clear speech (music-only)
-                # Fall through gracefully; pipeline still produces cuts/zooms/music without captions
-                print("[VideoProduction] Reap: no speech in audio — continuing without transcript", flush=True)
-                srt_text = ""
-                _reap_video_url = ""
-                tracking_data = {}
+        if not enable_captions:
+            print("[VideoProduction] captions disabled by user — skipping transcription", flush=True)
+            await update(30, "Captions disabled — skipping transcription…")
         else:
-            print("[VideoProduction] ffmpeg: no audio stream — skipping Reap", flush=True)
-            await update(30, "No audio detected — skipping transcription…")
+            await update(5, "Checking audio…")
+            has_speech = _probe_has_speech(video_bytes)
+            print(f"[VideoProduction] has_speech={has_speech}", flush=True)
+
+            if has_speech:
+                await update(8, "Transcribing…")
+                upload_id = await reap.upload_video(video_bytes, f"{job_id}_raw.mp4")
+                if not upload_id:
+                    raise RuntimeError("Upload to Reap failed")
+
+                trans_id = await reap.start_transcription(upload_id, "en")
+                if not trans_id:
+                    raise RuntimeError("Transcription failed to start")
+
+                try:
+                    srt_text, _reap_video_url, tracking_data = await reap.fetch_full_transcript_data(
+                        trans_id, timeout_seconds=600
+                    )
+                    if srt_text:
+                        print(
+                            f"[VideoProduction] srt={len(srt_text)}ch tracking={bool(tracking_data)}",
+                            flush=True,
+                        )
+                    else:
+                        print("[VideoProduction] Reap returned empty transcript — continuing without captions", flush=True)
+                except ValueError:
+                    # Reap returned invalid_content — audio present but no clear speech (music-only)
+                    print("[VideoProduction] Reap: no speech in audio — continuing without transcript", flush=True)
+                    srt_text = ""
+                    _reap_video_url = ""
+                    tracking_data = {}
+            else:
+                print("[VideoProduction] ffmpeg: no audio stream — skipping Reap", flush=True)
+                await update(30, "No audio detected — skipping transcription…")
 
         # ── Stage 2: Audio cleanup — noise reduction, leveling, de-essing ────────
         await update(30, "Cleaning audio…")
         cleaned_bytes = await _clean_audio(video_bytes)
 
+        # Step 1: always write to static server (reliable, no size limit).
+        # Step 2: tell Cloudinary to fetch from that URL — avoids direct byte upload
+        #         and Cloudinary's 100MB per-request limit entirely.
         await update(38, "Uploading clean video…")
-        clean_video_url = None
+        video_static_dir = "/app/static/videos"
+        os.makedirs(video_static_dir, exist_ok=True)
         static_url = ""
-        if os.path.isdir("/app"):
-            # Production: write to static dir then tell Cloudinary to fetch it
-            video_static_dir = "/app/static/videos"
-            os.makedirs(video_static_dir, exist_ok=True)
-            static_url = ""
-            try:
-                with open(f"{video_static_dir}/{job_id}.mp4", "wb") as vf:
-                    vf.write(cleaned_bytes)
-                static_url = f"https://api-staging.urisocial.com/static/videos/{job_id}.mp4"
-                print(f"[VideoProduction] static: {len(cleaned_bytes)//1024}KB → {static_url}", flush=True)
-            except Exception as e:
-                print(f"[VideoProduction] static write failed: {e}", flush=True)
-            if static_url:
-                clean_video_url = await _cloudinary_fetch_url(static_url, job_id)
-            if not clean_video_url:
-                clean_video_url = static_url or _reap_video_url
-        else:
-            # Local dev: upload bytes directly to Cloudinary
-            print(f"[VideoProduction] local dev: uploading {len(cleaned_bytes)//1024}KB directly to Cloudinary", flush=True)
-            clean_video_url = await _upload_to_cloudinary(cleaned_bytes, f"uri-video-prod/{job_id}")
-            if not clean_video_url:
-                clean_video_url = _reap_video_url
+        try:
+            with open(f"{video_static_dir}/{job_id}.mp4", "wb") as vf:
+                vf.write(cleaned_bytes)
+            static_url = f"https://api-staging.urisocial.com/static/videos/{job_id}.mp4"
+            print(f"[VideoProduction] static: {len(cleaned_bytes)//1024}KB → {static_url}", flush=True)
+        except Exception as e:
+            print(f"[VideoProduction] static write failed: {e}", flush=True)
+
+        # Now try to register on Cloudinary via URL fetch (no byte transfer).
+        clean_video_url = None
+        if static_url:
+            clean_video_url = await _cloudinary_fetch_url(static_url, job_id)
+        # Fallback chain: Cloudinary → static → Reap source
+        if not clean_video_url:
+            clean_video_url = static_url or _reap_video_url
 
         if not clean_video_url:
             raise RuntimeError("Could not obtain a video URL for rendering")
@@ -2768,10 +2289,10 @@ async def run_production_job(
 
         # ── Stage 3: Content Analysis (Phase 1) + Editing Rules (Phase 2) ────────
         await update(48, "AI analyzing content…")
-        srt_entries = _parse_srt(srt_text)
+        srt_entries = _filter_hallucinated_captions(_parse_srt(srt_text))
 
         analysis  = await analyze_content(srt_text, video_type, duration, tracking_data)
-        decisions = apply_editing_rules(analysis, duration, enable_sfx=enable_sfx, srt_entries=srt_entries)
+        decisions = apply_editing_rules(analysis, duration, enable_sfx=enable_sfx)
 
         gpt_cuts        = decisions["cuts"]
         zooms           = decisions["zooms"]
@@ -2804,28 +2325,12 @@ async def run_production_job(
             flush=True,
         )
 
-        # ── Generate b-roll images up-front so the user reviews REAL thumbnails ───
-        # (not blind prompts). Each item gets a "url"; failed generations are dropped.
-        if broll_decisions:
-            await update(55, "Generating b-roll visuals…")
-
-            async def _resolve_broll(br: Dict) -> Optional[Dict]:
-                prompt = br.get("image_prompt", "")
-                url = await _generate_broll_image(prompt) if prompt else None
-                return {**br, "url": url} if url else None
-
-            _results = await asyncio.gather(*[_resolve_broll(b) for b in broll_decisions])
-            broll_decisions = [r for r in _results if r]
-            print(f"[VideoProduction] pre-generated {len(broll_decisions)} b-roll images", flush=True)
-
-        # ── Store decisions + render context, then PAUSE for user review ──────────
-        # The user can remove, reroll, or edit-and-regenerate each b-roll, then hit
-        # start-render. Generated images already have URLs so render won't re-create them.
+        # ── REVIEW PAUSE — store decisions + render context, wait for user approval ─
         await db.video_production_jobs.update_one(
             {"job_id": job_id},
             {"$set": {
                 "status": "awaiting_review",
-                "status_message": "Review your b-roll before rendering",
+                "status_message": "Review AI decisions before rendering",
                 "progress": 55,
                 "ai_decisions": {
                     "cuts":           cuts,
@@ -2852,46 +2357,54 @@ async def run_production_job(
                     "tagline": tagline,
                     "website": website,
                     "enable_music": enable_music,
+                    "mute_original_audio": mute_original_audio,
+                    "custom_music_url": custom_music_url,
                     "transition_style": transition_style,
                 },
             }}
         )
         print(
             f"[VideoProduction] job={job_id} awaiting_review — "
-            f"{len(cuts)} cuts {len(zooms)} zooms {len(broll_decisions)} b-roll hook='{hook_text}'",
+            f"{len(cuts)} cuts {len(zooms)} zooms {len(sound_effects)} sfx "
+            f"{len(icon_overlays)} icons hook='{hook_text}'",
             flush=True,
         )
         return  # pipeline resumes via POST /produce-video-job/{id}/start-render
 
-        # ── Stage 4: Fetch assets — b-roll (Pixabay → fal.ai) + SFX library ──────
+        # ── Stage 4: Fetch assets — b-roll (Pexels → fal.ai) + SFX library ──────
         broll: List[Dict] = []
         if broll_decisions:
             await update(55, "Fetching b-roll assets…")
-            used_pixabay_ids: set = set()
-            for br in broll_decisions:
-                cdn_url, hit_id = await _fetch_broll_url(
-                    br.get("description", ""), br.get("concept", ""), br.get("concept_alt", ""),
-                    exclude_ids=used_pixabay_ids,
-                )
-                if cdn_url:
-                    broll.append({**br, "url": cdn_url})
-                    if hit_id is not None:
-                        used_pixabay_ids.add(hit_id)
+            tasks = [
+                _fetch_broll_url(br.get("description", ""), br.get("concept", ""))
+                for br in broll_decisions
+            ]
+            urls = await asyncio.gather(*tasks, return_exceptions=True)
+            for br, url in zip(broll_decisions, urls):
+                if isinstance(url, str) and url:
+                    broll.append({**br, "url": url})
             print(f"[VideoProduction] broll resolved {len(broll)}/{len(broll_decisions)}", flush=True)
 
-        # ── Stage 4b: Pick background music from Cloudinary library ─────────────
-        music_url = ""
+        # ── Stage 4b: Music — only runs when enable_music=True ──────────────────
+        music_url    = ""
+        music_volume = 0.08
         if enable_music:
-            await update(59, "Selecting background music…")
-            music_url = _pick_music_url(music_mood)
+            if custom_music_url:
+                music_url    = custom_music_url
+                music_volume = 0.25
+                print(f"[Music] custom track → {custom_music_url[-60:]}", flush=True)
+            else:
+                await update(59, "Selecting background music…")
+                music_url = _pick_music_url(music_mood)
 
         # ── Stage 5: Shotstack render + mix ──────────────────────────────────────
         await update(62, "Building edit timeline…")
 
-        # Build Cloudinary cut URL — cuts + transitions in a single CDN-served video.
-        # Shotstack then receives ONE clip and only handles captions, hook, music, SFX.
-        luma_pid     = _LUMA_MATTE_BY_TYPE.get(video_type, "uri-transitions/circle-wipe")
-        transition_dur = _TRANSITION_DUR_BY_TYPE.get(video_type, _CLD_TRANSITION_DUR)
+        # Build Cloudinary cut URL — hard cuts (no luma-matte) so both segment audio
+        # tracks never overlap, and transition_dur=0.0 keeps caption timestamps exact.
+        # Shotstack topic-change flash/swipe overlays provide visual polish at cut points.
+        luma_pid       = None   # hard cuts
+        transition_dur = 0.0
         cloudinary_cut_url = ""
         if "res.cloudinary.com" in (clean_video_url or ""):
             cld_pid = _cloudinary_public_id(clean_video_url)
@@ -2930,6 +2443,7 @@ async def run_production_job(
             aspect_ratio="9:16",
             job_id=job_id,
             music_url=music_url,
+            music_volume=music_volume,
             hook_text=hook_text,
             cloudinary_cut_url=cloudinary_cut_url,
             transition_dur=transition_dur if cloudinary_cut_url else 0.0,
@@ -2942,6 +2456,7 @@ async def run_production_job(
             caption_cues=decisions.get("caption_cues", []),
             topic_changes=decisions.get("topic_changes", []),
             video_type=video_type,
+            mute_original_audio=mute_original_audio,
         )
 
         await update(68, "Rendering video…")
@@ -2998,15 +2513,7 @@ async def run_render_phase(job_id: str, db) -> None:
     async def update(progress: int, message: str, status: str = "processing", **extra):
         doc: Dict[str, Any] = {"progress": progress, "status_message": message, "status": status}
         doc.update(extra)
-        for attempt in range(4):
-            try:
-                await db.video_production_jobs.update_one({"job_id": job_id}, {"$set": doc})
-                break
-            except Exception as db_err:
-                if attempt == 3:
-                    print(f"[VideoProduction:render] DB write failed after 4 attempts: {db_err}", flush=True)
-                else:
-                    await asyncio.sleep(3 * (attempt + 1))
+        await db.video_production_jobs.update_one({"job_id": job_id}, {"$set": doc})
         print(f"[VideoProduction:render] job={job_id} {progress}% {message}", flush=True)
 
     try:
@@ -3031,9 +2538,11 @@ async def run_render_phase(job_id: str, db) -> None:
         clean_video_url   = ctx.get("cloudinary_url") or ctx.get("static_url", "")
         srt_text          = ctx.get("srt_text", "")
         duration          = float(ctx.get("duration", 120.0))
-        video_type        = ctx.get("video_type", "founder")
-        enable_music      = ctx.get("enable_music", True)
-        transition_style  = ctx.get("transition_style", "auto")
+        video_type           = ctx.get("video_type", "founder")
+        enable_music         = ctx.get("enable_music", True)
+        mute_original_audio  = ctx.get("mute_original_audio", False)
+        custom_music_url     = ctx.get("custom_music_url", "")
+        transition_style     = ctx.get("transition_style", "auto")
         logo_url        = ctx.get("logo_url", "")
         brand_name      = ctx.get("brand_name", "")
         primary_color   = ctx.get("primary_color", "#FFD700")
@@ -3041,51 +2550,51 @@ async def run_render_phase(job_id: str, db) -> None:
         tagline         = ctx.get("tagline", "")
         website         = ctx.get("website", "")
 
-        srt_entries = _parse_srt(srt_text)
+        srt_entries = _filter_hallucinated_captions(_parse_srt(srt_text))
 
-        # ── Stage 4a: B-roll — reuse the images generated (and user-edited) at review ─
-        # Items already carry a "url" from the review step, so we don't regenerate.
-        # Only generate for any item still missing one (e.g. legacy jobs).
+        # ── Stage 4a: B-roll ──────────────────────────────────────────────────────
         broll: List[Dict] = []
         if broll_decisions:
-            await update(58, "Preparing b-roll…")
+            await update(58, "Fetching b-roll assets…")
+            tasks = [
+                _fetch_broll_url(br.get("description", ""), br.get("concept", ""))
+                for br in broll_decisions
+            ]
+            urls = await asyncio.gather(*tasks, return_exceptions=True)
+            for br, url in zip(broll_decisions, urls):
+                if isinstance(url, str) and url:
+                    broll.append({**br, "url": url})
+            print(f"[VideoProduction:render] broll {len(broll)}/{len(broll_decisions)}", flush=True)
 
-            async def _resolve(br: Dict) -> Optional[Dict]:
-                if br.get("url"):
-                    return br  # already generated / user-edited at review
-                prompt = br.get("image_prompt", "")
-                cdn_url = await _generate_broll_image(prompt) if prompt else None
-                # Legacy jobs (no image_prompt) fall back to stock search.
-                if not cdn_url and not prompt:
-                    cdn_url, _ = await _fetch_broll_url(
-                        br.get("description", ""), br.get("concept", ""), br.get("concept_alt", ""),
-                    )
-                return {**br, "url": cdn_url} if cdn_url else None
-
-            results = await asyncio.gather(*[_resolve(br) for br in broll_decisions])
-            broll = [r for r in results if r]
-            print(f"[VideoProduction:render] broll {len(broll)}/{len(broll_decisions)} ready", flush=True)
-
-        # ── Stage 4b: Music ───────────────────────────────────────────────────────
+        # ── Stage 4b: Music — only runs when enable_music=True ──────────────────
         music_url = ""
+        music_volume = 0.08
         if enable_music:
-            await update(62, "Selecting background music…")
-            music_url = _pick_music_url(music_mood)
+            if custom_music_url:
+                music_url = custom_music_url
+                music_volume = 0.25
+                print(f"[Music] custom track → {custom_music_url[-60:]}", flush=True)
+            else:
+                await update(62, "Selecting background music…")
+                music_url = _pick_music_url(music_mood)
 
         # ── Stage 5: Build Cloudinary cut URL + Shotstack timeline ───────────────
         await update(65, "Building edit timeline…")
 
-        # Resolve luma-matte PID from transition_style
+        # Resolve luma-matte PID from transition_style.
+        # Default "auto" uses hard cuts — no audio overlap and perfect caption sync.
+        # Luma-matte styles are still available on explicit request but require the
+        # transition_dur value to exactly match the uploaded luma-matte video's length.
         _LUMA_BY_STYLE: Dict[str, Optional[str]] = {
-            "auto":          _LUMA_MATTE_BY_TYPE.get(video_type, "uri-transitions/circle-wipe"),
+            "auto":          None,   # hard cuts by default — no audio overlap
             "circle_wipe":   "uri-transitions/circle-wipe",
             "diagonal_wipe": "uri-transitions/diagonal-wipe",
-            "flash":         None,   # hard cut; flash overlay handled by Shotstack
-            "swipe":         None,   # hard cut; swipe overlay handled by Shotstack
+            "flash":         None,
+            "swipe":         None,
             "hard_cut":      None,
             "none":          None,
         }
-        luma_pid       = _LUMA_BY_STYLE.get(transition_style, _LUMA_MATTE_BY_TYPE.get(video_type, "uri-transitions/circle-wipe"))
+        luma_pid       = _LUMA_BY_STYLE.get(transition_style, None)
         transition_dur = _TRANSITION_DUR_BY_TYPE.get(video_type, _CLD_TRANSITION_DUR) if luma_pid else 0.0
 
         cloudinary_cut_url = ""
@@ -3115,22 +2624,6 @@ async def run_render_phase(job_id: str, db) -> None:
                 flush=True,
             )
 
-        # In local dev, SRT files can't be served to Shotstack from localhost.
-        # Pre-upload them to Cloudinary so Shotstack always gets a reachable URL.
-        srt_url_overrides: Dict[str, str] = {}
-        if not os.path.isdir("/app") and srt_entries:
-            await update(66, "Uploading captions…")
-            for cap_type in ("standard", "emphasis", "cta", "metric"):
-                fname = f"{job_id}_{cap_type}.srt"
-                fpath = os.path.join(
-                    tempfile.gettempdir(), "uri_static_srt", fname
-                )
-                if os.path.exists(fpath):
-                    with open(fpath) as _f:
-                        cdn = await _upload_srt_to_cloudinary(_f.read(), fname)
-                    if cdn:
-                        srt_url_overrides[fname] = cdn
-
         timeline = build_shotstack_timeline(
             video_url=clean_video_url,
             video_duration=duration,
@@ -3156,26 +2649,9 @@ async def run_render_phase(job_id: str, db) -> None:
             video_type=video_type,
             icon_overlays=resolved_icon_overlays,
             transition_style=transition_style,
-            srt_url_overrides=srt_url_overrides,
+            music_volume=music_volume,
+            mute_original_audio=mute_original_audio,
         )
-
-        # In local dev, SRT files were just written to disk by build_shotstack_timeline.
-        # Upload them to Cloudinary now and patch the staging URLs in the timeline.
-        if not os.path.isdir("/app"):
-            srt_dir = os.path.join(tempfile.gettempdir(), "uri_static_srt")
-            for track in timeline.get("timeline", {}).get("tracks", []):
-                for clip in track.get("clips", []):
-                    asset = clip.get("asset", {})
-                    if asset.get("type") == "caption":
-                        src = asset.get("src", "")
-                        fname = src.split("/")[-1]
-                        fpath = os.path.join(srt_dir, fname)
-                        if os.path.exists(fpath) and fname not in srt_url_overrides:
-                            with open(fpath) as _f:
-                                cdn = await _upload_srt_to_cloudinary(_f.read(), fname)
-                            if cdn:
-                                asset["src"] = cdn
-                                print(f"[SRT] patched {fname} → {cdn[:60]}", flush=True)
 
         await update(68, "Rendering video…")
         render_id = await shotstack.render(timeline)
@@ -3213,13 +2689,7 @@ async def run_render_phase(job_id: str, db) -> None:
 
     except Exception as exc:
         print(f"[VideoProduction:render] FAILED job={job_id}: {exc}", flush=True)
-        for attempt in range(4):
-            try:
-                await db.video_production_jobs.update_one(
-                    {"job_id": job_id},
-                    {"$set": {"status": "failed", "status_message": str(exc), "progress": 0}},
-                )
-                break
-            except Exception:
-                if attempt < 3:
-                    await asyncio.sleep(3 * (attempt + 1))
+        await db.video_production_jobs.update_one(
+            {"job_id": job_id},
+            {"$set": {"status": "failed", "status_message": str(exc), "progress": 0}},
+        )
