@@ -41,6 +41,8 @@ class BrandProfileService:
             "voice_sample": data.get("voice_sample", ""),
             "platform_tones": data.get("platform_tones", {}),
             "same_tone_everywhere": data.get("same_tone_everywhere", True),
+            "target_audience": data.get("target_audience", ""),
+            "ideal_customer_profile": data.get("ideal_customer_profile", ""),
             "content_pillars": data.get("content_pillars", []),
             "preferred_formats": data.get("preferred_formats", []),
             "guardrails": data.get("guardrails", {}),
@@ -271,6 +273,7 @@ class BrandProfileService:
                 "derived_voice", "personality_quiz", "audience_age_range",
                 "audience_interests", "content_tones", "cta_styles", "default_link",
                 "tagline", "region", "font_preference", "logo_url", "logo_position", "logo_size",
+                "target_audience", "ideal_customer_profile",
                 "onboarding_completed",
             ]
             if profile is None and personal_profile:
@@ -347,6 +350,7 @@ class BrandProfileService:
             "platform_tones":       profile.get("platform_tones") or {},
             "same_tone_everywhere": profile.get("same_tone_everywhere", True),
             "target_audience":      target_audience,
+            "ideal_customer_profile": profile.get("ideal_customer_profile", ""),
             "audience_age_range":   profile.get("audience_age_range", ""),
             "primary_goal":         profile.get("primary_goal", ""),
             "target_platforms":     profile.get("target_platforms") or [],
