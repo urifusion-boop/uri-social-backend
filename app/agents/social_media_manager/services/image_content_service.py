@@ -1336,6 +1336,7 @@ OVERALL:
             voice_sample         = bc.get('voice_sample', '')
             brand_voice          = bc.get('brand_voice', '')
             target_audience      = bc.get('target_audience', '')
+            ideal_customer_profile = bc.get('ideal_customer_profile', '')
             audience_age_range   = bc.get('audience_age_range', '')
             primary_goal         = bc.get('primary_goal', '')
             region               = bc.get('region', '')
@@ -1423,6 +1424,10 @@ OVERALL:
             if target_audience:
                 brand_lines.append(
                     f"Target audience: {target_audience} — any people shown should match this demographic."
+                )
+            if ideal_customer_profile:
+                brand_lines.append(
+                    f"Ideal customer: {ideal_customer_profile} — the visual style, settings, and people in the image should resonate with this specific persona."
                 )
             if audience_age_range:
                 brand_lines.append(
