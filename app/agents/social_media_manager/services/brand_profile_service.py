@@ -28,6 +28,7 @@ class BrandProfileService:
             "key_products_services": data.get("key_products_services", []),
             "logo_url": data.get("logo_url"),
             "logo_position": data.get("logo_position", "bottom_right"),
+            "logo_size": data.get("logo_size", "small"),
             "sample_template_urls": data.get("sample_template_urls", []),
             "brand_colors": data.get("brand_colors", []),
             "personality_quiz": data.get("personality_quiz", {}),
@@ -180,7 +181,7 @@ class BrandProfileService:
                 "brand_colors", "industry", "visual_style", "aesthetic_keywords",
                 "derived_voice", "personality_quiz", "audience_age_range",
                 "audience_interests", "content_tones", "cta_styles", "default_link",
-                "tagline", "region", "font_preference", "logo_url", "logo_position",
+                "tagline", "region", "font_preference", "logo_url", "logo_position", "logo_size",
             ]
             if profile is None and personal_profile:
                 # No agency profile at all — use personal profile as base
@@ -248,6 +249,7 @@ class BrandProfileService:
             "key_products_services": [p for p in (profile.get("key_products_services") or []) if p],
             "logo_url":             profile.get("logo_url"),
             "logo_position":        profile.get("logo_position", "bottom_right"),
+            "logo_size":            profile.get("logo_size", "small"),
             "sample_template_urls": [u for u in (profile.get("sample_template_urls") or []) if u],
             "brand_colors":         profile.get("brand_colors") or [],
             "brand_voice":          brand_voice,
