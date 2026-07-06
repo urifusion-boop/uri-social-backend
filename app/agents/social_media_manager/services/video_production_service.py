@@ -2804,12 +2804,28 @@ async def run_production_job(
             flush=True,
         )
 
-        # ── Store decisions + render context, then immediately proceed to render ─
+        # ── Generate b-roll images up-front so the user reviews REAL thumbnails ───
+        # (not blind prompts). Each item gets a "url"; failed generations are dropped.
+        if broll_decisions:
+            await update(55, "Generating b-roll visuals…")
+
+            async def _resolve_broll(br: Dict) -> Optional[Dict]:
+                prompt = br.get("image_prompt", "")
+                url = await _generate_broll_image(prompt) if prompt else None
+                return {**br, "url": url} if url else None
+
+            _results = await asyncio.gather(*[_resolve_broll(b) for b in broll_decisions])
+            broll_decisions = [r for r in _results if r]
+            print(f"[VideoProduction] pre-generated {len(broll_decisions)} b-roll images", flush=True)
+
+        # ── Store decisions + render context, then PAUSE for user review ──────────
+        # The user can remove, reroll, or edit-and-regenerate each b-roll, then hit
+        # start-render. Generated images already have URLs so render won't re-create them.
         await db.video_production_jobs.update_one(
             {"job_id": job_id},
             {"$set": {
-                "status": "processing",
-                "status_message": "Fetching b-roll assets…",
+                "status": "awaiting_review",
+                "status_message": "Review your b-roll before rendering",
                 "progress": 55,
                 "ai_decisions": {
                     "cuts":           cuts,
@@ -2841,13 +2857,11 @@ async def run_production_job(
             }}
         )
         print(
-            f"[VideoProduction] job={job_id} decisions saved, proceeding to render — "
-            f"{len(cuts)} cuts {len(zooms)} zooms {len(sound_effects)} sfx "
-            f"{len(icon_overlays)} icons hook='{hook_text}'",
+            f"[VideoProduction] job={job_id} awaiting_review — "
+            f"{len(cuts)} cuts {len(zooms)} zooms {len(broll_decisions)} b-roll hook='{hook_text}'",
             flush=True,
         )
-        await run_render_phase(job_id, db)
-        return
+        return  # pipeline resumes via POST /produce-video-job/{id}/start-render
 
         # ── Stage 4: Fetch assets — b-roll (Pixabay → fal.ai) + SFX library ──────
         broll: List[Dict] = []
@@ -3029,14 +3043,16 @@ async def run_render_phase(job_id: str, db) -> None:
 
         srt_entries = _parse_srt(srt_text)
 
-        # ── Stage 4a: B-roll — generate a photorealistic still per moment ─────────
-        # Images are generated to match the exact speech, so relevance is guaranteed
-        # rather than depending on a stock library. Generate concurrently to save time.
+        # ── Stage 4a: B-roll — reuse the images generated (and user-edited) at review ─
+        # Items already carry a "url" from the review step, so we don't regenerate.
+        # Only generate for any item still missing one (e.g. legacy jobs).
         broll: List[Dict] = []
         if broll_decisions:
-            await update(58, "Generating b-roll visuals…")
+            await update(58, "Preparing b-roll…")
 
             async def _resolve(br: Dict) -> Optional[Dict]:
+                if br.get("url"):
+                    return br  # already generated / user-edited at review
                 prompt = br.get("image_prompt", "")
                 cdn_url = await _generate_broll_image(prompt) if prompt else None
                 # Legacy jobs (no image_prompt) fall back to stock search.
@@ -3048,7 +3064,7 @@ async def run_render_phase(job_id: str, db) -> None:
 
             results = await asyncio.gather(*[_resolve(br) for br in broll_decisions])
             broll = [r for r in results if r]
-            print(f"[VideoProduction:render] broll {len(broll)}/{len(broll_decisions)} generated", flush=True)
+            print(f"[VideoProduction:render] broll {len(broll)}/{len(broll_decisions)} ready", flush=True)
 
         # ── Stage 4b: Music ───────────────────────────────────────────────────────
         music_url = ""
