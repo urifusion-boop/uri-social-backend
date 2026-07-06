@@ -6289,12 +6289,14 @@ async def start_produce_video_render(
     if doc.get("status") != "awaiting_review":
         raise HTTPException(status_code=409, detail=f"Job is not awaiting review (status={doc.get('status')})")
 
-    # Merge user edits on top of the stored AI decisions (user can remove/edit items)
+    # Merge user edits on top of the stored AI decisions — only the keys the client
+    # sends are updated, so partial payloads (e.g. just broll) never drop zooms,
+    # captions, topic changes, or icon overlays.
     approved = payload.get("decisions") if payload else None
-    if approved:
+    if approved and isinstance(approved, dict):
         await db.video_production_jobs.update_one(
             {"job_id": job_id},
-            {"$set": {"ai_decisions": approved}}
+            {"$set": {f"ai_decisions.{k}": v for k, v in approved.items()}}
         )
 
     await db.video_production_jobs.update_one(
