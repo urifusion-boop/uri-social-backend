@@ -281,6 +281,12 @@ Write as if you're sharing hard-won business wisdom with fellow African entrepre
                 f'Write as if speaking directly to them — use their language and reference their world.'
             )
 
+        if brand_context.get("ideal_customer_profile"):
+            parts.append(
+                f'- Ideal Customer Profile: {brand_context["ideal_customer_profile"]}. '
+                f'Tailor all content specifically to resonate with this exact persona — their interests, pain points, and aspirations.'
+            )
+
         if brand_context.get("primary_goal"):
             parts.append(
                 f'- Brand\'s primary goal: {brand_context["primary_goal"]}. '
