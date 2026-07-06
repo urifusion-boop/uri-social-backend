@@ -287,11 +287,26 @@ Write as if you're sharing hard-won business wisdom with fellow African entrepre
                 f'Tailor all content specifically to resonate with this exact persona — their interests, pain points, and aspirations.'
             )
 
+        if brand_context.get("audience_age_range"):
+            age_range = brand_context["audience_age_range"]
+            parts.append(
+                f'- Audience age range: {age_range}. '
+                f'Adjust language complexity, cultural references, and energy to match this demographic.'
+            )
+
         if brand_context.get("primary_goal"):
             parts.append(
                 f'- Brand\'s primary goal: {brand_context["primary_goal"]}. '
                 f'Every post should move the reader one step closer to this goal.'
             )
+
+        if brand_context.get("target_platforms"):
+            platforms = brand_context["target_platforms"]
+            if isinstance(platforms, list) and platforms:
+                parts.append(
+                    f'- Priority platforms: {", ".join(platforms[:5])}. '
+                    f'Keep the tone and format optimized for these specific platforms.'
+                )
 
         if brand_context.get("region"):
             parts.append(
