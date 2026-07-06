@@ -246,7 +246,6 @@ class BrandProfileRequest(BaseModel):
     # Identity
     logo_url: Optional[str] = None
     logo_position: Optional[str] = None  # top_left | top_center | top_right | bottom_left | bottom_center | bottom_right | center
-    logo_size: Optional[str] = None  # small | medium | large
     brand_colors: Optional[List[str]] = None
     sample_template_urls: Optional[List[str]] = None
     # Personality
@@ -265,8 +264,6 @@ class BrandProfileRequest(BaseModel):
     audience_age_range: Optional[str] = None
     target_platforms: Optional[List[str]] = None
     primary_goal: Optional[str] = None
-    target_audience: Optional[str] = None
-    ideal_customer_profile: Optional[str] = None
     # Competitors
     competitor_handles: Optional[List[str]] = None
     # Scheduling
@@ -295,10 +292,6 @@ class BrandProfileRequest(BaseModel):
     # Typography
     font_style: Optional[str] = None
     font_style_prompt: Optional[str] = None
-    primary_font: Optional[str] = None
-    primary_font_prompt: Optional[str] = None
-    secondary_font: Optional[str] = None
-    secondary_font_prompt: Optional[str] = None
     custom_font_enabled: Optional[bool] = None
     custom_font_files: Optional[List[Dict[str, str]]] = None
     custom_font_analysis: Optional[Dict[str, Any]] = None
@@ -620,7 +613,7 @@ async def regenerate_content(
     user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
-
+    
     try:
         result = await ApprovalWorkflowService.regenerate_content(
             db=db,
@@ -629,220 +622,9 @@ async def regenerate_content(
             regeneration_feedback=feedback
         )
         return result
-
+        
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.post("/upload-user-content")
-async def upload_user_content(
-    request: Dict[str, Any],
-    background_tasks: BackgroundTasks,
-    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    ctx: dict = Depends(get_active_brand_context),
-):
-    """
-    Upload user-provided media (images/videos) and generate captions using brand playbook.
-
-    User uploads their own photos/videos, AI analyzes them and writes captions.
-    No AI image generation - uses uploaded media as-is.
-
-    PRD: User Uploaded Content Workflow
-    - Step 1: User uploads images/videos
-    - Step 2: AI analyzes uploaded media (vision)
-    - Step 3: AI generates captions using brand playbook
-    - Step 4: Creates drafts with uploaded media URLs
-    - Step 5: User can schedule/publish (existing workflow)
-    """
-    user_id = ctx["user_id"]
-    active_brand_id = ctx["brand_id"]
-
-    try:
-        # Parse request
-        uploaded_media = request.get("uploaded_media", [])
-        context_text = request.get("context_text", "")
-        platforms = request.get("platforms", [])
-        post_type = request.get("post_type", "feed")
-
-        if not uploaded_media:
-            raise HTTPException(status_code=400, detail="No media uploaded")
-        if not platforms:
-            raise HTTPException(status_code=400, detail="No platforms selected")
-
-        # Credit check (same as generate-content)
-        from app.services.CreditService import credit_service
-        from app.services.TrialService import trial_service
-
-        is_trial_user = await trial_service.has_active_trial(user_id)
-
-        if not is_trial_user:
-            has_credits = await credit_service.check_sufficient_credits(user_id)
-            if not has_credits:
-                return JSONResponse(
-                    status_code=402,
-                    content={
-                        "status": False,
-                        "responseCode": 402,
-                        "responseMessage": "You've run out of credits. Upgrade to continue.",
-                        "responseData": {"credits_remaining": 0, "upgrade_url": "/pricing"}
-                    }
-                )
-
-        # Upload media to Cloudinary
-        from ..services.user_media_storage_service import UserMediaStorageService
-
-        print(f"📤 Uploading {len(uploaded_media)} user media files...")
-        media_urls = await UserMediaStorageService.upload_user_media(uploaded_media, user_id)
-        print(f"✅ All media uploaded successfully: {len(media_urls)} URLs")
-
-        # Load brand profile
-        profile_result = await BrandProfileService.get(user_id, db, brand_id=active_brand_id)
-        profile_data = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
-        brand_context_dict = BrandProfileService.to_brand_context(profile_data)
-
-        # Analyze uploaded media with vision
-        # Build comprehensive analysis of all uploaded media
-        vision_analyses = []
-        for idx, media_url in enumerate(media_urls):
-            print(f"🔍 Analyzing media {idx + 1}/{len(media_urls)}...")
-            try:
-                vision_prompt = f"""Analyze this uploaded image/video for social media content generation.
-
-USER'S CONTEXT: {context_text if context_text else 'No additional context provided'}
-
-Provide a detailed description including:
-1. Main subject/content (what's shown?)
-2. Visual style (colors, mood, setting, composition)
-3. Key features or details that stand out
-4. Target audience (who would this appeal to?)
-5. Emotional tone (what feeling does it evoke?)
-6. Any text/branding visible in the media
-7. Suggested content angle (how should we talk about this?)
-
-Be specific and descriptive to help write engaging captions."""
-
-                from app.services.AIService import AIService
-                vision_request = AIService.build_ai_model(
-                    messages=[{
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": vision_prompt},
-                            {"type": "image_url", "image_url": {"url": media_url}}
-                        ]
-                    }],
-                    temperature=0.5,
-                )
-                vision_response = await AIService.chat_completion(vision_request)
-
-                if isinstance(vision_response, dict) and "error" in vision_response:
-                    print(f"⚠️ Vision analysis failed for media {idx + 1}: {vision_response['error']}")
-                else:
-                    analysis = vision_response.choices[0].message.content.strip()
-                    vision_analyses.append(f"[Media {idx + 1}]: {analysis}")
-                    print(f"✅ Analyzed media {idx + 1}")
-
-            except Exception as e:
-                print(f"⚠️ Vision analysis error for media {idx + 1}: {e}")
-
-        # Build enriched seed content
-        enriched_seed_content = f"""USER'S UPLOADED CONTENT:
-
-{chr(10).join(vision_analyses)}
-
-USER PROVIDED CONTEXT: {context_text if context_text else 'None provided'}
-
-Create engaging social media captions for THIS UPLOADED CONTENT. Base your writing on what's actually shown in the images/videos above."""
-
-        # Generate captions for each platform (reuse existing content generation)
-        result = await ContentGenerationService.generate_multi_platform_content(
-            user_id=user_id,
-            seed_content=enriched_seed_content,
-            platforms=platforms,
-            seed_type="uploaded_media",
-            brand_context=brand_context_dict,
-            db=db,
-        )
-
-        # Tag drafts with uploaded media and brand
-        if result.get("status"):
-            _rd = result.get("responseData", {})
-            _req_id = _rd.get("request_id")
-            _d_ids = [d["id"] for d in _rd.get("drafts", []) if d.get("id")]
-
-            if _req_id:
-                await db["content_requests"].update_one(
-                    {"id": _req_id},
-                    {"$set": {"brand_id": active_brand_id, "content_source": "user_uploaded"}}
-                )
-
-            if _d_ids:
-                # Mark drafts as user-uploaded and attach media URLs
-                await db["content_drafts"].update_many(
-                    {"id": {"$in": _d_ids}},
-                    {
-                        "$set": {
-                            "brand_id": active_brand_id,
-                            "content_source": "user_uploaded",
-                            "uploaded_media_urls": media_urls,
-                            "post_type": post_type,
-                        }
-                    }
-                )
-                # Update in-memory draft objects
-                for d in _rd.get("drafts", []):
-                    d["brand_id"] = active_brand_id
-                    d["content_source"] = "user_uploaded"
-                    d["uploaded_media_urls"] = media_urls
-                    d["post_type"] = post_type
-
-        # Deduct credits (cheaper than full generation since no image gen)
-        if result.get("status"):
-            request_id = result.get("responseData", {}).get("request_id")
-            credits_to_deduct = 0.5  # Half credit - no AI image generation cost
-
-            if request_id:
-                if is_trial_user:
-                    await trial_service.deduct_trial_credit(
-                        user_id=user_id,
-                        campaign_id=request_id,
-                        reason="upload_user_content",
-                        amount=credits_to_deduct,
-                    )
-                    print(f"✅ Deducted {credits_to_deduct} trial credit(s) from user {user_id}")
-                else:
-                    await credit_service.deduct_credit(
-                        user_id=user_id,
-                        campaign_id=request_id,
-                        reason="upload_user_content",
-                        retry_count=0,
-                        amount=credits_to_deduct,
-                    )
-                    print(f"✅ Deducted {credits_to_deduct} credit(s) from user {user_id}")
-
-            # Notification
-            try:
-                from app.services.NotificationService import notification_service
-                drafts_data = result.get("responseData", {}).get("drafts", [])
-                platforms_str = ", ".join(set(d.get("platform", "") for d in drafts_data if d.get("platform")))
-                preview = drafts_data[0].get("content", "")[:120] if drafts_data else ""
-                background_tasks.add_task(
-                    notification_service.notify_content_created,
-                    user_id=user_id,
-                    content_preview=preview,
-                    platforms=platforms_str,
-                    campaign_id=request_id or "",
-                )
-            except Exception as e:
-                print(f"⚠️ Content created notification failed: {e}")
-
-        return result
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        error_detail = str(e) or repr(e)
-        print(f"❌ upload_user_content error for user={user_id}: {error_detail}\n{traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=error_detail)
 
 # ==============================================================================
 # SOCIAL ACCOUNT CONNECTION ENDPOINTS
@@ -4255,9 +4037,7 @@ async def save_brand_profile(
     """Save or update the brand profile for the active brand."""
     user_id = ctx["user_id"]
     try:
-        print(f"🔍 PYDANTIC PARSED REQUEST: logo_position={repr(request.logo_position)}, logo_size={repr(request.logo_size)}")
         payload = request.dict(exclude_none=True)
-        print(f"🔍 PAYLOAD AFTER exclude_none: logo_position={repr(payload.get('logo_position'))}, logo_size={repr(payload.get('logo_size'))}")
         # Serialize nested Pydantic models to plain dicts
         if "guardrails" in payload and hasattr(payload["guardrails"], "dict"):
             payload["guardrails"] = payload["guardrails"].dict(exclude_none=True)
@@ -4495,7 +4275,6 @@ async def _generate_image_bg(
                 _style_profile_scope,
                 {"style_selections": 1, "style_prompt_fragments": 1, "style_rotation_index": 1, "industry": 1, "selected_custom_guides": 1, "selected_custom_guides_v2": 1},
             ) or {}
-            print(f"🔍 STYLE ROTATION - draft_id={draft_id[:12]}, platform={platform}, rotation_index={_bp.get('style_rotation_index')}, style_selections={_bp.get('style_selections')}")
 
             # Check if user has selected custom guides (V1 or V2)
             _custom_guide_ids_v1 = _bp.get("selected_custom_guides") or []
@@ -4553,41 +4332,24 @@ async def _generate_image_bg(
                             {"$set": {"style_rotation_index": _next_index}}
                         )
             else:
-                # Fallback to library style rotation with atomic increment to avoid race condition
+                # Fallback to library style rotation
                 _style_selections = _bp.get("style_selections") or []
                 _style_prompt_fragments = _bp.get("style_prompt_fragments") or []
+                _rotation_index = int(_bp.get("style_rotation_index") or 0)
                 _industry = _bp.get("industry") or brand_context.get("industry", "")
 
-                if _style_selections:
-                    # Use findOneAndUpdate with $inc for atomic increment
-                    # This ensures each parallel task gets a unique rotation index
-                    result = await db["brand_profiles"].find_one_and_update(
+                _slug, _fragment, _next_index = pick_next_style(
+                    _style_selections, _rotation_index, _industry, _style_prompt_fragments
+                )
+
+                if _fragment:
+                    brand_context = {**brand_context, "style_prompt_fragment": _fragment, "style_slug": _slug}
+                    print(f"🎨 Style [{_slug}] applied for this image (next index: {_next_index})")
+                    # Persist incremented rotation index
+                    await db["brand_profiles"].update_one(
                         _style_profile_scope,
-                        {"$inc": {"style_rotation_index": 1}},
-                        return_document=True,  # Return document AFTER update
-                        projection={"style_rotation_index": 1}
+                        {"$set": {"style_rotation_index": _next_index}},
                     )
-
-                    # The returned index is already incremented, so subtract 1 to get the index to use
-                    _rotation_index = int(result.get("style_rotation_index", 1)) - 1 if result else 0
-
-                    print(f"🔍 ATOMIC INCREMENT - draft_id={draft_id[:12]}, platform={platform}, got_rotation_index={_rotation_index}")
-
-                    _slug, _fragment, _next_index = pick_next_style(
-                        _style_selections, _rotation_index, _industry, _style_prompt_fragments
-                    )
-
-                    if _fragment:
-                        brand_context = {**brand_context, "style_prompt_fragment": _fragment, "style_slug": _slug}
-                        print(f"🎨 Style [{_slug}] applied for this image (index: {_rotation_index})")
-                else:
-                    # No styles selected, use default
-                    _rotation_index = 0
-                    _slug, _fragment, _next_index = pick_next_style(
-                        _style_selections, _rotation_index, _industry, _style_prompt_fragments
-                    )
-                    if _fragment:
-                        brand_context = {**brand_context, "style_prompt_fragment": _fragment, "style_slug": _slug}
 
         # For story posts pass image_type="story" so we get 1080x1920 dimensions
         image_type = "story" if post_type == "story" else "post_image"
@@ -6393,7 +6155,10 @@ async def produce_video(
     source_url: Optional[str] = Form(None),
     video_type: str = Form("founder"),
     enable_music: str = Form("true"),
+    mute_original_audio: str = Form("false"),
     enable_sfx: str = Form("true"),
+    enable_captions: str = Form("true"),
+    custom_music: Optional[UploadFile] = File(None),
     transition_style: str = Form("auto"),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
     token: dict = Depends(JWTBearer()),
@@ -6448,10 +6213,18 @@ async def produce_video(
         "completed_at": None,
     })
 
+    custom_music_bytes = b""
+    if custom_music is not None:
+        custom_music_bytes = await custom_music.read()
+        print(f"[CustomMusic] received {len(custom_music_bytes)//1024}KB — uploading to Cloudinary in background", flush=True)
+
     background_tasks.add_task(
         run_production_job, job_id, video_bytes, video_type, db,
         enable_music=(enable_music.lower() != "false"),
+        mute_original_audio=(mute_original_audio.lower() == "true"),
         enable_sfx=(enable_sfx.lower() != "false"),
+        enable_captions=(enable_captions.lower() != "false"),
+        custom_music_bytes=custom_music_bytes,
         transition_style=transition_style,
     )
 
@@ -6509,14 +6282,12 @@ async def start_produce_video_render(
     if doc.get("status") != "awaiting_review":
         raise HTTPException(status_code=409, detail=f"Job is not awaiting review (status={doc.get('status')})")
 
-    # Merge user edits on top of the stored AI decisions — only the keys the client
-    # sends are updated, so partial payloads (e.g. just broll) never drop zooms,
-    # captions, topic changes, or icon overlays.
+    # Merge user edits on top of the stored AI decisions (user can remove/edit items)
     approved = payload.get("decisions") if payload else None
-    if approved and isinstance(approved, dict):
+    if approved:
         await db.video_production_jobs.update_one(
             {"job_id": job_id},
-            {"$set": {f"ai_decisions.{k}": v for k, v in approved.items()}}
+            {"$set": {"ai_decisions": approved}}
         )
 
     await db.video_production_jobs.update_one(
@@ -6531,55 +6302,85 @@ async def start_produce_video_render(
     )
 
 
-@router.post("/produce-video-job/{job_id}/broll/{index}/regenerate")
-async def regenerate_broll(
+@router.post("/produce-video-job/{job_id}/adjust")
+async def adjust_produce_video(
     job_id: str,
-    index: int,
-    payload: dict = Body(default={}),
+    background_tasks: BackgroundTasks,
+    primary_color: Optional[str] = Form(None),
+    caption_text_edits: Optional[str] = Form(None),  # JSON: [{index, text}, ...]
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
     token: dict = Depends(JWTBearer()),
 ):
     """
-    Regenerate a single b-roll image during the review step.
-    Body: { "image_prompt": "optional new description" } — omit to reroll the same prompt.
-    Returns the updated b-roll item (new url + prompt). Only allowed while awaiting_review.
+    Re-render a completed video with light adjustments (caption colour, caption text edits).
+    Reads the existing render_context, applies overrides, and re-submits to Shotstack.
+    Poll GET /produce-video-job/{job_id} for the updated status and output_url.
     """
-    from app.agents.social_media_manager.services.video_production_service import _generate_broll_image
+    import json as _json
+    from app.agents.social_media_manager.services.video_production_service import run_render_phase
 
     user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    doc = await db.video_production_jobs.find_one(
-        {"job_id": job_id, "user_id": user_id}, {"_id": 0, "status": 1, "ai_decisions": 1}
-    )
+    doc = await db.video_production_jobs.find_one({"job_id": job_id, "user_id": user_id})
     if not doc:
         raise HTTPException(status_code=404, detail="Job not found")
-    if doc.get("status") != "awaiting_review":
-        raise HTTPException(status_code=409, detail=f"Job is not awaiting review (status={doc.get('status')})")
+    if doc.get("status") not in ("ready", "failed"):
+        raise HTTPException(status_code=409, detail="Job must be in ready state to adjust")
 
-    broll = (doc.get("ai_decisions") or {}).get("broll") or []
-    if index < 0 or index >= len(broll):
-        raise HTTPException(status_code=404, detail=f"b-roll index {index} out of range (have {len(broll)})")
+    ctx = doc.get("render_context", {})
+    if not ctx:
+        raise HTTPException(status_code=400, detail="No render context — cannot re-render")
 
-    new_prompt = (payload.get("image_prompt") or "").strip() if payload else ""
-    prompt = new_prompt or broll[index].get("image_prompt", "")
-    if not prompt:
-        raise HTTPException(status_code=400, detail="No image_prompt available to generate from")
+    # Apply primary_color override to render_context
+    if primary_color:
+        ctx["primary_color"] = primary_color
 
-    new_url = await _generate_broll_image(prompt)
-    if not new_url:
-        raise HTTPException(status_code=502, detail="Image generation failed, please try again")
+    # Apply caption text edits to the stored SRT
+    if caption_text_edits:
+        try:
+            edits = _json.loads(caption_text_edits)  # [{index: int, text: str}, ...]
+            srt_lines = ctx.get("srt_text", "").split("\n")
+            # Parse SRT into blocks: each block is [num, timing, text..., ""]
+            blocks: list = []
+            current: list = []
+            for line in srt_lines:
+                if line.strip() == "" and current:
+                    blocks.append(current)
+                    current = []
+                else:
+                    current.append(line)
+            if current:
+                blocks.append(current)
+            # Apply text edits by block index
+            for edit in edits:
+                idx = int(edit.get("index", -1))
+                new_text = str(edit.get("text", "")).strip()
+                if 0 <= idx < len(blocks) and len(blocks[idx]) >= 3 and new_text:
+                    blocks[idx][2] = new_text  # block[2] is the caption text line
+            # Reassemble SRT
+            ctx["srt_text"] = "\n".join("\n".join(b) for b in blocks) + "\n"
+        except Exception as e:
+            print(f"[Adjust] caption_text_edits parse error: {e}", flush=True)
 
+    # Persist the updated context and reset status
     await db.video_production_jobs.update_one(
         {"job_id": job_id},
         {"$set": {
-            f"ai_decisions.broll.{index}.url": new_url,
-            f"ai_decisions.broll.{index}.image_prompt": prompt,
-        }},
+            "render_context": ctx,
+            "status": "processing",
+            "status_message": "Re-rendering with your changes…",
+            "progress": 60,
+            "output_url": None,
+        }}
     )
-    updated = {**broll[index], "url": new_url, "image_prompt": prompt}
-    return UriResponse.get_single_data_response("regenerate_broll", {"index": index, "broll": updated})
+
+    background_tasks.add_task(run_render_phase, job_id, db)
+
+    return UriResponse.get_single_data_response(
+        "adjust_video", {"job_id": job_id, "status": "processing"}
+    )
 
 
 # ── Multi-Clip Composition (Phase 1 — Founder Story) ─────────────────────────
