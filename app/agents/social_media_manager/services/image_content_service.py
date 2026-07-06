@@ -1176,19 +1176,23 @@ OVERALL:
             if image_response.get('success'):
                 # Composite brand logo onto generated image for all models.
                 logo_url = (brand_context or {}).get('logo_url')
+                print(f"🖼️  LOGO CHECK: logo_url={repr(logo_url)}, has_brand_context={brand_context is not None}")
                 if logo_url:
                     import re as _re_logo
                     logo_position = (brand_context or {}).get('logo_position', 'bottom_right')
-                    print(f"🖼️  OVERLAY DEBUG: logo_position={repr(logo_position)}, brand_context_keys={list((brand_context or {}).keys())}")
+                    logo_size = (brand_context or {}).get('logo_size', 'small')
+                    print(f"🖼️  OVERLAY DEBUG: logo_position={repr(logo_position)}, logo_size={repr(logo_size)}, brand_context_keys={list((brand_context or {}).keys())}")
                     data_url = image_response['url']
                     _m = _re_logo.match(r"data:[^;]+;base64,(.+)", data_url, _re_logo.DOTALL)
                     if _m:
                         loop = asyncio.get_running_loop()
                         b64_final = await loop.run_in_executor(
                             None,
-                            lambda: ImageContentService._overlay_logo(_m.group(1), logo_url, logo_position)
+                            lambda: ImageContentService._overlay_logo(_m.group(1), logo_url, logo_position, logo_size)
                         )
                         image_response['url'] = f"data:image/webp;base64,{b64_final}"
+                else:
+                    print(f"⚠️  LOGO SKIPPED: logo_url is None or empty")
 
                 return UriResponse.get_single_data_response("platform_image", {
                     "image_url": image_response['url'],
@@ -2049,10 +2053,10 @@ OVERALL:
         )
     
     @staticmethod
-    def _overlay_logo(b64: str, logo_url: str, position: str = "bottom_right") -> str:
+    def _overlay_logo(b64: str, logo_url: str, position: str = "bottom_right", logo_size: str = "small") -> str:
         """
         Download the brand logo and composite it onto the generated image using Pillow.
-        Logo is resized to ~14% of image width and placed at the specified corner.
+        Logo is resized based on logo_size preference and placed at the specified corner.
         Falls back to the original image if anything fails.
         """
         import base64 as _b64
@@ -2074,8 +2078,7 @@ OVERALL:
             # Resize logo based on user preference or keep default at 8%
             # User can set logo_size: "small" (8%), "medium" (12%), "large" (16%)
             logo_size_map = {"small": 0.08, "medium": 0.12, "large": 0.16}
-            logo_size_pref = bc.get("logo_size", "small")  # Default to small (8% - current behavior)
-            logo_size_pct = logo_size_map.get(logo_size_pref, 0.08)  # Fallback to 8%
+            logo_size_pct = logo_size_map.get(logo_size, 0.08)  # Fallback to 8%
 
             target_w = max(40, int(bw * logo_size_pct))
             lw, lh = logo_img.size
