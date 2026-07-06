@@ -2050,8 +2050,13 @@ OVERALL:
             resp.raise_for_status()
             logo_img = Image.open(io.BytesIO(resp.content)).convert("RGBA")
 
-            # Resize logo to 8% of image width, preserve aspect ratio
-            target_w = max(40, int(bw * 0.08))
+            # Resize logo based on user preference or keep default at 8%
+            # User can set logo_size: "small" (8%), "medium" (12%), "large" (16%)
+            logo_size_map = {"small": 0.08, "medium": 0.12, "large": 0.16}
+            logo_size_pref = bc.get("logo_size", "small")  # Default to small (8% - current behavior)
+            logo_size_pct = logo_size_map.get(logo_size_pref, 0.08)  # Fallback to 8%
+
+            target_w = max(40, int(bw * logo_size_pct))
             lw, lh = logo_img.size
             scale = target_w / lw
             logo_img = logo_img.resize((target_w, int(lh * scale)), Image.LANCZOS)
