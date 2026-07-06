@@ -6309,6 +6309,57 @@ async def start_produce_video_render(
     )
 
 
+@router.post("/produce-video-job/{job_id}/broll/{index}/regenerate")
+async def regenerate_broll(
+    job_id: str,
+    index: int,
+    payload: dict = Body(default={}),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Regenerate a single b-roll image during the review step.
+    Body: { "image_prompt": "optional new description" } — omit to reroll the same prompt.
+    Returns the updated b-roll item (new url + prompt). Only allowed while awaiting_review.
+    """
+    from app.agents.social_media_manager.services.video_production_service import _generate_broll_image
+
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    doc = await db.video_production_jobs.find_one(
+        {"job_id": job_id, "user_id": user_id}, {"_id": 0, "status": 1, "ai_decisions": 1}
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if doc.get("status") != "awaiting_review":
+        raise HTTPException(status_code=409, detail=f"Job is not awaiting review (status={doc.get('status')})")
+
+    broll = (doc.get("ai_decisions") or {}).get("broll") or []
+    if index < 0 or index >= len(broll):
+        raise HTTPException(status_code=404, detail=f"b-roll index {index} out of range (have {len(broll)})")
+
+    new_prompt = (payload.get("image_prompt") or "").strip() if payload else ""
+    prompt = new_prompt or broll[index].get("image_prompt", "")
+    if not prompt:
+        raise HTTPException(status_code=400, detail="No image_prompt available to generate from")
+
+    new_url = await _generate_broll_image(prompt)
+    if not new_url:
+        raise HTTPException(status_code=502, detail="Image generation failed, please try again")
+
+    await db.video_production_jobs.update_one(
+        {"job_id": job_id},
+        {"$set": {
+            f"ai_decisions.broll.{index}.url": new_url,
+            f"ai_decisions.broll.{index}.image_prompt": prompt,
+        }},
+    )
+    updated = {**broll[index], "url": new_url, "image_prompt": prompt}
+    return UriResponse.get_single_data_response("regenerate_broll", {"index": index, "broll": updated})
+
+
 # ── Multi-Clip Composition (Phase 1 — Founder Story) ─────────────────────────
 
 @router.post("/multi-clip/start")
