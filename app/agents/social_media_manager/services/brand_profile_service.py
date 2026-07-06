@@ -17,6 +17,9 @@ class BrandProfileService:
     ) -> Dict[str, Any]:
         now = datetime.utcnow()
 
+        # Debug: Log what data is received from frontend
+        print(f"📥 SAVE INPUT: logo_position={repr(data.get('logo_position'))}, logo_size={repr(data.get('logo_size'))}")
+
         doc = {
             "user_id": user_id,
             "brand_id": brand_id,
@@ -140,7 +143,7 @@ class BrandProfileService:
             # Once onboarding_completed is True, never allow it to be reset to False
             if existing.get("onboarding_completed") and not doc.get("onboarding_completed"):
                 doc["onboarding_completed"] = True
-            print(f"🖼️  SAVE DEBUG brand={brand_id or user_id}: saving logo_position={repr(doc.get('logo_position'))}")
+            print(f"🖼️  SAVE DEBUG brand={brand_id or user_id}: saving logo_position={repr(doc.get('logo_position'))}, logo_size={repr(doc.get('logo_size'))}")
             await db[BrandProfileService.COLLECTION].update_one(
                 scope, {"$set": doc}
             )
