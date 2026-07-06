@@ -265,6 +265,8 @@ class BrandProfileRequest(BaseModel):
     audience_age_range: Optional[str] = None
     target_platforms: Optional[List[str]] = None
     primary_goal: Optional[str] = None
+    target_audience: Optional[str] = None
+    ideal_customer_profile: Optional[str] = None
     # Competitors
     competitor_handles: Optional[List[str]] = None
     # Scheduling
