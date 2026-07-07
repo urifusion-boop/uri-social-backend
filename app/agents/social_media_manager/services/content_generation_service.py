@@ -289,10 +289,23 @@ Write as if you're sharing hard-won business wisdom with fellow African entrepre
 
         if brand_context.get("audience_age_range"):
             age_range = brand_context["audience_age_range"]
-            parts.append(
-                f'- Audience age range: {age_range}. '
-                f'Adjust language complexity, cultural references, and energy to match this demographic.'
-            )
+
+            # Special handling for Gen Z to provide specific linguistic markers
+            if "Gen Z" in age_range or "18-24" in age_range:
+                voice_descriptor = active_voice or "conversational"
+                parts.append(
+                    f'- Voice adapted for Gen Z (18-24): {voice_descriptor} — but make it authentically Gen Z. '
+                    f'This means: Use Gen Z slang naturally (lowkey, highkey, no cap, fr, ngl, tbh, iykyk), '
+                    f'keep sentences short and punchy (fragments are fine), write like you\'re texting a friend not emailing a customer, '
+                    f'bold takes over polite diplomacy, lowercase casual style where appropriate ("it\'s giving...", "not me..."), '
+                    f'reference internet culture and trending topics, and ditch corporate jargon entirely.'
+                )
+            else:
+                # Default age range instruction for other demographics
+                parts.append(
+                    f'- Audience age range: {age_range}. '
+                    f'Adjust language complexity, cultural references, and energy to match this demographic.'
+                )
 
         if brand_context.get("primary_goal"):
             parts.append(
