@@ -620,7 +620,7 @@ async def regenerate_content(
     user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
-    
+
     try:
         result = await ApprovalWorkflowService.regenerate_content(
             db=db,
@@ -629,9 +629,220 @@ async def regenerate_content(
             regeneration_feedback=feedback
         )
         return result
-        
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/upload-user-content")
+async def upload_user_content(
+    request: Dict[str, Any],
+    background_tasks: BackgroundTasks,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    ctx: dict = Depends(get_active_brand_context),
+):
+    """
+    Upload user-provided media (images/videos) and generate captions using brand playbook.
+
+    User uploads their own photos/videos, AI analyzes them and writes captions.
+    No AI image generation - uses uploaded media as-is.
+
+    PRD: User Uploaded Content Workflow
+    - Step 1: User uploads images/videos
+    - Step 2: AI analyzes uploaded media (vision)
+    - Step 3: AI generates captions using brand playbook
+    - Step 4: Creates drafts with uploaded media URLs
+    - Step 5: User can schedule/publish (existing workflow)
+    """
+    user_id = ctx["user_id"]
+    active_brand_id = ctx["brand_id"]
+
+    try:
+        # Parse request
+        uploaded_media = request.get("uploaded_media", [])
+        context_text = request.get("context_text", "")
+        platforms = request.get("platforms", [])
+        post_type = request.get("post_type", "feed")
+
+        if not uploaded_media:
+            raise HTTPException(status_code=400, detail="No media uploaded")
+        if not platforms:
+            raise HTTPException(status_code=400, detail="No platforms selected")
+
+        # Credit check (same as generate-content)
+        from app.services.CreditService import credit_service
+        from app.services.TrialService import trial_service
+
+        is_trial_user = await trial_service.has_active_trial(user_id)
+
+        if not is_trial_user:
+            has_credits = await credit_service.check_sufficient_credits(user_id)
+            if not has_credits:
+                return JSONResponse(
+                    status_code=402,
+                    content={
+                        "status": False,
+                        "responseCode": 402,
+                        "responseMessage": "You've run out of credits. Upgrade to continue.",
+                        "responseData": {"credits_remaining": 0, "upgrade_url": "/pricing"}
+                    }
+                )
+
+        # Upload media to Cloudinary
+        from ..services.user_media_storage_service import UserMediaStorageService
+
+        print(f"📤 Uploading {len(uploaded_media)} user media files...")
+        media_urls = await UserMediaStorageService.upload_user_media(uploaded_media, user_id)
+        print(f"✅ All media uploaded successfully: {len(media_urls)} URLs")
+
+        # Load brand profile
+        profile_result = await BrandProfileService.get(user_id, db, brand_id=active_brand_id)
+        profile_data = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
+        brand_context_dict = BrandProfileService.to_brand_context(profile_data)
+
+        # Analyze uploaded media with vision
+        # Build comprehensive analysis of all uploaded media
+        vision_analyses = []
+        for idx, media_url in enumerate(media_urls):
+            print(f"🔍 Analyzing media {idx + 1}/{len(media_urls)}...")
+            try:
+                vision_prompt = f"""Analyze this uploaded image/video for social media content generation.
+
+USER'S CONTEXT: {context_text if context_text else 'No additional context provided'}
+
+Provide a detailed description including:
+1. Main subject/content (what's shown?)
+2. Visual style (colors, mood, setting, composition)
+3. Key features or details that stand out
+4. Target audience (who would this appeal to?)
+5. Emotional tone (what feeling does it evoke?)
+6. Any text/branding visible in the media
+7. Suggested content angle (how should we talk about this?)
+
+Be specific and descriptive to help write engaging captions."""
+
+                from app.services.AIService import AIService
+                vision_request = AIService.build_ai_model(
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": vision_prompt},
+                            {"type": "image_url", "image_url": {"url": media_url}}
+                        ]
+                    }],
+                    temperature=0.5,
+                )
+                vision_response = await AIService.chat_completion(vision_request)
+
+                if isinstance(vision_response, dict) and "error" in vision_response:
+                    print(f"⚠️ Vision analysis failed for media {idx + 1}: {vision_response['error']}")
+                else:
+                    analysis = vision_response.choices[0].message.content.strip()
+                    vision_analyses.append(f"[Media {idx + 1}]: {analysis}")
+                    print(f"✅ Analyzed media {idx + 1}")
+
+            except Exception as e:
+                print(f"⚠️ Vision analysis error for media {idx + 1}: {e}")
+
+        # Build enriched seed content
+        enriched_seed_content = f"""USER'S UPLOADED CONTENT:
+
+{chr(10).join(vision_analyses)}
+
+USER PROVIDED CONTEXT: {context_text if context_text else 'None provided'}
+
+Create engaging social media captions for THIS UPLOADED CONTENT. Base your writing on what's actually shown in the images/videos above."""
+
+        # Generate captions for each platform (reuse existing content generation)
+        result = await ContentGenerationService.generate_multi_platform_content(
+            user_id=user_id,
+            seed_content=enriched_seed_content,
+            platforms=platforms,
+            seed_type="uploaded_media",
+            brand_context=brand_context_dict,
+            db=db,
+        )
+
+        # Tag drafts with uploaded media and brand
+        if result.get("status"):
+            _rd = result.get("responseData", {})
+            _req_id = _rd.get("request_id")
+            _d_ids = [d["id"] for d in _rd.get("drafts", []) if d.get("id")]
+
+            if _req_id:
+                await db["content_requests"].update_one(
+                    {"id": _req_id},
+                    {"$set": {"brand_id": active_brand_id, "content_source": "user_uploaded"}}
+                )
+
+            if _d_ids:
+                # Mark drafts as user-uploaded and attach media URLs
+                await db["content_drafts"].update_many(
+                    {"id": {"$in": _d_ids}},
+                    {
+                        "$set": {
+                            "brand_id": active_brand_id,
+                            "content_source": "user_uploaded",
+                            "uploaded_media_urls": media_urls,
+                            "post_type": post_type,
+                        }
+                    }
+                )
+                # Update in-memory draft objects
+                for d in _rd.get("drafts", []):
+                    d["brand_id"] = active_brand_id
+                    d["content_source"] = "user_uploaded"
+                    d["uploaded_media_urls"] = media_urls
+                    d["post_type"] = post_type
+
+        # Deduct credits (cheaper than full generation since no image gen)
+        if result.get("status"):
+            request_id = result.get("responseData", {}).get("request_id")
+            credits_to_deduct = 0.5  # Half credit - no AI image generation cost
+
+            if request_id:
+                if is_trial_user:
+                    await trial_service.deduct_trial_credit(
+                        user_id=user_id,
+                        campaign_id=request_id,
+                        reason="upload_user_content",
+                        amount=credits_to_deduct,
+                    )
+                    print(f"✅ Deducted {credits_to_deduct} trial credit(s) from user {user_id}")
+                else:
+                    await credit_service.deduct_credit(
+                        user_id=user_id,
+                        campaign_id=request_id,
+                        reason="upload_user_content",
+                        retry_count=0,
+                        amount=credits_to_deduct,
+                    )
+                    print(f"✅ Deducted {credits_to_deduct} credit(s) from user {user_id}")
+
+            # Notification
+            try:
+                from app.services.NotificationService import notification_service
+                drafts_data = result.get("responseData", {}).get("drafts", [])
+                platforms_str = ", ".join(set(d.get("platform", "") for d in drafts_data if d.get("platform")))
+                preview = drafts_data[0].get("content", "")[:120] if drafts_data else ""
+                background_tasks.add_task(
+                    notification_service.notify_content_created,
+                    user_id=user_id,
+                    content_preview=preview,
+                    platforms=platforms_str,
+                    campaign_id=request_id or "",
+                )
+            except Exception as e:
+                print(f"⚠️ Content created notification failed: {e}")
+
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_detail = str(e) or repr(e)
+        print(f"❌ upload_user_content error for user={user_id}: {error_detail}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=error_detail)
 
 # ==============================================================================
 # SOCIAL ACCOUNT CONNECTION ENDPOINTS
