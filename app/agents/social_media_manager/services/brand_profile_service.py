@@ -93,6 +93,16 @@ class BrandProfileService:
         if "font_style_prompt" in data:
             doc["font_style_prompt"] = data["font_style_prompt"]
 
+        # Primary & Secondary Font fields
+        if "primary_font" in data:
+            doc["primary_font"] = data["primary_font"]
+        if "primary_font_prompt" in data:
+            doc["primary_font_prompt"] = data["primary_font_prompt"]
+        if "secondary_font" in data:
+            doc["secondary_font"] = data["secondary_font"]
+        if "secondary_font_prompt" in data:
+            doc["secondary_font_prompt"] = data["secondary_font_prompt"]
+
         # Custom font fields (Typography System)
         if "custom_font_enabled" in data:
             doc["custom_font_enabled"] = data["custom_font_enabled"]
@@ -281,6 +291,11 @@ class BrandProfileService:
             "style_rotation_index": int(profile.get("style_rotation_index") or 0),
             "font_style":           profile.get("font_style", ""),
             "font_style_prompt":    profile.get("font_style_prompt", ""),
+            # Primary & Secondary Font fields
+            "primary_font":         profile.get("primary_font", ""),
+            "primary_font_prompt":  profile.get("primary_font_prompt", ""),
+            "secondary_font":       profile.get("secondary_font", ""),
+            "secondary_font_prompt": profile.get("secondary_font_prompt", ""),
             # Custom font fields (Typography System)
             "custom_font_enabled":  profile.get("custom_font_enabled", False),
             "custom_font_files":    profile.get("custom_font_files") or [],
