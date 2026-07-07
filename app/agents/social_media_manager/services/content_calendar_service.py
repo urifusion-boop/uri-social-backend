@@ -26,6 +26,14 @@ from app.services.TrendDataService import TrendDataService
 from app.services.PerformanceAnalyticsService import PerformanceAnalyticsService
 from app.services.IdeaScoringService import IdeaScoringService
 
+# Enhanced calendar services (PRD requirements)
+from app.agents.social_media_manager.services.holiday_calendar_service import HolidayCalendarService
+from app.agents.social_media_manager.services.cta_recommender_service import CTARecommenderService
+from app.agents.social_media_manager.services.caption_angle_service import CaptionAngleService
+from app.agents.social_media_manager.services.content_explainer_service import ContentExplainerService
+from app.agents.social_media_manager.services.cultural_moment_service import CulturalMomentService
+from app.agents.social_media_manager.services.industry_trend_service import IndustryTrendService
+
 COLLECTION = "content_calendar_plans"
 
 
@@ -604,6 +612,19 @@ async def generate_plan(
     performance = await PerformanceAnalyticsService.get_user_performance(user_id, db)
     trend_keywords = await TrendDataService.get_trending_keywords(industry, db=db)
 
+    # ── Enhanced PRD signals ──────────────────────────────────────────────────
+    # Holidays & seasonal events (PRD Section 8)
+    region = brand.get("region", "")
+    upcoming_holidays = HolidayCalendarService.get_upcoming_holidays(week_start, region, industry)
+
+    # Cultural moments & trending topics (PRD Section 7)
+    trending_topics = CulturalMomentService.get_trending_topics(industry, region, week_start)
+    cultural_moments = CulturalMomentService.get_cultural_moments(week_start, region)
+
+    # Industry best practices (PRD Section 6)
+    industry_best_practices = IndustryTrendService.get_industry_best_practices(industry)
+    industry_trending = IndustryTrendService.get_trending_topics(industry)
+
     # ── Personalised content mix from performance data ────────────────────────
     week_number = monday.isocalendar()[1]
     if force:
@@ -641,33 +662,78 @@ async def generate_plan(
 
     for i, idea in enumerate(ai_ideas):
         day_date = (monday + timedelta(days=i)).strftime("%Y-%m-%d")
+        day_of_week = (monday + timedelta(days=i)).strftime("%A")
+        content_type = mix[i]
+        title = idea.get("title", "")
+
         # Score against real signals for transparency
         kw = idea.get("keyword", "")
         trend_score = 0
         perf_score = 0
         if trend_keywords:
-            match = next((t for t in trend_keywords if t["keyword"].lower() in idea.get("title", "").lower()), None)
+            match = next((t for t in trend_keywords if t["keyword"].lower() in title.lower()), None)
             if match:
                 trend_score = match.get("trend_score", 0)
         if performance.get("has_data"):
             top_topics = performance.get("top_topics", [])
-            title_lower = idea.get("title", "").lower()
+            title_lower = title.lower()
             if any(t.lower() in title_lower for t in top_topics):
                 perf_score = 75
+
+        # ── Enhanced PRD fields ───────────────────────────────────────────────
+
+        # Recommended CTA (PRD Output requirement)
+        primary_goal = brand.get("primary_goal", "engagement")
+        platform = platforms[0] if platforms else "instagram"
+        recommended_cta = CTARecommenderService.recommend_cta(
+            content_type=content_type,
+            primary_goal=primary_goal,
+            platform=platform,
+            brand_cta_styles=brand.get("cta_styles", None),
+        )
+
+        # Caption writing angle (PRD Output requirement)
+        brand_voice = brand.get("voice_personality", "")
+        audience_age = brand.get("audience_age_range", "")
+        caption_angle = CaptionAngleService.get_caption_angle(
+            content_type=content_type,
+            topic=title,
+            brand_voice=brand_voice,
+            audience_age=audience_age,
+        )
+
+        # Enhanced explanation with data backing (PRD Output requirement)
+        enhanced_reason = ContentExplainerService.explain_recommendation(
+            content_type=content_type,
+            topic=title,
+            post_day=day_of_week,
+            primary_goal=primary_goal,
+            historical_performance=performance if performance.get("has_data") else None,
+            upcoming_holidays=upcoming_holidays,
+            trending_topics=trending_topics + industry_trending,
+            industry_best_practices=industry_best_practices,
+        )
+
         days.append({
             "day_index":           i,
             "date":                day_date,
-            "content_type":        mix[i],
-            "title":               idea.get("title", ""),
+            "day_of_week":         day_of_week,
+            "content_type":        content_type,
+            "title":               title,
             "description":         idea.get("description", ""),
             "keyword":             kw,
             "trend_score":         trend_score,
             "performance_score":   perf_score,
             "format_score":        0,
             "final_score":         round((trend_score * 0.4) + (perf_score * 0.4), 1),
-            "reason":              idea.get("reason", "Generated using Market Intel + performance data"),
+            "reason":              enhanced_reason,
             "format":              (performance.get("top_formats") or ["image"])[0],
             "platforms":           platforms,
+            # Enhanced PRD fields
+            "recommended_cta":     recommended_cta,
+            "caption_angle":       caption_angle,
+            "upcoming_holidays":   [h for h in upcoming_holidays if h["date"] == day_date] if upcoming_holidays else [],
+            "trending_topics":     trending_topics[:3] if trending_topics else [],
             "acted_on":            False,
             "acted_on_draft_ids":  [],
             "regenerated_count":   0,
