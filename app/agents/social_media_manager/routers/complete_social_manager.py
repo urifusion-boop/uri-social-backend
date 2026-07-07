@@ -295,6 +295,10 @@ class BrandProfileRequest(BaseModel):
     # Typography
     font_style: Optional[str] = None
     font_style_prompt: Optional[str] = None
+    primary_font: Optional[str] = None
+    primary_font_prompt: Optional[str] = None
+    secondary_font: Optional[str] = None
+    secondary_font_prompt: Optional[str] = None
     custom_font_enabled: Optional[bool] = None
     custom_font_files: Optional[List[Dict[str, str]]] = None
     custom_font_analysis: Optional[Dict[str, Any]] = None

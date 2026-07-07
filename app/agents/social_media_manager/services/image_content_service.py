@@ -697,13 +697,32 @@ class ImageContentService:
             if style_fragment:
                 style_fragment = ImageContentService.inject_brand_variables(style_fragment, bc)
 
-            # Typography System: Prioritize custom font over library font
+            # Typography System: Prioritize custom font > primary/secondary fonts > legacy single font
             if bc.get("custom_font_enabled"):
                 font_prompt = bc.get("custom_font_directive", "")
                 print(f"[TYPOGRAPHY] Using custom font directive")
+            elif bc.get("primary_font_prompt") or bc.get("secondary_font_prompt"):
+                # Use primary & secondary font hierarchy
+                primary_prompt = bc.get("primary_font_prompt", "")
+                secondary_prompt = bc.get("secondary_font_prompt", "")
+
+                if primary_prompt and secondary_prompt:
+                    font_prompt = (
+                        f"Typography hierarchy:\n"
+                        f"- Headlines/main text: {primary_prompt}\n"
+                        f"- Body text/supporting copy/captions: {secondary_prompt}"
+                    )
+                    print(f"[TYPOGRAPHY] Using primary ({bc.get('primary_font', '')}) + secondary ({bc.get('secondary_font', '')}) fonts")
+                elif primary_prompt:
+                    font_prompt = f"All text: {primary_prompt}"
+                    print(f"[TYPOGRAPHY] Using primary font only: {bc.get('primary_font', '')}")
+                else:
+                    font_prompt = f"All text: {secondary_prompt}"
+                    print(f"[TYPOGRAPHY] Using secondary font only: {bc.get('secondary_font', '')}")
             else:
+                # Fallback to legacy single font
                 font_prompt = bc.get("font_style_prompt", "")
-                print(f"[TYPOGRAPHY] Using library font: {bc.get('font_style', 'default')}")
+                print(f"[TYPOGRAPHY] Using legacy library font: {bc.get('font_style', 'default')}")
 
             region = bc.get("region", "")
             brand_colors = bc.get("brand_colors") or []
