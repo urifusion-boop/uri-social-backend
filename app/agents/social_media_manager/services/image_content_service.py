@@ -775,21 +775,19 @@ class ImageContentService:
 
             logo_reserve_size = f"{reserve_width_pct}% width × {reserve_height_pct}% height"
 
-            # Build logo space reservation instruction - specify it's a CORNER/AREA, not full width
+            # Build logo space reservation instruction - keep it elegant, not restrictive
             logo_space_note = ""
             if logo_position:
-                if logo_position == "top_center":
-                    logo_space_note = f"\n⚠️ LOGO OVERLAY ZONE: A small rectangular area at the top-center ({logo_reserve_size}) starting from the top edge is RESERVED for brand logo overlay. Keep ONLY this small top-center rectangle clear. The rest of the image including sides can have content."
-                elif logo_position == "top_left":
-                    logo_space_note = f"\n⚠️ LOGO OVERLAY ZONE: A small rectangular area in the top-left corner ({logo_reserve_size}) is RESERVED for brand logo overlay. DO NOT place ANY text, headlines, visual elements, white boxes, cards, panels, or background shapes in this zone. This area should have the same background as the rest of the image - no special backgrounds or containers. Text must start to the RIGHT of or BELOW this reserved area."
-                elif logo_position == "top_right":
-                    logo_space_note = f"\n⚠️ LOGO OVERLAY ZONE: A small rectangular area in the top-right corner ({logo_reserve_size}) is RESERVED for brand logo overlay. Keep ONLY this small corner rectangle clear. The rest of the image can have content right up to the edge of this zone."
-                elif logo_position == "bottom_left":
-                    logo_space_note = f"\n⚠️ LOGO OVERLAY ZONE: A small rectangular area in the bottom-left corner ({logo_reserve_size}) is RESERVED for brand logo overlay. Keep ONLY this small corner rectangle clear. The rest of the image can have content right up to the edge of this zone."
-                elif logo_position == "bottom_center":
-                    logo_space_note = f"\n⚠️ LOGO OVERLAY ZONE: A small rectangular area at the bottom-center ({logo_reserve_size}) is RESERVED for brand logo overlay. Keep ONLY this small bottom-center rectangle clear. The rest of the image including sides can have content."
-                else:  # bottom_right (default)
-                    logo_space_note = f"\n⚠️ LOGO OVERLAY ZONE: A small rectangular area in the bottom-right corner ({logo_reserve_size}) is RESERVED for brand logo overlay. Keep ONLY this small corner rectangle clear. The rest of the image can have content right up to the edge of this zone."
+                position_map = {
+                    "top_center": "top-center",
+                    "top_left": "top-left corner",
+                    "top_right": "top-right corner",
+                    "bottom_left": "bottom-left corner",
+                    "bottom_center": "bottom-center",
+                    "bottom_right": "bottom-right corner"
+                }
+                pos_text = position_map.get(logo_position, logo_position)
+                logo_space_note = f"\n⚠️ LOGO OVERLAY ZONE: Keep a small {logo_reserve_size} rectangle in the {pos_text} clear for logo overlay - no text or visual elements in ONLY this small rectangle. DO NOT create white boxes, cards, panels, or special backgrounds around this area. The rest of the design should be elegant and natural - headlines and content can be positioned beautifully anywhere else in the image. This is just a small cutout for the logo, not a restriction on your overall creative layout."
 
             # SECTION 1: ABSOLUTE RULES (READ FIRST)
             absolute_rules = f"""=== ABSOLUTE RULES (READ FIRST — THESE OVERRIDE ALL OTHER INSTRUCTIONS) ===
