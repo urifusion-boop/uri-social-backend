@@ -1,10 +1,10 @@
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Union, Any
 
 
 class ChatMessage(BaseModel):
     role: str = "user"
-    content: str
+    content: Union[str, List[dict], Any]  # Support both text and vision (image_url) content
 
 
 class ChatModel(BaseModel):
