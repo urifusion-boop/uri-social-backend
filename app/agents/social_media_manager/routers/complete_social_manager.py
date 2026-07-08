@@ -6388,8 +6388,8 @@ async def adjust_produce_video(
                 new_text = str(edit.get("text", "")).strip()
                 if 0 <= idx < len(blocks) and len(blocks[idx]) >= 3 and new_text:
                     blocks[idx][2] = new_text  # block[2] is the caption text line
-            # Reassemble SRT
-            ctx["srt_text"] = "\n".join("\n".join(b) for b in blocks) + "\n"
+            # Reassemble SRT — blank line between blocks (standard SRT format)
+            ctx["srt_text"] = "\n\n".join("\n".join(b) for b in blocks) + "\n"
         except Exception as e:
             print(f"[Adjust] caption_text_edits parse error: {e}", flush=True)
 
