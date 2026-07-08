@@ -76,6 +76,7 @@ class ContentExplainerService:
         day_insight = ContentExplainerService._explain_day_strategy(
             post_day, content_type
         )
+        if day_insight:
             explanation_parts.append(day_insight)
 
         # 5. Goal Alignment
