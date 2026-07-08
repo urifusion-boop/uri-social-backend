@@ -863,7 +863,7 @@ Create engaging social media captions for THIS UPLOADED CONTENT. Base your writi
         # Deduct credits (cheaper than full generation since no image gen)
         if result.get("status"):
             request_id = result.get("responseData", {}).get("request_id")
-            credits_to_deduct = 0.5  # Half credit - no AI image generation cost
+            credits_to_deduct = 1  # 1 credit - no AI image generation cost (cheaper than full generation)
 
             if request_id:
                 if is_trial_user:
