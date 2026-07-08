@@ -775,21 +775,21 @@ class ImageContentService:
 
             logo_reserve_size = f"{reserve_width_pct}% width × {reserve_height_pct}% height"
 
-            # Build logo space reservation instruction
+            # Build logo space reservation instruction - specify it's a CORNER/AREA, not full width
             logo_space_note = ""
             if logo_position:
                 if logo_position == "top_center":
-                    logo_space_note = f"\n⚠️ LOGO OVERLAY ZONE: The top-center area ({logo_reserve_size} from top edge) is RESERVED for brand logo overlay. Do NOT place any text, faces, or important elements in this zone. Keep this area clear with plain background only."
+                    logo_space_note = f"\n⚠️ LOGO OVERLAY ZONE: A small rectangular area at the top-center ({logo_reserve_size}) starting from the top edge is RESERVED for brand logo overlay. Keep ONLY this small top-center rectangle clear. The rest of the image including sides can have content."
                 elif logo_position == "top_left":
-                    logo_space_note = f"\n⚠️ LOGO OVERLAY ZONE: The top-left corner ({logo_reserve_size}) is RESERVED for brand logo overlay. Do NOT place any text, faces, or important elements in this zone. Keep this area clear with plain background only."
+                    logo_space_note = f"\n⚠️ LOGO OVERLAY ZONE: A small rectangular area in the top-left corner ({logo_reserve_size}) is RESERVED for brand logo overlay. Keep ONLY this small corner rectangle clear. The rest of the image can have content right up to the edge of this zone."
                 elif logo_position == "top_right":
-                    logo_space_note = f"\n⚠️ LOGO OVERLAY ZONE: The top-right corner ({logo_reserve_size}) is RESERVED for brand logo overlay. Do NOT place any text, faces, or important elements in this zone. Keep this area clear with plain background only."
+                    logo_space_note = f"\n⚠️ LOGO OVERLAY ZONE: A small rectangular area in the top-right corner ({logo_reserve_size}) is RESERVED for brand logo overlay. Keep ONLY this small corner rectangle clear. The rest of the image can have content right up to the edge of this zone."
                 elif logo_position == "bottom_left":
-                    logo_space_note = f"\n⚠️ LOGO OVERLAY ZONE: The bottom-left corner ({logo_reserve_size}) is RESERVED for brand logo overlay. Do NOT place any text, faces, or important elements in this zone. Keep this area clear with plain background only."
+                    logo_space_note = f"\n⚠️ LOGO OVERLAY ZONE: A small rectangular area in the bottom-left corner ({logo_reserve_size}) is RESERVED for brand logo overlay. Keep ONLY this small corner rectangle clear. The rest of the image can have content right up to the edge of this zone."
                 elif logo_position == "bottom_center":
-                    logo_space_note = f"\n⚠️ LOGO OVERLAY ZONE: The bottom-center area ({logo_reserve_size}) is RESERVED for brand logo overlay. Do NOT place any text, faces, or important elements in this zone. Keep this area clear with plain background only."
+                    logo_space_note = f"\n⚠️ LOGO OVERLAY ZONE: A small rectangular area at the bottom-center ({logo_reserve_size}) is RESERVED for brand logo overlay. Keep ONLY this small bottom-center rectangle clear. The rest of the image including sides can have content."
                 else:  # bottom_right (default)
-                    logo_space_note = f"\n⚠️ LOGO OVERLAY ZONE: The bottom-right corner ({logo_reserve_size}) is RESERVED for brand logo overlay. Do NOT place any text, faces, or important elements in this zone. Keep this area clear with plain background only."
+                    logo_space_note = f"\n⚠️ LOGO OVERLAY ZONE: A small rectangular area in the bottom-right corner ({logo_reserve_size}) is RESERVED for brand logo overlay. Keep ONLY this small corner rectangle clear. The rest of the image can have content right up to the edge of this zone."
 
             # SECTION 1: ABSOLUTE RULES (READ FIRST)
             absolute_rules = f"""=== ABSOLUTE RULES (READ FIRST — THESE OVERRIDE ALL OTHER INSTRUCTIONS) ===
