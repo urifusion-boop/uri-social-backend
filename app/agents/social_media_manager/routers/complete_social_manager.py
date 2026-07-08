@@ -7014,3 +7014,52 @@ async def approve_product_script(
     return UriResponse.get_single_data_response(
         "approve_script", {"job_id": job_id, "status": "analyzing"}
     )
+
+
+@router.post("/fix-fractional-credits")
+async def fix_fractional_credits(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency)
+):
+    """
+    ADMIN ENDPOINT: Fix fractional credits in database.
+    Rounds all fractional credit values to integers.
+    """
+    try:
+        # Fix user_credits collection
+        result = await db.user_credits.update_many(
+            {},
+            [
+                {"$set": {
+                    "subscription_credits": {"$toInt": {"$round": "$subscription_credits"}},
+                    "bonus_credits": {"$toInt": {"$round": "$bonus_credits"}},
+                    "total_credits": {"$toInt": {"$round": "$total_credits"}},
+                    "credits_used": {"$toInt": {"$round": "$credits_used"}},
+                    "credits_remaining": {"$toInt": {"$round": "$credits_remaining"}}
+                }}
+            ]
+        )
+        wallets_fixed = result.modified_count
+
+        # Fix credit_transactions collection
+        tx_result = await db.credit_transactions.update_many(
+            {},
+            [
+                {"$set": {
+                    "amount": {"$toInt": {"$round": "$amount"}},
+                    "balance_before": {"$toInt": {"$round": "$balance_before"}},
+                    "balance_after": {"$toInt": {"$round": "$balance_after"}}
+                }}
+            ]
+        )
+        transactions_fixed = tx_result.modified_count
+
+        return UriResponse.success_response(
+            "Fixed fractional credits",
+            {
+                "wallets_fixed": wallets_fixed,
+                "transactions_fixed": transactions_fixed
+            }
+        )
+    except Exception as e:
+        print(f"❌ fix_fractional_credits error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
