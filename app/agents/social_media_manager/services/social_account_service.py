@@ -344,38 +344,47 @@ class SocialAccountService:
         else:
             brand_scope = {"brand_id": brand_id}
 
+        # Grab local record for metadata (platform/username) — not required to proceed.
         local = await db["social_connections"].find_one({
             **brand_scope,
             "outstand_account_id": outstand_account_id,
         })
-        if not local:
-            return UriResponse.error_response(
-                "Account not found or does not belong to this brand.", code=404
-            )
 
         outstand = OutstandService()
 
-        # Always remove from local DB first — user must always be able to disconnect
-        # even if the Outstand API is unreachable.
-        await db["social_connections"].delete_one({
+        # Always remove from local DB first (best-effort) so the user is never stuck.
+        del_result = await db["social_connections"].delete_one({
             **brand_scope,
             "outstand_account_id": outstand_account_id,
         })
+        if del_result.deleted_count == 0:
+            print(
+                f"[Disconnect] No local record for {outstand_account_id} "
+                "(may have been removed by a prior attempt) — still removing from Outstand.",
+                flush=True,
+            )
 
-        # Best-effort Outstand delete — log failures but don't surface them to the user.
+        # Best-effort Outstand delete — log failures but always return success to the user.
+        outstand_ok = False
         try:
             await outstand.delete_account(outstand_account_id)
+            outstand_ok = True
         except Exception as e:
             print(
-                f"[Disconnect] Outstand delete failed for {outstand_account_id}: {e} "
-                "(local record already removed)",
+                f"[Disconnect] Outstand delete failed for {outstand_account_id}: {e}",
                 flush=True,
+            )
+
+        # If neither local DB nor Outstand had the account, it's genuinely missing.
+        if del_result.deleted_count == 0 and not outstand_ok:
+            return UriResponse.error_response(
+                "Account not found — it may have already been disconnected.", code=404
             )
 
         return UriResponse.get_single_data_response("disconnection", {
             "outstand_account_id": outstand_account_id,
-            "platform": local.get("platform"),
-            "username": local.get("username"),
+            "platform": local.get("platform") if local else None,
+            "username": local.get("username") if local else None,
             "status": "disconnected",
             "disconnected_at": datetime.utcnow().isoformat(),
         })

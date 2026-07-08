@@ -6302,12 +6302,18 @@ async def start_produce_video_render(
     )
 
 
+class AdjustVideoBody(BaseModel):
+    caption_color: Optional[str] = None
+    caption_font: Optional[str] = None
+    caption_text_edits: Optional[list] = None  # [{index: int, text: str}, ...]
+    hook_text: Optional[str] = None
+
+
 @router.post("/produce-video-job/{job_id}/adjust")
 async def adjust_produce_video(
     job_id: str,
+    body: AdjustVideoBody,
     background_tasks: BackgroundTasks,
-    primary_color: Optional[str] = Form(None),
-    caption_text_edits: Optional[str] = Form(None),  # JSON: [{index, text}, ...]
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
     token: dict = Depends(JWTBearer()),
 ):
@@ -6318,6 +6324,10 @@ async def adjust_produce_video(
     """
     import json as _json
     from app.agents.social_media_manager.services.video_production_service import run_render_phase
+    caption_color = body.caption_color
+    caption_font = body.caption_font
+    caption_text_edits = body.caption_text_edits
+    hook_text = body.hook_text.upper().strip() if body.hook_text else None
 
     user_id = _get_user_id(token)
     if not user_id:
@@ -6333,14 +6343,24 @@ async def adjust_produce_video(
     if not ctx:
         raise HTTPException(status_code=400, detail="No render context — cannot re-render")
 
-    # Apply primary_color override to render_context
-    if primary_color:
-        ctx["primary_color"] = primary_color
+    print(f"[Adjust] job={job_id} received: caption_color={caption_color!r} caption_font={caption_font!r} caption_text_edits={'yes' if caption_text_edits else 'no'}", flush=True)
+    print(f"[Adjust] ctx BEFORE: primary_color={ctx.get('primary_color')!r} caption_color={ctx.get('caption_color')!r} caption_font_family={ctx.get('caption_font_family')!r}", flush=True)
+
+    # Apply caption text colour override — also sync karaoke highlight (primary_color)
+    if caption_color:
+        ctx["caption_color"] = caption_color
+        ctx["primary_color"] = caption_color
+
+    # Apply caption font family override
+    if caption_font:
+        ctx["caption_font_family"] = caption_font
+
+    print(f"[Adjust] ctx AFTER:  primary_color={ctx.get('primary_color')!r} caption_color={ctx.get('caption_color')!r} caption_font_family={ctx.get('caption_font_family')!r}", flush=True)
 
     # Apply caption text edits to the stored SRT
     if caption_text_edits:
         try:
-            edits = _json.loads(caption_text_edits)  # [{index: int, text: str}, ...]
+            edits = caption_text_edits  # already a list: [{index: int, text: str}, ...]
             srt_lines = ctx.get("srt_text", "").split("\n")
             # Parse SRT into blocks: each block is [num, timing, text..., ""]
             blocks: list = []
@@ -6365,16 +6385,16 @@ async def adjust_produce_video(
             print(f"[Adjust] caption_text_edits parse error: {e}", flush=True)
 
     # Persist the updated context and reset status
-    await db.video_production_jobs.update_one(
-        {"job_id": job_id},
-        {"$set": {
-            "render_context": ctx,
-            "status": "processing",
-            "status_message": "Re-rendering with your changes…",
-            "progress": 60,
-            "output_url": None,
-        }}
-    )
+    db_set: dict = {
+        "render_context": ctx,
+        "status": "processing",
+        "status_message": "Re-rendering with your changes…",
+        "progress": 60,
+        "output_url": None,
+    }
+    if hook_text:
+        db_set["ai_decisions.hook_text"] = hook_text
+    await db.video_production_jobs.update_one({"job_id": job_id}, {"$set": db_set})
 
     background_tasks.add_task(run_render_phase, job_id, db)
 
