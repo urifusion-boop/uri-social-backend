@@ -7025,6 +7025,20 @@ async def fix_fractional_credits(
     Rounds all fractional credit values to integers.
     """
     try:
+        # First, check for fractional values
+        sample_wallet = await db.user_credits.find_one({})
+        print(f"📊 Sample wallet before fix: {sample_wallet}")
+
+        # Count wallets with fractional values
+        fractional_count = await db.user_credits.count_documents({
+            "$or": [
+                {"subscription_credits": {"$type": "double"}},
+                {"bonus_credits": {"$type": "double"}},
+                {"credits_remaining": {"$type": "double"}}
+            ]
+        })
+        print(f"📊 Found {fractional_count} wallets with fractional (double) values")
+
         # Fix user_credits collection
         result = await db.user_credits.update_many(
             {},
@@ -7039,6 +7053,7 @@ async def fix_fractional_credits(
             ]
         )
         wallets_fixed = result.modified_count
+        print(f"✅ Modified {wallets_fixed} wallets")
 
         # Fix credit_transactions collection
         tx_result = await db.credit_transactions.update_many(
