@@ -764,15 +764,14 @@ class ImageContentService:
 
             # Calculate actual logo space based on size setting
             # Logo size percentages: small=8%, medium=12%, large=16%
-            # Add padding: +5% width, +4% height for badge and spacing
+            # Add minimal padding: just +2% for badge and edge spacing
             logo_size_map = {"small": 0.08, "medium": 0.12, "large": 0.16}
             logo_pct = logo_size_map.get(logo_size, 0.08)
 
-            # Reserve space = actual logo size + padding for white badge + edge spacing
-            # Width: logo + 2% padding on each side = logo + 4%
-            # Height: logo + 2% padding top/bottom = logo + 4%
-            reserve_width_pct = int((logo_pct + 0.05) * 100)  # e.g., 16% + 5% = 21%
-            reserve_height_pct = int((logo_pct + 0.04) * 100)  # e.g., 16% + 4% = 20%
+            # Reserve space = actual logo size + minimal padding for white badge
+            # Small padding to avoid overlap but not squeeze content
+            reserve_width_pct = int((logo_pct + 0.02) * 100)  # e.g., 16% + 2% = 18%
+            reserve_height_pct = int((logo_pct + 0.02) * 100)  # e.g., 16% + 2% = 18%
 
             logo_reserve_size = f"{reserve_width_pct}% width × {reserve_height_pct}% height"
 
