@@ -765,9 +765,9 @@ class ImageContentService:
             # Map logo size to reservation percentages (width × height)
             # small: 8%, medium: 12%, large: 16%
             logo_reserve_map = {
-                "small": "12% width × 10% height",
-                "medium": "18% width × 15% height",
-                "large": "24% width × 20% height"
+                "small": "10% width × 8% height",
+                "medium": "14% width × 11% height",
+                "large": "18% width × 14% height"
             }
             logo_reserve_size = logo_reserve_map.get(logo_size, "12% width × 10% height")
 
