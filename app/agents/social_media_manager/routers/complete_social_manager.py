@@ -7053,12 +7053,13 @@ async def fix_fractional_credits(
         )
         transactions_fixed = tx_result.modified_count
 
-        return UriResponse.success_response(
-            "Fixed fractional credits",
+        return UriResponse.get_single_data_response(
+            "fix_fractional_credits",
             {
                 "wallets_fixed": wallets_fixed,
                 "transactions_fixed": transactions_fixed
-            }
+            },
+            f"Fixed {wallets_fixed} wallets and {transactions_fixed} transactions"
         )
     except Exception as e:
         print(f"❌ fix_fractional_credits error: {e}")
