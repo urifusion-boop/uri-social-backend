@@ -6592,12 +6592,19 @@ async def adjust_produce_video(
                     current.append(line)
             if current:
                 blocks.append(current)
-            # Apply text edits by block index
+            # Build map from SRT 1-based sequence number → 0-based block index
+            seq_to_block = {
+                int(b[0].strip()): i
+                for i, b in enumerate(blocks)
+                if b and b[0].strip().isdigit()
+            }
+            # Apply text edits by SRT sequence number
             for edit in edits:
-                idx = int(edit.get("index", -1))
+                seq = int(edit.get("index", -1))
+                block_i = seq_to_block.get(seq, -1)
                 new_text = str(edit.get("text", "")).strip()
-                if 0 <= idx < len(blocks) and len(blocks[idx]) >= 3 and new_text:
-                    blocks[idx][2] = new_text  # block[2] is the caption text line
+                if block_i >= 0 and len(blocks[block_i]) >= 3 and new_text:
+                    blocks[block_i][2] = new_text
             # Reassemble SRT — blank line between blocks (standard SRT format)
             ctx["srt_text"] = "\n\n".join("\n".join(b) for b in blocks) + "\n"
         except Exception as e:
