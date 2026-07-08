@@ -372,8 +372,8 @@ _ICON_OVERLAY_LIBRARY: Dict[str, Dict[str, Any]] = {
     "star":      {"emoji": "⭐", "lottie": f"{_CDN}/uri-lottie/star.json", "position": "topRight",     "size": 140},
     "money":     {"emoji": "💰", "lottie": None,                            "position": "topRight",     "size": 140},
     "chart":     {"emoji": "📈", "lottie": None,                            "position": "topRight",     "size": 130},
-    "celebrate": {"emoji": "🎉", "lottie": None,                            "position": "topCenter",    "size": 180},
-    "arrow_up":  {"emoji": "👆", "lottie": f"{_CDN}/uri-lottie/idea.json", "position": "bottomCenter", "size": 130},
+    "celebrate": {"emoji": "🎉", "lottie": None,                            "position": "top",          "size": 180},
+    "arrow_up":  {"emoji": "👆", "lottie": f"{_CDN}/uri-lottie/idea.json", "position": "bottom",       "size": 130},
     "heart":     {"emoji": "❤️", "lottie": None,                            "position": "topRight",     "size": 130},
     "rocket":    {"emoji": "🚀", "lottie": None,                            "position": "topRight",     "size": 150},
 }
@@ -1496,6 +1496,8 @@ def build_shotstack_timeline(
     transition_style: str = "auto",  # overrides video_type-based flash/swipe selection
     music_volume: float = 0.08,
     mute_original_audio: bool = False,
+    caption_font_family: str = "Montserrat",
+    caption_color: str = "#ffffff",  # caption text colour (user-facing clean-up control)
 ) -> Dict[str, Any]:
     # broll items have: at (original ts), duration, url (resolved)
     keep_segments = _build_keep_segments(cuts, video_duration)
@@ -1639,10 +1641,11 @@ def build_shotstack_timeline(
     srt_dir = "/app/static/srt"
     os.makedirs(srt_dir, exist_ok=True)
 
+    print(f"[BuildTimeline] job={job_id} caption_color={caption_color!r} caption_font_family={caption_font_family!r} primary_color={primary_color!r}", flush=True)
     # Per-type Shotstack rich-caption styling
     _cap_style_map: Dict[str, Dict] = {
         "standard": {
-            "font":    {"family": "Montserrat", "size": 46, "color": "#ffffff", "weight": 800},
+            "font":    {"family": caption_font_family, "size": 46, "color": caption_color, "weight": 800},
             "stroke":  {"width": 2, "color": "#000000", "opacity": 1},
             "active":  {"font": {"color": secondary_color, "background": primary_color},
                         "stroke": {"width": 0, "color": "#000000", "opacity": 0}},
@@ -1650,15 +1653,15 @@ def build_shotstack_timeline(
         },
         "emphasis": {
             # Bigger, heavier — reserved for high-strength emphasis moments
-            "font":    {"family": "Montserrat", "size": 58, "color": "#ffffff", "weight": 900},
+            "font":    {"family": caption_font_family, "size": 58, "color": caption_color, "weight": 900},
             "stroke":  {"width": 3, "color": "#000000", "opacity": 1},
             "active":  {"font": {"color": "#ffffff", "background": primary_color},
                         "stroke": {"width": 0, "color": "#000000", "opacity": 0}},
             "width":   640, "height": 260, "y": 0.09,
         },
         "metric": {
-            # Gold text so numbers/stats stand out visually
-            "font":    {"family": "Montserrat", "size": 52, "color": "#FFE566", "weight": 900},
+            # Gold text so numbers/stats stand out visually — keeps its own colour
+            "font":    {"family": caption_font_family, "size": 52, "color": "#FFE566", "weight": 900},
             "stroke":  {"width": 2, "color": "#000000", "opacity": 1},
             "active":  {"font": {"color": "#000000", "background": "#FFE566"},
                         "stroke": {"width": 0, "color": "#000000", "opacity": 0}},
@@ -1666,7 +1669,7 @@ def build_shotstack_timeline(
         },
         "cta": {
             # Slightly higher position + brand accent to feel like a call-to-action
-            "font":    {"family": "Montserrat", "size": 44, "color": "#ffffff", "weight": 800},
+            "font":    {"family": caption_font_family, "size": 44, "color": caption_color, "weight": 800},
             "stroke":  {"width": 2, "color": "#000000", "opacity": 0.8},
             "active":  {"font": {"color": "#ffffff", "background": primary_color},
                         "stroke": {"width": 0, "color": "#000000", "opacity": 0}},
@@ -1787,7 +1790,7 @@ def build_shotstack_timeline(
             "length":     round(actual_dur, 3),
             "opacity":    _tc_op,
             "transition": {"in": tr_in, "out": tr_out},
-            "position":   "fill",
+            "position":   "center",
         })
         print(
             f"[VideoProduction] topic-change {_tc_type} at orig={orig_at:.1f}s → tl={tl_at:.1f}s",
@@ -2545,10 +2548,13 @@ async def run_render_phase(job_id: str, db) -> None:
         transition_style     = ctx.get("transition_style", "auto")
         logo_url        = ctx.get("logo_url", "")
         brand_name      = ctx.get("brand_name", "")
-        primary_color   = ctx.get("primary_color", "#FFD700")
-        secondary_color = ctx.get("secondary_color", "#000000")
-        tagline         = ctx.get("tagline", "")
-        website         = ctx.get("website", "")
+        primary_color        = ctx.get("primary_color", "#FFD700")
+        secondary_color      = ctx.get("secondary_color", "#000000")
+        caption_font_family  = ctx.get("caption_font_family", "Montserrat")
+        caption_color        = ctx.get("caption_color", "#ffffff")
+        print(f"[RenderPhase] job={job_id} caption_color={caption_color!r} caption_font_family={caption_font_family!r} primary_color={primary_color!r}", flush=True)
+        tagline              = ctx.get("tagline", "")
+        website              = ctx.get("website", "")
 
         srt_entries = _filter_hallucinated_captions(_parse_srt(srt_text))
 
@@ -2651,6 +2657,8 @@ async def run_render_phase(job_id: str, db) -> None:
             transition_style=transition_style,
             music_volume=music_volume,
             mute_original_audio=mute_original_audio,
+            caption_font_family=caption_font_family,
+            caption_color=caption_color,
         )
 
         await update(68, "Rendering video…")
