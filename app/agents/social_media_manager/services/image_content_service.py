@@ -757,25 +757,35 @@ class ImageContentService:
             brand_name = bc.get("brand_name", "")
             color_str = ", ".join(str(c) for c in brand_colors[:4]) if brand_colors else ""
 
-            # Get logo position to reserve space
+            # Get logo position and size to reserve space
             logo_url = bc.get('logo_url')
             logo_position = bc.get('logo_position', 'bottom_right') if logo_url else None
+            logo_size = bc.get('logo_size', 'small')
+
+            # Map logo size to reservation percentages (width × height)
+            # small: 8%, medium: 12%, large: 16%
+            logo_reserve_map = {
+                "small": "12% width × 10% height",
+                "medium": "18% width × 15% height",
+                "large": "24% width × 20% height"
+            }
+            logo_reserve_size = logo_reserve_map.get(logo_size, "12% width × 10% height")
 
             # Build logo space reservation instruction
             logo_space_note = ""
             if logo_position:
                 if logo_position == "top_center":
-                    logo_space_note = "\n⚠️ LOGO OVERLAY ZONE: The top-center area (10% width × 8% height from top edge) is RESERVED for brand logo overlay. Do NOT place any text, faces, or important elements in this zone. Keep this area clear with plain background only."
+                    logo_space_note = f"\n⚠️ LOGO OVERLAY ZONE: The top-center area ({logo_reserve_size} from top edge) is RESERVED for brand logo overlay. Do NOT place any text, faces, or important elements in this zone. Keep this area clear with plain background only."
                 elif logo_position == "top_left":
-                    logo_space_note = "\n⚠️ LOGO OVERLAY ZONE: The top-left corner (10% width × 8% height) is RESERVED for brand logo overlay. Do NOT place any text, faces, or important elements in this zone. Keep this area clear with plain background only."
+                    logo_space_note = f"\n⚠️ LOGO OVERLAY ZONE: The top-left corner ({logo_reserve_size}) is RESERVED for brand logo overlay. Do NOT place any text, faces, or important elements in this zone. Keep this area clear with plain background only."
                 elif logo_position == "top_right":
-                    logo_space_note = "\n⚠️ LOGO OVERLAY ZONE: The top-right corner (10% width × 8% height) is RESERVED for brand logo overlay. Do NOT place any text, faces, or important elements in this zone. Keep this area clear with plain background only."
+                    logo_space_note = f"\n⚠️ LOGO OVERLAY ZONE: The top-right corner ({logo_reserve_size}) is RESERVED for brand logo overlay. Do NOT place any text, faces, or important elements in this zone. Keep this area clear with plain background only."
                 elif logo_position == "bottom_left":
-                    logo_space_note = "\n⚠️ LOGO OVERLAY ZONE: The bottom-left corner (10% width × 8% height) is RESERVED for brand logo overlay. Do NOT place any text, faces, or important elements in this zone. Keep this area clear with plain background only."
+                    logo_space_note = f"\n⚠️ LOGO OVERLAY ZONE: The bottom-left corner ({logo_reserve_size}) is RESERVED for brand logo overlay. Do NOT place any text, faces, or important elements in this zone. Keep this area clear with plain background only."
                 elif logo_position == "bottom_center":
-                    logo_space_note = "\n⚠️ LOGO OVERLAY ZONE: The bottom-center area (10% width × 8% height) is RESERVED for brand logo overlay. Do NOT place any text, faces, or important elements in this zone. Keep this area clear with plain background only."
+                    logo_space_note = f"\n⚠️ LOGO OVERLAY ZONE: The bottom-center area ({logo_reserve_size}) is RESERVED for brand logo overlay. Do NOT place any text, faces, or important elements in this zone. Keep this area clear with plain background only."
                 else:  # bottom_right (default)
-                    logo_space_note = "\n⚠️ LOGO OVERLAY ZONE: The bottom-right corner (10% width × 8% height) is RESERVED for brand logo overlay. Do NOT place any text, faces, or important elements in this zone. Keep this area clear with plain background only."
+                    logo_space_note = f"\n⚠️ LOGO OVERLAY ZONE: The bottom-right corner ({logo_reserve_size}) is RESERVED for brand logo overlay. Do NOT place any text, faces, or important elements in this zone. Keep this area clear with plain background only."
 
             # SECTION 1: ABSOLUTE RULES (READ FIRST)
             absolute_rules = f"""=== ABSOLUTE RULES (READ FIRST — THESE OVERRIDE ALL OTHER INSTRUCTIONS) ===
