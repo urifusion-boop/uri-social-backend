@@ -4044,9 +4044,9 @@ async def save_brand_profile(
     """Save or update the brand profile for the active brand."""
     user_id = ctx["user_id"]
     try:
-        print(f"🔍 PYDANTIC PARSED REQUEST: logo_position={repr(request.logo_position)}, logo_size={repr(request.logo_size)}")
+        print(f"🔍 PYDANTIC PARSED REQUEST: logo_position={repr(request.logo_position)}, logo_size={repr(request.logo_size)}, ideal_customer_profile={repr(request.ideal_customer_profile)}, primary_font={repr(request.primary_font)}, secondary_font={repr(request.secondary_font)}")
         payload = request.dict(exclude_none=True)
-        print(f"🔍 PAYLOAD AFTER exclude_none: logo_position={repr(payload.get('logo_position'))}, logo_size={repr(payload.get('logo_size'))}")
+        print(f"🔍 PAYLOAD AFTER exclude_none: logo_position={repr(payload.get('logo_position'))}, logo_size={repr(payload.get('logo_size'))}, ideal_customer_profile={repr(payload.get('ideal_customer_profile'))}, primary_font={repr(payload.get('primary_font'))}, secondary_font={repr(payload.get('secondary_font'))}")
         # Serialize nested Pydantic models to plain dicts
         if "guardrails" in payload and hasattr(payload["guardrails"], "dict"):
             payload["guardrails"] = payload["guardrails"].dict(exclude_none=True)

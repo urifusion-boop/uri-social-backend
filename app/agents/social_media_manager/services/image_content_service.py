@@ -781,7 +781,7 @@ class ImageContentService:
                 if logo_position == "top_center":
                     logo_space_note = f"\n⚠️ LOGO OVERLAY ZONE: A small rectangular area at the top-center ({logo_reserve_size}) starting from the top edge is RESERVED for brand logo overlay. Keep ONLY this small top-center rectangle clear. The rest of the image including sides can have content."
                 elif logo_position == "top_left":
-                    logo_space_note = f"\n⚠️ LOGO OVERLAY ZONE: A small rectangular area in the top-left corner ({logo_reserve_size}) is RESERVED for brand logo overlay. Keep ONLY this small corner rectangle clear. The rest of the image can have content right up to the edge of this zone."
+                    logo_space_note = f"\n⚠️ LOGO OVERLAY ZONE: A small rectangular area in the top-left corner ({logo_reserve_size}) is RESERVED for brand logo overlay. DO NOT place ANY text, headlines, visual elements, white boxes, cards, panels, or background shapes in this zone. This area should have the same background as the rest of the image - no special backgrounds or containers. Text must start to the RIGHT of or BELOW this reserved area."
                 elif logo_position == "top_right":
                     logo_space_note = f"\n⚠️ LOGO OVERLAY ZONE: A small rectangular area in the top-right corner ({logo_reserve_size}) is RESERVED for brand logo overlay. Keep ONLY this small corner rectangle clear. The rest of the image can have content right up to the edge of this zone."
                 elif logo_position == "bottom_left":
