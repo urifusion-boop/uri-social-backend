@@ -1498,6 +1498,8 @@ def build_shotstack_timeline(
     mute_original_audio: bool = False,
     caption_font_family: str = "Montserrat",
     caption_color: str = "#ffffff",  # caption text colour (user-facing clean-up control)
+    hook_text_color: str = "#ffffff",
+    hook_text_size: int = 52,
 ) -> Dict[str, Any]:
     # broll items have: at (original ts), duration, url (resolved)
     keep_segments = _build_keep_segments(cuts, video_duration)
@@ -1909,8 +1911,8 @@ def build_shotstack_timeline(
             "<style>"
             "*{margin:0;padding:0;box-sizing:border-box;}"
             f"body{{width:720px;background:{primary_color};overflow:hidden;}}"
-            f"p{{font-family:'Arial Black',Arial,sans-serif;font-size:52px;"
-            f"font-weight:900;color:#fff;text-align:center;text-transform:uppercase;"
+            f"p{{font-family:'Arial Black',Arial,sans-serif;font-size:{hook_text_size}px;"
+            f"font-weight:900;color:{hook_text_color};text-align:center;text-transform:uppercase;"
             f"line-height:1.15;word-wrap:break-word;padding:24px 28px;}}"
             "</style></head>"
             f"<body><p>{_hook_upper}</p></body></html>"
@@ -2552,6 +2554,8 @@ async def run_render_phase(job_id: str, db) -> None:
         secondary_color      = ctx.get("secondary_color", "#000000")
         caption_font_family  = ctx.get("caption_font_family", "Montserrat")
         caption_color        = ctx.get("caption_color", "#ffffff")
+        hook_text_color      = ctx.get("hook_text_color", "#ffffff")
+        hook_text_size       = ctx.get("hook_text_size", 52)
         print(f"[RenderPhase] job={job_id} caption_color={caption_color!r} caption_font_family={caption_font_family!r} primary_color={primary_color!r}", flush=True)
         tagline              = ctx.get("tagline", "")
         website              = ctx.get("website", "")
@@ -2659,6 +2663,8 @@ async def run_render_phase(job_id: str, db) -> None:
             mute_original_audio=mute_original_audio,
             caption_font_family=caption_font_family,
             caption_color=caption_color,
+            hook_text_color=hook_text_color,
+            hook_text_size=hook_text_size,
         )
 
         await update(68, "Rendering video…")
