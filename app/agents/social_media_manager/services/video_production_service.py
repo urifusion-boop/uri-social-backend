@@ -2413,6 +2413,22 @@ async def run_production_job(
             flush=True,
         )
 
+        # ── Generate b-roll up-front so the review screen shows real thumbnails ──
+        # (not blind text). Failed generations are dropped; render reuses these URLs.
+        if broll_decisions:
+            await update(52, "Generating b-roll visuals…")
+            _tasks = [
+                _fetch_broll_url(br.get("description", ""), br.get("concept", ""))
+                for br in broll_decisions
+            ]
+            _urls = await asyncio.gather(*_tasks, return_exceptions=True)
+            broll_decisions = [
+                {**br, "url": url}
+                for br, url in zip(broll_decisions, _urls)
+                if isinstance(url, str) and url
+            ]
+            print(f"[VideoProduction] pre-generated {len(broll_decisions)} b-roll images", flush=True)
+
         # ── REVIEW PAUSE — store decisions + render context, wait for user approval ─
         await db.video_production_jobs.update_one(
             {"job_id": job_id},
@@ -2646,18 +2662,22 @@ async def run_render_phase(job_id: str, db) -> None:
         srt_entries = _filter_hallucinated_captions(_parse_srt(srt_text))
 
         # ── Stage 4a: B-roll ──────────────────────────────────────────────────────
+        # Reuse the images generated (and user-reviewed) up-front; only generate any
+        # item still missing a URL (legacy jobs, or a client that stripped them).
         broll: List[Dict] = []
         if broll_decisions:
-            await update(58, "Fetching b-roll assets…")
-            tasks = [
-                _fetch_broll_url(br.get("description", ""), br.get("concept", ""))
-                for br in broll_decisions
-            ]
-            urls = await asyncio.gather(*tasks, return_exceptions=True)
-            for br, url in zip(broll_decisions, urls):
+            await update(58, "Preparing b-roll…")
+            missing = [br for br in broll_decisions if not br.get("url")]
+            gen = await asyncio.gather(
+                *[_fetch_broll_url(br.get("description", ""), br.get("concept", "")) for br in missing],
+                return_exceptions=True,
+            ) if missing else []
+            filled = {id(br): u for br, u in zip(missing, gen)}
+            for br in broll_decisions:
+                url = br.get("url") or filled.get(id(br))
                 if isinstance(url, str) and url:
                     broll.append({**br, "url": url})
-            print(f"[VideoProduction:render] broll {len(broll)}/{len(broll_decisions)}", flush=True)
+            print(f"[VideoProduction:render] broll {len(broll)}/{len(broll_decisions)} ready", flush=True)
 
         # ── Stage 4b: Music — only runs when enable_music=True ──────────────────
         music_url = ""
