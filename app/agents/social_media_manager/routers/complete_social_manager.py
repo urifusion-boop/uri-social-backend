@@ -774,24 +774,36 @@ Create engaging social media captions for THIS UPLOADED CONTENT. Base your writi
                 )
 
             if _d_ids:
+                # Attach uploaded images to drafts so they can be published
+                if post_type == "carousel":
+                    # For carousel: create slides from uploaded images
+                    carousel_images = [{"image_url": url} for url in media_urls]
+                    update_fields = {
+                        "brand_id": active_brand_id,
+                        "content_source": "user_uploaded",
+                        "uploaded_media_urls": media_urls,
+                        "post_type": post_type,
+                        "carousel_images": carousel_images,
+                    }
+                else:
+                    # For single post: use first uploaded image as main image
+                    update_fields = {
+                        "brand_id": active_brand_id,
+                        "content_source": "user_uploaded",
+                        "uploaded_media_urls": media_urls,
+                        "post_type": post_type,
+                        "image_url": media_urls[0] if media_urls else None,
+                    }
+
                 # Mark drafts as user-uploaded and attach media URLs
                 await db["content_drafts"].update_many(
                     {"id": {"$in": _d_ids}},
-                    {
-                        "$set": {
-                            "brand_id": active_brand_id,
-                            "content_source": "user_uploaded",
-                            "uploaded_media_urls": media_urls,
-                            "post_type": post_type,
-                        }
-                    }
+                    {"$set": update_fields}
                 )
+
                 # Update in-memory draft objects
                 for d in _rd.get("drafts", []):
-                    d["brand_id"] = active_brand_id
-                    d["content_source"] = "user_uploaded"
-                    d["uploaded_media_urls"] = media_urls
-                    d["post_type"] = post_type
+                    d.update(update_fields)
 
         # Deduct credits (cheaper than full generation since no image gen)
         if result.get("status"):
