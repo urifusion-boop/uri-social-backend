@@ -4,7 +4,7 @@ import asyncio
 import json
 import subprocess
 import traceback
-from fastapi import APIRouter, Body, Depends, HTTPException, BackgroundTasks, Query, Request, UploadFile, File, Form
+from fastapi import APIRouter, Body, Depends, HTTPException, BackgroundTasks, Query, Request, Response, UploadFile, File, Form
 from fastapi.responses import RedirectResponse, StreamingResponse, JSONResponse
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from pydantic import BaseModel, Field
@@ -6482,6 +6482,48 @@ async def get_produce_video_job(
         raise HTTPException(status_code=404, detail="Job not found")
 
     return UriResponse.get_single_data_response("produce_video_job", doc)
+
+
+@router.get("/produce-video-job/{job_id}/capture-frame")
+async def capture_video_frame(
+    job_id: str,
+    t: float = Query(default=0.0, ge=0.0),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """Extract a JPEG frame at time t (seconds) from the produced video using ffmpeg."""
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    doc = await db.video_production_jobs.find_one(
+        {"job_id": job_id, "user_id": user_id}, {"output_url": 1}
+    )
+    if not doc or not doc.get("output_url"):
+        raise HTTPException(status_code=404, detail="Job not found or video not ready")
+
+    output_url = doc["output_url"]
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-ss", str(t),
+                "-i", output_url,
+                "-vframes", "1",
+                "-f", "image2pipe",
+                "-vcodec", "mjpeg",
+                "pipe:1",
+            ],
+            capture_output=True,
+            timeout=30,
+        )
+        if not result.stdout:
+            raise HTTPException(status_code=500, detail="ffmpeg produced no output")
+        return Response(content=result.stdout, media_type="image/jpeg")
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="Frame capture timed out")
+    except FileNotFoundError:
+        raise HTTPException(status_code=500, detail="ffmpeg not available on server")
 
 
 @router.post("/produce-video-job/{job_id}/start-render")
