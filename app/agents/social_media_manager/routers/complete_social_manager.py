@@ -6580,6 +6580,8 @@ class AdjustVideoBody(BaseModel):
     caption_font: Optional[str] = None
     caption_text_edits: Optional[list] = None  # [{index: int, text: str}, ...]
     hook_text: Optional[str] = None
+    hook_text_color: Optional[str] = None
+    hook_text_size: Optional[int] = None
 
 
 @router.post("/produce-video-job/{job_id}/adjust")
@@ -6601,6 +6603,8 @@ async def adjust_produce_video(
     caption_font = body.caption_font
     caption_text_edits = body.caption_text_edits
     hook_text = body.hook_text.upper().strip() if body.hook_text else None
+    hook_text_color = body.hook_text_color
+    hook_text_size = body.hook_text_size
 
     user_id = _get_user_id(token)
     if not user_id:
@@ -6627,6 +6631,12 @@ async def adjust_produce_video(
     # Apply caption font family override
     if caption_font:
         ctx["caption_font_family"] = caption_font
+
+    # Apply hook text style overrides
+    if hook_text_color:
+        ctx["hook_text_color"] = hook_text_color
+    if hook_text_size:
+        ctx["hook_text_size"] = hook_text_size
 
     print(f"[Adjust] ctx AFTER:  primary_color={ctx.get('primary_color')!r} caption_color={ctx.get('caption_color')!r} caption_font_family={ctx.get('caption_font_family')!r}", flush=True)
 
