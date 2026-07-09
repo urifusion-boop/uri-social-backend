@@ -379,13 +379,24 @@ Write as if you're sharing hard-won business wisdom with fellow African entrepre
                 parts.append(f'- Compliance requirement: {guardrails["compliance_notes"]}.')
 
         # ── CTAs & links ─────────────────────────────────────────────────────
-        # Check for one-time override CTA first
+        # Priority order: override_cta > selected_cta (from image) > cta_styles (all CTAs)
+        # This ensures caption CTA matches the image CTA for consistency
         override_cta = brand_context.get("override_cta")
+        selected_cta = brand_context.get("selected_cta")  # CTA used in the image
+
         if override_cta:
+            # One-time override CTA (highest priority)
             parts.append(
                 f'- Call-to-action: End the post with this exact CTA: "{override_cta}"'
             )
+        elif selected_cta:
+            # Use the SAME CTA that was used in the image (for consistency)
+            parts.append(
+                f'- Call-to-action: End the post with this exact CTA: "{selected_cta}"'
+            )
+            print(f"✅ Caption will use same CTA as image: '{selected_cta}'")
         elif brand_context.get("cta_styles"):
+            # Fallback: if no image CTA was selected, AI can pick from all CTAs
             ctas = brand_context["cta_styles"]
             if isinstance(ctas, list) and ctas:
                 parts.append(
