@@ -709,7 +709,7 @@ async def upload_user_content(
             import base64
             import requests
             import io
-            from PIL import Image, ImageDraw, ImageFont
+            from PIL import Image
 
             processed_media_urls = []
             for media_url in media_urls:
@@ -742,38 +742,78 @@ async def upload_user_content(
 
                     # Apply CTA overlay if requested
                     if add_cta:
-                        # Determine CTA text
-                        cta_text = custom_cta if custom_cta else brand_context_dict.get('default_link', '').replace('https://', '').replace('http://', '')
+                        # Determine CTA text (same logic as normal image generation)
+                        if custom_cta:
+                            # Use custom CTA if provided
+                            cta_text = custom_cta
+                        else:
+                            # Use brand playbook CTA logic (same as normal generation)
+                            cta_styles_list = brand_context_dict.get("cta_styles", [])
+                            if isinstance(cta_styles_list, list) and cta_styles_list:
+                                import random
+                                cta_text = random.choice(cta_styles_list)
+                            else:
+                                # Fallback to default_link if cta_styles is empty
+                                cta_text = brand_context_dict.get("default_link", "Link in bio")
+                                # Remove https:// prefix for cleaner display
+                                cta_text = cta_text.replace('https://', '').replace('http://', '')
 
                         if cta_text:
-                            draw = ImageDraw.Draw(img)
-                            width, height = img.size
-
-                            # CTA styling
-                            font_size = max(20, int(height * 0.03))
+                            # Use gpt-image-2 edit to add CTA professionally (same as normal generation)
                             try:
-                                font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
-                            except:
-                                font = ImageFont.load_default()
+                                from app.services.AIService import client as openai_client
+                                import asyncio
 
-                            # Get text size
-                            bbox = draw.textbbox((0, 0), cta_text, font=font)
-                            text_width = bbox[2] - bbox[0]
-                            text_height = bbox[3] - bbox[1]
+                                # Convert image to PNG for gpt-image-2 edit
+                                width, height = img.size
+                                img_png_buf = io.BytesIO()
+                                img.save(img_png_buf, format="PNG")
+                                img_png_buf.seek(0)
 
-                            # Position at bottom center
-                            x = (width - text_width) // 2
-                            y = height - text_height - int(height * 0.05)
+                                # Determine size for gpt-image-2 (must be 1024x1024, 1792x1024, or 1024x1792)
+                                if width >= height:
+                                    gpt2_size = "1792x1024" if width / height > 1.5 else "1024x1024"
+                                else:
+                                    gpt2_size = "1024x1792"
 
-                            # Draw background rectangle
-                            padding = 15
-                            draw.rectangle(
-                                [x - padding, y - padding, x + text_width + padding, y + text_height + padding],
-                                fill=(0, 0, 0, 180)
-                            )
+                                # Build edit prompt to add CTA text
+                                cta_prompt = f"""Add call-to-action text to this image.
 
-                            # Draw text
-                            draw.text((x, y), cta_text, fill=(255, 255, 255), font=font)
+CRITICAL INSTRUCTIONS:
+1. Add the following text at the bottom-center of the image: "{cta_text}"
+2. Use clean, modern sans-serif font
+3. Style the text subtle but legible - approximately 30% the size of any headline text
+4. Position it in the bottom-center within safe zone (at least 10% from bottom edge)
+5. DO NOT style it as a button or banner - just clean text
+6. Keep the text color high-contrast against the background for readability
+7. DO NOT modify the rest of the image - preserve all existing content exactly as-is
+8. The CTA text should blend naturally with the image's existing design style"""
+
+                                # Call gpt-image-2 edit API
+                                loop = asyncio.get_running_loop()
+                                edit_response = await asyncio.wait_for(
+                                    loop.run_in_executor(
+                                        None,
+                                        lambda: openai_client.images.edit(
+                                            model="gpt-image-2",
+                                            image=("image.png", img_png_buf, "image/png"),
+                                            prompt=cta_prompt,
+                                            n=1,
+                                            size=gpt2_size,
+                                        ),
+                                    ),
+                                    timeout=300,
+                                )
+
+                                # Download edited image
+                                edited_url = edit_response.data[0].url
+                                resp_edit = requests.get(edited_url, timeout=10)
+                                resp_edit.raise_for_status()
+                                img = Image.open(io.BytesIO(resp_edit.content)).convert("RGBA")
+                                print(f"✅ CTA text added via gpt-image-2 edit: '{cta_text}'")
+
+                            except Exception as cta_err:
+                                print(f"⚠️ CTA overlay via AI failed: {cta_err}, skipping CTA")
 
                     # Upload processed image back to Cloudinary
                     buf = io.BytesIO()
