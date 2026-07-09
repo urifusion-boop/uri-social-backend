@@ -729,6 +729,11 @@ async def upload_user_content(
         platforms = request.get("platforms", [])
         post_type = request.get("post_type", "feed")
 
+        # New options: logo and CTA overlays
+        add_logo = request.get("add_logo", False)
+        add_cta = request.get("add_cta", False)
+        custom_cta = request.get("custom_cta", "")  # If provided, use this instead of default
+
         if not uploaded_media:
             raise HTTPException(status_code=400, detail="No media uploaded")
         if not platforms:
@@ -760,10 +765,101 @@ async def upload_user_content(
         media_urls = await UserMediaStorageService.upload_user_media(uploaded_media, user_id)
         print(f"✅ All media uploaded successfully: {len(media_urls)} URLs")
 
-        # Load brand profile
+        # Load brand profile (needed for logo/CTA overlays)
         profile_result = await BrandProfileService.get(user_id, db, brand_id=active_brand_id)
         profile_data = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
         brand_context_dict = BrandProfileService.to_brand_context(profile_data)
+
+        # Apply logo and/or CTA overlays if requested
+        if add_logo or add_cta:
+            from ..services.image_content_service import ImageContentService
+            import base64
+            import requests
+            import io
+            from PIL import Image, ImageDraw, ImageFont
+
+            processed_media_urls = []
+            for media_url in media_urls:
+                try:
+                    # Download the uploaded image
+                    resp = requests.get(media_url, timeout=10)
+                    resp.raise_for_status()
+                    img = Image.open(io.BytesIO(resp.content)).convert("RGBA")
+
+                    # Apply logo overlay if requested
+                    if add_logo and brand_context_dict.get('logo_url'):
+                        logo_position = brand_context_dict.get('logo_position', 'bottom_right')
+                        logo_size = brand_context_dict.get('logo_size', 'small')
+
+                        # Convert image to base64, apply logo, convert back
+                        buf = io.BytesIO()
+                        img.convert("RGB").save(buf, format="JPEG", quality=95)
+                        img_b64 = base64.b64encode(buf.getvalue()).decode()
+
+                        # Use existing logo overlay method
+                        img_b64_with_logo = ImageContentService._overlay_logo(
+                            img_b64,
+                            brand_context_dict['logo_url'],
+                            logo_position,
+                            logo_size
+                        )
+
+                        # Convert back to PIL for CTA overlay
+                        img = Image.open(io.BytesIO(base64.b64decode(img_b64_with_logo))).convert("RGBA")
+
+                    # Apply CTA overlay if requested
+                    if add_cta:
+                        # Determine CTA text
+                        cta_text = custom_cta if custom_cta else brand_context_dict.get('default_link', '').replace('https://', '').replace('http://', '')
+
+                        if cta_text:
+                            draw = ImageDraw.Draw(img)
+                            width, height = img.size
+
+                            # CTA styling
+                            font_size = max(20, int(height * 0.03))
+                            try:
+                                font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
+                            except:
+                                font = ImageFont.load_default()
+
+                            # Get text size
+                            bbox = draw.textbbox((0, 0), cta_text, font=font)
+                            text_width = bbox[2] - bbox[0]
+                            text_height = bbox[3] - bbox[1]
+
+                            # Position at bottom center
+                            x = (width - text_width) // 2
+                            y = height - text_height - int(height * 0.05)
+
+                            # Draw background rectangle
+                            padding = 15
+                            draw.rectangle(
+                                [x - padding, y - padding, x + text_width + padding, y + text_height + padding],
+                                fill=(0, 0, 0, 180)
+                            )
+
+                            # Draw text
+                            draw.text((x, y), cta_text, fill=(255, 255, 255), font=font)
+
+                    # Upload processed image back to Cloudinary
+                    buf = io.BytesIO()
+                    img.convert("RGB").save(buf, format="JPEG", quality=95)
+                    buf.seek(0)
+
+                    # Re-upload to Cloudinary using Cloudinary service
+                    from app.services.cloudinary_service import upload_bytes
+                    folder = f"uri-social/user-uploads/{user_id}/processed"
+                    processed_url = await upload_bytes(buf.getvalue(), folder=folder, resource_type="image")
+                    processed_media_urls.append(processed_url)
+                    print(f"✅ Applied overlays to image {len(processed_media_urls)}/{len(media_urls)}")
+
+                except Exception as e:
+                    print(f"⚠️ Overlay processing failed for image, using original: {e}")
+                    processed_media_urls.append(media_url)
+
+            # Use processed URLs
+            media_urls = processed_media_urls
 
         # Analyze uploaded media with vision
         # Build comprehensive analysis of all uploaded media
