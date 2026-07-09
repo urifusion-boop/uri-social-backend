@@ -787,7 +787,7 @@ class ImageContentService:
                     "bottom_right": "bottom-right corner"
                 }
                 pos_text = position_map.get(logo_position, logo_position)
-                logo_space_note = f"\n⚠️ LOGO OVERLAY ZONE: Keep a small {logo_reserve_size} rectangle in the {pos_text} clear for logo overlay - no text or visual elements in ONLY this small rectangle. DO NOT create white boxes, cards, panels, or special backgrounds around this area. The rest of the design should be elegant and natural - headlines and content can be positioned beautifully anywhere else in the image. This is just a small cutout for the logo, not a restriction on your overall creative layout."
+                logo_space_note = f"\n⚠️ LOGO OVERLAY ZONE: A brand logo will be overlaid in the {pos_text} (approximately {logo_reserve_size}). Keep this small area free of text and important visual elements. CRITICAL: Do NOT create any white box, card, badge, panel, frame, border, or background shape in this area. The background pattern/design should continue naturally through this zone - just avoid placing text or key visual elements there. The logo will be placed directly on top of whatever background exists."
 
             # SECTION 1: ABSOLUTE RULES (READ FIRST)
             absolute_rules = f"""=== ABSOLUTE RULES (READ FIRST — THESE OVERRIDE ALL OTHER INSTRUCTIONS) ===
