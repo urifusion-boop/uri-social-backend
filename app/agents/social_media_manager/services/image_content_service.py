@@ -847,6 +847,12 @@ that follows.{logo_space_note}"""
                     # Fallback to default_link if cta_styles is empty
                     cta_text = bc.get("default_link", "Link in bio")
 
+            # Store selected CTA in brand_context for caption consistency
+            # This ensures the caption uses the SAME CTA that appears in the image
+            if brand_context is not None:
+                brand_context["selected_cta"] = cta_text
+                print(f"🎯 CTA selected for image: '{cta_text}' (will be passed to caption generation)")
+
             # Brand name display logic (PRD Section 4)
             # Art-piece posters ALWAYS include brand logo + tagline + badges
             show_brand_name = is_art_piece or any([
