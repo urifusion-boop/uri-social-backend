@@ -645,17 +645,94 @@ async def _fal_generate(description: str) -> Optional[str]:
     return None
 
 
+async def _upload_image_bytes_to_cloudinary(img_bytes: bytes, public_id: str) -> Optional[str]:
+    """Upload raw image bytes to Cloudinary and return the secure_url."""
+    cloud = settings.CLOUDINARY_CLOUD_NAME
+    api_key = settings.CLOUDINARY_API_KEY
+    api_secret = settings.CLOUDINARY_API_SECRET
+    if not all([cloud, api_key, api_secret]):
+        return None
+    folder = "uri-broll"
+    ts = int(time.time())
+    params_str = f"folder={folder}&public_id={public_id}&timestamp={ts}"
+    signature = hashlib.sha1(f"{params_str}{api_secret}".encode()).hexdigest()
+    form = aiohttp.FormData()
+    form.add_field("file", img_bytes, filename=f"{public_id}.png", content_type="image/png")
+    form.add_field("api_key", api_key)
+    form.add_field("timestamp", str(ts))
+    form.add_field("signature", signature)
+    form.add_field("public_id", public_id)
+    form.add_field("folder", folder)
+    form.add_field("resource_type", "image")
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"https://api.cloudinary.com/v1_1/{cloud}/image/upload",
+                data=form, timeout=aiohttp.ClientTimeout(total=60),
+            ) as resp:
+                body = json.loads(await resp.text())
+                if not resp.ok:
+                    print(f"[Cloudinary:gen] upload failed {resp.status}: {body}", flush=True)
+                    return None
+                return body.get("secure_url", "") or None
+    except Exception as e:
+        print(f"[Cloudinary:gen] error: {e}", flush=True)
+        return None
+
+
+async def _generate_broll_image(image_prompt: str) -> Optional[str]:
+    """
+    Generate a photorealistic 9:16 b-roll still with gpt-image-1 and host it on
+    Cloudinary. Returns the CDN URL, or None on failure. Created to match the moment,
+    so relevance doesn't depend on a stock library having the right shot.
+    """
+    import base64
+    import uuid as _uuid
+    if not settings.OPENAI_API_KEY or not (image_prompt or "").strip():
+        return None
+    _STYLE = (
+        "Shot on a 35mm cinema camera, cinematic color grade with soft warm highlights "
+        "and gentle teal shadows, filmic contrast, shallow depth of field, natural "
+        "lighting, subtle film grain, consistent muted palette across the frame."
+    )
+    full_prompt = (
+        f"{image_prompt.strip()}. "
+        f"{_STYLE} Vertical 9:16 framing, photorealistic candid documentary photograph. "
+        "It must look like a real photo — NOT an illustration, cartoon, 3D render, or "
+        "clip-art. Absolutely no text, no words, no captions, no watermarks, no logos, "
+        "no brand marks, and no on-screen UI text."
+    )
+    try:
+        client = openai.AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+        resp = await client.images.generate(
+            model="gpt-image-1",
+            prompt=full_prompt,
+            size="1024x1536",   # portrait, cover-fits 9:16
+            quality="high",
+            n=1,
+        )
+        b64 = resp.data[0].b64_json if resp.data else None
+        if not b64:
+            return None
+        img_bytes = base64.b64decode(b64)
+        pid = f"broll-gen-{_uuid.uuid4().hex[:12]}"
+        cdn = await _upload_image_bytes_to_cloudinary(img_bytes, pid)
+        if cdn:
+            print(f"[B-roll:gen] generated → {cdn[:80]}", flush=True)
+        return cdn
+    except Exception as e:
+        print(f"[B-roll:gen] error: {e}", flush=True)
+        return None
+
+
 async def _fetch_broll_url(description: str, concept: str) -> Optional[str]:
-    """Priority: Pexels stock → fal.ai generate. Returns a public video URL or None."""
-    url = await _pexels_search(concept or description)
-    if url:
-        print(f"[B-roll] Pexels hit: '{concept}' → {url[:70]}…", flush=True)
-        return url
-    print(f"[B-roll] Pexels miss for '{concept}', trying fal.ai…", flush=True)
-    url = await _fal_generate(description)
-    if url:
-        print(f"[B-roll] fal.ai generated for '{description[:40]}' → {url[:70]}…", flush=True)
-    return url
+    """B-roll is AI-generated (gpt-image-1) to match the exact moment. Returns a
+    Cloudinary image URL, or None. Replaces the old Pexels/fal.ai video path — fal.ai
+    was 405-ing, producing zero b-roll on staging."""
+    prompt = (description or concept or "").strip()
+    if not prompt:
+        return None
+    return await _generate_broll_image(prompt)
 
 
 # ── Background music ──────────────────────────────────────────────────────────
@@ -1862,17 +1939,23 @@ def build_shotstack_timeline(
         if br_dur < 0.5:
             continue
         fade = min(0.25, br_dur / 4)
+        # B-roll is now an AI-generated still (gpt-image-1) hosted on Cloudinary.
+        # Detect image vs legacy video URL and build the right asset — a still gets a
+        # slow Ken Burns zoom so it feels alive.
+        _u = br_url.lower().split("?")[0]
+        _is_image = ("/image/upload/" in _u) or _u.endswith((".png", ".jpg", ".jpeg", ".webp"))
+        if _is_image:
+            asset = {"type": "image", "src": br_url}
+            effect = "zoomIn" if (len(broll_clips) % 2 == 0) else "zoomOut"
+        else:
+            asset = {"type": "video", "src": br_url, "trim": 0, "volume": 0}
+            effect = "slideUp"
         broll_clips.append({
-            "asset": {
-                "type": "video",
-                "src": br_url,
-                "trim": 0,
-                "volume": 0,  # keep original voice; mute b-roll audio
-            },
+            "asset": asset,
             "start": round(tl_at, 3),
             "length": round(br_dur, 3),
             "fit": "cover",
-            "effect": "slideUp",
+            "effect": effect,
             "opacity": [
                 {"from": 0, "to": 1, "start": 0, "length": fade,
                  "interpolation": "bezier", "easing": "easeOutCubic"},
