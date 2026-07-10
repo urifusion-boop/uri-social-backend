@@ -209,6 +209,10 @@ app.include_router(jane_router, prefix="/social-media", tags=["Jane's First Mess
 # Include Agency Accounts (agency layer wrapping Jane)
 app.include_router(agency_router, prefix="/social-media", tags=["Agency"])
 
+# Include Jane + Ads (decision-engine demo UI at /jane-ads/demo)
+from app.agents.jane_ads.router import router as jane_ads_router
+app.include_router(jane_ads_router)
+
 # Include multi-tenant routers (Enterprise/SDK features)
 app.include_router(client_router)
 app.include_router(workspace_router)
