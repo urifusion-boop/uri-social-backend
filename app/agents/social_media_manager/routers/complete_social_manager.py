@@ -979,18 +979,16 @@ Create engaging social media captions for THIS UPLOADED CONTENT. Base your writi
                         user_id=user_id,
                         campaign_id=request_id,
                         reason="upload_user_content",
-                        amount=credits_to_deduct,
                     )
-                    print(f"✅ Deducted {credits_to_deduct} trial credit(s) from user {user_id}")
+                    print(f"✅ Deducted 1 trial credit from user {user_id}")
                 else:
                     await credit_service.deduct_credit(
                         user_id=user_id,
                         campaign_id=request_id,
                         reason="upload_user_content",
                         retry_count=0,
-                        amount=credits_to_deduct,
                     )
-                    print(f"✅ Deducted {credits_to_deduct} credit(s) from user {user_id}")
+                    print(f"✅ Deducted 1 credit from user {user_id}")
 
             # Notification
             try:
