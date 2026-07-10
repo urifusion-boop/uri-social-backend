@@ -733,6 +733,14 @@ async def upload_user_content(
         add_logo = request.get("add_logo", False)
         add_cta = request.get("add_cta", False)
         custom_cta = request.get("custom_cta", "")  # If provided, use this instead of default
+        logo_position_override = request.get("logo_position_override", "")  # User can override logo position for this upload
+
+        print(f"📥 Upload content request:")
+        print(f"   add_logo: {add_logo}")
+        print(f"   add_cta: {add_cta}")
+        print(f"   custom_cta: {custom_cta}")
+        print(f"   logo_position_override: {logo_position_override}")
+        print(f"   num_media: {len(uploaded_media)}")
 
         if not uploaded_media:
             raise HTTPException(status_code=400, detail="No media uploaded")
@@ -776,7 +784,7 @@ async def upload_user_content(
             import base64
             import requests
             import io
-            from PIL import Image, ImageDraw, ImageFont
+            from PIL import Image
 
             processed_media_urls = []
             for media_url in media_urls:
@@ -788,8 +796,65 @@ async def upload_user_content(
 
                     # Apply logo overlay if requested
                     if add_logo and brand_context_dict.get('logo_url'):
-                        logo_position = brand_context_dict.get('logo_position', 'bottom_right')
                         logo_size = brand_context_dict.get('logo_size', 'small')
+
+                        # Determine logo position: user override > AI analysis > brand profile default
+                        if logo_position_override:
+                            # User manually selected position for this upload
+                            logo_position = logo_position_override
+                            print(f"🎨 Using user-selected logo position: {logo_position}")
+                        else:
+                            # Use AI to find best logo position (avoids important content)
+                            print(f"🤖 Analyzing image to find best logo position...")
+                            try:
+                                from app.services.AIService import AIService
+
+                                vision_prompt = """Analyze this image and determine the best corner to place a brand logo overlay.
+
+Consider:
+1. Which corners have the LEAST important content (text, faces, key visual elements)?
+2. Which corners have the most empty/background space?
+3. Avoid corners with text, faces, or focal points
+
+Respond with ONLY ONE of these positions:
+- top_left
+- top_right
+- top_center
+- bottom_left
+- bottom_right
+- bottom_center
+
+Choose the position that will cause the LEAST visual disruption."""
+
+                                vision_request = AIService.build_ai_model(
+                                    messages=[{
+                                        "role": "user",
+                                        "content": [
+                                            {"type": "text", "text": vision_prompt},
+                                            {"type": "image_url", "image_url": {"url": media_url}}
+                                        ]
+                                    }],
+                                    temperature=0.3,
+                                )
+                                vision_response = await AIService.chat_completion(vision_request)
+                                ai_position = vision_response.choices[0].message.content.strip().lower()
+
+                                # Validate AI response
+                                valid_positions = ["top_left", "top_right", "top_center", "bottom_left", "bottom_right", "bottom_center"]
+                                if ai_position in valid_positions:
+                                    logo_position = ai_position
+                                    print(f"✅ AI selected best logo position: {logo_position}")
+                                else:
+                                    # Fallback to brand profile default
+                                    logo_position = brand_context_dict.get('logo_position', 'bottom_right')
+                                    print(f"⚠️ AI gave invalid position '{ai_position}', using brand default: {logo_position}")
+
+                            except Exception as vision_err:
+                                # If AI analysis fails, use brand profile default
+                                logo_position = brand_context_dict.get('logo_position', 'bottom_right')
+                                print(f"⚠️ AI position analysis failed: {vision_err}, using brand default: {logo_position}")
+
+                        print(f"🎨 Applying logo overlay: position={logo_position}, size={logo_size}")
 
                         # Convert image to base64, apply logo, convert back
                         buf = io.BytesIO()
@@ -806,6 +871,9 @@ async def upload_user_content(
 
                         # Convert back to PIL for CTA overlay
                         img = Image.open(io.BytesIO(base64.b64decode(img_b64_with_logo))).convert("RGBA")
+                        print(f"✅ Logo overlay applied successfully")
+                    elif add_logo and not brand_context_dict.get('logo_url'):
+                        print(f"⚠️ Logo overlay requested but no logo_url in brand profile")
 
                     # Apply CTA overlay if requested
                     if add_cta:
