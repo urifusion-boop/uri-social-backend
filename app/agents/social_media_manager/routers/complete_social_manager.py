@@ -915,29 +915,18 @@ Choose the position that will cause the LEAST visual disruption."""
                                 else:  # right
                                     x = width - text_width - margin
 
-                                # Draw text with semi-transparent background for better readability
-                                # Add padding around text
-                                padding = int(font_size * 0.3)
-                                bg_x1 = x - padding
-                                bg_y1 = y - padding
-                                bg_x2 = x + text_width + padding
-                                bg_y2 = y + text_height + padding
-
-                                # Draw semi-transparent dark background
-                                from PIL import Image as PILImage
-                                overlay = PILImage.new('RGBA', img.size, (0, 0, 0, 0))
-                                overlay_draw = ImageDraw.Draw(overlay)
-                                overlay_draw.rounded_rectangle(
-                                    [(bg_x1, bg_y1), (bg_x2, bg_y2)],
-                                    radius=int(font_size * 0.2),
-                                    fill=(0, 0, 0, 180)  # Semi-transparent black
+                                # Draw text naturally with proper spacing and stroke for visibility
+                                # Use stroke parameter for clean outline effect
+                                # Choose text color that contrasts with background
+                                # White text with black stroke works on most backgrounds
+                                draw.text(
+                                    (x, y),
+                                    cta_text,
+                                    font=font,
+                                    fill="white",
+                                    stroke_width=2,
+                                    stroke_fill="black"
                                 )
-                                img = PILImage.alpha_composite(img, overlay)
-
-                                # Redraw on composite image
-                                draw = ImageDraw.Draw(img)
-                                # Draw white text on dark background
-                                draw.text((x, y), cta_text, font=font, fill="white")
 
                                 print(f"✅ CTA text drawn at {cta_position}: '{cta_text}'")
 
