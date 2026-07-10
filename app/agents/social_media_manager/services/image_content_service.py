@@ -792,18 +792,25 @@ class ImageContentService:
             # Build logo space reservation instruction
             logo_space_note = ""
             if logo_position:
-                if logo_position == "top_center":
-                    logo_space_note = "\n⚠️ LOGO OVERLAY ZONE: The top-center area (10% width × 8% height from top edge) is RESERVED for brand logo overlay. Do NOT place any text, faces, or important elements in this zone. Keep this area clear with plain background only."
-                elif logo_position == "top_left":
-                    logo_space_note = "\n⚠️ LOGO OVERLAY ZONE: The top-left corner (10% width × 8% height) is RESERVED for brand logo overlay. Keep this area clear."
-                elif logo_position == "top_right":
-                    logo_space_note = "\n⚠️ LOGO OVERLAY ZONE: The top-right corner (10% width × 8% height) is RESERVED for brand logo overlay. Keep this area clear."
-                elif logo_position == "bottom_left":
-                    logo_space_note = "\n⚠️ LOGO OVERLAY ZONE: The bottom-left corner (10% width × 8% height) is RESERVED for brand logo overlay. Keep this area clear."
-                elif logo_position == "bottom_center":
-                    logo_space_note = "\n⚠️ LOGO OVERLAY ZONE: The bottom-center area (10% width × 8% height) is RESERVED for brand logo overlay. Keep this area clear."
-                else:  # bottom_right (default)
-                    logo_space_note = "\n⚠️ LOGO OVERLAY ZONE: The bottom-right corner (10% width × 8% height) is RESERVED for brand logo overlay. Keep this area clear."
+                position_map = {
+                    "top_center": "top-center",
+                    "top_left": "top-left corner",
+                    "top_right": "top-right corner",
+                    "bottom_left": "bottom-left corner",
+                    "bottom_center": "bottom-center",
+                    "bottom_right": "bottom-right corner"
+                }
+                pos_text = position_map.get(logo_position, logo_position)
+                logo_space_note = f"\n\n🚨 CRITICAL - LOGO OVERLAY ZONE ({pos_text}):\n" \
+                    f"A {logo_reserve_size} brand logo will be overlaid in the {pos_text}.\n" \
+                    f"MANDATORY REQUIREMENTS:\n" \
+                    f"  • This zone MUST be 100% clear of ALL text, headlines, diagrams, illustrations, and visual elements\n" \
+                    f"  • ONLY solid colors, gradients, or simple background patterns allowed in this zone\n" \
+                    f"  • NO text of any kind (not even small text or labels)\n" \
+                    f"  • NO shapes, icons, illustrations, or graphic elements\n" \
+                    f"  • NO white boxes, cards, panels, frames, or borders\n" \
+                    f"  • Place ALL content (headlines, diagrams, text, visuals) OUTSIDE this reserved zone\n" \
+                    f"If ANY element overlaps this zone, the design FAILS. This overrides all aesthetic preferences."
 
             # SECTION 1: ABSOLUTE RULES (READ FIRST)
             absolute_rules = f"""=== ABSOLUTE RULES (READ FIRST — THESE OVERRIDE ALL OTHER INSTRUCTIONS) ===
