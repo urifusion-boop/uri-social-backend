@@ -811,16 +811,17 @@ CRITICAL INSTRUCTIONS:
 8. The CTA text should blend naturally with the image's existing design style"""
 
                                 # Call gpt-image-2 edit API
+                                # Note: Using dall-e-2 for edit as gpt-image-2 doesn't support edit endpoint
                                 loop = asyncio.get_running_loop()
                                 edit_response = await asyncio.wait_for(
                                     loop.run_in_executor(
                                         None,
                                         lambda: openai_client.images.edit(
-                                            model="gpt-image-2",
+                                            model="dall-e-2",
                                             image=("image.png", img_png_buf, "image/png"),
                                             prompt=cta_prompt,
                                             n=1,
-                                            size=gpt2_size,
+                                            size="1024x1024",  # dall-e-2 edit only supports 1024x1024
                                         ),
                                     ),
                                     timeout=300,
@@ -841,8 +842,8 @@ CRITICAL INSTRUCTIONS:
                     img.convert("RGB").save(buf, format="JPEG", quality=95)
                     buf.seek(0)
 
-                    # Re-upload to Cloudinary using Cloudinary service
-                    from app.services.cloudinary_service import upload_bytes
+                    # Re-upload to Cloudinary
+                    from app.utils.cloudinary_upload import upload_bytes
                     folder = f"uri-social/user-uploads/{user_id}/processed"
                     processed_url = await upload_bytes(buf.getvalue(), folder=folder, resource_type="image")
                     processed_media_urls.append(processed_url)
