@@ -808,9 +808,12 @@ class ImageContentService:
                     f"  • ONLY solid colors, gradients, or simple background patterns allowed in this zone\n" \
                     f"  • NO text of any kind (not even small text or labels)\n" \
                     f"  • NO shapes, icons, illustrations, or graphic elements\n" \
-                    f"  • NO white boxes, cards, panels, frames, or borders\n" \
+                    f"  • ABSOLUTELY NO boxes, rectangles, squares, frames, borders, outlines, or containers of ANY kind\n" \
+                    f"  • ABSOLUTELY NO white boxes, dotted borders, dashed lines, or placeholder frames\n" \
+                    f"  • DO NOT draw rectangles, rounded corners, cards, panels, or any geometric shapes in this area\n" \
+                    f"  • The logo will be placed DIRECTLY on the background with transparency - keep the area COMPLETELY CLEAN\n" \
                     f"  • Place ALL content (headlines, diagrams, text, visuals) OUTSIDE this reserved zone\n" \
-                    f"If ANY element overlaps this zone, the design FAILS. This overrides all aesthetic preferences."
+                    f"If you draw ANY box, border, frame, or shape in this zone, the design FAILS. This overrides all aesthetic preferences."
 
             # SECTION 1: ABSOLUTE RULES (READ FIRST)
             absolute_rules = f"""=== ABSOLUTE RULES (READ FIRST — THESE OVERRIDE ALL OTHER INSTRUCTIONS) ===
