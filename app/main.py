@@ -19,6 +19,7 @@ from app.agents.social_media_manager.routers.custom_visual_guides import router 
 from app.agents.social_media_manager.routers.custom_visual_guides_v2 import router as custom_guides_v2_router
 from app.agents.social_media_manager.routers.canvas_editor import router as canvas_editor_router
 from app.agents.social_media_manager.routers.jane_router import router as jane_router
+from app.agents.visual_engine_v2.routers.visual_engine_v2_router import router as visual_engine_v2_router
 from app.routers.auth_router import router as auth_router
 from app.routers.billing_router import router as billing_router
 from app.routers.notification_router import router as notification_router
@@ -199,6 +200,9 @@ app.include_router(blog_router, prefix="/social-media", tags=["Blog Generator"])
 # Include custom visual guides routers
 app.include_router(custom_guides_router)  # V1
 app.include_router(custom_guides_v2_router)  # V2 - Advanced style transfer
+
+# Include Visual Engine V2 (4-layer compositing system)
+app.include_router(visual_engine_v2_router, prefix="/social-media/visual-engine", tags=["Visual Engine V2"])
 
 # Include Canvas Editor (layered document editing)
 app.include_router(canvas_editor_router, prefix="/social-media", tags=["Canvas Editor"])
