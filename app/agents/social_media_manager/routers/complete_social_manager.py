@@ -1012,8 +1012,8 @@ Choose the position that will cause the LEAST visual disruption."""
                     img.convert("RGB").save(buf, format="JPEG", quality=95)
                     buf.seek(0)
 
-                    # Re-upload to Cloudinary using Cloudinary service
-                    from app.services.cloudinary_service import upload_bytes
+                    # Re-upload to Cloudinary
+                    from app.utils.cloudinary_upload import upload_bytes
                     folder = f"uri-social/user-uploads/{user_id}/processed"
                     processed_url = await upload_bytes(buf.getvalue(), folder=folder, resource_type="image")
                     processed_media_urls.append(processed_url)
