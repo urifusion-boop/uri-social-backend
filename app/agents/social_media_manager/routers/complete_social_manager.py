@@ -730,6 +730,7 @@ async def upload_user_content(
                     if add_logo and brand_context_dict.get('logo_url'):
                         logo_position = brand_context_dict.get('logo_position', 'bottom_right')
                         logo_size = brand_context_dict.get('logo_size', 'small')
+                        print(f"🎨 Applying logo overlay: position={logo_position}, size={logo_size}")
 
                         # Convert image to base64, apply logo, convert back
                         buf = io.BytesIO()
@@ -746,10 +747,14 @@ async def upload_user_content(
 
                         # Convert back to PIL for CTA overlay
                         img = Image.open(io.BytesIO(base64.b64decode(img_b64_with_logo))).convert("RGBA")
+                        print(f"✅ Logo overlay applied successfully")
+                    elif add_logo and not brand_context_dict.get('logo_url'):
+                        print(f"⚠️ Logo overlay requested but no logo_url in brand profile")
 
                     # Apply CTA overlay if requested
                     if add_cta:
                         # Determine CTA text (same logic as normal image generation)
+                        cta_text = None
                         if custom_cta:
                             # Use custom CTA if provided
                             cta_text = custom_cta
@@ -761,12 +766,21 @@ async def upload_user_content(
                                 cta_text = random.choice(cta_styles_list)
                             else:
                                 # Fallback to default_link if cta_styles is empty
-                                cta_text = brand_context_dict.get("default_link", "Link in bio")
-                                # Remove https:// prefix for cleaner display
-                                cta_text = cta_text.replace('https://', '').replace('http://', '')
+                                default_link = brand_context_dict.get("default_link", "")
+                                if default_link:
+                                    cta_text = default_link
+                                    # Remove https:// prefix for cleaner display
+                                    if isinstance(cta_text, str):
+                                        cta_text = cta_text.replace('https://', '').replace('http://', '')
+                                else:
+                                    # Final fallback
+                                    cta_text = "Link in bio"
+
+                        print(f"🎯 CTA text determined: '{cta_text}'")
 
                         if cta_text:
                             # Use gpt-image-2 edit to add CTA professionally (same as normal generation)
+                            print(f"🔄 Calling gpt-image-2 to add CTA: '{cta_text}'")
                             try:
                                 from app.services.AIService import client as openai_client
                                 import asyncio
