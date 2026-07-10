@@ -4439,17 +4439,79 @@ async def _generate_image_bg(
             reference_image = v2_reference_image
             print(f"📸 Using V2 reference image: {reference_image[:80]}...")
 
-        image_result = await ImageContentService._generate_platform_image(
-            platform=platform,
-            content=content,
-            seed_content=seed_content,
-            brand_context=brand_context,
-            reference_image=reference_image,
-            image_type=image_type,
-            image_model=image_model,
-            slide_index=slide_index,
-            total_slides=total_slides,
-        )
+        if reference_image:
+            # User explicitly uploaded reference image - highest priority
+            # Use standard generation flow with reference image (skip V2 guide)
+            print(f"📸 User reference image detected - using standard generation (V2 guide ignored)")
+            v2_guide_id = None  # Override V2 guide when reference image is provided
+
+        if v2_guide_id:
+            print(f"🎨 V2 CUSTOM GUIDE DETECTED - Using pure style cloning")
+            print(f"V2 Guide ID: {v2_guide_id}")
+
+            from app.agents.social_media_manager.services.custom_visual_guide_v2_service import CustomVisualGuideV2Service
+
+            # Pure style cloning - minimal brand context (no colors, no styles)
+            minimal_brand_context = {
+                "brand_name": brand_context.get("brand_name", ""),
+                "logo_url": brand_context.get("logo_url", ""),
+                "logo_position": brand_context.get("logo_position", "bottom_right"),
+            }
+
+            # Extract headline/subtext/cta from content if available
+            headline = content.split("\n")[0] if content else seed_content[:50]
+            subtext = content.split("\n")[1] if "\n" in content else ""
+
+            # Get CTA - check override_cta first, then cta_styles with round-robin, then default_link
+            override_cta = brand_context.get("override_cta")
+            if override_cta:
+                cta = override_cta
+            else:
+                cta_styles_list = brand_context.get("cta_styles", [])
+                if isinstance(cta_styles_list, list) and cta_styles_list:
+                    # Use round-robin rotation for even CTA distribution
+                    cta_rotation_index = brand_context.get("cta_rotation_index", 0)
+                    if cta_rotation_index >= len(cta_styles_list):
+                        cta_rotation_index = 0
+                    cta = cta_styles_list[cta_rotation_index]
+                    # Update for next time (will be saved by main flow)
+                    next_index = (cta_rotation_index + 1) % len(cta_styles_list)
+                    brand_context["cta_rotation_index"] = next_index
+                    print(f"🔄 V2 Guide CTA rotation: using '{cta}' (index {cta_rotation_index}/{len(cta_styles_list)-1}), next: {next_index}")
+                else:
+                    cta = brand_context.get("default_link", "Learn more")
+
+            image_result = await CustomVisualGuideV2Service.generate_image_with_v2_guide(
+                guide_id=v2_guide_id,
+                seed_content=seed_content,
+                brand_context=minimal_brand_context,  # Minimal context for pure cloning
+                platform=platform,
+                headline=headline,
+                subtext=subtext,
+                cta=cta,
+                db=db,
+            )
+        else:
+            # Standard generation flow (V1 guides or no custom guide)
+            # Extract V2 reference image from brand_context if present (legacy fallback)
+            # BUT: Don't override user's uploaded reference image
+            if not reference_image:
+                v2_reference_image = brand_context.get("custom_guide_v2_reference_image")
+                if v2_reference_image:
+                    reference_image = v2_reference_image
+                    print(f"📸 Using V2 reference image (legacy): {reference_image[:80]}...")
+
+            image_result = await ImageContentService._generate_platform_image(
+                platform=platform,
+                content=content,
+                seed_content=seed_content,
+                brand_context=brand_context,
+                reference_image=reference_image,
+                image_type=image_type,
+                image_model=image_model,
+                slide_index=slide_index,
+                total_slides=total_slides,
+            )
 
         if not image_result.get("status"):
             print(f"⚠️ BG image gen failed for draft {draft_id}: {image_result.get('responseMessage')}")
@@ -4552,6 +4614,19 @@ async def _generate_image_bg(
                     {"$set": update_fields}
                 )
                 print(f"✅ BG carousel slide {slide_index} image saved for draft {draft_id}: matched={result.matched_count}")
+
+                # Save updated CTA rotation index to brand profile (for round-robin CTA rotation)
+                # Only save once per carousel (not for every slide) - check if first slide
+                if slide_index == 0 and brand_context.get("cta_rotation_index") is not None:
+                    user_id = brand_context.get("user_id", "")
+                    brand_id = brand_context.get("brand_id")
+                    _cta_profile_scope = {"brand_id": brand_id} if brand_id else {"user_id": user_id}
+
+                    await db["brand_profiles"].update_one(
+                        _cta_profile_scope,
+                        {"$set": {"cta_rotation_index": brand_context["cta_rotation_index"]}}
+                    )
+                    print(f"🔄 CTA rotation index updated to {brand_context['cta_rotation_index']}")
             else:
                 # Regular post - save both image_url and document
                 update_fields = {
@@ -4573,6 +4648,18 @@ async def _generate_image_bg(
                 print(f"   Image URL: {final_url[:80]}...")
                 if canvas_doc:
                     print(f"✅ Canvas document saved for draft {draft_id} with {len(canvas_doc.get('layers', []))} layers")
+
+                # Save updated CTA rotation index to brand profile (for round-robin CTA rotation)
+                if brand_context.get("cta_rotation_index") is not None:
+                    user_id = brand_context.get("user_id", "")
+                    brand_id = brand_context.get("brand_id")
+                    _cta_profile_scope = {"brand_id": brand_id} if brand_id else {"user_id": user_id}
+
+                    await db["brand_profiles"].update_one(
+                        _cta_profile_scope,
+                        {"$set": {"cta_rotation_index": brand_context["cta_rotation_index"]}}
+                    )
+                    print(f"🔄 CTA rotation index updated to {brand_context['cta_rotation_index']}")
         else:
             if post_type == "carousel" and slide_index is not None:
                 # Mark slide as failed
