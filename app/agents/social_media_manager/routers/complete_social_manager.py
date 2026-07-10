@@ -6574,6 +6574,7 @@ async def produce_video(
     video: Optional[UploadFile] = File(None),
     source_url: Optional[str] = Form(None),
     video_type: str = Form("founder"),
+    template_id: str = Form("fast_founder"),
     enable_music: str = Form("true"),
     mute_original_audio: str = Form("false"),
     enable_sfx: str = Form("true"),
@@ -6620,6 +6621,7 @@ async def produce_video(
         "job_id": job_id,
         "user_id": user_id,
         "video_type": video_type,
+        "template_id": template_id,
         "status": "processing",
         "status_message": "Starting…",
         "progress": 0,
@@ -6646,6 +6648,7 @@ async def produce_video(
         enable_captions=(enable_captions.lower() != "false"),
         custom_music_bytes=custom_music_bytes,
         transition_style=transition_style,
+        template_id=template_id,
     )
 
     return UriResponse.get_single_data_response(
