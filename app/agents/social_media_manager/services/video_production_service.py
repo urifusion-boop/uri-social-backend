@@ -1226,12 +1226,13 @@ def _auto_cuts_from_words(
     words: List[Dict[str, Any]],
     duration: float,
     video_type: str = "tiktok",
+    silence_threshold: Optional[float] = None,
 ) -> List[Dict]:
     """
     Silence detection from word-level timestamps.
     Catches mid-sentence pauses that SRT entry boundaries miss entirely.
     """
-    threshold = _SILENCE_THRESHOLD.get(video_type, 1.0)
+    threshold = silence_threshold if silence_threshold is not None else _SILENCE_THRESHOLD.get(video_type, 1.0)
     cuts: List[Dict] = []
     if not words:
         return cuts
@@ -1268,9 +1269,10 @@ def _auto_cuts_from_srt(
     srt_entries: List[Dict[str, Any]],
     duration: float,
     video_type: str = "tiktok",
+    silence_threshold: Optional[float] = None,
 ) -> List[Dict]:
     """SRT-entry gap fallback — used only when word-level data is unavailable."""
-    threshold = _SILENCE_THRESHOLD.get(video_type, 1.0)
+    threshold = silence_threshold if silence_threshold is not None else _SILENCE_THRESHOLD.get(video_type, 1.0)
     cuts: List[Dict] = []
     if not srt_entries:
         return cuts
@@ -2231,7 +2233,14 @@ async def run_production_job(
     enable_captions: bool = True,
     custom_music_bytes: bytes = b"",
     transition_style: str = "auto",  # auto | circle_wipe | diagonal_wipe | flash | swipe | hard_cut | none
+    template_id: str = "fast_founder",
 ) -> None:
+    from .video_style_templates import get_template
+    tmpl = get_template(template_id)
+    # Template overrides video_type for GPT analysis + pacing
+    effective_video_type = tmpl.get("video_type", video_type)
+    template_silence_threshold: Optional[float] = tmpl.get("silence_threshold")
+
     reap = ReapProvider()
     shotstack = ShotstackProvider()
 
@@ -2379,7 +2388,7 @@ async def run_production_job(
         await update(48, "AI analyzing content…")
         srt_entries = _filter_hallucinated_captions(_parse_srt(srt_text))
 
-        analysis  = await analyze_content(srt_text, video_type, duration, tracking_data)
+        analysis  = await analyze_content(srt_text, effective_video_type, duration, tracking_data)
         decisions = apply_editing_rules(analysis, duration, enable_sfx=enable_sfx)
 
         gpt_cuts        = decisions["cuts"]
@@ -2387,20 +2396,22 @@ async def run_production_job(
         sound_effects   = decisions["sound_effects"]
         broll_decisions = decisions["broll"]
         hook_text       = decisions["hook_text"]
-        music_mood      = decisions["music_mood"]
+        # Template music mood overrides AI's suggestion
+        music_mood      = tmpl.get("music_mood") or decisions["music_mood"]
         pacing_note     = decisions["pacing_note"]
         topic_changes   = decisions.get("topic_changes", [])
         caption_cues    = decisions.get("caption_cues", [])
         icon_overlays   = decisions.get("icon_overlays", [])
 
         # Algorithmic cuts — word-level when Reap provides timestamps, SRT fallback otherwise.
+        # Template silence_threshold overrides the video_type default.
         words = _extract_words(tracking_data)
         if words:
-            auto_cuts   = _auto_cuts_from_words(words, duration, video_type)
+            auto_cuts   = _auto_cuts_from_words(words, duration, effective_video_type, template_silence_threshold)
             filler_cuts = _filler_cuts_from_words(words)
             rep_cuts    = _repetition_cuts_from_words(words)
         else:
-            auto_cuts   = _auto_cuts_from_srt(srt_entries, duration, video_type)
+            auto_cuts   = _auto_cuts_from_srt(srt_entries, duration, effective_video_type, template_silence_threshold)
             filler_cuts = _filler_cuts_from_srt(srt_entries)
             rep_cuts    = _repetition_cuts_from_srt(srt_entries)
         cuts = _merge_cuts(auto_cuts + filler_cuts + rep_cuts, gpt_cuts)
@@ -2453,7 +2464,7 @@ async def run_production_job(
                     "cloudinary_url": clean_video_url,
                     "srt_text": srt_text,
                     "duration": duration,
-                    "video_type": video_type,
+                    "video_type": effective_video_type,
                     "logo_url": logo_url,
                     "brand_name": brand_name,
                     "primary_color": primary_color,
@@ -2463,7 +2474,12 @@ async def run_production_job(
                     "enable_music": enable_music,
                     "mute_original_audio": mute_original_audio,
                     "custom_music_url": custom_music_url,
-                    "transition_style": transition_style,
+                    # Template style params — override defaults in run_render_phase
+                    "transition_style": tmpl.get("transition_style", transition_style),
+                    "caption_font_family": tmpl.get("caption_font", "Montserrat"),
+                    "caption_color": tmpl.get("caption_color", "#ffffff"),
+                    "template_music_volume": tmpl.get("music_volume", 0.08),
+                    "template_id": template_id,
                 },
             }}
         )
@@ -2681,7 +2697,7 @@ async def run_render_phase(job_id: str, db) -> None:
 
         # ── Stage 4b: Music — only runs when enable_music=True ──────────────────
         music_url = ""
-        music_volume = 0.08
+        music_volume = ctx.get("template_music_volume", 0.08)
         if enable_music:
             if custom_music_url:
                 music_url = custom_music_url
