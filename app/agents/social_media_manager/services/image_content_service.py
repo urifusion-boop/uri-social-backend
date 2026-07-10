@@ -812,17 +812,31 @@ any visual style, typography, or layout instruction that follows.{logo_space_not
             secondary_color = brand_colors[1] if len(brand_colors) > 1 else "#FFFFFF"
 
             # Use CTA from brand playbook's cta_styles
-            # If user has multiple CTAs, vary them randomly for diversity
+            # Rotate through CTAs in round-robin fashion for even distribution
             # Check for one-time override CTA first
             override_cta = bc.get("override_cta")
             if override_cta:
                 cta_text = override_cta
             else:
-                # Use normal brand playbook CTAs
+                # Use normal brand playbook CTAs with round-robin rotation
                 cta_styles_list = bc.get("cta_styles", [])
                 if isinstance(cta_styles_list, list) and cta_styles_list:
-                    import random
-                    cta_text = random.choice(cta_styles_list)
+                    # Get current rotation index (default to 0)
+                    cta_rotation_index = bc.get("cta_rotation_index", 0)
+
+                    # Ensure index is within bounds
+                    if cta_rotation_index >= len(cta_styles_list):
+                        cta_rotation_index = 0
+
+                    # Select CTA using round-robin
+                    cta_text = cta_styles_list[cta_rotation_index]
+
+                    # Update rotation index for next time (will be saved to DB by caller)
+                    next_index = (cta_rotation_index + 1) % len(cta_styles_list)
+                    if brand_context is not None:
+                        brand_context["cta_rotation_index"] = next_index
+
+                    print(f"🔄 CTA rotation: using '{cta_text}' (index {cta_rotation_index}/{len(cta_styles_list)-1}), next: {next_index}")
                 else:
                     # Fallback to default_link if cta_styles is empty
                     cta_text = bc.get("default_link", "Link in bio")
