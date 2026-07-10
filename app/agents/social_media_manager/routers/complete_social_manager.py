@@ -837,76 +837,94 @@ Choose the position that will cause the LEAST visual disruption."""
                         print(f"🎯 CTA text determined: '{cta_text}'")
 
                         if cta_text:
-                            # Use gpt-image-2 edit to add CTA professionally (same as normal generation)
-                            print(f"🔄 Calling gpt-image-2 to add CTA: '{cta_text}'")
+                            # Use AI vision to find best position, then PIL to draw text
+                            print(f"🔄 Using AI vision to find best CTA position: '{cta_text}'")
                             try:
-                                from app.services.AIService import client as openai_client
-                                import asyncio
+                                from app.services.AIService import AIService
+                                from PIL import ImageDraw, ImageFont
 
-                                # Convert image to PNG for gpt-image-2 edit
-                                width, height = img.size
-                                img_png_buf = io.BytesIO()
-                                img.save(img_png_buf, format="PNG")
-                                img_png_buf.seek(0)
+                                # Use AI vision to determine best position for CTA
+                                vision_prompt = """Analyze this image to find the best location to add a small call-to-action text.
 
-                                # Determine size for gpt-image-2 (must be 1024x1024, 1792x1024, or 1024x1792)
-                                if width >= height:
-                                    gpt2_size = "1792x1024" if width / height > 1.5 else "1024x1024"
-                                else:
-                                    gpt2_size = "1024x1792"
+Consider:
+1. Where is there the MOST empty/background space?
+2. Avoid areas with text, faces, or important visual elements
+3. Look for solid color areas or minimal content zones
 
-                                # Build edit prompt with smart positioning to avoid distorting content
-                                cta_prompt = f"""Add call-to-action text to this image without covering important content.
+Respond with ONLY ONE of these positions:
+- top_center
+- bottom_center
+- top_left
+- top_right
+- bottom_left
+- bottom_right
 
-CRITICAL INSTRUCTIONS:
-1. Add this text: "{cta_text}"
-2. ANALYZE the image first to find where important content is (faces, text, key visuals)
-3. Place the CTA text in an area that has the LEAST important content - look for:
-   - Empty/background space
-   - Solid color areas
-   - Bottom or top areas with minimal content
-4. DO NOT place text over faces, existing text, or focal points
-5. Use clean, modern sans-serif font that's legible but not overwhelming
-6. Choose text color with high contrast against its background
-7. Keep text small and subtle - approximately 20-30% the size of any main headline
-8. Position within safe zone (at least 10% from all edges)
-9. DO NOT modify the rest of the image - preserve all existing content exactly as-is
-10. The CTA should feel like a natural part of the design, not an intrusive overlay"""
+Choose the position that will cause the LEAST visual disruption."""
 
-                                # Call gpt-image-2 edit API
-                                loop = asyncio.get_running_loop()
-                                edit_response = await asyncio.wait_for(
-                                    loop.run_in_executor(
-                                        None,
-                                        lambda: openai_client.images.edit(
-                                            model="gpt-image-2",
-                                            image=("image.png", img_png_buf, "image/png"),
-                                            prompt=cta_prompt,
-                                            n=1,
-                                            size=gpt2_size,
-                                        ),
-                                    ),
-                                    timeout=300,
+                                vision_request = AIService.build_ai_model(
+                                    messages=[{
+                                        "role": "user",
+                                        "content": [
+                                            {"type": "text", "text": vision_prompt},
+                                            {"type": "image_url", "image_url": {"url": media_url}}
+                                        ]
+                                    }],
+                                    temperature=0.3,
                                 )
+                                vision_response = await AIService.chat_completion(vision_request)
+                                cta_position = vision_response.choices[0].message.content.strip().lower()
 
-                                # Download edited image
-                                print(f"🔍 Edit response received: {edit_response}")
-                                if edit_response.data and len(edit_response.data) > 0:
-                                    edited_url = edit_response.data[0].url
-                                    print(f"📥 Downloading edited image from: {edited_url[:100] if edited_url else 'None'}")
+                                # Validate position
+                                valid_positions = ["top_center", "bottom_center", "top_left", "top_right", "bottom_left", "bottom_right"]
+                                if cta_position not in valid_positions:
+                                    cta_position = "bottom_center"  # Fallback
 
-                                    if not edited_url:
-                                        raise ValueError("OpenAI edit response did not include image URL")
+                                print(f"✅ AI selected CTA position: {cta_position}")
 
-                                    resp_edit = requests.get(edited_url, timeout=10)
-                                    resp_edit.raise_for_status()
-                                    img = Image.open(io.BytesIO(resp_edit.content)).convert("RGBA")
-                                    print(f"✅ CTA text added via gpt-image-2 edit: '{cta_text}'")
-                                else:
-                                    raise ValueError("OpenAI edit response has no data")
+                                # Draw CTA text using PIL
+                                width, height = img.size
+                                draw = ImageDraw.Draw(img)
+
+                                # Calculate font size (2-3% of image width)
+                                font_size = int(width * 0.025)
+                                try:
+                                    font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", font_size)
+                                except:
+                                    font = ImageFont.load_default()
+
+                                # Get text bounding box
+                                bbox = draw.textbbox((0, 0), cta_text, font=font)
+                                text_width = bbox[2] - bbox[0]
+                                text_height = bbox[3] - bbox[1]
+
+                                # Calculate position based on AI selection
+                                margin = int(width * 0.05)  # 5% margin
+                                if "top" in cta_position:
+                                    y = margin
+                                else:  # bottom
+                                    y = height - text_height - margin
+
+                                if "center" in cta_position:
+                                    x = (width - text_width) // 2
+                                elif "left" in cta_position:
+                                    x = margin
+                                else:  # right
+                                    x = width - text_width - margin
+
+                                # Draw text with outline for visibility
+                                outline_color = "white"
+                                text_color = "black"
+                                # Draw outline
+                                for adj_x in [-1, 0, 1]:
+                                    for adj_y in [-1, 0, 1]:
+                                        draw.text((x + adj_x, y + adj_y), cta_text, font=font, fill=outline_color)
+                                # Draw main text
+                                draw.text((x, y), cta_text, font=font, fill=text_color)
+
+                                print(f"✅ CTA text drawn at {cta_position}: '{cta_text}'")
 
                             except Exception as cta_err:
-                                print(f"⚠️ CTA overlay via AI failed: {cta_err}, skipping CTA")
+                                print(f"⚠️ CTA overlay failed: {cta_err}, skipping CTA")
 
                     # Upload processed image back to Cloudinary
                     buf = io.BytesIO()
