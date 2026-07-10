@@ -885,12 +885,16 @@ Choose the position that will cause the LEAST visual disruption."""
                                 width, height = img.size
                                 draw = ImageDraw.Draw(img)
 
-                                # Calculate font size (2-3% of image width)
-                                font_size = int(width * 0.025)
+                                # Calculate font size (4-5% of image width for better visibility)
+                                font_size = int(width * 0.045)
                                 try:
                                     font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", font_size)
                                 except:
-                                    font = ImageFont.load_default()
+                                    try:
+                                        # Fallback to Arial
+                                        font = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial.ttf", font_size)
+                                    except:
+                                        font = ImageFont.load_default()
 
                                 # Get text bounding box
                                 bbox = draw.textbbox((0, 0), cta_text, font=font)
@@ -911,13 +915,15 @@ Choose the position that will cause the LEAST visual disruption."""
                                 else:  # right
                                     x = width - text_width - margin
 
-                                # Draw text with outline for visibility
+                                # Draw text with thicker outline for better visibility
                                 outline_color = "white"
                                 text_color = "black"
-                                # Draw outline
-                                for adj_x in [-1, 0, 1]:
-                                    for adj_y in [-1, 0, 1]:
-                                        draw.text((x + adj_x, y + adj_y), cta_text, font=font, fill=outline_color)
+                                # Draw thicker outline (2px)
+                                outline_thickness = 2
+                                for adj_x in range(-outline_thickness, outline_thickness + 1):
+                                    for adj_y in range(-outline_thickness, outline_thickness + 1):
+                                        if adj_x != 0 or adj_y != 0:  # Don't draw at center
+                                            draw.text((x + adj_x, y + adj_y), cta_text, font=font, fill=outline_color)
                                 # Draw main text
                                 draw.text((x, y), cta_text, font=font, fill=text_color)
 
