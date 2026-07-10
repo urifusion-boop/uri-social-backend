@@ -295,14 +295,17 @@ Write as if you're sharing hard-won business wisdom with fellow African entrepre
             if "Gen Z" in age_range or "18-24" in age_range:
                 print(f"✅ Applying Gen Z voice adaptation")
                 parts.insert(0,
-                    f'🎯 TARGET AUDIENCE: Gen Z (18-24) - CRITICAL\n'
-                    f'Write like you\'re a Gen Z person talking to friends:\n'
-                    f'  • Use Gen Z slang naturally (lowkey, highkey, no cap, fr, ngl, tbh, iykyk)\n'
-                    f'  • Keep it short and punchy\n'
-                    f'  • Casual tone - like TikTok/Instagram captions\n'
-                    f'  • Reference trends and internet culture\n'
-                    f'  • Avoid corporate jargon\n'
-                    f'This takes priority over other tone instructions.'
+                    f'🚨 MANDATORY GEN Z VOICE (18-24) - OVERRIDES EVERYTHING:\n'
+                    f'You MUST sound like an actual 20-year-old texting, NOT a brand or marketer.\n'
+                    f'REQUIRED Gen Z elements in EVERY caption:\n'
+                    f'  ✓ Use slang: lowkey, highkey, no cap, fr (for real), ngl (not gonna lie), tbh (to be honest), iykyk (if you know you know)\n'
+                    f'  ✓ Short sentences (5-10 words max). Fragments are GOOD.\n'
+                    f'  ✓ Casual lowercase where natural ("fr this is it", "ngl i love this")\n'
+                    f'  ✓ Drop formality completely - sound like Instagram/TikTok comments\n'
+                    f'  ✓ NO corporate words: "navigate", "key", "special moments", "come to life" = BANNED\n'
+                    f'  ✓ NO polished marketing language - keep it raw and real\n\n'
+                    f'IGNORE any "professional", "polished", or "sophisticated" instructions below.\n'
+                    f'If the caption sounds like it could be from a 40-year-old marketing manager, you FAILED.'
                 )
             elif "Millennials" in age_range or "25-40" in age_range:
                 print(f"✅ Applying Millennials voice adaptation")
