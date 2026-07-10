@@ -2152,9 +2152,9 @@ OVERALL:
             logo_img = logo_img.resize((target_w, int(lh * scale)), Image.LANCZOS)
             lw, lh = logo_img.size
 
-            # Badge padding (inner: 5px each side, outer edge: 1.5% of width)
+            # Badge padding (inner: 5px each side, outer edge: 3% of width for better spacing)
             badge_pad_inner = max(5, int(bw * 0.005))
-            edge_pad = max(12, int(bw * 0.015))
+            edge_pad = max(20, int(bw * 0.03))  # Increased from 1.5% to 3% to avoid text overlap
 
             badge_w = lw + badge_pad_inner * 2
             badge_h = lh + badge_pad_inner * 2
@@ -2181,24 +2181,7 @@ OVERALL:
                 bx = bw - badge_w - edge_pad
                 by = bh - badge_h - edge_pad
 
-            # Draw semi-transparent white rounded-rectangle badge behind logo
-            badge = Image.new("RGBA", (badge_w, badge_h), (0, 0, 0, 0))
-            try:
-                from PIL import ImageDraw
-                draw = ImageDraw.Draw(badge)
-                radius = max(6, badge_h // 5)
-                draw.rounded_rectangle(
-                    [(0, 0), (badge_w - 1, badge_h - 1)],
-                    radius=radius,
-                    fill=(255, 255, 255, 210)  # white at 82% opacity
-                )
-            except Exception:
-                # Fallback: plain white rectangle if rounded_rectangle unavailable
-                badge = Image.new("RGBA", (badge_w, badge_h), (255, 255, 255, 210))
-
-            base_img.paste(badge, (bx, by), badge)
-
-            # Paste logo on top of badge
+            # Paste logo directly on image (no shadow, no badge background)
             logo_x = bx + badge_pad_inner
             logo_y = by + badge_pad_inner
             base_img.paste(logo_img, (logo_x, logo_y), logo_img)
