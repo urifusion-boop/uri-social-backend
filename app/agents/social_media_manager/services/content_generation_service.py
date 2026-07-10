@@ -289,9 +289,11 @@ Write as if you're sharing hard-won business wisdom with fellow African entrepre
 
         if brand_context.get("audience_age_range"):
             age_range = brand_context["audience_age_range"]
+            print(f"🎯 Audience age range detected: '{age_range}'")
 
             # Special handling for Gen Z to provide specific linguistic markers
             if "Gen Z" in age_range or "18-24" in age_range:
+                print(f"✅ Using Gen Z voice adaptation")
                 voice_descriptor = active_voice or "conversational"
                 parts.append(
                     f'- Voice adapted for Gen Z (18-24): {voice_descriptor} — but make it authentically Gen Z. '
