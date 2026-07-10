@@ -4746,6 +4746,7 @@ async def _generate_image_bg(
                 _custom_guide_ids_v1 = _bp.get("selected_custom_guides") or []
                 _custom_guide_ids_v2 = _bp.get("selected_custom_guides_v2") or []
                 _all_custom_guide_ids = _custom_guide_ids_v1 + _custom_guide_ids_v2
+                _custom_guide_id = None  # Initialize to avoid UnboundLocalError
 
                 if _all_custom_guide_ids:
                     # Rotate through custom guides (V1 + V2) like library styles
@@ -4844,6 +4845,7 @@ async def _generate_image_bg(
                 _custom_guide_ids_v1 = _bp.get("selected_custom_guides") or []
                 _custom_guide_ids_v2 = _bp.get("selected_custom_guides_v2") or []
                 _all_custom_guide_ids = _custom_guide_ids_v1 + _custom_guide_ids_v2
+                _custom_guide_id = None  # Initialize to avoid UnboundLocalError
 
                 if _all_custom_guide_ids:
                     # Rotate through custom guides (V1 + V2) like library styles
