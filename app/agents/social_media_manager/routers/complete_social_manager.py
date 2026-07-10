@@ -877,38 +877,135 @@ Choose the position that will cause the LEAST visual disruption."""
 
                     # Apply CTA overlay if requested
                     if add_cta:
-                        # Determine CTA text
-                        cta_text = custom_cta if custom_cta else brand_context_dict.get('default_link', '').replace('https://', '').replace('http://', '')
+                        # Determine CTA text (same logic as normal image generation)
+                        cta_text = None
+                        if custom_cta:
+                            # Use custom CTA if provided
+                            cta_text = custom_cta
+                        else:
+                            # Use brand playbook CTA logic (same as normal generation)
+                            cta_styles_list = brand_context_dict.get("cta_styles", [])
+                            if isinstance(cta_styles_list, list) and cta_styles_list:
+                                import random
+                                cta_text = random.choice(cta_styles_list)
+                            else:
+                                # Fallback to default_link if cta_styles is empty
+                                default_link = brand_context_dict.get("default_link", "")
+                                if default_link:
+                                    cta_text = default_link
+                                    # Remove https:// prefix for cleaner display
+                                    if isinstance(cta_text, str):
+                                        cta_text = cta_text.replace('https://', '').replace('http://', '')
+                                else:
+                                    # Final fallback
+                                    cta_text = "Link in bio"
+
+                        print(f"🎯 CTA text determined: '{cta_text}'")
 
                         if cta_text:
-                            draw = ImageDraw.Draw(img)
-                            width, height = img.size
-
-                            # CTA styling
-                            font_size = max(20, int(height * 0.03))
+                            # Use AI vision to find best position, then PIL to draw text
+                            print(f"🔄 Using AI vision to find best CTA position: '{cta_text}'")
                             try:
-                                font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
-                            except:
-                                font = ImageFont.load_default()
+                                from app.services.AIService import AIService
+                                from PIL import ImageDraw, ImageFont
 
-                            # Get text size
-                            bbox = draw.textbbox((0, 0), cta_text, font=font)
-                            text_width = bbox[2] - bbox[0]
-                            text_height = bbox[3] - bbox[1]
+                                # Use AI vision to determine best position for CTA
+                                vision_prompt = """Analyze this image to find the best location to add a small call-to-action text.
 
-                            # Position at bottom center
-                            x = (width - text_width) // 2
-                            y = height - text_height - int(height * 0.05)
+Consider:
+1. Where is there the MOST empty/background space?
+2. Avoid areas with text, faces, or important visual elements
+3. Look for solid color areas or minimal content zones
 
-                            # Draw background rectangle
-                            padding = 15
-                            draw.rectangle(
-                                [x - padding, y - padding, x + text_width + padding, y + text_height + padding],
-                                fill=(0, 0, 0, 180)
-                            )
+Respond with ONLY ONE of these positions:
+- top_center
+- bottom_center
+- top_left
+- top_right
+- bottom_left
+- bottom_right
 
-                            # Draw text
-                            draw.text((x, y), cta_text, fill=(255, 255, 255), font=font)
+Choose the position that will cause the LEAST visual disruption."""
+
+                                vision_request = AIService.build_ai_model(
+                                    messages=[{
+                                        "role": "user",
+                                        "content": [
+                                            {"type": "text", "text": vision_prompt},
+                                            {"type": "image_url", "image_url": {"url": media_url}}
+                                        ]
+                                    }],
+                                    temperature=0.3,
+                                )
+                                vision_response = await AIService.chat_completion(vision_request)
+                                cta_position = vision_response.choices[0].message.content.strip().lower()
+
+                                # Validate position
+                                valid_positions = ["top_center", "bottom_center", "top_left", "top_right", "bottom_left", "bottom_right"]
+                                if cta_position not in valid_positions:
+                                    cta_position = "bottom_center"  # Fallback
+
+                                print(f"✅ AI selected CTA position: {cta_position}")
+
+                                # Draw CTA text using PIL
+                                width, height = img.size
+                                draw = ImageDraw.Draw(img)
+
+                                # Calculate font size (4-5% of image width for better visibility)
+                                font_size = int(width * 0.045)
+                                try:
+                                    font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", font_size)
+                                except:
+                                    try:
+                                        # Fallback to Arial
+                                        font = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial.ttf", font_size)
+                                    except:
+                                        font = ImageFont.load_default()
+
+                                # Get text bounding box
+                                bbox = draw.textbbox((0, 0), cta_text, font=font)
+                                text_width = bbox[2] - bbox[0]
+                                text_height = bbox[3] - bbox[1]
+
+                                # Calculate position based on AI selection
+                                margin = int(width * 0.05)  # 5% margin
+                                if "top" in cta_position:
+                                    y = margin
+                                else:  # bottom
+                                    y = height - text_height - margin
+
+                                if "center" in cta_position:
+                                    x = (width - text_width) // 2
+                                elif "left" in cta_position:
+                                    x = margin
+                                else:  # right
+                                    x = width - text_width - margin
+
+                                # Draw text with subtle drop shadow for depth without looking squeezed
+                                # First draw shadow (offset by a few pixels)
+                                shadow_offset = 3
+                                shadow_color = (0, 0, 0, 120)  # Semi-transparent black shadow
+
+                                # Draw shadow
+                                draw.text(
+                                    (x + shadow_offset, y + shadow_offset),
+                                    cta_text,
+                                    font=font,
+                                    fill=shadow_color
+                                )
+
+                                # Draw main text in white - clean and crisp
+                                draw.text(
+                                    (x, y),
+                                    cta_text,
+                                    font=font,
+                                    fill="white"
+                                )
+
+                                print(f"✅ CTA text drawn at {cta_position}: '{cta_text}'")
+
+                            except Exception as cta_err:
+                                print(f"⚠️ CTA overlay failed: {cta_err}, skipping CTA")
 
                     # Upload processed image back to Cloudinary
                     buf = io.BytesIO()
