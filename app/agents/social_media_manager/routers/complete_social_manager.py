@@ -811,17 +811,16 @@ CRITICAL INSTRUCTIONS:
 8. The CTA text should blend naturally with the image's existing design style"""
 
                                 # Call gpt-image-2 edit API
-                                # Note: Using dall-e-2 for edit as gpt-image-2 doesn't support edit endpoint
                                 loop = asyncio.get_running_loop()
                                 edit_response = await asyncio.wait_for(
                                     loop.run_in_executor(
                                         None,
                                         lambda: openai_client.images.edit(
-                                            model="dall-e-2",
+                                            model="gpt-image-2",
                                             image=("image.png", img_png_buf, "image/png"),
                                             prompt=cta_prompt,
                                             n=1,
-                                            size="1024x1024",  # dall-e-2 edit only supports 1024x1024
+                                            size=gpt2_size,
                                         ),
                                     ),
                                     timeout=300,
