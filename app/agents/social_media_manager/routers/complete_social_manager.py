@@ -890,11 +890,20 @@ CRITICAL INSTRUCTIONS:
                                 )
 
                                 # Download edited image
-                                edited_url = edit_response.data[0].url
-                                resp_edit = requests.get(edited_url, timeout=10)
-                                resp_edit.raise_for_status()
-                                img = Image.open(io.BytesIO(resp_edit.content)).convert("RGBA")
-                                print(f"✅ CTA text added via gpt-image-2 edit: '{cta_text}'")
+                                print(f"🔍 Edit response received: {edit_response}")
+                                if edit_response.data and len(edit_response.data) > 0:
+                                    edited_url = edit_response.data[0].url
+                                    print(f"📥 Downloading edited image from: {edited_url[:100] if edited_url else 'None'}")
+
+                                    if not edited_url:
+                                        raise ValueError("OpenAI edit response did not include image URL")
+
+                                    resp_edit = requests.get(edited_url, timeout=10)
+                                    resp_edit.raise_for_status()
+                                    img = Image.open(io.BytesIO(resp_edit.content)).convert("RGBA")
+                                    print(f"✅ CTA text added via gpt-image-2 edit: '{cta_text}'")
+                                else:
+                                    raise ValueError("OpenAI edit response has no data")
 
                             except Exception as cta_err:
                                 print(f"⚠️ CTA overlay via AI failed: {cta_err}, skipping CTA")
