@@ -915,17 +915,25 @@ Choose the position that will cause the LEAST visual disruption."""
                                 else:  # right
                                     x = width - text_width - margin
 
-                                # Draw text naturally with proper spacing and stroke for visibility
-                                # Use stroke parameter for clean outline effect
-                                # Choose text color that contrasts with background
-                                # White text with black stroke works on most backgrounds
+                                # Draw text with subtle drop shadow for depth without looking squeezed
+                                # First draw shadow (offset by a few pixels)
+                                shadow_offset = 3
+                                shadow_color = (0, 0, 0, 120)  # Semi-transparent black shadow
+
+                                # Draw shadow
+                                draw.text(
+                                    (x + shadow_offset, y + shadow_offset),
+                                    cta_text,
+                                    font=font,
+                                    fill=shadow_color
+                                )
+
+                                # Draw main text in white - clean and crisp
                                 draw.text(
                                     (x, y),
                                     cta_text,
                                     font=font,
-                                    fill="white",
-                                    stroke_width=2,
-                                    stroke_fill="black"
+                                    fill="white"
                                 )
 
                                 print(f"✅ CTA text drawn at {cta_position}: '{cta_text}'")
