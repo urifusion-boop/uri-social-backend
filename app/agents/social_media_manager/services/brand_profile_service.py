@@ -131,6 +131,8 @@ class BrandProfileService:
             doc["selected_custom_guides_v2"] = data["selected_custom_guides_v2"]
         if "style_rotation_index" in data:
             doc["style_rotation_index"] = data["style_rotation_index"]
+        if "cta_rotation_index" in data:
+            doc["cta_rotation_index"] = data["cta_rotation_index"]
 
         # brand_id is the isolation boundary; fall back to user_id for solo/legacy.
         scope = {"brand_id": brand_id} if brand_id else {"user_id": user_id}
@@ -290,6 +292,7 @@ class BrandProfileService:
             "approval_workflow":    profile.get("approval_workflow", ""),
             "style_selections":     profile.get("style_selections") or [],
             "style_rotation_index": int(profile.get("style_rotation_index") or 0),
+            "cta_rotation_index":   int(profile.get("cta_rotation_index") or 0),
             "font_style":           profile.get("font_style", ""),
             "font_style_prompt":    profile.get("font_style_prompt", ""),
             # Primary & Secondary Font fields

@@ -4749,15 +4749,22 @@ async def _generate_image_bg(
             headline = content.split("\n")[0] if content else seed_content[:50]
             subtext = content.split("\n")[1] if "\n" in content else ""
 
-            # Get CTA - check override_cta first, then cta_styles, then default_link
+            # Get CTA - check override_cta first, then cta_styles with round-robin, then default_link
             override_cta = brand_context.get("override_cta")
             if override_cta:
                 cta = override_cta
             else:
                 cta_styles_list = brand_context.get("cta_styles", [])
                 if isinstance(cta_styles_list, list) and cta_styles_list:
-                    import random
-                    cta = random.choice(cta_styles_list)
+                    # Use round-robin rotation for even CTA distribution
+                    cta_rotation_index = brand_context.get("cta_rotation_index", 0)
+                    if cta_rotation_index >= len(cta_styles_list):
+                        cta_rotation_index = 0
+                    cta = cta_styles_list[cta_rotation_index]
+                    # Update for next time (will be saved by main flow)
+                    next_index = (cta_rotation_index + 1) % len(cta_styles_list)
+                    brand_context["cta_rotation_index"] = next_index
+                    print(f"🔄 V2 Guide CTA rotation: using '{cta}' (index {cta_rotation_index}/{len(cta_styles_list)-1}), next: {next_index}")
                 else:
                     cta = brand_context.get("default_link", "Learn more")
 
@@ -4894,6 +4901,19 @@ async def _generate_image_bg(
                     {"$set": update_fields}
                 )
                 print(f"✅ BG carousel slide {slide_index} image saved for draft {draft_id}: matched={result.matched_count}")
+
+                # Save updated CTA rotation index to brand profile (for round-robin CTA rotation)
+                # Only save once per carousel (not for every slide) - check if first slide
+                if slide_index == 0 and brand_context.get("cta_rotation_index") is not None:
+                    user_id = brand_context.get("user_id", "")
+                    brand_id = brand_context.get("brand_id")
+                    _cta_profile_scope = {"brand_id": brand_id} if brand_id else {"user_id": user_id}
+
+                    await db["brand_profiles"].update_one(
+                        _cta_profile_scope,
+                        {"$set": {"cta_rotation_index": brand_context["cta_rotation_index"]}}
+                    )
+                    print(f"🔄 CTA rotation index updated to {brand_context['cta_rotation_index']}")
             else:
                 # Regular post - save both image_url and document
                 update_fields = {
@@ -4914,6 +4934,18 @@ async def _generate_image_bg(
                 print(f"✅ BG image saved for draft {draft_id}: matched={result.matched_count}")
                 if canvas_doc:
                     print(f"✅ Canvas document saved for draft {draft_id} with {len(canvas_doc.get('layers', []))} layers")
+
+                # Save updated CTA rotation index to brand profile (for round-robin CTA rotation)
+                if brand_context.get("cta_rotation_index") is not None:
+                    user_id = brand_context.get("user_id", "")
+                    brand_id = brand_context.get("brand_id")
+                    _cta_profile_scope = {"brand_id": brand_id} if brand_id else {"user_id": user_id}
+
+                    await db["brand_profiles"].update_one(
+                        _cta_profile_scope,
+                        {"$set": {"cta_rotation_index": brand_context["cta_rotation_index"]}}
+                    )
+                    print(f"🔄 CTA rotation index updated to {brand_context['cta_rotation_index']}")
         else:
             if post_type == "carousel" and slide_index is not None:
                 # Mark slide as failed
