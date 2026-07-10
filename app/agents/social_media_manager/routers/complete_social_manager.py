@@ -666,11 +666,13 @@ async def upload_user_content(
         add_logo = request.get("add_logo", False)
         add_cta = request.get("add_cta", False)
         custom_cta = request.get("custom_cta", "")  # If provided, use this instead of default
+        logo_position_override = request.get("logo_position_override", "")  # User can override logo position for this upload
 
         print(f"📥 Upload content request:")
         print(f"   add_logo: {add_logo}")
         print(f"   add_cta: {add_cta}")
         print(f"   custom_cta: {custom_cta}")
+        print(f"   logo_position_override: {logo_position_override}")
         print(f"   num_media: {len(uploaded_media)}")
 
         if not uploaded_media:
@@ -728,8 +730,64 @@ async def upload_user_content(
 
                     # Apply logo overlay if requested
                     if add_logo and brand_context_dict.get('logo_url'):
-                        logo_position = brand_context_dict.get('logo_position', 'bottom_right')
                         logo_size = brand_context_dict.get('logo_size', 'small')
+
+                        # Determine logo position: user override > AI analysis > brand profile default
+                        if logo_position_override:
+                            # User manually selected position for this upload
+                            logo_position = logo_position_override
+                            print(f"🎨 Using user-selected logo position: {logo_position}")
+                        else:
+                            # Use AI to find best logo position (avoids important content)
+                            print(f"🤖 Analyzing image to find best logo position...")
+                            try:
+                                from app.services.AIService import AIService
+
+                                vision_prompt = """Analyze this image and determine the best corner to place a brand logo overlay.
+
+Consider:
+1. Which corners have the LEAST important content (text, faces, key visual elements)?
+2. Which corners have the most empty/background space?
+3. Avoid corners with text, faces, or focal points
+
+Respond with ONLY ONE of these positions:
+- top_left
+- top_right
+- top_center
+- bottom_left
+- bottom_right
+- bottom_center
+
+Choose the position that will cause the LEAST visual disruption."""
+
+                                vision_request = AIService.build_ai_model(
+                                    messages=[{
+                                        "role": "user",
+                                        "content": [
+                                            {"type": "text", "text": vision_prompt},
+                                            {"type": "image_url", "image_url": {"url": media_url}}
+                                        ]
+                                    }],
+                                    temperature=0.3,
+                                )
+                                vision_response = await AIService.chat_completion(vision_request)
+                                ai_position = vision_response.choices[0].message.content.strip().lower()
+
+                                # Validate AI response
+                                valid_positions = ["top_left", "top_right", "top_center", "bottom_left", "bottom_right", "bottom_center"]
+                                if ai_position in valid_positions:
+                                    logo_position = ai_position
+                                    print(f"✅ AI selected best logo position: {logo_position}")
+                                else:
+                                    # Fallback to brand profile default
+                                    logo_position = brand_context_dict.get('logo_position', 'bottom_right')
+                                    print(f"⚠️ AI gave invalid position '{ai_position}', using brand default: {logo_position}")
+
+                            except Exception as vision_err:
+                                # If AI analysis fails, use brand profile default
+                                logo_position = brand_context_dict.get('logo_position', 'bottom_right')
+                                print(f"⚠️ AI position analysis failed: {vision_err}, using brand default: {logo_position}")
+
                         print(f"🎨 Applying logo overlay: position={logo_position}, size={logo_size}")
 
                         # Convert image to base64, apply logo, convert back
@@ -797,18 +855,23 @@ async def upload_user_content(
                                 else:
                                     gpt2_size = "1024x1792"
 
-                                # Build edit prompt to add CTA text
-                                cta_prompt = f"""Add call-to-action text to this image.
+                                # Build edit prompt with smart positioning to avoid distorting content
+                                cta_prompt = f"""Add call-to-action text to this image without covering important content.
 
 CRITICAL INSTRUCTIONS:
-1. Add the following text at the bottom-center of the image: "{cta_text}"
-2. Use clean, modern sans-serif font
-3. Style the text subtle but legible - approximately 30% the size of any headline text
-4. Position it in the bottom-center within safe zone (at least 10% from bottom edge)
-5. DO NOT style it as a button or banner - just clean text
-6. Keep the text color high-contrast against the background for readability
-7. DO NOT modify the rest of the image - preserve all existing content exactly as-is
-8. The CTA text should blend naturally with the image's existing design style"""
+1. Add this text: "{cta_text}"
+2. ANALYZE the image first to find where important content is (faces, text, key visuals)
+3. Place the CTA text in an area that has the LEAST important content - look for:
+   - Empty/background space
+   - Solid color areas
+   - Bottom or top areas with minimal content
+4. DO NOT place text over faces, existing text, or focal points
+5. Use clean, modern sans-serif font that's legible but not overwhelming
+6. Choose text color with high contrast against its background
+7. Keep text small and subtle - approximately 20-30% the size of any main headline
+8. Position within safe zone (at least 10% from all edges)
+9. DO NOT modify the rest of the image - preserve all existing content exactly as-is
+10. The CTA should feel like a natural part of the design, not an intrusive overlay"""
 
                                 # Call gpt-image-2 edit API
                                 loop = asyncio.get_running_loop()
