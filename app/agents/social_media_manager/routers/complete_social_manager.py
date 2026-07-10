@@ -667,6 +667,12 @@ async def upload_user_content(
         add_cta = request.get("add_cta", False)
         custom_cta = request.get("custom_cta", "")  # If provided, use this instead of default
 
+        print(f"📥 Upload content request:")
+        print(f"   add_logo: {add_logo}")
+        print(f"   add_cta: {add_cta}")
+        print(f"   custom_cta: {custom_cta}")
+        print(f"   num_media: {len(uploaded_media)}")
+
         if not uploaded_media:
             raise HTTPException(status_code=400, detail="No media uploaded")
         if not platforms:
@@ -705,6 +711,7 @@ async def upload_user_content(
 
         # Apply logo and/or CTA overlays if requested
         if add_logo or add_cta:
+            print(f"🖼️  Applying overlays: logo={add_logo}, cta={add_cta}")
             from ..services.image_content_service import ImageContentService
             import base64
             import requests
