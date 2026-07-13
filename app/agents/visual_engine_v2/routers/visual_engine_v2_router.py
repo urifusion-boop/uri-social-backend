@@ -14,8 +14,7 @@ PRD Section 5: API Endpoints
 """
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
-from typing import Optional, List
-from bson import ObjectId
+from typing import Optional, List, Dict, Any
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from openai import AsyncOpenAI
 import os
@@ -32,7 +31,8 @@ from app.agents.visual_engine_v2.services.content_layer_service import ContentLa
 from app.agents.visual_engine_v2.services.image_path_service import ImagePathService, ImageGenerationError
 from app.agents.visual_engine_v2.services.brand_compositor_service import BrandCompositorService
 from app.agents.visual_engine_v2.services.quality_gate_service import QualityGateService
-from app.dependencies import get_db_dependency, get_current_user
+from app.agents.social_media_manager.services.brand_profile_service import BrandProfileService
+from app.dependencies import get_db_dependency, get_active_brand_context, get_current_user
 
 
 router = APIRouter(prefix="/v2", tags=["Visual Engine V2"])
@@ -41,10 +41,24 @@ router = APIRouter(prefix="/v2", tags=["Visual Engine V2"])
 openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 
+async def _require_brand_profile(user_id: str, brand_id: str, db: AsyncIOMotorDatabase) -> Dict[str, Any]:
+    """
+    Resolve the active brand's profile the same way every other endpoint in this
+    app does (BrandProfileService.get, scoped by JWT user_id + active brand_id) —
+    never by a client-supplied brand_profile_id, which nothing else in the app
+    exposes (BrandProfileService.get() deliberately strips _id from every response).
+    """
+    result = await BrandProfileService.get(user_id, db, brand_id=brand_id)
+    profile = result.get("responseData") if isinstance(result, dict) else None
+    if not profile:
+        raise HTTPException(status_code=404, detail="Brand profile not found — complete Brand Playbook first")
+    return profile
+
+
 @router.post("/content-plan")
 async def generate_content_plan(
     request: ContentPlanRequest,
-    current_user: dict = Depends(get_current_user),
+    brand_ctx: dict = Depends(get_active_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
@@ -53,15 +67,8 @@ async def generate_content_plan(
     PRD Section 7: Content Layer
     Returns structured text for template filling.
     """
-    user_id = str(current_user["userId"])
-
-    # Fetch brand profile
-    brand_profile = await db["brand_profiles"].find_one(
-        {"_id": ObjectId(request.brand_profile_id), "user_id": user_id}
-    )
-
-    if not brand_profile:
-        raise HTTPException(status_code=404, detail="Brand profile not found")
+    user_id = brand_ctx["user_id"]
+    brand_profile = await _require_brand_profile(user_id, brand_ctx["brand_id"], db)
 
     # Generate content layer
     content_service = ContentLayerService(openai_client)
@@ -82,7 +89,7 @@ async def generate_content_plan(
 @router.post("/generate-image")
 async def generate_image_path_a(
     request: GenerateImageRequest,
-    current_user: dict = Depends(get_current_user),
+    brand_ctx: dict = Depends(get_active_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
@@ -91,16 +98,7 @@ async def generate_image_path_a(
     PRD Section 8: Imagery Layer - Path A
     Generates imagery-only (no text, no brand elements).
     """
-    user_id = str(current_user["userId"])
-
-    # Fetch brand profile for style hints
-    brand_profile = await db["brand_profiles"].find_one(
-        {"_id": ObjectId(request.brand_profile_id), "user_id": user_id}
-    )
-
-    if not brand_profile:
-        raise HTTPException(status_code=404, detail="Brand profile not found")
-
+    brand_profile = await _require_brand_profile(brand_ctx["user_id"], brand_ctx["brand_id"], db)
     style_hint = brand_profile.get("style_prompt_fragment")
 
     # Generate imagery. Path A already retries once internally (PRD Section 12);
@@ -146,11 +144,10 @@ async def generate_image_path_a(
 
 @router.post("/upload-image")
 async def upload_image_path_b(
-    brand_profile_id: str = Form(...),
     format: str = Form("1:1"),
     remove_background: bool = Form(False),
     image_file: UploadFile = File(...),
-    current_user: dict = Depends(get_current_user),
+    brand_ctx: dict = Depends(get_active_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
@@ -159,15 +156,7 @@ async def upload_image_path_b(
     PRD Section 8: Imagery Layer - Path B
     Processes user-uploaded image with optional background removal.
     """
-    user_id = str(current_user["userId"])
-
-    # Verify brand profile ownership
-    brand_profile = await db["brand_profiles"].find_one(
-        {"_id": ObjectId(brand_profile_id), "user_id": user_id}
-    )
-
-    if not brand_profile:
-        raise HTTPException(status_code=404, detail="Brand profile not found")
+    await _require_brand_profile(brand_ctx["user_id"], brand_ctx["brand_id"], db)
 
     # Read image data
     image_data = await image_file.read()
@@ -202,7 +191,7 @@ async def upload_image_path_b(
 @router.post("/render")
 async def render_full_composition(
     request: RenderRequest,
-    current_user: dict = Depends(get_current_user),
+    brand_ctx: dict = Depends(get_active_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
@@ -211,15 +200,8 @@ async def render_full_composition(
     PRD Section 11: Four-Layer Architecture
     Orchestrates all layers and produces final render.
     """
-    user_id = str(current_user["userId"])
-
-    # Verify brand profile ownership
-    brand_profile = await db["brand_profiles"].find_one(
-        {"_id": ObjectId(request.brand_profile_id), "user_id": user_id}
-    )
-
-    if not brand_profile:
-        raise HTTPException(status_code=404, detail="Brand profile not found")
+    user_id = brand_ctx["user_id"]
+    await _require_brand_profile(user_id, brand_ctx["brand_id"], db)
 
     # Parse layer data from request
     content_layer = LayerData(**request.content_layer)
@@ -229,7 +211,7 @@ async def render_full_composition(
     compositor_service = BrandCompositorService(db)
     render = await compositor_service.compose_final_render(
         user_id=user_id,
-        brand_profile_id=request.brand_profile_id,
+        brand_id=brand_ctx["brand_id"],
         content_layer=content_layer,
         imagery_layer=imagery_layer,
         format=request.format,
@@ -263,7 +245,7 @@ async def render_full_composition(
 @router.post("/render-carousel")
 async def render_carousel(
     request: CarouselRenderRequest,
-    current_user: dict = Depends(get_current_user),
+    brand_ctx: dict = Depends(get_active_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
@@ -272,15 +254,8 @@ async def render_carousel(
     PRD Section 13: Carousel Posts
     Generates 2-10 slides for carousel posts.
     """
-    user_id = str(current_user["userId"])
-
-    # Verify brand profile ownership
-    brand_profile = await db["brand_profiles"].find_one(
-        {"_id": ObjectId(request.brand_profile_id), "user_id": user_id}
-    )
-
-    if not brand_profile:
-        raise HTTPException(status_code=404, detail="Brand profile not found")
+    user_id = brand_ctx["user_id"]
+    await _require_brand_profile(user_id, brand_ctx["brand_id"], db)
 
     # Parse layer data
     content_layer = LayerData(**request.content_layer)
@@ -290,7 +265,7 @@ async def render_carousel(
     compositor_service = BrandCompositorService(db)
     render = await compositor_service.compose_final_render(
         user_id=user_id,
-        brand_profile_id=request.brand_profile_id,
+        brand_id=brand_ctx["brand_id"],
         content_layer=content_layer,
         imagery_layer=imagery_layer,
         format=request.format,

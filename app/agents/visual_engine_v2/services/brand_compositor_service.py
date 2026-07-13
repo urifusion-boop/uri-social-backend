@@ -11,7 +11,6 @@ Layer 4: Typesetting (template-fill render)
 
 from typing import Dict, List, Optional
 from datetime import datetime
-from bson import ObjectId
 
 from app.agents.visual_engine_v2.models.visual_engine_models import (
     VisualEngineRenderV2,
@@ -21,6 +20,7 @@ from app.agents.visual_engine_v2.services.template_service import TemplateServic
 from app.agents.visual_engine_v2.services.image_path_service import ImagePathService
 from app.agents.visual_engine_v2.config.template_config import select_template
 from app.agents.visual_engine_v2.config.vendor_config import VendorConfig
+from app.agents.social_media_manager.services.brand_profile_service import BrandProfileService
 from app.utils.cloudinary_upload import upload_bytes
 import httpx
 
@@ -38,7 +38,7 @@ class BrandCompositorService:
     async def compose_final_render(
         self,
         user_id: str,
-        brand_profile_id: str,
+        brand_id: str,
         content_layer: LayerData,
         imagery_layer: LayerData,
         format: str = "1:1",
@@ -53,8 +53,10 @@ class BrandCompositorService:
         extra render, not a new content/image generation.
 
         Args:
-            user_id: User ID
-            brand_profile_id: Brand profile ID
+            user_id: User ID (from JWT)
+            brand_id: Active brand ID (from get_active_brand_context — personal or
+                agency brand), the same identifier every other endpoint in this
+                app uses to resolve a brand profile. Never a raw Mongo _id.
             content_layer: Layer 1 (AI text: headline, subhead, promo, cta)
             imagery_layer: Layer 2 (imagery URL + metadata)
             format: single aspect ratio, used when `formats` isn't given
@@ -69,7 +71,7 @@ class BrandCompositorService:
         print(f"🎬 Starting 4-layer composition (formats={target_formats}, carousel={carousel_count})")
 
         # Layer 3: Extract brand context from database (shared across every format)
-        brand_layer = await self._extract_brand_layer(brand_profile_id)
+        brand_layer = await self._extract_brand_layer(user_id, brand_id)
 
         # Layer 4: select template + render, once per requested format
         typesetting_layers: Dict[str, LayerData] = {}
@@ -104,7 +106,7 @@ class BrandCompositorService:
         # Build final render document
         render = VisualEngineRenderV2(
             user_id=user_id,
-            brand_profile_id=brand_profile_id,
+            brand_profile_id=brand_id,
             content_layer=content_layer,
             imagery_layer=imagery_layer,
             brand_layer=brand_layer,
@@ -122,7 +124,7 @@ class BrandCompositorService:
         print(f"✅ 4-layer composition complete: {len(target_formats)} format(s), {len(render.final_outputs)} output(s) in primary format")
         return render
 
-    async def _extract_brand_layer(self, brand_profile_id: str) -> LayerData:
+    async def _extract_brand_layer(self, user_id: str, brand_id: str) -> LayerData:
         """
         Layer 3: Extract exact brand assets from database.
 
@@ -131,15 +133,23 @@ class BrandCompositorService:
         - Logo URL
         - Font family names
         - No AI interpretation - exact values only
+
+        Resolved via the same BrandProfileService.get() every other endpoint in
+        this app uses (JWT user_id + active brand_id), not a raw Mongo _id lookup —
+        there is no client-facing "brand profile id" anywhere else in this system.
         """
         print("🏢 Extracting Layer 3: Brand assets")
 
-        brand_profile = await self.db["brand_profiles"].find_one(
-            {"_id": ObjectId(brand_profile_id)}
-        )
+        result = await BrandProfileService.get(user_id, self.db, brand_id=brand_id)
+        brand_profile = result.get("responseData") if isinstance(result, dict) else None
 
         if not brand_profile:
-            raise ValueError(f"Brand profile not found: {brand_profile_id}")
+            raise ValueError(f"Brand profile not found for brand_id={brand_id}")
+
+        # Colors are stored as an ordered list (brand_colors), not separate named
+        # fields — map primary/secondary/accent by position, matching how every
+        # other content-generation path in this app reads brand color.
+        brand_colors = brand_profile.get("brand_colors") or []
 
         # Extract exact brand values (no defaults, no AI interpretation)
         brand_data = {
@@ -148,9 +158,9 @@ class BrandCompositorService:
             "logo_position": brand_profile.get("logo_position", "bottom_right"),
 
             # Exact colors from database
-            "primary_color": brand_profile.get("primary_color"),
-            "secondary_color": brand_profile.get("secondary_color"),
-            "accent_color": brand_profile.get("accent_color"),
+            "primary_color": brand_colors[0] if len(brand_colors) > 0 else None,
+            "secondary_color": brand_colors[1] if len(brand_colors) > 1 else None,
+            "accent_color": brand_colors[2] if len(brand_colors) > 2 else None,
             "background_color": brand_profile.get("background_color"),
 
             # Font families
@@ -167,7 +177,7 @@ class BrandCompositorService:
         return LayerData(
             layer_type="brand",
             data=brand_data,
-            metadata={"source": "database", "brand_profile_id": brand_profile_id}
+            metadata={"source": "database", "brand_id": brand_id}
         )
 
     async def _render_typesetting_layer(
