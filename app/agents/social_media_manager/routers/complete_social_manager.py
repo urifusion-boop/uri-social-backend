@@ -173,7 +173,9 @@ class ContentGenerationRequest(BaseModel):
     include_images: bool = False
     image_model: Optional[str] = None  # e.g. "fal-ai/flux-pro/v1.1", "fal-ai/flux/dev", "fal-ai/ideogram/v3", or None (default Imagen)
     brand_context: Optional[BrandContextRequest] = None
-    reference_image: Optional[str] = None  # base64 data URL uploaded by user for contextual reference
+    reference_image: Optional[str] = None  # DEPRECATED: use reference_images. Kept for backward compatibility.
+    reference_images: Optional[List[str]] = None  # base64 data URLs uploaded by user for contextual reference (multiple supported)
+    slide_image_map: Optional[List[Optional[int]]] = None  # carousel only: per-slide index into reference_images (or null for no image). Defaults to cycling image N -> slide N when omitted.
     post_type: str = "feed"   # feed | carousel | story
     num_slides: int = 3        # carousel only (2–5)
     acknowledged_incomplete_profile: bool = False  # OPTION 1: User acknowledged incomplete profile warning
@@ -439,6 +441,27 @@ async def generate_content(
         post_type = request.post_type or "feed"
         num_slides = max(2, min(5, request.num_slides or 3))
 
+        # ── Reference images: normalise to a list, keep old single-image field working ──
+        ref_images: List[str] = request.reference_images or (
+            [request.reference_image] if request.reference_image else []
+        )
+
+        def _slide_reference_image(slide_index: int) -> Optional[str]:
+            """Which single reference image (if any) a given carousel slide should use.
+            Explicit slide_image_map wins; otherwise images cycle 1:1 across slides
+            (image 1 -> slide 1, image 2 -> slide 2, wrapping if there are fewer images
+            than slides)."""
+            if not ref_images:
+                return None
+            if request.slide_image_map is not None and slide_index < len(request.slide_image_map):
+                img_idx = request.slide_image_map[slide_index]
+                if img_idx is None:
+                    return None
+                if 0 <= img_idx < len(ref_images):
+                    return ref_images[img_idx]
+                return None
+            return ref_images[slide_index % len(ref_images)]
+
         if post_type == "carousel":
             from ..services.carousel_generation_service import CarouselGenerationService
             result = await CarouselGenerationService.generate_multi_platform(
@@ -458,7 +481,7 @@ async def generate_content(
                 seed_type=request.seed_type,
                 brand_context=brand_context_dict,
                 db=db,
-                reference_image=request.reference_image,
+                reference_image=ref_images[0] if ref_images else None,
             )
 
         # Stamp the ACTIVE BRAND on the request + every draft so content is isolated
@@ -579,7 +602,7 @@ async def generate_content(
                             seed_content=enriched_seed,  # Use enriched seed with both original context and slide-specific focus
                             brand_context=brand_context_dict,
                             db=db,
-                            reference_image=request.reference_image,
+                            reference_image=_slide_reference_image(slide_index),
                             post_type=post_type,
                             slide_index=slide_index,
                             image_model=request.image_model,
@@ -594,7 +617,7 @@ async def generate_content(
                         seed_content=request.seed_content,
                         brand_context=brand_context_dict,
                         db=db,
-                        reference_image=request.reference_image,
+                        reference_image=ref_images[0] if ref_images else None,
                         post_type=post_type,
                         image_model=request.image_model,
                     )))
