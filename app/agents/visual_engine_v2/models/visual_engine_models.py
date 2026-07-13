@@ -29,11 +29,12 @@ class LayerData(BaseModel):
 # ============================================================================
 
 class ContentPlanRequest(BaseModel):
-    """Request to plan content (AI text layer)"""
+    """Request to plan content (AI text layer). Brand is resolved server-side from
+    the authenticated user's active brand context — never passed by the client,
+    matching every other endpoint in this app."""
     seed_content: str = Field(..., description="Topic or brief for content")
     platforms: List[str] = Field(..., description="Target platforms")
     post_intent: str = Field(..., description="sale, product, announcement, testimonial, educational")
-    brand_profile_id: Optional[str] = Field(None, description="Brand profile ID for context")
     carousel_slides: int = Field(1, description="Number of slides (1 for single post)")
 
 
@@ -42,19 +43,16 @@ class GenerateImageRequest(BaseModel):
     content_plan: str = Field(..., description="What to generate")
     negative_space: str = Field("left_third", description="Where to leave space for text")
     format: str = Field("1:1", description="Aspect ratio: 1:1, 4:5, or 9:16")
-    brand_profile_id: Optional[str] = Field(None)
 
 
 class UploadImageRequest(BaseModel):
     """Path B: Upload and clean user image"""
     image_url: str = Field(..., description="User's uploaded image URL")
     cleanup_level: Literal["none", "background_removal", "reframe", "ai_recomposite"] = "background_removal"
-    brand_profile_id: Optional[str] = Field(None)
 
 
 class RenderRequest(BaseModel):
     """4-layer compositor render request"""
-    brand_profile_id: str = Field(..., description="Brand profile to pull exact brand values from")
     content_layer: Dict[str, Any] = Field(..., description="headline, subhead, promo, cta")
     imagery_layer: Dict[str, Any] = Field(..., description="path, image_url, source")
 
@@ -68,7 +66,6 @@ class RenderRequest(BaseModel):
 
 class CarouselRenderRequest(BaseModel):
     """Multi-slide carousel render"""
-    brand_profile_id: str = Field(..., description="Brand profile to pull exact brand values from")
     content_layer: Dict[str, Any] = Field(..., description="headline, subhead, promo, cta")
     imagery_layer: Dict[str, Any] = Field(..., description="path, image_url, source")
     format: str = Field("1:1", description="Aspect ratio to render")
