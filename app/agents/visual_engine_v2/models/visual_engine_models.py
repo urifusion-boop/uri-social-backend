@@ -135,7 +135,11 @@ class VisualEngineRenderV2(BaseModel):
     # Output
     final_outputs: List[str] = Field(default_factory=list)  # rendered URL(s) in the primary format; 1 for single post, N for carousel slides
     format_outputs: Dict[str, List[str]] = Field(default_factory=dict)  # PRD Section 14: every requested aspect-ratio format, keyed by "1:1"/"4:5"/"9:16"
-    status: Literal["planning", "rendering", "review", "approved", "rejected", "published", "completed"] = "planning"
+    status: Literal[
+        "planning", "rendering", "review", "approved", "rejected", "completed",
+        "scheduled", "published", "publish_failed"
+    ] = "planning"
+    content_draft_id: Optional[str] = None  # links to the content_drafts document once bridged to the real posting pipeline
 
     # Quality gate
     confidence_score: float = 0.0

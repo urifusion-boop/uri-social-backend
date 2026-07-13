@@ -31,8 +31,10 @@ from app.agents.visual_engine_v2.services.content_layer_service import ContentLa
 from app.agents.visual_engine_v2.services.image_path_service import ImagePathService, ImageGenerationError
 from app.agents.visual_engine_v2.services.brand_compositor_service import BrandCompositorService
 from app.agents.visual_engine_v2.services.quality_gate_service import QualityGateService
+from app.agents.visual_engine_v2.services.publish_bridge_service import PublishBridgeService, SUPPORTED_PLATFORMS
 from app.agents.social_media_manager.services.brand_profile_service import BrandProfileService
 from app.dependencies import get_db_dependency, get_active_brand_context, get_current_user
+from datetime import datetime
 
 
 router = APIRouter(prefix="/v2", tags=["Visual Engine V2"])
@@ -378,3 +380,66 @@ async def reject_review(
         raise HTTPException(status_code=404, detail="Review not found")
 
     return {"success": True, "message": "Render rejected"}
+
+
+@router.get("/connections")
+async def get_connected_platforms(
+    brand_ctx: dict = Depends(get_active_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency)
+):
+    """
+    Which platforms does the active brand's account actually have connected
+    right now — reuses the exact social_connections query the real posting
+    pipeline runs, so this reflects reality, not a guess.
+    """
+    bridge = PublishBridgeService(db)
+    connected = await bridge.get_connected_platforms(brand_ctx["user_id"])
+    return {
+        "success": True,
+        "connected_platforms": connected,
+        "supported_platforms": SUPPORTED_PLATFORMS,
+    }
+
+
+@router.post("/render/{render_id}/publish")
+async def publish_render(
+    render_id: str,
+    platform: str,
+    scheduled_datetime: Optional[str] = None,
+    brand_ctx: dict = Depends(get_active_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency)
+):
+    """
+    Bridge a completed V2 render into the real posting pipeline: builds a
+    content_drafts document in the shape approval_workflow_service.py expects
+    and hands it to the actual publish/schedule functions — no platform API
+    calls happen in this module, they're reused from the existing pipeline.
+
+    scheduled_datetime: ISO 8601 string. Omit to publish immediately.
+    """
+    user_id = brand_ctx["user_id"]
+
+    render = await db["visual_engine_renders_v2"].find_one({"_id": render_id, "user_id": user_id})
+    if not render:
+        raise HTTPException(status_code=404, detail="Render not found")
+
+    parsed_schedule = None
+    if scheduled_datetime:
+        try:
+            parsed_schedule = datetime.fromisoformat(scheduled_datetime.replace("Z", "+00:00"))
+        except ValueError:
+            raise HTTPException(status_code=400, detail="scheduled_datetime must be ISO 8601")
+
+    bridge = PublishBridgeService(db)
+    result = await bridge.publish_render(
+        user_id=user_id,
+        brand_id=brand_ctx.get("brand_id"),
+        render=render,
+        platform=platform,
+        scheduled_datetime=parsed_schedule,
+    )
+
+    if not result["success"]:
+        raise HTTPException(status_code=400, detail=result["error"])
+
+    return result
