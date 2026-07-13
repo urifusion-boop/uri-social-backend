@@ -29,15 +29,24 @@ class TemplateService:
         format: str = "1:1"
     ) -> str:
         """
-        Render via Orshot API
+        Render via Orshot API.
+
+        Verified against https://orshot.com/docs/api-reference/render-from-template —
+        the real endpoint is POST /v1/generate/images with a templateId/response/
+        modifications body; the /v1/render this originally called doesn't exist
+        (404, confirmed by hand) and was never actually reachable.
 
         Args:
-            template_id: Template to use
-            data: Slot mappings {slot_name: value}
-            format: Aspect ratio
+            template_id: Our internal template_config.py entry to use
+            data: Slot mappings {slot_name: value} — sent as Orshot's "modifications"
+            format: Our aspect-ratio concept (1:1/4:5/9:16). Orshot has no render-time
+                parameter for this — each aspect ratio is its own fixed-size template,
+                already selected via template_config.select_template() before this is
+                ever called. Kept as a parameter for logging/API symmetry only.
 
         Returns:
-            Rendered image URL (permanently hosted)
+            Rendered image URL (permanently hosted — response.type="url" is
+            confirmed permanent per Orshot's own docs, not an expiring link)
         """
         if not VendorConfig.is_orshot_available():
             raise TemplateRenderError("Orshot not configured")
@@ -48,13 +57,13 @@ class TemplateService:
         if not orshot_template_id:
             raise TemplateRenderError(f"Template {template_id} not configured in Orshot")
 
-        # Build Orshot API payload
         payload = {
-            "template_id": orshot_template_id,
-            "data": data,
-            "format": format,
-            "permanent": True,  # PRD requirement: permanent hosting
-            "webhook": None  # Synchronous for now
+            "templateId": orshot_template_id,
+            "response": {
+                "format": "png",
+                "type": "url"
+            },
+            "modifications": data
         }
 
         headers = {
@@ -65,17 +74,17 @@ class TemplateService:
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.post(
-                    f"{VendorConfig.ORSHOT_API_URL}/render",
+                    f"{VendorConfig.ORSHOT_API_URL}/generate/images",
                     json=payload,
                     headers=headers
                 )
                 response.raise_for_status()
 
                 result = response.json()
-                render_url = result.get("url") or result.get("image_url")
+                render_url = (result.get("data") or {}).get("content")
 
                 if not render_url:
-                    raise TemplateRenderError(f"Orshot returned no URL: {result}")
+                    raise TemplateRenderError(f"Orshot returned no content: {result}")
 
                 print(f"✅ Orshot render completed: {render_url}")
                 return render_url
@@ -91,7 +100,13 @@ class TemplateService:
         format: str = "1:1"
     ) -> str:
         """
-        Render via Placid API (fallback vendor)
+        Render via Placid API (fallback vendor).
+
+        Unlike render_via_orshot, this endpoint/payload shape has NOT been
+        verified against Placid's real docs (Orshot's was verified by hand and
+        was wrong — /v1/render didn't exist). Treat this as equally unverified
+        until someone checks it the same way, especially since Placid isn't
+        even configured/enabled yet (no PLACID_API_KEY set anywhere).
 
         Note: Placid doesn't support carousel in single call
         """
@@ -203,23 +218,16 @@ class TemplateService:
         format: str = "1:1"
     ) -> List[str]:
         """
-        Render multi-slide carousel
+        Render multi-slide carousel.
 
-        PRD Section 9: Carousel generation
-        Orshot supports native multi-page, Placid doesn't
+        PRD Section 9: Carousel generation. Previously tried an Orshot "native
+        multi-page" call first (POST /v1/render/carousel) — that endpoint
+        doesn't exist (same class of error as /v1/render; confirmed by hand
+        against Orshot's real docs, which don't document any multi-page/
+        carousel endpoint). Removed rather than left calling a fictional URL;
+        every slide is rendered as its own /v1/generate/images call instead.
+        Revisit if Orshot documents real carousel support later.
         """
-        if VendorConfig.is_orshot_available():
-            # Try Orshot native multi-page (if supported)
-            try:
-                return await TemplateService._render_carousel_orshot_native(
-                    template_id,
-                    slides_data,
-                    format
-                )
-            except Exception as e:
-                print(f"⚠️ Orshot native carousel failed, rendering slides individually: {e}")
-
-        # Fall back: render each slide individually
         tasks = [
             TemplateService.render_with_fallback(template_id, slide_data, format)
             for slide_data in slides_data
@@ -237,42 +245,3 @@ class TemplateService:
             raise TemplateRenderError("All carousel slides failed to render")
 
         return valid_urls
-
-    @staticmethod
-    async def _render_carousel_orshot_native(
-        template_id: str,
-        slides_data: List[Dict[str, Any]],
-        format: str = "1:1"
-    ) -> List[str]:
-        """Orshot native multi-page carousel (single API call)"""
-        template_config = get_template_config(template_id)
-        orshot_template_id = template_config.get("orshot_template_id")
-
-        payload = {
-            "template_id": orshot_template_id,
-            "pages": slides_data,  # Multi-page data
-            "format": format,
-            "permanent": True
-        }
-
-        headers = {
-            "Authorization": f"Bearer {VendorConfig.ORSHOT_API_KEY}",
-            "Content-Type": "application/json"
-        }
-
-        async with httpx.AsyncClient(timeout=60.0) as client:  # Longer timeout for carousel
-            response = await client.post(
-                f"{VendorConfig.ORSHOT_API_URL}/render/carousel",
-                json=payload,
-                headers=headers
-            )
-            response.raise_for_status()
-
-            result = response.json()
-            slide_urls = result.get("pages") or result.get("slides")
-
-            if not slide_urls:
-                raise TemplateRenderError(f"Orshot carousel returned no URLs: {result}")
-
-            print(f"✅ Orshot carousel ({len(slide_urls)} slides) completed")
-            return slide_urls
