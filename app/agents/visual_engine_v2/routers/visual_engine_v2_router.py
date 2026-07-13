@@ -118,7 +118,7 @@ async def generate_image_path_a(
         print(f"⚠️ [Path A] Falling back to brand-colored placeholder: {e}")
         needs_attention = True
         error_message = str(e)
-        imagery_result = ImagePathService.generate_placeholder_image(
+        imagery_result = await ImagePathService.generate_placeholder_image(
             brand_profile.get("primary_color"),
             format=request.format
         )
