@@ -4,20 +4,36 @@ FastAPI endpoints for the 4-layer compositing system
 
 PRD Section 5: API Endpoints
 - POST /v2/content-plan - Generate Layer 1 (content)
-- POST /v2/generate-image - Generate Layer 2 (Path A)
-- POST /v2/upload-image - Upload Layer 2 (Path B)
-- POST /v2/render - Full 4-layer render
-- POST /v2/render-carousel - Multi-slide carousel
+- POST /v2/generate-image - Generate Layer 2 (Path A) — starts a background job
+- POST /v2/upload-image - Upload Layer 2 (Path B) — starts a background job
+- POST /v2/render - Full 4-layer render — starts a background job
+- POST /v2/render-carousel - Multi-slide carousel — starts a background job
+- GET /v2/jobs/{job_id} - Poll a background job's status/result
 - GET /v2/review-queue - Get pending reviews
 - POST /v2/review/{review_id}/approve - Approve review
 - POST /v2/review/{review_id}/reject - Reject review
+- GET /v2/connections - Which platforms are actually connected
+- POST /v2/render/{render_id}/publish - Bridge a render into real posting
+
+Generate-image/upload-image/render/render-carousel all return a job_id
+immediately and do the actual (potentially 30-90s+) work in a FastAPI
+BackgroundTasks callback, mirroring the production /generate-content
+endpoint's own pattern ("text is always returned immediately... images
+are generated in the background"). Holding one HTTP connection open for
+the full duration of a GPT Image 2 or Orshot call is fragile against any
+intermediate proxy/gateway timeout, independent of the client's own
+timeout setting — confirmed live: raising the frontend timeout to 300s
+did not fix a hung request, because nothing in the chain was actually
+waiting on the client's timeout value at all.
 """
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, UploadFile, File, Form
 from typing import Optional, List, Dict, Any
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from openai import AsyncOpenAI
+from datetime import datetime
 import os
+import uuid
 
 from app.agents.visual_engine_v2.models.visual_engine_models import (
     ContentPlanRequest,
@@ -34,7 +50,6 @@ from app.agents.visual_engine_v2.services.quality_gate_service import QualityGat
 from app.agents.visual_engine_v2.services.publish_bridge_service import PublishBridgeService, SUPPORTED_PLATFORMS
 from app.agents.social_media_manager.services.brand_profile_service import BrandProfileService
 from app.dependencies import get_db_dependency, get_active_brand_context, get_current_user
-from datetime import datetime
 
 
 router = APIRouter(prefix="/v2", tags=["Visual Engine V2"])
@@ -57,6 +72,163 @@ async def _require_brand_profile(user_id: str, brand_id: str, db: AsyncIOMotorDa
     return profile
 
 
+# ============================================================================
+# BACKGROUND JOB HELPERS
+# ============================================================================
+
+async def _create_job(db: AsyncIOMotorDatabase, user_id: str, job_type: str) -> str:
+    job_id = str(uuid.uuid4())
+    await db["visual_engine_jobs"].insert_one({
+        "job_id": job_id,
+        "user_id": user_id,
+        "type": job_type,
+        "status": "pending",
+        "result": None,
+        "error": None,
+        "created_at": datetime.utcnow(),
+        "completed_at": None,
+    })
+    return job_id
+
+
+async def _complete_job(db: AsyncIOMotorDatabase, job_id: str, result: Dict[str, Any]) -> None:
+    await db["visual_engine_jobs"].update_one(
+        {"job_id": job_id},
+        {"$set": {"status": "completed", "result": result, "completed_at": datetime.utcnow()}}
+    )
+
+
+async def _fail_job(db: AsyncIOMotorDatabase, job_id: str, error: str) -> None:
+    await db["visual_engine_jobs"].update_one(
+        {"job_id": job_id},
+        {"$set": {"status": "failed", "error": error, "completed_at": datetime.utcnow()}}
+    )
+
+
+# ============================================================================
+# BACKGROUND JOB WORKERS
+# ============================================================================
+
+async def _job_generate_image_path_a(
+    db: AsyncIOMotorDatabase, job_id: str, content_plan: str,
+    style_hint: Optional[str], format: str, brand_primary: Optional[str]
+) -> None:
+    try:
+        image_service = ImagePathService(openai_client)
+        needs_attention = False
+        error_message = None
+        try:
+            imagery_result = await image_service.generate_imagery_path_a(
+                content_plan=content_plan, style_hint=style_hint, format=format
+            )
+        except ImageGenerationError as e:
+            print(f"⚠️ [Path A] Falling back to brand-colored placeholder: {e}")
+            needs_attention = True
+            error_message = str(e)
+            imagery_result = await ImagePathService.generate_placeholder_image(brand_primary, format=format)
+
+        imagery_layer = LayerData(
+            layer_type="imagery",
+            data={"imagery_url": imagery_result["imagery_url"]},
+            metadata={
+                "path": imagery_result["path"],
+                "cost": imagery_result["cost"],
+                "format": format,
+                "needs_attention": needs_attention,
+                "error_message": error_message
+            }
+        )
+        await _complete_job(db, job_id, {
+            "success": True,
+            "imagery_layer": imagery_layer.model_dump(),
+            "cost": imagery_result["cost"],
+            "needs_attention": needs_attention,
+        })
+    except Exception as e:
+        print(f"❌ [Job {job_id}] generate_image_path_a failed unexpectedly: {e}")
+        await _fail_job(db, job_id, str(e))
+
+
+async def _job_upload_image_path_b(
+    db: AsyncIOMotorDatabase, job_id: str, image_data: bytes,
+    remove_background: bool, format: str
+) -> None:
+    try:
+        image_service = ImagePathService(openai_client)
+        imagery_result = await image_service.process_uploaded_image_path_b(
+            image_data=image_data, remove_background=remove_background, format=format
+        )
+        imagery_layer = LayerData(
+            layer_type="imagery",
+            data={"imagery_url": imagery_result["imagery_url"]},
+            metadata={
+                "path": imagery_result["path"],
+                "cost": imagery_result["cost"],
+                "format": format,
+                "background_removed": remove_background
+            }
+        )
+        await _complete_job(db, job_id, {
+            "success": True,
+            "imagery_layer": imagery_layer.model_dump(),
+            "cost": imagery_result["cost"],
+        })
+    except Exception as e:
+        print(f"❌ [Job {job_id}] upload_image_path_b failed unexpectedly: {e}")
+        await _fail_job(db, job_id, str(e))
+
+
+async def _job_render(
+    db: AsyncIOMotorDatabase, job_id: str, user_id: str, brand_id: str,
+    content_layer: LayerData, imagery_layer: LayerData,
+    format: str, formats: Optional[List[str]], carousel_count: int
+) -> None:
+    try:
+        compositor_service = BrandCompositorService(db)
+        render: VisualEngineRenderV2 = await compositor_service.compose_final_render(
+            user_id=user_id,
+            brand_id=brand_id,
+            content_layer=content_layer,
+            imagery_layer=imagery_layer,
+            format=format,
+            formats=formats,
+            carousel_count=carousel_count
+        )
+
+        quality_gate_service = QualityGateService(db)
+        quality_result = await quality_gate_service.evaluate_render(render, user_id)
+
+        render_dict = render.model_dump()
+        render_dict["_id"] = render.id
+        render_dict["quality_gate_result"] = quality_result
+        await db["visual_engine_renders_v2"].insert_one(render_dict)
+
+        result: Dict[str, Any] = {
+            "success": True,
+            "render_id": render.id,
+            "format_outputs": render.format_outputs,
+            "template_id": render.typesetting_layer.data.get("template_id"),
+            "style_family": render.typesetting_layer.data.get("style_family"),
+            "total_cost": render.total_cost,
+            "quality_gate": quality_result,
+            "status": "pending_review" if quality_result["requires_review"] else "completed",
+        }
+        if carousel_count > 1:
+            result["carousel_slides"] = render.final_outputs
+            result["slide_count"] = len(render.final_outputs)
+        else:
+            result["final_outputs"] = render.final_outputs
+
+        await _complete_job(db, job_id, result)
+    except Exception as e:
+        print(f"❌ [Job {job_id}] render failed unexpectedly: {e}")
+        await _fail_job(db, job_id, str(e))
+
+
+# ============================================================================
+# ENDPOINTS
+# ============================================================================
+
 @router.post("/content-plan")
 async def generate_content_plan(
     request: ContentPlanRequest,
@@ -67,12 +239,12 @@ async def generate_content_plan(
     Generate Layer 1: Content (headline, subtext, CTA).
 
     PRD Section 7: Content Layer
-    Returns structured text for template filling.
+    Returns structured text for template filling. A single GPT-4o text call
+    is fast enough to stay synchronous — no job/polling needed here.
     """
     user_id = brand_ctx["user_id"]
     brand_profile = await _require_brand_profile(user_id, brand_ctx["brand_id"], db)
 
-    # Generate content layer
     content_service = ContentLayerService(openai_client)
     content_layer = await content_service.generate_content_plan(
         seed_content=request.seed_content,
@@ -91,61 +263,31 @@ async def generate_content_plan(
 @router.post("/generate-image")
 async def generate_image_path_a(
     request: GenerateImageRequest,
+    background_tasks: BackgroundTasks,
     brand_ctx: dict = Depends(get_active_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
     Generate Layer 2: Imagery (Path A - GPT Image 2).
 
-    PRD Section 8: Imagery Layer - Path A
-    Generates imagery-only (no text, no brand elements).
+    PRD Section 8: Imagery Layer - Path A. Returns a job_id immediately;
+    poll GET /v2/jobs/{job_id} for the result.
     """
     brand_profile = await _require_brand_profile(brand_ctx["user_id"], brand_ctx["brand_id"], db)
     style_hint = brand_profile.get("style_prompt_fragment")
 
-    # Generate imagery. Path A already retries once internally (PRD Section 12);
-    # if it still fails, fall back to a brand-colored placeholder rather than a 500.
-    image_service = ImagePathService(openai_client)
-    needs_attention = False
-    error_message = None
-    try:
-        imagery_result = await image_service.generate_imagery_path_a(
-            content_plan=request.content_plan,
-            style_hint=style_hint,
-            format=request.format
-        )
-    except ImageGenerationError as e:
-        print(f"⚠️ [Path A] Falling back to brand-colored placeholder: {e}")
-        needs_attention = True
-        error_message = str(e)
-        imagery_result = await ImagePathService.generate_placeholder_image(
-            brand_profile.get("primary_color"),
-            format=request.format
-        )
-
-    # Build LayerData
-    imagery_layer = LayerData(
-        layer_type="imagery",
-        data={"imagery_url": imagery_result["imagery_url"]},
-        metadata={
-            "path": imagery_result["path"],
-            "cost": imagery_result["cost"],
-            "format": request.format,
-            "needs_attention": needs_attention,
-            "error_message": error_message
-        }
+    job_id = await _create_job(db, brand_ctx["user_id"], "generate_image")
+    background_tasks.add_task(
+        _job_generate_image_path_a,
+        db, job_id, request.content_plan, style_hint, request.format, brand_profile.get("primary_color")
     )
 
-    return {
-        "success": True,
-        "imagery_layer": imagery_layer.model_dump(),
-        "cost": imagery_result["cost"],
-        "needs_attention": needs_attention
-    }
+    return {"success": True, "job_id": job_id, "status": "pending"}
 
 
 @router.post("/upload-image")
 async def upload_image_path_b(
+    background_tasks: BackgroundTasks,
     format: str = Form("1:1"),
     remove_background: bool = Form(False),
     image_file: UploadFile = File(...),
@@ -155,148 +297,99 @@ async def upload_image_path_b(
     """
     Upload Layer 2: Imagery (Path B - User upload).
 
-    PRD Section 8: Imagery Layer - Path B
-    Processes user-uploaded image with optional background removal.
+    PRD Section 8: Imagery Layer - Path B. Returns a job_id immediately;
+    poll GET /v2/jobs/{job_id} for the result.
     """
     await _require_brand_profile(brand_ctx["user_id"], brand_ctx["brand_id"], db)
 
-    # Read image data
+    # Read the upload synchronously — the file stream doesn't survive into a
+    # background task, but the raw bytes do.
     image_data = await image_file.read()
 
-    # Process image
-    image_service = ImagePathService(openai_client)
-    imagery_result = await image_service.process_uploaded_image_path_b(
-        image_data=image_data,
-        remove_background=remove_background,
-        format=format
-    )
+    job_id = await _create_job(db, brand_ctx["user_id"], "upload_image")
+    background_tasks.add_task(_job_upload_image_path_b, db, job_id, image_data, remove_background, format)
 
-    # Build LayerData
-    imagery_layer = LayerData(
-        layer_type="imagery",
-        data={"imagery_url": imagery_result["imagery_url"]},
-        metadata={
-            "path": imagery_result["path"],
-            "cost": imagery_result["cost"],
-            "format": format,
-            "background_removed": remove_background
-        }
-    )
-
-    return {
-        "success": True,
-        "imagery_layer": imagery_layer.model_dump(),
-        "cost": imagery_result["cost"]
-    }
+    return {"success": True, "job_id": job_id, "status": "pending"}
 
 
 @router.post("/render")
 async def render_full_composition(
     request: RenderRequest,
+    background_tasks: BackgroundTasks,
     brand_ctx: dict = Depends(get_active_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
     Full 4-layer render: Content → Imagery → Brand → Typesetting.
 
-    PRD Section 11: Four-Layer Architecture
-    Orchestrates all layers and produces final render.
+    PRD Section 11: Four-Layer Architecture. Returns a job_id immediately;
+    poll GET /v2/jobs/{job_id} for the result.
     """
     user_id = brand_ctx["user_id"]
     await _require_brand_profile(user_id, brand_ctx["brand_id"], db)
 
-    # Parse layer data from request
     content_layer = LayerData(**request.content_layer)
     imagery_layer = LayerData(**request.imagery_layer)
 
-    # Compose final render — across every requested format if `formats` was given
-    compositor_service = BrandCompositorService(db)
-    render = await compositor_service.compose_final_render(
-        user_id=user_id,
-        brand_id=brand_ctx["brand_id"],
-        content_layer=content_layer,
-        imagery_layer=imagery_layer,
-        format=request.format,
-        formats=request.formats
+    job_id = await _create_job(db, user_id, "render")
+    background_tasks.add_task(
+        _job_render, db, job_id, user_id, brand_ctx["brand_id"],
+        content_layer, imagery_layer, request.format, request.formats, 1
     )
 
-    # Quality gate evaluation (may reference render.id, e.g. in a review-queue entry)
-    quality_gate_service = QualityGateService(db)
-    quality_result = await quality_gate_service.evaluate_render(render, user_id)
-
-    # Save render to database, keyed by the same id the quality gate already used
-    # (so a review-queue entry's render_id resolves to this document)
-    render_dict = render.model_dump()
-    render_dict["_id"] = render.id
-    render_dict["quality_gate_result"] = quality_result
-    await db["visual_engine_renders_v2"].insert_one(render_dict)
-
-    return {
-        "success": True,
-        "render_id": render.id,
-        "final_outputs": render.final_outputs,
-        "format_outputs": render.format_outputs,
-        "template_id": render.typesetting_layer.data.get("template_id"),
-        "style_family": render.typesetting_layer.data.get("style_family"),
-        "total_cost": render.total_cost,
-        "quality_gate": quality_result,
-        "status": "pending_review" if quality_result["requires_review"] else "completed"
-    }
+    return {"success": True, "job_id": job_id, "status": "pending"}
 
 
 @router.post("/render-carousel")
 async def render_carousel(
     request: CarouselRenderRequest,
+    background_tasks: BackgroundTasks,
     brand_ctx: dict = Depends(get_active_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
     Multi-slide carousel render.
 
-    PRD Section 13: Carousel Posts
-    Generates 2-10 slides for carousel posts.
+    PRD Section 13: Carousel Posts. Returns a job_id immediately;
+    poll GET /v2/jobs/{job_id} for the result.
     """
     user_id = brand_ctx["user_id"]
     await _require_brand_profile(user_id, brand_ctx["brand_id"], db)
 
-    # Parse layer data
     content_layer = LayerData(**request.content_layer)
     imagery_layer = LayerData(**request.imagery_layer)
 
-    # Compose carousel render — across every requested format if `formats` was given
-    compositor_service = BrandCompositorService(db)
-    render = await compositor_service.compose_final_render(
-        user_id=user_id,
-        brand_id=brand_ctx["brand_id"],
-        content_layer=content_layer,
-        imagery_layer=imagery_layer,
-        format=request.format,
-        formats=request.formats,
-        carousel_count=request.carousel_count
+    job_id = await _create_job(db, user_id, "render_carousel")
+    background_tasks.add_task(
+        _job_render, db, job_id, user_id, brand_ctx["brand_id"],
+        content_layer, imagery_layer, request.format, request.formats, request.carousel_count
     )
 
-    # Quality gate evaluation (may reference render.id, e.g. in a review-queue entry)
-    quality_gate_service = QualityGateService(db)
-    quality_result = await quality_gate_service.evaluate_render(render, user_id)
+    return {"success": True, "job_id": job_id, "status": "pending"}
 
-    # Save render to database, keyed by the same id the quality gate already used
-    # (so a review-queue entry's render_id resolves to this document)
-    render_dict = render.model_dump()
-    render_dict["_id"] = render.id
-    render_dict["quality_gate_result"] = quality_result
-    await db["visual_engine_renders_v2"].insert_one(render_dict)
+
+@router.get("/jobs/{job_id}")
+async def get_job_status(
+    job_id: str,
+    brand_ctx: dict = Depends(get_active_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency)
+):
+    """
+    Poll a background job started by generate-image/upload-image/render/
+    render-carousel. status is "pending" | "completed" | "failed"; `result`
+    is populated (matching that endpoint's old synchronous response shape)
+    once status is "completed".
+    """
+    job = await db["visual_engine_jobs"].find_one({"job_id": job_id, "user_id": brand_ctx["user_id"]})
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
 
     return {
         "success": True,
-        "render_id": render.id,
-        "carousel_slides": render.final_outputs,
-        "slide_count": len(render.final_outputs),
-        "format_outputs": render.format_outputs,
-        "template_id": render.typesetting_layer.data.get("template_id"),
-        "style_family": render.typesetting_layer.data.get("style_family"),
-        "total_cost": render.total_cost,
-        "quality_gate": quality_result,
-        "status": "pending_review" if quality_result["requires_review"] else "completed"
+        "job_id": job_id,
+        "status": job["status"],
+        "result": job.get("result"),
+        "error": job.get("error"),
     }
 
 
