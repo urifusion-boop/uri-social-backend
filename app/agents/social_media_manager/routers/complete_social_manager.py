@@ -334,6 +334,14 @@ async def generate_content(
     user_id = ctx["user_id"]
     active_brand_id = ctx["brand_id"]
 
+    print(
+        f"🖼️📥 [REF-IMG TRACE] incoming request: post_type={request.post_type!r} "
+        f"num_slides={request.num_slides!r} "
+        f"reference_image={'<set, len=' + str(len(request.reference_image)) + '>' if request.reference_image else None} "
+        f"reference_images_count={len(request.reference_images) if request.reference_images else 0} "
+        f"slide_image_map={request.slide_image_map!r}"
+    )
+
     try:
         # ==================== PRD 7.2 & 8: Credit Check ====================
         # Check trial credits first, then paid credits
@@ -445,6 +453,7 @@ async def generate_content(
         ref_images: List[str] = request.reference_images or (
             [request.reference_image] if request.reference_image else []
         )
+        print(f"🖼️📥 [REF-IMG TRACE] resolved ref_images_count={len(ref_images)}")
 
         def _slide_reference_image(slide_index: int) -> Optional[str]:
             """Which single reference image (if any) a given carousel slide should use.
@@ -452,15 +461,21 @@ async def generate_content(
             (image 1 -> slide 1, image 2 -> slide 2, wrapping if there are fewer images
             than slides)."""
             if not ref_images:
+                print(f"🖼️📥 [REF-IMG TRACE] slide {slide_index}: no ref_images available -> None")
                 return None
             if request.slide_image_map is not None and slide_index < len(request.slide_image_map):
                 img_idx = request.slide_image_map[slide_index]
                 if img_idx is None:
+                    print(f"🖼️📥 [REF-IMG TRACE] slide {slide_index}: slide_image_map explicitly maps to None")
                     return None
                 if 0 <= img_idx < len(ref_images):
+                    print(f"🖼️📥 [REF-IMG TRACE] slide {slide_index}: slide_image_map -> image #{img_idx}")
                     return ref_images[img_idx]
+                print(f"🖼️📥 [REF-IMG TRACE] slide {slide_index}: slide_image_map index {img_idx} out of range -> None")
                 return None
-            return ref_images[slide_index % len(ref_images)]
+            picked = slide_index % len(ref_images)
+            print(f"🖼️📥 [REF-IMG TRACE] slide {slide_index}: auto-cycle -> image #{picked}")
+            return ref_images[picked]
 
         if post_type == "carousel":
             from ..services.carousel_generation_service import CarouselGenerationService
@@ -4680,6 +4695,11 @@ async def _generate_image_bg(
     import re
     import os
     import base64
+
+    print(
+        f"🖼️📥 [REF-IMG TRACE] _generate_image_bg entry: draft={draft_id[:12]} post_type={post_type} "
+        f"slide_index={slide_index} reference_image={'<set, len=' + str(len(reference_image)) + '>' if reference_image else None}"
+    )
 
     try:
         from app.agents.social_media_manager.services.style_library import pick_next_style
