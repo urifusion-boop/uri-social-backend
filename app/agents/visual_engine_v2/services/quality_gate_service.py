@@ -228,7 +228,9 @@ class QualityGateService:
 
     async def approve_render(self, review_queue_id: str, reviewer_notes: Optional[str] = None) -> bool:
         """
-        Manually approve a render from review queue.
+        Manually approve a render from review queue. Also flips the underlying
+        render document's own status — this is what a publish step actually
+        gates on, not the review-queue entry (which is just a UI worklist).
 
         Args:
             review_queue_id: Review queue item ID
@@ -237,26 +239,38 @@ class QualityGateService:
         Returns:
             True if approved successfully
         """
+        queue_item = await self.db["visual_engine_review_queue_v2"].find_one(
+            {"_id": ObjectId(review_queue_id)}
+        )
+        if not queue_item:
+            return False
+
+        now = datetime.utcnow()
         result = await self.db["visual_engine_review_queue_v2"].update_one(
             {"_id": ObjectId(review_queue_id)},
             {
                 "$set": {
                     "status": "approved",
-                    "reviewed_at": datetime.utcnow(),
+                    "reviewed_at": now,
                     "reviewer_notes": reviewer_notes
                 }
             }
         )
 
         if result.modified_count > 0:
-            print(f"✅ Review approved: {review_queue_id}")
+            await self.db["visual_engine_renders_v2"].update_one(
+                {"_id": queue_item["render_id"]},
+                {"$set": {"status": "approved", "reviewed_at": now}}
+            )
+            print(f"✅ Review approved: {review_queue_id} (render {queue_item['render_id']})")
             return True
 
         return False
 
     async def reject_render(self, review_queue_id: str, reviewer_notes: Optional[str] = None) -> bool:
         """
-        Manually reject a render from review queue.
+        Manually reject a render from review queue. Also flips the underlying
+        render document's own status so a publish step can never act on it.
 
         Args:
             review_queue_id: Review queue item ID
@@ -265,19 +279,30 @@ class QualityGateService:
         Returns:
             True if rejected successfully
         """
+        queue_item = await self.db["visual_engine_review_queue_v2"].find_one(
+            {"_id": ObjectId(review_queue_id)}
+        )
+        if not queue_item:
+            return False
+
+        now = datetime.utcnow()
         result = await self.db["visual_engine_review_queue_v2"].update_one(
             {"_id": ObjectId(review_queue_id)},
             {
                 "$set": {
                     "status": "rejected",
-                    "reviewed_at": datetime.utcnow(),
+                    "reviewed_at": now,
                     "reviewer_notes": reviewer_notes
                 }
             }
         )
 
         if result.modified_count > 0:
-            print(f"❌ Review rejected: {review_queue_id}")
+            await self.db["visual_engine_renders_v2"].update_one(
+                {"_id": queue_item["render_id"]},
+                {"$set": {"status": "rejected", "reviewed_at": now}}
+            )
+            print(f"❌ Review rejected: {review_queue_id} (render {queue_item['render_id']})")
             return True
 
         return False
