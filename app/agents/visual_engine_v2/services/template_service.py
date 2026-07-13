@@ -102,6 +102,40 @@ class TemplateService:
             print(f"❌ Orshot API error: {e}")
             raise TemplateRenderError(f"Orshot API failed: {e}")
 
+    # Our internal fields that are image URLs rather than text — everything
+    # else in a slot dict is treated as a Placid text layer. Generic across
+    # templates since these names are fixed by our own compositor code
+    # (brand_compositor_service.py), not by any individual template.
+    PLACID_IMAGE_FIELDS = {
+        "background_image_url", "logo_url", "product_image",
+        "customer_image", "icon_or_image",
+    }
+
+    @staticmethod
+    def _build_placid_layers(template_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Placid's real payload shape (verified against placid.app/docs/2.0/rest/images,
+        not guessed): each layer is a typed object, not a bare value —
+        {"title": {"text": "..."}} for text, {"img": {"image": "url"}} for images.
+        Translate our vocabulary to this template's real Placid layer names via
+        `placid_field_mapping` (same opt-in-only convention as Orshot's
+        `field_mapping` — templates whose designer used our exact names need
+        no entry at all), then wrap each value by its actual type.
+        """
+        template_config = get_template_config(template_id)
+        field_mapping = template_config.get("placid_field_mapping") or {}
+
+        layers: Dict[str, Any] = {}
+        for our_key, value in data.items():
+            if not value:
+                continue
+            placid_key = field_mapping.get(our_key, our_key)
+            if our_key in TemplateService.PLACID_IMAGE_FIELDS:
+                layers[placid_key] = {"image": value}
+            else:
+                layers[placid_key] = {"text": value}
+        return layers
+
     @staticmethod
     async def render_via_placid(
         template_id: str,
@@ -109,15 +143,22 @@ class TemplateService:
         format: str = "1:1"
     ) -> str:
         """
-        Render via Placid API (fallback vendor).
+        Render via Placid API — verified against placid.app/docs/2.0/rest/images
+        (the earlier version of this function was an unverified guess and was
+        wrong on two counts, corrected here):
 
-        Unlike render_via_orshot, this endpoint/payload shape has NOT been
-        verified against Placid's real docs (Orshot's was verified by hand and
-        was wrong — /v1/render didn't exist). Treat this as equally unverified
-        until someone checks it the same way, especially since Placid isn't
-        even configured/enabled yet (no PLACID_API_KEY set anywhere).
+        1. Layer values are typed objects, not bare strings — see
+           _build_placid_layers.
+        2. Image creation is ASYNCHRONOUS by default: POST /images returns
+           immediately with status="queued", image_url=null, and a
+           polling_url — the real image only exists once that polling_url
+           reports status="finished". There is no synchronous variant used
+           here (Placid's own docs warn create_now=true "may fail under
+           load"), so this polls politely instead, same reasoning as why our
+           own /v2 endpoints moved to a background-job pattern rather than
+           holding a connection open.
 
-        Note: Placid doesn't support carousel in single call
+        Note: Placid doesn't support carousel in a single call.
         """
         if not VendorConfig.is_placid_available():
             raise TemplateRenderError("Placid not configured")
@@ -128,10 +169,9 @@ class TemplateService:
         if not placid_template_id:
             raise TemplateRenderError(f"Template {template_id} not configured in Placid")
 
-        # Build Placid API payload
         payload = {
             "template_uuid": placid_template_id,
-            "layers": data,  # Placid uses "layers" instead of "data"
+            "layers": TemplateService._build_placid_layers(template_id, data),
         }
 
         headers = {
@@ -147,15 +187,31 @@ class TemplateService:
                     headers=headers
                 )
                 response.raise_for_status()
-
                 result = response.json()
-                render_url = result.get("image_url")
 
-                if not render_url:
-                    raise TemplateRenderError(f"Placid returned no URL: {result}")
+                if result.get("status") == "finished" and result.get("image_url"):
+                    print(f"✅ Placid render completed (sync): {result['image_url']}")
+                    return result["image_url"]
 
-                print(f"✅ Placid render completed: {render_url}")
-                return render_url
+                polling_url = result.get("polling_url")
+                if not polling_url:
+                    raise TemplateRenderError(f"Placid returned no polling_url: {result}")
+
+                # ~30s ceiling at 2s intervals — matches the retry-with-backoff
+                # spirit of PRD Section 12 without holding this open forever.
+                for _ in range(15):
+                    await asyncio.sleep(2)
+                    poll_response = await client.get(polling_url, headers=headers)
+                    poll_response.raise_for_status()
+                    poll_result = poll_response.json()
+
+                    if poll_result.get("status") == "finished" and poll_result.get("image_url"):
+                        print(f"✅ Placid render completed (polled): {poll_result['image_url']}")
+                        return poll_result["image_url"]
+                    if poll_result.get("status") == "error":
+                        raise TemplateRenderError(f"Placid render failed: {poll_result}")
+
+                raise TemplateRenderError("Placid render timed out waiting for completion")
 
         except httpx.HTTPError as e:
             print(f"❌ Placid API error: {e}")
@@ -190,23 +246,44 @@ class TemplateService:
         format: str = "1:1"
     ) -> str:
         """
-        Render with automatic fallback
+        Render with automatic fallback.
 
-        PRD Section 12: Try Orshot, fall back to Placid if down
+        PRD Section 12: Try Orshot, fall back to Placid if down — this is the
+        default ("auto") behavior and is untouched. VendorConfig.PREFERRED_VENDOR
+        is a manual override (VISUAL_ENGINE_PREFERRED_VENDOR env var) for
+        A/B-testing template-authoring experience: set to "placid" to force
+        every render through Placid only, with no Orshot attempt and no
+        fallback either way, so a failure is visible rather than silently
+        masked by the other vendor.
+
+        Each vendor gets `data` in our own raw vocabulary, not a shared
+        pre-mapped dict — Orshot's and Placid's field name/shape translation
+        are unrelated to each other (_apply_field_mapping vs
+        _build_placid_layers), so mapping for one is meaningless input to
+        the other. Previously this fell back to Placid using Orshot's
+        already-mapped dict, which would have sent Placid nonsense field
+        names on every real fallback.
         """
-        mapped_data = TemplateService._apply_field_mapping(template_id, data)
+        preferred = VendorConfig.get_preferred_vendor()
 
-        # Try primary vendor (Orshot)
+        if preferred == "placid":
+            return await TemplateService.render_via_placid(template_id, data, format)
+
+        if preferred == "orshot":
+            mapped_data = TemplateService._apply_field_mapping(template_id, data)
+            return await TemplateService.render_via_orshot(template_id, mapped_data, format)
+
+        # "auto": Orshot first, Placid fallback — default, unchanged behavior.
         if VendorConfig.is_orshot_available():
             try:
+                mapped_data = TemplateService._apply_field_mapping(template_id, data)
                 return await TemplateService.render_via_orshot(template_id, mapped_data, format)
             except TemplateRenderError as e:
                 print(f"⚠️ Orshot failed, trying fallback: {e}")
 
-        # Fall back to Placid
         if VendorConfig.is_placid_available():
             try:
-                return await TemplateService.render_via_placid(template_id, mapped_data, format)
+                return await TemplateService.render_via_placid(template_id, data, format)
             except TemplateRenderError as e:
                 print(f"❌ Placid fallback also failed: {e}")
                 raise
