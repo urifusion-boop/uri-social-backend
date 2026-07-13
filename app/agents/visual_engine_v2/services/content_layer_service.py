@@ -2,8 +2,8 @@
 Content Layer Service - Visual Engine V2
 AI text generation wrapper for Layer 1
 
-PRD Section 7: Content Layer
-- Generates headline, subtext, CTA
+PRD Section 7 / Section 3: Content Layer
+- Generates headline, subhead, promo (sale/product posts only), CTA
 - Can reuse existing V1 content generation logic
 - Wraps output in LayerData format
 """
@@ -117,6 +117,12 @@ class ContentLayerService:
         }
         length_guide = length_guides.get(platform, length_guides["instagram"])
 
+        # PRD Section 6: promo (e.g. "CODE: WEEKEND20") only makes sense for
+        # sale/product posts — never invented for announcement/educational/testimonial.
+        wants_promo = post_intent in ("sale", "product")
+        promo_line = "\nPROMO: [A short promo code or offer line, e.g. \"CODE: WEEKEND20\" — omit the brackets]" if wants_promo else ""
+        promo_requirement = "\n- PROMO must be a real, usable code/offer string, not a placeholder" if wants_promo else ""
+
         prompt = f"""Generate structured social media content for {brand_name} ({industry}).
 
 Content idea: {seed_content}
@@ -125,21 +131,21 @@ Post intent: {post_intent}
 Brand voice: {', '.join(voice_tone)}
 Platform: {platform}
 
-Generate THREE components in this EXACT format:
+Generate the following components in this EXACT format:
 
 HEADLINE: [Short, attention-grabbing opener - {length_guide.split('.')[0]}]
-SUBTEXT: [Supporting detail or value prop - {length_guide.split('.')[1]}]
+SUBTEXT: [Supporting detail or value prop - {length_guide.split('.')[1]}]{promo_line}
 CTA: [Clear call to action - 2-4 words]
 
 Requirements:
 - Headline should hook attention immediately
 - Subtext should reinforce the headline with specifics
-- CTA should be action-oriented
+- CTA should be action-oriented{promo_requirement}
 - Match the brand voice: {', '.join(voice_tone)}
 - Sound human, not AI-generated
 - No hashtags, no emojis (those come later)
 
-Output ONLY the three lines above. No explanations."""
+Output ONLY the lines above, in order. No explanations."""
 
         return prompt
 
@@ -150,6 +156,7 @@ Output ONLY the three lines above. No explanations."""
         Expected format:
         HEADLINE: ...
         SUBTEXT: ...
+        PROMO: ... (sale/product posts only)
         CTA: ...
         """
         lines = content_text.strip().split("\n")
@@ -157,6 +164,7 @@ Output ONLY the three lines above. No explanations."""
         content_data = {
             "headline": "",
             "subtext": "",
+            "promo": "",
             "cta": ""
         }
 
@@ -166,14 +174,17 @@ Output ONLY the three lines above. No explanations."""
                 content_data["headline"] = line.replace("HEADLINE:", "").strip()
             elif line.startswith("SUBTEXT:"):
                 content_data["subtext"] = line.replace("SUBTEXT:", "").strip()
+            elif line.startswith("PROMO:"):
+                content_data["promo"] = line.replace("PROMO:", "").strip()
             elif line.startswith("CTA:"):
                 content_data["cta"] = line.replace("CTA:", "").strip()
 
-        # Fallback: if parsing fails, use first 3 lines
+        # Fallback: if parsing fails entirely, use the first non-empty lines in order
         if not content_data["headline"]:
-            content_data["headline"] = lines[0] if len(lines) > 0 else "Check this out"
-            content_data["subtext"] = lines[1] if len(lines) > 1 else ""
-            content_data["cta"] = lines[2] if len(lines) > 2 else "Learn more"
+            non_empty = [l.strip() for l in lines if l.strip()]
+            content_data["headline"] = non_empty[0] if len(non_empty) > 0 else "Check this out"
+            content_data["subtext"] = non_empty[1] if len(non_empty) > 1 else ""
+            content_data["cta"] = non_empty[2] if len(non_empty) > 2 else "Learn more"
 
         return content_data
 

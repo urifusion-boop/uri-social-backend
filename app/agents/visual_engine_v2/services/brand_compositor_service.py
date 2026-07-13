@@ -18,7 +18,9 @@ from app.agents.visual_engine_v2.models.visual_engine_models import (
     LayerData
 )
 from app.agents.visual_engine_v2.services.template_service import TemplateService
-from app.agents.visual_engine_v2.config.template_config import TemplateConfig
+from app.agents.visual_engine_v2.services.image_path_service import ImagePathService
+from app.agents.visual_engine_v2.config.template_config import select_template
+from app.agents.visual_engine_v2.config.vendor_config import VendorConfig
 from app.utils.cloudinary_upload import upload_bytes
 import httpx
 
@@ -32,7 +34,6 @@ class BrandCompositorService:
     def __init__(self, db):
         self.db = db
         self.template_service = TemplateService()
-        self.template_config = TemplateConfig()
 
     async def compose_final_render(
         self,
@@ -41,35 +42,64 @@ class BrandCompositorService:
         content_layer: LayerData,
         imagery_layer: LayerData,
         format: str = "1:1",
+        formats: Optional[List[str]] = None,
         carousel_count: int = 1
     ) -> VisualEngineRenderV2:
         """
         Main composition pipeline: 4-layer → Final render.
 
+        PRD Section 14: one content+image plan, rendered into every requested
+        aspect-ratio format — the marginal cost of an extra format is just the
+        extra render, not a new content/image generation.
+
         Args:
             user_id: User ID
             brand_profile_id: Brand profile ID
-            content_layer: Layer 1 (AI text: headline, subtext, cta)
+            content_layer: Layer 1 (AI text: headline, subhead, promo, cta)
             imagery_layer: Layer 2 (imagery URL + metadata)
-            format: "1:1", "4:5", or "9:16"
+            format: single aspect ratio, used when `formats` isn't given
+            formats: one or more aspect ratios ("1:1", "4:5", "9:16") to render
+                the same content+image plan into
             carousel_count: Number of carousel slides (1 = single post)
 
         Returns:
             VisualEngineRenderV2 document ready to save to DB
         """
-        print(f"🎬 Starting 4-layer composition (format={format}, carousel={carousel_count})")
+        target_formats = formats or [format]
+        print(f"🎬 Starting 4-layer composition (formats={target_formats}, carousel={carousel_count})")
 
-        # Layer 3: Extract brand context from database
+        # Layer 3: Extract brand context from database (shared across every format)
         brand_layer = await self._extract_brand_layer(brand_profile_id)
 
-        # Layer 4: Select template and render
-        typesetting_layer = await self._render_typesetting_layer(
-            content_layer=content_layer,
-            imagery_layer=imagery_layer,
-            brand_layer=brand_layer,
-            format=format,
-            carousel_count=carousel_count
+        # Layer 4: select template + render, once per requested format
+        typesetting_layers: Dict[str, LayerData] = {}
+        for fmt in target_formats:
+            typesetting_layers[fmt] = await self._render_typesetting_layer(
+                content_layer=content_layer,
+                imagery_layer=imagery_layer,
+                brand_layer=brand_layer,
+                format=fmt,
+                carousel_count=carousel_count
+            )
+
+        primary_format = target_formats[0]
+        primary_layer = typesetting_layers[primary_format]
+        format_outputs = {fmt: layer.data.get("rendered_urls", []) for fmt, layer in typesetting_layers.items()}
+
+        # PRD Section 12: surface failures rather than hide them — a fallback that
+        # succeeded still needs a human to look at it, whether it came from the
+        # imagery step (Path A retry exhausted) or the render step (both vendors down),
+        # in any of the requested formats.
+        needs_attention = imagery_layer.metadata.get("needs_attention", False) or any(
+            layer.metadata.get("needs_attention", False) for layer in typesetting_layers.values()
         )
+        error_message = imagery_layer.metadata.get("error_message") or next(
+            (layer.metadata.get("error_message") for layer in typesetting_layers.values() if layer.metadata.get("error_message")),
+            None
+        )
+
+        total_cost = content_layer.metadata.get("cost", 0.0) + imagery_layer.metadata.get("cost", 0.0)
+        total_cost += sum(layer.metadata.get("cost", 0.0) for layer in typesetting_layers.values())
 
         # Build final render document
         render = VisualEngineRenderV2(
@@ -78,14 +108,18 @@ class BrandCompositorService:
             content_layer=content_layer,
             imagery_layer=imagery_layer,
             brand_layer=brand_layer,
-            typesetting_layer=typesetting_layer,
-            final_outputs=typesetting_layer.rendered_urls,
+            typesetting_layer=primary_layer,
+            final_outputs=format_outputs[primary_format],
+            format_outputs=format_outputs,
             status="completed",
             created_at=datetime.utcnow(),
-            total_cost=self._calculate_total_cost(content_layer, imagery_layer, typesetting_layer)
+            total_cost=round(total_cost, 4),
+            needs_attention=needs_attention,
+            error_message=error_message,
+            used_fallback_background=any(layer.metadata.get("used_fallback_background", False) for layer in typesetting_layers.values())
         )
 
-        print(f"✅ 4-layer composition complete: {len(render.final_outputs)} output(s)")
+        print(f"✅ 4-layer composition complete: {len(target_formats)} format(s), {len(render.final_outputs)} output(s) in primary format")
         return render
 
     async def _extract_brand_layer(self, brand_profile_id: str) -> LayerData:
@@ -164,7 +198,7 @@ class BrandCompositorService:
         image_path = imagery_layer.metadata.get("path", "both")  # "A", "B", or "both"
 
         # Select template
-        template_id = self.template_config.select_template(
+        template_id = select_template(
             style_family=style_family,
             post_intent=post_intent,
             format=format,
@@ -178,6 +212,8 @@ class BrandCompositorService:
             # Layer 1: Content
             "headline": content_data.get("headline", ""),
             "subtext": content_data.get("subtext", ""),
+            "subhead": content_data.get("subtext", ""),  # template slots use "subhead" (PRD naming)
+            "promo": content_data.get("promo", ""),
             "cta": content_data.get("cta", ""),
 
             # Layer 2: Imagery
@@ -193,40 +229,65 @@ class BrandCompositorService:
             "secondary_font": brand_data.get("secondary_font", "Inter"),
         }
 
-        # Render based on carousel count
-        if carousel_count == 1:
-            # Single post
-            rendered_url = await self.template_service.render_with_fallback(
-                template_id=template_id,
-                data=template_data,
-                format=format
-            )
-            rendered_urls = [rendered_url]
-            print(f"✓ Single render: {rendered_url[:80]}...")
+        # Render based on carousel count. PRD Section 12: if the render vendor(s) are
+        # down or fail outright, fall back to a brand-colored placeholder per slide
+        # rather than raising — a delayed/degraded post beats a dropped job.
+        needs_attention = False
+        error_message = None
+        try:
+            if carousel_count == 1:
+                # Single post
+                rendered_url = await self.template_service.render_with_fallback(
+                    template_id=template_id,
+                    data=template_data,
+                    format=format
+                )
+                rendered_urls = [rendered_url]
+                print(f"✓ Single render: {rendered_url[:80]}...")
 
-        else:
-            # Carousel (multi-slide)
-            # Split content into slides (e.g., headline → slide 1, subtext → slide 2, etc.)
-            slides_data = self._prepare_carousel_slides(template_data, carousel_count)
+            else:
+                # Carousel (multi-slide)
+                # Split content into slides (e.g., headline → slide 1, subtext → slide 2, etc.)
+                slides_data = self._prepare_carousel_slides(template_data, carousel_count)
 
-            rendered_urls = await self.template_service.render_carousel(
-                template_id=template_id,
-                slides_data=slides_data,
-                format=format
-            )
-            print(f"✓ Carousel rendered: {len(rendered_urls)} slides")
+                rendered_urls = await self.template_service.render_carousel(
+                    template_id=template_id,
+                    slides_data=slides_data,
+                    format=format
+                )
+                print(f"✓ Carousel rendered: {len(rendered_urls)} slides")
+        except Exception as e:
+            print(f"⚠️ Template render failed on all vendors, falling back to brand-colored placeholder(s): {e}")
+            needs_attention = True
+            error_message = f"Template render failed: {e}"
+            rendered_urls = [
+                ImagePathService.generate_placeholder_image(
+                    brand_data.get("primary_color"), format=format
+                )["imagery_url"]
+                for _ in range(max(carousel_count, 1))
+            ]
+
+        # PRD Section 11: cost model — a fallback placeholder never actually reached
+        # a paid vendor, so it costs nothing; a real render costs once per output image.
+        render_cost = 0.0 if needs_attention else VendorConfig().cost_model.template_render_cost * len(rendered_urls)
 
         return LayerData(
             layer_type="typesetting",
             data={
                 "template_id": template_id,
+                "style_family": style_family,
+                "post_intent": post_intent,
                 "rendered_urls": rendered_urls,
                 "format": format,
                 "carousel_count": carousel_count
             },
             metadata={
                 "template_vendor": "orshot",  # or "placid" if fallback
-                "render_timestamp": datetime.utcnow().isoformat()
+                "render_timestamp": datetime.utcnow().isoformat(),
+                "needs_attention": needs_attention,
+                "error_message": error_message,
+                "used_fallback_background": needs_attention,
+                "cost": round(render_cost, 4)
             }
         )
 
@@ -245,29 +306,35 @@ class BrandCompositorService:
         """
         slides = []
 
-        # Slide 1: Headline
+        # Slide 1: Headline (hook)
         slides.append({
             **base_template_data,
             "headline": base_template_data["headline"],
             "subtext": "",
+            "subhead": "",
+            "promo": "",
             "cta": ""
         })
 
-        # Slide 2: Subtext (if carousel_count >= 2)
+        # Slide 2: Subtext / value (if carousel_count >= 2)
         if carousel_count >= 2:
             slides.append({
                 **base_template_data,
                 "headline": "",
                 "subtext": base_template_data["subtext"],
+                "subhead": base_template_data["subtext"],
+                "promo": "",
                 "cta": ""
             })
 
-        # Slide 3+: CTA (if carousel_count >= 3)
+        # Slide 3+: CTA + promo, the closing slide (if carousel_count >= 3)
         if carousel_count >= 3:
             slides.append({
                 **base_template_data,
                 "headline": "",
                 "subtext": "",
+                "subhead": "",
+                "promo": base_template_data.get("promo", ""),
                 "cta": base_template_data["cta"]
             })
 
@@ -276,25 +343,3 @@ class BrandCompositorService:
             slides.append(slides[-1])
 
         return slides[:carousel_count]
-
-    def _calculate_total_cost(
-        self,
-        content_layer: LayerData,
-        imagery_layer: LayerData,
-        typesetting_layer: LayerData
-    ) -> float:
-        """
-        Calculate total cost from all layers.
-        """
-        total = 0.0
-
-        # Layer 1: Content cost
-        total += content_layer.metadata.get("cost", 0.0)
-
-        # Layer 2: Imagery cost
-        total += imagery_layer.metadata.get("cost", 0.0)
-
-        # Layer 4: Typesetting cost (from template service)
-        total += typesetting_layer.metadata.get("cost", 0.0)
-
-        return round(total, 4)

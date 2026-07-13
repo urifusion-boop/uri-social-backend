@@ -6,6 +6,22 @@ Visual Content Engine V2 - Pydantic Models
 from typing import Optional, List, Dict, Any, Literal
 from pydantic import BaseModel, Field
 from datetime import datetime
+from uuid import uuid4
+
+
+# ============================================================================
+# LAYER WRAPPER
+# ============================================================================
+
+class LayerData(BaseModel):
+    """
+    Generic wrapper for one layer's output: the layer's own data plus
+    metadata about how it was produced (cost, model used, timestamps, etc).
+    Used for content/imagery/brand/typesetting layers alike.
+    """
+    layer_type: str
+    data: Dict[str, Any] = Field(default_factory=dict)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
 # ============================================================================
@@ -17,41 +33,49 @@ class ContentPlanRequest(BaseModel):
     seed_content: str = Field(..., description="Topic or brief for content")
     platforms: List[str] = Field(..., description="Target platforms")
     post_intent: str = Field(..., description="sale, product, announcement, testimonial, educational")
-    brand_id: Optional[str] = Field(None, description="Brand ID for context")
+    brand_profile_id: Optional[str] = Field(None, description="Brand profile ID for context")
     carousel_slides: int = Field(1, description="Number of slides (1 for single post)")
 
 
 class GenerateImageRequest(BaseModel):
     """Path A: Generate imagery-only via GPT Image 2"""
-    content_brief: str = Field(..., description="What to generate")
+    content_plan: str = Field(..., description="What to generate")
     negative_space: str = Field("left_third", description="Where to leave space for text")
-    size: str = Field("1024x1024", description="Image dimensions")
-    brand_id: Optional[str] = Field(None)
+    format: str = Field("1:1", description="Aspect ratio: 1:1, 4:5, or 9:16")
+    brand_profile_id: Optional[str] = Field(None)
 
 
 class UploadImageRequest(BaseModel):
     """Path B: Upload and clean user image"""
     image_url: str = Field(..., description="User's uploaded image URL")
     cleanup_level: Literal["none", "background_removal", "reframe", "ai_recomposite"] = "background_removal"
-    brand_id: Optional[str] = Field(None)
+    brand_profile_id: Optional[str] = Field(None)
 
 
 class RenderRequest(BaseModel):
     """4-layer compositor render request"""
+    brand_profile_id: str = Field(..., description="Brand profile to pull exact brand values from")
     content_layer: Dict[str, Any] = Field(..., description="headline, subhead, promo, cta")
     imagery_layer: Dict[str, Any] = Field(..., description="path, image_url, source")
-    brand_layer: Dict[str, Any] = Field(..., description="logo_url, primary_color, font")
-    template_layer: Dict[str, Any] = Field(..., description="template_id, format, style_family")
 
     # Options
-    formats: List[str] = Field(["1:1"], description="Aspect ratios to render")
+    format: str = Field("1:1", description="Aspect ratio to render")
+    formats: Optional[List[str]] = Field(
+        None, description="One or more aspect ratios to render (PRD Section 14 multi-format); overrides `format` when set"
+    )
     require_review: bool = Field(False, description="Force human review")
 
 
 class CarouselRenderRequest(BaseModel):
     """Multi-slide carousel render"""
-    slides: List[RenderRequest] = Field(..., description="Render request per slide")
-    brand_id: str = Field(..., description="Brand ID")
+    brand_profile_id: str = Field(..., description="Brand profile to pull exact brand values from")
+    content_layer: Dict[str, Any] = Field(..., description="headline, subhead, promo, cta")
+    imagery_layer: Dict[str, Any] = Field(..., description="path, image_url, source")
+    format: str = Field("1:1", description="Aspect ratio to render")
+    formats: Optional[List[str]] = Field(
+        None, description="One or more aspect ratios to render (PRD Section 14 multi-format); overrides `format` when set"
+    )
+    carousel_count: int = Field(3, ge=2, le=10, description="Number of slides, 2-10 per PRD Section 9")
 
 
 # ============================================================================
@@ -101,19 +125,20 @@ class RenderResponse(BaseModel):
 
 class VisualEngineRenderV2(BaseModel):
     """V2 render job stored in DB"""
-    id: str = Field(..., description="Unique render ID")
+    id: str = Field(default_factory=lambda: str(uuid4()), description="Unique render ID")
     user_id: str
-    brand_id: str
+    brand_profile_id: str
 
     # 4-layer data
-    content_layer: Dict[str, Any]  # {headline, subhead, promo, cta}
-    imagery_layer: Dict[str, Any]  # {path: "A"|"B", image_url, source}
-    brand_layer: Dict[str, Any]    # {logo_url, primary_color, font}
-    template_layer: Dict[str, Any] # {template_id, format, version, style_family}
+    content_layer: LayerData      # {headline, subhead, promo, cta}
+    imagery_layer: LayerData      # {path: "A"|"B", image_url, source}
+    brand_layer: LayerData        # {logo_url, primary_color, font}
+    typesetting_layer: LayerData  # {template_id, rendered_urls, format, carousel_count}
 
     # Output
-    final_render_urls: Dict[str, str] = Field(default_factory=dict)  # {format: url}
-    status: Literal["planning", "rendering", "review", "approved", "rejected", "published"] = "planning"
+    final_outputs: List[str] = Field(default_factory=list)  # rendered URL(s) in the primary format; 1 for single post, N for carousel slides
+    format_outputs: Dict[str, List[str]] = Field(default_factory=dict)  # PRD Section 14: every requested aspect-ratio format, keyed by "1:1"/"4:5"/"9:16"
+    status: Literal["planning", "rendering", "review", "approved", "rejected", "published", "completed"] = "planning"
 
     # Quality gate
     confidence_score: float = 0.0
@@ -122,9 +147,18 @@ class VisualEngineRenderV2(BaseModel):
     reviewed_by: Optional[str] = None
     reviewed_at: Optional[datetime] = None
 
+    # PRD Section 13: tiered review model
+    review_tier: Literal["auto", "soft", "mandatory"] = "auto"
+    review_expires_at: Optional[datetime] = None  # soft tier: auto-approves if not rejected by this time
+
+    # PRD Section 12: failure handling — never post a broken asset, never fail silently
+    needs_attention: bool = False
+    error_message: Optional[str] = None
+    used_fallback_background: bool = False  # true if a brand-colored placeholder replaced a failed render
+
     # Cost tracking
     cost_breakdown: Dict[str, float] = Field(default_factory=dict)
-    total_cost_usd: float = 0.0
+    total_cost: float = 0.0
 
     # Metadata
     post_intent: str = Field("general", description="sale, product, announcement, etc")
@@ -167,24 +201,26 @@ class VisualEngineTemplateV2(BaseModel):
 
 class VisualEngineReviewQueueV2(BaseModel):
     """Review queue entry"""
-    queue_id: str
+    queue_id: str = Field(default_factory=lambda: str(uuid4()))
     render_id: str
     user_id: str
-    brand_id: str
+    brand_profile_id: str
+    review_tier: Literal["soft", "mandatory"] = "soft"
 
     # Why it needs review
-    review_reason: str
-    confidence_score: float
-    auto_flags: List[str] = Field(default_factory=list)  # ["incomplete_profile", "low_image_quality"]
+    review_reason: str = ""
+    quality_score: float
+    detected_issues: List[str] = Field(default_factory=list)  # ["incomplete_profile", "low_image_quality"]
 
     # Preview
-    preview_url: str
-    content_preview: Dict[str, Any]
+    preview_url: str = ""
+    content_preview: Dict[str, Any] = Field(default_factory=dict)
 
     # Status
     status: Literal["pending", "approved", "rejected"] = "pending"
     assigned_to: Optional[str] = None
     reviewed_at: Optional[datetime] = None
+    reviewer_notes: Optional[str] = None
 
     # Metadata
     created_at: datetime = Field(default_factory=datetime.utcnow)
