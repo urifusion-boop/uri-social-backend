@@ -29,12 +29,21 @@ class TemplateService:
         format: str = "1:1"
     ) -> str:
         """
-        Render via Orshot API.
+        Render via Orshot API — Studio templates (POST /v1/studio/render).
 
-        Verified against https://orshot.com/docs/api-reference/render-from-template —
-        the real endpoint is POST /v1/generate/images with a templateId/response/
-        modifications body; the /v1/render this originally called doesn't exist
-        (404, confirmed by hand) and was never actually reachable.
+        Our own templates (PRD Section 4.2: human-authored once per style, in
+        Orshot's Studio editor) are Studio templates, NOT Orshot's public
+        library templates — those are two genuinely separate endpoints, not
+        two names for the same thing:
+          - Library templates (Orshot's own pre-built ones, e.g. "website-screenshot"):
+            POST /v1/generate/images
+          - Studio templates (ours, numeric IDs like 14698):
+            POST /v1/studio/render
+        Using the library endpoint for a Studio template ID fails with a
+        confusingly generic "templateId not found" / "library template not
+        found" 400 — confirmed by hand against a real Studio template. Both
+        endpoints share the same request/response body shape otherwise
+        (templateId/response.{format,type}/modifications → data.content).
 
         Args:
             template_id: Our internal template_config.py entry to use
@@ -74,7 +83,7 @@ class TemplateService:
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.post(
-                    f"{VendorConfig.ORSHOT_API_URL}/generate/images",
+                    f"{VendorConfig.ORSHOT_API_URL}/studio/render",
                     json=payload,
                     headers=headers
                 )
@@ -153,6 +162,28 @@ class TemplateService:
             raise TemplateRenderError(f"Placid API failed: {e}")
 
     @staticmethod
+    def _apply_field_mapping(template_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Translate our abstract slot vocabulary (headline/subhead/promo/cta/...)
+        into whatever field names this specific template's designer actually
+        used in Orshot Studio. Templates are built independently of our code —
+        there's no reason to expect their field names to match ours, and no
+        need to require it. A template only needs a `field_mapping` entry in
+        template_config.py if its real fields differ from our vocabulary;
+        templates whose designer used our exact names need no mapping at all.
+        """
+        template_config = get_template_config(template_id)
+        field_mapping = template_config.get("field_mapping")
+        if not field_mapping:
+            return data
+
+        static_fields = template_config.get("static_fields", {})
+        return {
+            **{orshot_key: data.get(our_key, "") for our_key, orshot_key in field_mapping.items()},
+            **static_fields,
+        }
+
+    @staticmethod
     async def render_with_fallback(
         template_id: str,
         data: Dict[str, Any],
@@ -163,17 +194,19 @@ class TemplateService:
 
         PRD Section 12: Try Orshot, fall back to Placid if down
         """
+        mapped_data = TemplateService._apply_field_mapping(template_id, data)
+
         # Try primary vendor (Orshot)
         if VendorConfig.is_orshot_available():
             try:
-                return await TemplateService.render_via_orshot(template_id, data, format)
+                return await TemplateService.render_via_orshot(template_id, mapped_data, format)
             except TemplateRenderError as e:
                 print(f"⚠️ Orshot failed, trying fallback: {e}")
 
         # Fall back to Placid
         if VendorConfig.is_placid_available():
             try:
-                return await TemplateService.render_via_placid(template_id, data, format)
+                return await TemplateService.render_via_placid(template_id, mapped_data, format)
             except TemplateRenderError as e:
                 print(f"❌ Placid fallback also failed: {e}")
                 raise

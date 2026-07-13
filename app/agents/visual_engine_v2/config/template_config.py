@@ -78,7 +78,7 @@ TEMPLATE_LIBRARY: List[Dict] = [
         "format": "1:1",
         "post_intent": "announcement",
         "image_path": "path_a",  # Generated backgrounds work well
-        "orshot_template_id": None,
+        "orshot_template_id": "14698",  # Studio template (POST /v1/studio/render) — real fields differ from our vocabulary, see field_mapping
         "slots": {
             "background_image": "image",
             "headline": "text",
@@ -87,7 +87,21 @@ TEMPLATE_LIBRARY: List[Dict] = [
             "logo": "image",
             "brand_primary": "color",
             "brand_font": "font"
-        }
+        },
+        # This Studio template's actual field names (eyebrow/title_top/title_main/
+        # date/venue/host, an event-invitation layout) don't match our abstract
+        # vocabulary at all — proves the system doesn't require them to. Maps our
+        # key -> this template's real key; static_fields fills whatever's left.
+        "field_mapping": {
+            "promo": "eyebrow",
+            "subhead": "title_top",
+            "headline": "title_main",
+            "cta": "host",
+        },
+        "static_fields": {
+            "date": "",
+            "venue": "",
+        },
     },
 
     # Educational/Tips Templates
