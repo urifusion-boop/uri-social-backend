@@ -7440,3 +7440,140 @@ async def fix_fractional_credits(
     except Exception as e:
         print(f"❌ fix_fractional_credits error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Submagic Video Production ─────────────────────────────────────────────────
+
+@router.post("/submagic-produce")
+async def submagic_produce(
+    video: UploadFile = File(...),
+    template_name: str = Form("Sara"),
+    language: str = Form("en"),
+    remove_silence_pace: Optional[str] = Form(None),
+    magic_zooms: bool = Form(False),
+    magic_brolls: bool = Form(False),
+    clean_audio: bool = Form(False),
+    remove_bad_takes: bool = Form(False),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """Upload a video to Submagic for AI-powered captioning and editing."""
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    api_key = settings.SUBMAGIC_API_KEY
+    if not api_key:
+        raise HTTPException(status_code=503, detail="Submagic API key not configured")
+
+    from datetime import datetime, timezone
+    import uuid as _uuid
+    from app.agents.social_media_manager.services.video_production_service import _upload_to_cloudinary
+
+    video_bytes = await video.read()
+    if not video_bytes:
+        raise HTTPException(status_code=400, detail="Empty video file")
+
+    # Upload to Cloudinary to get a publicly accessible URL for Submagic
+    public_id = f"submagic-{_uuid.uuid4().hex[:12]}"
+    cloudinary_url = await _upload_to_cloudinary(video_bytes, public_id)
+    if not cloudinary_url:
+        raise HTTPException(status_code=502, detail="Could not upload video to storage")
+
+    import httpx as _httpx
+    payload: dict = {
+        "title": (video.filename or "Produced Video").rsplit(".", 1)[0],
+        "language": language,
+        "videoUrl": cloudinary_url,
+        "templateName": template_name,
+    }
+    if remove_silence_pace and remove_silence_pace != "off":
+        payload["removeSilencePace"] = remove_silence_pace
+    if magic_zooms:
+        payload["magicZooms"] = True
+    if magic_brolls:
+        payload["magicBrolls"] = True
+    if clean_audio:
+        payload["cleanAudio"] = True
+    if remove_bad_takes:
+        payload["removeBadTakes"] = True
+
+    try:
+        async with _httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                "https://api.submagic.co/v1/projects",
+                headers={"x-api-key": api_key, "Content-Type": "application/json"},
+                json=payload,
+            )
+            if resp.status_code != 201:
+                print(f"[Submagic] create error {resp.status_code}: {resp.text}", flush=True)
+                raise HTTPException(status_code=502, detail=f"Submagic error: {resp.text}")
+            project = resp.json()
+    except _httpx.RequestError as exc:
+        raise HTTPException(status_code=502, detail=f"Submagic unreachable: {exc}")
+
+    project_id = project["id"]
+    job_id = _uuid.uuid4().hex
+    now = datetime.now(timezone.utc).isoformat()
+
+    await db["submagic_jobs"].insert_one({
+        "job_id": job_id,
+        "project_id": project_id,
+        "user_id": user_id,
+        "status": "processing",
+        "template_name": template_name,
+        "created_at": now,
+    })
+
+    print(f"[Submagic] job {job_id} → project {project_id}", flush=True)
+    return UriResponse.get_single_data_response("submagic_job", {"job_id": job_id})
+
+
+@router.get("/submagic-job/{job_id}")
+async def get_submagic_job(
+    job_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """Poll a Submagic production job for status and output URL."""
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    job = await db["submagic_jobs"].find_one({"job_id": job_id, "user_id": user_id}, {"_id": 0})
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    api_key = settings.SUBMAGIC_API_KEY
+    if not api_key:
+        raise HTTPException(status_code=503, detail="Submagic API key not configured")
+
+    import httpx as _httpx
+    project_id = job["project_id"]
+
+    try:
+        async with _httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(
+                f"https://api.submagic.co/v1/projects/{project_id}",
+                headers={"x-api-key": api_key},
+            )
+            if resp.status_code != 200:
+                raise HTTPException(status_code=502, detail=f"Submagic error: {resp.text}")
+            project = resp.json()
+    except _httpx.RequestError as exc:
+        raise HTTPException(status_code=502, detail=f"Submagic unreachable: {exc}")
+
+    status = project.get("status", "processing")
+    output_url = project.get("downloadUrl") or project.get("directUrl")
+    failure_reason = project.get("failureReason")
+
+    await db["submagic_jobs"].update_one(
+        {"job_id": job_id},
+        {"$set": {"status": status, "output_url": output_url}},
+    )
+
+    return UriResponse.get_single_data_response("submagic_job", {
+        "status": status,
+        "output_url": output_url,
+        "failure_reason": failure_reason,
+    })
