@@ -136,6 +136,15 @@ class CostModel:
         return costs
 
 
+# VendorConfig and CostModel were always meant to be used together
+# (every call site does `self.vendor_config.cost_model.xxx`), but nothing
+# ever actually attached one to the other — VendorConfig().cost_model raised
+# AttributeError in production the moment any render path was actually
+# exercised live. Wired here, after both classes exist, rather than at
+# each of the 4 call sites that assumed it worked.
+VendorConfig.cost_model = CostModel()
+
+
 # ============================================================================
 # FEATURE FLAGS
 # ============================================================================
