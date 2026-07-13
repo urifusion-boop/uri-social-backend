@@ -25,9 +25,14 @@ class AIService:
 
     @staticmethod
     def build_ai_model(
-        messages: List[dict], model: str = "gpt-4o-mini", temperature: float = 0.7
+        messages: List[dict],
+        model: str = "gpt-4o-mini",
+        temperature: float = 0.7,
+        max_tokens: int = None,
     ):
-        return ChatModel(model=model, messages=messages, temperature=temperature)
+        return ChatModel(
+            model=model, messages=messages, temperature=temperature, max_tokens=max_tokens
+        )
 
     @staticmethod
     async def chat_completion(request: ChatModel):
