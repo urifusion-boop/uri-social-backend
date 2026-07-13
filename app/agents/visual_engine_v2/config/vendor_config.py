@@ -32,6 +32,18 @@ class VendorConfig:
     # Feature flags
     VISUAL_ENGINE_V2_ENABLED = os.getenv("VISUAL_ENGINE_V2_ENABLED", "true").lower() == "true"
 
+    # Manual A/B switch: force every render through one vendor only, bypassing
+    # the default Orshot-first-then-Placid-fallback behavior, so the two
+    # template-authoring experiences can be compared directly. Unset (or any
+    # value other than "orshot"/"placid") leaves existing behavior untouched.
+    PREFERRED_VENDOR = os.getenv("VISUAL_ENGINE_PREFERRED_VENDOR", "auto").lower()
+
+    @classmethod
+    def get_preferred_vendor(cls) -> str:
+        if cls.PREFERRED_VENDOR in ("orshot", "placid"):
+            return cls.PREFERRED_VENDOR
+        return "auto"
+
     @classmethod
     def is_orshot_available(cls) -> bool:
         """Check if Orshot is configured and enabled"""
