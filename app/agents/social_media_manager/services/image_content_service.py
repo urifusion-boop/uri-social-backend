@@ -1084,9 +1084,22 @@ Follow these rules precisely for every image. No exceptions.
                 dynamic_motion = ImageContentService._get_dynamic_motion_detail(industry)
                 text_styling = ImageContentService._get_text_styling_detail(industry)
 
+                # The zone descriptions below give the model very specific spatial
+                # instructions (fill this whole side with text). Without an explicit
+                # carve-out, that competes with — and tends to win over — the more
+                # generic logo-reservation rule stated earlier in the prompt, so the
+                # corner holding the logo needs to be named again, right here.
+                logo_corner_note = ""
+                if logo_position:
+                    logo_corner_note = (
+                        f"\n- EXCEPTION: the {pos_text} corner is reserved for the brand logo "
+                        f"({logo_reserve_size}) — keep that corner completely empty; start the "
+                        f"headline text outside of it, not inside it"
+                    )
+
                 if composition_mode == "editorial":
                     # Editorial/Two-Zone mode for minimal/clean styles
-                    composition_block = """
+                    composition_block = f"""
 === EDITORIAL COMPOSITION ===
 Create a professional social media product graphic with TWO distinct zones:
 
@@ -1102,7 +1115,7 @@ TEXT ZONE (45% of frame, opposite side of product):
 - All text placed in this zone: headline, subtext, CTA
 - Text must be in the NEGATIVE SPACE beside the product
 - NO text overlapping or on top of the product
-- 20px minimum gap between any text and the product
+- 20px minimum gap between any text and the product{logo_corner_note}
 
 CRITICAL RULES:
 - The product itself is SACRED - never distort, never regenerate, never modify
@@ -1140,7 +1153,7 @@ TEXT:
 - {text_styling}
 - NEVER overlaps product label
 - Max 3 elements: headline (5 words), subtext (optional), CTA
-- CTA at the bottom, integrated into the scene
+- CTA at the bottom, integrated into the scene{logo_corner_note}
 
 DEPTH AND ATMOSPHERE:
 - THREE depth layers: soft foreground, sharp product, atmospheric bg
