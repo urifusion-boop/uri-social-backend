@@ -540,6 +540,27 @@ async def generate_content(
                 return None
             return ref_images[slide_index % len(ref_images)]
 
+        # ── Reference images: normalise to a list, keep old single-image field working ──
+        ref_images: List[str] = request.reference_images or (
+            [request.reference_image] if request.reference_image else []
+        )
+
+        def _slide_reference_image(slide_index: int) -> Optional[str]:
+            """Which single reference image (if any) a given carousel slide should use.
+            Explicit slide_image_map wins; otherwise images cycle 1:1 across slides
+            (image 1 -> slide 1, image 2 -> slide 2, wrapping if there are fewer images
+            than slides)."""
+            if not ref_images:
+                return None
+            if request.slide_image_map is not None and slide_index < len(request.slide_image_map):
+                img_idx = request.slide_image_map[slide_index]
+                if img_idx is None:
+                    return None
+                if 0 <= img_idx < len(ref_images):
+                    return ref_images[img_idx]
+                return None
+            return ref_images[slide_index % len(ref_images)]
+
         if post_type == "carousel":
             from ..services.carousel_generation_service import CarouselGenerationService
             result = await CarouselGenerationService.generate_multi_platform(
