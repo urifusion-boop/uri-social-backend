@@ -83,7 +83,7 @@ class ImagePathService:
 
                 img_bytes = base64.b64decode(response.data[0].b64_json)
 
-                cloudinary_url = upload_bytes(
+                cloudinary_url = await upload_bytes(
                     img_bytes,
                     folder="visual_engine_v2/imagery",
                     resource_type="image"
@@ -105,7 +105,7 @@ class ImagePathService:
         raise ImageGenerationError(f"Path A generation failed after retry: {last_error}")
 
     @staticmethod
-    def generate_placeholder_image(brand_primary: Optional[str], format: str = "1:1") -> Dict[str, str]:
+    async def generate_placeholder_image(brand_primary: Optional[str], format: str = "1:1") -> Dict[str, str]:
         """
         PRD Section 12 fallback: when imagery/rendering fails even after a retry,
         produce a brand-colored placeholder rather than posting nothing.
@@ -126,7 +126,7 @@ class ImagePathService:
         placeholder.save(buffer, format="PNG")
         buffer.seek(0)
 
-        cloudinary_url = upload_bytes(
+        cloudinary_url = await upload_bytes(
             buffer.read(),
             folder="visual_engine_v2/placeholders",
             resource_type="image"
@@ -180,7 +180,7 @@ class ImagePathService:
         final_bytes = output.read()
 
         # Upload to Cloudinary
-        cloudinary_url = upload_bytes(
+        cloudinary_url = await upload_bytes(
             final_bytes,
             folder="visual_engine_v2/imagery",
             resource_type="image"

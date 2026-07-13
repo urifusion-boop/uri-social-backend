@@ -271,9 +271,9 @@ class BrandCompositorService:
             needs_attention = True
             error_message = f"Template render failed: {e}"
             rendered_urls = [
-                ImagePathService.generate_placeholder_image(
+                (await ImagePathService.generate_placeholder_image(
                     brand_data.get("primary_color"), format=format
-                )["imagery_url"]
+                ))["imagery_url"]
                 for _ in range(max(carousel_count, 1))
             ]
 
