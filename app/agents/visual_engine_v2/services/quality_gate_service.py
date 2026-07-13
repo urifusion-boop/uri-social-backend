@@ -2,15 +2,16 @@
 Quality Gate Service - Visual Engine V2
 Human review queue for quality control
 
-PRD Section 14: Quality Gate & Human Review
-- Beta users: Quality gate enabled by default
-- Production users: Quality gate disabled (auto-approve)
-- Scoring system for failure detection
-- Review queue for manual approval
+PRD Section 13: Quality Gate & Human Review — tiered by risk:
+- auto: standard posts, complete brand profile, confidence above threshold — posts on schedule
+- soft: new client's first posts, or borderline confidence — surfaced for quick approve/reject,
+        auto-publishes if not rejected within a window
+- mandatory: AI re-composited photos (premium) or anything flagged by a safety/quality
+             check (including this module's own fallback path) — never auto-publishes
 """
 
-from typing import Dict, Optional, List
-from datetime import datetime
+from typing import Dict, Optional, List, Tuple
+from datetime import datetime, timedelta
 from bson import ObjectId
 
 from app.agents.visual_engine_v2.models.visual_engine_models import (
@@ -19,15 +20,18 @@ from app.agents.visual_engine_v2.models.visual_engine_models import (
 )
 from app.agents.visual_engine_v2.config.vendor_config import FeatureFlags
 
+SOFT_REVIEW_WINDOW = timedelta(hours=24)
+
 
 class QualityGateService:
     """
     Quality gate and review queue management.
 
     Flow:
-    1. Render completes → QualityGate check
-    2. If quality_gate_enabled && score < threshold → Review Queue
-    3. Else → Auto-approve
+    1. Render completes → compute quality score + review tier
+    2. auto → publish on schedule, no queue entry
+    3. soft/mandatory → review queue entry; soft auto-approves if not rejected
+       within SOFT_REVIEW_WINDOW (see sweep_expired_soft_reviews), mandatory never does
     """
 
     def __init__(self, db):
@@ -40,16 +44,13 @@ class QualityGateService:
         user_id: str
     ) -> Dict[str, any]:
         """
-        Evaluate render quality and determine approval/review.
-
-        Args:
-            render: Completed VisualEngineRenderV2
-            user_id: User ID for feature flag check
+        Evaluate render quality, assign a review tier, and queue it if needed.
 
         Returns:
             {
                 "approved": bool,
                 "requires_review": bool,
+                "review_tier": "auto" | "soft" | "mandatory",
                 "quality_score": float,
                 "issues": List[str],
                 "review_queue_id": Optional[str]
@@ -57,65 +58,78 @@ class QualityGateService:
         """
         print(f"🔍 Quality Gate: Evaluating render {render.id}")
 
-        # Check if quality gate is enabled for this user
-        quality_gate_enabled = await self._is_quality_gate_enabled(user_id)
-
-        if not quality_gate_enabled:
-            print("✓ Quality Gate: DISABLED for this user (auto-approve)")
-            return {
-                "approved": True,
-                "requires_review": False,
-                "quality_score": 1.0,
-                "issues": [],
-                "review_queue_id": None
-            }
-
-        # Run quality checks
         quality_score, issues = await self._calculate_quality_score(render)
+        tier, expires_at, reason = await self._determine_review_tier(render, quality_score)
 
-        print(f"📊 Quality Score: {quality_score:.2f} (threshold: {self.feature_flags.quality_gate_threshold})")
+        # Mutate the render so the caller's subsequent DB save persists the tier/expiry
+        render.review_tier = tier
+        render.review_expires_at = expires_at
+        render.confidence_score = quality_score
 
-        # Determine if review is required
-        requires_review = quality_score < self.feature_flags.quality_gate_threshold
+        print(f"📊 Quality Score: {quality_score:.2f} (threshold: {self.feature_flags.MIN_CONFIDENCE_AUTO_PUBLISH}) → tier: {tier}")
 
-        if requires_review:
-            # Add to review queue
-            review_queue_id = await self._add_to_review_queue(render, quality_score, issues, user_id)
-            print(f"⚠️ Quality Gate: REVIEW REQUIRED (queue_id={review_queue_id})")
-
-            return {
-                "approved": False,
-                "requires_review": True,
-                "quality_score": quality_score,
-                "issues": issues,
-                "review_queue_id": review_queue_id
-            }
-        else:
-            print("✅ Quality Gate: PASSED (auto-approve)")
+        if tier == "auto":
+            print("✅ Quality Gate: AUTO-PUBLISH")
             return {
                 "approved": True,
                 "requires_review": False,
+                "review_tier": tier,
                 "quality_score": quality_score,
                 "issues": issues,
                 "review_queue_id": None
             }
 
-    async def _is_quality_gate_enabled(self, user_id: str) -> bool:
+        review_queue_id = await self._add_to_review_queue(render, quality_score, issues, user_id, tier, reason)
+        print(f"⚠️ Quality Gate: {tier.upper()} REVIEW REQUIRED (queue_id={review_queue_id}) — {reason}")
+
+        return {
+            "approved": False,
+            "requires_review": True,
+            "review_tier": tier,
+            "quality_score": quality_score,
+            "issues": issues,
+            "review_queue_id": review_queue_id
+        }
+
+    async def _determine_review_tier(
+        self,
+        render: VisualEngineRenderV2,
+        quality_score: float
+    ) -> Tuple[str, Optional[datetime], str]:
         """
-        Check if quality gate is enabled for this user.
-
-        PRD: Beta users have quality gate enabled by default.
+        PRD Section 13 tiering, in priority order:
+        1. mandatory — a fallback was used (needs_attention), or the imagery went
+           through AI re-compositing (premium; not yet implemented upstream, but the
+           hook is here so it's honored the moment that cleanup level is added)
+        2. soft — first-N posts for this brand, or confidence below threshold
+        3. auto — everything else
         """
-        # Check if user is in beta list
-        if user_id in self.feature_flags.beta_users:
-            return True
+        if render.needs_attention:
+            return "mandatory", None, "Render used a fallback background/image and needs a human look"
 
-        # Check user settings (allow manual override)
-        user = await self.db["users"].find_one({"_id": ObjectId(user_id)})
-        if user:
-            return user.get("quality_gate_enabled", False)
+        if render.imagery_layer.metadata.get("cleanup_level") == "ai_recomposite":
+            return "mandatory", None, "AI re-composited product photo (premium) always requires review"
 
-        return False
+        if await self._is_within_first_n_posts(render.brand_profile_id):
+            n = self.feature_flags.REQUIRE_REVIEW_FIRST_N_POSTS
+            return "soft", datetime.utcnow() + SOFT_REVIEW_WINDOW, f"Within this brand's first {n} posts"
+
+        if quality_score < self.feature_flags.MIN_CONFIDENCE_AUTO_PUBLISH:
+            return (
+                "soft",
+                datetime.utcnow() + SOFT_REVIEW_WINDOW,
+                f"Confidence score {quality_score:.2f} below {self.feature_flags.MIN_CONFIDENCE_AUTO_PUBLISH} threshold"
+            )
+
+        return "auto", None, ""
+
+    async def _is_within_first_n_posts(self, brand_profile_id: str) -> bool:
+        """PRD Section 13: a new client's first N posts get soft review regardless of confidence."""
+        n = self.feature_flags.REQUIRE_REVIEW_FIRST_N_POSTS
+        count = await self.db["visual_engine_renders_v2"].count_documents(
+            {"brand_profile_id": brand_profile_id}
+        )
+        return count < n
 
     async def _calculate_quality_score(
         self,
@@ -179,7 +193,9 @@ class QualityGateService:
         render: VisualEngineRenderV2,
         quality_score: float,
         issues: List[str],
-        user_id: str
+        user_id: str,
+        review_tier: str = "soft",
+        reason: str = ""
     ) -> str:
         """
         Add render to review queue for human approval.
@@ -188,8 +204,16 @@ class QualityGateService:
             render_id=str(render.id),
             user_id=user_id,
             brand_profile_id=render.brand_profile_id,
+            review_tier=review_tier,
+            review_reason=reason or (", ".join(issues) if issues else "Below confidence threshold"),
             quality_score=quality_score,
             detected_issues=issues,
+            preview_url=(render.final_outputs[0] if render.final_outputs else ""),
+            content_preview={
+                "headline": render.content_layer.data.get("headline", ""),
+                "subtext": render.content_layer.data.get("subtext", ""),
+                "cta": render.content_layer.data.get("cta", ""),
+            },
             status="pending",
             created_at=datetime.utcnow(),
             reviewed_at=None,
@@ -276,3 +300,51 @@ class QualityGateService:
         items = await cursor.to_list(length=100)
 
         return [VisualEngineReviewQueueV2(**item) for item in items]
+
+    async def sweep_expired_soft_reviews(self) -> Dict[str, int]:
+        """
+        PRD Section 13: soft-review renders auto-publish if not explicitly rejected
+        within their review window. Mandatory-tier renders are never touched here.
+
+        This is intentionally just a plain method + router endpoint, not wired into
+        the shared APScheduler/GitHub Actions cron infrastructure — this module is
+        still isolated for testing (see the Visual Engine V2 build note). Point an
+        external cron at POST /social-media/visual-engine/v2/review-queue/sweep-expired
+        once ready to move past that.
+        """
+        now = datetime.utcnow()
+
+        cursor = self.db["visual_engine_renders_v2"].find({
+            "review_tier": "soft",
+            "review_expires_at": {"$lte": now},
+        })
+        expired = await cursor.to_list(length=500)
+
+        auto_approved = 0
+        for render_doc in expired:
+            render_id = render_doc.get("id") or str(render_doc.get("_id"))
+
+            # Don't auto-approve if a human already rejected it
+            rejected = await self.db["visual_engine_review_queue_v2"].find_one({
+                "render_id": render_id,
+                "status": "rejected"
+            })
+            if rejected:
+                continue
+
+            await self.db["visual_engine_renders_v2"].update_one(
+                {"_id": render_doc["_id"]},
+                {"$set": {"status": "approved", "reviewed_at": now}}
+            )
+            await self.db["visual_engine_review_queue_v2"].update_many(
+                {"render_id": render_id, "status": "pending"},
+                {"$set": {
+                    "status": "approved",
+                    "reviewed_at": now,
+                    "reviewer_notes": "Auto-approved: soft-review window expired without rejection"
+                }}
+            )
+            auto_approved += 1
+
+        print(f"🧹 Soft-review sweep: checked {len(expired)}, auto-approved {auto_approved}")
+        return {"checked": len(expired), "auto_approved": auto_approved}

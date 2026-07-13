@@ -11,11 +11,17 @@ from typing import Dict, Optional
 from PIL import Image
 import io
 import base64
+import asyncio
 import httpx
 from openai import AsyncOpenAI
 
 from app.agents.visual_engine_v2.config.vendor_config import VendorConfig
 from app.utils.cloudinary_upload import upload_bytes
+
+
+class ImageGenerationError(Exception):
+    """Raised when Path A imagery generation fails after its retry, per PRD Section 12."""
+    pass
 
 
 class ImagePathService:
@@ -51,48 +57,85 @@ class ImagePathService:
                 "cost": 0.04
             }
         """
-        # Map format to dimensions
+        # Map format to the sizes GPT Image 2 actually supports (square, portrait, landscape)
         dimension_map = {
             "1:1": "1024x1024",
-            "4:5": "1024x1280",
-            "9:16": "1024x1792"
+            "4:5": "1024x1536",
+            "9:16": "1024x1536"
         }
         size = dimension_map.get(format, "1024x1024")
 
         # Build imagery-only prompt (no text, no logo, no brand elements)
         prompt = self._build_imagery_prompt(content_plan, style_hint)
 
-        print(f"🎨 [Path A] Generating imagery-only with GPT Image 2 ({size})")
-        print(f"Prompt: {prompt[:150]}...")
+        # PRD Section 12: "retry once with the same brief" before treating this as a failure
+        last_error: Optional[Exception] = None
+        for attempt in (1, 2):
+            try:
+                print(f"🎨 [Path A] Generating imagery-only with GPT Image 2 ({size}), attempt {attempt}/2")
+                response = await self.openai_client.images.generate(
+                    model="gpt-image-2",
+                    prompt=prompt,
+                    size=size,
+                    quality="high",
+                    n=1
+                )
 
-        # Generate with GPT Image 2
-        response = await self.openai_client.images.generate(
-            model="dall-e-3",
-            prompt=prompt,
-            size=size,
-            quality="hd",
-            n=1
-        )
+                img_bytes = base64.b64decode(response.data[0].b64_json)
 
-        # Download and upload to Cloudinary
-        image_url = response.data[0].url
-        async with httpx.AsyncClient() as client:
-            img_response = await client.get(image_url)
-            img_bytes = img_response.content
+                cloudinary_url = upload_bytes(
+                    img_bytes,
+                    folder="visual_engine_v2/imagery",
+                    resource_type="image"
+                )
 
-        # Upload to Cloudinary under visual_engine_v2/imagery folder
+                print(f"✅ [Path A] Imagery generated: {cloudinary_url[:80]}...")
+
+                return {
+                    "imagery_url": cloudinary_url,
+                    "path": "A",
+                    "cost": self.vendor_config.cost_model.image_generation_cost
+                }
+            except Exception as e:
+                last_error = e
+                print(f"⚠️ [Path A] Attempt {attempt}/2 failed: {e}")
+                if attempt == 1:
+                    await asyncio.sleep(1)
+
+        raise ImageGenerationError(f"Path A generation failed after retry: {last_error}")
+
+    @staticmethod
+    def generate_placeholder_image(brand_primary: Optional[str], format: str = "1:1") -> Dict[str, str]:
+        """
+        PRD Section 12 fallback: when imagery/rendering fails even after a retry,
+        produce a brand-colored placeholder rather than posting nothing.
+        """
+        size_map = {
+            "1:1": (1024, 1024),
+            "4:5": (1024, 1280),
+            "9:16": (1024, 1792)
+        }
+        width, height = size_map.get(format, (1024, 1024))
+
+        color = (brand_primary or "#CCCCCC").strip()
+        if not color.startswith("#"):
+            color = "#CCCCCC"
+
+        placeholder = Image.new("RGB", (width, height), color=color)
+        buffer = io.BytesIO()
+        placeholder.save(buffer, format="PNG")
+        buffer.seek(0)
+
         cloudinary_url = upload_bytes(
-            img_bytes,
-            folder="visual_engine_v2/imagery",
+            buffer.read(),
+            folder="visual_engine_v2/placeholders",
             resource_type="image"
         )
 
-        print(f"✅ [Path A] Imagery generated: {cloudinary_url[:80]}...")
-
         return {
             "imagery_url": cloudinary_url,
-            "path": "A",
-            "cost": self.vendor_config.cost_model.image_generation_cost
+            "path": "placeholder",
+            "cost": 0.0
         }
 
     async def process_uploaded_image_path_b(
