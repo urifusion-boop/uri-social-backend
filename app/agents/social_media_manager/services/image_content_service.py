@@ -2207,6 +2207,125 @@ OVERALL:
             return b64
 
     @staticmethod
+    async def rank_overlay_positions(image_url: str) -> List[str]:
+        """
+        Determine a ranked list of candidate corners (best to worst) for placing
+        a logo/badge overlay on a user-uploaded image.
+
+        Forces the model to look at each candidate region individually before
+        picking, rather than a single open-ended guess — this is meaningfully
+        more reliable for small vision models than "just tell me the best one."
+        Falls back to a fixed safe order if the model call or parsing fails.
+        """
+        from app.services.AIService import AIService
+        import json as _json
+
+        valid_positions = ["top_left", "top_right", "top_center", "bottom_left", "bottom_right", "bottom_center"]
+        fallback_order = ["bottom_right", "bottom_left", "top_right", "top_left", "bottom_center", "top_center"]
+
+        prompt = """You are choosing where to place a small brand logo badge on this image, so it never
+covers anything important.
+
+For EACH of these six regions, briefly note what is actually there — text, a face, a focal
+subject, or just empty/background:
+- top_left
+- top_right
+- top_center
+- bottom_left
+- bottom_right
+- bottom_center
+
+Then rank all six from BEST (emptiest, least important content, furthest from any text or
+faces) to WORST (most likely to cover something important).
+
+Return JSON only, no markdown, no explanations outside the JSON:
+{
+  "regions": {"top_left": "...", "top_right": "...", "top_center": "...", "bottom_left": "...", "bottom_right": "...", "bottom_center": "..."},
+  "ranking": ["best_position", "...", "...", "...", "...", "worst_position"]
+}"""
+
+        try:
+            request = AIService.build_ai_model(
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": image_url}},
+                    ],
+                }],
+                model="gpt-4o-mini",
+                temperature=0,
+                max_tokens=500,
+            )
+            response = await AIService.chat_completion(request)
+            if isinstance(response, dict) and "error" in response:
+                raise Exception(response["error"])
+
+            raw = response.choices[0].message.content.strip()
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+
+            parsed = _json.loads(raw)
+            ranking = [p for p in parsed.get("ranking", []) if p in valid_positions]
+            # Append any missing positions at the end so we always have all 6 as a fallback chain
+            ranking += [p for p in fallback_order if p not in ranking]
+            print(f"🎯 Logo position ranking: {ranking}")
+            return ranking
+
+        except Exception as e:
+            print(f"⚠️ Logo position ranking failed: {e}, using fixed fallback order")
+            return fallback_order
+
+    @staticmethod
+    async def composited_overlay_has_conflict(composited_data_url: str, position: str) -> bool:
+        """
+        Post-placement sanity check: look at the FINAL composited image and ask
+        whether the logo actually landed on top of text, a face, or another
+        important element. Returns True if there's a conflict (caller should
+        try the next-ranked position), False if it looks clean.
+
+        Fails safe (returns False = "accept it") on any error — a broken
+        quality-check call must never block the post from going out.
+        """
+        from app.services.AIService import AIService
+
+        position_label = position.replace("_", "-")
+        prompt = f"""A small brand logo badge was just placed in the {position_label} corner of this image.
+
+Look specifically at that corner. Does the logo visibly overlap, cover, or cut off any text,
+a face, or another important visual element?
+
+Answer with exactly one word: "yes" or "no"."""
+
+        try:
+            request = AIService.build_ai_model(
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": composited_data_url}},
+                    ],
+                }],
+                model="gpt-4o-mini",
+                temperature=0,
+                max_tokens=10,
+            )
+            response = await AIService.chat_completion(request)
+            if isinstance(response, dict) and "error" in response:
+                raise Exception(response["error"])
+
+            answer = response.choices[0].message.content.strip().lower()
+            has_conflict = answer.startswith("yes")
+            print(f"🔍 Overlay conflict check at {position}: {'CONFLICT' if has_conflict else 'clean'}")
+            return has_conflict
+
+        except Exception as e:
+            print(f"⚠️ Overlay conflict check failed: {e}, accepting placement as-is")
+            return False
+
+    @staticmethod
     def _map_to_gemini_aspect(size: str) -> str:
         """Map platform dimensions to Nano Banana 2 (Imagen) supported aspect ratios."""
         try:
