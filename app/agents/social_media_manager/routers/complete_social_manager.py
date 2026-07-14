@@ -7789,7 +7789,7 @@ async def zapcap_produce(
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.post(
             f"{_ZAPCAP_BASE}/videos/url",
-            json={"videoUrl": video_url},
+            json={"url": video_url},
             headers=headers,
         )
         if r.status_code not in (200, 201):
