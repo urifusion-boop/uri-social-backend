@@ -1043,14 +1043,22 @@ Create engaging social media captions for THIS UPLOADED CONTENT. Base your writi
             if _d_ids:
                 # Attach uploaded images to drafts so they can be published
                 if post_type == "carousel":
-                    # For carousel: create slides from uploaded images
-                    carousel_images = [{"image_url": url} for url in media_urls]
+                    # For carousel: one slide per uploaded image, in the exact
+                    # shape both DraftCard (isCarousel = slides.length > 0) and
+                    # publish logic (approval_workflow_service reads draft.slides)
+                    # expect. A prior "carousel_images" field here was never read
+                    # by either, so uploaded carousels silently rendered/published
+                    # as a single post.
+                    slides = [
+                        {"headline": "", "body": "", "image_url": url, "image_failed": False}
+                        for url in media_urls
+                    ]
                     update_fields = {
                         "brand_id": active_brand_id,
                         "content_source": "user_uploaded",
                         "uploaded_media_urls": media_urls,
                         "post_type": post_type,
-                        "carousel_images": carousel_images,
+                        "slides": slides,
                     }
                 else:
                     # For single post: use first uploaded image as main image
