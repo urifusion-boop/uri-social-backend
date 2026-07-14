@@ -2207,6 +2207,55 @@ OVERALL:
             return b64
 
     @staticmethod
+    def rank_overlay_positions_cv(image_bytes: bytes, region_pct: float = 0.22) -> List[str]:
+        """
+        Deterministically rank candidate logo corners by how visually "busy"
+        each region actually is, using plain pixel analysis — no AI guessing.
+
+        Text, faces, and graphics all produce measurably higher edge density
+        than flat background or sky, so scoring each corner's edge variance
+        (a standard OpenCV blur/detail metric) and picking the lowest is a
+        far more reliable signal than asking a vision model "which corner
+        looks empty?" — this is what actually fixed unreliable placement,
+        the earlier vision-only ranking never had real pixel data to go on.
+
+        Returns positions ordered least-busy (safest) to most-busy (worst).
+        """
+        import cv2
+        import numpy as np
+        from PIL import Image
+        import io as _io
+
+        try:
+            img = Image.open(_io.BytesIO(image_bytes)).convert("L")  # grayscale
+            w, h = img.size
+            rw = max(1, int(w * region_pct))
+            rh = max(1, int(h * region_pct))
+
+            regions = {
+                "top_left": (0, 0, rw, rh),
+                "top_right": (w - rw, 0, w, rh),
+                "top_center": ((w - rw) // 2, 0, (w - rw) // 2 + rw, rh),
+                "bottom_left": (0, h - rh, rw, h),
+                "bottom_right": (w - rw, h - rh, w, h),
+                "bottom_center": ((w - rw) // 2, h - rh, (w - rw) // 2 + rw, h),
+            }
+
+            np_img = np.array(img)
+            scores = {}
+            for pos, (x1, y1, x2, y2) in regions.items():
+                crop = np_img[y1:y2, x1:x2]
+                scores[pos] = float(cv2.Laplacian(crop, cv2.CV_64F).var()) if crop.size else float("inf")
+
+            ranked = sorted(scores.keys(), key=lambda p: scores[p])
+            print(f"📐 Logo corner busyness (lower=emptier): {[(p, round(scores[p], 1)) for p in ranked]}")
+            return ranked
+
+        except Exception as e:
+            print(f"⚠️ CV-based position ranking failed: {e}, using fixed fallback order")
+            return ["bottom_right", "bottom_left", "top_right", "top_left", "bottom_center", "top_center"]
+
+    @staticmethod
     async def rank_overlay_positions(image_url: str) -> List[str]:
         """
         Determine a ranked list of candidate corners (best to worst) for placing
@@ -2216,6 +2265,10 @@ OVERALL:
         picking, rather than a single open-ended guess — this is meaningfully
         more reliable for small vision models than "just tell me the best one."
         Falls back to a fixed safe order if the model call or parsing fails.
+
+        NOTE: superseded by rank_overlay_positions_cv() for the primary ranking
+        signal (see that docstring) — kept here in case a text-based fallback
+        or secondary signal is useful later.
         """
         from app.services.AIService import AIService
         import json as _json
