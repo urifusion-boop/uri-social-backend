@@ -7764,6 +7764,7 @@ async def zapcap_produce(
     token: dict = Depends(JWTBearer()),
 ):
     import uuid as _uuid
+    import httpx
     from datetime import datetime, timezone
     from app.agents.social_media_manager.services.video_production_service import (
         _upload_to_cloudinary,
@@ -7854,6 +7855,8 @@ async def zapcap_job_status(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
     token: dict = Depends(JWTBearer()),
 ):
+    import httpx
+
     user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
