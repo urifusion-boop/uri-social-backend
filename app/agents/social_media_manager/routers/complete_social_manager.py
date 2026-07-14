@@ -7496,6 +7496,72 @@ async def fix_fractional_credits(
 
 # ── Submagic Video Production ─────────────────────────────────────────────────
 
+async def _mix_music_into_video(video_url: str, music_url: str) -> Optional[str]:
+    """Download Submagic output + Cloudinary music, mix with ffmpeg, upload result to Cloudinary."""
+    import tempfile
+    import asyncio as _asyncio
+    import os as _os
+    import uuid as _uuid
+    import httpx as _httpx
+    from app.agents.social_media_manager.services.video_production_service import _upload_to_cloudinary
+
+    try:
+        async with _httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
+            video_resp = await client.get(video_url)
+            music_resp = await client.get(music_url)
+
+        if video_resp.status_code != 200:
+            print(f"[SubmagicMusic] video download failed {video_resp.status_code}", flush=True)
+            return None
+        if music_resp.status_code != 200:
+            print(f"[SubmagicMusic] music download failed {music_resp.status_code}", flush=True)
+            return None
+
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as vf:
+            vf.write(video_resp.content)
+            video_tmp = vf.name
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as mf:
+            mf.write(music_resp.content)
+            music_tmp = mf.name
+
+        output_path = f"/tmp/submagic-mixed-{_uuid.uuid4().hex[:8]}.mp4"
+
+        proc = await _asyncio.create_subprocess_exec(
+            "ffmpeg", "-y",
+            "-i", video_tmp,
+            "-stream_loop", "-1", "-i", music_tmp,
+            "-filter_complex", "[1:a]volume=0.7[m];[0:a][m]amix=inputs=2:duration=first[a]",
+            "-map", "0:v", "-map", "[a]",
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+            "-shortest",
+            output_path,
+            stdout=_asyncio.subprocess.DEVNULL,
+            stderr=_asyncio.subprocess.PIPE,
+        )
+        _, stderr = await _asyncio.wait_for(proc.communicate(), timeout=300)
+
+        if proc.returncode != 0:
+            print(f"[SubmagicMusic] ffmpeg failed: {stderr.decode()[-500:]}", flush=True)
+            for p in [video_tmp, music_tmp, output_path]:
+                try: _os.unlink(p)
+                except: pass
+            return None
+
+        with open(output_path, "rb") as f:
+            mixed_bytes = f.read()
+
+        for p in [video_tmp, music_tmp, output_path]:
+            try: _os.unlink(p)
+            except: pass
+
+        public_id = f"submagic-mixed-{_uuid.uuid4().hex[:12]}"
+        return await _upload_to_cloudinary(mixed_bytes, public_id)
+
+    except Exception as e:
+        print(f"[SubmagicMusic] error: {e}", flush=True)
+        return None
+
+
 @router.post("/submagic-produce")
 async def submagic_produce(
     video: UploadFile = File(...),
@@ -7506,6 +7572,8 @@ async def submagic_produce(
     magic_brolls: bool = Form(False),
     clean_audio: bool = Form(False),
     remove_bad_takes: bool = Form(False),
+    enable_music: bool = Form(False),
+    custom_music: Optional[UploadFile] = File(None),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
     token: dict = Depends(JWTBearer()),
 ):
@@ -7520,7 +7588,13 @@ async def submagic_produce(
 
     from datetime import datetime, timezone
     import uuid as _uuid
-    from app.agents.social_media_manager.services.video_production_service import _upload_to_cloudinary
+    from app.agents.social_media_manager.services.video_production_service import (
+        _upload_to_cloudinary,
+        _upload_audio_to_cloudinary,
+    )
+
+    job_id = _uuid.uuid4().hex
+    now = datetime.now(timezone.utc).isoformat()
 
     video_bytes = await video.read()
     if not video_bytes:
@@ -7531,6 +7605,15 @@ async def submagic_produce(
     cloudinary_url = await _upload_to_cloudinary(video_bytes, public_id)
     if not cloudinary_url:
         raise HTTPException(status_code=502, detail="Could not upload video to storage")
+
+    # Upload music to Cloudinary
+    music_url = None
+    if enable_music and custom_music:
+        music_bytes = await custom_music.read()
+        if music_bytes:
+            music_url = await _upload_audio_to_cloudinary(music_bytes, f"submagic-{job_id}")
+            if not music_url:
+                print("[SubmagicMusic] Cloudinary upload failed — continuing without music", flush=True)
 
     import httpx as _httpx
     payload: dict = {
@@ -7565,19 +7648,21 @@ async def submagic_produce(
         raise HTTPException(status_code=502, detail=f"Submagic unreachable: {exc}")
 
     project_id = project["id"]
-    job_id = _uuid.uuid4().hex
-    now = datetime.now(timezone.utc).isoformat()
 
-    await db["submagic_jobs"].insert_one({
+    job_doc: dict = {
         "job_id": job_id,
         "project_id": project_id,
         "user_id": user_id,
         "status": "processing",
         "template_name": template_name,
         "created_at": now,
-    })
+    }
+    if music_url:
+        job_doc["music_url"] = music_url
 
-    print(f"[Submagic] job {job_id} → project {project_id}", flush=True)
+    await db["submagic_jobs"].insert_one(job_doc)
+
+    print(f"[Submagic] job {job_id} → project {project_id} music={'yes' if music_url else 'no'}", flush=True)
     return UriResponse.get_single_data_response("submagic_job", {"job_id": job_id})
 
 
@@ -7595,6 +7680,14 @@ async def get_submagic_job(
     job = await db["submagic_jobs"].find_one({"job_id": job_id, "user_id": user_id}, {"_id": 0})
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+
+    # Already finished with music mixed — serve cached result
+    if job.get("final_output_url"):
+        return UriResponse.get_single_data_response("submagic_job", {
+            "status": "completed",
+            "output_url": job["final_output_url"],
+            "failure_reason": None,
+        })
 
     api_key = settings.SUBMAGIC_API_KEY
     if not api_key:
@@ -7624,7 +7717,190 @@ async def get_submagic_job(
         {"$set": {"status": status, "output_url": output_url}},
     )
 
+    # When complete and music was requested, mix it in and cache the result
+    if status == "completed" and output_url and job.get("music_url"):
+        print(f"[SubmagicMusic] mixing music into job {job_id}", flush=True)
+        mixed_url = await _mix_music_into_video(output_url, job["music_url"])
+        if mixed_url:
+            await db["submagic_jobs"].update_one(
+                {"job_id": job_id},
+                {"$set": {"final_output_url": mixed_url}},
+            )
+            output_url = mixed_url
+            print(f"[SubmagicMusic] done → {mixed_url[:60]}", flush=True)
+        else:
+            print(f"[SubmagicMusic] mix failed — returning raw Submagic URL", flush=True)
+
     return UriResponse.get_single_data_response("submagic_job", {
+        "status": status,
+        "output_url": output_url,
+        "failure_reason": failure_reason,
+    })
+
+
+# ── ZapCap ────────────────────────────────────────────────────────────────────
+
+_ZAPCAP_BASE = "https://api.zapcap.ai"
+
+
+async def _zapcap_headers() -> dict:
+    key = settings.ZAPCAP_API_KEY
+    if not key:
+        raise HTTPException(status_code=503, detail="ZAPCAP_API_KEY not configured")
+    return {"x-api-key": key, "Accept": "application/json"}
+
+
+@router.post("/zapcap-produce")
+async def zapcap_produce(
+    request: Request,
+    video: UploadFile = File(...),
+    template_id: str = Form("beast"),
+    language: str = Form("en"),
+    output_mode: str = Form("composited"),
+    quality: str = Form("standard"),
+    enable_broll: str = Form("false"),
+    enable_music: str = Form("false"),
+    custom_music: Optional[UploadFile] = File(None),
+):
+    user = await _get_user(request)
+    db = await _get_db(request)
+
+    job_id = _uuid.uuid4().hex
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Upload video to Cloudinary first so ZapCap can reach it via URL
+    video_bytes = await video.read()
+    video_public_id = f"zapcap-input-{job_id}"
+    video_url = await _upload_to_cloudinary(video_bytes, video_public_id)
+
+    headers = await _zapcap_headers()
+
+    # Upload video URL to ZapCap → get videoId
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(
+            f"{_ZAPCAP_BASE}/videos/url",
+            json={"videoUrl": video_url},
+            headers=headers,
+        )
+        if r.status_code not in (200, 201):
+            raise HTTPException(status_code=502, detail=f"ZapCap upload failed: {r.text}")
+        zapcap_video_id = r.json().get("videoId") or r.json().get("id")
+        if not zapcap_video_id:
+            raise HTTPException(status_code=502, detail=f"ZapCap returned no videoId: {r.text}")
+
+    # Build task payload
+    task_payload: dict = {
+        "templateId": template_id,
+        "language": language,
+        "outputMode": output_mode,
+    }
+    if quality != "standard":
+        task_payload["quality"] = quality
+    if enable_broll.lower() == "true":
+        task_payload["magicBroll"] = True
+
+    # Submit task → get taskId
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(
+            f"{_ZAPCAP_BASE}/videos/{zapcap_video_id}/task",
+            json=task_payload,
+            headers=headers,
+        )
+        if r.status_code not in (200, 201):
+            raise HTTPException(status_code=502, detail=f"ZapCap task failed: {r.text}")
+        zapcap_task_id = r.json().get("taskId") or r.json().get("id")
+        if not zapcap_task_id:
+            raise HTTPException(status_code=502, detail=f"ZapCap returned no taskId: {r.text}")
+
+    # Handle optional background music
+    music_url: Optional[str] = None
+    if enable_music.lower() == "true" and custom_music:
+        music_bytes = await custom_music.read()
+        music_url = await _upload_audio_to_cloudinary(music_bytes, f"zapcap-{job_id}")
+        print(f"[ZapCap] music uploaded → {music_url[:60]}", flush=True)
+
+    # Persist job
+    await db["zapcap_jobs"].insert_one({
+        "job_id": job_id,
+        "user_id": str(user["_id"]),
+        "zapcap_video_id": zapcap_video_id,
+        "zapcap_task_id": zapcap_task_id,
+        "template_id": template_id,
+        "language": language,
+        "output_mode": output_mode,
+        "quality": quality,
+        "enable_broll": enable_broll.lower() == "true",
+        "music_url": music_url,
+        "status": "pending",
+        "created_at": now,
+    })
+
+    print(f"[ZapCap] job {job_id} submitted  video_id={zapcap_video_id}  task_id={zapcap_task_id}  music={'yes' if music_url else 'no'}", flush=True)
+    return UriResponse.get_single_data_response("zapcap_job", {"job_id": job_id})
+
+
+@router.get("/zapcap-job/{job_id}")
+async def zapcap_job_status(job_id: str, request: Request):
+    db = await _get_db(request)
+
+    job = await db["zapcap_jobs"].find_one({"job_id": job_id})
+    if not job:
+        raise HTTPException(status_code=404, detail="ZapCap job not found")
+
+    # Return cached result if already complete
+    if job.get("final_output_url"):
+        return UriResponse.get_single_data_response("zapcap_job", {
+            "status": "completed",
+            "output_url": job["final_output_url"],
+            "failure_reason": None,
+        })
+
+    headers = await _zapcap_headers()
+    zapcap_video_id = job["zapcap_video_id"]
+    zapcap_task_id = job["zapcap_task_id"]
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(
+            f"{_ZAPCAP_BASE}/videos/{zapcap_video_id}/task/{zapcap_task_id}",
+            headers=headers,
+        )
+
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"ZapCap poll failed: {r.text}")
+
+    data = r.json()
+    status = data.get("status", "pending")
+    output_url = data.get("downloadUrl") or data.get("outputUrl") or data.get("url")
+    failure_reason = data.get("failureReason") or data.get("error")
+
+    print(f"[ZapCap] poll job={job_id}  status={status}  url={'yes' if output_url else 'no'}", flush=True)
+
+    await db["zapcap_jobs"].update_one(
+        {"job_id": job_id},
+        {"$set": {"status": status, "output_url": output_url}},
+    )
+
+    # When complete and music was requested, mix it in and cache the result
+    if status == "completed" and output_url and job.get("music_url"):
+        print(f"[ZapCapMusic] mixing music into job {job_id}", flush=True)
+        mixed_url = await _mix_music_into_video(output_url, job["music_url"])
+        if mixed_url:
+            await db["zapcap_jobs"].update_one(
+                {"job_id": job_id},
+                {"$set": {"final_output_url": mixed_url}},
+            )
+            output_url = mixed_url
+            print(f"[ZapCapMusic] done → {mixed_url[:60]}", flush=True)
+        else:
+            print(f"[ZapCapMusic] mix failed — returning raw ZapCap URL", flush=True)
+    elif status == "completed" and output_url:
+        # No music — cache as final to skip future polls
+        await db["zapcap_jobs"].update_one(
+            {"job_id": job_id},
+            {"$set": {"final_output_url": output_url}},
+        )
+
+    return UriResponse.get_single_data_response("zapcap_job", {
         "status": status,
         "output_url": output_url,
         "failure_reason": failure_reason,

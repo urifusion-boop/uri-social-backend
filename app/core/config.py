@@ -116,6 +116,7 @@ class Settings(BaseSettings):
     # ── Video Production — Render Engine ─────────────────────────────────
     SHOTSTACK_API_KEY: Optional[str] = None
     SUBMAGIC_API_KEY: Optional[str] = None
+    ZAPCAP_API_KEY: Optional[str] = None
     OPUSCLIP_API_KEY: Optional[str] = None   # Phase 0 testing only
     VIZARD_API_KEY: Optional[str] = None      # Phase 0 testing only
     # Set to 'reap' | 'opusclip' | 'vizard' after Phase 0 Pidgin test picks a winner
