@@ -1029,6 +1029,24 @@ Follow these rules precisely for every image. No exceptions.
 
             do_not_include = "=== DO NOT INCLUDE ===\n" + "\n".join(f"- {item}" for item in do_not_include_items)
 
+            # The logo-reservation rule already appears once at the very top (in
+            # absolute_rules). Repeating it once more as the LAST thing the model
+            # reads — after it has already worked out headline/layout — catches the
+            # cases where an earlier instruction gets lost among everything else in
+            # a long prompt. This applies whether or not a reference image is used
+            # (the reference-image path adds its own reminder later, inside the
+            # composition block, on top of this one).
+            logo_final_reminder = ""
+            if logo_position:
+                logo_final_reminder = (
+                    f"=== FINAL LAYOUT CHECK ===\n"
+                    f"Before finalising, check the {pos_text} of the canvas "
+                    f"({logo_reserve_size}). A brand logo will be placed there after "
+                    f"generation. That exact area must be empty background — no letters, "
+                    f"words, icons, or graphics touching it. If your layout puts anything "
+                    f"there, shift it elsewhere before rendering."
+                )
+
             # ASSEMBLE FINAL PROMPT (Order matters - rules at top!)
             parts = [
                 absolute_rules,
@@ -1038,6 +1056,7 @@ Follow these rules precisely for every image. No exceptions.
                 content_section,
                 format_section,
                 do_not_include,
+                logo_final_reminder,
             ]
             image_prompt = "\n\n".join(p for p in parts if p)
 
