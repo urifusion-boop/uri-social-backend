@@ -7763,6 +7763,9 @@ async def zapcap_produce(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
     token: dict = Depends(JWTBearer()),
 ):
+    import uuid as _uuid
+    from datetime import datetime, timezone
+
     user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
