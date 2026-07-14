@@ -783,10 +783,13 @@ async def upload_user_content(
                                 img_b64, brand_context_dict['logo_url'], logo_position, logo_size
                             )
                         else:
-                            # Rank candidate corners, then place + verify, retrying the next
-                            # candidate if the placement turns out to overlap something.
-                            print(f"🤖 Ranking candidate logo positions...")
-                            candidates = await ImageContentService.rank_overlay_positions(media_url)
+                            # Rank candidate corners by actual pixel busyness (deterministic,
+                            # not an AI guess — see rank_overlay_positions_cv docstring), then
+                            # place + verify, retrying the next candidate if it still overlaps
+                            # something the pixel analysis alone didn't catch (e.g. a face on
+                            # a flat-coloured background).
+                            print(f"📐 Ranking candidate logo positions by pixel busyness...")
+                            candidates = ImageContentService.rank_overlay_positions_cv(resp.content)
 
                             img_b64_with_logo = None
                             logo_position = brand_context_dict.get('logo_position', 'bottom_right')
