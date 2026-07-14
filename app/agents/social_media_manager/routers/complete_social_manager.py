@@ -4771,11 +4771,38 @@ async def _generate_image_bg(
                             _style_profile_scope,
                             {"$set": {"style_rotation_index": _next_index}},
                         )
+
+                # ── Lock the CTA for the whole carousel, same reasoning as style above ──
+                # _generate_platform_image() picks (and round-robin rotates) its own CTA
+                # every time it's called, and it's called once PER SLIDE, concurrently,
+                # all sharing the same brand_context dict — so without locking it here,
+                # each slide could race onto a different cta_rotation_index and end up
+                # with a different CTA than its neighbours in the same carousel.
+                _carousel_cta = brand_context.get("override_cta")
+                if not _carousel_cta:
+                    _cta_styles_list = brand_context.get("cta_styles", [])
+                    if isinstance(_cta_styles_list, list) and _cta_styles_list:
+                        _cta_rotation_index = int(brand_context.get("cta_rotation_index", 0) or 0)
+                        if _cta_rotation_index >= len(_cta_styles_list):
+                            _cta_rotation_index = 0
+                        _carousel_cta = _cta_styles_list[_cta_rotation_index]
+                        _cta_next_index = (_cta_rotation_index + 1) % len(_cta_styles_list)
+                        await db["brand_profiles"].update_one(
+                            _style_profile_scope,
+                            {"$set": {"cta_rotation_index": _cta_next_index}},
+                        )
+                    else:
+                        _carousel_cta = brand_context.get("default_link", "Link in bio")
+                await db["content_drafts"].update_one(
+                    {"id": carousel_id}, {"$set": {"carousel_cta_text": _carousel_cta}}
+                )
+                brand_context = {**brand_context, "override_cta": _carousel_cta}
+                print(f"🎯 CTA [{_carousel_cta}] locked for all {total_slides} carousel slides")
             else:
-                # Subsequent slides: reuse cached style from first slide
+                # Subsequent slides: reuse cached style + CTA from first slide
                 draft = await db["content_drafts"].find_one(
                     {"id": carousel_id},
-                    {"carousel_style_slug": 1, "carousel_style_fragment": 1}
+                    {"carousel_style_slug": 1, "carousel_style_fragment": 1, "carousel_cta_text": 1}
                 )
                 if draft:
                     _slug = draft.get("carousel_style_slug")
@@ -4783,6 +4810,10 @@ async def _generate_image_bg(
                     if _fragment:
                         brand_context = {**brand_context, "style_prompt_fragment": _fragment, "style_slug": _slug}
                         print(f"🎨 Reusing carousel style [{_slug}] for slide {slide_index + 1}/{total_slides}")
+                    _carousel_cta = draft.get("carousel_cta_text")
+                    if _carousel_cta:
+                        brand_context = {**brand_context, "override_cta": _carousel_cta}
+                        print(f"🎯 Reusing carousel CTA [{_carousel_cta}] for slide {slide_index + 1}/{total_slides}")
         else:
             # Regular post: check for custom guides (V1 + V2) first, then fallback to style rotation
             _bp = await db["brand_profiles"].find_one(
