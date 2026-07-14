@@ -7752,7 +7752,6 @@ async def _zapcap_headers() -> dict:
 
 @router.post("/zapcap-produce")
 async def zapcap_produce(
-    request: Request,
     video: UploadFile = File(...),
     template_id: str = Form("beast"),
     language: str = Form("en"),
@@ -7761,9 +7760,12 @@ async def zapcap_produce(
     enable_broll: str = Form("false"),
     enable_music: str = Form("false"),
     custom_music: Optional[UploadFile] = File(None),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
 ):
-    user = await _get_user(request)
-    db = await _get_db(request)
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
     job_id = _uuid.uuid4().hex
     now = datetime.now(timezone.utc).isoformat()
@@ -7822,7 +7824,7 @@ async def zapcap_produce(
     # Persist job
     await db["zapcap_jobs"].insert_one({
         "job_id": job_id,
-        "user_id": str(user["_id"]),
+        "user_id": user_id,
         "zapcap_video_id": zapcap_video_id,
         "zapcap_task_id": zapcap_task_id,
         "template_id": template_id,
@@ -7840,8 +7842,14 @@ async def zapcap_produce(
 
 
 @router.get("/zapcap-job/{job_id}")
-async def zapcap_job_status(job_id: str, request: Request):
-    db = await _get_db(request)
+async def zapcap_job_status(
+    job_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
     job = await db["zapcap_jobs"].find_one({"job_id": job_id})
     if not job:
