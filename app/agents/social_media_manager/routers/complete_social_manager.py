@@ -7765,6 +7765,10 @@ async def zapcap_produce(
 ):
     import uuid as _uuid
     from datetime import datetime, timezone
+    from app.agents.social_media_manager.services.video_production_service import (
+        _upload_to_cloudinary,
+        _upload_audio_to_cloudinary,
+    )
 
     user_id = _get_user_id(token)
     if not user_id:
