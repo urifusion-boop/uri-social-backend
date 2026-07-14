@@ -166,6 +166,33 @@ class PlanResult(BaseModel):
     advice: Optional[PlanAdvice] = None
 
 
+# ── Ad creative (split-doc 1.6) ───────────────────────────────────────────────
+
+class AdCopy(BaseModel):
+    """The written parts of an ad, plus the prompt used to generate its image."""
+    headline: str = ""              # ≤ ~5 words
+    primary_text: str = ""          # 1–2 sentence body
+    image_prompt: str = ""          # what the creative image should show
+
+
+class CreativeSource(str, Enum):
+    """Mirrors PRD Part D2 — the three ways a creative's image is sourced."""
+    GENERATE = "generate"    # Jane generates it via the brand playbook engine (default)
+    UPLOAD = "upload"        # the user's own uploaded photo/video
+    DRAFT = "draft"          # an existing content draft the user already liked
+
+
+class AdCreative(BaseModel):
+    """A complete ad ready to submit: an image + copy + the WhatsApp CTA.
+    Every ad routes to WhatsApp — the CTA is fixed, never up to the user."""
+    image_url: str = ""             # final image, hosted on Cloudinary
+    headline: str = ""
+    primary_text: str = ""
+    cta: str = "Send WhatsApp Message"
+    source: CreativeSource = CreativeSource.GENERATE
+    generated: bool = True          # False when there's no image → copy-only fallback
+
+
 # ── Events (adapter → Shore) ──────────────────────────────────────────────────
 
 class ConversationDelivered(BaseModel):
