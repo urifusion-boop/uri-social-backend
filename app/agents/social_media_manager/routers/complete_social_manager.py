@@ -7750,6 +7750,17 @@ async def _zapcap_headers() -> dict:
     return {"x-api-key": key, "Accept": "application/json"}
 
 
+@router.get("/zapcap-templates")
+async def zapcap_templates(token: dict = Depends(JWTBearer())):
+    import httpx
+    headers = await _zapcap_headers()
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(f"{_ZAPCAP_BASE}/templates", headers=headers)
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"ZapCap templates failed: {r.text}")
+    return UriResponse.get_single_data_response("zapcap_templates", {"templates": r.json()})
+
+
 @router.post("/zapcap-produce")
 async def zapcap_produce(
     video: UploadFile = File(...),
@@ -7798,16 +7809,24 @@ async def zapcap_produce(
         if not zapcap_video_id:
             raise HTTPException(status_code=502, detail=f"ZapCap returned no videoId: {r.text}")
 
-    # Build task payload
+    # Build task payload with correct ZapCap field structure
+    export_settings: dict = {}
+    if output_mode == "transparent":
+        export_settings["outputMode"] = "transparent"
+    elif output_mode == "greenScreen":
+        export_settings["greenScreen"] = True
+    if quality != "standard":
+        export_settings["quality"] = quality
+
     task_payload: dict = {
         "templateId": template_id,
         "language": language,
-        "outputMode": output_mode,
+        "autoApprove": True,
     }
-    if quality != "standard":
-        task_payload["quality"] = quality
+    if export_settings:
+        task_payload["exportSettings"] = export_settings
     if enable_broll.lower() == "true":
-        task_payload["magicBroll"] = True
+        task_payload["transcribeSettings"] = {"broll": {"brollPercent": 50}}
 
     # Submit task → get taskId
     async with httpx.AsyncClient(timeout=60) as client:
