@@ -20,70 +20,108 @@ class BrandProfileService:
         # Debug: Log what data is received from frontend
         print(f"📥 SAVE INPUT: logo_position={repr(data.get('logo_position'))}, logo_size={repr(data.get('logo_size'))}")
 
-        doc = {
+        # Fetched up front (rather than right before the update_one call, as
+        # before) so the field-defaulting loop below can tell a brand-new
+        # profile from an update to an existing one.
+        scope = {"brand_id": brand_id} if brand_id else {"user_id": user_id}
+        existing = await db[BrandProfileService.COLLECTION].find_one(scope)
+
+        # Only ever $set a field if the caller's payload actually included it —
+        # unless this is a brand-new profile, in which case every field still
+        # gets backfilled with a sensible default so the initial document is
+        # fully populated. This used to build a full ~30-field document on
+        # EVERY save using data.get(field, default) regardless of whether it
+        # was an insert or an update — meaning any partial save (e.g. the
+        # custom-guide-selection or Canvas Editor auto-saves elsewhere in the
+        # frontend, which only send a couple of changed fields plus whatever
+        # was in their local cached copy of the profile) would silently reset
+        # every other field to its empty default. Confirmed live: 0 of 123
+        # production brand profiles ever had a non-empty ideal_customer_profile
+        # despite the save/read code path working correctly in isolation.
+        doc: Dict[str, Any] = {
             "user_id": user_id,
             "brand_id": brand_id,
-            "brand_name": data.get("brand_name", ""),
-            "industry": data.get("industry", ""),
-            "website": data.get("website", ""),
-            "tagline": data.get("tagline", ""),
-            "product_description": data.get("product_description", ""),
-            "key_products_services": data.get("key_products_services", []),
-            "logo_url": data.get("logo_url"),
-            "logo_position": data.get("logo_position", "bottom_right"),
-            "logo_size": data.get("logo_size", "small"),
-            "sample_template_urls": data.get("sample_template_urls", []),
-            "brand_colors": data.get("brand_colors", []),
-            "personality_quiz": data.get("personality_quiz", {}),
-            "derived_voice": data.get("derived_voice", ""),
-            "voice_sample": data.get("voice_sample", ""),
-            "platform_tones": data.get("platform_tones", {}),
-            "same_tone_everywhere": data.get("same_tone_everywhere", True),
-            "target_audience": data.get("target_audience", ""),
-            "ideal_customer_profile": data.get("ideal_customer_profile", ""),
-            "content_pillars": data.get("content_pillars", []),
-            "preferred_formats": data.get("preferred_formats", []),
-            "guardrails": data.get("guardrails", {}),
-            "cta_styles": data.get("cta_styles", []),
-            "default_link": data.get("default_link", ""),
-            "audience_age_range": data.get("audience_age_range", ""),
-            "target_platforms": data.get("target_platforms", []),
-            "primary_goal": data.get("primary_goal", ""),
-            "competitor_handles": data.get("competitor_handles", []),
-            "key_dates": data.get("key_dates", []),
-            "posting_cadence": data.get("posting_cadence", ""),
-            "posting_time_mode": data.get("posting_time_mode", ""),
-            "posting_time_prefs": data.get("posting_time_prefs", {}),
-            "approval_workflow": data.get("approval_workflow", ""),
-            "approval_channels": data.get("approval_channels", []),
-            "notification_events": data.get("notification_events", []),
-            "notification_channel": data.get("notification_channel", ""),
-            "team_members": data.get("team_members", []),
-            "languages": data.get("languages", []),
-            "region": data.get("region", ""),
-            "onboarding_completed": data.get("onboarding_completed", False),
-            # Caption Voice System fields (PRD Section 3.1)
-            "voice_profile": {
-                "formality": data.get("voice_profile", {}).get("formality", "casual"),
-                "sentence_style": data.get("voice_profile", {}).get("sentence_style", "mixed_rhythm"),
-                "emoji_usage": data.get("voice_profile", {}).get("emoji_usage", "light"),
-                "emoji_placement": data.get("voice_profile", {}).get("emoji_placement", "end_of_lines"),
-                "slang_level": data.get("voice_profile", {}).get("slang_level", "pure_english"),
-                "cta_style": data.get("voice_profile", {}).get("cta_style", "direct"),
-                "caption_length": data.get("voice_profile", {}).get("caption_length", "short"),
-                "hook_style": data.get("voice_profile", {}).get("hook_style", "bold_statement"),
-                "hashtag_style": data.get("voice_profile", {}).get("hashtag_style", "minimal"),
-                "hashtag_placement": data.get("voice_profile", {}).get("hashtag_placement", "end"),
-                "humor_level": data.get("voice_profile", {}).get("humor_level", "none"),
-                "nigerian_expressions": data.get("voice_profile", {}).get("nigerian_expressions", []),
-                "banned_words": data.get("voice_profile", {}).get("banned_words", []),
-                "sample_captions": data.get("voice_profile", {}).get("sample_captions", []),
-                "platform_overrides": data.get("voice_profile", {}).get("platform_overrides", {}),
-            },
-            # Voice sample analysis (PRD Section 6.1)
-            "voice_sample_analysis": data.get("voice_sample_analysis", {}),
             "updated_at": now,
         }
+
+        DEFAULTS: Dict[str, Any] = {
+            "brand_name": "",
+            "industry": "",
+            "website": "",
+            "tagline": "",
+            "product_description": "",
+            "key_products_services": [],
+            "logo_url": None,
+            "logo_position": "bottom_right",
+            "logo_size": "small",
+            "sample_template_urls": [],
+            "brand_colors": [],
+            "personality_quiz": {},
+            "derived_voice": "",
+            "voice_sample": "",
+            "platform_tones": {},
+            "same_tone_everywhere": True,
+            "target_audience": "",
+            "ideal_customer_profile": "",
+            "content_pillars": [],
+            "preferred_formats": [],
+            "guardrails": {},
+            "cta_styles": [],
+            "default_link": "",
+            "audience_age_range": "",
+            "target_platforms": [],
+            "primary_goal": "",
+            "competitor_handles": [],
+            "key_dates": [],
+            "posting_cadence": "",
+            "posting_time_mode": "",
+            "posting_time_prefs": {},
+            "approval_workflow": "",
+            "approval_channels": [],
+            "notification_events": [],
+            "notification_channel": "",
+            "team_members": [],
+            "languages": [],
+            "region": "",
+            "onboarding_completed": False,
+            "voice_sample_analysis": {},
+        }
+        for field, default in DEFAULTS.items():
+            if field in data:
+                doc[field] = data[field]
+            elif existing is None:
+                doc[field] = default
+
+        # Caption Voice System fields (PRD Section 3.1) — same "only touch what
+        # was sent" rule applied per sub-field, not just at the top level, so a
+        # save that only changes e.g. emoji_usage doesn't reset banned_words etc.
+        vp_defaults = {
+            "formality": "casual",
+            "sentence_style": "mixed_rhythm",
+            "emoji_usage": "light",
+            "emoji_placement": "end_of_lines",
+            "slang_level": "pure_english",
+            "cta_style": "direct",
+            "caption_length": "short",
+            "hook_style": "bold_statement",
+            "hashtag_style": "minimal",
+            "hashtag_placement": "end",
+            "humor_level": "none",
+            "nigerian_expressions": [],
+            "banned_words": [],
+            "sample_captions": [],
+            "platform_overrides": {},
+        }
+        if "voice_profile" in data:
+            incoming_vp = data.get("voice_profile") or {}
+            existing_vp = (existing or {}).get("voice_profile") or {}
+            doc["voice_profile"] = {
+                key: incoming_vp[key] if key in incoming_vp else existing_vp.get(key, default)
+                for key, default in vp_defaults.items()
+            }
+        elif existing is None:
+            doc["voice_profile"] = dict(vp_defaults)
+
         if "style_selections" in data:
             doc["style_selections"] = data["style_selections"]
         if "style_prompt_fragments" in data:
@@ -133,10 +171,6 @@ class BrandProfileService:
             doc["style_rotation_index"] = data["style_rotation_index"]
         if "cta_rotation_index" in data:
             doc["cta_rotation_index"] = data["cta_rotation_index"]
-
-        # brand_id is the isolation boundary; fall back to user_id for solo/legacy.
-        scope = {"brand_id": brand_id} if brand_id else {"user_id": user_id}
-        existing = await db[BrandProfileService.COLLECTION].find_one(scope)
 
         # OPTION 2: ONBOARDING VALIDATION - Enforce required fields
         # Only validate when user is ACTIVELY TRYING to complete onboarding (transition from False→True)
