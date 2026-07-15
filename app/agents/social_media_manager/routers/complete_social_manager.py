@@ -7917,25 +7917,52 @@ async def zapcap_job_status(
         {"$set": {"status": status, "output_url": output_url}},
     )
 
-    # When complete and music was requested, mix it in and cache the result
-    if status == "completed" and output_url and job.get("music_url"):
-        print(f"[ZapCapMusic] mixing music into job {job_id}", flush=True)
-        mixed_url = await _mix_music_into_video(output_url, job["music_url"])
-        if mixed_url:
-            await db["zapcap_jobs"].update_one(
-                {"job_id": job_id},
-                {"$set": {"final_output_url": mixed_url}},
-            )
-            output_url = mixed_url
-            print(f"[ZapCapMusic] done → {mixed_url[:60]}", flush=True)
-        else:
-            print(f"[ZapCapMusic] mix failed — returning raw ZapCap URL", flush=True)
-    elif status == "completed" and output_url:
-        # No music — cache as final to skip future polls
-        await db["zapcap_jobs"].update_one(
-            {"job_id": job_id},
-            {"$set": {"final_output_url": output_url}},
+    # When complete, always get a permanent Cloudinary URL
+    if status == "completed" and output_url:
+        from app.agents.social_media_manager.services.video_production_service import (
+            _upload_to_cloudinary as _zc_upload,
+            _upload_audio_to_cloudinary as _zc_upload_audio,
         )
+        import uuid as _uuid2
+
+        if job.get("music_url"):
+            print(f"[ZapCapMusic] mixing music into job {job_id}", flush=True)
+            mixed_url = await _mix_music_into_video(output_url, job["music_url"])
+            if mixed_url:
+                await db["zapcap_jobs"].update_one(
+                    {"job_id": job_id},
+                    {"$set": {"final_output_url": mixed_url}},
+                )
+                output_url = mixed_url
+                print(f"[ZapCapMusic] done → {mixed_url[:60]}", flush=True)
+            else:
+                print(f"[ZapCapMusic] mix failed — uploading raw video to Cloudinary", flush=True)
+                try:
+                    async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
+                        r2 = await client.get(output_url)
+                    if r2.status_code == 200:
+                        cdn_url = await _zc_upload(r2.content, f"zapcap-output-{_uuid2.uuid4().hex[:12]}")
+                        await db["zapcap_jobs"].update_one(
+                            {"job_id": job_id}, {"$set": {"final_output_url": cdn_url}}
+                        )
+                        output_url = cdn_url
+                except Exception as _e:
+                    print(f"[ZapCap] fallback Cloudinary upload failed: {_e}", flush=True)
+        else:
+            # No music — upload to Cloudinary for a permanent URL
+            print(f"[ZapCap] uploading output to Cloudinary for job {job_id}", flush=True)
+            try:
+                async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
+                    r2 = await client.get(output_url)
+                if r2.status_code == 200:
+                    cdn_url = await _zc_upload(r2.content, f"zapcap-output-{_uuid2.uuid4().hex[:12]}")
+                    await db["zapcap_jobs"].update_one(
+                        {"job_id": job_id}, {"$set": {"final_output_url": cdn_url}}
+                    )
+                    output_url = cdn_url
+                    print(f"[ZapCap] uploaded → {cdn_url[:60]}", flush=True)
+            except Exception as _e:
+                print(f"[ZapCap] Cloudinary upload failed: {_e}", flush=True)
 
     return UriResponse.get_single_data_response("zapcap_job", {
         "status": status,
