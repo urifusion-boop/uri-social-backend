@@ -172,11 +172,15 @@ async def write_ad_copy(business_name: str, category: str, goal: str = "messages
 
 # ── Source 1: GENERATE — brand data, direct controlled image call ────────────
 
-async def _upload_bytes_to_cloudinary(img_bytes: bytes, public_id: str) -> Optional[str]:
+async def _upload_bytes_to_cloudinary(
+    file_bytes: bytes, public_id: str,
+    resource_type: str = "image", ext: str = "png", content_type: str = "image/png",
+) -> Optional[str]:
     """Signed REST upload straight from `settings` (not the `cloudinary` SDK, which
     reads raw os.environ and silently no-ops when credentials only live in .env via
     pydantic Settings). Matches the pattern already proven in this package's b-roll
-    generation — self-contained, no extra package coupling."""
+    generation — self-contained, no extra package coupling. Works for both images
+    (GENERATE's gpt-image-1 stills) and videos (a user's own uploaded ad video)."""
     cloud, api_key, api_secret = (settings.CLOUDINARY_CLOUD_NAME, settings.CLOUDINARY_API_KEY,
                                    settings.CLOUDINARY_API_SECRET)
     if not all([cloud, api_key, api_secret]):
@@ -184,14 +188,16 @@ async def _upload_bytes_to_cloudinary(img_bytes: bytes, public_id: str) -> Optio
     ts = int(time.time())
     sig = hashlib.sha1(f"folder=uri-ads&public_id={public_id}&timestamp={ts}{api_secret}".encode()).hexdigest()
     form = aiohttp.FormData()
-    form.add_field("file", img_bytes, filename=f"{public_id}.png", content_type="image/png")
+    form.add_field("file", file_bytes, filename=f"{public_id}.{ext}", content_type=content_type)
     for k, v in (("api_key", api_key), ("timestamp", str(ts)), ("signature", sig),
-                 ("public_id", public_id), ("folder", "uri-ads"), ("resource_type", "image")):
+                 ("public_id", public_id), ("folder", "uri-ads"), ("resource_type", resource_type)):
         form.add_field(k, v)
+    # Video files are much larger than a generated still — allow more time to upload.
+    timeout = 180 if resource_type == "video" else 60
     try:
         async with aiohttp.ClientSession() as s:
-            async with s.post(f"https://api.cloudinary.com/v1_1/{cloud}/image/upload",
-                              data=form, timeout=aiohttp.ClientTimeout(total=60)) as r:
+            async with s.post(f"https://api.cloudinary.com/v1_1/{cloud}/{resource_type}/upload",
+                              data=form, timeout=aiohttp.ClientTimeout(total=timeout)) as r:
                 body = json.loads(await r.text())
                 return body.get("secure_url") if r.ok else None
     except Exception as e:
@@ -292,17 +298,31 @@ async def get_draft_image(draft_id: str, user_id: str, db) -> Optional[dict]:
 
 # ── Assemble (pure) ───────────────────────────────────────────────────────────
 
+_VIDEO_EXTENSIONS = (".mp4", ".mov", ".webm", ".m4v")
+
+
+def _looks_like_video(url: str) -> bool:
+    """Best-effort detection from the URL extension — used when the caller doesn't
+    already know the media type (e.g. a content draft, where it's rare but possible)."""
+    return url.lower().split("?")[0].endswith(_VIDEO_EXTENSIONS)
+
+
 def assemble_creative(copy: AdCopy, image_url: Optional[str],
-                      source: CreativeSource = CreativeSource.GENERATE) -> AdCreative:
-    """Combine copy + image into a submittable creative. The WhatsApp CTA is always
-    attached; `generated` is False when there's no image (copy-only fallback)."""
+                      source: CreativeSource = CreativeSource.GENERATE,
+                      is_video: Optional[bool] = None) -> AdCreative:
+    """Combine copy + media into a submittable creative. The WhatsApp CTA is always
+    attached; `generated` is False when there's no media (copy-only fallback).
+    `is_video` should be passed explicitly when the caller already knows the media
+    type (e.g. from the upload's content-type); otherwise it's guessed from the URL."""
+    url = image_url or ""
     return AdCreative(
-        image_url=image_url or "",
+        image_url=url,
+        is_video=is_video if is_video is not None else _looks_like_video(url),
         headline=copy.headline,
         primary_text=copy.primary_text,
         cta=WHATSAPP_CTA,
         source=source,
-        generated=bool(image_url),
+        generated=bool(url),
     )
 
 
@@ -327,14 +347,15 @@ async def generate_ad_creative(
 async def creative_from_upload(
     business_name: str, category: str, image_url: str, goal: str = "messages",
     description: str = "", user_id: str = "", db=None, brand_id: Optional[str] = None,
+    is_video: Optional[bool] = None,
 ) -> AdCreative:
-    """SOURCE 2 — the user's own uploaded photo/video (already hosted via the
-    existing /upload-user-content flow) becomes the creative directly; Jane still
-    writes fresh copy to match it. No location grounding needed — the photo IS the
-    real place already."""
+    """SOURCE 2 — the user's own uploaded photo OR video (uploaded via
+    /jane-ads/creative/upload, or the existing /upload-user-content flow) becomes
+    the creative directly; Jane still writes fresh copy to match it. No location
+    grounding needed — the media IS the real place already."""
     brand_context = await get_brand_context(user_id, db, brand_id) if user_id else {}
     copy = await write_ad_copy(business_name, category, goal, description, brand_context)
-    return assemble_creative(copy, image_url, source=CreativeSource.UPLOAD)
+    return assemble_creative(copy, image_url, source=CreativeSource.UPLOAD, is_video=is_video)
 
 
 async def creative_from_draft(

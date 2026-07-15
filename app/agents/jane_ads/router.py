@@ -199,6 +199,7 @@ class CreativeForBrandBody(BaseModel):
     city: str = ""                     # grounds the GENERATE image in the real place
     source: str = "generate"           # generate | upload | draft
     reference_image_url: str = ""      # required for source=upload
+    is_video: bool = False             # is reference_image_url a video? (from /creative/upload)
     draft_id: str = ""                 # required for source=draft
 
 
@@ -220,6 +221,7 @@ async def creative_for_brand(
         ad = await creative_from_upload(
             body.business_name, body.category, body.reference_image_url, body.goal,
             body.description, user_id=user_id, db=db, brand_id=brand_id,
+            is_video=body.is_video,
         )
     elif body.source == "draft":
         if not body.draft_id:
@@ -251,26 +253,45 @@ async def creative_drafts(
     return {"drafts": drafts}
 
 
+_UPLOAD_IMAGE_TYPES = {
+    "image/png": "png", "image/jpeg": "jpg", "image/jpg": "jpg", "image/webp": "webp",
+}
+_UPLOAD_VIDEO_TYPES = {
+    "video/mp4": "mp4", "video/quicktime": "mov", "video/webm": "webm", "video/x-m4v": "m4v",
+}
+_MAX_UPLOAD_IMAGE_BYTES = 8 * 1024 * 1024     # 8 MB
+_MAX_UPLOAD_VIDEO_BYTES = 100 * 1024 * 1024   # 100 MB — short vertical ad clips
+
+
 @router.post("/creative/upload")
 async def creative_upload(
     file: UploadFile = File(...),
     brand_ctx: dict = Depends(get_active_brand_context),
 ) -> dict:
-    """Upload the user's own photo for the source=upload ad creative path. Returns a
-    hosted URL to pass as `reference_image_url` to /creative/for-brand."""
-    allowed = {"image/png", "image/jpeg", "image/jpg", "image/webp"}
-    if file.content_type not in allowed:
-        raise HTTPException(status_code=400, detail=f"Unsupported file type: {file.content_type}")
+    """Upload the user's own photo OR video for the source=upload ad creative path.
+    Returns a hosted URL (+ is_video) to pass to /creative/for-brand."""
+    is_video = file.content_type in _UPLOAD_VIDEO_TYPES
+    ext = _UPLOAD_VIDEO_TYPES.get(file.content_type) or _UPLOAD_IMAGE_TYPES.get(file.content_type)
+    if not ext:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type: {file.content_type}. Use PNG/JPG/WEBP or MP4/MOV/WEBM.",
+        )
     contents = await file.read()
-    if len(contents) > 8 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="Image must be under 8 MB.")
+    max_bytes = _MAX_UPLOAD_VIDEO_BYTES if is_video else _MAX_UPLOAD_IMAGE_BYTES
+    if len(contents) > max_bytes:
+        raise HTTPException(status_code=400, detail=f"File must be under {max_bytes // (1024*1024)} MB.")
 
     from .creative import _upload_bytes_to_cloudinary
     import uuid as _uuid
-    url = await _upload_bytes_to_cloudinary(contents, f"upload-{_uuid.uuid4().hex[:12]}")
+    url = await _upload_bytes_to_cloudinary(
+        contents, f"upload-{_uuid.uuid4().hex[:12]}",
+        resource_type="video" if is_video else "image",
+        ext=ext, content_type=file.content_type,
+    )
     if not url:
         raise HTTPException(status_code=502, detail="Upload failed, please try again.")
-    return {"url": url}
+    return {"url": url, "is_video": is_video}
 
 
 # ── Real wallet funding via Squad ─────────────────────────────────────────────
@@ -629,10 +650,10 @@ async function run(){
   html+='<div style="margin-top:16px">'+
     '<div class="branchset" style="margin-bottom:8px">'+
       '<button type="button" onclick="genCreative(\\'generate\\')" style="background:#111;width:auto;margin:0;padding:10px 16px">🎨 Generate'+(loggedIn?' (my brand)':'')+'</button>'+
-      '<button type="button" onclick="triggerUpload()" style="background:'+(loggedIn?'#555':'#ccc')+';width:auto;margin:0;padding:10px 16px" '+(loggedIn?'':'disabled title="log in first"')+'>📤 Upload my own photo</button>'+
+      '<button type="button" onclick="triggerUpload()" style="background:'+(loggedIn?'#555':'#ccc')+';width:auto;margin:0;padding:10px 16px" '+(loggedIn?'':'disabled title="log in first"')+'>📤 Upload my own photo/video</button>'+
       '<button type="button" onclick="pickDraft()" style="background:'+(loggedIn?'#555':'#ccc')+';width:auto;margin:0;padding:10px 16px" '+(loggedIn?'':'disabled title="log in first"')+'>🗂️ Pick from my drafts</button>'+
     '</div>'+
-    '<input type="file" id="uploadFile" accept="image/png,image/jpeg,image/webp" style="display:none" onchange="uploadAndGenerate()"/>'+
+    '<input type="file" id="uploadFile" accept="image/png,image/jpeg,image/webp,video/mp4,video/quicktime,video/webm" style="display:none" onchange="uploadAndGenerate()"/>'+
   '</div><div id="creative"></div>';
   out.insertAdjacentHTML('beforeend',html);
 }
@@ -668,10 +689,12 @@ function renderCreative(a){
   const box=document.getElementById('creative');
   let h='<hr class="divider"/>';
   if(a.source) h+='<span class="pill">source: '+esc(a.source)+'</span>';
-  if(a.image_url){
+  if(a.image_url && a.is_video){
+    h+='<video src="'+a.image_url+'" controls style="width:100%;max-width:280px;border-radius:12px;display:block;margin:10px auto"></video>';
+  } else if(a.image_url){
     h+='<img src="'+a.image_url+'" alt="ad" style="width:100%;max-width:280px;border-radius:12px;display:block;margin:10px auto"/>';
   } else {
-    h+='<p class="why">(Image unavailable — showing copy only.)</p>';
+    h+='<p class="why">(Media unavailable — showing copy only.)</p>';
   }
   h+='<p class="verdict" style="font-size:16px">'+esc(a.headline)+'</p>'+
      '<p class="why">"'+esc(a.primary_text)+'"</p>'+
@@ -707,13 +730,14 @@ async function uploadAndGenerate(){
   const file=input.files[0];
   if(!file) return;
   const box=document.getElementById('creative');
-  box.innerHTML='<p class="thinking" style="margin-top:14px">📤 Uploading your photo…</p>';
+  const isVid=file.type.startsWith('video/');
+  box.innerHTML='<p class="thinking" style="margin-top:14px">📤 Uploading your '+(isVid?'video':'photo')+'…</p>';
   const form=new FormData(); form.append('file',file);
   try{
     const r=await fetch('/jane-ads/creative/upload',{method:'POST',headers:{'Authorization':'Bearer '+authToken},body:form});
     const d=await r.json();
     if(!r.ok) throw new Error(d.detail||'upload failed');
-    await genCreative('upload',{reference_image_url:d.url});
+    await genCreative('upload',{reference_image_url:d.url,is_video:d.is_video});
   }catch(e){ box.innerHTML='<p class="why">Upload failed: '+String(e.message||e)+'</p>'; }
 }
 async function pickDraft(){

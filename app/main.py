@@ -60,7 +60,7 @@ async def startup_event():
     # Ensure unique email index on users collection (prevents duplicate signups)
     try:
         from app.database import get_db
-        db = await get_db()
+        db = get_db()
         await db["users"].create_index("email", unique=True)
         print("✅ Unique email index ensured on users collection")
     except Exception as e:
@@ -71,7 +71,7 @@ async def startup_event():
     # (user_id, platform, brand_id, page_id) so each brand gets its own isolated connection.
     try:
         from app.database import get_db
-        db = await get_db()
+        db = get_db()
         existing = await db["social_connections"].index_information()
         if "user_id_1_platform_1_page_id_1" in existing:
             await db["social_connections"].drop_index("user_id_1_platform_1_page_id_1")
@@ -85,6 +85,25 @@ async def startup_event():
         print("✅ social_connections multi-brand index ensured")
     except Exception as e:
         print(f"⚠️  Warning: Failed to migrate social_connections index: {e}")
+
+    # Migrate brand_profiles index: a legacy unique index on user_id alone (from before
+    # agencies could own multiple brands) makes creating a second brand for the same
+    # owner throw a duplicate-key error at the DB layer — surfaces as "Failed to add
+    # brand" with an unhandled 500. Each brand's profile is scoped by brand_id, so
+    # user_id must not be unique on its own; keep it as a plain lookup index instead.
+    try:
+        from app.database import get_db
+        db = get_db()
+        existing = await db["brand_profiles"].index_information()
+        for name, info in existing.items():
+            keys = info.get("key", [])
+            if info.get("unique") and len(keys) == 1 and keys[0][0] == "user_id":
+                await db["brand_profiles"].drop_index(name)
+                print(f"✅ Dropped legacy unique brand_profiles index ({name})")
+        await db["brand_profiles"].create_index("user_id", unique=False, name="user_id_1_lookup")
+        print("✅ brand_profiles multi-brand index ensured")
+    except Exception as e:
+        print(f"⚠️  Warning: Failed to migrate brand_profiles index: {e}")
 
     # Start notification scheduler (PRD 8: Scheduled Jobs)
     try:
