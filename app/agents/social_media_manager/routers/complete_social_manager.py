@@ -5547,6 +5547,7 @@ async def save_video_draft(
             "draft_id": draft_id,
             "request_id": request_id,
             "platform": platform,
+            "platforms": [platform],
             "user_id": user_id,
             "media_type": "video",
             "video_url": request.merged_video_url,
