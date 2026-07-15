@@ -1236,10 +1236,13 @@ class ApprovalWorkflowService:
         Returns {"success": bool, "post_id": str|None, "raw_response": dict}.
         """
         # Build content string (append hashtags inline)
-        content = draft["content"]
+        content = (draft.get("content") or "").strip()
         if draft.get("hashtags"):
             tags = " ".join(f"#{t.strip('#')}" for t in draft["hashtags"])
-            content = f"{content} {tags}"
+            content = f"{content} {tags}".strip()
+        # Outstand requires at least 1 character in content
+        if not content:
+            content = " "
 
         # ── X direct (OAuth 1.0a) ─────────────────────────────────────────────
         if platform in ("x", "twitter") and connection.get("connected_via") == "x_direct":
@@ -1616,6 +1619,11 @@ class ApprovalWorkflowService:
                                 media_urls = [image_url]
                         else:
                             media_urls = [image_url]
+
+                # For reel posts, pass video_url as the Outstand media
+                if post_type == "reel" and not media_urls and draft.get("video_url"):
+                    media_urls = [draft["video_url"]]
+                    print(f"🎬 Reel: passing video_url to Outstand media: {draft['video_url'][:80]}")
 
                 # Instagram requires at least one image — warn and skip if no media
                 if platform == "instagram" and not media_urls:
