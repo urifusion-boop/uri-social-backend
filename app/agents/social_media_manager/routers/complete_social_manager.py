@@ -5535,23 +5535,32 @@ async def save_video_draft(
     from datetime import datetime, timezone
     import uuid as _uuid
 
-    draft_id = _uuid.uuid4().hex
-    doc = {
-        "id": draft_id,
-        "request_id": draft_id,      # satisfies unique index on content_drafts
-        "platform": "video",          # satisfies compound index (request_id, platform)
-        "user_id": user_id,
-        "media_type": "video",
-        "video_url": request.merged_video_url,
-        "content": request.caption,
-        "platforms": request.platforms,
-        "status": "draft",
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-    await db["content_drafts"].insert_one(doc)
+    now = datetime.now(timezone.utc).isoformat()
+    platforms = request.platforms if request.platforms else ["instagram"]
+    request_id = _uuid.uuid4().hex
 
-    doc.pop("_id", None)
-    return UriResponse.get_single_data_response("video_draft", doc)
+    docs = []
+    for platform in platforms:
+        draft_id = _uuid.uuid4().hex
+        docs.append({
+            "id": draft_id,
+            "draft_id": draft_id,
+            "request_id": request_id,
+            "platform": platform,
+            "user_id": user_id,
+            "media_type": "video",
+            "video_url": request.merged_video_url,
+            "content": request.caption,
+            "status": "draft",
+            "post_type": "reel",
+            "created_at": now,
+        })
+
+    await db["content_drafts"].insert_many(docs)
+
+    for doc in docs:
+        doc.pop("_id", None)
+    return UriResponse.get_single_data_response("video_draft", docs[0])
 
 
 @router.get("/video-drafts")
