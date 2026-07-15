@@ -21,13 +21,15 @@ from app.core.auth_bearer import JWTBearer
 from app.dependencies import get_active_brand_context, get_db_dependency
 
 from .adapters.mock import MockAdPlatformAdapter
-from .decision_engine import plan_campaign
+from .decision_engine import apply_platform_override, plan_campaign
+from .instrumentation import InstrumentationService, MongoInstrumentationStore
 from .models import (
     CampaignRequest,
     CreativeContext,
     CreativeKind,
     Goal,
     PlanDecision,
+    Platform,
     PurchaseBehaviour,
 )
 from .payments import JaneAdsPayments
@@ -50,18 +52,40 @@ class PlanRequestBody(BaseModel):
     geo: str = ""
     city: str = ""                    # e.g. "Surulere" — enables pin-and-pocket geo
     conversation_cost_ngn: float = Field(500.0, gt=0)
+    override_platforms: Optional[list[Platform]] = None   # reject Jane's pick, choose your own
+    override_reason: str = ""
 
 
-async def _plan_and_simulate(req: CampaignRequest, city: str, conversation_cost_ngn: float) -> dict:
+async def _plan_and_simulate(
+    req: CampaignRequest,
+    city: str,
+    conversation_cost_ngn: float,
+    db: AsyncIOMotorDatabase,
+    override_platforms: Optional[list[Platform]] = None,
+    override_reason: str = "",
+) -> dict:
     """Run the decision engine → geo refinement → a real-wallet/mock-adapter end-to-end.
-    Shared by /plan (form) and /understand (natural language)."""
+    Shared by /plan (form) and /understand (natural language). Every call is logged
+    (PRD §1.8); an explicit `override_platforms` also logs and applies an override."""
+    instrumentation = InstrumentationService(MongoInstrumentationStore(db))
     result = plan_campaign(req, funded_amount_ngn=req.budget_ngn,
                            total_funded_wallets_ngn=req.budget_ngn)
     if result.decision == PlanDecision.ADVISE:
+        await instrumentation.record_decision(req.business_id, result)
         return {"decision": "advise", "advice": result.advice.model_dump(),
                 "trace": result.advice.trace}
 
     plan_obj = result.plan
+    jane_platforms = [p.platform for p in plan_obj.platforms]
+    if override_platforms:
+        plan_obj = apply_platform_override(plan_obj, override_platforms)
+        await instrumentation.record_override(
+            req.business_id, jane_platforms=jane_platforms,
+            user_platforms=override_platforms, reason=override_reason,
+        )
+    await instrumentation.record_decision(
+        req.business_id, result, final_platforms=[p.platform for p in plan_obj.platforms],
+    )
 
     # Geo refinement — pin-and-pocket targeting within the chosen platform.
     geo_dump = None
@@ -104,6 +128,8 @@ async def _plan_and_simulate(req: CampaignRequest, city: str, conversation_cost_
         "account_cap_ngn": plan_obj.account_cap_ngn,
         "geo": geo_dump,
         "platforms": [p.model_dump() for p in plan_obj.platforms],
+        "overridden": bool(override_platforms),
+        "jane_recommended_platforms": [p.value for p in jane_platforms] if override_platforms else None,
         "simulation": {
             "conversations_delivered": len(delivered),
             "conversations_charged": charged,
@@ -119,7 +145,10 @@ async def _plan_and_simulate(req: CampaignRequest, city: str, conversation_cost_
 
 
 @router.post("/plan")
-async def plan(body: PlanRequestBody) -> dict:
+async def plan(
+    body: PlanRequestBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+) -> dict:
     """Form path: structured inputs → plan + geo + wallet simulation."""
     req = CampaignRequest(
         business_id="demo",
@@ -137,7 +166,10 @@ async def plan(body: PlanRequestBody) -> dict:
         has_existing_demand=body.has_existing_demand,
         geo=body.geo,
     )
-    return await _plan_and_simulate(req, body.city, body.conversation_cost_ngn)
+    return await _plan_and_simulate(
+        req, body.city, body.conversation_cost_ngn, db,
+        override_platforms=body.override_platforms, override_reason=body.override_reason,
+    )
 
 
 class UnderstandBody(BaseModel):
@@ -148,7 +180,10 @@ class UnderstandBody(BaseModel):
 
 
 @router.post("/understand")
-async def understand(body: UnderstandBody) -> dict:
+async def understand(
+    body: UnderstandBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+) -> dict:
     """Natural-language path: Jane reads a plain-English message, extracts the goal/
     budget/behaviour/city herself, then runs the same plan. Asks a follow-up if the
     budget is missing rather than guessing."""
@@ -161,7 +196,7 @@ async def understand(body: UnderstandBody) -> dict:
             "understood": parsed.model_dump(),
             "question": parsed.clarify or "How much would you like to spend?",
         }
-    result = await _plan_and_simulate(req, parsed.city, body.conversation_cost_ngn)
+    result = await _plan_and_simulate(req, parsed.city, body.conversation_cost_ngn, db)
     result["understood"] = parsed.model_dump()
     return result
 
@@ -356,6 +391,25 @@ async def wallet_balance(
         "business_id": business_id,
         "balance_ngn": balance,
         "transactions": [t.model_dump(mode="json") for t in txns[-20:]],
+    }
+
+
+@router.get("/instrumentation/{business_id}")
+async def instrumentation_log(
+    business_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    _token: dict = Depends(JWTBearer()),
+    limit: int = 100,
+) -> dict:
+    """Decision + override history for a business (PRD §1.8) — to measure and
+    improve Jane: how often she's overridden, and on what kind of call."""
+    instrumentation = InstrumentationService(MongoInstrumentationStore(db))
+    decisions = await instrumentation.decisions_for(business_id, limit)
+    overrides = await instrumentation.overrides_for(business_id, limit)
+    return {
+        "business_id": business_id,
+        "decisions": [d.model_dump(mode="json") for d in decisions],
+        "overrides": [o.model_dump(mode="json") for o in overrides],
     }
 
 

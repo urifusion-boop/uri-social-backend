@@ -207,6 +207,30 @@ def choose_platform(
 plan_campaign = choose_platform
 
 
+def apply_platform_override(plan: CampaignPlan, chosen: list[Platform]) -> CampaignPlan:
+    """Rebuild a plan's platform split around the user's explicit choice, overriding
+    Jane's recommendation (PRD §1.8 — every override is logged separately by the
+    instrumentation layer; this just makes the simulation actually reflect it).
+    Re-splits the same total budget (per_business_cap_ngn) evenly across `chosen`."""
+    chosen = list(dict.fromkeys(chosen))  # dedupe, preserve order
+    if not chosen:
+        raise ValueError("override must choose at least one platform")
+
+    total_budget = plan.per_business_cap_ngn
+    per_platform_budget = total_budget / len(chosen)
+    days = _days_for(total_budget)
+
+    platform_plans: list[PlatformPlan] = []
+    for p in chosen:
+        variants, scope = _variant_plan(per_platform_budget, C.USEFUL_MIN_NGN[p.value])
+        platform_plans.append(PlatformPlan(
+            platform=p, budget_ngn=round(per_platform_budget, 2), days=days,
+            variants=variants, test_scope=scope,
+            objective=CampaignObjective.CONVERSATIONS,
+        ))
+    return plan.model_copy(update={"platforms": platform_plans})
+
+
 def _explain(
     request: CampaignRequest,
     behaviour: PurchaseBehaviour,
