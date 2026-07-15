@@ -183,14 +183,17 @@ class CreativeSource(str, Enum):
 
 
 class AdCreative(BaseModel):
-    """A complete ad ready to submit: an image + copy + the WhatsApp CTA.
-    Every ad routes to WhatsApp — the CTA is fixed, never up to the user."""
-    image_url: str = ""             # final image, hosted on Cloudinary
+    """A complete ad ready to submit: a creative (image or video) + copy + the
+    WhatsApp CTA. Every ad routes to WhatsApp — the CTA is fixed, never up to the
+    user. GENERATE always produces an image (gpt-image-1 has no video mode); UPLOAD
+    and DRAFT can carry either — `is_video` says which."""
+    image_url: str = ""             # final creative media URL, hosted on Cloudinary
+    is_video: bool = False           # True when image_url is actually a video
     headline: str = ""
     primary_text: str = ""
     cta: str = "Send WhatsApp Message"
     source: CreativeSource = CreativeSource.GENERATE
-    generated: bool = True          # False when there's no image → copy-only fallback
+    generated: bool = True          # False when there's no media → copy-only fallback
 
 
 # ── Events (adapter → Shore) ──────────────────────────────────────────────────

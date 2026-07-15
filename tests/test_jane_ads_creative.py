@@ -11,6 +11,7 @@ from app.agents.jane_ads.creative import (
     _as_ad_content,
     _draft_to_summary,
     _location_prompt_bit,
+    _looks_like_video,
     assemble_creative,
 )
 from app.agents.jane_ads.models import AdCopy, CreativeSource
@@ -25,6 +26,7 @@ def test_assemble_with_image_defaults_to_generate_source():
     assert c.primary_text == "Hot meals near your office."
     assert c.source == CreativeSource.GENERATE
     assert c.generated is True
+    assert c.is_video is False
 
 
 def test_cta_is_always_whatsapp():
@@ -144,3 +146,39 @@ def test_location_bit_matches_setting_to_business_tier():
     out = _location_prompt_bit("Ikeja", category="fine dining restaurant")
     assert "fine dining restaurant" in out
     assert "caliber" in out.lower() or "quality" in out.lower()
+
+
+# ── Video upload support (pure) ────────────────────────────────────────────────
+# UPLOAD (and, in rare cases, DRAFT) can carry a video, not just a photo — the CTA/
+# copy/source handling is identical either way, only `is_video` differs.
+
+def test_looks_like_video_detects_common_extensions():
+    for url in ("https://cdn/ad.mp4", "https://cdn/ad.mov", "https://cdn/ad.webm",
+                "https://cdn/ad.mp4?x=1"):
+        assert _looks_like_video(url) is True
+
+
+def test_looks_like_video_false_for_images():
+    for url in ("https://cdn/ad.png", "https://cdn/ad.jpg", "https://cdn/ad.webp"):
+        assert _looks_like_video(url) is False
+
+
+def test_assemble_creative_explicit_is_video_true():
+    c = assemble_creative(AdCopy(headline="h"), "https://cdn/clip.mp4",
+                          source=CreativeSource.UPLOAD, is_video=True)
+    assert c.is_video is True
+    assert c.source == CreativeSource.UPLOAD
+    assert c.generated is True   # a video still counts as a real, submittable creative
+
+
+def test_assemble_creative_auto_detects_video_when_not_told():
+    # Caller didn't say — fall back to guessing from the URL (e.g. a content draft).
+    c = assemble_creative(AdCopy(headline="h"), "https://cdn/clip.mov")
+    assert c.is_video is True
+
+
+def test_assemble_creative_explicit_flag_overrides_guess():
+    # A .mp4 URL that's explicitly marked non-video (edge case, e.g. a signed URL
+    # without an extension) should respect the caller's explicit answer.
+    c = assemble_creative(AdCopy(headline="h"), "https://cdn/weird-no-ext", is_video=False)
+    assert c.is_video is False
