@@ -88,6 +88,25 @@ async def startup_event():
     except Exception as e:
         print(f"⚠️  Warning: Failed to migrate social_connections index: {e}")
 
+    # Migrate brand_profiles index: a legacy unique index on user_id alone (from before
+    # agencies could own multiple brands) makes creating a second brand for the same
+    # owner throw a duplicate-key error at the DB layer — surfaces as "Failed to add
+    # brand" with an unhandled 500. Each brand's profile is scoped by brand_id, so
+    # user_id must not be unique on its own; keep it as a plain lookup index instead.
+    try:
+        from app.database import get_db
+        db = get_db()
+        existing = await db["brand_profiles"].index_information()
+        for name, info in existing.items():
+            keys = info.get("key", [])
+            if info.get("unique") and len(keys) == 1 and keys[0][0] == "user_id":
+                await db["brand_profiles"].drop_index(name)
+                print(f"✅ Dropped legacy unique brand_profiles index ({name})")
+        await db["brand_profiles"].create_index("user_id", unique=False, name="user_id_1_lookup")
+        print("✅ brand_profiles multi-brand index ensured")
+    except Exception as e:
+        print(f"⚠️  Warning: Failed to migrate brand_profiles index: {e}")
+
     # Start notification scheduler (PRD 8: Scheduled Jobs)
     try:
         from app.services.notification_scheduler import start_notification_scheduler
