@@ -7530,7 +7530,7 @@ async def _mix_music_into_video(video_url: str, music_url: str) -> Optional[str]
             "ffmpeg", "-y",
             "-i", video_tmp,
             "-stream_loop", "-1", "-i", music_tmp,
-            "-filter_complex", "[1:a]volume=0.15[m];[0:a][m]amix=inputs=2:duration=first:normalize=0[a]",
+            "-filter_complex", "[0:a]volume=2.0[va];[1:a]volume=0.3[ma];[va][ma]amix=inputs=2:duration=first[a]",
             "-map", "0:v", "-map", "[a]",
             "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
             "-shortest",
