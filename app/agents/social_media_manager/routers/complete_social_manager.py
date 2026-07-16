@@ -180,6 +180,7 @@ class ContentGenerationRequest(BaseModel):
     num_slides: int = 3        # carousel only (2–5)
     acknowledged_incomplete_profile: bool = False  # OPTION 1: User acknowledged incomplete profile warning
     override_cta: Optional[str] = None  # One-time CTA for this generation only (not saved to brand playbook)
+    style_override: Optional[List[str]] = None  # One-time visual style slug(s) for this generation only (not saved to brand playbook). Carousel: cycles per slide. Single post: uses the first slug.
 
 class SocialConnectionRequest(BaseModel):
     platforms: List[str] = Field(..., min_items=1, max_items=10)
@@ -623,6 +624,7 @@ async def generate_content(
                             image_model=request.image_model,
                             total_slides=total_slides,
                             carousel_id=carousel_id,
+                            style_override=request.style_override,
                         )))
                 else:
                     _bg_image_tasks.append(asyncio.create_task(_generate_image_bg(
@@ -635,6 +637,7 @@ async def generate_content(
                         reference_image=ref_images[0] if ref_images else None,
                         post_type=post_type,
                         image_model=request.image_model,
+                        style_override=request.style_override,
                     )))
             _BG_IMAGE_TASKS.update(_bg_image_tasks)
             for t in _bg_image_tasks:
@@ -4662,6 +4665,7 @@ async def _generate_image_bg(
     image_model: Optional[str] = None,
     total_slides: Optional[int] = None,
     carousel_id: Optional[str] = None,
+    style_override: Optional[List[str]] = None,
 ):
     """
     Background task: generate an image for an existing draft and save it to DB.
@@ -4680,7 +4684,7 @@ async def _generate_image_bg(
     )
 
     try:
-        from app.agents.social_media_manager.services.style_library import pick_next_style
+        from app.agents.social_media_manager.services.style_library import pick_next_style, get_prompt_fragment
 
         # Build the correct brand profile scope for style lookups.
         # Using user_id alone returns the personal brand profile even when an agency
@@ -4689,95 +4693,115 @@ async def _generate_image_bg(
         _bc_user_id = brand_context.get("user_id", "")
         _style_profile_scope = {"brand_id": _bc_brand_id} if _bc_brand_id else {"user_id": _bc_user_id}
 
-        # ── Visual style rotation ─────────────────────────────────────────────
-        # For carousel posts: lock style to first slide, reuse for all subsequent slides
-        # For regular posts: rotate style normally
         if post_type == "carousel" and carousel_id and slide_index is not None:
-            if slide_index == 0:
-                # First slide: pick style and cache it for this carousel
-                _bp = await db["brand_profiles"].find_one(
-                    _style_profile_scope,
-                    {"style_selections": 1, "style_prompt_fragments": 1, "style_rotation_index": 1, "industry": 1, "selected_custom_guides": 1, "selected_custom_guides_v2": 1},
-                ) or {}
+            # ── Visual style: cycles PER SLIDE, not locked for the whole carousel ──
+            # slide 0 gets style_override[0] (or style_selections[0]), slide 1 gets
+            # [1], etc, wrapping if there are more slides than styles. Each slide
+            # computes its own index independently from the (explicit override or
+            # brand-profile) style list and its own slide_index — no cross-slide
+            # cache to race on, since these run concurrently as separate asyncio
+            # tasks. Custom visual guides are a different feature and still lock
+            # one guide for the whole carousel (unchanged) — mixing guides
+            # mid-carousel isn't what a "custom guide" selection is for, and an
+            # explicit style_override always means the user picked library styles
+            # for this generation, so it takes priority over any custom guide.
+            _bp = await db["brand_profiles"].find_one(
+                _style_profile_scope,
+                {"style_selections": 1, "style_prompt_fragments": 1, "style_rotation_index": 1, "industry": 1, "selected_custom_guides": 1, "selected_custom_guides_v2": 1},
+            ) or {}
 
-                # Check if user has selected custom guides (V1 or V2)
-                _custom_guide_ids_v1 = _bp.get("selected_custom_guides") or []
-                _custom_guide_ids_v2 = _bp.get("selected_custom_guides_v2") or []
-                _all_custom_guide_ids = _custom_guide_ids_v1 + _custom_guide_ids_v2
-                _custom_guide_id = None  # Initialize to avoid UnboundLocalError
+            _custom_guide_ids_v1 = _bp.get("selected_custom_guides") or []
+            _custom_guide_ids_v2 = _bp.get("selected_custom_guides_v2") or []
+            _all_custom_guide_ids = [] if style_override else (_custom_guide_ids_v1 + _custom_guide_ids_v2)
+            _custom_guide_id = None  # Initialize to avoid UnboundLocalError
 
-                if _all_custom_guide_ids:
-                    # Rotate through custom guides (V1 + V2) like library styles
+            if _all_custom_guide_ids:
+                # Custom guide: still locked to first slide, reused for the rest.
+                if slide_index == 0:
                     from app.agents.social_media_manager.services.custom_visual_guide_service import CustomVisualGuideService
                     from app.agents.social_media_manager.services.custom_visual_guide_v2_service import CustomVisualGuideV2Service
 
                     _rotation_index = int(_bp.get("style_rotation_index") or 0)
                     _custom_guide_id = _all_custom_guide_ids[_rotation_index % len(_all_custom_guide_ids)]
-
-                    # Determine if this is V1 or V2
                     is_v2 = _custom_guide_id in _custom_guide_ids_v2
 
                     if is_v2:
-                        # V2: Load guide and apply reference image
                         custom_guide = await db["custom_visual_guides"].find_one({"_id": ObjectId(_custom_guide_id), "version": "v2"})
                         if custom_guide:
-                            _fragment = ""  # V2 doesn't use prompt fragments
                             _slug = f"custom_v2_{_custom_guide_id[:8]}"
                             _next_index = (_rotation_index + 1) % (len(_all_custom_guide_ids) + len(_bp.get("style_selections") or []))
+                            _v2_ref = custom_guide.get("original_image_url")
                             brand_context = {
                                 **brand_context,
                                 "style_slug": _slug,
                                 "custom_guide_v2_id": _custom_guide_id,
-                                "custom_guide_v2_reference_image": custom_guide.get("original_image_url")
+                                "custom_guide_v2_reference_image": _v2_ref,
                             }
+                            await db["content_drafts"].update_one(
+                                {"id": carousel_id},
+                                {"$set": {"carousel_style_slug": _slug, "carousel_custom_guide_v2_id": _custom_guide_id, "carousel_custom_guide_v2_ref": _v2_ref}},
+                            )
+                            await db["brand_profiles"].update_one(_style_profile_scope, {"$set": {"style_rotation_index": _next_index}})
                             print(f"🎨 Custom V2 guide [{custom_guide.get('name')}] applied for all {total_slides} carousel slides")
                     else:
-                        # V1: Use prompt fragment
                         custom_guide = await CustomVisualGuideService.get_guide_detail(_custom_guide_id, db)
                         if custom_guide:
                             _fragment = custom_guide.get("prompt_fragment", "")
                             _slug = f"custom_{_custom_guide_id[:8]}"
                             _next_index = (_rotation_index + 1) % (len(_all_custom_guide_ids) + len(_bp.get("style_selections") or []))
                             brand_context = {**brand_context, "style_prompt_fragment": _fragment, "style_slug": _slug, "custom_guide_id": _custom_guide_id}
-                            print(f"🎨 Custom V1 guide [{custom_guide.get('name')}] applied for all {total_slides} carousel slides")
-
-                            # Track V1 usage
+                            await db["content_drafts"].update_one(
+                                {"id": carousel_id},
+                                {"$set": {"carousel_style_slug": _slug, "carousel_style_fragment": _fragment}},
+                            )
+                            await db["brand_profiles"].update_one(_style_profile_scope, {"$set": {"style_rotation_index": _next_index}})
                             await CustomVisualGuideService.track_guide_usage(_custom_guide_id, False, db)
+                            print(f"🎨 Custom V1 guide [{custom_guide.get('name')}] applied for all {total_slides} carousel slides")
                 else:
-                    # Fallback to library style rotation
-                    _style_selections = _bp.get("style_selections") or []
-                    _style_prompt_fragments = _bp.get("style_prompt_fragments") or []
-                    _rotation_index = int(_bp.get("style_rotation_index") or 0)
-                    _industry = _bp.get("industry") or brand_context.get("industry", "")
-
-                    _slug, _fragment, _next_index = pick_next_style(
-                        _style_selections, _rotation_index, _industry, _style_prompt_fragments
+                    draft = await db["content_drafts"].find_one(
+                        {"id": carousel_id},
+                        {"carousel_style_slug": 1, "carousel_style_fragment": 1, "carousel_custom_guide_v2_id": 1, "carousel_custom_guide_v2_ref": 1},
                     )
+                    if draft:
+                        _slug = draft.get("carousel_style_slug")
+                        if draft.get("carousel_custom_guide_v2_id"):
+                            brand_context = {
+                                **brand_context,
+                                "style_slug": _slug,
+                                "custom_guide_v2_id": draft["carousel_custom_guide_v2_id"],
+                                "custom_guide_v2_reference_image": draft.get("carousel_custom_guide_v2_ref"),
+                            }
+                        elif draft.get("carousel_style_fragment"):
+                            brand_context = {**brand_context, "style_prompt_fragment": draft["carousel_style_fragment"], "style_slug": _slug}
+                        print(f"🎨 Reusing carousel custom guide [{_slug}] for slide {slide_index + 1}/{total_slides}")
+            else:
+                # Library styles (or an on-the-fly override): rotate per slide.
+                _style_selections = style_override or (_bp.get("style_selections") or [])
+                _style_prompt_fragments = [] if style_override else (_bp.get("style_prompt_fragments") or [])
+                _industry = _bp.get("industry") or brand_context.get("industry", "")
+
+                if _style_selections:
+                    _idx = slide_index % len(_style_selections)
+                    _slug = _style_selections[_idx]
+                    if _style_prompt_fragments and _idx < len(_style_prompt_fragments) and _style_prompt_fragments[_idx]:
+                        _fragment = _style_prompt_fragments[_idx]
+                    else:
+                        _fragment = get_prompt_fragment(_slug)
+                else:
+                    _slug, _fragment, _ = pick_next_style([], 0, _industry, [])
 
                 if _fragment:
-                    # Cache style in draft document for subsequent slides
-                    await db["content_drafts"].update_one(
-                        {"id": carousel_id},
-                        {"$set": {
-                            "carousel_style_slug": _slug,
-                            "carousel_style_fragment": _fragment
-                        }}
-                    )
+                    brand_context = {**brand_context, "style_prompt_fragment": _fragment, "style_slug": _slug}
+                    _pos = f"{(_idx + 1) if _style_selections else 1}/{len(_style_selections) or 1}"
+                    print(f"🎨 Slide {slide_index + 1}/{total_slides} style [{_slug}] ({_pos} in rotation)")
 
-                    # Only increment rotation index ONCE per carousel (not per slide) - skip for custom guides
-                    if not _custom_guide_id:
-                        print(f"🎨 Carousel style [{_slug}] applied for all {total_slides} slides (next index: {_next_index})")
-                        await db["brand_profiles"].update_one(
-                            _style_profile_scope,
-                            {"$set": {"style_rotation_index": _next_index}},
-                        )
-
-                # ── Lock the CTA for the whole carousel, same reasoning as style above ──
-                # _generate_platform_image() picks (and round-robin rotates) its own CTA
-                # every time it's called, and it's called once PER SLIDE, concurrently,
-                # all sharing the same brand_context dict — so without locking it here,
-                # each slide could race onto a different cta_rotation_index and end up
-                # with a different CTA than its neighbours in the same carousel.
+            # ── CTA: still locked once for the whole carousel ──
+            # _generate_platform_image() picks (and round-robin rotates) its own CTA
+            # every time it's called, and it's called once PER SLIDE, concurrently,
+            # all sharing the same brand_context dict — so without locking it here,
+            # each slide could race onto a different cta_rotation_index and end up
+            # with a different CTA than its neighbours in the same carousel.
+            if slide_index == 0:
                 _carousel_cta = brand_context.get("override_cta")
                 if not _carousel_cta:
                     _cta_styles_list = brand_context.get("cta_styles", [])
@@ -4799,21 +4823,11 @@ async def _generate_image_bg(
                 brand_context = {**brand_context, "override_cta": _carousel_cta}
                 print(f"🎯 CTA [{_carousel_cta}] locked for all {total_slides} carousel slides")
             else:
-                # Subsequent slides: reuse cached style + CTA from first slide
-                draft = await db["content_drafts"].find_one(
-                    {"id": carousel_id},
-                    {"carousel_style_slug": 1, "carousel_style_fragment": 1, "carousel_cta_text": 1}
-                )
-                if draft:
-                    _slug = draft.get("carousel_style_slug")
-                    _fragment = draft.get("carousel_style_fragment")
-                    if _fragment:
-                        brand_context = {**brand_context, "style_prompt_fragment": _fragment, "style_slug": _slug}
-                        print(f"🎨 Reusing carousel style [{_slug}] for slide {slide_index + 1}/{total_slides}")
-                    _carousel_cta = draft.get("carousel_cta_text")
-                    if _carousel_cta:
-                        brand_context = {**brand_context, "override_cta": _carousel_cta}
-                        print(f"🎯 Reusing carousel CTA [{_carousel_cta}] for slide {slide_index + 1}/{total_slides}")
+                draft = await db["content_drafts"].find_one({"id": carousel_id}, {"carousel_cta_text": 1})
+                _carousel_cta = draft.get("carousel_cta_text") if draft else None
+                if _carousel_cta:
+                    brand_context = {**brand_context, "override_cta": _carousel_cta}
+                    print(f"🎯 Reusing carousel CTA [{_carousel_cta}] for slide {slide_index + 1}/{total_slides}")
         else:
             # Regular post: check for custom guides (V1 + V2) first, then fallback to style rotation
             _bp = await db["brand_profiles"].find_one(
@@ -4821,13 +4835,19 @@ async def _generate_image_bg(
                 {"style_selections": 1, "style_prompt_fragments": 1, "style_rotation_index": 1, "industry": 1, "selected_custom_guides": 1, "selected_custom_guides_v2": 1},
             ) or {}
 
-            # Check if user has selected custom guides (V1 or V2)
+            # An on-the-fly style override always takes priority over custom guides too.
             _custom_guide_ids_v1 = _bp.get("selected_custom_guides") or []
             _custom_guide_ids_v2 = _bp.get("selected_custom_guides_v2") or []
-            _all_custom_guide_ids = _custom_guide_ids_v1 + _custom_guide_ids_v2
+            _all_custom_guide_ids = [] if style_override else (_custom_guide_ids_v1 + _custom_guide_ids_v2)
             _custom_guide_id = None  # Initialize to avoid UnboundLocalError
 
-            if _all_custom_guide_ids:
+            if style_override:
+                _slug = style_override[0]
+                _fragment = get_prompt_fragment(_slug)
+                if _fragment:
+                    brand_context = {**brand_context, "style_prompt_fragment": _fragment, "style_slug": _slug}
+                    print(f"🎨 Style override [{_slug}] applied for this image")
+            elif _all_custom_guide_ids:
                 # Rotate through custom guides (V1 + V2) like library styles
                 from app.agents.social_media_manager.services.custom_visual_guide_service import CustomVisualGuideService
                 from app.agents.social_media_manager.services.custom_visual_guide_v2_service import CustomVisualGuideV2Service
