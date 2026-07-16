@@ -13,6 +13,7 @@ from typing import Optional
 from datetime import datetime, timedelta
 from math import ceil
 from motor.motor_asyncio import AsyncIOMotorDatabase
+from pymongo import ReturnDocument
 from app.database import get_db
 from app.domain.models.billing_models import (
     UserTrial,
@@ -157,25 +158,27 @@ class TrialService:
         For carousels: deduct 1 credit per image.
         Returns False if trial expired or insufficient credits.
         """
-        trial_doc = await self.trials_collection.find_one({"user_id": user_id})
-        if not trial_doc:
-            return False
-
         now = datetime.utcnow()
-        end_date = trial_doc["trial_end_date"]
-        credits_remaining = trial_doc["credits_remaining"]
 
-        # PRD 2.3: Trial ends when 7 days elapsed OR credits = 0
-        if now >= end_date or credits_remaining < amount:
+        # Atomic check-and-decrement: the expiry/balance guard lives in the
+        # filter, so two concurrent requests can't both read the same
+        # credits_remaining and both succeed (the old find_one -> $set
+        # pattern allowed exactly that).
+        updated = await self.trials_collection.find_one_and_update(
+            {
+                "user_id": user_id,
+                "trial_end_date": {"$gt": now},
+                "credits_remaining": {"$gte": amount},
+            },
+            {"$inc": {"credits_remaining": -amount}},
+            return_document=ReturnDocument.AFTER,
+        )
+
+        if not updated:
             return False
 
-        balance_before = credits_remaining
-        new_remaining = credits_remaining - amount
-
-        await self.trials_collection.update_one(
-            {"user_id": user_id},
-            {"$set": {"credits_remaining": new_remaining}},
-        )
+        balance_after = updated["credits_remaining"]
+        balance_before = balance_after + amount
 
         # Log deduction
         await self.credit_transactions_collection.insert_one(
@@ -184,7 +187,7 @@ class TrialService:
                 type="deduction",
                 amount=-amount,  # Log actual amount deducted
                 balance_before=balance_before,
-                balance_after=new_remaining,
+                balance_after=balance_after,
                 reason=reason,
                 campaign_id=campaign_id,
                 created_at=now,
