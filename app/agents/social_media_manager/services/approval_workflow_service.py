@@ -1362,6 +1362,18 @@ class ApprovalWorkflowService:
                     slides=validated_slides,
                     page_id=page_id,
                 )
+            elif post_type == "reel":
+                video_url = draft.get("video_url") or ""
+                if not video_url:
+                    return {"success": False, "error": "Reel draft has no video_url. Re-generate the video before publishing."}
+                print(f"🎬 Instagram reel publish | ig_user_id={ig_user_id} video_url={video_url[:80]}")
+                return await InstagramDirectService.publish_reel(
+                    ig_user_id=ig_user_id,
+                    page_access_token=page_token,
+                    video_url=video_url,
+                    caption=content,
+                    page_id=page_id,
+                )
             elif post_type == "story":
                 image_url = ApprovalWorkflowService._resolve_image_url(draft.get("image_url") or "")
                 if image_url and image_url.startswith("data:"):
