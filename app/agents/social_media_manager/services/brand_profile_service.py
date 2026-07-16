@@ -149,10 +149,22 @@ class BrandProfileService:
             is_personal_brand = (brand_id == personal_bid)
 
             if is_personal_brand:
-                # Personal brand: query by user_id (ignore brand_id field entirely)
-                # This handles migration from old profiles without brand_id AND profiles with mismatched brand_id
-                scope = {"user_id": user_id}
-                existing = await db[BrandProfileService.COLLECTION].find_one(scope)
+                # Personal brand: scope by brand_id like the agency branch below. A
+                # bare {"user_id": user_id} here would match ANY of this user's
+                # brand_profiles docs (a multi-brand user has one per brand) and
+                # silently overwrite a DIFFERENT brand's document with personal-brand
+                # data on the next save.
+                existing = await db[BrandProfileService.COLLECTION].find_one({"brand_id": personal_bid})
+                if not existing:
+                    # Legacy: personal profile saved before brand_id existed.
+                    existing = await db[BrandProfileService.COLLECTION].find_one(
+                        {"user_id": user_id, "brand_id": {"$exists": False}}
+                    )
+
+                if existing and not existing.get("brand_id"):
+                    scope = {"user_id": user_id, "brand_id": {"$exists": False}}
+                else:
+                    scope = {"brand_id": personal_bid}
             else:
                 # Agency mode: query by brand_id (team brand)
                 # Try to find by brand_id first, then by user_id (for migration from old profiles)
@@ -249,12 +261,16 @@ class BrandProfileService:
         is_agency_brand = brand_id and brand_id != personal_bid
 
         # For personal brands, try multiple query strategies to find legacy profiles
-        # that were saved with user_id only (before brand_id was introduced)
+        # that were saved with user_id only (before brand_id was introduced). No bare
+        # {"user_id": user_id} fallback here — a user with several brands has several
+        # brand_profiles docs sharing that user_id, and matching on user_id alone can
+        # return a DIFFERENT brand's document (confirmed live: switching to the
+        # personal brand or a brand without its own doc served up whatever other
+        # brand's profile Mongo happened to return first for that user_id).
         if brand_id and not is_agency_brand:
             scope_options = [
                 {"brand_id": brand_id},
                 {"user_id": user_id, "brand_id": {"$exists": False}},
-                {"user_id": user_id},
             ]
             profile = None
             for scope in scope_options:
@@ -269,10 +285,12 @@ class BrandProfileService:
         # (colors, visual style, industry), merge in the personal brand's values so
         # content generation has a full context rather than using generic defaults.
         if is_agency_brand:
+            # No bare {"user_id": user_id} fallback here either — same cross-brand
+            # leak risk as above, just merging the wrong brand's data into this one
+            # instead of returning it outright.
             personal_scope_options = [
                 {"brand_id": personal_bid},
                 {"user_id": user_id, "brand_id": {"$exists": False}},
-                {"user_id": user_id},
             ]
             personal_profile = None
             for ps in personal_scope_options:
