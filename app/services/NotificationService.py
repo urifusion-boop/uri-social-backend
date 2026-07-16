@@ -216,7 +216,7 @@ class NotificationService:
         if not await self._check_rate_limit(user_id):
             return
 
-        app_url = settings.WEB_APP_URL or "https://app.urisocial.com"
+        app_url = (settings.WEB_APP_URL or "https://www.urisocial.com").strip("'\"")
         user_name = first_name or email.split("@")[0]
 
         # Welcome email
@@ -312,7 +312,7 @@ class NotificationService:
         if await self._was_recently_sent(user_id, "content_created", hours=4):
             return
 
-        app_url = settings.WEB_APP_URL or "https://app.urisocial.com"
+        app_url = (settings.WEB_APP_URL or "https://www.urisocial.com").strip("'\"")
         user_name = user.get("first_name") or user.get("email", "").split("@")[0]
 
         subject = "Your Content is Ready! ✨"
@@ -365,7 +365,7 @@ class NotificationService:
         if await self._was_recently_sent(user_id, "content_posted", hours=2):
             return
 
-        app_url = settings.WEB_APP_URL or "https://app.urisocial.com"
+        app_url = (settings.WEB_APP_URL or "https://www.urisocial.com").strip("'\"")
         user_name = user.get("first_name") or user.get("email", "").split("@")[0]
 
         subject = f"Content Published on {platform}! 🚀"
@@ -411,7 +411,7 @@ class NotificationService:
         if await self._was_recently_sent(user_id, "daily_suggestion", hours=20):
             return
 
-        app_url = settings.WEB_APP_URL or "https://app.urisocial.com"
+        app_url = (settings.WEB_APP_URL or "https://www.urisocial.com").strip("'\"")
         user_name = user.get("first_name") or user.get("email", "").split("@")[0]
 
         subject = "Today's Content Idea 💡"
@@ -458,7 +458,7 @@ class NotificationService:
         if await self._was_recently_sent(user_id, "inactivity", hours=48):
             return
 
-        app_url = settings.WEB_APP_URL or "https://app.urisocial.com"
+        app_url = (settings.WEB_APP_URL or "https://www.urisocial.com").strip("'\"")
         user_name = user.get("first_name") or user.get("email", "").split("@")[0]
 
         subject = "We Miss You! Your Audience is Waiting 👋"
@@ -502,7 +502,7 @@ class NotificationService:
         if await self._was_recently_sent(user_id, "trial_start", hours=24):
             return
 
-        app_url = settings.WEB_APP_URL or "https://app.urisocial.com"
+        app_url = (settings.WEB_APP_URL or "https://www.urisocial.com").strip("'\"")
         user_name = first_name or email.split("@")[0]
 
         subject = "Your Free Trial Has Started! 🎯"
@@ -542,7 +542,7 @@ class NotificationService:
         if await self._was_recently_sent(user_id, "trial_ending", hours=24):
             return
 
-        app_url = settings.WEB_APP_URL or "https://app.urisocial.com"
+        app_url = (settings.WEB_APP_URL or "https://www.urisocial.com").strip("'\"")
         user_name = user.get("first_name") or user.get("email", "").split("@")[0]
 
         subject = "Your Trial Ends Soon ⏳"
@@ -577,7 +577,7 @@ class NotificationService:
         if await self._was_recently_sent(user_id, "trial_expired", hours=48):
             return
 
-        app_url = settings.WEB_APP_URL or "https://app.urisocial.com"
+        app_url = (settings.WEB_APP_URL or "https://www.urisocial.com").strip("'\"")
         user_name = user.get("first_name") or user.get("email", "").split("@")[0]
 
         subject = "Your Free Trial Has Ended"

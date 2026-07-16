@@ -53,7 +53,7 @@ class PaymentService:
         print(f"🔐 SQUAD Payment Gateway initialized (default: {self.default_mode.upper()})")
 
         # User-facing callback URL (where users return after payment)
-        web_app_url = getattr(settings, 'WEB_APP_URL', 'https://www.urisocial.com')
+        web_app_url = (getattr(settings, 'WEB_APP_URL', '') or 'https://www.urisocial.com').strip("'\"")
         self.callback_url = f'{web_app_url}/workspace?tab=billing'
 
     async def _get_current_mode(self) -> str:
