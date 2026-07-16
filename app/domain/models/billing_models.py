@@ -100,7 +100,7 @@ class CreditTransaction(BaseModel):
     amount: int = Field(..., description="Credit amount (negative for deduction)")
     balance_before: int = Field(..., description="Credit balance before transaction")
     balance_after: int = Field(..., description="Credit balance after transaction")
-    reason: Literal["subscription", "retry", "campaign_generation", "refund", "bonus", "trial", "whatsapp_content_generation", "whatsapp_graphic_generation", "upload_user_content"] = Field(..., description="Why credits changed")
+    reason: Literal["subscription", "retry", "campaign_generation", "refund", "bonus", "trial", "whatsapp_content_generation", "whatsapp_graphic_generation", "upload_user_content", "custom_credit_purchase"] = Field(..., description="Why credits changed")
     campaign_id: Optional[str] = Field(default=None, description="Reference to content_requests if applicable")
     retry_count: Optional[int] = Field(default=0, description="Retry number if applicable")
     created_at: datetime = Field(default_factory=datetime.utcnow)
@@ -192,10 +192,19 @@ class PaymentTransaction(BaseModel):
     payment_method: Optional[str] = Field(default=None, description="card|bank_transfer|ussd")
     gateway: str = Field(default="squad", description="Payment gateway used")
 
-    # Subscription details (PRD 8.1 & 8.2)
-    subscription_tier: str = Field(..., description="Tier being purchased")
+    # What this payment is for — subscription tier purchase (default, legacy
+    # behavior) or a one-off custom-quantity bonus-credit top-up.
+    purchase_type: Literal["subscription", "custom_credits"] = Field(
+        default="subscription", description="subscription|custom_credits"
+    )
+
+    # Subscription details (PRD 8.1 & 8.2) — only set for purchase_type="subscription"
+    subscription_tier: Optional[str] = Field(default=None, description="Tier being purchased")
     billing_cycle: str = Field(default="monthly", description="monthly|3_months|6_months|12_months")
-    credits_allocated: int = Field(..., description="Total credits to be allocated for this payment")
+    credits_allocated: Optional[int] = Field(default=None, description="Total credits to be allocated for this payment")
+
+    # Only set for purchase_type="custom_credits"
+    credit_quantity: Optional[int] = Field(default=None, description="Number of bonus credits purchased (custom_credits only)")
 
     squad_response: Optional[dict] = Field(default=None, description="Full SQUAD webhook payload")
     created_at: datetime = Field(default_factory=datetime.utcnow)
@@ -348,6 +357,22 @@ class InitializePaymentResponse(BaseModel):
 class VerifyPaymentRequest(BaseModel):
     """Request to verify payment status"""
     transaction_ref: str = Field(..., description="SQUAD transaction reference")
+
+
+class PurchaseCustomCreditsRequest(BaseModel):
+    """
+    Request to buy an arbitrary quantity of bonus credits at a fixed
+    per-credit price (see PaymentService.CUSTOM_CREDIT_PRICE_NGN).
+    Credits are added as bonus_credits (never expire) once payment verifies.
+    """
+    quantity: int = Field(..., ge=1, le=1000, description="Number of credits to purchase (1-1000)")
+
+    class Config:
+        schema_extra = {
+            "example": {
+                "quantity": 10
+            }
+        }
 
 
 class CreditBalanceResponse(BaseModel):
