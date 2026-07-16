@@ -8,7 +8,7 @@
 <a href="{{ app_url }}/login" class="cta">Log In →</a>
 {% else %}
 <p>Sign up with this email address to get started — you'll automatically be added to the team.</p>
-<a href="{{ app_url }}/signup" class="cta">Create Your Account →</a>
+<a href="{{ app_url }}/login?tab=signup" class="cta">Create Your Account →</a>
 {% endif %}
 <p style="font-size:13px; color:#9CA3AF; margin-top:12px;">As {{ "an Admin" if role == "admin" else "an Agent" }}, you'll be able to {{ "manage billing, brands, and members" if role == "admin" else "create and manage content for the brands assigned to you" }}.</p>
 {% endblock %}
