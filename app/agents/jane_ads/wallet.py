@@ -133,21 +133,25 @@ class WalletService:
         InsufficientFundsError if the balance can't cover the charge — nothing runs on
         an empty wallet."""
         now = now or _now()
-        wallet = await self.get_or_create(business_id)
+        # Ensures a wallet doc exists before the debit attempt; the debit itself
+        # doesn't rely on this read for its balance decision.
+        await self.get_or_create(business_id)
         trailing = await self.trailing_cost_per_conversation(business_id, now=now)
         price = self.price_conversation(trailing)
 
-        if wallet.status != WalletStatus.ACTIVE:
-            raise InsufficientFundsError(f"Wallet {business_id} is {wallet.status.value}.")
-        if wallet.balance_ngn < price:
+        # Atomic guard-and-decrement: the ACTIVE/balance check and the deduction
+        # happen as one store operation, so two concurrent charges against the
+        # same wallet can't both read a sufficient balance and both succeed
+        # (the previous read -> compute -> upsert pattern allowed exactly that).
+        wallet = await self._store.try_debit(business_id, price, now)
+        if wallet is None:
+            current = await self._store.get_wallet(business_id)
+            if current and current.status != WalletStatus.ACTIVE:
+                raise InsufficientFundsError(f"Wallet {business_id} is {current.status.value}.")
+            balance = current.balance_ngn if current else 0.0
             raise InsufficientFundsError(
-                f"Balance ₦{wallet.balance_ngn:,.2f} < charge ₦{price:,.2f}."
+                f"Balance ₦{balance:,.2f} < charge ₦{price:,.2f}."
             )
-
-        wallet.balance_ngn = round(wallet.balance_ngn - price, 2)
-        wallet.total_spent_ngn = round(wallet.total_spent_ngn + price, 2)
-        wallet.updated_at = now
-        await self._store.upsert_wallet(wallet)
 
         txn = Transaction(
             transaction_id=f"txn_{uuid.uuid4().hex[:16]}",

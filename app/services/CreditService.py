@@ -13,6 +13,7 @@ from typing import Optional, List, Dict
 from datetime import datetime, timedelta
 from bson import ObjectId
 from motor.motor_asyncio import AsyncIOMotorDatabase
+from pymongo import ReturnDocument
 from app.database import get_db
 from app.domain.models.billing_models import (
     UserCreditWallet,
@@ -249,51 +250,87 @@ class CreditService:
         Returns:
             bool: True if deduction successful, False if insufficient credits
         """
-        wallet = await self.get_user_wallet(user_id)
-
-        if not wallet:
+        # Cheap existence check only — decides the legacy-bypass branch. The
+        # actual balance guard below is atomic, so this read can go stale
+        # without opening a double-spend window.
+        wallet_exists = await self.user_credits_collection.find_one(
+            {"user_id": user_id}, {"_id": 1}
+        )
+        if not wallet_exists:
             # Legacy user from before billing system - skip deduction
             return True
 
-        if wallet.credits_remaining < amount:
+        # Deduct from subscription first (use before expiry), then bonus
+        # (never expires). Guarded by $expr in the filter and computed via an
+        # update pipeline so the check-and-decrement is a single atomic
+        # operation — two concurrent requests can no longer both read the
+        # same balance and both succeed (the old read -> compute -> $set
+        # pattern allowed exactly that).
+        # Legacy documents may predate these fields entirely (the old code
+        # read them via getattr(wallet, field, 0)) — $ifNull keeps the
+        # pipeline equivalent to that default for any doc missing a field.
+        sub_credits = {"$ifNull": ["$subscription_credits", 0]}
+        bonus_credits = {"$ifNull": ["$bonus_credits", 0]}
+        credits_used = {"$ifNull": ["$credits_used", 0]}
+
+        updated = await self.user_credits_collection.find_one_and_update(
+            {
+                "user_id": user_id,
+                "$expr": {
+                    "$gte": [
+                        {"$add": [sub_credits, bonus_credits]},
+                        amount,
+                    ]
+                },
+            },
+            [
+                {
+                    "$set": {
+                        "_deduct_from_subscription": {
+                            "$min": [sub_credits, amount]
+                        }
+                    }
+                },
+                {
+                    "$set": {
+                        "subscription_credits": {
+                            "$subtract": [
+                                sub_credits,
+                                "$_deduct_from_subscription",
+                            ]
+                        },
+                        "bonus_credits": {
+                            "$subtract": [
+                                bonus_credits,
+                                {"$subtract": [amount, "$_deduct_from_subscription"]},
+                            ]
+                        },
+                        "credits_used": {"$add": [credits_used, amount]},
+                    }
+                },
+                {
+                    "$set": {
+                        "total_credits": {
+                            "$add": ["$subscription_credits", "$bonus_credits"]
+                        },
+                        "credits_remaining": {
+                            "$add": ["$subscription_credits", "$bonus_credits"]
+                        },
+                        "updated_at": datetime.utcnow(),
+                    }
+                },
+                {"$unset": "_deduct_from_subscription"},
+            ],
+            return_document=ReturnDocument.AFTER,
+        )
+
+        if not updated:
+            # Either the wallet vanished between the two reads, or the
+            # balance guard failed — both mean "insufficient credits" now.
             return False
 
-        # Get current credit breakdown
-        current_bonus = getattr(wallet, 'bonus_credits', 0)
-        current_subscription = getattr(wallet, 'subscription_credits', 0)
-        balance_before = wallet.credits_remaining
-
-        remaining_to_deduct = amount
-
-        # Deduct from subscription first (use before expiry), then bonus (never expires)
-        if current_subscription >= remaining_to_deduct:
-            # Deduct all from subscription credits
-            new_subscription = current_subscription - remaining_to_deduct
-            new_bonus = current_bonus
-        else:
-            # Deduct all subscription, then from bonus
-            new_subscription = 0
-            new_bonus = current_bonus - (remaining_to_deduct - current_subscription)
-
-        # Calculate new totals
-        new_total = new_bonus + new_subscription
-        new_credits_used = wallet.credits_used + amount
-        new_credits_remaining = new_total
-
-        # Update wallet
-        await self.user_credits_collection.update_one(
-            {"user_id": user_id},
-            {
-                "$set": {
-                    "bonus_credits": new_bonus,
-                    "subscription_credits": new_subscription,
-                    "total_credits": new_total,
-                    "credits_used": new_credits_used,
-                    "credits_remaining": new_credits_remaining,
-                    "updated_at": datetime.utcnow()
-                }
-            }
-        )
+        balance_after = updated["credits_remaining"]
+        balance_before = balance_after + amount
 
         # PRD 11: Log all credit usage events
         transaction = CreditTransaction(
@@ -301,7 +338,7 @@ class CreditService:
             type="deduction",
             amount=-amount,  # Log actual amount deducted
             balance_before=balance_before,
-            balance_after=new_credits_remaining,
+            balance_after=balance_after,
             reason=reason,
             campaign_id=campaign_id,
             retry_count=retry_count,
