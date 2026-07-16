@@ -7999,3 +7999,119 @@ async def zapcap_job_status(
         "output_url": output_url,
         "failure_reason": failure_reason,
     })
+
+
+@router.get("/zapcap-job/{job_id}/transcript")
+async def zapcap_job_transcript(
+    job_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    import httpx
+
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    job = await db["zapcap_jobs"].find_one({"job_id": job_id})
+    if not job:
+        raise HTTPException(status_code=404, detail="ZapCap job not found")
+
+    headers = await _zapcap_headers()
+    zapcap_video_id = job["zapcap_video_id"]
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(
+            f"{_ZAPCAP_BASE}/videos/{zapcap_video_id}",
+            headers=headers,
+        )
+
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"ZapCap transcript fetch failed: {r.text}")
+
+    data = r.json()
+    # ZapCap nests transcript words under transcript.words or words directly
+    transcript = data.get("transcript") or {}
+    words = transcript.get("words") if isinstance(transcript, dict) else []
+    if not words:
+        words = data.get("words", [])
+
+    print(f"[ZapCap] transcript for job={job_id} video={zapcap_video_id} words={len(words)}", flush=True)
+    return UriResponse.get_single_data_response("zapcap_transcript", {"words": words, "raw": data})
+
+
+@router.post("/zapcap-job/{job_id}/rerender")
+async def zapcap_job_rerender(
+    job_id: str,
+    body: dict,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    import uuid as _uuid2
+    import httpx
+    from datetime import datetime, timezone
+
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    job = await db["zapcap_jobs"].find_one({"job_id": job_id})
+    if not job:
+        raise HTTPException(status_code=404, detail="ZapCap job not found")
+
+    headers = await _zapcap_headers()
+    zapcap_video_id = job["zapcap_video_id"]
+    template_id = body.get("template_id") or job.get("template_id", "beast")
+    word_edits = body.get("word_edits", [])  # [{id, text}]
+
+    task_payload: dict = {
+        "templateId": template_id,
+        "language": job.get("language", "en"),
+        "autoApprove": True,
+    }
+    if word_edits:
+        task_payload["transcriptEdits"] = word_edits
+
+    export_settings: dict = {}
+    output_mode = job.get("output_mode", "composited")
+    quality = job.get("quality", "standard")
+    if output_mode == "transparent":
+        export_settings["outputMode"] = "transparent"
+    elif output_mode == "greenScreen":
+        export_settings["greenScreen"] = True
+    if quality != "standard":
+        export_settings["quality"] = quality
+    if export_settings:
+        task_payload["exportSettings"] = export_settings
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(
+            f"{_ZAPCAP_BASE}/videos/{zapcap_video_id}/task",
+            json=task_payload,
+            headers=headers,
+        )
+        if r.status_code not in (200, 201):
+            raise HTTPException(status_code=502, detail=f"ZapCap rerender task failed: {r.text}")
+        zapcap_task_id = r.json().get("taskId") or r.json().get("id")
+        if not zapcap_task_id:
+            raise HTTPException(status_code=502, detail=f"ZapCap returned no taskId on rerender: {r.text}")
+
+    new_job_id = _uuid2.uuid4().hex
+    now = datetime.now(timezone.utc).isoformat()
+    await db["zapcap_jobs"].insert_one({
+        "job_id": new_job_id,
+        "user_id": user_id,
+        "zapcap_video_id": zapcap_video_id,
+        "zapcap_task_id": zapcap_task_id,
+        "template_id": template_id,
+        "language": job.get("language", "en"),
+        "output_mode": output_mode,
+        "quality": quality,
+        "enable_broll": job.get("enable_broll", False),
+        "music_url": job.get("music_url"),
+        "status": "pending",
+        "created_at": now,
+    })
+
+    print(f"[ZapCap] rerender job={new_job_id} video={zapcap_video_id} task={zapcap_task_id} edits={len(word_edits)}", flush=True)
+    return UriResponse.get_single_data_response("zapcap_rerender", {"job_id": new_job_id})
