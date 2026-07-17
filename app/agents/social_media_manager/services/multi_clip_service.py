@@ -505,6 +505,51 @@ def _shift_srt(srt: str, offset_seconds: float) -> str:
     return "\n".join(out)
 
 
+def _trim_srt(srt: str, trim_start: float, new_dur: float) -> str:
+    """
+    Filter and shift SRT blocks for a center-cut clip.
+    Removes blocks outside [trim_start, trim_start + new_dur) and shifts by -trim_start.
+    """
+    def _parse_ts(ts: str) -> float:
+        h, m, rest = ts.split(":")
+        s, ms = rest.replace(",", ".").split(".")
+        return int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000
+
+    def _fmt_ts(t: float) -> str:
+        t = max(0.0, t)
+        h = int(t // 3600)
+        m = int((t % 3600) // 60)
+        s = int(t % 60)
+        ms = round((t % 1) * 1000)
+        return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+    if not srt.strip() or trim_start == 0.0:
+        return srt
+
+    blocks = [b.strip() for b in srt.strip().split("\n\n") if b.strip()]
+    result: List[str] = []
+    counter = 1
+    for block in blocks:
+        lines = block.split("\n")
+        if len(lines) < 3 or " --> " not in lines[1]:
+            continue
+        parts = lines[1].split(" --> ")
+        t_start = _parse_ts(parts[0].strip())
+        t_end = _parse_ts(parts[1].strip())
+        if t_end <= trim_start or t_start >= trim_start + new_dur:
+            continue
+        new_start = max(0.0, t_start - trim_start)
+        new_end = min(new_dur, t_end - trim_start)
+        if new_end <= 0:
+            continue
+        result.append(str(counter))
+        result.append(f"{_fmt_ts(new_start)} --> {_fmt_ts(new_end)}")
+        result.extend(lines[2:])
+        result.append("")
+        counter += 1
+    return "\n".join(result)
+
+
 def _merge_srts(clips_ordered: List[Dict]) -> str:
     """Merge SRT from all clips in order, shifting timestamps to stitched positions."""
     merged_lines: List[str] = []
@@ -634,9 +679,9 @@ def _build_founder_timeline(
     tracks: List[Dict] = []
     total_footage = sum(c["duration_seconds"] for c in clips_ordered)
 
-    # Trimming applies to Product Story only (mute_clips=True) when over budget
+    # Trimming applies whenever a target duration is set (both Founder and Product Story)
     trim_ratio = 1.0
-    if mute_clips and target_duration > 0 and total_footage > 0:
+    if target_duration > 0 and total_footage > 0:
         trim_ratio = min(1.0, target_duration / total_footage)
 
     total_duration = round(total_footage * trim_ratio, 3)
@@ -644,17 +689,18 @@ def _build_founder_timeline(
     # Resolve AI transition to Shotstack transition object (None = hard cut)
     transition = _AI_TRANSITION_MAP.get(ai_transition_style, {"out": "fade"})
 
-    # Build a set of clip indices that contain a zoom moment (by global timestamp)
+    # Build a set of clip indices that contain a zoom moment.
+    # Use ORIGINAL durations for matching since GPT analyzed the untrimmed timeline.
     zoom_clip_indices: set = set()
     if ai_zoom_moments:
         t = 0.0
         for idx, c in enumerate(clips_ordered):
-            clip_dur = round(c["duration_seconds"] * trim_ratio, 3)
+            orig_dur = c["duration_seconds"]
             for zm in ai_zoom_moments:
                 zm_at = float(zm.get("at", 0))
-                if t <= zm_at < t + clip_dur:
+                if t <= zm_at < t + orig_dur:
                     zoom_clip_indices.add(idx)
-            t += clip_dur
+            t += orig_dur
 
     # ── Track: video clips ────────────────────────────────────────────────────
     video_clips: List[Dict] = []
@@ -1313,7 +1359,20 @@ async def run_multi_clip_stitch(job_id: str, db) -> None:
             mute_clips = True
         else:
             await update(72, "Merging transcripts…")
-            merged_srt = _merge_srts(active_clips)
+            if target_duration > 0:
+                # Center-cut each clip to fit the target, then trim its SRT to match
+                total_footage = sum(c["duration_seconds"] for c in active_clips)
+                tr = min(1.0, target_duration / max(total_footage, 1.0))
+                srt_clips = []
+                for c in active_clips:
+                    orig_dur = c["duration_seconds"]
+                    new_dur = round(orig_dur * tr, 3)
+                    trim_start = round((orig_dur - new_dur) / 2.0, 3) if tr < 1.0 else 0.0
+                    trimmed_srt = _trim_srt(c.get("srt") or "", trim_start, new_dur)
+                    srt_clips.append({**c, "srt": trimmed_srt, "duration_seconds": new_dur})
+                merged_srt = _merge_srts(srt_clips)
+            else:
+                merged_srt = _merge_srts(active_clips)
             mute_clips = False
 
         await update(75, "Selecting music…")
