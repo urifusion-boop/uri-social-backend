@@ -51,6 +51,41 @@ class UploadImageRequest(BaseModel):
     cleanup_level: Literal["none", "background_removal", "reframe", "ai_recomposite"] = "background_removal"
 
 
+class CarouselContentPlanRequest(BaseModel):
+    """PRD Section 9.1: one AI call plans the whole carousel's narrative arc."""
+    seed_content: str = Field(..., description="Topic or brief for the carousel")
+    platforms: List[str] = Field(..., description="Target platforms")
+    post_intent: str = Field("carousel", description="sale, product, announcement, testimonial, educational, carousel")
+    carousel_count: int = Field(3, ge=2, le=10, description="Number of slides, 2-10 per PRD Section 9")
+
+
+class CarouselGenerateImagesRequest(BaseModel):
+    """Path A carousel: one independent GPT Image 2 generation per slide brief."""
+    image_briefs: List[str] = Field(..., min_length=2, max_length=10, description="One image brief per slide, from the carousel content plan")
+    format: str = Field("1:1", description="Aspect ratio: 1:1, 4:5, or 9:16")
+    negative_space: str = Field("left_third", description="Where to leave space for text on each slide")
+
+
+class BrandPrefsUpdateRequest(BaseModel):
+    """
+    V2-only per-brand preferences — stored in visual_engine_v2_brand_prefs,
+    never on the shared brand_profiles document.
+    """
+    logo_control_mode: Optional[Literal["agent", "user"]] = Field(
+        None, description="'agent' = Orshot places the logo natively in-template; "
+                          "'user' = render without a logo, then composite at logo_manual_position"
+    )
+    logo_manual_position: Optional[
+        Literal["top_left", "top_right", "top_center", "bottom_left", "bottom_right", "bottom_center", "center"]
+    ] = Field(None, description="Required when logo_control_mode='user'")
+    style_family: Optional[
+        Literal[
+            "bold_modern", "minimal_clean", "modern_professional", "educational",
+            "testimonial_social_proof", "playful_colorful", "elegant_luxury"
+        ]
+    ] = Field(None, description="Manual override of the auto-derived template style family")
+
+
 class RenderRequest(BaseModel):
     """4-layer compositor render request"""
     content_layer: Dict[str, Any] = Field(..., description="headline, subhead, promo, cta")
@@ -65,9 +100,15 @@ class RenderRequest(BaseModel):
 
 
 class CarouselRenderRequest(BaseModel):
-    """Multi-slide carousel render"""
-    content_layer: Dict[str, Any] = Field(..., description="headline, subhead, promo, cta")
-    imagery_layer: Dict[str, Any] = Field(..., description="path, image_url, source")
+    """
+    Multi-slide carousel render. content_layer must carry a per-slide
+    narrative (data.slides[], from POST /v2/carousel-content-plan) and
+    imagery_layers must carry one independently-generated/uploaded image per
+    slide (from POST /v2/carousel-generate-images or /v2/carousel-upload-images)
+    — PRD Section 9.1, never one flat plan/image fragmented across slides.
+    """
+    content_layer: Dict[str, Any] = Field(..., description="Carousel content plan with data.slides[]")
+    imagery_layers: List[Dict[str, Any]] = Field(..., min_length=1, description="Per-slide imagery layers, same order as content_layer.data.slides")
     format: str = Field("1:1", description="Aspect ratio to render")
     formats: Optional[List[str]] = Field(
         None, description="One or more aspect ratios to render (PRD Section 14 multi-format); overrides `format` when set"

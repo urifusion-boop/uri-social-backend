@@ -8,8 +8,9 @@ PRD Section 7 / Section 3: Content Layer
 - Wraps output in LayerData format
 """
 
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 from datetime import datetime
+import json
 from openai import AsyncOpenAI
 
 from app.agents.visual_engine_v2.models.visual_engine_models import LayerData
@@ -105,7 +106,11 @@ class ContentLayerService:
         Build AI prompt for content generation.
         """
         brand_name = brand_context.get("brand_name", "the brand")
-        voice_tone = brand_context.get("voice_profile", {}).get("tone", ["professional"])
+        # brand_voice is already a fully-derived string (from personality_quiz +
+        # derived_voice via BrandProfileService.to_brand_context) — the caller
+        # must pass a to_brand_context() result here, not a raw brand profile
+        # document, which has no top-level "brand_voice" field.
+        voice_tone = brand_context.get("brand_voice") or "professional"
         industry = brand_context.get("industry", "")
 
         # Platform-specific length constraints
@@ -128,7 +133,7 @@ class ContentLayerService:
 Content idea: {seed_content}
 
 Post intent: {post_intent}
-Brand voice: {', '.join(voice_tone)}
+Brand voice: {voice_tone}
 Platform: {platform}
 
 Generate the following components in this EXACT format:
@@ -141,7 +146,7 @@ Requirements:
 - Headline should hook attention immediately
 - Subtext should reinforce the headline with specifics
 - CTA should be action-oriented{promo_requirement}
-- Match the brand voice: {', '.join(voice_tone)}
+- Match the brand voice: {voice_tone}
 - Sound human, not AI-generated
 - No hashtags, no emojis (those come later)
 
@@ -187,6 +192,143 @@ Output ONLY the lines above, in order. No explanations."""
             content_data["cta"] = non_empty[2] if len(non_empty) > 2 else "Learn more"
 
         return content_data
+
+    async def generate_carousel_content_plan(
+        self,
+        seed_content: str,
+        brand_context: Dict,
+        carousel_count: int,
+        post_intent: str = "carousel",
+        platform: str = "instagram"
+    ) -> LayerData:
+        """
+        Generate carousel Layer 1: the whole slide-by-slide narrative arc.
+
+        PRD Section 9.1: "one AI call plans the full narrative arc across
+        slides — slide 1 hook, slides 2-N body/value, final slide CTA —
+        returning a structured per-slide array (headline, body, image brief
+        per slide). One call, not one per slide, to keep cost down."
+
+        This is deliberately a distinct method from generate_content_plan()
+        (single post) rather than that method looping N times — a real
+        narrative arc needs the whole carousel in view in one completion,
+        not N independent single-post generations that don't know about
+        each other.
+        """
+        print(f"📝 Generating Layer 1: Carousel content ({carousel_count} slides, intent={post_intent})")
+
+        prompt = self._build_carousel_content_prompt(seed_content, brand_context, carousel_count, post_intent, platform)
+
+        response = await self.openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a social media copywriter planning a multi-slide carousel narrative arc. Respond only with valid JSON."
+                },
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.8,
+            max_tokens=1200,
+            response_format={"type": "json_object"}
+        )
+
+        raw = response.choices[0].message.content.strip()
+        slides = self._parse_carousel_structure(raw, carousel_count, seed_content)
+
+        # Last slide's CTA falls back to the brand's own CTA rotation if the
+        # model left it blank, same source single-post generation uses.
+        if slides and not slides[-1].get("cta"):
+            slides[-1]["cta"] = self._select_cta(brand_context)
+
+        print(f"✓ Carousel content Layer: {len(slides)} slides planned")
+
+        return LayerData(
+            layer_type="content",
+            data={"slides": slides, "slide_count": len(slides)},
+            metadata={
+                "post_intent": post_intent,
+                "platform": platform,
+                "model": "gpt-4o",
+                "cost": self.vendor_config.cost_model.content_generation_cost,
+                "generated_at": datetime.utcnow().isoformat()
+            }
+        )
+
+    def _build_carousel_content_prompt(
+        self,
+        seed_content: str,
+        brand_context: Dict,
+        carousel_count: int,
+        post_intent: str,
+        platform: str
+    ) -> str:
+        brand_name = brand_context.get("brand_name", "the brand")
+        # brand_voice is the fully-derived string from to_brand_context() —
+        # caller must pass that, not a raw brand profile document.
+        voice_tone = brand_context.get("brand_voice") or "professional"
+        industry = brand_context.get("industry", "")
+
+        wants_promo = post_intent in ("sale", "product")
+        promo_instruction = (
+            '\n- "promo": a short promo code/offer string on the CTA (last) slide only, empty ("") elsewhere'
+            if wants_promo else ""
+        )
+
+        return f"""Plan a {carousel_count}-slide {platform} carousel for {brand_name} ({industry}).
+
+Content idea: {seed_content}
+Brand voice: {voice_tone}
+
+Structure the narrative arc across exactly {carousel_count} slides:
+- Slide 1: the hook — grabs attention, states the topic, makes someone want to swipe.
+- Middle slides: body/value — one clear point per slide, building the story slide by slide.
+- Last slide: the close — a clear call to action.
+
+For EACH slide, provide:
+- "headline": short punchy text for that slide (3-8 words)
+- "subtext": one supporting line (0-15 words; can be empty on hook/CTA slides)
+- "cta": leave empty ("") on every slide except the LAST, where it must be a real 2-4 word call to action{promo_instruction}
+- "image_brief": a specific, concrete visual description for an image generator to create a background for THIS slide — each slide needs its OWN distinct scene/composition that fits this slide's point, not the same image description repeated. Do not mention text, logos, or brand names in the brief — imagery only.
+
+Respond with JSON only, in this exact shape:
+{{"slides": [{{"headline": "...", "subtext": "...", "cta": "...", "promo": "...", "image_brief": "..."}}, ...]}}
+
+Exactly {carousel_count} entries in the "slides" array, in order."""
+
+    def _parse_carousel_structure(self, raw_json: str, carousel_count: int, seed_content: str) -> List[Dict]:
+        """
+        Parse the carousel JSON completion into a clean per-slide list. Never
+        raises — a parsing miss degrades to a flat plan repeated across
+        slides rather than failing the whole carousel job (PRD Section 12
+        guiding principle: degrade, don't drop).
+        """
+        try:
+            parsed = json.loads(raw_json)
+            raw_slides = parsed.get("slides") or []
+            cleaned = []
+            for s in raw_slides:
+                if not isinstance(s, dict):
+                    continue
+                cleaned.append({
+                    "headline": str(s.get("headline", "")).strip(),
+                    "subtext": str(s.get("subtext", "")).strip(),
+                    "promo": str(s.get("promo", "")).strip(),
+                    "cta": str(s.get("cta", "")).strip(),
+                    "image_brief": str(s.get("image_brief", "")).strip() or seed_content,
+                })
+            if cleaned:
+                while len(cleaned) < carousel_count:
+                    cleaned.append(dict(cleaned[-1]))
+                return cleaned[:carousel_count]
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            pass
+
+        print("⚠️ Carousel content JSON parse failed, falling back to a flat plan repeated across slides")
+        return [
+            {"headline": seed_content[:60], "subtext": "", "promo": "", "cta": "", "image_brief": seed_content}
+            for _ in range(carousel_count)
+        ]
 
     def _select_cta(self, brand_context: Dict) -> str:
         """

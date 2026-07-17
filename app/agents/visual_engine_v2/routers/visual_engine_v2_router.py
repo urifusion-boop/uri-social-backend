@@ -32,6 +32,7 @@ from typing import Optional, List, Dict, Any
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from openai import AsyncOpenAI
 from datetime import datetime
+import asyncio
 import os
 import uuid
 
@@ -40,6 +41,9 @@ from app.agents.visual_engine_v2.models.visual_engine_models import (
     GenerateImageRequest,
     RenderRequest,
     CarouselRenderRequest,
+    CarouselContentPlanRequest,
+    CarouselGenerateImagesRequest,
+    BrandPrefsUpdateRequest,
     VisualEngineRenderV2,
     LayerData
 )
@@ -48,7 +52,11 @@ from app.agents.visual_engine_v2.services.image_path_service import ImagePathSer
 from app.agents.visual_engine_v2.services.brand_compositor_service import BrandCompositorService
 from app.agents.visual_engine_v2.services.quality_gate_service import QualityGateService
 from app.agents.visual_engine_v2.services.publish_bridge_service import PublishBridgeService, SUPPORTED_PLATFORMS
+from app.agents.visual_engine_v2.services.brand_prefs_service import BrandPrefsServiceV2
+from app.agents.visual_engine_v2.services.image_cache_service import ImageCacheServiceV2, hash_image_bytes
+from app.agents.visual_engine_v2.services.metrics_service import VisualEngineMetricsServiceV2
 from app.agents.social_media_manager.services.brand_profile_service import BrandProfileService
+from app.agents.social_media_manager.services.style_library import pick_next_style
 from app.dependencies import get_db_dependency, get_active_brand_context, get_current_user
 
 
@@ -56,6 +64,31 @@ router = APIRouter(prefix="/v2", tags=["Visual Engine V2"])
 
 # Initialize OpenAI client
 openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+
+def _resolve_cleanup_level(cleanup_level: str) -> bool:
+    """
+    PRD Section 5.2 cleanup levels, mapped to what's actually implemented:
+    - "none": no background removal — plain center-crop only.
+    - "background_removal": strip the background onto the template's clean
+      brand background — the "highest-leverage single step" per the PRD.
+    - "reframe": content-aware smart crop instead of a blind center-crop
+      (see ImagePathService._smart_crop_to_format) — handled by the caller
+      passing cleanup_level through to process_uploaded_image_path_b, this
+      function's boolean return is just the background-removal flag.
+    - "ai_recomposite": handled entirely separately by the caller (single-post
+      upload only, via process_uploaded_image_path_b_recomposite) before this
+      function is ever reached. Carousel uploads don't support it yet — that's
+      the one case that still reaches this function with "ai_recomposite" and
+      gets rejected below, rather than silently no-op'ing.
+    """
+    if cleanup_level == "ai_recomposite":
+        raise HTTPException(
+            status_code=400,
+            detail="AI re-compositing isn't available for carousel uploads yet — use it on a single-post upload instead, "
+                   "or use 'background_removal'/'reframe'/'none' for this carousel."
+        )
+    return cleanup_level == "background_removal"
 
 
 async def _require_brand_profile(user_id: str, brand_id: str, db: AsyncIOMotorDatabase) -> Dict[str, Any]:
@@ -70,6 +103,45 @@ async def _require_brand_profile(user_id: str, brand_id: str, db: AsyncIOMotorDa
     if not profile:
         raise HTTPException(status_code=404, detail="Brand profile not found — complete Brand Playbook first")
     return profile
+
+
+def _resolve_style_hint(brand_profile: Dict[str, Any]) -> Optional[str]:
+    """
+    Real style-prompt-fragment lookup for Path A image generation. The raw
+    brand profile document has no "style_prompt_fragment" field (that never
+    existed — a previous version of this code read a nonexistent key and
+    silently always got None). The real fields are style_selections,
+    style_rotation_index, and style_prompt_fragments (plural, list, stored
+    per-selection) — reusing V1's own pick_next_style() (read-only import)
+    is the same rotation logic V1's own image generation already uses.
+
+    Deliberately read-only: unlike V1's callers, this never persists the
+    advanced rotation index back onto the brand profile — V2 always reads
+    the brand's current rotation position rather than owning/advancing it,
+    since committing that write is V1's concern, not V2's.
+    """
+    style_selections = brand_profile.get("style_selections") or []
+    if not style_selections:
+        return None
+    slug, fragment, _next_index = pick_next_style(
+        style_selections=style_selections,
+        rotation_index=int(brand_profile.get("style_rotation_index") or 0),
+        industry=brand_profile.get("industry", ""),
+        style_prompt_fragments=brand_profile.get("style_prompt_fragments") or [],
+    )
+    return fragment or None
+
+
+def _resolve_brand_primary_color(brand_profile: Dict[str, Any]) -> Optional[str]:
+    """
+    Colors live in the ordered brand_colors list, not a "primary_color"
+    scalar field (that field never existed on the raw document — a previous
+    version of this code read it directly and always got None, so the
+    brand-colored placeholder fallback always used the generic gray default
+    instead of the brand's real primary color).
+    """
+    brand_colors = brand_profile.get("brand_colors") or []
+    return brand_colors[0] if brand_colors else None
 
 
 # ============================================================================
@@ -111,7 +183,8 @@ async def _fail_job(db: AsyncIOMotorDatabase, job_id: str, error: str) -> None:
 
 async def _job_generate_image_path_a(
     db: AsyncIOMotorDatabase, job_id: str, content_plan: str,
-    style_hint: Optional[str], format: str, brand_primary: Optional[str]
+    style_hint: Optional[str], format: str, brand_primary: Optional[str],
+    negative_space: str = "left_third"
 ) -> None:
     try:
         image_service = ImagePathService(openai_client)
@@ -119,7 +192,8 @@ async def _job_generate_image_path_a(
         error_message = None
         try:
             imagery_result = await image_service.generate_imagery_path_a(
-                content_plan=content_plan, style_hint=style_hint, format=format
+                content_plan=content_plan, style_hint=style_hint, format=format,
+                negative_space=negative_space
             )
         except ImageGenerationError as e:
             print(f"⚠️ [Path A] Falling back to brand-colored placeholder: {e}")
@@ -151,13 +225,21 @@ async def _job_generate_image_path_a(
 
 async def _job_upload_image_path_b(
     db: AsyncIOMotorDatabase, job_id: str, image_data: bytes,
-    remove_background: bool, format: str
+    remove_background: bool, format: str, user_id: str, brand_id: str, cleanup_level: str
 ) -> None:
     try:
-        image_service = ImagePathService(openai_client)
-        imagery_result = await image_service.process_uploaded_image_path_b(
-            image_data=image_data, remove_background=remove_background, format=format
-        )
+        image_hash = hash_image_bytes(image_data)
+        imagery_result = await ImageCacheServiceV2.get_cached(db, user_id, brand_id, image_hash, cleanup_level, format)
+
+        if not imagery_result:
+            image_service = ImagePathService(openai_client)
+            imagery_result = await image_service.process_uploaded_image_path_b(
+                image_data=image_data, remove_background=remove_background, format=format, cleanup_level=cleanup_level
+            )
+            await ImageCacheServiceV2.store(
+                db, user_id, brand_id, image_hash, cleanup_level, format, imagery_result["imagery_url"]
+            )
+
         imagery_layer = LayerData(
             layer_type="imagery",
             data={"imagery_url": imagery_result["imagery_url"]},
@@ -165,7 +247,8 @@ async def _job_upload_image_path_b(
                 "path": imagery_result["path"],
                 "cost": imagery_result["cost"],
                 "format": format,
-                "background_removed": remove_background
+                "background_removed": remove_background,
+                "cleanup_level": cleanup_level,
             }
         )
         await _complete_job(db, job_id, {
@@ -178,10 +261,114 @@ async def _job_upload_image_path_b(
         await _fail_job(db, job_id, str(e))
 
 
+async def _job_upload_image_path_b_recomposite(
+    db: AsyncIOMotorDatabase, job_id: str, image_data: bytes,
+    content_plan: str, style_hint: Optional[str], format: str
+) -> None:
+    try:
+        image_service = ImagePathService(openai_client)
+        imagery_result = await image_service.process_uploaded_image_path_b_recomposite(
+            image_data=image_data, content_plan=content_plan, style_hint=style_hint, format=format
+        )
+        imagery_layer = LayerData(
+            layer_type="imagery",
+            data={"imagery_url": imagery_result["imagery_url"]},
+            metadata={
+                "path": imagery_result["path"],
+                "cost": imagery_result["cost"],
+                "format": format,
+                "cleanup_level": "ai_recomposite",
+            }
+        )
+        await _complete_job(db, job_id, {
+            "success": True,
+            "imagery_layer": imagery_layer.model_dump(),
+            "cost": imagery_result["cost"],
+        })
+    except Exception as e:
+        print(f"❌ [Job {job_id}] upload_image_path_b_recomposite failed unexpectedly: {e}")
+        await _fail_job(db, job_id, str(e))
+
+
+async def _job_carousel_generate_images(
+    db: AsyncIOMotorDatabase, job_id: str, image_briefs: List[str],
+    style_hint: Optional[str], format: str, brand_primary: Optional[str], negative_space: str
+) -> None:
+    try:
+        image_service = ImagePathService(openai_client)
+        results = await image_service.generate_carousel_imagery_path_a(
+            image_briefs=image_briefs, brand_primary=brand_primary, style_hint=style_hint,
+            format=format, negative_space=negative_space
+        )
+        imagery_layers = [
+            LayerData(
+                layer_type="imagery",
+                data={"imagery_url": r["imagery_url"]},
+                metadata={
+                    "path": r["path"], "cost": r["cost"], "format": format,
+                    "needs_attention": r.get("needs_attention", False),
+                }
+            )
+            for r in results
+        ]
+        await _complete_job(db, job_id, {
+            "success": True,
+            "imagery_layers": [l.model_dump() for l in imagery_layers],
+            "cost": sum(r["cost"] for r in results),
+        })
+    except Exception as e:
+        print(f"❌ [Job {job_id}] carousel_generate_images failed unexpectedly: {e}")
+        await _fail_job(db, job_id, str(e))
+
+
+async def _job_carousel_upload_images(
+    db: AsyncIOMotorDatabase, job_id: str, images_data: List[bytes],
+    carousel_count: int, remove_background: bool, format: str,
+    user_id: str, brand_id: str, cleanup_level: str
+) -> None:
+    try:
+        image_service = ImagePathService(openai_client)
+
+        async def _clean_one(img_bytes: bytes) -> Dict[str, Any]:
+            image_hash = hash_image_bytes(img_bytes)
+            cached = await ImageCacheServiceV2.get_cached(db, user_id, brand_id, image_hash, cleanup_level, format)
+            if cached:
+                return cached
+            result = await image_service.process_uploaded_image_path_b(
+                image_data=img_bytes, remove_background=remove_background, format=format, cleanup_level=cleanup_level
+            )
+            await ImageCacheServiceV2.store(db, user_id, brand_id, image_hash, cleanup_level, format, result["imagery_url"])
+            return result
+
+        results = list(await asyncio.gather(*[_clean_one(img) for img in images_data]))
+        while len(results) < carousel_count and results:
+            results.append(dict(results[-1]))
+        results = results[:carousel_count]
+
+        imagery_layers = [
+            LayerData(
+                layer_type="imagery",
+                data={"imagery_url": r["imagery_url"]},
+                metadata={"path": r["path"], "cost": r["cost"], "format": format, "background_removed": remove_background}
+            )
+            for r in results
+        ]
+        await _complete_job(db, job_id, {
+            "success": True,
+            "imagery_layers": [l.model_dump() for l in imagery_layers],
+            "cost": sum(r["cost"] for r in results),
+        })
+    except Exception as e:
+        print(f"❌ [Job {job_id}] carousel_upload_images failed unexpectedly: {e}")
+        await _fail_job(db, job_id, str(e))
+
+
 async def _job_render(
     db: AsyncIOMotorDatabase, job_id: str, user_id: str, brand_id: str,
-    content_layer: LayerData, imagery_layer: LayerData,
-    format: str, formats: Optional[List[str]], carousel_count: int
+    content_layer: LayerData,
+    format: str, formats: Optional[List[str]], carousel_count: int,
+    imagery_layer: Optional[LayerData] = None,
+    imagery_layers: Optional[List[LayerData]] = None,
 ) -> None:
     try:
         compositor_service = BrandCompositorService(db)
@@ -190,6 +377,7 @@ async def _job_render(
             brand_id=brand_id,
             content_layer=content_layer,
             imagery_layer=imagery_layer,
+            imagery_layers=imagery_layers,
             format=format,
             formats=formats,
             carousel_count=carousel_count
@@ -248,7 +436,7 @@ async def generate_content_plan(
     content_service = ContentLayerService(openai_client)
     content_layer = await content_service.generate_content_plan(
         seed_content=request.seed_content,
-        brand_context=brand_profile,
+        brand_context=BrandProfileService.to_brand_context(brand_profile),
         post_intent=request.post_intent,
         platform=(request.platforms[0] if request.platforms else "instagram")
     )
@@ -274,12 +462,13 @@ async def generate_image_path_a(
     poll GET /v2/jobs/{job_id} for the result.
     """
     brand_profile = await _require_brand_profile(brand_ctx["user_id"], brand_ctx["brand_id"], db)
-    style_hint = brand_profile.get("style_prompt_fragment")
+    style_hint = _resolve_style_hint(brand_profile)
 
     job_id = await _create_job(db, brand_ctx["user_id"], "generate_image")
     background_tasks.add_task(
         _job_generate_image_path_a,
-        db, job_id, request.content_plan, style_hint, request.format, brand_profile.get("primary_color")
+        db, job_id, request.content_plan, style_hint, request.format, _resolve_brand_primary_color(brand_profile),
+        request.negative_space
     )
 
     return {"success": True, "job_id": job_id, "status": "pending"}
@@ -289,7 +478,8 @@ async def generate_image_path_a(
 async def upload_image_path_b(
     background_tasks: BackgroundTasks,
     format: str = Form("1:1"),
-    remove_background: bool = Form(False),
+    cleanup_level: str = Form("background_removal"),
+    content_plan: Optional[str] = Form(None),
     image_file: UploadFile = File(...),
     brand_ctx: dict = Depends(get_active_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
@@ -297,17 +487,125 @@ async def upload_image_path_b(
     """
     Upload Layer 2: Imagery (Path B - User upload).
 
-    PRD Section 8: Imagery Layer - Path B. Returns a job_id immediately;
-    poll GET /v2/jobs/{job_id} for the result.
+    PRD Section 8: Imagery Layer - Path B. cleanup_level: "none",
+    "background_removal" (default), "reframe" (content-aware crop), or
+    "ai_recomposite" (premium — preserves the real product pixel-exact,
+    generates a new scene around it via background-removal + Path A
+    generation + compositing; requires content_plan describing the new
+    scene, and always routes to mandatory review per PRD Section 13).
+    Returns a job_id immediately; poll GET /v2/jobs/{job_id} for the result.
     """
-    await _require_brand_profile(brand_ctx["user_id"], brand_ctx["brand_id"], db)
-
-    # Read the upload synchronously — the file stream doesn't survive into a
-    # background task, but the raw bytes do.
+    brand_profile = await _require_brand_profile(brand_ctx["user_id"], brand_ctx["brand_id"], db)
     image_data = await image_file.read()
 
+    if cleanup_level == "ai_recomposite":
+        if not content_plan or not content_plan.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="content_plan is required when cleanup_level='ai_recomposite' — describe the new scene to generate around the product."
+            )
+        style_hint = _resolve_style_hint(brand_profile)
+        job_id = await _create_job(db, brand_ctx["user_id"], "upload_image")
+        background_tasks.add_task(
+            _job_upload_image_path_b_recomposite, db, job_id, image_data, content_plan.strip(), style_hint, format
+        )
+        return {"success": True, "job_id": job_id, "status": "pending"}
+
+    remove_background = _resolve_cleanup_level(cleanup_level)
     job_id = await _create_job(db, brand_ctx["user_id"], "upload_image")
-    background_tasks.add_task(_job_upload_image_path_b, db, job_id, image_data, remove_background, format)
+    background_tasks.add_task(
+        _job_upload_image_path_b, db, job_id, image_data, remove_background, format,
+        brand_ctx["user_id"], brand_ctx["brand_id"], cleanup_level
+    )
+
+    return {"success": True, "job_id": job_id, "status": "pending"}
+
+
+@router.post("/carousel-content-plan")
+async def generate_carousel_content_plan(
+    request: CarouselContentPlanRequest,
+    brand_ctx: dict = Depends(get_active_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency)
+):
+    """
+    Generate carousel Layer 1: the full per-slide narrative arc in one call.
+
+    PRD Section 9.1. Returns content_layer.data.slides[] — feed the
+    image_brief from each slide into POST /v2/carousel-generate-images
+    (Path A) or upload one photo per slide to POST /v2/carousel-upload-images
+    (Path B), then pass both into POST /v2/render-carousel.
+    """
+    user_id = brand_ctx["user_id"]
+    brand_profile = await _require_brand_profile(user_id, brand_ctx["brand_id"], db)
+
+    content_service = ContentLayerService(openai_client)
+    content_layer = await content_service.generate_carousel_content_plan(
+        seed_content=request.seed_content,
+        brand_context=BrandProfileService.to_brand_context(brand_profile),
+        carousel_count=request.carousel_count,
+        post_intent=request.post_intent,
+        platform=(request.platforms[0] if request.platforms else "instagram")
+    )
+
+    return {
+        "success": True,
+        "content_layer": content_layer.model_dump(),
+        "cost": content_layer.metadata.get("cost", 0.0)
+    }
+
+
+@router.post("/carousel-generate-images")
+async def carousel_generate_images_path_a(
+    request: CarouselGenerateImagesRequest,
+    background_tasks: BackgroundTasks,
+    brand_ctx: dict = Depends(get_active_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency)
+):
+    """
+    Generate carousel Layer 2 (Path A): one independent GPT Image 2
+    generation per slide brief, run concurrently. PRD Section 9.1 — never
+    one image reused across every slide. Returns a job_id immediately;
+    poll GET /v2/jobs/{job_id} for the result (imagery_layers: List[LayerData]).
+    """
+    brand_profile = await _require_brand_profile(brand_ctx["user_id"], brand_ctx["brand_id"], db)
+    style_hint = _resolve_style_hint(brand_profile)
+
+    job_id = await _create_job(db, brand_ctx["user_id"], "carousel_generate_images")
+    background_tasks.add_task(
+        _job_carousel_generate_images,
+        db, job_id, request.image_briefs, style_hint, request.format,
+        _resolve_brand_primary_color(brand_profile), request.negative_space
+    )
+
+    return {"success": True, "job_id": job_id, "status": "pending"}
+
+
+@router.post("/carousel-upload-images")
+async def carousel_upload_images_path_b(
+    background_tasks: BackgroundTasks,
+    carousel_count: int = Form(...),
+    format: str = Form("1:1"),
+    cleanup_level: str = Form("background_removal"),
+    image_files: List[UploadFile] = File(...),
+    brand_ctx: dict = Depends(get_active_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency)
+):
+    """
+    Upload carousel Layer 2 (Path B): one photo per slide. PRD Section 9.1 —
+    if fewer photos are uploaded than there are slides, the last uploaded
+    photo repeats for the remaining slides ("repeats a hero image where
+    appropriate"). Returns a job_id immediately; poll GET /v2/jobs/{job_id}.
+    """
+    await _require_brand_profile(brand_ctx["user_id"], brand_ctx["brand_id"], db)
+    remove_background = _resolve_cleanup_level(cleanup_level)
+
+    images_data = [await f.read() for f in image_files]
+
+    job_id = await _create_job(db, brand_ctx["user_id"], "carousel_upload_images")
+    background_tasks.add_task(
+        _job_carousel_upload_images, db, job_id, images_data, carousel_count, remove_background, format,
+        brand_ctx["user_id"], brand_ctx["brand_id"], cleanup_level
+    )
 
     return {"success": True, "job_id": job_id, "status": "pending"}
 
@@ -334,7 +632,8 @@ async def render_full_composition(
     job_id = await _create_job(db, user_id, "render")
     background_tasks.add_task(
         _job_render, db, job_id, user_id, brand_ctx["brand_id"],
-        content_layer, imagery_layer, request.format, request.formats, 1
+        content_layer, request.format, request.formats, 1,
+        imagery_layer,
     )
 
     return {"success": True, "job_id": job_id, "status": "pending"}
@@ -350,19 +649,23 @@ async def render_carousel(
     """
     Multi-slide carousel render.
 
-    PRD Section 13: Carousel Posts. Returns a job_id immediately;
-    poll GET /v2/jobs/{job_id} for the result.
+    PRD Section 9: Carousel Posts. content_layer must carry a per-slide
+    narrative (data.slides[], from POST /v2/carousel-content-plan) and
+    imagery_layers one independently-produced image per slide (from
+    POST /v2/carousel-generate-images or /v2/carousel-upload-images).
+    Returns a job_id immediately; poll GET /v2/jobs/{job_id} for the result.
     """
     user_id = brand_ctx["user_id"]
     await _require_brand_profile(user_id, brand_ctx["brand_id"], db)
 
     content_layer = LayerData(**request.content_layer)
-    imagery_layer = LayerData(**request.imagery_layer)
+    imagery_layers = [LayerData(**layer) for layer in request.imagery_layers]
 
     job_id = await _create_job(db, user_id, "render_carousel")
     background_tasks.add_task(
         _job_render, db, job_id, user_id, brand_ctx["brand_id"],
-        content_layer, imagery_layer, request.format, request.formats, request.carousel_count
+        content_layer, request.format, request.formats, request.carousel_count,
+        None, imagery_layers,
     )
 
     return {"success": True, "job_id": job_id, "status": "pending"}
@@ -536,3 +839,95 @@ async def publish_render(
         raise HTTPException(status_code=400, detail=result["error"])
 
     return result
+
+
+@router.get("/brand-prefs")
+async def get_brand_prefs(
+    brand_ctx: dict = Depends(get_active_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency)
+):
+    """
+    This brand's V2-only rendering preferences: the auto-derived (or
+    overridden) style_family, the logo control mode, and a recommended
+    imagery path (PRD Section 10.1). Stored in V2's own
+    visual_engine_v2_brand_prefs collection — never the shared brand profile.
+    """
+    user_id = brand_ctx["user_id"]
+    brand_id = brand_ctx["brand_id"]
+    brand_profile = await _require_brand_profile(user_id, brand_id, db)
+    context = BrandProfileService.to_brand_context(brand_profile)
+
+    prefs = await BrandPrefsServiceV2.get_or_create(
+        db, user_id=user_id, brand_id=brand_id,
+        style_selections=context.get("style_selections"),
+        industry=context.get("industry"),
+    )
+    has_product_images = await ImageCacheServiceV2.has_any_for_brand(db, user_id, brand_id)
+
+    return {
+        "success": True,
+        "style_family": prefs.get("style_family"),
+        "style_family_override": prefs.get("style_family_override", False),
+        "logo_control_mode": prefs.get("logo_control_mode", "agent"),
+        "logo_manual_position": prefs.get("logo_manual_position"),
+        "has_product_images": has_product_images,
+        "recommended_image_path": "B" if has_product_images else "A",
+    }
+
+
+@router.put("/brand-prefs")
+async def update_brand_prefs(
+    request: BrandPrefsUpdateRequest,
+    brand_ctx: dict = Depends(get_active_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency)
+):
+    """
+    Update this brand's V2-only preferences.
+
+    logo_control_mode='user' requires logo_manual_position to be set (either
+    in this same call or a prior one) — the frontend should show the
+    tradeoff warning ("reduced template-fit guarantees") before letting the
+    user pick this mode.
+    """
+    user_id = brand_ctx["user_id"]
+    brand_id = brand_ctx["brand_id"]
+
+    if request.logo_control_mode == "user" and not request.logo_manual_position:
+        existing = await db["visual_engine_v2_brand_prefs"].find_one({"user_id": user_id, "brand_id": brand_id})
+        if not existing or not existing.get("logo_manual_position"):
+            raise HTTPException(
+                status_code=400,
+                detail="logo_manual_position is required when switching logo_control_mode to 'user'"
+            )
+
+    try:
+        prefs = await BrandPrefsServiceV2.update_prefs(
+            db, user_id=user_id, brand_id=brand_id,
+            logo_control_mode=request.logo_control_mode,
+            logo_manual_position=request.logo_manual_position,
+            style_family=request.style_family,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {
+        "success": True,
+        "style_family": prefs.get("style_family"),
+        "style_family_override": prefs.get("style_family_override", False),
+        "logo_control_mode": prefs.get("logo_control_mode", "agent"),
+        "logo_manual_position": prefs.get("logo_manual_position"),
+    }
+
+
+@router.get("/metrics")
+async def get_metrics(
+    brand_ctx: dict = Depends(get_active_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency)
+):
+    """
+    PRD Section 16: success metrics, computed from this user's stored V2
+    renders (visual_engine_renders_v2) — no separate instrumentation
+    pipeline. Scoped to the authenticated user, not global/cross-tenant.
+    """
+    metrics = await VisualEngineMetricsServiceV2.compute(db, user_id=brand_ctx["user_id"])
+    return {"success": True, **metrics}
