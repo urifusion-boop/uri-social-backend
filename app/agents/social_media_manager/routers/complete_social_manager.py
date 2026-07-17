@@ -7388,6 +7388,11 @@ async def analyze_multi_clip_job(
             "cuts": [], "zooms": [], "transition_style": "fade", "summary": "No clips to analyze."
         })
 
+    # Return cached decisions applied during stitch — avoids a redundant GPT call
+    if job.get("ai_decisions"):
+        print(f"[MultiClip/analyze] returning cached decisions for job={job_id}", flush=True)
+        return UriResponse.get_single_data_response("multi_clip_decisions", job["ai_decisions"])
+
     # Build per-clip time windows
     cumulative = 0.0
     clip_entries = []

@@ -533,6 +533,81 @@ def _merge_srts(clips_ordered: List[Dict]) -> str:
 
 # ── Shotstack timeline builder ────────────────────────────────────────────────
 
+_AI_TRANSITION_MAP: Dict[str, Optional[Dict]] = {
+    "cut":   None,                    # hard cut — no transition object
+    "fade":  {"out": "fade"},
+    "slide": {"out": "slideLeft"},
+    "zoom":  {"out": "zoom"},
+}
+
+
+async def _run_ai_analysis(clips_ordered: List[Dict], story_type: str) -> Dict:
+    """
+    GPT-4o-mini analysis of ordered clips. Returns {cuts, zooms, transition_style, summary}.
+    Called inside run_multi_clip_stitch so decisions can be applied before rendering.
+    """
+    import json as _json
+    from openai import AsyncOpenAI
+
+    cumulative = 0.0
+    clip_entries = []
+    for c in clips_ordered:
+        if c.get("dropped"):
+            continue
+        dur = float(c.get("duration_seconds") or 10)
+        clip_entries.append({
+            "start": cumulative,
+            "end": cumulative + dur,
+            "clip_type": c.get("clip_type", "speech"),
+            "transcript": (c.get("transcript") or "").strip()[:300],
+        })
+        cumulative += dur
+
+    if not clip_entries:
+        return {"cuts": [], "zooms": [], "transition_style": "fade", "summary": ""}
+
+    total_duration = cumulative
+    clips_text = "\n".join([
+        f"Clip {i + 1} ({e['start']:.1f}s–{e['end']:.1f}s, {e['clip_type']}): "
+        + (f'"{e["transcript"]}"' if e["transcript"] else "(no speech)")
+        for i, e in enumerate(clip_entries)
+    ])
+
+    prompt = (
+        f"You are a professional video editor. Analyze this {story_type} style video "
+        f"({total_duration:.0f}s total) and return editing decisions.\n\n"
+        f"Clips:\n{clips_text}\n\n"
+        f"Return ONLY a JSON object — no extra text, no markdown:\n"
+        f'{{"cuts": [{{"at": <float>, "end": <float>, "reason": "<why>"}}], '
+        f'"zooms": [{{"at": <float>, "duration": <float>, "reason": "<impactful moment>"}}], '
+        f'"transition_style": "cut" | "fade" | "slide" | "zoom", '
+        f'"summary": "<one sentence summary of the video>"}}\n\n'
+        f"Rules:\n"
+        f"- 2–4 cuts targeting filler, pauses, \"um/uh\", or repeated points. at >= 0, end <= {total_duration:.1f}.\n"
+        f"- 1–3 zoom moments on the most compelling or emotional phrases. duration 1.0–3.0 s.\n"
+        f"- Cuts must not overlap. Zooms must stay within clip bounds.\n"
+        f"- transition_style must match the energy: founder → cut or slide, product → fade or zoom.\n"
+        f"- Only the JSON object."
+    )
+
+    try:
+        client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+        resp = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=700,
+        )
+        raw = resp.choices[0].message.content.strip()
+        if raw.startswith("```"):
+            raw = "\n".join(raw.split("\n")[1:])
+            raw = raw.rsplit("```", 1)[0].strip()
+        return _json.loads(raw)
+    except Exception as exc:
+        print(f"[MultiClip/_run_ai_analysis] GPT error: {exc}", flush=True)
+        return {"cuts": [], "zooms": [], "transition_style": "fade", "summary": ""}
+
+
 def _build_founder_timeline(
     clips_ordered: List[Dict],
     merged_srt: str,
@@ -543,6 +618,8 @@ def _build_founder_timeline(
     mute_clips: bool = False,
     target_duration: float = 0,
     music_volume: float = 0.12,
+    ai_transition_style: str = "fade",
+    ai_zoom_moments: Optional[List[Dict]] = None,
 ) -> Dict:
     """
     Build a Shotstack timeline for a multi-clip stitch.
@@ -552,6 +629,7 @@ def _build_founder_timeline(
     Optional music track spans the full duration.
     When target_duration > 0 and mute_clips (Product Story), clips are center-cut
     proportionally to fit the target.
+    ai_transition_style and ai_zoom_moments are applied from the pre-stitch AI analysis.
     """
     tracks: List[Dict] = []
     total_footage = sum(c["duration_seconds"] for c in clips_ordered)
@@ -562,6 +640,21 @@ def _build_founder_timeline(
         trim_ratio = min(1.0, target_duration / total_footage)
 
     total_duration = round(total_footage * trim_ratio, 3)
+
+    # Resolve AI transition to Shotstack transition object (None = hard cut)
+    transition = _AI_TRANSITION_MAP.get(ai_transition_style, {"out": "fade"})
+
+    # Build a set of clip indices that contain a zoom moment (by global timestamp)
+    zoom_clip_indices: set = set()
+    if ai_zoom_moments:
+        t = 0.0
+        for idx, c in enumerate(clips_ordered):
+            clip_dur = round(c["duration_seconds"] * trim_ratio, 3)
+            for zm in ai_zoom_moments:
+                zm_at = float(zm.get("at", 0))
+                if t <= zm_at < t + clip_dur:
+                    zoom_clip_indices.add(idx)
+            t += clip_dur
 
     # ── Track: video clips ────────────────────────────────────────────────────
     video_clips: List[Dict] = []
@@ -602,11 +695,12 @@ def _build_founder_timeline(
                 "fit": "crop",
                 "position": position,
             }
-        # Crossfade into next clip (not the last one)
-        if i < len(clips_ordered) - 1:
-            clip_entry["transition"] = {
-                "out": "fade",
-            }
+            # Apply zoom effect on video clips that contain a zoom moment
+            if i in zoom_clip_indices:
+                clip_entry["effect"] = "zoomIn"
+        # Apply AI-chosen transition between clips (not the last one)
+        if i < len(clips_ordered) - 1 and transition is not None:
+            clip_entry["transition"] = transition
         video_clips.append(clip_entry)
         cursor += new_dur
 
@@ -1228,7 +1322,19 @@ async def run_multi_clip_stitch(job_id: str, db) -> None:
             music_mood = doc.get("music_mood", "chill")
             music_url = _pick_music_url(music_mood)
 
-        await update(78, "Building timeline…")
+        await update(76, "Analyzing editing style…")
+        ai_decisions = await _run_ai_analysis(active_clips, story_type)
+        await db.multi_clip_jobs.update_one(
+            {"job_id": job_id},
+            {"$set": {"ai_decisions": ai_decisions}},
+        )
+        print(
+            f"[MultiClip] AI decisions: transition={ai_decisions.get('transition_style')} "
+            f"zooms={len(ai_decisions.get('zooms', []))}",
+            flush=True,
+        )
+
+        await update(79, "Building timeline…")
         aspect_ratio = doc.get("orientation", "9:16")
         primary_color = doc.get("primary_color", "#CD1B78")
         music_volume = float(doc.get("music_volume", 0.12))
@@ -1242,6 +1348,8 @@ async def run_multi_clip_stitch(job_id: str, db) -> None:
             mute_clips=mute_clips,
             target_duration=target_duration,
             music_volume=music_volume,
+            ai_transition_style=ai_decisions.get("transition_style", "fade"),
+            ai_zoom_moments=ai_decisions.get("zooms", []),
         )
 
         await update(82, "Rendering…")
