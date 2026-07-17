@@ -290,36 +290,10 @@ class TemplateService:
 
         raise TemplateRenderError("No rendering vendor available")
 
-    @staticmethod
-    async def render_multi_format(
-        template_id: str,
-        data: Dict[str, Any],
-        formats: List[str] = ["1:1"]
-    ) -> Dict[str, str]:
-        """
-        Render multiple formats (1:1, 4:5, 9:16)
-
-        PRD Section 14: Multi-format output
-        Returns: {format: url}
-        """
-        results = {}
-
-        # Render each format
-        tasks = [
-            TemplateService.render_with_fallback(template_id, data, fmt)
-            for fmt in formats
-        ]
-
-        rendered_urls = await asyncio.gather(*tasks, return_exceptions=True)
-
-        for fmt, url in zip(formats, rendered_urls):
-            if isinstance(url, Exception):
-                print(f"❌ Failed to render format {fmt}: {url}")
-                results[fmt] = None
-            else:
-                results[fmt] = url
-
-        return results
+    # Multi-format rendering (PRD Section 14) happens one level up, in
+    # BrandCompositorService.compose_final_render — it parallelizes across
+    # formats at the full typesetting-layer level (template selection +
+    # render + logo compositing per format), not just the raw render call.
 
     @staticmethod
     async def render_carousel(

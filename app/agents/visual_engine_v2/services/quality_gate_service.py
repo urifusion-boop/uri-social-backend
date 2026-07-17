@@ -160,9 +160,17 @@ class QualityGateService:
             score -= 0.2
             issues.append("missing_cta")
 
-        # Check 2: Imagery layer
+        # Check 2: Imagery layer. Carousel renders synthesize a wrapper shape
+        # (data.slides[], no top-level imagery_url) — checking for the
+        # single-post key here would dock every carousel regardless of
+        # whether its slide images actually rendered.
         imagery_data = render.imagery_layer.data
-        if not imagery_data.get("imagery_url"):
+        if render.is_carousel:
+            slides = imagery_data.get("slides") or []
+            if not slides or not all(s.get("imagery_url") for s in slides):
+                score -= 0.4
+                issues.append("missing_imagery")
+        elif not imagery_data.get("imagery_url"):
             score -= 0.4
             issues.append("missing_imagery")
 
@@ -209,11 +217,22 @@ class QualityGateService:
             quality_score=quality_score,
             detected_issues=issues,
             preview_url=(render.final_outputs[0] if render.final_outputs else ""),
-            content_preview={
-                "headline": render.content_layer.data.get("headline", ""),
-                "subtext": render.content_layer.data.get("subtext", ""),
-                "cta": render.content_layer.data.get("cta", ""),
-            },
+            # Carousel content_layer.data is {"slides": [...]} — preview the
+            # hook (slide 1), since there's no top-level headline/subtext/cta
+            # on a carousel's content data the way there is on a single post.
+            content_preview=(
+                {
+                    "headline": render.content_layer.data["slides"][0].get("headline", ""),
+                    "subtext": render.content_layer.data["slides"][0].get("subtext", ""),
+                    "cta": render.content_layer.data["slides"][-1].get("cta", ""),
+                }
+                if render.is_carousel and render.content_layer.data.get("slides")
+                else {
+                    "headline": render.content_layer.data.get("headline", ""),
+                    "subtext": render.content_layer.data.get("subtext", ""),
+                    "cta": render.content_layer.data.get("cta", ""),
+                }
+            ),
             status="pending",
             created_at=datetime.utcnow(),
             reviewed_at=None,

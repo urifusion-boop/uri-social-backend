@@ -94,10 +94,15 @@ class PublishBridgeService:
             return {"success": False, "error": f"No active {platform} connection for this account."}
 
         content_data = (render.get("content_layer") or {}).get("data", {})
-        caption = self._build_caption(content_data)
+        # Carousel content_layer.data is {"slides": [{headline, subtext, promo,
+        # cta, image_brief}, ...]} (PRD Section 9.1 narrative arc) — a flat
+        # single-post shape has no "slides" key at all, so this branches cleanly.
+        slides_content: Optional[List[Dict[str, Any]]] = content_data.get("slides")
 
         final_outputs: List[str] = render.get("final_outputs") or []
         is_carousel = len(final_outputs) > 1
+
+        caption = self._build_carousel_caption(slides_content) if (is_carousel and slides_content) else self._build_caption(content_data)
 
         draft_id = str(uuid4())
         draft_doc: Dict[str, Any] = {
@@ -118,8 +123,8 @@ class PublishBridgeService:
             draft_doc["slides"] = [
                 {
                     "slide_number": i + 1,
-                    "headline": content_data.get("headline", "") if i == 0 else "",
-                    "body": content_data.get("subtext", "") if i == 0 else "",
+                    "headline": (slides_content[i].get("headline", "") if slides_content and i < len(slides_content) else ""),
+                    "body": (slides_content[i].get("subtext", "") if slides_content and i < len(slides_content) else ""),
                     "image_url": url,
                     "image_specs": {"width": 1080, "height": 1080},
                     "image_retry_count": 0,
@@ -169,4 +174,22 @@ class PublishBridgeService:
             parts.append(content_data["promo"])
         if content_data.get("cta"):
             parts.append(content_data["cta"])
+        return "\n\n".join(p for p in parts if p)
+
+    @staticmethod
+    def _build_carousel_caption(slides: List[Dict[str, Any]]) -> str:
+        """
+        Carousel caption: lead with the hook (slide 1's headline/subtext),
+        close with the CTA/promo (last slide) — the caption should read as
+        the narrative arc's opening + close, not a dump of every slide's text.
+        """
+        if not slides:
+            return ""
+        hook = slides[0]
+        close = slides[-1]
+        parts = [hook.get("headline", ""), hook.get("subtext", "")]
+        if close.get("promo"):
+            parts.append(close["promo"])
+        if close.get("cta"):
+            parts.append(close["cta"])
         return "\n\n".join(p for p in parts if p)
