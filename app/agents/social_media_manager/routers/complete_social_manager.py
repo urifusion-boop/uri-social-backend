@@ -7358,6 +7358,102 @@ async def stitch_multi_clip_job(
     )
 
 
+@router.post("/multi-clip/job/{job_id}/analyze")
+async def analyze_multi_clip_job(
+    job_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    AI analyzes a stitched multi-clip video using existing clip transcripts/metadata
+    and returns suggested cuts, zoom moments, and transition style.
+    Call after job status == 'ready'.
+    """
+    import json as _json
+    from openai import AsyncOpenAI
+
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    job = await db.multi_clip_jobs.find_one({"job_id": job_id, "user_id": user_id}, {"_id": 0})
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.get("status") != "ready":
+        raise HTTPException(status_code=409, detail="Job must be in ready status to analyze")
+
+    clips = job.get("clips", [])
+    if not clips:
+        return UriResponse.get_single_data_response("multi_clip_decisions", {
+            "cuts": [], "zooms": [], "transition_style": "fade", "summary": "No clips to analyze."
+        })
+
+    # Build per-clip time windows
+    cumulative = 0.0
+    clip_entries = []
+    for c in clips:
+        if c.get("dropped"):
+            continue
+        dur = float(c.get("duration_seconds") or 10)
+        clip_entries.append({
+            "start": cumulative,
+            "end": cumulative + dur,
+            "clip_type": c.get("clip_type", "speech"),
+            "transcript": (c.get("transcript") or "").strip()[:300],
+        })
+        cumulative += dur
+
+    total_duration = cumulative
+    story_type = job.get("story_type", "founder")
+
+    clips_text = "\n".join([
+        f"Clip {i + 1} ({e['start']:.1f}s–{e['end']:.1f}s, {e['clip_type']}): "
+        + (f'"{e["transcript"]}"' if e["transcript"] else "(no speech)")
+        for i, e in enumerate(clip_entries)
+    ])
+
+    prompt = f"""You are a professional video editor. Analyze this {story_type} style video ({total_duration:.0f}s total) and return editing decisions.
+
+Clips:
+{clips_text}
+
+Return ONLY a JSON object — no extra text, no markdown:
+{{
+  "cuts": [{{"at": <float>, "end": <float>, "reason": "<why>"}}],
+  "zooms": [{{"at": <float>, "duration": <float>, "reason": "<impactful moment>"}}],
+  "transition_style": "cut" | "fade" | "slide" | "zoom",
+  "summary": "<one sentence summary of the video>"
+}}
+
+Rules:
+- 2–4 cuts targeting filler, pauses, "um/uh", or repeated points. at >= 0, end <= {total_duration:.1f}.
+- 1–3 zoom moments on the most compelling or emotional phrases. duration 1.0–3.0 s.
+- Cuts must not overlap. Zooms must stay within clip bounds.
+- transition_style must match the energy: founder → cut or slide, product → fade or zoom.
+- Only the JSON object."""
+
+    try:
+        client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+        resp = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=700,
+        )
+        raw = resp.choices[0].message.content.strip()
+        # Strip markdown fences if GPT wraps the response
+        if raw.startswith("```"):
+            raw = "\n".join(raw.split("\n")[1:])
+            raw = raw.rsplit("```", 1)[0].strip()
+        decisions = _json.loads(raw)
+    except Exception as exc:
+        print(f"[MultiClip/analyze] GPT error: {exc}", flush=True)
+        decisions = {"cuts": [], "zooms": [], "transition_style": "fade", "summary": ""}
+
+    print(f"[MultiClip/analyze] job={job_id} cuts={len(decisions.get('cuts', []))} zooms={len(decisions.get('zooms', []))}", flush=True)
+    return UriResponse.get_single_data_response("multi_clip_decisions", decisions)
+
+
 class DraftScriptRequest(BaseModel):
     description: str
 
@@ -7793,7 +7889,8 @@ async def zapcap_templates(token: dict = Depends(JWTBearer())):
 
 @router.post("/zapcap-produce")
 async def zapcap_produce(
-    video: UploadFile = File(...),
+    video: Optional[UploadFile] = File(None),
+    source_url: Optional[str] = Form(None),
     template_id: str = Form("beast"),
     language: str = Form("en"),
     output_mode: str = Form("composited"),
@@ -7819,10 +7916,16 @@ async def zapcap_produce(
     job_id = _uuid.uuid4().hex
     now = datetime.now(timezone.utc).isoformat()
 
-    # Upload video to Cloudinary first so ZapCap can reach it via URL
-    video_bytes = await video.read()
-    video_public_id = f"zapcap-input-{job_id}"
-    video_url = await _upload_to_cloudinary(video_bytes, video_public_id)
+    # Resolve video URL — either upload the file to Cloudinary or use the provided URL directly
+    if video is not None:
+        video_bytes = await video.read()
+        video_public_id = f"zapcap-input-{job_id}"
+        video_url = await _upload_to_cloudinary(video_bytes, video_public_id)
+    elif source_url:
+        video_url = source_url
+        print(f"[ZapCap] using source_url directly: {source_url[:80]}", flush=True)
+    else:
+        raise HTTPException(status_code=400, detail="Provide either a video file or source_url")
 
     headers = await _zapcap_headers()
 
@@ -7942,6 +8045,64 @@ async def zapcap_job_status(
 
     print(f"[ZapCap] poll job={job_id}  status={status}  url={'yes' if output_url else 'no'}", flush=True)
 
+    # When transcription is done and waiting for approval, apply pending edits then approve (once only)
+    if status == "transcriptionCompleted" and not job.get("approved"):
+        pending_edits = job.get("pending_transcript_edits", [])
+        if pending_edits:
+            stored_words: list = job.get("transcript_words") or []
+            # Fetch fresh transcript words if not cached
+            if not stored_words:
+                async with httpx.AsyncClient(timeout=30) as client:
+                    tr = await client.get(
+                        f"{_ZAPCAP_BASE}/videos/{zapcap_video_id}/task/{zapcap_task_id}/transcript",
+                        headers=headers,
+                    )
+                if tr.status_code == 200:
+                    stored_words = tr.json() if isinstance(tr.json(), list) else []
+                    for i, w in enumerate(stored_words):
+                        if "id" not in w:
+                            w["id"] = str(i)
+            edit_map = {e["id"]: e["text"] for e in pending_edits if "id" in e and "text" in e}
+            updated_words = []
+            for w in stored_words:
+                word_copy = {k: v for k, v in w.items() if k != "id"}
+                if w.get("id") in edit_map:
+                    word_copy["text"] = edit_map[w["id"]]
+                updated_words.append(word_copy)
+            if updated_words:
+                async with httpx.AsyncClient(timeout=30) as client:
+                    put_r = await client.put(
+                        f"{_ZAPCAP_BASE}/videos/{zapcap_video_id}/task/{zapcap_task_id}/transcript",
+                        json=updated_words,
+                        headers=headers,
+                    )
+                print(f"[ZapCap] auto PUT transcript: {put_r.status_code} words={len(updated_words)} edits={len(pending_edits)}", flush=True)
+                if put_r.status_code in (200, 201, 204):
+                    # Re-index synthetic ids and persist updated words so editor shows correct text
+                    for i, w in enumerate(updated_words):
+                        w["id"] = str(i)
+                    await db["zapcap_jobs"].update_one(
+                        {"job_id": job_id},
+                        {"$set": {"transcript_words": updated_words}},
+                    )
+
+        async with httpx.AsyncClient(timeout=30) as client:
+            apr = await client.post(
+                f"{_ZAPCAP_BASE}/videos/{zapcap_video_id}/task/{zapcap_task_id}/approve-transcript",
+                headers=headers,
+            )
+        print(f"[ZapCap] approve-transcript: {apr.status_code}", flush=True)
+        await db["zapcap_jobs"].update_one(
+            {"job_id": job_id},
+            {"$set": {"status": "rendering", "approved": True}, "$unset": {"pending_transcript_edits": ""}},
+        )
+        # Return rendering so frontend keeps polling
+        return UriResponse.get_single_data_response("zapcap_job", {
+            "status": "rendering",
+            "output_url": None,
+            "failure_reason": None,
+        })
+
     await db["zapcap_jobs"].update_one(
         {"job_id": job_id},
         {"$set": {"status": status, "output_url": output_url}},
@@ -8017,27 +8178,44 @@ async def zapcap_job_transcript(
     if not job:
         raise HTTPException(status_code=404, detail="ZapCap job not found")
 
+    # Use cached words from DB if available
+    cached_words = job.get("transcript_words")
+    if cached_words:
+        print(f"[ZapCap] transcript from DB cache job={job_id} words={len(cached_words)}", flush=True)
+        return UriResponse.get_single_data_response("zapcap_transcript", {"words": cached_words})
+
     headers = await _zapcap_headers()
     zapcap_video_id = job["zapcap_video_id"]
+    zapcap_task_id = job.get("zapcap_task_id")
 
+    if not zapcap_task_id:
+        return UriResponse.get_single_data_response("zapcap_transcript", {"words": []})
+
+    # Dedicated transcript endpoint returns a JSON array of word objects
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.get(
-            f"{_ZAPCAP_BASE}/videos/{zapcap_video_id}",
+            f"{_ZAPCAP_BASE}/videos/{zapcap_video_id}/task/{zapcap_task_id}/transcript",
             headers=headers,
         )
 
     if r.status_code != 200:
         raise HTTPException(status_code=502, detail=f"ZapCap transcript fetch failed: {r.text}")
 
-    data = r.json()
-    # ZapCap nests transcript words under transcript.words or words directly
-    transcript = data.get("transcript") or {}
-    words = transcript.get("words") if isinstance(transcript, dict) else []
-    if not words:
-        words = data.get("words", [])
+    words = r.json()  # array of {text, type, confidence, start_time, end_time, ...}
+    if not isinstance(words, list):
+        words = []
 
-    print(f"[ZapCap] transcript for job={job_id} video={zapcap_video_id} words={len(words)}", flush=True)
-    return UriResponse.get_single_data_response("zapcap_transcript", {"words": words, "raw": data})
+    # Inject a stable id (index-based) so the frontend can key edits
+    for i, w in enumerate(words):
+        if "id" not in w:
+            w["id"] = str(i)
+
+    print(f"[ZapCap] transcript fetched job={job_id} words={len(words)}", flush=True)
+
+    if words:
+        await db["zapcap_jobs"].update_one({"job_id": job_id}, {"$set": {"transcript_words": words}})
+
+    return UriResponse.get_single_data_response("zapcap_transcript", {"words": words})
 
 
 @router.post("/zapcap-job/{job_id}/rerender")
@@ -8061,26 +8239,28 @@ async def zapcap_job_rerender(
 
     headers = await _zapcap_headers()
     zapcap_video_id = job["zapcap_video_id"]
+    old_task_id = job.get("zapcap_task_id")
     template_id = body.get("template_id") or job.get("template_id", "beast")
-    word_edits = body.get("word_edits", [])  # [{id, text}]
+    word_edits: list = body.get("word_edits", [])  # [{id, text}]
 
-    task_payload: dict = {
-        "templateId": template_id,
-        "language": job.get("language", "en"),
-        "autoApprove": True,
-    }
-    if word_edits:
-        task_payload["transcriptEdits"] = word_edits
-
-    export_settings: dict = {}
     output_mode = job.get("output_mode", "composited")
     quality = job.get("quality", "standard")
+
+    # Build export settings
+    export_settings: dict = {}
     if output_mode == "transparent":
         export_settings["outputMode"] = "transparent"
     elif output_mode == "greenScreen":
         export_settings["greenScreen"] = True
     if quality != "standard":
         export_settings["quality"] = quality
+
+    task_payload: dict = {
+        "templateId": template_id,
+        "language": job.get("language", "en"),
+        # autoApprove: False so the poll handler can apply caption edits before rendering
+        "autoApprove": False if word_edits else True,
+    }
     if export_settings:
         task_payload["exportSettings"] = export_settings
 
@@ -8098,7 +8278,7 @@ async def zapcap_job_rerender(
 
     new_job_id = _uuid2.uuid4().hex
     now = datetime.now(timezone.utc).isoformat()
-    await db["zapcap_jobs"].insert_one({
+    new_doc: dict = {
         "job_id": new_job_id,
         "user_id": user_id,
         "zapcap_video_id": zapcap_video_id,
@@ -8111,7 +8291,13 @@ async def zapcap_job_rerender(
         "music_url": job.get("music_url"),
         "status": "pending",
         "created_at": now,
-    })
+    }
+    if word_edits:
+        # Store edits + original transcript so poll handler can apply them at transcriptionCompleted
+        new_doc["pending_transcript_edits"] = word_edits
+        new_doc["transcript_words"] = job.get("transcript_words", [])
 
-    print(f"[ZapCap] rerender job={new_job_id} video={zapcap_video_id} task={zapcap_task_id} edits={len(word_edits)}", flush=True)
+    await db["zapcap_jobs"].insert_one(new_doc)
+    mode = "caption edits" if word_edits else "new template"
+    print(f"[ZapCap] rerender ({mode}) job={new_job_id} video={zapcap_video_id} task={zapcap_task_id} edits={len(word_edits)}", flush=True)
     return UriResponse.get_single_data_response("zapcap_rerender", {"job_id": new_job_id})
