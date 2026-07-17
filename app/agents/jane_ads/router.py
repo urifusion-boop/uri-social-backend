@@ -496,6 +496,8 @@ _DEMO_HTML = """<!DOCTYPE html>
     </div>
     <button onclick="doLogin()" style="margin-top:10px">Log in</button>
     <div id="authStatus" style="font-size:12px;color:#888;margin-top:8px"></div>
+    <button type="button" onclick="viewLog()" style="margin-top:10px;width:auto;padding:9px 14px;background:#555">📋 View decision log</button>
+    <div id="logPanel"></div>
   </div>
 
   <details class="tree-wrap">
@@ -627,7 +629,7 @@ function ex(o){
   run();
 }
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
-async function run(){
+async function run(overridePlatforms, overrideReason){
   const beh=document.getElementById('beh').value;
   const body={business_name:document.getElementById('name').value,category:document.getElementById('cat').value,
     goal:document.getElementById('goal').value,
@@ -637,6 +639,9 @@ async function run(){
     has_existing_demand:document.getElementById('demand').checked,
     city:document.getElementById('city').value,
     stated_behaviour:beh||null};
+  if(overridePlatforms && overridePlatforms.length){
+    body.override_platforms=overridePlatforms; body.override_reason=overrideReason||'';
+  }
   const out=document.getElementById('out');out.style.display='block';
   const naira=n=>'₦'+Number(n).toLocaleString();
   const esc=t=>String(t).replace(/</g,'&lt;');
@@ -669,12 +674,21 @@ async function run(){
     return;
   }
   let html='<hr class="divider"/>'+
+    (d.overridden?'<p class="pill" style="background:#C2185B22;color:#C2185B;display:inline-block;margin-bottom:8px">↺ overridden — Jane recommended '+(d.jane_recommended_platforms||[]).map(p=>p.toUpperCase()).join(' + ')+'</p>':'')+
     '<p class="verdict">'+d.platforms.map(p=>p.platform.toUpperCase()).join(' + ')+'</p>'+
     '<span class="pill">goal: '+d.goal+'</span> <span class="pill">'+d.behaviour+'</span> '+
     '<span class="pill">cap '+naira(d.per_business_cap_ngn)+'</span>'+
     '<p class="why">"'+d.explanation+'"</p>';
   d.platforms.forEach(p=>{html+='<div class="plat"><b>'+p.platform.toUpperCase()+'</b>'+
     '<span class="meta">'+naira(p.budget_ngn)+' · '+p.days+' days · '+p.variants+' variant(s) · test: '+p.test_scope+'</span></div>';});
+  html+='<div style="margin-top:14px;padding:12px 14px;background:#f6f5f3;border-radius:10px">'+
+    '<div style="font-size:12px;font-weight:700;color:#555;margin-bottom:8px">Not what you expected? Override Jane\\'s platform choice:</div>'+
+    '<div class="branchset" id="ovrPlats">'+
+      ['meta','google','tiktok'].map(p=>'<label class="chip" style="cursor:pointer"><input type="checkbox" value="'+p+'" style="margin-right:4px"/>'+p.toUpperCase()+'</label>').join('')+
+    '</div>'+
+    '<input type="text" id="ovrReason" placeholder="why? (optional)" style="margin-top:8px;width:100%;box-sizing:border-box;padding:8px 10px;border:1.5px solid #e0dcd9;border-radius:8px;font-size:13px"/>'+
+    '<button type="button" onclick="runOverride()" style="background:#555;margin-top:8px;padding:9px 14px;width:auto">↺ Run with my choice instead</button>'+
+  '</div>';
   if(d.geo){
     const g=d.geo;
     html+='<p class="thinking" style="margin-top:18px">📍 Geo — '+(g.mode==='watering_hole'?'watering-hole (go to where they gather)':'own-radius (pull them in)')+'</p>';
@@ -710,6 +724,38 @@ async function run(){
     '<input type="file" id="uploadFile" accept="image/png,image/jpeg,image/webp,video/mp4,video/quicktime,video/webm" style="display:none" onchange="uploadAndGenerate()"/>'+
   '</div><div id="creative"></div>';
   out.insertAdjacentHTML('beforeend',html);
+}
+function runOverride(){
+  const checked=[...document.querySelectorAll('#ovrPlats input:checked')].map(c=>c.value);
+  if(!checked.length){ alert('Pick at least one platform to override with.'); return; }
+  run(checked, document.getElementById('ovrReason').value);
+}
+async function viewLog(){
+  if(!authToken){ alert('Log in first to view the decision log.'); return; }
+  const panel=document.getElementById('logPanel');
+  const esc=t=>String(t||'').replace(/</g,'&lt;');
+  panel.innerHTML='<p class="thinking" style="margin-top:10px">📋 Loading…</p>';
+  let d;
+  try{
+    const r=await fetch('/jane-ads/instrumentation/demo',{headers:{'Authorization':'Bearer '+authToken}});
+    d=await r.json();
+    if(!r.ok) throw new Error(d.detail||('HTTP '+r.status));
+  }catch(e){ panel.innerHTML='<p class="why">Could not load the log: '+esc(e.message||e)+'</p>'; return; }
+  let h='<hr class="divider"/><p class="thinking">📋 Decisions ('+d.decisions.length+')</p>';
+  if(!d.decisions.length) h+='<p class="why">No decisions logged yet — run a plan above.</p>';
+  d.decisions.forEach(dec=>{
+    const plats=(dec.overridden?dec.final_platforms:dec.jane_platforms).map(p=>p.toUpperCase()).join(' + ')||'—';
+    h+='<div class="plat"><b>'+dec.decision.toUpperCase()+(dec.overridden?' <span class="pill" style="background:#C2185B22;color:#C2185B">overridden</span>':'')+'</b>'+
+      '<span class="meta">'+esc(plats)+' · '+new Date(dec.at).toLocaleString()+'</span></div>';
+  });
+  if(d.overrides.length){
+    h+='<p class="thinking" style="margin-top:14px">↺ Overrides ('+d.overrides.length+')</p>';
+    d.overrides.forEach(o=>{
+      h+='<div class="plat"><b>'+o.jane_platforms.map(p=>p.toUpperCase()).join(' + ')+' → '+o.user_platforms.map(p=>p.toUpperCase()).join(' + ')+'</b>'+
+        '<span class="meta">'+esc(o.reason||'no reason given')+'</span></div>';
+    });
+  }
+  panel.innerHTML=h;
 }
 
 // ── Auth (needed for brand-playbook / upload / draft sources) ────────────────
