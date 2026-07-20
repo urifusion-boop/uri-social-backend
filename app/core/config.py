@@ -30,6 +30,8 @@ class Settings(BaseSettings):
     # the ads page-connect flow still runs and stores the page token; only the
     # final "grant URI's Business Manager ADVERTISE access" step is skipped.
     META_BUSINESS_MANAGER_ID: str = ""
+    # Numeric id only, no "act_" prefix (the Marketing API adds that itself).
+    META_AD_ACCOUNT_ID: str = ""
 
     # Instagram Business Login (separate app credentials from the Instagram product)
     INSTAGRAM_APP_ID: str = ""
