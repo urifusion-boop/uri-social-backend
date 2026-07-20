@@ -11,10 +11,9 @@ from typing import List, Optional, Dict, Any
 from pydantic import BaseModel, Field
 from datetime import datetime
 
-from app.middleware.api_key_auth import verify_api_key
-from app.models.api_key import APIKey, APIKeyScope
+from app.models.api_key import APIKeyScope
 from app.domain.responses.uri_response import UriResponse
-from app.dependencies import get_db_dependency
+from app.dependencies import get_db_dependency, get_sdk_context
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from ..services.content_generation_service import ContentGenerationService
@@ -72,6 +71,29 @@ class ScheduleRequest(BaseModel):
         populate_by_name = True
 
 
+async def _get_brand_profile_dict(user_id: str, brand_id: str, db: AsyncIOMotorDatabase) -> Dict[str, Any]:
+    """
+    Shared helper: fetch the brand profile for this (developer-or-end-user-scoped)
+    brand_id, falling back to a minimal profile if none exists yet — mirrors the
+    fallback the /content/generate endpoint always had, just brand_id-scoped now
+    instead of always reading the developer's own profile regardless of caller.
+    """
+    profile_result = await BrandProfileService.get(user_id, db, brand_id=brand_id)
+    profile = profile_result.get("responseData") if profile_result.get("status") else None
+    if profile:
+        return profile
+    user = await db.users.find_one({"_id": user_id})
+    return {
+        "user_id": user_id,
+        "brand_id": brand_id,
+        "brand_name": (user or {}).get("name", "Your Brand"),
+        "industry": "general_other",
+        "region": "West Africa, Nigeria",
+        "brand_colors": ["#C41E3A", "#FFFEF2"],
+        "style_selections": ["lifestyle_natural"],
+    }
+
+
 # =====================================================
 # CONTENT GENERATION ENDPOINTS
 # =====================================================
@@ -80,7 +102,7 @@ class ScheduleRequest(BaseModel):
 async def generate_content(
     request: Request,
     body: ContentGenerationRequest,
-    api_key: APIKey = Depends(verify_api_key),
+    ctx: dict = Depends(get_sdk_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
@@ -92,68 +114,70 @@ async def generate_content(
 
     **Credits**: Deducts credits from user account
     """
+    api_key = ctx["api_key_obj"]
+    brand_id = ctx["brand_id"]
+
     try:
-        # Check scopes
         if not api_key.has_scope(APIKeyScope.CONTENT_WRITE):
             raise HTTPException(status_code=403, detail="Insufficient permissions: content:write required")
+        if not api_key.has_scope(APIKeyScope.IMAGES_GENERATE):
+            raise HTTPException(status_code=403, detail="Insufficient permissions: images:generate required")
 
-        # Check credits
         user = await db.users.find_one({"_id": api_key.user_id})
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
 
-        # Get brand profile
-        brand_profile = await BrandProfileService.get_brand_profile(api_key.user_id, db)
-        if not brand_profile:
-            # Create minimal profile
-            brand_profile = {
-                "user_id": api_key.user_id,
-                "brand_name": user.get("name", "Your Brand"),
-                "industry": "general_other",
-                "region": "West Africa, Nigeria",
-                "brand_colors": ["#C41E3A", "#FFFEF2"],
-                "style_selections": ["lifestyle_natural"]
-            }
+        brand_profile = await _get_brand_profile_dict(api_key.user_id, brand_id, db)
+        brand_context = {**brand_profile, "brand_id": brand_id}
 
-        # Generate content
-        result = await ContentGenerationService.generate_multi_platform_content(
+        # Single call generates text + images together and persists drafts
+        # (content_drafts, keyed by their own "id" field, not Mongo _id) —
+        # same real pipeline the main app's /generate-content uses, rather
+        # than the previous two-step call into a generate_image() method
+        # that never existed on ImageContentService.
+        result = await ImageContentService.generate_content_with_images(
             user_id=api_key.user_id,
             seed_content=body.seedContent,
             platforms=body.platforms,
+            include_images=True,
+            brand_context=brand_context,
+            db=db,
             reference_image=body.referenceImage,
-            tone=body.tone,
-            db=db
         )
 
-        # Generate image if needed
-        if body.referenceImage or True:  # Always generate images
-            if not api_key.has_scope(APIKeyScope.IMAGES_GENERATE):
-                raise HTTPException(status_code=403, detail="Insufficient permissions: images:generate required")
+        if not result.get("status"):
+            raise HTTPException(status_code=500, detail=result.get("responseMessage", "Content generation failed"))
 
-            image_result = await ImageContentService.generate_image(
-                user_id=api_key.user_id,
-                text_content=result.get("text_content", {}),
-                brand_profile=brand_profile,
-                reference_image=body.referenceImage,
-                db=db
-            )
-            result["image_url"] = image_result.get("image_url")
+        response_data = result.get("responseData", {})
+        drafts = response_data.get("drafts", [])
 
-        # Format response for SDK
+        # Stamp brand_id on the request + every draft, same pattern used by
+        # /social-media/generate-content — this is the isolation boundary
+        # drafts/content are later fetched by, not just the auth layer.
+        request_id = response_data.get("request_id")
+        draft_ids = [d["id"] for d in drafts if d.get("id")]
+        if request_id:
+            await db["content_requests"].update_one({"id": request_id}, {"$set": {"brand_id": brand_id}})
+        if draft_ids:
+            await db["content_drafts"].update_many({"id": {"$in": draft_ids}}, {"$set": {"brand_id": brand_id}})
+        for d in drafts:
+            d["brand_id"] = brand_id
+
         sdk_response = {
-            "id": str(result.get("draft_id", "")),
+            "id": draft_ids[0] if draft_ids else "",
+            "request_id": request_id,
             "platforms": [
                 {
-                    "platform": platform,
-                    "text": content.get("text", ""),
-                    "hashtags": content.get("hashtags", []),
-                    "character_count": len(content.get("text", ""))
+                    "platform": d.get("platform"),
+                    "text": d.get("content", ""),
+                    "hashtags": d.get("hashtags", []),
+                    "character_count": len(d.get("content", "")),
+                    "image_url": d.get("image_url"),
                 }
-                for platform, content in result.get("text_content", {}).items()
+                for d in drafts
             ],
-            "image_url": result.get("image_url"),
             "created_at": datetime.utcnow().isoformat(),
-            "status": "completed"
+            "status": "completed",
         }
 
         return JSONResponse(content=sdk_response, status_code=201)
@@ -167,7 +191,7 @@ async def generate_content(
 @router.get("/content/{content_id}")
 async def get_content(
     content_id: str,
-    api_key: APIKey = Depends(verify_api_key),
+    ctx: dict = Depends(get_sdk_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
@@ -175,17 +199,22 @@ async def get_content(
 
     **Required Scopes**: content:read
     """
+    api_key = ctx["api_key_obj"]
+    brand_id = ctx["brand_id"]
+
     if not api_key.has_scope(APIKeyScope.CONTENT_READ):
         raise HTTPException(status_code=403, detail="Insufficient permissions: content:read required")
 
-    draft = await db.content_drafts.find_one({
-        "_id": content_id,
-        "user_id": api_key.user_id
-    })
+    # content_drafts documents are keyed by their own "id" string field, not
+    # Mongo's auto _id (every real writer — approval_workflow_service,
+    # carousel_generation_service, etc. — sets "id" explicitly and lets Mongo
+    # assign an unrelated _id). Querying by _id here never matched a real draft.
+    draft = await db.content_drafts.find_one({"id": content_id, "brand_id": brand_id})
 
     if not draft:
         raise HTTPException(status_code=404, detail="Content not found")
 
+    draft.pop("_id", None)
     return JSONResponse(content=draft)
 
 
@@ -197,7 +226,7 @@ async def get_content(
 async def list_drafts(
     page: int = Query(1, ge=1),
     per_page: int = Query(20, ge=1, le=100),
-    api_key: APIKey = Depends(verify_api_key),
+    ctx: dict = Depends(get_sdk_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
@@ -205,34 +234,20 @@ async def list_drafts(
 
     **Required Scopes**: drafts:read
     """
+    api_key = ctx["api_key_obj"]
+    brand_id = ctx["brand_id"]
+
     if not api_key.has_scope(APIKeyScope.DRAFTS_READ):
         raise HTTPException(status_code=403, detail="Insufficient permissions: drafts:read required")
 
     skip = (page - 1) * per_page
+    query = {"brand_id": brand_id}
 
-    print(f"📋 SDK /api/v1/drafts request - API key user_id: {api_key.user_id}, page: {page}, per_page: {per_page}")
-
-    # Query all drafts for this user to debug
-    all_drafts_sample = await db.content_drafts.find(
-        {"user_id": api_key.user_id}
-    ).sort("created_at", -1).limit(5).to_list(length=5)
-
-    print(f"📋 Top 5 most recent draft IDs in DB: {[d.get('id', 'no-id') for d in all_drafts_sample]}")
-
-    # Now get the paginated results
-    drafts_cursor = db.content_drafts.find(
-        {"user_id": api_key.user_id}
-    ).sort("created_at", -1).skip(skip).limit(per_page)
-
+    drafts_cursor = db.content_drafts.find(query).sort("created_at", -1).skip(skip).limit(per_page)
     drafts = await drafts_cursor.to_list(length=per_page)
-    total = await db.content_drafts.count_documents({"user_id": api_key.user_id})
+    total = await db.content_drafts.count_documents(query)
 
-    print(f"📋 Returning {len(drafts)} drafts (total: {total})")
-
-    # Convert ObjectId and datetime to string for JSON serialization
-    import json
-    from bson import ObjectId
-    from datetime import datetime
+    from bson import ObjectId as _ObjectId
 
     def serialize_doc(doc):
         """Convert MongoDB document to JSON-serializable dict"""
@@ -240,7 +255,7 @@ async def list_drafts(
             return {k: serialize_doc(v) for k, v in doc.items()}
         elif isinstance(doc, list):
             return [serialize_doc(item) for item in doc]
-        elif isinstance(doc, ObjectId):
+        elif isinstance(doc, _ObjectId):
             return str(doc)
         elif isinstance(doc, datetime):
             return doc.isoformat()
@@ -249,7 +264,9 @@ async def list_drafts(
 
     serialized_drafts = []
     for draft in drafts:
-        draft["id"] = str(draft.pop("_id"))
+        # Drafts already carry their own "id" field from creation — don't
+        # overwrite it with the unrelated Mongo _id, just drop _id.
+        draft.pop("_id", None)
         serialized_drafts.append(serialize_doc(draft))
 
     return JSONResponse(content={
@@ -264,7 +281,7 @@ async def list_drafts(
 @router.get("/drafts/{draft_id}")
 async def get_draft(
     draft_id: str,
-    api_key: APIKey = Depends(verify_api_key),
+    ctx: dict = Depends(get_sdk_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
@@ -272,18 +289,18 @@ async def get_draft(
 
     **Required Scopes**: drafts:read
     """
+    api_key = ctx["api_key_obj"]
+    brand_id = ctx["brand_id"]
+
     if not api_key.has_scope(APIKeyScope.DRAFTS_READ):
         raise HTTPException(status_code=403, detail="Insufficient permissions")
 
-    draft = await db.content_drafts.find_one({
-        "_id": draft_id,
-        "user_id": api_key.user_id
-    })
+    draft = await db.content_drafts.find_one({"id": draft_id, "brand_id": brand_id})
 
     if not draft:
         raise HTTPException(status_code=404, detail="Draft not found")
 
-    draft["id"] = str(draft.pop("_id"))
+    draft.pop("_id", None)
     return JSONResponse(content=draft)
 
 
@@ -291,7 +308,7 @@ async def get_draft(
 async def update_draft(
     draft_id: str,
     updates: Dict[str, Any] = Body(...),
-    api_key: APIKey = Depends(verify_api_key),
+    ctx: dict = Depends(get_sdk_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
@@ -299,19 +316,22 @@ async def update_draft(
 
     **Required Scopes**: drafts:write
     """
+    api_key = ctx["api_key_obj"]
+    brand_id = ctx["brand_id"]
+
     if not api_key.has_scope(APIKeyScope.DRAFTS_WRITE):
         raise HTTPException(status_code=403, detail="Insufficient permissions")
 
     result = await db.content_drafts.update_one(
-        {"_id": draft_id, "user_id": api_key.user_id},
+        {"id": draft_id, "brand_id": brand_id},
         {"$set": {**updates, "updated_at": datetime.utcnow()}}
     )
 
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Draft not found")
 
-    updated_draft = await db.content_drafts.find_one({"_id": draft_id})
-    updated_draft["id"] = str(updated_draft.pop("_id"))
+    updated_draft = await db.content_drafts.find_one({"id": draft_id})
+    updated_draft.pop("_id", None)
 
     return JSONResponse(content=updated_draft)
 
@@ -319,7 +339,7 @@ async def update_draft(
 @router.delete("/drafts/{draft_id}")
 async def delete_draft(
     draft_id: str,
-    api_key: APIKey = Depends(verify_api_key),
+    ctx: dict = Depends(get_sdk_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
@@ -327,13 +347,13 @@ async def delete_draft(
 
     **Required Scopes**: drafts:delete
     """
+    api_key = ctx["api_key_obj"]
+    brand_id = ctx["brand_id"]
+
     if not api_key.has_scope(APIKeyScope.DRAFTS_DELETE):
         raise HTTPException(status_code=403, detail="Insufficient permissions")
 
-    result = await db.content_drafts.delete_one({
-        "_id": draft_id,
-        "user_id": api_key.user_id
-    })
+    result = await db.content_drafts.delete_one({"id": draft_id, "brand_id": brand_id})
 
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Draft not found")
@@ -348,7 +368,7 @@ async def delete_draft(
 @router.post("/images/generate")
 async def generate_image(
     body: ImageGenerationRequest,
-    api_key: APIKey = Depends(verify_api_key),
+    ctx: dict = Depends(get_sdk_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
@@ -358,10 +378,12 @@ async def generate_image(
 
     **Rate Limit**: 50 requests/hour
     """
+    api_key = ctx["api_key_obj"]
+    brand_id = ctx["brand_id"]
+
     if not api_key.has_scope(APIKeyScope.IMAGES_GENERATE):
         raise HTTPException(status_code=403, detail="Insufficient permissions")
 
-    # Check specific rate limit for image generation
     if not api_key.check_rate_limit("image_generation"):
         raise HTTPException(
             status_code=429,
@@ -369,21 +391,37 @@ async def generate_image(
         )
 
     try:
-        brand_profile = await BrandProfileService.get_brand_profile(api_key.user_id, db)
+        brand_profile = await _get_brand_profile_dict(api_key.user_id, brand_id, db)
 
-        result = await ImageContentService.generate_image(
-            user_id=api_key.user_id,
-            text_content={"instagram": {"text": body.prompt}},
-            brand_profile=brand_profile or {},
+        # Standalone image generation (no draft/platform-content context) —
+        # ImageContentService has no generate_image() method; this is the real
+        # single-image primitive the rest of the app's generation paths call.
+        image_result = await ImageContentService._generate_platform_image(
+            platform="instagram",
+            content=body.prompt,
+            seed_content=body.prompt,
+            brand_context=brand_profile,
             reference_image=body.referenceImage,
-            db=db
         )
 
+        if not image_result.get("status"):
+            raise HTTPException(status_code=500, detail=image_result.get("responseMessage", "Image generation failed"))
+
+        image_data = image_result.get("responseData", {})
+        raw_image_url = image_data.get("image_url")
+
+        stored_url = raw_image_url
+        if raw_image_url and raw_image_url.startswith("data:"):
+            from app.utils.cloudinary_upload import upload_base64
+            stored_url = await upload_base64(raw_image_url, folder="uri-social/sdk-images")
+
         return JSONResponse(content={
-            "image_url": result.get("image_url"),
-            "revised_prompt": result.get("revised_prompt")
+            "image_url": stored_url,
+            "specs": image_data.get("specs"),
         })
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Image generation failed: {str(e)}")
 
@@ -391,7 +429,7 @@ async def generate_image(
 @router.post("/images/remove-background")
 async def remove_background(
     image_url: str = Body(..., embed=True),
-    api_key: APIKey = Depends(verify_api_key),
+    ctx: dict = Depends(get_sdk_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
@@ -399,6 +437,8 @@ async def remove_background(
 
     **Required Scopes**: images:edit
     """
+    api_key = ctx["api_key_obj"]
+
     if not api_key.has_scope(APIKeyScope.IMAGES_EDIT):
         raise HTTPException(status_code=403, detail="Insufficient permissions")
 
@@ -411,13 +451,15 @@ async def remove_background(
 @router.post("/images/analyze-product")
 async def analyze_product(
     image_url: str = Body(..., embed=True),
-    api_key: APIKey = Depends(verify_api_key)
+    ctx: dict = Depends(get_sdk_context)
 ):
     """
     Analyze product in image
 
     **Required Scopes**: images:generate
     """
+    api_key = ctx["api_key_obj"]
+
     if not api_key.has_scope(APIKeyScope.IMAGES_GENERATE):
         raise HTTPException(status_code=403, detail="Insufficient permissions")
 
@@ -433,7 +475,7 @@ async def analyze_product(
 
 @router.get("/connections")
 async def list_connections(
-    api_key: APIKey = Depends(verify_api_key),
+    ctx: dict = Depends(get_sdk_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
@@ -441,25 +483,31 @@ async def list_connections(
 
     **Required Scopes**: connections:read
     """
+    api_key = ctx["api_key_obj"]
+    brand_id = ctx["brand_id"]
+
     if not api_key.has_scope(APIKeyScope.CONNECTIONS_READ):
         raise HTTPException(status_code=403, detail="Insufficient permissions")
 
-    connections = await SocialAccountService.get_connections(api_key.user_id, db)
+    result = await SocialAccountService.get_user_connections(db, api_key.user_id, brand_id=brand_id)
+    data = result.get("responseData", {}) if result.get("status") else {}
 
-    return JSONResponse(content={"connected_platforms": connections})
+    return JSONResponse(content={"connected_platforms": data.get("connected_platforms", [])})
 
 
 @router.get("/connections/{platform}/connect")
 async def get_connect_url(
     platform: str,
     redirect_url: Optional[str] = Query(None),
-    api_key: APIKey = Depends(verify_api_key)
+    ctx: dict = Depends(get_sdk_context)
 ):
     """
     Get OAuth URL to connect platform
 
     **Required Scopes**: connections:write
     """
+    api_key = ctx["api_key_obj"]
+
     if not api_key.has_scope(APIKeyScope.CONNECTIONS_WRITE):
         raise HTTPException(status_code=403, detail="Insufficient permissions")
 
@@ -472,7 +520,7 @@ async def get_connect_url(
 @router.delete("/connections/{platform}")
 async def disconnect_platform(
     platform: str,
-    api_key: APIKey = Depends(verify_api_key),
+    ctx: dict = Depends(get_sdk_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
@@ -480,10 +528,26 @@ async def disconnect_platform(
 
     **Required Scopes**: connections:delete
     """
+    api_key = ctx["api_key_obj"]
+    brand_id = ctx["brand_id"]
+
     if not api_key.has_scope(APIKeyScope.CONNECTIONS_DELETE):
         raise HTTPException(status_code=403, detail="Insufficient permissions")
 
-    await SocialAccountService.disconnect(api_key.user_id, platform, db)
+    # disconnect_account() takes Outstand's own account id, not a bare platform
+    # name — look the connected account up first to get it.
+    connections_result = await SocialAccountService.get_user_connections(db, api_key.user_id, brand_id=brand_id)
+    connections = connections_result.get("responseData", {}).get("connections", {}) if connections_result.get("status") else {}
+    platform_accounts = connections.get(platform, [])
+
+    if not platform_accounts:
+        raise HTTPException(status_code=404, detail=f"No connected {platform} account found")
+
+    outstand_account_id = platform_accounts[0].get("outstand_account_id")
+    if not outstand_account_id:
+        raise HTTPException(status_code=404, detail=f"No disconnectable {platform} account found")
+
+    await SocialAccountService.disconnect_account(db, api_key.user_id, outstand_account_id, brand_id=brand_id)
 
     return JSONResponse(content={"success": True})
 
@@ -495,7 +559,7 @@ async def disconnect_platform(
 @router.post("/publish")
 async def publish_content(
     body: PublishRequest,
-    api_key: APIKey = Depends(verify_api_key),
+    ctx: dict = Depends(get_sdk_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
@@ -503,10 +567,13 @@ async def publish_content(
 
     **Required Scopes**: publishing:write
     """
+    api_key = ctx["api_key_obj"]
+
     if not api_key.has_scope(APIKeyScope.PUBLISHING_WRITE):
         raise HTTPException(status_code=403, detail="Insufficient permissions")
 
-    # TODO: Implement publishing logic
+    # TODO: Implement publishing logic — thread ctx["brand_id"] through once
+    # this calls the real posting pipeline, so it stays isolated per end-user.
     results = []
     for platform in body.platforms:
         results.append({
@@ -524,7 +591,7 @@ async def publish_content(
 @router.post("/publish/schedule")
 async def schedule_content(
     body: ScheduleRequest,
-    api_key: APIKey = Depends(verify_api_key),
+    ctx: dict = Depends(get_sdk_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
@@ -532,10 +599,13 @@ async def schedule_content(
 
     **Required Scopes**: publishing:schedule
     """
+    api_key = ctx["api_key_obj"]
+
     if not api_key.has_scope(APIKeyScope.PUBLISHING_SCHEDULE):
         raise HTTPException(status_code=403, detail="Insufficient permissions")
 
-    # TODO: Implement scheduling logic
+    # TODO: Implement scheduling logic — thread ctx["brand_id"] through once
+    # this calls the real scheduling pipeline, so it stays isolated per end-user.
     scheduled_id = f"scheduled_{api_key.user_id}_{datetime.utcnow().timestamp()}"
 
     return JSONResponse(content={
@@ -550,14 +620,20 @@ async def schedule_content(
 
 @router.get("/billing/info")
 async def get_billing_info(
-    api_key: APIKey = Depends(verify_api_key),
+    ctx: dict = Depends(get_sdk_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
     Get billing information and credits
 
     **Required Scopes**: billing:read
+
+    Deliberately keyed on the developer's own user_id, not the resolved
+    brand/end-user — credits are developer-level (SDKClientProfile's
+    shared_credits_with_developer), billing must never be per-end-user.
     """
+    api_key = ctx["api_key_obj"]
+
     if not api_key.has_scope(APIKeyScope.BILLING_READ):
         raise HTTPException(status_code=403, detail="Insufficient permissions")
 
