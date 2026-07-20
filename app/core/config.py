@@ -32,6 +32,13 @@ class Settings(BaseSettings):
     META_BUSINESS_MANAGER_ID: str = ""
     # Numeric id only, no "act_" prefix (the Marketing API adds that itself).
     META_AD_ACCOUNT_ID: str = ""
+    # Working credential for real ad-account calls. A long-lived USER access token
+    # (~60 day expiry) obtained via /connect/facebook-ads OAuth consent — confirmed
+    # live to work where a system-user-generated token (META_SYSTEM_TOKEN) did not,
+    # for reasons not yet root-caused. Needs periodic manual refresh until that's
+    # sorted out. The Facebook Page connected for Click-to-WhatsApp ads.
+    META_ADS_ACCESS_TOKEN: str = ""
+    META_ADS_PAGE_ID: str = ""
 
     # Instagram Business Login (separate app credentials from the Instagram product)
     INSTAGRAM_APP_ID: str = ""
