@@ -23,6 +23,16 @@ router = APIRouter(prefix="/auth", tags=["Auth"])
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
+# A verification code is only good until the NEXT one is generated — every send
+# site overwrites verification_code/verification_code_expires. The frontend's
+# verify-email page auto-calls /resend-verification on mount (belt-and-suspenders
+# "make sure a code was sent"), which lands seconds after /signup already sent
+# one — so the user gets two emails, and the first one's code is silently
+# invalidated by the second write, even though its own 15-minute expiry hasn't
+# elapsed. This cooldown makes a resend arriving right after a send a no-op
+# instead of a second, code-invalidating email.
+VERIFICATION_RESEND_COOLDOWN_SECONDS = 30
+
 
 class SignupRequest(BaseModel):
     email: EmailStr
@@ -75,6 +85,7 @@ async def signup(body: SignupRequest, db: AsyncIOMotorDatabase = Depends(get_db_
             "email_verified": False,
             "verification_code": verification_code,
             "verification_code_expires": verification_code_expires,
+            "verification_code_sent_at": now,
             "account_status": "pending_verification",
             "last_login_at": None,
             "last_seen_at": now,
@@ -274,41 +285,50 @@ async def login(body: LoginRequest, db: AsyncIOMotorDatabase = Depends(get_db_de
         user.get("auth_provider") != "google" and
         user.get("account_status") == "pending_verification"):
 
-        # This is a NEW user who just signed up and hasn't verified yet
-        # Generate and send a new verification code
-        verification_code = ''.join([str(random.randint(0, 9)) for _ in range(6)])
-        verification_code_expires = datetime.utcnow() + timedelta(minutes=15)
-
-        await db["users"].update_one(
-            {"email": body.email},
-            {
-                "$set": {
-                    "verification_code": verification_code,
-                    "verification_code_expires": verification_code_expires,
-                    "updated_at": datetime.utcnow(),
-                }
-            }
+        # This is a NEW user who just signed up and hasn't verified yet.
+        # Only generate + send a new code if the last one wasn't sent moments
+        # ago (e.g. signup's own send, or the verify-email page's auto-resend)
+        # — otherwise this silently invalidates a code the user was just
+        # emailed seconds earlier.
+        last_sent = user.get("verification_code_sent_at")
+        within_cooldown = (
+            last_sent and (datetime.utcnow() - last_sent).total_seconds() < VERIFICATION_RESEND_COOLDOWN_SECONDS
         )
 
-        # Send new verification email
-        try:
-            import asyncio
-            asyncio.ensure_future(email_service.send_email(
-                to_email=body.email,
-                subject="Verify your URI Social account",
-                template_name="email_verification",
-                template_vars={
-                    "first_name": user.get("first_name") or "there",
-                    "verification_code": verification_code,
-                    "expires_in": "15 minutes",
+        if not within_cooldown:
+            verification_code = ''.join([str(random.randint(0, 9)) for _ in range(6)])
+            verification_code_expires = datetime.utcnow() + timedelta(minutes=15)
+
+            await db["users"].update_one(
+                {"email": body.email},
+                {
+                    "$set": {
+                        "verification_code": verification_code,
+                        "verification_code_expires": verification_code_expires,
+                        "verification_code_sent_at": datetime.utcnow(),
+                        "updated_at": datetime.utcnow(),
+                    }
                 }
-            ))
-        except Exception as e:
-            print(f"⚠️ Verification email failed for {body.email}: {e}")
+            )
+
+            try:
+                import asyncio
+                asyncio.ensure_future(email_service.send_email(
+                    to_email=body.email,
+                    subject="Verify your URI Social account",
+                    template_name="email_verification",
+                    template_vars={
+                        "first_name": user.get("first_name") or "there",
+                        "verification_code": verification_code,
+                        "expires_in": "15 minutes",
+                    }
+                ))
+            except Exception as e:
+                print(f"⚠️ Verification email failed for {body.email}: {e}")
 
         raise HTTPException(
             status_code=403,
-            detail="Please verify your email before logging in. We've sent a new verification code to your inbox."
+            detail="Please verify your email before logging in. We've sent a verification code to your inbox."
         )
 
     # Update last_login_at and last_seen_at
@@ -456,6 +476,21 @@ async def resend_verification(body: ResendVerificationRequest, db: AsyncIOMotorD
     if user.get("email_verified"):
         raise HTTPException(status_code=400, detail="Email is already verified.")
 
+    # A code was already sent moments ago (signup's own send, or a near-
+    # simultaneous duplicate call) — don't regenerate. Regenerating here would
+    # silently invalidate whatever code the user was just emailed, without
+    # them knowing why the first email's code stopped working.
+    last_sent = user.get("verification_code_sent_at")
+    if last_sent and (datetime.utcnow() - last_sent).total_seconds() < VERIFICATION_RESEND_COOLDOWN_SECONDS:
+        return {
+            "status": True,
+            "responseCode": 200,
+            "responseMessage": "A verification code was already sent — please check your inbox (and spam folder).",
+            "responseData": {
+                "email": body.email,
+            },
+        }
+
     # Generate new verification code
     verification_code = ''.join([str(random.randint(0, 9)) for _ in range(6)])
     verification_code_expires = datetime.utcnow() + timedelta(minutes=15)
@@ -466,6 +501,7 @@ async def resend_verification(body: ResendVerificationRequest, db: AsyncIOMotorD
             "$set": {
                 "verification_code": verification_code,
                 "verification_code_expires": verification_code_expires,
+                "verification_code_sent_at": datetime.utcnow(),
                 "updated_at": datetime.utcnow(),
             }
         }
