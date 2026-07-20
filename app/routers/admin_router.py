@@ -362,3 +362,93 @@ async def export_user_emails(
         "emails": emails,
         "total": len(emails)
     }
+
+
+# ── Brand-profile integrity scan (read-only) ──────────────────────────────────
+# Diagnoses the historical cross-brand data leak (fixed in
+# services/brand_profile_service.py — a bare {"user_id": user_id} query used to
+# match ANY of a user's brand_profiles docs instead of the one actually requested).
+# The code fix stops NEW corruption; documents already overwritten before the fix
+# shipped are still wrong and need identifying here, then repairing separately.
+# This endpoint only reads — it changes nothing.
+
+_IDENTITY_FIELDS = [
+    "brand_name", "industry", "website", "tagline", "product_description",
+    "target_audience", "primary_goal",
+]
+
+
+@router.get("/brand-profiles/integrity-scan")
+async def brand_profile_integrity_scan(
+    admin_user: dict = Depends(verify_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Two independent signals, both reported (a profile can trip either or both):
+
+    1. name_mismatch — brand_profiles.brand_name doesn't match the brand's real
+       name in brand_accounts for the SAME brand_id. Strong evidence this document
+       was written for a different brand and never corrected.
+    2. shared_content — two or more DIFFERENT brand_ids under the same user_id
+       have byte-identical identity fields (name/industry/tagline/etc). Two
+       genuinely independent brands don't naturally end up identical; this is the
+       exact fingerprint of the old bug (one document silently serving several
+       brands).
+    """
+    brands_by_id = {}
+    async for b in db["brand_accounts"].find({}, {"brand_id": 1, "name": 1, "owner_user_id": 1}):
+        brands_by_id[b["brand_id"]] = b
+
+    profiles = []
+    async for p in db["brand_profiles"].find({}):
+        p["_id"] = str(p["_id"])
+        profiles.append(p)
+
+    name_mismatches = []
+    for p in profiles:
+        bid = p.get("brand_id")
+        if not bid or bid not in brands_by_id:
+            continue
+        real_name = (brands_by_id[bid].get("name") or "").strip().lower()
+        stored_name = (p.get("brand_name") or "").strip().lower()
+        if real_name and stored_name and real_name != stored_name:
+            name_mismatches.append({
+                "brand_id": bid,
+                "user_id": p.get("user_id"),
+                "brand_real_name": brands_by_id[bid].get("name"),
+                "profile_stored_name": p.get("brand_name"),
+                "profile_updated_at": str(p.get("updated_at")),
+            })
+
+    by_user = {}
+    for p in profiles:
+        uid = p.get("user_id")
+        if uid:
+            by_user.setdefault(uid, []).append(p)
+
+    shared_content_groups = []
+    for uid, user_profiles in by_user.items():
+        if len(user_profiles) < 2:
+            continue
+        by_signature = {}
+        for p in user_profiles:
+            sig = tuple((p.get(f) or "") for f in _IDENTITY_FIELDS)
+            by_signature.setdefault(sig, []).append(p)
+        for sig, group in by_signature.items():
+            distinct_brand_ids = {p.get("brand_id") for p in group}
+            if len(group) > 1 and len(distinct_brand_ids) > 1 and any(sig):
+                shared_content_groups.append({
+                    "user_id": uid,
+                    "shared_brand_name": sig[0],
+                    "affected_brand_ids": sorted(distinct_brand_ids),
+                    "count": len(group),
+                })
+
+    return {
+        "status": True,
+        "total_profiles_scanned": len(profiles),
+        "name_mismatches": name_mismatches,
+        "name_mismatch_count": len(name_mismatches),
+        "shared_content_groups": shared_content_groups,
+        "shared_content_group_count": len(shared_content_groups),
+    }
