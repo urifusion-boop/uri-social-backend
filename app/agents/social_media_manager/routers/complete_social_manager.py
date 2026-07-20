@@ -583,7 +583,12 @@ async def generate_content(
             # PRE-ASSIGN visual styles sequentially to avoid race condition when parallel tasks
             # all read the same rotation_index simultaneously. Each draft gets a unique style,
             # then they can generate images concurrently without conflicts.
+            #
+            # Custom guides (V1 + V2) take priority over library styles — same priority
+            # order the per-draft dynamic-assignment fallback below still uses — so this
+            # phase must resolve those first, not just always call pick_next_style().
             from app.agents.social_media_manager.services.style_library import pick_next_style
+            from app.agents.social_media_manager.services.custom_visual_guide_service import CustomVisualGuideService
             _bc_brand_id = brand_context_dict.get("brand_id", "")
             _bc_user_id = brand_context_dict.get("user_id", "")
             _style_profile_scope = {"brand_id": _bc_brand_id} if _bc_brand_id else {"user_id": _bc_user_id}
@@ -598,17 +603,54 @@ async def generate_content(
             _style_selections = _style_profile.get("style_selections") or []
             _style_prompt_fragments = _style_profile.get("style_prompt_fragments") or []
             _industry = _style_profile.get("industry") or brand_context_dict.get("industry", "")
+            _custom_guide_ids_v1 = _style_profile.get("selected_custom_guides") or []
+            _custom_guide_ids_v2 = _style_profile.get("selected_custom_guides_v2") or []
+            _all_custom_guide_ids = _custom_guide_ids_v1 + _custom_guide_ids_v2
 
-            # Pre-assign styles to each non-carousel draft
-            _assigned_styles = {}  # draft_id -> (slug, fragment)
+            # Pre-assign styles to each non-carousel draft. Each assignment is a dict:
+            # {"type": "library"|"custom_v1"|"custom_v2", "slug", "fragment"?,
+            #  "custom_guide_id"?, "reference_image"?}
+            _assigned_styles: Dict[str, Dict[str, Any]] = {}
             _next_rotation_index = _current_rotation_index
 
             for draft in drafts:
-                if post_type != "carousel":  # Carousels handle their own style assignment
+                if post_type == "carousel":
+                    continue  # Carousels handle their own style assignment
+
+                if _all_custom_guide_ids:
+                    # Rotate through custom guides (V1 + V2) like library styles
+                    _custom_guide_id = _all_custom_guide_ids[_next_rotation_index % len(_all_custom_guide_ids)]
+                    _is_v2 = _custom_guide_id in _custom_guide_ids_v2
+                    _next_rotation_index = (_next_rotation_index + 1) % (len(_all_custom_guide_ids) + len(_style_selections))
+
+                    if _is_v2:
+                        _custom_guide = await db["custom_visual_guides"].find_one(
+                            {"_id": ObjectId(_custom_guide_id), "version": "v2"}
+                        )
+                        if _custom_guide:
+                            _assigned_styles[draft["id"]] = {
+                                "type": "custom_v2",
+                                "slug": f"custom_v2_{_custom_guide_id[:8]}",
+                                "custom_guide_id": _custom_guide_id,
+                                "reference_image": _custom_guide.get("original_image_url"),
+                            }
+                            print(f"🎨 Pre-assigned Custom V2 guide [{_custom_guide.get('name')}] to draft {draft['id'][:12]}...")
+                    else:
+                        _custom_guide = await CustomVisualGuideService.get_guide_detail(_custom_guide_id, db)
+                        if _custom_guide:
+                            _assigned_styles[draft["id"]] = {
+                                "type": "custom_v1",
+                                "slug": f"custom_{_custom_guide_id[:8]}",
+                                "fragment": _custom_guide.get("prompt_fragment", ""),
+                                "custom_guide_id": _custom_guide_id,
+                            }
+                            print(f"🎨 Pre-assigned Custom V1 guide [{_custom_guide.get('name')}] to draft {draft['id'][:12]}...")
+                            await CustomVisualGuideService.track_guide_usage(_custom_guide_id, False, db)
+                else:
                     _slug, _fragment, _next_rotation_index = pick_next_style(
                         _style_selections, _next_rotation_index, _industry, _style_prompt_fragments
                     )
-                    _assigned_styles[draft["id"]] = (_slug, _fragment)
+                    _assigned_styles[draft["id"]] = {"type": "library", "slug": _slug, "fragment": _fragment}
 
             # Save the final rotation index after all assignments
             if _assigned_styles:
@@ -4706,7 +4748,7 @@ async def _generate_image_bg(
     image_model: Optional[str] = None,
     total_slides: Optional[int] = None,
     carousel_id: Optional[str] = None,
-    preassigned_style: Optional[tuple[str, str]] = None,
+    preassigned_style: Optional[Dict[str, Any]] = None,
 ):
     """
     Background task: generate an image for an existing draft and save it to DB.
@@ -4829,11 +4871,33 @@ async def _generate_image_bg(
             # Regular post: use preassigned style if provided (avoids race condition),
             # otherwise check for custom guides (V1 + V2) first, then fallback to style rotation
             if preassigned_style:
-                # Use pre-assigned style from the sequential assignment phase
-                _slug, _fragment = preassigned_style
-                if _fragment:
-                    brand_context = {**brand_context, "style_prompt_fragment": _fragment, "style_slug": _slug}
-                    print(f"🎨 Style [{_slug}] applied (pre-assigned to avoid race condition)")
+                # Use pre-assigned style/guide from the sequential assignment phase.
+                # Mirrors the three branches the dynamic fallback below handles.
+                _ptype = preassigned_style.get("type")
+                _slug = preassigned_style.get("slug", "")
+
+                if _ptype == "custom_v2":
+                    brand_context = {
+                        **brand_context,
+                        "style_slug": _slug,
+                        "custom_guide_v2_id": preassigned_style.get("custom_guide_id"),
+                        "custom_guide_v2_reference_image": preassigned_style.get("reference_image"),
+                    }
+                    print(f"🎨 Custom V2 guide [{_slug}] applied (pre-assigned to avoid race condition)")
+                elif _ptype == "custom_v1":
+                    _fragment = preassigned_style.get("fragment", "")
+                    brand_context = {
+                        **brand_context,
+                        "style_prompt_fragment": _fragment,
+                        "style_slug": _slug,
+                        "custom_guide_id": preassigned_style.get("custom_guide_id"),
+                    }
+                    print(f"🎨 Custom V1 guide [{_slug}] applied (pre-assigned to avoid race condition)")
+                else:
+                    _fragment = preassigned_style.get("fragment", "")
+                    if _fragment:
+                        brand_context = {**brand_context, "style_prompt_fragment": _fragment, "style_slug": _slug}
+                        print(f"🎨 Style [{_slug}] applied (pre-assigned to avoid race condition)")
             else:
                 # Fallback to dynamic assignment (used by regenerate_image and other paths)
                 _bp = await db["brand_profiles"].find_one(
