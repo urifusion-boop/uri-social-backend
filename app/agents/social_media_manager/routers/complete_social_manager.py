@@ -173,11 +173,14 @@ class ContentGenerationRequest(BaseModel):
     include_images: bool = False
     image_model: Optional[str] = None  # e.g. "fal-ai/flux-pro/v1.1", "fal-ai/flux/dev", "fal-ai/ideogram/v3", or None (default Imagen)
     brand_context: Optional[BrandContextRequest] = None
-    reference_image: Optional[str] = None  # base64 data URL uploaded by user for contextual reference
+    reference_image: Optional[str] = None  # DEPRECATED: use reference_images. Kept for backward compatibility.
+    reference_images: Optional[List[str]] = None  # base64 data URLs uploaded by user for contextual reference (multiple supported)
+    slide_image_map: Optional[List[Optional[int]]] = None  # carousel only: per-slide index into reference_images (or null for no image). Defaults to cycling image N -> slide N when omitted.
     post_type: str = "feed"   # feed | carousel | story
     num_slides: int = 3        # carousel only (2–5)
     acknowledged_incomplete_profile: bool = False  # OPTION 1: User acknowledged incomplete profile warning
     override_cta: Optional[str] = None  # One-time CTA for this generation only (not saved to brand playbook)
+    style_override: Optional[List[str]] = None  # One-time visual style slug(s) for this generation only (not saved to brand playbook). Carousel: cycles per slide. Single post: uses the first slug.
 
 class SocialConnectionRequest(BaseModel):
     platforms: List[str] = Field(..., min_items=1, max_items=10)
@@ -332,6 +335,14 @@ async def generate_content(
     user_id = ctx["user_id"]
     active_brand_id = ctx["brand_id"]
 
+    print(
+        f"🖼️📥 [REF-IMG TRACE] incoming request: post_type={request.post_type!r} "
+        f"num_slides={request.num_slides!r} "
+        f"reference_image={'<set, len=' + str(len(request.reference_image)) + '>' if request.reference_image else None} "
+        f"reference_images_count={len(request.reference_images) if request.reference_images else 0} "
+        f"slide_image_map={request.slide_image_map!r}"
+    )
+
     try:
         # ==================== PRD 7.2 & 8: Credit Check ====================
         # Check trial credits first, then paid credits
@@ -439,6 +450,34 @@ async def generate_content(
         post_type = request.post_type or "feed"
         num_slides = max(2, min(5, request.num_slides or 3))
 
+        # ── Reference images: normalise to a list, keep old single-image field working ──
+        ref_images: List[str] = request.reference_images or (
+            [request.reference_image] if request.reference_image else []
+        )
+        print(f"🖼️📥 [REF-IMG TRACE] resolved ref_images_count={len(ref_images)}")
+
+        def _slide_reference_image(slide_index: int) -> Optional[str]:
+            """Which single reference image (if any) a given carousel slide should use.
+            Explicit slide_image_map wins; otherwise images cycle 1:1 across slides
+            (image 1 -> slide 1, image 2 -> slide 2, wrapping if there are fewer images
+            than slides)."""
+            if not ref_images:
+                print(f"🖼️📥 [REF-IMG TRACE] slide {slide_index}: no ref_images available -> None")
+                return None
+            if request.slide_image_map is not None and slide_index < len(request.slide_image_map):
+                img_idx = request.slide_image_map[slide_index]
+                if img_idx is None:
+                    print(f"🖼️📥 [REF-IMG TRACE] slide {slide_index}: slide_image_map explicitly maps to None")
+                    return None
+                if 0 <= img_idx < len(ref_images):
+                    print(f"🖼️📥 [REF-IMG TRACE] slide {slide_index}: slide_image_map -> image #{img_idx}")
+                    return ref_images[img_idx]
+                print(f"🖼️📥 [REF-IMG TRACE] slide {slide_index}: slide_image_map index {img_idx} out of range -> None")
+                return None
+            picked = slide_index % len(ref_images)
+            print(f"🖼️📥 [REF-IMG TRACE] slide {slide_index}: auto-cycle -> image #{picked}")
+            return ref_images[picked]
+
         if post_type == "carousel":
             from ..services.carousel_generation_service import CarouselGenerationService
             result = await CarouselGenerationService.generate_multi_platform(
@@ -458,7 +497,7 @@ async def generate_content(
                 seed_type=request.seed_type,
                 brand_context=brand_context_dict,
                 db=db,
-                reference_image=request.reference_image,
+                reference_image=ref_images[0] if ref_images else None,
             )
 
         # Stamp the ACTIVE BRAND on the request + every draft so content is isolated
@@ -579,12 +618,13 @@ async def generate_content(
                             seed_content=enriched_seed,  # Use enriched seed with both original context and slide-specific focus
                             brand_context=brand_context_dict,
                             db=db,
-                            reference_image=request.reference_image,
+                            reference_image=_slide_reference_image(slide_index),
                             post_type=post_type,
                             slide_index=slide_index,
                             image_model=request.image_model,
                             total_slides=total_slides,
                             carousel_id=carousel_id,
+                            style_override=request.style_override,
                         )))
                 else:
                     _bg_image_tasks.append(asyncio.create_task(_generate_image_bg(
@@ -594,9 +634,10 @@ async def generate_content(
                         seed_content=request.seed_content,
                         brand_context=brand_context_dict,
                         db=db,
-                        reference_image=request.reference_image,
+                        reference_image=ref_images[0] if ref_images else None,
                         post_type=post_type,
                         image_model=request.image_model,
+                        style_override=request.style_override,
                     )))
             _BG_IMAGE_TASKS.update(_bg_image_tasks)
             for t in _bg_image_tasks:
@@ -732,76 +773,46 @@ async def upload_user_content(
                     if add_logo and brand_context_dict.get('logo_url'):
                         logo_size = brand_context_dict.get('logo_size', 'small')
 
-                        # Determine logo position: user override > AI analysis > brand profile default
-                        if logo_position_override:
-                            # User manually selected position for this upload
-                            logo_position = logo_position_override
-                            print(f"🎨 Using user-selected logo position: {logo_position}")
-                        else:
-                            # Use AI to find best logo position (avoids important content)
-                            print(f"🤖 Analyzing image to find best logo position...")
-                            try:
-                                from app.services.AIService import AIService
-
-                                vision_prompt = """Analyze this image and determine the best corner to place a brand logo overlay.
-
-Consider:
-1. Which corners have the LEAST important content (text, faces, key visual elements)?
-2. Which corners have the most empty/background space?
-3. Avoid corners with text, faces, or focal points
-
-Respond with ONLY ONE of these positions:
-- top_left
-- top_right
-- top_center
-- bottom_left
-- bottom_right
-- bottom_center
-
-Choose the position that will cause the LEAST visual disruption."""
-
-                                vision_request = AIService.build_ai_model(
-                                    messages=[{
-                                        "role": "user",
-                                        "content": [
-                                            {"type": "text", "text": vision_prompt},
-                                            {"type": "image_url", "image_url": {"url": media_url}}
-                                        ]
-                                    }],
-                                    temperature=0.3,
-                                )
-                                vision_response = await AIService.chat_completion(vision_request)
-                                ai_position = vision_response.choices[0].message.content.strip().lower()
-
-                                # Validate AI response
-                                valid_positions = ["top_left", "top_right", "top_center", "bottom_left", "bottom_right", "bottom_center"]
-                                if ai_position in valid_positions:
-                                    logo_position = ai_position
-                                    print(f"✅ AI selected best logo position: {logo_position}")
-                                else:
-                                    # Fallback to brand profile default
-                                    logo_position = brand_context_dict.get('logo_position', 'bottom_right')
-                                    print(f"⚠️ AI gave invalid position '{ai_position}', using brand default: {logo_position}")
-
-                            except Exception as vision_err:
-                                # If AI analysis fails, use brand profile default
-                                logo_position = brand_context_dict.get('logo_position', 'bottom_right')
-                                print(f"⚠️ AI position analysis failed: {vision_err}, using brand default: {logo_position}")
-
-                        print(f"🎨 Applying logo overlay: position={logo_position}, size={logo_size}")
-
-                        # Convert image to base64, apply logo, convert back
+                        # Convert image to base64 up front — needed either way
                         buf = io.BytesIO()
                         img.convert("RGB").save(buf, format="JPEG", quality=95)
                         img_b64 = base64.b64encode(buf.getvalue()).decode()
 
-                        # Use existing logo overlay method
-                        img_b64_with_logo = ImageContentService._overlay_logo(
-                            img_b64,
-                            brand_context_dict['logo_url'],
-                            logo_position,
-                            logo_size
-                        )
+                        if logo_position_override:
+                            # User manually selected position for this upload — respect it, no AI second-guessing
+                            logo_position = logo_position_override
+                            print(f"🎨 Using user-selected logo position: {logo_position}")
+                            img_b64_with_logo = ImageContentService._overlay_logo(
+                                img_b64, brand_context_dict['logo_url'], logo_position, logo_size
+                            )
+                        else:
+                            # Rank candidate corners by actual pixel busyness (deterministic,
+                            # not an AI guess — see rank_overlay_positions_cv docstring), then
+                            # place + verify, retrying the next candidate if it still overlaps
+                            # something the pixel analysis alone didn't catch (e.g. a face on
+                            # a flat-coloured background).
+                            print(f"📐 Ranking candidate logo positions by pixel busyness...")
+                            candidates = ImageContentService.rank_overlay_positions_cv(resp.content)
+
+                            img_b64_with_logo = None
+                            logo_position = brand_context_dict.get('logo_position', 'bottom_right')
+                            for attempt_position in candidates[:3]:
+                                attempt_b64 = ImageContentService._overlay_logo(
+                                    img_b64, brand_context_dict['logo_url'], attempt_position, logo_size
+                                )
+                                conflict = await ImageContentService.composited_overlay_has_conflict(
+                                    f"data:image/webp;base64,{attempt_b64}", attempt_position
+                                )
+                                logo_position = attempt_position
+                                img_b64_with_logo = attempt_b64
+                                if not conflict:
+                                    print(f"✅ Logo position accepted: {attempt_position}")
+                                    break
+                                print(f"↩️ Retrying with next-ranked position after conflict at {attempt_position}")
+                            else:
+                                print(f"⚠️ All candidate positions showed a conflict — keeping last attempt ({logo_position}) rather than skip the logo")
+
+                        print(f"🎨 Applying logo overlay: position={logo_position}, size={logo_size}")
 
                         # Convert back to PIL for CTA overlay
                         img = Image.open(io.BytesIO(base64.b64decode(img_b64_with_logo))).convert("RGBA")
@@ -837,76 +848,109 @@ Choose the position that will cause the LEAST visual disruption."""
                         print(f"🎯 CTA text determined: '{cta_text}'")
 
                         if cta_text:
-                            # Use gpt-image-2 edit to add CTA professionally (same as normal generation)
-                            print(f"🔄 Calling gpt-image-2 to add CTA: '{cta_text}'")
+                            # Use AI vision to find best position, then PIL to draw text
+                            print(f"🔄 Using AI vision to find best CTA position: '{cta_text}'")
                             try:
-                                from app.services.AIService import client as openai_client
-                                import asyncio
+                                from app.services.AIService import AIService
+                                from PIL import ImageDraw, ImageFont
 
-                                # Convert image to PNG for gpt-image-2 edit
+                                # Use AI vision to determine best position for CTA
+                                vision_prompt = """Analyze this image to find the best location to add a small call-to-action text.
+
+Consider:
+1. Where is there the MOST empty/background space?
+2. Avoid areas with text, faces, or important visual elements
+3. Look for solid color areas or minimal content zones
+
+Respond with ONLY ONE of these positions:
+- top_center
+- bottom_center
+- top_left
+- top_right
+- bottom_left
+- bottom_right
+
+Choose the position that will cause the LEAST visual disruption."""
+
+                                vision_request = AIService.build_ai_model(
+                                    messages=[{
+                                        "role": "user",
+                                        "content": [
+                                            {"type": "text", "text": vision_prompt},
+                                            {"type": "image_url", "image_url": {"url": media_url}}
+                                        ]
+                                    }],
+                                    temperature=0.3,
+                                )
+                                vision_response = await AIService.chat_completion(vision_request)
+                                cta_position = vision_response.choices[0].message.content.strip().lower()
+
+                                # Validate position
+                                valid_positions = ["top_center", "bottom_center", "top_left", "top_right", "bottom_left", "bottom_right"]
+                                if cta_position not in valid_positions:
+                                    cta_position = "bottom_center"  # Fallback
+
+                                print(f"✅ AI selected CTA position: {cta_position}")
+
+                                # Draw CTA text using PIL
                                 width, height = img.size
-                                img_png_buf = io.BytesIO()
-                                img.save(img_png_buf, format="PNG")
-                                img_png_buf.seek(0)
+                                draw = ImageDraw.Draw(img)
 
-                                # Determine size for gpt-image-2 (must be 1024x1024, 1792x1024, or 1024x1792)
-                                if width >= height:
-                                    gpt2_size = "1792x1024" if width / height > 1.5 else "1024x1024"
-                                else:
-                                    gpt2_size = "1024x1792"
+                                # Calculate font size (4-5% of image width for better visibility)
+                                font_size = int(width * 0.045)
+                                try:
+                                    font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", font_size)
+                                except:
+                                    try:
+                                        # Fallback to Arial
+                                        font = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial.ttf", font_size)
+                                    except:
+                                        font = ImageFont.load_default()
 
-                                # Build edit prompt with smart positioning to avoid distorting content
-                                cta_prompt = f"""Add call-to-action text to this image without covering important content.
+                                # Get text bounding box
+                                bbox = draw.textbbox((0, 0), cta_text, font=font)
+                                text_width = bbox[2] - bbox[0]
+                                text_height = bbox[3] - bbox[1]
 
-CRITICAL INSTRUCTIONS:
-1. Add this text: "{cta_text}"
-2. ANALYZE the image first to find where important content is (faces, text, key visuals)
-3. Place the CTA text in an area that has the LEAST important content - look for:
-   - Empty/background space
-   - Solid color areas
-   - Bottom or top areas with minimal content
-4. DO NOT place text over faces, existing text, or focal points
-5. Use clean, modern sans-serif font that's legible but not overwhelming
-6. Choose text color with high contrast against its background
-7. Keep text small and subtle - approximately 20-30% the size of any main headline
-8. Position within safe zone (at least 10% from all edges)
-9. DO NOT modify the rest of the image - preserve all existing content exactly as-is
-10. The CTA should feel like a natural part of the design, not an intrusive overlay"""
+                                # Calculate position based on AI selection
+                                margin = int(width * 0.05)  # 5% margin
+                                if "top" in cta_position:
+                                    y = margin
+                                else:  # bottom
+                                    y = height - text_height - margin
 
-                                # Call gpt-image-2 edit API
-                                loop = asyncio.get_running_loop()
-                                edit_response = await asyncio.wait_for(
-                                    loop.run_in_executor(
-                                        None,
-                                        lambda: openai_client.images.edit(
-                                            model="gpt-image-2",
-                                            image=("image.png", img_png_buf, "image/png"),
-                                            prompt=cta_prompt,
-                                            n=1,
-                                            size=gpt2_size,
-                                        ),
-                                    ),
-                                    timeout=300,
+                                if "center" in cta_position:
+                                    x = (width - text_width) // 2
+                                elif "left" in cta_position:
+                                    x = margin
+                                else:  # right
+                                    x = width - text_width - margin
+
+                                # Draw text with subtle drop shadow for depth without looking squeezed
+                                # First draw shadow (offset by a few pixels)
+                                shadow_offset = 3
+                                shadow_color = (0, 0, 0, 120)  # Semi-transparent black shadow
+
+                                # Draw shadow
+                                draw.text(
+                                    (x + shadow_offset, y + shadow_offset),
+                                    cta_text,
+                                    font=font,
+                                    fill=shadow_color
                                 )
 
-                                # Download edited image
-                                print(f"🔍 Edit response received: {edit_response}")
-                                if edit_response.data and len(edit_response.data) > 0:
-                                    edited_url = edit_response.data[0].url
-                                    print(f"📥 Downloading edited image from: {edited_url[:100] if edited_url else 'None'}")
+                                # Draw main text in white - clean and crisp
+                                draw.text(
+                                    (x, y),
+                                    cta_text,
+                                    font=font,
+                                    fill="white"
+                                )
 
-                                    if not edited_url:
-                                        raise ValueError("OpenAI edit response did not include image URL")
-
-                                    resp_edit = requests.get(edited_url, timeout=10)
-                                    resp_edit.raise_for_status()
-                                    img = Image.open(io.BytesIO(resp_edit.content)).convert("RGBA")
-                                    print(f"✅ CTA text added via gpt-image-2 edit: '{cta_text}'")
-                                else:
-                                    raise ValueError("OpenAI edit response has no data")
+                                print(f"✅ CTA text drawn at {cta_position}: '{cta_text}'")
 
                             except Exception as cta_err:
-                                print(f"⚠️ CTA overlay via AI failed: {cta_err}, skipping CTA")
+                                print(f"⚠️ CTA overlay failed: {cta_err}, skipping CTA")
 
                     # Upload processed image back to Cloudinary
                     buf = io.BytesIO()
@@ -1005,14 +1049,22 @@ Create engaging social media captions for THIS UPLOADED CONTENT. Base your writi
             if _d_ids:
                 # Attach uploaded images to drafts so they can be published
                 if post_type == "carousel":
-                    # For carousel: create slides from uploaded images
-                    carousel_images = [{"image_url": url} for url in media_urls]
+                    # For carousel: one slide per uploaded image, in the exact
+                    # shape both DraftCard (isCarousel = slides.length > 0) and
+                    # publish logic (approval_workflow_service reads draft.slides)
+                    # expect. A prior "carousel_images" field here was never read
+                    # by either, so uploaded carousels silently rendered/published
+                    # as a single post.
+                    slides = [
+                        {"headline": "", "body": "", "image_url": url, "image_failed": False}
+                        for url in media_urls
+                    ]
                     update_fields = {
                         "brand_id": active_brand_id,
                         "content_source": "user_uploaded",
                         "uploaded_media_urls": media_urls,
                         "post_type": post_type,
-                        "carousel_images": carousel_images,
+                        "slides": slides,
                     }
                 else:
                     # For single post: use first uploaded image as main image
@@ -1289,6 +1341,198 @@ async def facebook_direct_finalize(
         raise HTTPException(status_code=404, detail="Facebook connection not found — try reconnecting")
 
     return UriResponse.get_single_data_response("facebook_connected", {"fb_page_id": fb_page_id})
+
+
+# ── Facebook Login for Business — the "hybrid page grant" (Ibukun's engineering
+# work-split item 2.3). Same OAuth shape as facebook-direct above, but requests
+# advertising permissions and — once URI's Business Manager id is configured —
+# grants that Business Manager ADVERTISE-only access to the page via
+# MetaAdsService.share_page_with_business_manager(). Never claims/transfers the
+# page (that's POST /{business_id}/owned_pages, deliberately not used here).
+
+@router.get("/connect/facebook-ads/initiate")
+async def facebook_ads_initiate(source: Optional[str] = Query("settings")):
+    """Redirect to Facebook's OAuth page requesting advertising-scoped permissions
+    for a Page, on top of the standard page-management scopes."""
+    import urllib.parse
+
+    app_id = settings.META_APP_ID
+    if not app_id:
+        raise HTTPException(status_code=500, detail="META_APP_ID not configured")
+
+    _base = (settings.PUBLIC_API_URL or settings.URI_GATEWAY_BASE_API_URL).rstrip("/")
+    redirect_uri = f"{_base}/social-media/connect/facebook-ads/callback"
+
+    scopes = [
+        "pages_show_list",
+        "pages_read_engagement",
+        "pages_manage_metadata",
+        "business_management",
+        "ads_management",
+        "pages_manage_ads",
+    ]
+    params = {
+        "client_id": app_id,
+        "redirect_uri": redirect_uri,
+        "scope": ",".join(scopes),
+        "response_type": "code",
+        "state": source or "settings",
+    }
+    auth_url = f"https://www.facebook.com/{settings.FACEBOOK_API_VERSION}/dialog/oauth?" + urllib.parse.urlencode(params)
+    return RedirectResponse(auth_url)
+
+
+@router.get("/connect/facebook-ads/callback")
+async def facebook_ads_callback(
+    code: Optional[str] = Query(None),
+    state: Optional[str] = Query(None),
+    error: Optional[str] = Query(None),
+    error_reason: Optional[str] = Query(None),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """Exchanges the auth code for an ads-scoped Page token, stores the pending
+    connection, and — if URI's Business Manager id is configured — requests
+    ADVERTISE-only access to the page for it."""
+    import urllib.parse
+    import httpx
+    from datetime import timezone
+    from app.services.MetaAdsService import BusinessManagerNotConfigured, share_page_with_business_manager
+
+    web_app_url = settings.WEB_APP_URL.strip("'\"")
+    base_redirect = f"{web_app_url}/workspace?tab=connections"
+
+    if error:
+        msg = urllib.parse.quote(error_reason or error)
+        return RedirectResponse(f"{base_redirect}&connected=false&error={msg}")
+
+    if not code:
+        return RedirectResponse(f"{base_redirect}&connected=false&error=missing_code")
+
+    _base = (settings.PUBLIC_API_URL or settings.URI_GATEWAY_BASE_API_URL).rstrip("/")
+    redirect_uri = f"{_base}/social-media/connect/facebook-ads/callback"
+    app_id = settings.META_APP_ID
+    app_secret = settings.META_APP_SECRET
+    graph_base = f"https://graph.facebook.com/{settings.FACEBOOK_API_VERSION}"
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            token_resp = await client.get(
+                f"{graph_base}/oauth/access_token",
+                params={
+                    "client_id": app_id,
+                    "client_secret": app_secret,
+                    "redirect_uri": redirect_uri,
+                    "code": code,
+                },
+            )
+            token_data = token_resp.json()
+            if "error" in token_data:
+                raise ValueError(f"Token exchange error: {token_data['error'].get('message')}")
+            short_token = token_data["access_token"]
+
+            ll_resp = await client.get(
+                f"{graph_base}/oauth/access_token",
+                params={
+                    "grant_type": "fb_exchange_token",
+                    "client_id": app_id,
+                    "client_secret": app_secret,
+                    "fb_exchange_token": short_token,
+                },
+            )
+            ll_data = ll_resp.json()
+            long_token = ll_data.get("access_token", short_token)
+
+            pages_resp = await client.get(
+                f"{graph_base}/me/accounts",
+                params={"access_token": long_token, "fields": "id,name,access_token,picture"},
+            )
+            pages_data = pages_resp.json()
+            pages = pages_data.get("data", [])
+
+            if not pages:
+                err_msg = urllib.parse.quote("No Facebook Pages found. You need a Facebook Page to connect.")
+                return RedirectResponse(f"{base_redirect}&connected=false&error={err_msg}")
+
+            page = pages[0]
+            page_id = page["id"]
+            page_name = page["name"]
+            page_token = page["access_token"]
+            profile_pic = page.get("picture", {}).get("data", {}).get("url", "") if isinstance(page.get("picture"), dict) else ""
+
+            business_manager_shared = False
+            business_manager_error = None
+            try:
+                await share_page_with_business_manager(page_id, page_token)
+                business_manager_shared = True
+                print(f"[FBAdsOAuth] ✅ Granted URI Business Manager ADVERTISE access to page {page_id}")
+            except BusinessManagerNotConfigured:
+                print(f"[FBAdsOAuth] ⚠️ META_BUSINESS_MANAGER_ID not set — page {page_id} token stored, BM share deferred")
+            except Exception as e:
+                business_manager_error = str(e)
+                print(f"[FBAdsOAuth] ❌ Business Manager share failed for page {page_id}: {e}")
+
+            now = datetime.now(timezone.utc).isoformat()
+            conn_doc = {
+                "id": f"fbads_{page_id}",
+                "user_id": None,               # set by finalize
+                "platform": "facebook_ads",
+                "connected_via": "facebook_ads_oauth",
+                "page_id": page_id,
+                "page_access_token": page_token,
+                "account_name": page_name,
+                "profile_picture_url": profile_pic,
+                "connection_status": "pending_user_match",
+                "business_manager_shared": business_manager_shared,
+                "business_manager_error": business_manager_error,
+                "connected_at": now,
+                "updated_at": now,
+            }
+            await db["social_connections"].update_one(
+                {"id": f"fbads_{page_id}"},
+                {"$set": conn_doc},
+                upsert=True,
+            )
+            print(f"[FBAdsOAuth] ✅ Stored ads-scoped page '{page_name}' (page_id={page_id}) pending user match")
+
+            params_out = (
+                f"connected=facebook_ads"
+                f"&fb_page_id={urllib.parse.quote(page_id)}"
+                f"&page_name={urllib.parse.quote(page_name)}"
+            )
+            return RedirectResponse(f"{base_redirect}&{params_out}")
+
+    except Exception as e:
+        print(f"[FBAdsOAuth] ❌ Error: {e}")
+        return RedirectResponse(
+            f"{base_redirect}&connected=false&error={urllib.parse.quote(str(e))}"
+        )
+
+
+@router.post("/connect/facebook-ads/finalize")
+async def facebook_ads_finalize(
+    fb_page_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    ctx: dict = Depends(get_active_brand_context),
+):
+    """Associates the pending ads-scoped connection with the authenticated user
+    and active brand — same pattern as /connect/facebook-direct/finalize."""
+    from app.models.brand_account import BrandAccount
+    user_id = ctx["user_id"]
+    brand_id = ctx["brand_id"]
+    is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
+
+    update_fields: dict = {"user_id": user_id, "connection_status": "active", "updated_at": datetime.utcnow().isoformat()}
+    if not is_personal:
+        update_fields["brand_id"] = brand_id
+
+    result = await db["social_connections"].update_one(
+        {"id": f"fbads_{fb_page_id}"},
+        {"$set": update_fields},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Facebook ads connection not found — try reconnecting")
+
+    return UriResponse.get_single_data_response("facebook_ads_connected", {"fb_page_id": fb_page_id})
 
 
 @router.get("/connect/instagram-direct/initiate")
@@ -4613,6 +4857,7 @@ async def _generate_image_bg(
     image_model: Optional[str] = None,
     total_slides: Optional[int] = None,
     carousel_id: Optional[str] = None,
+    style_override: Optional[List[str]] = None,
 ):
     """
     Background task: generate an image for an existing draft and save it to DB.
@@ -4625,8 +4870,13 @@ async def _generate_image_bg(
     import os
     import base64
 
+    print(
+        f"🖼️📥 [REF-IMG TRACE] _generate_image_bg entry: draft={draft_id[:12]} post_type={post_type} "
+        f"slide_index={slide_index} reference_image={'<set, len=' + str(len(reference_image)) + '>' if reference_image else None}"
+    )
+
     try:
-        from app.agents.social_media_manager.services.style_library import pick_next_style
+        from app.agents.social_media_manager.services.style_library import pick_next_style, get_prompt_fragment
 
         # Build the correct brand profile scope for style lookups.
         # Using user_id alone returns the personal brand profile even when an agency
@@ -4635,100 +4885,141 @@ async def _generate_image_bg(
         _bc_user_id = brand_context.get("user_id", "")
         _style_profile_scope = {"brand_id": _bc_brand_id} if _bc_brand_id else {"user_id": _bc_user_id}
 
-        # ── Visual style rotation ─────────────────────────────────────────────
-        # For carousel posts: lock style to first slide, reuse for all subsequent slides
-        # For regular posts: rotate style normally
         if post_type == "carousel" and carousel_id and slide_index is not None:
-            if slide_index == 0:
-                # First slide: pick style and cache it for this carousel
-                _bp = await db["brand_profiles"].find_one(
-                    _style_profile_scope,
-                    {"style_selections": 1, "style_prompt_fragments": 1, "style_rotation_index": 1, "industry": 1, "selected_custom_guides": 1, "selected_custom_guides_v2": 1},
-                ) or {}
+            # ── Visual style: cycles PER SLIDE, not locked for the whole carousel ──
+            # slide 0 gets style_override[0] (or style_selections[0]), slide 1 gets
+            # [1], etc, wrapping if there are more slides than styles. Each slide
+            # computes its own index independently from the (explicit override or
+            # brand-profile) style list and its own slide_index — no cross-slide
+            # cache to race on, since these run concurrently as separate asyncio
+            # tasks. Custom visual guides are a different feature and still lock
+            # one guide for the whole carousel (unchanged) — mixing guides
+            # mid-carousel isn't what a "custom guide" selection is for, and an
+            # explicit style_override always means the user picked library styles
+            # for this generation, so it takes priority over any custom guide.
+            _bp = await db["brand_profiles"].find_one(
+                _style_profile_scope,
+                {"style_selections": 1, "style_prompt_fragments": 1, "style_rotation_index": 1, "industry": 1, "selected_custom_guides": 1, "selected_custom_guides_v2": 1},
+            ) or {}
 
-                # Check if user has selected custom guides (V1 or V2)
-                _custom_guide_ids_v1 = _bp.get("selected_custom_guides") or []
-                _custom_guide_ids_v2 = _bp.get("selected_custom_guides_v2") or []
-                _all_custom_guide_ids = _custom_guide_ids_v1 + _custom_guide_ids_v2
-                _custom_guide_id = None  # Initialize to avoid UnboundLocalError
+            _custom_guide_ids_v1 = _bp.get("selected_custom_guides") or []
+            _custom_guide_ids_v2 = _bp.get("selected_custom_guides_v2") or []
+            _all_custom_guide_ids = [] if style_override else (_custom_guide_ids_v1 + _custom_guide_ids_v2)
+            _custom_guide_id = None  # Initialize to avoid UnboundLocalError
 
-                if _all_custom_guide_ids:
-                    # Rotate through custom guides (V1 + V2) like library styles
+            if _all_custom_guide_ids:
+                # Custom guide: still locked to first slide, reused for the rest.
+                if slide_index == 0:
                     from app.agents.social_media_manager.services.custom_visual_guide_service import CustomVisualGuideService
                     from app.agents.social_media_manager.services.custom_visual_guide_v2_service import CustomVisualGuideV2Service
 
                     _rotation_index = int(_bp.get("style_rotation_index") or 0)
                     _custom_guide_id = _all_custom_guide_ids[_rotation_index % len(_all_custom_guide_ids)]
-
-                    # Determine if this is V1 or V2
                     is_v2 = _custom_guide_id in _custom_guide_ids_v2
 
                     if is_v2:
-                        # V2: Load guide and apply reference image
                         custom_guide = await db["custom_visual_guides"].find_one({"_id": ObjectId(_custom_guide_id), "version": "v2"})
                         if custom_guide:
-                            _fragment = ""  # V2 doesn't use prompt fragments
                             _slug = f"custom_v2_{_custom_guide_id[:8]}"
                             _next_index = (_rotation_index + 1) % (len(_all_custom_guide_ids) + len(_bp.get("style_selections") or []))
+                            _v2_ref = custom_guide.get("original_image_url")
                             brand_context = {
                                 **brand_context,
                                 "style_slug": _slug,
                                 "custom_guide_v2_id": _custom_guide_id,
-                                "custom_guide_v2_reference_image": custom_guide.get("original_image_url")
+                                "custom_guide_v2_reference_image": _v2_ref,
                             }
+                            await db["content_drafts"].update_one(
+                                {"id": carousel_id},
+                                {"$set": {"carousel_style_slug": _slug, "carousel_custom_guide_v2_id": _custom_guide_id, "carousel_custom_guide_v2_ref": _v2_ref}},
+                            )
+                            await db["brand_profiles"].update_one(_style_profile_scope, {"$set": {"style_rotation_index": _next_index}})
                             print(f"🎨 Custom V2 guide [{custom_guide.get('name')}] applied for all {total_slides} carousel slides")
                     else:
-                        # V1: Use prompt fragment
                         custom_guide = await CustomVisualGuideService.get_guide_detail(_custom_guide_id, db)
                         if custom_guide:
                             _fragment = custom_guide.get("prompt_fragment", "")
                             _slug = f"custom_{_custom_guide_id[:8]}"
                             _next_index = (_rotation_index + 1) % (len(_all_custom_guide_ids) + len(_bp.get("style_selections") or []))
                             brand_context = {**brand_context, "style_prompt_fragment": _fragment, "style_slug": _slug, "custom_guide_id": _custom_guide_id}
-                            print(f"🎨 Custom V1 guide [{custom_guide.get('name')}] applied for all {total_slides} carousel slides")
-
-                            # Track V1 usage
+                            await db["content_drafts"].update_one(
+                                {"id": carousel_id},
+                                {"$set": {"carousel_style_slug": _slug, "carousel_style_fragment": _fragment}},
+                            )
+                            await db["brand_profiles"].update_one(_style_profile_scope, {"$set": {"style_rotation_index": _next_index}})
                             await CustomVisualGuideService.track_guide_usage(_custom_guide_id, False, db)
+                            print(f"🎨 Custom V1 guide [{custom_guide.get('name')}] applied for all {total_slides} carousel slides")
                 else:
-                    # Fallback to library style rotation
-                    _style_selections = _bp.get("style_selections") or []
-                    _style_prompt_fragments = _bp.get("style_prompt_fragments") or []
-                    _rotation_index = int(_bp.get("style_rotation_index") or 0)
-                    _industry = _bp.get("industry") or brand_context.get("industry", "")
-
-                    _slug, _fragment, _next_index = pick_next_style(
-                        _style_selections, _rotation_index, _industry, _style_prompt_fragments
+                    draft = await db["content_drafts"].find_one(
+                        {"id": carousel_id},
+                        {"carousel_style_slug": 1, "carousel_style_fragment": 1, "carousel_custom_guide_v2_id": 1, "carousel_custom_guide_v2_ref": 1},
                     )
+                    if draft:
+                        _slug = draft.get("carousel_style_slug")
+                        if draft.get("carousel_custom_guide_v2_id"):
+                            brand_context = {
+                                **brand_context,
+                                "style_slug": _slug,
+                                "custom_guide_v2_id": draft["carousel_custom_guide_v2_id"],
+                                "custom_guide_v2_reference_image": draft.get("carousel_custom_guide_v2_ref"),
+                            }
+                        elif draft.get("carousel_style_fragment"):
+                            brand_context = {**brand_context, "style_prompt_fragment": draft["carousel_style_fragment"], "style_slug": _slug}
+                        print(f"🎨 Reusing carousel custom guide [{_slug}] for slide {slide_index + 1}/{total_slides}")
+            else:
+                # Library styles (or an on-the-fly override): rotate per slide.
+                _style_selections = style_override or (_bp.get("style_selections") or [])
+                _style_prompt_fragments = [] if style_override else (_bp.get("style_prompt_fragments") or [])
+                _industry = _bp.get("industry") or brand_context.get("industry", "")
+
+                if _style_selections:
+                    _idx = slide_index % len(_style_selections)
+                    _slug = _style_selections[_idx]
+                    if _style_prompt_fragments and _idx < len(_style_prompt_fragments) and _style_prompt_fragments[_idx]:
+                        _fragment = _style_prompt_fragments[_idx]
+                    else:
+                        _fragment = get_prompt_fragment(_slug)
+                else:
+                    _slug, _fragment, _ = pick_next_style([], 0, _industry, [])
 
                 if _fragment:
-                    # Cache style in draft document for subsequent slides
-                    await db["content_drafts"].update_one(
-                        {"id": carousel_id},
-                        {"$set": {
-                            "carousel_style_slug": _slug,
-                            "carousel_style_fragment": _fragment
-                        }}
-                    )
+                    brand_context = {**brand_context, "style_prompt_fragment": _fragment, "style_slug": _slug}
+                    _pos = f"{(_idx + 1) if _style_selections else 1}/{len(_style_selections) or 1}"
+                    print(f"🎨 Slide {slide_index + 1}/{total_slides} style [{_slug}] ({_pos} in rotation)")
 
-                    # Only increment rotation index ONCE per carousel (not per slide) - skip for custom guides
-                    if not _custom_guide_id:
-                        print(f"🎨 Carousel style [{_slug}] applied for all {total_slides} slides (next index: {_next_index})")
+            # ── CTA: still locked once for the whole carousel ──
+            # _generate_platform_image() picks (and round-robin rotates) its own CTA
+            # every time it's called, and it's called once PER SLIDE, concurrently,
+            # all sharing the same brand_context dict — so without locking it here,
+            # each slide could race onto a different cta_rotation_index and end up
+            # with a different CTA than its neighbours in the same carousel.
+            if slide_index == 0:
+                _carousel_cta = brand_context.get("override_cta")
+                if not _carousel_cta:
+                    _cta_styles_list = brand_context.get("cta_styles", [])
+                    if isinstance(_cta_styles_list, list) and _cta_styles_list:
+                        _cta_rotation_index = int(brand_context.get("cta_rotation_index", 0) or 0)
+                        if _cta_rotation_index >= len(_cta_styles_list):
+                            _cta_rotation_index = 0
+                        _carousel_cta = _cta_styles_list[_cta_rotation_index]
+                        _cta_next_index = (_cta_rotation_index + 1) % len(_cta_styles_list)
                         await db["brand_profiles"].update_one(
                             _style_profile_scope,
-                            {"$set": {"style_rotation_index": _next_index}},
+                            {"$set": {"cta_rotation_index": _cta_next_index}},
                         )
-            else:
-                # Subsequent slides: reuse cached style from first slide
-                draft = await db["content_drafts"].find_one(
-                    {"id": carousel_id},
-                    {"carousel_style_slug": 1, "carousel_style_fragment": 1}
+                    else:
+                        _carousel_cta = brand_context.get("default_link", "Link in bio")
+                await db["content_drafts"].update_one(
+                    {"id": carousel_id}, {"$set": {"carousel_cta_text": _carousel_cta}}
                 )
-                if draft:
-                    _slug = draft.get("carousel_style_slug")
-                    _fragment = draft.get("carousel_style_fragment")
-                    if _fragment:
-                        brand_context = {**brand_context, "style_prompt_fragment": _fragment, "style_slug": _slug}
-                        print(f"🎨 Reusing carousel style [{_slug}] for slide {slide_index + 1}/{total_slides}")
+                brand_context = {**brand_context, "override_cta": _carousel_cta}
+                print(f"🎯 CTA [{_carousel_cta}] locked for all {total_slides} carousel slides")
+            else:
+                draft = await db["content_drafts"].find_one({"id": carousel_id}, {"carousel_cta_text": 1})
+                _carousel_cta = draft.get("carousel_cta_text") if draft else None
+                if _carousel_cta:
+                    brand_context = {**brand_context, "override_cta": _carousel_cta}
+                    print(f"🎯 Reusing carousel CTA [{_carousel_cta}] for slide {slide_index + 1}/{total_slides}")
         else:
             # Regular post: check for custom guides (V1 + V2) first, then fallback to style rotation
             _bp = await db["brand_profiles"].find_one(
@@ -4736,13 +5027,19 @@ async def _generate_image_bg(
                 {"style_selections": 1, "style_prompt_fragments": 1, "style_rotation_index": 1, "industry": 1, "selected_custom_guides": 1, "selected_custom_guides_v2": 1},
             ) or {}
 
-            # Check if user has selected custom guides (V1 or V2)
+            # An on-the-fly style override always takes priority over custom guides too.
             _custom_guide_ids_v1 = _bp.get("selected_custom_guides") or []
             _custom_guide_ids_v2 = _bp.get("selected_custom_guides_v2") or []
-            _all_custom_guide_ids = _custom_guide_ids_v1 + _custom_guide_ids_v2
+            _all_custom_guide_ids = [] if style_override else (_custom_guide_ids_v1 + _custom_guide_ids_v2)
             _custom_guide_id = None  # Initialize to avoid UnboundLocalError
 
-            if _all_custom_guide_ids:
+            if style_override:
+                _slug = style_override[0]
+                _fragment = get_prompt_fragment(_slug)
+                if _fragment:
+                    brand_context = {**brand_context, "style_prompt_fragment": _fragment, "style_slug": _slug}
+                    print(f"🎨 Style override [{_slug}] applied for this image")
+            elif _all_custom_guide_ids:
                 # Rotate through custom guides (V1 + V2) like library styles
                 from app.agents.social_media_manager.services.custom_visual_guide_service import CustomVisualGuideService
                 from app.agents.social_media_manager.services.custom_visual_guide_v2_service import CustomVisualGuideV2Service
@@ -5450,23 +5747,33 @@ async def save_video_draft(
     from datetime import datetime, timezone
     import uuid as _uuid
 
-    draft_id = _uuid.uuid4().hex
-    doc = {
-        "id": draft_id,
-        "request_id": draft_id,      # satisfies unique index on content_drafts
-        "platform": "video",          # satisfies compound index (request_id, platform)
-        "user_id": user_id,
-        "media_type": "video",
-        "video_url": request.merged_video_url,
-        "content": request.caption,
-        "platforms": request.platforms,
-        "status": "draft",
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-    await db["content_drafts"].insert_one(doc)
+    now = datetime.now(timezone.utc).isoformat()
+    platforms = request.platforms if request.platforms else ["instagram"]
+    request_id = _uuid.uuid4().hex
 
-    doc.pop("_id", None)
-    return UriResponse.get_single_data_response("video_draft", doc)
+    docs = []
+    for platform in platforms:
+        draft_id = _uuid.uuid4().hex
+        docs.append({
+            "id": draft_id,
+            "draft_id": draft_id,
+            "request_id": request_id,
+            "platform": platform,
+            "platforms": [platform],
+            "user_id": user_id,
+            "media_type": "video",
+            "video_url": request.merged_video_url,
+            "content": request.caption,
+            "status": "draft",
+            "post_type": "reel",
+            "created_at": now,
+        })
+
+    await db["content_drafts"].insert_many(docs)
+
+    for doc in docs:
+        doc.pop("_id", None)
+    return UriResponse.get_single_data_response("video_draft", docs[0])
 
 
 @router.get("/video-drafts")
@@ -7243,6 +7550,107 @@ async def stitch_multi_clip_job(
     )
 
 
+@router.post("/multi-clip/job/{job_id}/analyze")
+async def analyze_multi_clip_job(
+    job_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    AI analyzes a stitched multi-clip video using existing clip transcripts/metadata
+    and returns suggested cuts, zoom moments, and transition style.
+    Call after job status == 'ready'.
+    """
+    import json as _json
+    from openai import AsyncOpenAI
+
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    job = await db.multi_clip_jobs.find_one({"job_id": job_id, "user_id": user_id}, {"_id": 0})
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.get("status") != "ready":
+        raise HTTPException(status_code=409, detail="Job must be in ready status to analyze")
+
+    clips = job.get("clips", [])
+    if not clips:
+        return UriResponse.get_single_data_response("multi_clip_decisions", {
+            "cuts": [], "zooms": [], "transition_style": "fade", "summary": "No clips to analyze."
+        })
+
+    # Return cached decisions applied during stitch — avoids a redundant GPT call
+    if job.get("ai_decisions"):
+        print(f"[MultiClip/analyze] returning cached decisions for job={job_id}", flush=True)
+        return UriResponse.get_single_data_response("multi_clip_decisions", job["ai_decisions"])
+
+    # Build per-clip time windows
+    cumulative = 0.0
+    clip_entries = []
+    for c in clips:
+        if c.get("dropped"):
+            continue
+        dur = float(c.get("duration_seconds") or 10)
+        clip_entries.append({
+            "start": cumulative,
+            "end": cumulative + dur,
+            "clip_type": c.get("clip_type", "speech"),
+            "transcript": (c.get("transcript") or "").strip()[:300],
+        })
+        cumulative += dur
+
+    total_duration = cumulative
+    story_type = job.get("story_type", "founder")
+
+    clips_text = "\n".join([
+        f"Clip {i + 1} ({e['start']:.1f}s–{e['end']:.1f}s, {e['clip_type']}): "
+        + (f'"{e["transcript"]}"' if e["transcript"] else "(no speech)")
+        for i, e in enumerate(clip_entries)
+    ])
+
+    prompt = f"""You are a professional video editor. Analyze this {story_type} style video ({total_duration:.0f}s total) and return editing decisions.
+
+Clips:
+{clips_text}
+
+Return ONLY a JSON object — no extra text, no markdown:
+{{
+  "cuts": [{{"at": <float>, "end": <float>, "reason": "<why>"}}],
+  "zooms": [{{"at": <float>, "duration": <float>, "reason": "<impactful moment>"}}],
+  "transition_style": "cut" | "fade" | "slide" | "zoom",
+  "summary": "<one sentence summary of the video>"
+}}
+
+Rules:
+- 2–4 cuts targeting filler, pauses, "um/uh", or repeated points. at >= 0, end <= {total_duration:.1f}.
+- 1–3 zoom moments on the most compelling or emotional phrases. duration 1.0–3.0 s.
+- Cuts must not overlap. Zooms must stay within clip bounds.
+- transition_style must match the energy: founder → cut or slide, product → fade or zoom.
+- Only the JSON object."""
+
+    try:
+        client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+        resp = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=700,
+        )
+        raw = resp.choices[0].message.content.strip()
+        # Strip markdown fences if GPT wraps the response
+        if raw.startswith("```"):
+            raw = "\n".join(raw.split("\n")[1:])
+            raw = raw.rsplit("```", 1)[0].strip()
+        decisions = _json.loads(raw)
+    except Exception as exc:
+        print(f"[MultiClip/analyze] GPT error: {exc}", flush=True)
+        decisions = {"cuts": [], "zooms": [], "transition_style": "fade", "summary": ""}
+
+    print(f"[MultiClip/analyze] job={job_id} cuts={len(decisions.get('cuts', []))} zooms={len(decisions.get('zooms', []))}", flush=True)
+    return UriResponse.get_single_data_response("multi_clip_decisions", decisions)
+
+
 class DraftScriptRequest(BaseModel):
     description: str
 
@@ -7407,3 +7815,686 @@ async def fix_fractional_credits(
     except Exception as e:
         print(f"❌ fix_fractional_credits error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Submagic Video Production ─────────────────────────────────────────────────
+
+async def _mix_music_into_video(video_url: str, music_url: str) -> Optional[str]:
+    """Download Submagic output + Cloudinary music, mix with ffmpeg, upload result to Cloudinary."""
+    import tempfile
+    import asyncio as _asyncio
+    import os as _os
+    import uuid as _uuid
+    import httpx as _httpx
+    from app.agents.social_media_manager.services.video_production_service import _upload_to_cloudinary
+
+    try:
+        async with _httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
+            video_resp = await client.get(video_url)
+            music_resp = await client.get(music_url)
+
+        if video_resp.status_code != 200:
+            print(f"[SubmagicMusic] video download failed {video_resp.status_code}", flush=True)
+            return None
+        if music_resp.status_code != 200:
+            print(f"[SubmagicMusic] music download failed {music_resp.status_code}", flush=True)
+            return None
+
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as vf:
+            vf.write(video_resp.content)
+            video_tmp = vf.name
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as mf:
+            mf.write(music_resp.content)
+            music_tmp = mf.name
+
+        output_path = f"/tmp/submagic-mixed-{_uuid.uuid4().hex[:8]}.mp4"
+
+        proc = await _asyncio.create_subprocess_exec(
+            "ffmpeg", "-y",
+            "-i", video_tmp,
+            "-stream_loop", "-1", "-i", music_tmp,
+            "-filter_complex", "[0:a]volume=2.0[va];[1:a]volume=0.3[ma];[va][ma]amix=inputs=2:duration=first[a]",
+            "-map", "0:v", "-map", "[a]",
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+            "-shortest",
+            output_path,
+            stdout=_asyncio.subprocess.DEVNULL,
+            stderr=_asyncio.subprocess.PIPE,
+        )
+        _, stderr = await _asyncio.wait_for(proc.communicate(), timeout=300)
+
+        if proc.returncode != 0:
+            print(f"[SubmagicMusic] ffmpeg failed: {stderr.decode()[-500:]}", flush=True)
+            for p in [video_tmp, music_tmp, output_path]:
+                try: _os.unlink(p)
+                except: pass
+            return None
+
+        with open(output_path, "rb") as f:
+            mixed_bytes = f.read()
+
+        for p in [video_tmp, music_tmp, output_path]:
+            try: _os.unlink(p)
+            except: pass
+
+        public_id = f"submagic-mixed-{_uuid.uuid4().hex[:12]}"
+        return await _upload_to_cloudinary(mixed_bytes, public_id)
+
+    except Exception as e:
+        print(f"[SubmagicMusic] error: {e}", flush=True)
+        return None
+
+
+@router.post("/submagic-produce")
+async def submagic_produce(
+    video: UploadFile = File(...),
+    template_name: str = Form("Sara"),
+    language: str = Form("en"),
+    remove_silence_pace: Optional[str] = Form(None),
+    magic_zooms: bool = Form(False),
+    magic_brolls: bool = Form(False),
+    clean_audio: bool = Form(False),
+    remove_bad_takes: bool = Form(False),
+    enable_music: bool = Form(False),
+    custom_music: Optional[UploadFile] = File(None),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """Upload a video to Submagic for AI-powered captioning and editing."""
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    api_key = settings.SUBMAGIC_API_KEY
+    if not api_key:
+        raise HTTPException(status_code=503, detail="Submagic API key not configured")
+
+    from datetime import datetime, timezone
+    import uuid as _uuid
+    from app.agents.social_media_manager.services.video_production_service import (
+        _upload_to_cloudinary,
+        _upload_audio_to_cloudinary,
+    )
+
+    job_id = _uuid.uuid4().hex
+    now = datetime.now(timezone.utc).isoformat()
+
+    video_bytes = await video.read()
+    if not video_bytes:
+        raise HTTPException(status_code=400, detail="Empty video file")
+
+    # Upload to Cloudinary to get a publicly accessible URL for Submagic
+    public_id = f"submagic-{_uuid.uuid4().hex[:12]}"
+    cloudinary_url = await _upload_to_cloudinary(video_bytes, public_id)
+    if not cloudinary_url:
+        raise HTTPException(status_code=502, detail="Could not upload video to storage")
+
+    # Upload music to Cloudinary
+    music_url = None
+    if enable_music and custom_music:
+        music_bytes = await custom_music.read()
+        if music_bytes:
+            music_url = await _upload_audio_to_cloudinary(music_bytes, f"submagic-{job_id}")
+            if not music_url:
+                print("[SubmagicMusic] Cloudinary upload failed — continuing without music", flush=True)
+
+    import httpx as _httpx
+    payload: dict = {
+        "title": (video.filename or "Produced Video").rsplit(".", 1)[0],
+        "language": language,
+        "videoUrl": cloudinary_url,
+        "templateName": template_name,
+    }
+    if remove_silence_pace and remove_silence_pace != "off":
+        payload["removeSilencePace"] = remove_silence_pace
+    if magic_zooms:
+        payload["magicZooms"] = True
+    if magic_brolls:
+        payload["magicBrolls"] = True
+    if clean_audio:
+        payload["cleanAudio"] = True
+    if remove_bad_takes:
+        payload["removeBadTakes"] = True
+
+    try:
+        async with _httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                "https://api.submagic.co/v1/projects",
+                headers={"x-api-key": api_key, "Content-Type": "application/json"},
+                json=payload,
+            )
+            if resp.status_code != 201:
+                print(f"[Submagic] create error {resp.status_code}: {resp.text}", flush=True)
+                raise HTTPException(status_code=502, detail=f"Submagic error: {resp.text}")
+            project = resp.json()
+    except _httpx.RequestError as exc:
+        raise HTTPException(status_code=502, detail=f"Submagic unreachable: {exc}")
+
+    project_id = project["id"]
+
+    job_doc: dict = {
+        "job_id": job_id,
+        "project_id": project_id,
+        "user_id": user_id,
+        "status": "processing",
+        "template_name": template_name,
+        "created_at": now,
+    }
+    if music_url:
+        job_doc["music_url"] = music_url
+
+    await db["submagic_jobs"].insert_one(job_doc)
+
+    print(f"[Submagic] job {job_id} → project {project_id} music={'yes' if music_url else 'no'}", flush=True)
+    return UriResponse.get_single_data_response("submagic_job", {"job_id": job_id})
+
+
+@router.get("/submagic-job/{job_id}")
+async def get_submagic_job(
+    job_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """Poll a Submagic production job for status and output URL."""
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    job = await db["submagic_jobs"].find_one({"job_id": job_id, "user_id": user_id}, {"_id": 0})
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    # Already finished with music mixed — serve cached result
+    if job.get("final_output_url"):
+        return UriResponse.get_single_data_response("submagic_job", {
+            "status": "completed",
+            "output_url": job["final_output_url"],
+            "failure_reason": None,
+        })
+
+    api_key = settings.SUBMAGIC_API_KEY
+    if not api_key:
+        raise HTTPException(status_code=503, detail="Submagic API key not configured")
+
+    import httpx as _httpx
+    project_id = job["project_id"]
+
+    try:
+        async with _httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(
+                f"https://api.submagic.co/v1/projects/{project_id}",
+                headers={"x-api-key": api_key},
+            )
+            if resp.status_code != 200:
+                raise HTTPException(status_code=502, detail=f"Submagic error: {resp.text}")
+            project = resp.json()
+    except _httpx.RequestError as exc:
+        raise HTTPException(status_code=502, detail=f"Submagic unreachable: {exc}")
+
+    status = project.get("status", "processing")
+    output_url = project.get("downloadUrl") or project.get("directUrl")
+    failure_reason = project.get("failureReason")
+
+    await db["submagic_jobs"].update_one(
+        {"job_id": job_id},
+        {"$set": {"status": status, "output_url": output_url}},
+    )
+
+    # When complete and music was requested, mix it in and cache the result
+    if status == "completed" and output_url and job.get("music_url"):
+        print(f"[SubmagicMusic] mixing music into job {job_id}", flush=True)
+        mixed_url = await _mix_music_into_video(output_url, job["music_url"])
+        if mixed_url:
+            await db["submagic_jobs"].update_one(
+                {"job_id": job_id},
+                {"$set": {"final_output_url": mixed_url}},
+            )
+            output_url = mixed_url
+            print(f"[SubmagicMusic] done → {mixed_url[:60]}", flush=True)
+        else:
+            print(f"[SubmagicMusic] mix failed — returning raw Submagic URL", flush=True)
+
+    return UriResponse.get_single_data_response("submagic_job", {
+        "status": status,
+        "output_url": output_url,
+        "failure_reason": failure_reason,
+    })
+
+
+# ── ZapCap ────────────────────────────────────────────────────────────────────
+
+_ZAPCAP_BASE = "https://api.zapcap.ai"
+
+
+async def _zapcap_headers() -> dict:
+    key = settings.ZAPCAP_API_KEY
+    if not key:
+        raise HTTPException(status_code=503, detail="ZAPCAP_API_KEY not configured")
+    return {"x-api-key": key, "Accept": "application/json"}
+
+
+@router.get("/zapcap-templates")
+async def zapcap_templates(token: dict = Depends(JWTBearer())):
+    import httpx
+    headers = await _zapcap_headers()
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(f"{_ZAPCAP_BASE}/templates", headers=headers)
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"ZapCap templates failed: {r.text}")
+    return UriResponse.get_single_data_response("zapcap_templates", {"templates": r.json()})
+
+
+@router.post("/zapcap-produce")
+async def zapcap_produce(
+    video: Optional[UploadFile] = File(None),
+    source_url: Optional[str] = Form(None),
+    template_id: str = Form("beast"),
+    language: str = Form("en"),
+    output_mode: str = Form("composited"),
+    quality: str = Form("standard"),
+    enable_broll: str = Form("false"),
+    enable_music: str = Form("false"),
+    custom_music: Optional[UploadFile] = File(None),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    import uuid as _uuid
+    import httpx
+    from datetime import datetime, timezone
+    from app.agents.social_media_manager.services.video_production_service import (
+        _upload_to_cloudinary,
+        _upload_audio_to_cloudinary,
+    )
+
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    job_id = _uuid.uuid4().hex
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Resolve video URL — either upload the file to Cloudinary or use the provided URL directly
+    if video is not None:
+        video_bytes = await video.read()
+        video_public_id = f"zapcap-input-{job_id}"
+        video_url = await _upload_to_cloudinary(video_bytes, video_public_id)
+    elif source_url:
+        video_url = source_url
+        print(f"[ZapCap] using source_url directly: {source_url[:80]}", flush=True)
+    else:
+        raise HTTPException(status_code=400, detail="Provide either a video file or source_url")
+
+    headers = await _zapcap_headers()
+
+    # Upload video URL to ZapCap → get videoId
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(
+            f"{_ZAPCAP_BASE}/videos/url",
+            json={"url": video_url},
+            headers=headers,
+        )
+        if r.status_code not in (200, 201):
+            raise HTTPException(status_code=502, detail=f"ZapCap upload failed: {r.text}")
+        zapcap_video_id = r.json().get("videoId") or r.json().get("id")
+        if not zapcap_video_id:
+            raise HTTPException(status_code=502, detail=f"ZapCap returned no videoId: {r.text}")
+
+    # Build task payload with correct ZapCap field structure
+    export_settings: dict = {}
+    if output_mode == "transparent":
+        export_settings["outputMode"] = "transparent"
+    elif output_mode == "greenScreen":
+        export_settings["greenScreen"] = True
+    if quality != "standard":
+        export_settings["quality"] = quality
+
+    task_payload: dict = {
+        "templateId": template_id,
+        "language": language,
+        "autoApprove": True,
+    }
+    if export_settings:
+        task_payload["exportSettings"] = export_settings
+    if enable_broll.lower() == "true":
+        task_payload["transcribeSettings"] = {"broll": {"brollPercent": 50}}
+
+    # Submit task → get taskId
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(
+            f"{_ZAPCAP_BASE}/videos/{zapcap_video_id}/task",
+            json=task_payload,
+            headers=headers,
+        )
+        if r.status_code not in (200, 201):
+            raise HTTPException(status_code=502, detail=f"ZapCap task failed: {r.text}")
+        zapcap_task_id = r.json().get("taskId") or r.json().get("id")
+        if not zapcap_task_id:
+            raise HTTPException(status_code=502, detail=f"ZapCap returned no taskId: {r.text}")
+
+    # Handle optional background music
+    music_url: Optional[str] = None
+    if enable_music.lower() == "true" and custom_music:
+        music_bytes = await custom_music.read()
+        music_url = await _upload_audio_to_cloudinary(music_bytes, f"zapcap-{job_id}")
+        print(f"[ZapCap] music uploaded → {music_url[:60]}", flush=True)
+
+    # Persist job
+    await db["zapcap_jobs"].insert_one({
+        "job_id": job_id,
+        "user_id": user_id,
+        "zapcap_video_id": zapcap_video_id,
+        "zapcap_task_id": zapcap_task_id,
+        "template_id": template_id,
+        "language": language,
+        "output_mode": output_mode,
+        "quality": quality,
+        "enable_broll": enable_broll.lower() == "true",
+        "music_url": music_url,
+        "status": "pending",
+        "created_at": now,
+    })
+
+    print(f"[ZapCap] job {job_id} submitted  video_id={zapcap_video_id}  task_id={zapcap_task_id}  music={'yes' if music_url else 'no'}", flush=True)
+    return UriResponse.get_single_data_response("zapcap_job", {"job_id": job_id})
+
+
+@router.get("/zapcap-job/{job_id}")
+async def zapcap_job_status(
+    job_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    import httpx
+
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    job = await db["zapcap_jobs"].find_one({"job_id": job_id})
+    if not job:
+        raise HTTPException(status_code=404, detail="ZapCap job not found")
+
+    # Return cached result if already complete
+    if job.get("final_output_url"):
+        return UriResponse.get_single_data_response("zapcap_job", {
+            "status": "completed",
+            "output_url": job["final_output_url"],
+            "failure_reason": None,
+        })
+
+    headers = await _zapcap_headers()
+    zapcap_video_id = job["zapcap_video_id"]
+    zapcap_task_id = job["zapcap_task_id"]
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(
+            f"{_ZAPCAP_BASE}/videos/{zapcap_video_id}/task/{zapcap_task_id}",
+            headers=headers,
+        )
+
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"ZapCap poll failed: {r.text}")
+
+    data = r.json()
+    status = data.get("status", "pending")
+    output_url = data.get("downloadUrl") or data.get("outputUrl") or data.get("url")
+    failure_reason = data.get("failureReason") or data.get("error")
+
+    print(f"[ZapCap] poll job={job_id}  status={status}  url={'yes' if output_url else 'no'}", flush=True)
+
+    # When transcription is done and waiting for approval, apply pending edits then approve (once only)
+    if status == "transcriptionCompleted" and not job.get("approved"):
+        pending_edits = job.get("pending_transcript_edits", [])
+        if pending_edits:
+            stored_words: list = job.get("transcript_words") or []
+            # Fetch fresh transcript words if not cached
+            if not stored_words:
+                async with httpx.AsyncClient(timeout=30) as client:
+                    tr = await client.get(
+                        f"{_ZAPCAP_BASE}/videos/{zapcap_video_id}/task/{zapcap_task_id}/transcript",
+                        headers=headers,
+                    )
+                if tr.status_code == 200:
+                    stored_words = tr.json() if isinstance(tr.json(), list) else []
+                    for i, w in enumerate(stored_words):
+                        if "id" not in w:
+                            w["id"] = str(i)
+            edit_map = {e["id"]: e["text"] for e in pending_edits if "id" in e and "text" in e}
+            updated_words = []
+            for w in stored_words:
+                word_copy = {k: v for k, v in w.items() if k != "id"}
+                if w.get("id") in edit_map:
+                    word_copy["text"] = edit_map[w["id"]]
+                updated_words.append(word_copy)
+            if updated_words:
+                async with httpx.AsyncClient(timeout=30) as client:
+                    put_r = await client.put(
+                        f"{_ZAPCAP_BASE}/videos/{zapcap_video_id}/task/{zapcap_task_id}/transcript",
+                        json=updated_words,
+                        headers=headers,
+                    )
+                print(f"[ZapCap] auto PUT transcript: {put_r.status_code} words={len(updated_words)} edits={len(pending_edits)}", flush=True)
+                if put_r.status_code in (200, 201, 204):
+                    # Re-index synthetic ids and persist updated words so editor shows correct text
+                    for i, w in enumerate(updated_words):
+                        w["id"] = str(i)
+                    await db["zapcap_jobs"].update_one(
+                        {"job_id": job_id},
+                        {"$set": {"transcript_words": updated_words}},
+                    )
+
+        async with httpx.AsyncClient(timeout=30) as client:
+            apr = await client.post(
+                f"{_ZAPCAP_BASE}/videos/{zapcap_video_id}/task/{zapcap_task_id}/approve-transcript",
+                headers=headers,
+            )
+        print(f"[ZapCap] approve-transcript: {apr.status_code}", flush=True)
+        await db["zapcap_jobs"].update_one(
+            {"job_id": job_id},
+            {"$set": {"status": "rendering", "approved": True}, "$unset": {"pending_transcript_edits": ""}},
+        )
+        # Return rendering so frontend keeps polling
+        return UriResponse.get_single_data_response("zapcap_job", {
+            "status": "rendering",
+            "output_url": None,
+            "failure_reason": None,
+        })
+
+    await db["zapcap_jobs"].update_one(
+        {"job_id": job_id},
+        {"$set": {"status": status, "output_url": output_url}},
+    )
+
+    # When complete, always get a permanent Cloudinary URL
+    if status == "completed" and output_url:
+        from app.agents.social_media_manager.services.video_production_service import (
+            _upload_to_cloudinary as _zc_upload,
+            _upload_audio_to_cloudinary as _zc_upload_audio,
+        )
+        import uuid as _uuid2
+
+        if job.get("music_url"):
+            print(f"[ZapCapMusic] mixing music into job {job_id}", flush=True)
+            mixed_url = await _mix_music_into_video(output_url, job["music_url"])
+            if mixed_url:
+                await db["zapcap_jobs"].update_one(
+                    {"job_id": job_id},
+                    {"$set": {"final_output_url": mixed_url}},
+                )
+                output_url = mixed_url
+                print(f"[ZapCapMusic] done → {mixed_url[:60]}", flush=True)
+            else:
+                print(f"[ZapCapMusic] mix failed — uploading raw video to Cloudinary", flush=True)
+                try:
+                    async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
+                        r2 = await client.get(output_url)
+                    if r2.status_code == 200:
+                        cdn_url = await _zc_upload(r2.content, f"zapcap-output-{_uuid2.uuid4().hex[:12]}")
+                        await db["zapcap_jobs"].update_one(
+                            {"job_id": job_id}, {"$set": {"final_output_url": cdn_url}}
+                        )
+                        output_url = cdn_url
+                except Exception as _e:
+                    print(f"[ZapCap] fallback Cloudinary upload failed: {_e}", flush=True)
+        else:
+            # No music — upload to Cloudinary for a permanent URL
+            print(f"[ZapCap] uploading output to Cloudinary for job {job_id}", flush=True)
+            try:
+                async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
+                    r2 = await client.get(output_url)
+                if r2.status_code == 200:
+                    cdn_url = await _zc_upload(r2.content, f"zapcap-output-{_uuid2.uuid4().hex[:12]}")
+                    await db["zapcap_jobs"].update_one(
+                        {"job_id": job_id}, {"$set": {"final_output_url": cdn_url}}
+                    )
+                    output_url = cdn_url
+                    print(f"[ZapCap] uploaded → {cdn_url[:60]}", flush=True)
+            except Exception as _e:
+                print(f"[ZapCap] Cloudinary upload failed: {_e}", flush=True)
+
+    return UriResponse.get_single_data_response("zapcap_job", {
+        "status": status,
+        "output_url": output_url,
+        "failure_reason": failure_reason,
+    })
+
+
+@router.get("/zapcap-job/{job_id}/transcript")
+async def zapcap_job_transcript(
+    job_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    import httpx
+
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    job = await db["zapcap_jobs"].find_one({"job_id": job_id})
+    if not job:
+        raise HTTPException(status_code=404, detail="ZapCap job not found")
+
+    # Use cached words from DB if available
+    cached_words = job.get("transcript_words")
+    if cached_words:
+        print(f"[ZapCap] transcript from DB cache job={job_id} words={len(cached_words)}", flush=True)
+        return UriResponse.get_single_data_response("zapcap_transcript", {"words": cached_words})
+
+    headers = await _zapcap_headers()
+    zapcap_video_id = job["zapcap_video_id"]
+    zapcap_task_id = job.get("zapcap_task_id")
+
+    if not zapcap_task_id:
+        return UriResponse.get_single_data_response("zapcap_transcript", {"words": []})
+
+    # Dedicated transcript endpoint returns a JSON array of word objects
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(
+            f"{_ZAPCAP_BASE}/videos/{zapcap_video_id}/task/{zapcap_task_id}/transcript",
+            headers=headers,
+        )
+
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"ZapCap transcript fetch failed: {r.text}")
+
+    words = r.json()  # array of {text, type, confidence, start_time, end_time, ...}
+    if not isinstance(words, list):
+        words = []
+
+    # Inject a stable id (index-based) so the frontend can key edits
+    for i, w in enumerate(words):
+        if "id" not in w:
+            w["id"] = str(i)
+
+    print(f"[ZapCap] transcript fetched job={job_id} words={len(words)}", flush=True)
+
+    if words:
+        await db["zapcap_jobs"].update_one({"job_id": job_id}, {"$set": {"transcript_words": words}})
+
+    return UriResponse.get_single_data_response("zapcap_transcript", {"words": words})
+
+
+@router.post("/zapcap-job/{job_id}/rerender")
+async def zapcap_job_rerender(
+    job_id: str,
+    body: dict,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    import uuid as _uuid2
+    import httpx
+    from datetime import datetime, timezone
+
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    job = await db["zapcap_jobs"].find_one({"job_id": job_id})
+    if not job:
+        raise HTTPException(status_code=404, detail="ZapCap job not found")
+
+    headers = await _zapcap_headers()
+    zapcap_video_id = job["zapcap_video_id"]
+    old_task_id = job.get("zapcap_task_id")
+    template_id = body.get("template_id") or job.get("template_id", "beast")
+    word_edits: list = body.get("word_edits", [])  # [{id, text}]
+
+    output_mode = job.get("output_mode", "composited")
+    quality = job.get("quality", "standard")
+
+    # Build export settings
+    export_settings: dict = {}
+    if output_mode == "transparent":
+        export_settings["outputMode"] = "transparent"
+    elif output_mode == "greenScreen":
+        export_settings["greenScreen"] = True
+    if quality != "standard":
+        export_settings["quality"] = quality
+
+    task_payload: dict = {
+        "templateId": template_id,
+        "language": job.get("language", "en"),
+        # autoApprove: False so the poll handler can apply caption edits before rendering
+        "autoApprove": False if word_edits else True,
+    }
+    if export_settings:
+        task_payload["exportSettings"] = export_settings
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(
+            f"{_ZAPCAP_BASE}/videos/{zapcap_video_id}/task",
+            json=task_payload,
+            headers=headers,
+        )
+        if r.status_code not in (200, 201):
+            raise HTTPException(status_code=502, detail=f"ZapCap rerender task failed: {r.text}")
+        zapcap_task_id = r.json().get("taskId") or r.json().get("id")
+        if not zapcap_task_id:
+            raise HTTPException(status_code=502, detail=f"ZapCap returned no taskId on rerender: {r.text}")
+
+    new_job_id = _uuid2.uuid4().hex
+    now = datetime.now(timezone.utc).isoformat()
+    new_doc: dict = {
+        "job_id": new_job_id,
+        "user_id": user_id,
+        "zapcap_video_id": zapcap_video_id,
+        "zapcap_task_id": zapcap_task_id,
+        "template_id": template_id,
+        "language": job.get("language", "en"),
+        "output_mode": output_mode,
+        "quality": quality,
+        "enable_broll": job.get("enable_broll", False),
+        "music_url": job.get("music_url"),
+        "status": "pending",
+        "created_at": now,
+    }
+    if word_edits:
+        # Store edits + original transcript so poll handler can apply them at transcriptionCompleted
+        new_doc["pending_transcript_edits"] = word_edits
+        new_doc["transcript_words"] = job.get("transcript_words", [])
+
+    await db["zapcap_jobs"].insert_one(new_doc)
+    mode = "caption edits" if word_edits else "new template"
+    print(f"[ZapCap] rerender ({mode}) job={new_job_id} video={zapcap_video_id} task={zapcap_task_id} edits={len(word_edits)}", flush=True)
+    return UriResponse.get_single_data_response("zapcap_rerender", {"job_id": new_job_id})

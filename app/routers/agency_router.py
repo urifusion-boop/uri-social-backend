@@ -315,7 +315,7 @@ async def invite_member(
             "inviter_name": (inviter or {}).get("first_name") or "A teammate",
             "role": body.role.value if hasattr(body.role, "value") else body.role,
             "has_account": bool(user),
-            "app_url": settings.WEB_APP_URL or "https://app.urisocial.com",
+            "app_url": (settings.WEB_APP_URL or "https://www.urisocial.com").strip("'\""),
         },
     ))
 

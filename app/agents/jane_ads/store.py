@@ -11,7 +11,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import Optional
 
-from .entities import Transaction, Wallet
+from .entities import Transaction, Wallet, WalletStatus
 
 
 class WalletStore(ABC):
@@ -20,6 +20,15 @@ class WalletStore(ABC):
 
     @abstractmethod
     async def upsert_wallet(self, wallet: Wallet) -> None: ...
+
+    @abstractmethod
+    async def try_debit(
+        self, business_id: str, amount_ngn: float, now: datetime
+    ) -> Optional[Wallet]:
+        """Atomically debit `amount_ngn` if (and only if) the wallet is ACTIVE and
+        balance_ngn >= amount_ngn — the balance check and the decrement happen as one
+        operation. Returns the updated wallet, or None if the debit was refused
+        (insufficient funds, suspended, or no wallet)."""
 
     @abstractmethod
     async def add_transaction(self, txn: Transaction) -> None: ...
@@ -43,6 +52,25 @@ class InMemoryWalletStore(WalletStore):
 
     async def upsert_wallet(self, wallet: Wallet) -> None:
         self._wallets[wallet.business_id] = wallet.model_copy(deep=True)
+
+    async def try_debit(
+        self, business_id: str, amount_ngn: float, now: datetime
+    ) -> Optional[Wallet]:
+        # asyncio is single-threaded so there's no real race here, but the
+        # guard-then-mutate happens with no `await` in between, keeping the
+        # semantics identical to the Mongo implementation.
+        wallet = self._wallets.get(business_id)
+        if (
+            wallet is None
+            or wallet.status != WalletStatus.ACTIVE
+            or wallet.balance_ngn < amount_ngn
+        ):
+            return None
+        wallet.balance_ngn = round(wallet.balance_ngn - amount_ngn, 2)
+        wallet.total_spent_ngn = round(wallet.total_spent_ngn + amount_ngn, 2)
+        wallet.updated_at = now
+        self._wallets[business_id] = wallet.model_copy(deep=True)
+        return wallet.model_copy(deep=True)
 
     async def add_transaction(self, txn: Transaction) -> None:
         self._txns.append(txn.model_copy(deep=True))
@@ -75,6 +103,34 @@ class MongoWalletStore(WalletStore):
             {"$set": wallet.model_dump()},
             upsert=True,
         )
+
+    async def try_debit(
+        self, business_id: str, amount_ngn: float, now: datetime
+    ) -> Optional[Wallet]:
+        from pymongo import ReturnDocument
+
+        doc = await self._db.jane_ads_wallets.find_one_and_update(
+            {
+                "business_id": business_id,
+                "status": WalletStatus.ACTIVE.value,
+                "balance_ngn": {"$gte": amount_ngn},
+            },
+            {
+                "$inc": {
+                    "balance_ngn": -amount_ngn,
+                    "total_spent_ngn": amount_ngn,
+                },
+                "$set": {"updated_at": now},
+            },
+            projection={"_id": 0},
+            return_document=ReturnDocument.AFTER,
+        )
+        if not doc:
+            return None
+        # Guard against float drift accumulating in $inc over many charges.
+        doc["balance_ngn"] = round(doc["balance_ngn"], 2)
+        doc["total_spent_ngn"] = round(doc["total_spent_ngn"], 2)
+        return Wallet(**doc)
 
     async def add_transaction(self, txn: Transaction) -> None:
         await self._db.jane_ads_transactions.insert_one(txn.model_dump())

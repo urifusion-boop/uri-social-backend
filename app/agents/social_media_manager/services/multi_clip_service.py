@@ -505,6 +505,51 @@ def _shift_srt(srt: str, offset_seconds: float) -> str:
     return "\n".join(out)
 
 
+def _trim_srt(srt: str, trim_start: float, new_dur: float) -> str:
+    """
+    Filter and shift SRT blocks for a center-cut clip.
+    Removes blocks outside [trim_start, trim_start + new_dur) and shifts by -trim_start.
+    """
+    def _parse_ts(ts: str) -> float:
+        h, m, rest = ts.split(":")
+        s, ms = rest.replace(",", ".").split(".")
+        return int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000
+
+    def _fmt_ts(t: float) -> str:
+        t = max(0.0, t)
+        h = int(t // 3600)
+        m = int((t % 3600) // 60)
+        s = int(t % 60)
+        ms = round((t % 1) * 1000)
+        return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+    if not srt.strip() or trim_start == 0.0:
+        return srt
+
+    blocks = [b.strip() for b in srt.strip().split("\n\n") if b.strip()]
+    result: List[str] = []
+    counter = 1
+    for block in blocks:
+        lines = block.split("\n")
+        if len(lines) < 3 or " --> " not in lines[1]:
+            continue
+        parts = lines[1].split(" --> ")
+        t_start = _parse_ts(parts[0].strip())
+        t_end = _parse_ts(parts[1].strip())
+        if t_end <= trim_start or t_start >= trim_start + new_dur:
+            continue
+        new_start = max(0.0, t_start - trim_start)
+        new_end = min(new_dur, t_end - trim_start)
+        if new_end <= 0:
+            continue
+        result.append(str(counter))
+        result.append(f"{_fmt_ts(new_start)} --> {_fmt_ts(new_end)}")
+        result.extend(lines[2:])
+        result.append("")
+        counter += 1
+    return "\n".join(result)
+
+
 def _merge_srts(clips_ordered: List[Dict]) -> str:
     """Merge SRT from all clips in order, shifting timestamps to stitched positions."""
     merged_lines: List[str] = []
@@ -533,6 +578,81 @@ def _merge_srts(clips_ordered: List[Dict]) -> str:
 
 # ── Shotstack timeline builder ────────────────────────────────────────────────
 
+_AI_TRANSITION_MAP: Dict[str, Optional[Dict]] = {
+    "cut":   None,                    # hard cut — no transition object
+    "fade":  {"out": "fade"},
+    "slide": {"out": "slideLeft"},
+    "zoom":  {"out": "zoom"},
+}
+
+
+async def _run_ai_analysis(clips_ordered: List[Dict], story_type: str) -> Dict:
+    """
+    GPT-4o-mini analysis of ordered clips. Returns {cuts, zooms, transition_style, summary}.
+    Called inside run_multi_clip_stitch so decisions can be applied before rendering.
+    """
+    import json as _json
+    from openai import AsyncOpenAI
+
+    cumulative = 0.0
+    clip_entries = []
+    for c in clips_ordered:
+        if c.get("dropped"):
+            continue
+        dur = float(c.get("duration_seconds") or 10)
+        clip_entries.append({
+            "start": cumulative,
+            "end": cumulative + dur,
+            "clip_type": c.get("clip_type", "speech"),
+            "transcript": (c.get("transcript") or "").strip()[:300],
+        })
+        cumulative += dur
+
+    if not clip_entries:
+        return {"cuts": [], "zooms": [], "transition_style": "fade", "summary": ""}
+
+    total_duration = cumulative
+    clips_text = "\n".join([
+        f"Clip {i + 1} ({e['start']:.1f}s–{e['end']:.1f}s, {e['clip_type']}): "
+        + (f'"{e["transcript"]}"' if e["transcript"] else "(no speech)")
+        for i, e in enumerate(clip_entries)
+    ])
+
+    prompt = (
+        f"You are a professional video editor. Analyze this {story_type} style video "
+        f"({total_duration:.0f}s total) and return editing decisions.\n\n"
+        f"Clips:\n{clips_text}\n\n"
+        f"Return ONLY a JSON object — no extra text, no markdown:\n"
+        f'{{"cuts": [{{"at": <float>, "end": <float>, "reason": "<why>"}}], '
+        f'"zooms": [{{"at": <float>, "duration": <float>, "reason": "<impactful moment>"}}], '
+        f'"transition_style": "cut" | "fade" | "slide" | "zoom", '
+        f'"summary": "<one sentence summary of the video>"}}\n\n'
+        f"Rules:\n"
+        f"- 2–4 cuts targeting filler, pauses, \"um/uh\", or repeated points. at >= 0, end <= {total_duration:.1f}.\n"
+        f"- 1–3 zoom moments on the most compelling or emotional phrases. duration 1.0–3.0 s.\n"
+        f"- Cuts must not overlap. Zooms must stay within clip bounds.\n"
+        f"- transition_style must match the energy: founder → cut or slide, product → fade or zoom.\n"
+        f"- Only the JSON object."
+    )
+
+    try:
+        client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+        resp = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=700,
+        )
+        raw = resp.choices[0].message.content.strip()
+        if raw.startswith("```"):
+            raw = "\n".join(raw.split("\n")[1:])
+            raw = raw.rsplit("```", 1)[0].strip()
+        return _json.loads(raw)
+    except Exception as exc:
+        print(f"[MultiClip/_run_ai_analysis] GPT error: {exc}", flush=True)
+        return {"cuts": [], "zooms": [], "transition_style": "fade", "summary": ""}
+
+
 def _build_founder_timeline(
     clips_ordered: List[Dict],
     merged_srt: str,
@@ -543,73 +663,159 @@ def _build_founder_timeline(
     mute_clips: bool = False,
     target_duration: float = 0,
     music_volume: float = 0.12,
+    ai_transition_style: str = "fade",
+    ai_zoom_moments: Optional[List[Dict]] = None,
+    ai_cuts: Optional[List[Dict]] = None,
 ) -> Dict:
     """
     Build a Shotstack timeline for a multi-clip stitch.
 
-    Each clip occupies its own segment. Crossfade transitions connect them.
-    Captions come from the merged SRT across all clips.
-    Optional music track spans the full duration.
-    When target_duration > 0 and mute_clips (Product Story), clips are center-cut
-    proportionally to fit the target.
+    Each clip may be split into sub-segments by ai_cuts (removing filler sections).
+    Segments alternate slideLeft/slideRight; zoom moments get the cinematic rotate+skew
+    transform from the produce section. Transitions between clips use the AI-chosen style.
+    Captions come from the merged SRT. Music track spans the full duration.
     """
     tracks: List[Dict] = []
     total_footage = sum(c["duration_seconds"] for c in clips_ordered)
 
-    # Trimming applies to Product Story only (mute_clips=True) when over budget
+    # Trimming applies whenever a target duration is set (both Founder and Product Story)
     trim_ratio = 1.0
-    if mute_clips and target_duration > 0 and total_footage > 0:
+    if target_duration > 0 and total_footage > 0:
         trim_ratio = min(1.0, target_duration / total_footage)
 
-    total_duration = round(total_footage * trim_ratio, 3)
+    # Resolve AI transition (None = hard cut between clips)
+    _border_transition: Optional[Dict] = None
+    if ai_transition_style == "cut":
+        _border_transition = None
+    elif ai_transition_style == "zoom":
+        _border_transition = {"in": "zoom"}
+    elif ai_transition_style == "slide":
+        _border_transition = {"in": "slideLeft"}
+    else:
+        _border_transition = {"in": "fade"}
 
-    # ── Track: video clips ────────────────────────────────────────────────────
+    # Map GPT original-timeline zoom timestamps → clip indices
+    # GPT analyzed untrimmed durations, so use original durations for matching.
+    zoom_clip_indices: set = set()
+    if ai_zoom_moments:
+        t = 0.0
+        for idx, c in enumerate(clips_ordered):
+            orig_dur = c["duration_seconds"]
+            for zm in ai_zoom_moments:
+                zm_at = float(zm.get("at", 0))
+                if t <= zm_at < t + orig_dur:
+                    zoom_clip_indices.add(idx)
+            t += orig_dur
+
+    # ── Track: video clips ─────────────────────────────────────────────────────
+    # Each clip is expanded into keep-segments after applying ai_cuts within it.
     video_clips: List[Dict] = []
-    cursor = 0.0
-    for i, clip in enumerate(clips_ordered):
+    global_cursor = 0.0
+    seg_index = 0          # counts all output segments for alternating slide direction
+    cut_ranges: List[tuple] = []   # global (start, end) ranges removed — used for caption filtering
+
+    for clip_idx, clip in enumerate(clips_ordered):
         orig_dur = clip["duration_seconds"]
         new_dur = round(orig_dur * trim_ratio, 3)
-        # Center-cut: skip the first (and last) trim_start seconds of the source clip
-        trim_start = round((orig_dur - new_dur) / 2.0, 3) if trim_ratio < 1.0 else 0.0
+        center_trim = round((orig_dur - new_dur) / 2.0, 3) if trim_ratio < 1.0 else 0.0
 
         position = clip.get("subject_position", "center")
+        has_zoom = clip_idx in zoom_clip_indices
+        clip_global_start = global_cursor
 
-        if clip.get("clip_type") == "still":
-            clip_entry: Dict = {
-                "asset": {
-                    "type": "image",
+        # Collect ai_cuts that overlap with this clip's trimmed window
+        clip_local_cuts: List[tuple] = []
+        for cut in (ai_cuts or []):
+            cut_at = float(cut.get("at", 0))
+            cut_end = float(cut.get("end", 0))
+            local_at = cut_at - clip_global_start
+            local_end = cut_end - clip_global_start
+            if local_end > 0 and local_at < new_dur:
+                clip_local_cuts.append((max(0.0, local_at), min(new_dur, local_end)))
+        clip_local_cuts.sort(key=lambda x: x[0])
+
+        # Build keep-parts (sections of this clip NOT removed by cuts)
+        keep_parts: List[tuple] = []
+        prev = 0.0
+        for (cs, ce) in clip_local_cuts:
+            if cs > prev:
+                keep_parts.append((prev, cs))
+            # Record removed range in global coordinates for caption filtering
+            cut_ranges.append((clip_global_start + cs, clip_global_start + ce))
+            prev = ce
+        if prev < new_dur:
+            keep_parts.append((prev, new_dur))
+        if not keep_parts:
+            keep_parts = [(0.0, new_dur)]
+
+        for part_idx, (local_start, local_end) in enumerate(keep_parts):
+            seg_len = round(local_end - local_start, 3)
+            if seg_len < 0.1:
+                continue
+            src_trim = round(center_trim + local_start, 3)
+            is_first_seg_of_clip = part_idx == 0
+            is_clip_boundary = clip_idx > 0 and is_first_seg_of_clip
+
+            if clip.get("clip_type") == "still":
+                clip_entry: Dict = {
+                    "asset": {"type": "image", "src": clip["cloudinary_url"]},
+                    "start": round(global_cursor, 3),
+                    "length": seg_len,
+                    "effect": "zoomIn",
+                    "fit": "crop",
+                    "position": position,
+                }
+            else:
+                clip_vol = 0.0 if mute_clips else min(1.0, clip.get("volume_boost", 1.0))
+                asset: Dict = {
+                    "type": "video",
                     "src": clip["cloudinary_url"],
-                },
-                "start": round(cursor, 3),
-                "length": new_dur,
-                "effect": "zoomIn",
-                "fit": "crop",
-                "position": position,
-            }
-        else:
-            clip_vol = 0.0 if mute_clips else min(1.0, clip.get("volume_boost", 1.0))
-            asset: Dict = {
-                "type": "video",
-                "src": clip["cloudinary_url"],
-                "volume": round(clip_vol, 3),
-            }
-            if trim_start > 0:
-                asset["trim"] = trim_start
-            clip_entry = {
-                "asset": asset,
-                "start": round(cursor, 3),
-                "length": new_dur,
-                "fit": "crop",
-                "position": position,
-            }
-        # Crossfade into next clip (not the last one)
-        if i < len(clips_ordered) - 1:
-            clip_entry["transition"] = {
-                "out": "fade",
-            }
-        video_clips.append(clip_entry)
-        cursor += new_dur
+                    "volume": round(clip_vol, 3),
+                }
+                if src_trim > 0:
+                    asset["trim"] = src_trim
 
+                base_effect = "slideLeft" if seg_index % 2 == 0 else "slideRight"
+                effect = "zoomIn" if has_zoom else base_effect
+
+                clip_entry = {
+                    "asset": asset,
+                    "start": round(global_cursor, 3),
+                    "length": seg_len,
+                    "fit": "crop",
+                    "position": position,
+                    "effect": effect,
+                }
+
+                # Cinematic jank-zoom from the produce section — visible on the most
+                # impactful moment in each zoom clip
+                if has_zoom and is_first_seg_of_clip:
+                    clip_entry["transform"] = {
+                        "rotate": {
+                            "angle": [
+                                {"from": 6.0, "to": -3.0, "start": 0, "length": 0.35,
+                                 "interpolation": "bezier", "easing": "easeOutBack"},
+                                {"from": -3.0, "to": 0, "start": 0.35, "length": 0.2,
+                                 "interpolation": "bezier", "easing": "easeOutCubic"},
+                            ]
+                        },
+                        "skew": {
+                            "x": [
+                                {"from": 0.07, "to": 0, "start": 0, "length": 0.3,
+                                 "interpolation": "bezier", "easing": "easeOutCubic"},
+                            ]
+                        },
+                    }
+
+            # Clip-boundary transitions only; within-clip cut segments hard-cut
+            if is_clip_boundary and _border_transition is not None:
+                clip_entry["transition"] = _border_transition
+
+            video_clips.append(clip_entry)
+            global_cursor = round(global_cursor + seg_len, 3)
+            seg_index += 1
+
+    total_duration = global_cursor
     tracks.append({"clips": video_clips})
 
     # ── Track: captions ───────────────────────────────────────────────────────
@@ -635,6 +841,9 @@ def _build_founder_timeline(
             caption_text = " ".join(lines[2:]).strip()
             cap_dur = max(0.5, t_end - t_start)
             if t_start >= total_duration:
+                continue
+            # Skip captions that fall within a cut region
+            if any(cs <= t_start < ce for (cs, ce) in cut_ranges):
                 continue
             caption_clips.append({
                 "asset": {
@@ -1219,7 +1428,20 @@ async def run_multi_clip_stitch(job_id: str, db) -> None:
             mute_clips = True
         else:
             await update(72, "Merging transcripts…")
-            merged_srt = _merge_srts(active_clips)
+            if target_duration > 0:
+                # Center-cut each clip to fit the target, then trim its SRT to match
+                total_footage = sum(c["duration_seconds"] for c in active_clips)
+                tr = min(1.0, target_duration / max(total_footage, 1.0))
+                srt_clips = []
+                for c in active_clips:
+                    orig_dur = c["duration_seconds"]
+                    new_dur = round(orig_dur * tr, 3)
+                    trim_start = round((orig_dur - new_dur) / 2.0, 3) if tr < 1.0 else 0.0
+                    trimmed_srt = _trim_srt(c.get("srt") or "", trim_start, new_dur)
+                    srt_clips.append({**c, "srt": trimmed_srt, "duration_seconds": new_dur})
+                merged_srt = _merge_srts(srt_clips)
+            else:
+                merged_srt = _merge_srts(active_clips)
             mute_clips = False
 
         await update(75, "Selecting music…")
@@ -1228,7 +1450,19 @@ async def run_multi_clip_stitch(job_id: str, db) -> None:
             music_mood = doc.get("music_mood", "chill")
             music_url = _pick_music_url(music_mood)
 
-        await update(78, "Building timeline…")
+        await update(76, "Analyzing editing style…")
+        ai_decisions = await _run_ai_analysis(active_clips, story_type)
+        await db.multi_clip_jobs.update_one(
+            {"job_id": job_id},
+            {"$set": {"ai_decisions": ai_decisions}},
+        )
+        print(
+            f"[MultiClip] AI decisions: transition={ai_decisions.get('transition_style')} "
+            f"zooms={len(ai_decisions.get('zooms', []))} cuts={len(ai_decisions.get('cuts', []))}",
+            flush=True,
+        )
+
+        await update(79, "Building timeline…")
         aspect_ratio = doc.get("orientation", "9:16")
         primary_color = doc.get("primary_color", "#CD1B78")
         music_volume = float(doc.get("music_volume", 0.12))
@@ -1242,6 +1476,9 @@ async def run_multi_clip_stitch(job_id: str, db) -> None:
             mute_clips=mute_clips,
             target_duration=target_duration,
             music_volume=music_volume,
+            ai_transition_style=ai_decisions.get("transition_style", "fade"),
+            ai_zoom_moments=ai_decisions.get("zooms", []),
+            ai_cuts=ai_decisions.get("cuts", []),
         )
 
         await update(82, "Rendering…")
