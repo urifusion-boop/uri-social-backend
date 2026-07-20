@@ -787,7 +787,16 @@ class ImageContentService:
                     "bottom_right": "bottom-right corner"
                 }
                 pos_text = position_map.get(logo_position, logo_position)
-                logo_space_note = f"\n⚠️ LOGO OVERLAY ZONE: A brand logo will be overlaid in the {pos_text} (approximately {logo_reserve_size}). Keep this small area free of text and important visual elements. CRITICAL: Do NOT create any white box, card, badge, panel, frame, border, or background shape in this area. The background pattern/design should continue naturally through this zone - just avoid placing text or key visual elements there. The logo will be placed directly on top of whatever background exists."
+                logo_space_note = f"\n\n🚨 CRITICAL - LOGO OVERLAY ZONE ({pos_text}):\n" \
+                    f"A {logo_reserve_size} brand logo will be overlaid in the {pos_text}.\n" \
+                    f"MANDATORY REQUIREMENTS:\n" \
+                    f"  • This zone MUST be 100% clear of ALL text, headlines, diagrams, illustrations, and visual elements\n" \
+                    f"  • ONLY solid colors, gradients, or simple background patterns allowed in this zone\n" \
+                    f"  • NO text of any kind (not even small text or labels)\n" \
+                    f"  • NO shapes, icons, illustrations, or graphic elements\n" \
+                    f"  • NO white boxes, cards, panels, frames, or borders\n" \
+                    f"  • Place ALL content (headlines, diagrams, text, visuals) OUTSIDE this reserved zone\n" \
+                    f"If ANY element overlaps this zone, the design FAILS. This overrides all aesthetic preferences."
 
             # SECTION 1: ABSOLUTE RULES (READ FIRST)
             absolute_rules = f"""=== ABSOLUTE RULES (READ FIRST — THESE OVERRIDE ALL OTHER INSTRUCTIONS) ===
@@ -1020,6 +1029,24 @@ Follow these rules precisely for every image. No exceptions.
 
             do_not_include = "=== DO NOT INCLUDE ===\n" + "\n".join(f"- {item}" for item in do_not_include_items)
 
+            # The logo-reservation rule already appears once at the very top (in
+            # absolute_rules). Repeating it once more as the LAST thing the model
+            # reads — after it has already worked out headline/layout — catches the
+            # cases where an earlier instruction gets lost among everything else in
+            # a long prompt. This applies whether or not a reference image is used
+            # (the reference-image path adds its own reminder later, inside the
+            # composition block, on top of this one).
+            logo_final_reminder = ""
+            if logo_position:
+                logo_final_reminder = (
+                    f"=== FINAL LAYOUT CHECK ===\n"
+                    f"Before finalising, check the {pos_text} of the canvas "
+                    f"({logo_reserve_size}). A brand logo will be placed there after "
+                    f"generation. That exact area must be empty background — no letters, "
+                    f"words, icons, or graphics touching it. If your layout puts anything "
+                    f"there, shift it elsewhere before rendering."
+                )
+
             # ASSEMBLE FINAL PROMPT (Order matters - rules at top!)
             parts = [
                 absolute_rules,
@@ -1029,6 +1056,7 @@ Follow these rules precisely for every image. No exceptions.
                 content_section,
                 format_section,
                 do_not_include,
+                logo_final_reminder,
             ]
             image_prompt = "\n\n".join(p for p in parts if p)
 
@@ -1075,9 +1103,22 @@ Follow these rules precisely for every image. No exceptions.
                 dynamic_motion = ImageContentService._get_dynamic_motion_detail(industry)
                 text_styling = ImageContentService._get_text_styling_detail(industry)
 
+                # The zone descriptions below give the model very specific spatial
+                # instructions (fill this whole side with text). Without an explicit
+                # carve-out, that competes with — and tends to win over — the more
+                # generic logo-reservation rule stated earlier in the prompt, so the
+                # corner holding the logo needs to be named again, right here.
+                logo_corner_note = ""
+                if logo_position:
+                    logo_corner_note = (
+                        f"\n- EXCEPTION: the {pos_text} corner is reserved for the brand logo "
+                        f"({logo_reserve_size}) — keep that corner completely empty; start the "
+                        f"headline text outside of it, not inside it"
+                    )
+
                 if composition_mode == "editorial":
                     # Editorial/Two-Zone mode for minimal/clean styles
-                    composition_block = """
+                    composition_block = f"""
 === EDITORIAL COMPOSITION ===
 Create a professional social media product graphic with TWO distinct zones:
 
@@ -1093,7 +1134,7 @@ TEXT ZONE (45% of frame, opposite side of product):
 - All text placed in this zone: headline, subtext, CTA
 - Text must be in the NEGATIVE SPACE beside the product
 - NO text overlapping or on top of the product
-- 20px minimum gap between any text and the product
+- 20px minimum gap between any text and the product{logo_corner_note}
 
 CRITICAL RULES:
 - The product itself is SACRED - never distort, never regenerate, never modify
@@ -1131,7 +1172,7 @@ TEXT:
 - {text_styling}
 - NEVER overlaps product label
 - Max 3 elements: headline (5 words), subtext (optional), CTA
-- CTA at the bottom, integrated into the scene
+- CTA at the bottom, integrated into the scene{logo_corner_note}
 
 DEPTH AND ATMOSPHERE:
 - THREE depth layers: soft foreground, sharp product, atmospheric bg
@@ -2164,6 +2205,178 @@ OVERALL:
         except Exception as e:
             print(f"⚠️ Logo overlay failed: {e}, returning original image")
             return b64
+
+    @staticmethod
+    def rank_overlay_positions_cv(image_bytes: bytes, region_pct: float = 0.22) -> List[str]:
+        """
+        Deterministically rank candidate logo corners by how visually "busy"
+        each region actually is, using plain pixel analysis — no AI guessing.
+
+        Text, faces, and graphics all produce measurably higher edge density
+        than flat background or sky, so scoring each corner's edge variance
+        (a standard OpenCV blur/detail metric) and picking the lowest is a
+        far more reliable signal than asking a vision model "which corner
+        looks empty?" — this is what actually fixed unreliable placement,
+        the earlier vision-only ranking never had real pixel data to go on.
+
+        Returns positions ordered least-busy (safest) to most-busy (worst).
+        """
+        import cv2
+        import numpy as np
+        from PIL import Image
+        import io as _io
+
+        try:
+            img = Image.open(_io.BytesIO(image_bytes)).convert("L")  # grayscale
+            w, h = img.size
+            rw = max(1, int(w * region_pct))
+            rh = max(1, int(h * region_pct))
+
+            regions = {
+                "top_left": (0, 0, rw, rh),
+                "top_right": (w - rw, 0, w, rh),
+                "top_center": ((w - rw) // 2, 0, (w - rw) // 2 + rw, rh),
+                "bottom_left": (0, h - rh, rw, h),
+                "bottom_right": (w - rw, h - rh, w, h),
+                "bottom_center": ((w - rw) // 2, h - rh, (w - rw) // 2 + rw, h),
+            }
+
+            np_img = np.array(img)
+            scores = {}
+            for pos, (x1, y1, x2, y2) in regions.items():
+                crop = np_img[y1:y2, x1:x2]
+                scores[pos] = float(cv2.Laplacian(crop, cv2.CV_64F).var()) if crop.size else float("inf")
+
+            ranked = sorted(scores.keys(), key=lambda p: scores[p])
+            print(f"📐 Logo corner busyness (lower=emptier): {[(p, round(scores[p], 1)) for p in ranked]}")
+            return ranked
+
+        except Exception as e:
+            print(f"⚠️ CV-based position ranking failed: {e}, using fixed fallback order")
+            return ["bottom_right", "bottom_left", "top_right", "top_left", "bottom_center", "top_center"]
+
+    @staticmethod
+    async def rank_overlay_positions(image_url: str) -> List[str]:
+        """
+        Determine a ranked list of candidate corners (best to worst) for placing
+        a logo/badge overlay on a user-uploaded image.
+
+        Forces the model to look at each candidate region individually before
+        picking, rather than a single open-ended guess — this is meaningfully
+        more reliable for small vision models than "just tell me the best one."
+        Falls back to a fixed safe order if the model call or parsing fails.
+
+        NOTE: superseded by rank_overlay_positions_cv() for the primary ranking
+        signal (see that docstring) — kept here in case a text-based fallback
+        or secondary signal is useful later.
+        """
+        from app.services.AIService import AIService
+        import json as _json
+
+        valid_positions = ["top_left", "top_right", "top_center", "bottom_left", "bottom_right", "bottom_center"]
+        fallback_order = ["bottom_right", "bottom_left", "top_right", "top_left", "bottom_center", "top_center"]
+
+        prompt = """You are choosing where to place a small brand logo badge on this image, so it never
+covers anything important.
+
+For EACH of these six regions, briefly note what is actually there — text, a face, a focal
+subject, or just empty/background:
+- top_left
+- top_right
+- top_center
+- bottom_left
+- bottom_right
+- bottom_center
+
+Then rank all six from BEST (emptiest, least important content, furthest from any text or
+faces) to WORST (most likely to cover something important).
+
+Return JSON only, no markdown, no explanations outside the JSON:
+{
+  "regions": {"top_left": "...", "top_right": "...", "top_center": "...", "bottom_left": "...", "bottom_right": "...", "bottom_center": "..."},
+  "ranking": ["best_position", "...", "...", "...", "...", "worst_position"]
+}"""
+
+        try:
+            request = AIService.build_ai_model(
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": image_url}},
+                    ],
+                }],
+                model="gpt-4o-mini",
+                temperature=0,
+                max_tokens=500,
+            )
+            response = await AIService.chat_completion(request)
+            if isinstance(response, dict) and "error" in response:
+                raise Exception(response["error"])
+
+            raw = response.choices[0].message.content.strip()
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+
+            parsed = _json.loads(raw)
+            ranking = [p for p in parsed.get("ranking", []) if p in valid_positions]
+            # Append any missing positions at the end so we always have all 6 as a fallback chain
+            ranking += [p for p in fallback_order if p not in ranking]
+            print(f"🎯 Logo position ranking: {ranking}")
+            return ranking
+
+        except Exception as e:
+            print(f"⚠️ Logo position ranking failed: {e}, using fixed fallback order")
+            return fallback_order
+
+    @staticmethod
+    async def composited_overlay_has_conflict(composited_data_url: str, position: str) -> bool:
+        """
+        Post-placement sanity check: look at the FINAL composited image and ask
+        whether the logo actually landed on top of text, a face, or another
+        important element. Returns True if there's a conflict (caller should
+        try the next-ranked position), False if it looks clean.
+
+        Fails safe (returns False = "accept it") on any error — a broken
+        quality-check call must never block the post from going out.
+        """
+        from app.services.AIService import AIService
+
+        position_label = position.replace("_", "-")
+        prompt = f"""A small brand logo badge was just placed in the {position_label} corner of this image.
+
+Look specifically at that corner. Does the logo visibly overlap, cover, or cut off any text,
+a face, or another important visual element?
+
+Answer with exactly one word: "yes" or "no"."""
+
+        try:
+            request = AIService.build_ai_model(
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": composited_data_url}},
+                    ],
+                }],
+                model="gpt-4o-mini",
+                temperature=0,
+                max_tokens=10,
+            )
+            response = await AIService.chat_completion(request)
+            if isinstance(response, dict) and "error" in response:
+                raise Exception(response["error"])
+
+            answer = response.choices[0].message.content.strip().lower()
+            has_conflict = answer.startswith("yes")
+            print(f"🔍 Overlay conflict check at {position}: {'CONFLICT' if has_conflict else 'clean'}")
+            return has_conflict
+
+        except Exception as e:
+            print(f"⚠️ Overlay conflict check failed: {e}, accepting placement as-is")
+            return False
 
     @staticmethod
     def _map_to_gemini_aspect(size: str) -> str:

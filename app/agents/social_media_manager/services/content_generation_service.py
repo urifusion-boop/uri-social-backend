@@ -289,22 +289,61 @@ Write as if you're sharing hard-won business wisdom with fellow African entrepre
 
         if brand_context.get("audience_age_range"):
             age_range = brand_context["audience_age_range"]
+            print(f"🎯 Audience age range detected: '{age_range}'")
 
-            # Special handling for Gen Z to provide specific linguistic markers
+            # Build age-specific voice instructions for each demographic
             if "Gen Z" in age_range or "18-24" in age_range:
-                voice_descriptor = active_voice or "conversational"
-                parts.append(
-                    f'- Voice adapted for Gen Z (18-24): {voice_descriptor} — but make it authentically Gen Z. '
-                    f'This means: Use Gen Z slang naturally (lowkey, highkey, no cap, fr, ngl, tbh, iykyk), '
-                    f'keep sentences short and punchy (fragments are fine), write like you\'re texting a friend not emailing a customer, '
-                    f'bold takes over polite diplomacy, lowercase casual style where appropriate ("it\'s giving...", "not me..."), '
-                    f'reference internet culture and trending topics, and ditch corporate jargon entirely.'
+                print(f"✅ Applying Gen Z voice adaptation")
+                parts.insert(0,
+                    f'🚨 MANDATORY GEN Z VOICE (18-24) - OVERRIDES EVERYTHING:\n'
+                    f'You MUST sound like an actual 20-year-old texting, NOT a brand or marketer.\n'
+                    f'REQUIRED Gen Z elements in EVERY caption:\n'
+                    f'  ✓ Use slang: lowkey, highkey, no cap, fr (for real), ngl (not gonna lie), tbh (to be honest), iykyk (if you know you know)\n'
+                    f'  ✓ Short sentences (5-10 words max). Fragments are GOOD.\n'
+                    f'  ✓ Casual lowercase where natural ("fr this is it", "ngl i love this")\n'
+                    f'  ✓ Drop formality completely - sound like Instagram/TikTok comments\n'
+                    f'  ✓ NO corporate words: "navigate", "key", "special moments", "come to life" = BANNED\n'
+                    f'  ✓ NO polished marketing language - keep it raw and real\n\n'
+                    f'IGNORE any "professional", "polished", or "sophisticated" instructions below.\n'
+                    f'If the caption sounds like it could be from a 40-year-old marketing manager, you FAILED.'
                 )
-            else:
-                # Default age range instruction for other demographics
+            elif "Millennials" in age_range or "25-40" in age_range:
+                print(f"✅ Applying Millennials voice adaptation")
+                parts.insert(0,
+                    f'🎯 TARGET AUDIENCE: Millennials (25-40) - CRITICAL\n'
+                    f'Write for millennials who value authenticity:\n'
+                    f'  • Conversational but polished\n'
+                    f'  • Reference millennial culture (nostalgia, work-life balance, experiences)\n'
+                    f'  • Balance casual and professional\n'
+                    f'  • Relatable without being too corporate or too trendy\n'
+                    f'This takes priority over other tone instructions.'
+                )
+            elif "Gen X" in age_range or "41-56" in age_range:
+                print(f"✅ Applying Gen X voice adaptation")
+                parts.insert(0,
+                    f'🎯 TARGET AUDIENCE: Gen X (41-56) - CRITICAL\n'
+                    f'Write for Gen X who value authenticity and directness:\n'
+                    f'  • Straightforward, no-nonsense tone\n'
+                    f'  • Skip the hype - be genuine and practical\n'
+                    f'  • Professional but not stiff\n'
+                    f'  • Focus on value, quality, and results\n'
+                    f'This takes priority over other tone instructions.'
+                )
+            elif "Boomers" in age_range or "57+" in age_range:
+                print(f"✅ Applying Boomers voice adaptation")
+                parts.insert(0,
+                    f'🎯 TARGET AUDIENCE: Boomers (57+) - CRITICAL\n'
+                    f'Write for baby boomers with respect and clarity:\n'
+                    f'  • Professional, respectful tone\n'
+                    f'  • Clear, well-structured sentences\n'
+                    f'  • Emphasize trust, reliability, expertise\n'
+                    f'  • Avoid slang and internet jargon\n'
+                    f'This takes priority over other tone instructions.'
+                )
+            elif "Everyone" not in age_range:
+                # Fallback for custom age ranges
                 parts.append(
-                    f'- Audience age range: {age_range}. '
-                    f'Adjust language complexity, cultural references, and energy to match this demographic.'
+                    f'- Target audience age: {age_range}. Adjust language and references to match this demographic.'
                 )
 
         if brand_context.get("primary_goal"):

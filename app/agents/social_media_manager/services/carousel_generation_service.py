@@ -162,7 +162,9 @@ This is a {content_analysis['type'].upper()} carousel. Build a cohesive narrativ
             "Rules:\n"
             "- Each headline: ≤8 words, punchy and bold\n"
             "- Each body: ≤25 words, clear and scannable\n"
-            "- Overall caption: engaging hook + relevant hashtags, suitable for the platform\n"
+            "- Overall caption: engaging hook, suitable for the platform\n"
+            "- End the caption with 3-6 relevant, specific hashtags (not generic ones like #social "
+            "or #post) — always include hashtags, this is not optional\n"
             "- The carousel must tell a complete, cohesive story from slide 1 to slide N\n"
             "- Each slide must build on the previous slide\n"
             "- Return ONLY valid JSON — no markdown, no extra text\n\n"
@@ -190,8 +192,16 @@ This is a {content_analysis['type'].upper()} carousel. Build a cohesive narrativ
             raw = response.choices[0].message.content or "{}"
             data = json.loads(raw)
 
-            caption = data.get("caption", "")
+            caption_raw = data.get("caption", "")
             slides_raw = data.get("slides", [])
+
+            # Same convention as feed/story posts: hashtags live in their own
+            # field, not mixed into the displayed caption text. DraftCard only
+            # renders the hashtag pills from this separate list, so without
+            # this extraction step carousels silently showed no hashtags at
+            # all even when the model did include them in the caption string.
+            from .content_generation_service import ContentGenerationService
+            caption, hashtags = ContentGenerationService._extract_and_clean_hashtags(caption_raw, platform)
 
             # Normalise slides and add slide_number
             slides: List[Dict[str, str]] = []
@@ -212,6 +222,7 @@ This is a {content_analysis['type'].upper()} carousel. Build a cohesive narrativ
 
             return {
                 "caption": caption,
+                "hashtags": hashtags,
                 "slides": slides,
                 "content_analysis": content_analysis
             }
@@ -229,6 +240,7 @@ This is a {content_analysis['type'].upper()} carousel. Build a cohesive narrativ
             ]
             return {
                 "caption": seed_content[:200],
+                "hashtags": [],
                 "slides": slides,
                 "content_analysis": content_analysis
             }
@@ -319,7 +331,7 @@ This is a {content_analysis['type'].upper()} carousel. Build a cohesive narrativ
                 "content": carousel_data["caption"],
                 "post_type": "carousel",
                 "slides": slides_with_specs,
-                "hashtags": [],
+                "hashtags": carousel_data.get("hashtags", []),
                 "status": "draft",
                 "approval_status": "pending",
                 "has_image": False,
