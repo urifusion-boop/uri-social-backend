@@ -8105,6 +8105,7 @@ async def zapcap_produce(
         _upload_to_cloudinary,
         _upload_audio_to_cloudinary,
     )
+    from app.agents.social_media_manager.services.multi_clip_service import _probe_clip
 
     user_id = _get_user_id(token)
     if not user_id:
@@ -8141,8 +8142,26 @@ async def zapcap_produce(
 
     # Build task payload with correct ZapCap field structure
     export_settings: dict = {}
+    probed_width = probed_height = 0
     if output_mode == "transparent":
         export_settings["outputMode"] = "transparent"
+        # ZapCap requires exportSettings.width/height whenever outputMode is
+        # "transparent" (confirmed against the live API: without them it
+        # 400s with "width and height are required when outputMode is
+        # transparent", which the client only ever saw as an opaque 502).
+        # ffprobe reads dimensions directly off the remote URL, no download needed.
+        probe = await _probe_clip(video_url)
+        probed_width, probed_height = probe.get("width", 0), probe.get("height", 0)
+        if probed_width and probed_height:
+            export_settings["width"] = probed_width
+            export_settings["height"] = probed_height
+        else:
+            # Never send a transparent task ZapCap will just reject — fail
+            # loudly here with a clear reason instead of a second opaque 502.
+            raise HTTPException(
+                status_code=422,
+                detail="Could not read this video's dimensions, which are required for transparent output. Try a different file."
+            )
     elif output_mode == "greenScreen":
         export_settings["greenScreen"] = True
     if quality != "standard":
@@ -8190,6 +8209,9 @@ async def zapcap_produce(
         "quality": quality,
         "enable_broll": enable_broll.lower() == "true",
         "music_url": music_url,
+        "video_url": video_url,
+        "video_width": probed_width or None,
+        "video_height": probed_height or None,
         "status": "pending",
         "created_at": now,
     })
@@ -8425,6 +8447,7 @@ async def zapcap_job_rerender(
     import uuid as _uuid2
     import httpx
     from datetime import datetime, timezone
+    from app.agents.social_media_manager.services.multi_clip_service import _probe_clip
 
     user_id = _get_user_id(token)
     if not user_id:
@@ -8447,6 +8470,22 @@ async def zapcap_job_rerender(
     export_settings: dict = {}
     if output_mode == "transparent":
         export_settings["outputMode"] = "transparent"
+        # Same ZapCap requirement as the initial produce call: transparent
+        # output needs width/height. Reuse what was probed at job creation;
+        # older job records (created before this field existed) fall back
+        # to re-probing the stored video_url.
+        width, height = job.get("video_width"), job.get("video_height")
+        if not (width and height) and job.get("video_url"):
+            probe = await _probe_clip(job["video_url"])
+            width, height = probe.get("width", 0), probe.get("height", 0)
+        if width and height:
+            export_settings["width"] = width
+            export_settings["height"] = height
+        else:
+            raise HTTPException(
+                status_code=422,
+                detail="Could not determine this video's dimensions, which are required for transparent output."
+            )
     elif output_mode == "greenScreen":
         export_settings["greenScreen"] = True
     if quality != "standard":
