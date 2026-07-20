@@ -586,20 +586,125 @@ _AI_TRANSITION_MAP: Dict[str, Optional[Dict]] = {
 }
 
 
+_COMPOSE_FILLER_RE = re.compile(
+    r"^(um+|uh+|ah+|hmm+|er+|erm+|mhm+|uhh+|umm+|huh|mm+)$",
+    re.IGNORECASE,
+)
+_COMPOSE_SILENCE_THRESHOLD = 0.9   # seconds — matches video_production_service founder threshold
+
+
+def _timing_cuts_from_clip_srt(srt: str, clip_offset: float, clip_duration: float) -> List[Dict]:
+    """
+    Parse a single clip's SRT string and return cuts (in global timeline coordinates)
+    for silences (gaps between SRT entries) and whole-entry filler words.
+    This runs entirely on timing data — no GPT needed.
+    """
+    def _parse_ts(ts: str) -> float:
+        h, m, rest = ts.split(":")
+        s, ms = rest.replace(",", ".").split(".")
+        return int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000
+
+    entries = []
+    for block in [b.strip() for b in srt.strip().split("\n\n") if b.strip()]:
+        lines = block.split("\n")
+        if len(lines) < 3 or " --> " not in lines[1]:
+            continue
+        parts = lines[1].split(" --> ")
+        entries.append({
+            "start": _parse_ts(parts[0].strip()),
+            "end":   _parse_ts(parts[1].strip()),
+            "text":  " ".join(lines[2:]).strip(),
+        })
+
+    if not entries:
+        return []
+
+    cuts: List[Dict] = []
+
+    # Leading silence before first word
+    if entries[0]["start"] > _COMPOSE_SILENCE_THRESHOLD:
+        cuts.append({
+            "at":     clip_offset,
+            "end":    round(clip_offset + entries[0]["start"], 3),
+            "reason": f"leading silence {entries[0]['start']:.1f}s",
+        })
+
+    # Gaps between SRT entries
+    for i in range(1, len(entries)):
+        gap_start = entries[i - 1]["end"]
+        gap_end   = entries[i]["start"]
+        gap = gap_end - gap_start
+        if gap > _COMPOSE_SILENCE_THRESHOLD:
+            cuts.append({
+                "at":     round(clip_offset + gap_start, 3),
+                "end":    round(clip_offset + gap_end,   3),
+                "reason": f"silence {gap:.1f}s",
+            })
+
+    # Trailing silence after last word
+    trail = clip_duration - entries[-1]["end"]
+    if trail > _COMPOSE_SILENCE_THRESHOLD:
+        cuts.append({
+            "at":     round(clip_offset + entries[-1]["end"], 3),
+            "end":    round(clip_offset + clip_duration,       3),
+            "reason": f"trailing silence {trail:.1f}s",
+        })
+
+    # Whole-entry filler words (um, uh, etc.)
+    for entry in entries:
+        clean = entry["text"].lower().strip(".,!?;:\"' ")
+        if _COMPOSE_FILLER_RE.match(clean):
+            cuts.append({
+                "at":     round(clip_offset + entry["start"], 3),
+                "end":    round(clip_offset + entry["end"],   3),
+                "reason": f'filler: "{entry["text"]}"',
+            })
+
+    return cuts
+
+
+def _merge_cuts(cuts: List[Dict]) -> List[Dict]:
+    """Sort and merge overlapping/adjacent cut ranges."""
+    if not cuts:
+        return []
+    cuts = sorted(cuts, key=lambda c: c["at"])
+    merged: List[Dict] = [dict(cuts[0])]
+    for cut in cuts[1:]:
+        if cut["at"] <= merged[-1]["end"]:
+            merged[-1]["end"] = max(merged[-1]["end"], cut["end"])
+            merged[-1]["reason"] += f"; {cut['reason']}"
+        else:
+            merged.append(dict(cut))
+    # Remove cuts shorter than 0.1s (rounding artifacts)
+    return [c for c in merged if c["end"] - c["at"] >= 0.1]
+
+
 async def _run_ai_analysis(clips_ordered: List[Dict], story_type: str) -> Dict:
     """
-    GPT-4o-mini analysis of ordered clips. Returns {cuts, zooms, transition_style, summary}.
-    Called inside run_multi_clip_stitch so decisions can be applied before rendering.
+    Analyze ordered clips and return {cuts, zooms, transition_style, summary}.
+
+    Two-layer approach:
+    1. Timing-based: parse each clip's SRT to detect silences and filler words
+       deterministically (no GPT, catches pauses GPT cannot see from text alone).
+    2. GPT-4o-mini: content analysis for contextual cuts (repetitions, off-topic
+       tangents), zoom moments, transition style, and summary.
+
+    Results are merged and deduplicated before returning.
     """
     import json as _json
     from openai import AsyncOpenAI
 
+    # ── Layer 1: timing-based silence + filler detection ─────────────────────
+    timing_cuts: List[Dict] = []
     cumulative = 0.0
     clip_entries = []
     for c in clips_ordered:
         if c.get("dropped"):
             continue
         dur = float(c.get("duration_seconds") or 10)
+        srt = c.get("srt") or ""
+        if srt:
+            timing_cuts.extend(_timing_cuts_from_clip_srt(srt, cumulative, dur))
         clip_entries.append({
             "start": cumulative,
             "end": cumulative + dur,
@@ -612,28 +717,44 @@ async def _run_ai_analysis(clips_ordered: List[Dict], story_type: str) -> Dict:
         return {"cuts": [], "zooms": [], "transition_style": "fade", "summary": ""}
 
     total_duration = cumulative
+
+    # ── Layer 2: GPT content analysis ─────────────────────────────────────────
     clips_text = "\n".join([
         f"Clip {i + 1} ({e['start']:.1f}s–{e['end']:.1f}s, {e['clip_type']}): "
         + (f'"{e["transcript"]}"' if e["transcript"] else "(no speech)")
         for i, e in enumerate(clip_entries)
     ])
 
+    # Tell GPT about already-detected timing cuts so it focuses on content cuts only
+    timing_cut_summary = (
+        f"Timing-based cuts already detected (silences/fillers): "
+        + ", ".join(f"{c['at']:.1f}s–{c['end']:.1f}s" for c in timing_cuts[:8])
+        if timing_cuts else "No timing-based cuts detected."
+    )
+
     prompt = (
         f"You are a professional video editor. Analyze this {story_type} style video "
         f"({total_duration:.0f}s total) and return editing decisions.\n\n"
         f"Clips:\n{clips_text}\n\n"
+        f"{timing_cut_summary}\n\n"
         f"Return ONLY a JSON object — no extra text, no markdown:\n"
         f'{{"cuts": [{{"at": <float>, "end": <float>, "reason": "<why>"}}], '
         f'"zooms": [{{"at": <float>, "duration": <float>, "reason": "<impactful moment>"}}], '
         f'"transition_style": "cut" | "fade" | "slide" | "zoom", '
         f'"summary": "<one sentence summary of the video>"}}\n\n'
         f"Rules:\n"
-        f"- 2–4 cuts targeting filler, pauses, \"um/uh\", or repeated points. at >= 0, end <= {total_duration:.1f}.\n"
+        f"- 0–3 ADDITIONAL content cuts for repetitions, off-topic tangents, or contradictions. "
+        f"Do NOT re-cut ranges already covered by the timing cuts above. at >= 0, end <= {total_duration:.1f}.\n"
         f"- 1–3 zoom moments on the most compelling or emotional phrases. duration 1.0–3.0 s.\n"
-        f"- Cuts must not overlap. Zooms must stay within clip bounds.\n"
+        f"- Cuts must not overlap each other or the timing cuts. Zooms must stay within clip bounds.\n"
         f"- transition_style must match the energy: founder → cut or slide, product → fade or zoom.\n"
         f"- Only the JSON object."
     )
+
+    gpt_cuts: List[Dict] = []
+    gpt_zooms: List[Dict] = []
+    transition_style = "fade"
+    summary = ""
 
     try:
         client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
@@ -647,10 +768,23 @@ async def _run_ai_analysis(clips_ordered: List[Dict], story_type: str) -> Dict:
         if raw.startswith("```"):
             raw = "\n".join(raw.split("\n")[1:])
             raw = raw.rsplit("```", 1)[0].strip()
-        return _json.loads(raw)
+        gpt = _json.loads(raw)
+        gpt_cuts = gpt.get("cuts", [])
+        gpt_zooms = gpt.get("zooms", [])
+        transition_style = gpt.get("transition_style", "fade")
+        summary = gpt.get("summary", "")
     except Exception as exc:
         print(f"[MultiClip/_run_ai_analysis] GPT error: {exc}", flush=True)
-        return {"cuts": [], "zooms": [], "transition_style": "fade", "summary": ""}
+
+    # ── Merge and deduplicate ─────────────────────────────────────────────────
+    all_cuts = timing_cuts + gpt_cuts
+    merged = _merge_cuts(all_cuts)
+    print(
+        f"[MultiClip/analyze] timing_cuts={len(timing_cuts)} gpt_cuts={len(gpt_cuts)} "
+        f"merged={len(merged)} zooms={len(gpt_zooms)}",
+        flush=True,
+    )
+    return {"cuts": merged, "zooms": gpt_zooms, "transition_style": transition_style, "summary": summary}
 
 
 def _build_founder_timeline(
