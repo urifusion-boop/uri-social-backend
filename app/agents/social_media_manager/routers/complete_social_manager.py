@@ -1441,7 +1441,6 @@ async def facebook_ads_callback(
             )
             ll_data = ll_resp.json()
             long_token = ll_data.get("access_token", short_token)
-            print(f"[FBAdsOAuth][TEMP-DEBUG] long_token={long_token}")  # TODO: remove after debugging ad-account access
 
             pages_resp = await client.get(
                 f"{graph_base}/me/accounts",
