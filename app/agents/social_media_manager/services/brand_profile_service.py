@@ -307,10 +307,18 @@ class BrandProfileService:
                 "onboarding_completed",
             ]
             if profile is None and personal_profile:
-                # No agency profile at all — use personal profile as base
-                profile = dict(personal_profile)
-                profile.pop("_id", None)
-                profile["brand_id"] = brand_id  # stamp agency brand_id for context
+                # No agency profile at all — inherit STYLE defaults only (colors,
+                # voice, industry, etc.) so content generation isn't starting from
+                # nothing. Never borrow brand_name: this brand's own real name
+                # (from brand_accounts) must always be what's shown/generated for
+                # it, or the Brand Playbook page displays a different brand's
+                # identity as if it were this one's.
+                profile = {f: personal_profile[f] for f in PLAYBOOK_FIELDS if personal_profile.get(f)}
+                profile["brand_id"] = brand_id
+                profile["user_id"] = user_id
+                own_brand = await db["brand_accounts"].find_one({"brand_id": brand_id})
+                profile["brand_name"] = (own_brand or {}).get("name", "")
+                profile["onboarding_completed"] = False
             elif profile and personal_profile:
                 # Agency profile exists but may be sparse — fill missing fields from personal
                 profile.pop("_id", None)

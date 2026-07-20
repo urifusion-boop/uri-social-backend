@@ -36,10 +36,11 @@ async def isolated_user():
     """A disposable user_id, cleaned up before and after the test."""
     user_id = "TEST_isolation_" + os.urandom(6).hex()
     db = _db()
-    coll = db["brand_profiles"]
-    await coll.delete_many({"user_id": user_id})
+    await db["brand_profiles"].delete_many({"user_id": user_id})
+    await db["brand_accounts"].delete_many({"owner_user_id": user_id})
     yield user_id, db
-    await coll.delete_many({"user_id": user_id})
+    await db["brand_profiles"].delete_many({"user_id": user_id})
+    await db["brand_accounts"].delete_many({"owner_user_id": user_id})
 
 
 class TestBrandProfileGetIsolation:
@@ -116,3 +117,60 @@ class TestBrandProfileSaveIsolation:
         assert personal_doc is not None
         assert personal_doc["brand_name"] == "My Personal Brand"
         assert total == 2
+
+
+class TestBrandProfileIdentityFallback:
+    """fix/brand-profile-identity-fallback: an un-onboarded agency brand should
+    inherit STYLE defaults (colors, voice, industry) from the personal brand for
+    content generation, but must never borrow the personal brand's brand_name or
+    show it as its own identity — confirmed live: the Brand Playbook page was
+    showing a completely different brand's name and logo for a brand that had
+    simply never completed onboarding yet."""
+
+    @pytest.mark.asyncio
+    async def test_unonboarded_agency_brand_keeps_its_own_name(self, isolated_user):
+        user_id, db = isolated_user
+        personal_bid = BrandAccount.personal_brand_id(user_id)
+        agency_brand_id = f"{user_id}_agency_brand"
+
+        await db["brand_accounts"].insert_one({
+            "brand_id": personal_bid, "owner_user_id": user_id, "agency_id": None,
+            "name": "Real Personal Biz", "status": "active",
+        })
+        await db["brand_profiles"].insert_one({
+            "user_id": user_id, "brand_id": personal_bid, "brand_name": "Real Personal Biz",
+            "industry": "Fashion", "brand_colors": ["#111", "#222"],
+            "logo_url": "https://cdn/personal-logo.png", "onboarding_completed": True,
+        })
+        await db["brand_accounts"].insert_one({
+            "brand_id": agency_brand_id, "owner_user_id": user_id, "agency_id": "agcy_test",
+            "name": "Brand New Sub-Brand", "status": "active",
+        })
+
+        result = await BrandProfileService.get(user_id, db, brand_id=agency_brand_id)
+        data = result["responseData"]
+
+        assert data["brand_name"] == "Brand New Sub-Brand"
+        assert data["brand_colors"] == ["#111", "#222"]
+        assert data["industry"] == "Fashion"
+        assert data["onboarding_completed"] is False
+
+    @pytest.mark.asyncio
+    async def test_agency_brand_with_no_brand_accounts_entry_gets_empty_name_not_borrowed(self, isolated_user):
+        # Defensive: if the brand_accounts lookup somehow misses, still must not
+        # silently show the personal brand's name.
+        user_id, db = isolated_user
+        personal_bid = BrandAccount.personal_brand_id(user_id)
+        agency_brand_id = f"{user_id}_agency_brand_orphan"
+
+        await db["brand_profiles"].insert_one({
+            "user_id": user_id, "brand_id": personal_bid, "brand_name": "Real Personal Biz",
+            "industry": "Fashion", "onboarding_completed": True,
+        })
+        # Note: no brand_accounts entry created for agency_brand_id at all.
+
+        result = await BrandProfileService.get(user_id, db, brand_id=agency_brand_id)
+        data = result["responseData"]
+
+        assert data["brand_name"] == ""
+        assert data["industry"] == "Fashion"  # style default still applies
