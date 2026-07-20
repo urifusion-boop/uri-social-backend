@@ -209,6 +209,83 @@ async def flexible_auth(
     )
 
 
+async def get_sdk_context(
+    request: Request,
+    x_api_key: str = Header(..., alias="X-API-Key"),
+    x_end_user_id: Optional[str] = Header(None, alias="X-End-User-ID"),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+) -> dict:
+    """
+    Auth + brand resolution for the dedicated /api/v1/* SDK surface
+    (sdk_router.py). API-key-only by design — no JWT fallback should ever be
+    reachable here, unlike flexible_auth/get_flexible_brand_context which
+    also serves the dashboard's /social-media/* routes.
+
+    Mirrors flexible_auth's multi-tenant branch + get_flexible_brand_context's
+    resolution exactly, calling the same MultiTenantService helper, so both
+    SDK entry points can't drift apart on how end-user brands are resolved.
+
+    Returns {"api_key_obj", "user_id", "brand_id", "is_multi_tenant", "end_user_id"}.
+    """
+    from app.middleware.api_key_auth import api_key_auth_service
+    from app.services.MultiTenantService import MultiTenantService
+    from app.services.BrandAccountService import BrandAccountService
+
+    api_key_obj = await api_key_auth_service.verify_api_key(api_key=x_api_key, request=request)
+
+    if not x_end_user_id:
+        # Backward-compatible single-tenant path — unchanged from today.
+        personal = await BrandAccountService.get_or_create_personal_brand(api_key_obj.user_id, db)
+        return {
+            "api_key_obj": api_key_obj,
+            "user_id": api_key_obj.user_id,
+            "brand_id": personal.brand_id,
+            "is_multi_tenant": False,
+            "end_user_id": None,
+        }
+
+    sdk_client = await MultiTenantService.get_or_create_sdk_client(
+        api_key_hash=api_key_obj.key_hash,
+        api_key_prefix=api_key_obj.key_prefix,
+        developer_id=api_key_obj.user_id,
+        company_name=api_key_obj.name or "SDK Client",
+        db=db,
+    )
+    if not sdk_client:
+        raise HTTPException(status_code=500, detail="Failed to create SDK client profile")
+
+    if not await MultiTenantService.can_create_end_user(sdk_client.sdk_client_id, db):
+        raise HTTPException(
+            status_code=403,
+            detail=f"SDK client has reached maximum end-user limit ({sdk_client.limits.max_end_users})",
+        )
+
+    end_user = await MultiTenantService.get_or_create_end_user(
+        sdk_client_id=sdk_client.sdk_client_id,
+        external_user_id=x_end_user_id,
+        external_email=None,
+        external_name=None,
+        db=db,
+    )
+    if not end_user:
+        raise HTTPException(status_code=500, detail="Failed to create end-user profile")
+
+    await MultiTenantService.update_sdk_client_activity(sdk_client.sdk_client_id, db)
+    await MultiTenantService.update_end_user_activity(end_user.end_user_id, db)
+
+    resolved_brand_id = await MultiTenantService.get_or_create_end_user_brand_id(
+        end_user=end_user, developer_user_id=api_key_obj.user_id, db=db,
+    )
+
+    return {
+        "api_key_obj": api_key_obj,
+        "user_id": api_key_obj.user_id,
+        "brand_id": resolved_brand_id,
+        "is_multi_tenant": True,
+        "end_user_id": end_user.end_user_id,
+    }
+
+
 def extract_user_id_from_auth(auth: dict) -> str:
     """
     Helper function to extract user_id from flexible auth result.
@@ -240,6 +317,7 @@ async def get_flexible_brand_context(
     """
     from app.services.AgencyService import AgencyService
     from app.services.BrandAccountService import BrandAccountService
+    from app.services.MultiTenantService import MultiTenantService
 
     user_id = auth["user_id"]
     requested = brand_id or x_brand_id
@@ -253,9 +331,24 @@ async def get_flexible_brand_context(
             "auth_type": auth["auth_type"],
         }
 
-    # No brand requested, OR user doesn't have access → fall back to personal brand
     if requested:
-        print(f"⚠️ brand context: user {user_id} has no access to brand {requested}; falling back to personal brand")
+        print(f"⚠️ brand context: user {user_id} has no access to brand {requested}; falling back to personal/end-user brand")
+
+    # SDK multi-tenant end-user: isolate to THIS end-user's own brand, never the
+    # developer's personal brand — see MultiTenantService.get_or_create_end_user_brand_id.
+    if auth.get("is_multi_tenant"):
+        resolved_brand_id = await MultiTenantService.get_or_create_end_user_brand_id(
+            end_user=auth["end_user"], developer_user_id=user_id, db=db,
+        )
+        return {
+            "user_id": user_id,
+            "brand_id": resolved_brand_id,
+            "agency_id": None,
+            "auth_type": auth["auth_type"],
+        }
+
+    # JWT dashboard users and single-tenant API-key developers (no X-End-User-ID) —
+    # unchanged from before.
     personal = await BrandAccountService.get_or_create_personal_brand(user_id, db)
     return {
         "user_id": user_id,
