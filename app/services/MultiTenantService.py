@@ -202,6 +202,41 @@ class MultiTenantService:
         return result.modified_count > 0
 
     @staticmethod
+    async def get_or_create_end_user_brand_id(
+        end_user: SDKEndUser,
+        developer_user_id: str,
+        db: AsyncIOMotorDatabase
+    ) -> str:
+        """
+        Resolve (and lazily create) the brand_id an SDK end-user's brand/content
+        data is isolated under. Idempotent: repeat calls for the same end_user
+        return the same brand_id.
+
+        This is the single place this resolution should happen — both the
+        /social-media/* path (get_flexible_brand_context) and the /api/v1/*
+        path (get_sdk_context) call this, so they can't drift apart. Before
+        this existed, every end-user of a developer's SDK integration
+        collided onto that developer's own personal brand, since nothing
+        ever populated SDKEndUser.brand_profile_id despite the field
+        existing specifically to prevent that.
+        """
+        if end_user.brand_profile_id:
+            return end_user.brand_profile_id
+
+        from app.services.BrandAccountService import BrandAccountService
+
+        brand_name = end_user.external_name or f"{end_user.external_user_id}'s Brand"
+        brand = await BrandAccountService.create_brand(
+            owner_user_id=developer_user_id,
+            name=brand_name,
+            db=db,
+        )
+        await MultiTenantService.link_end_user_to_brand_profile(
+            end_user.end_user_id, brand.brand_id, db
+        )
+        return brand.brand_id
+
+    @staticmethod
     async def update_end_user_activity(
         end_user_id: str,
         db: AsyncIOMotorDatabase
