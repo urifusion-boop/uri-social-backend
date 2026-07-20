@@ -1343,6 +1343,198 @@ async def facebook_direct_finalize(
     return UriResponse.get_single_data_response("facebook_connected", {"fb_page_id": fb_page_id})
 
 
+# ── Facebook Login for Business — the "hybrid page grant" (Ibukun's engineering
+# work-split item 2.3). Same OAuth shape as facebook-direct above, but requests
+# advertising permissions and — once URI's Business Manager id is configured —
+# grants that Business Manager ADVERTISE-only access to the page via
+# MetaAdsService.share_page_with_business_manager(). Never claims/transfers the
+# page (that's POST /{business_id}/owned_pages, deliberately not used here).
+
+@router.get("/connect/facebook-ads/initiate")
+async def facebook_ads_initiate(source: Optional[str] = Query("settings")):
+    """Redirect to Facebook's OAuth page requesting advertising-scoped permissions
+    for a Page, on top of the standard page-management scopes."""
+    import urllib.parse
+
+    app_id = settings.META_APP_ID
+    if not app_id:
+        raise HTTPException(status_code=500, detail="META_APP_ID not configured")
+
+    _base = (settings.PUBLIC_API_URL or settings.URI_GATEWAY_BASE_API_URL).rstrip("/")
+    redirect_uri = f"{_base}/social-media/connect/facebook-ads/callback"
+
+    scopes = [
+        "pages_show_list",
+        "pages_read_engagement",
+        "pages_manage_metadata",
+        "business_management",
+        "ads_management",
+        "pages_manage_ads",
+    ]
+    params = {
+        "client_id": app_id,
+        "redirect_uri": redirect_uri,
+        "scope": ",".join(scopes),
+        "response_type": "code",
+        "state": source or "settings",
+    }
+    auth_url = f"https://www.facebook.com/{settings.FACEBOOK_API_VERSION}/dialog/oauth?" + urllib.parse.urlencode(params)
+    return RedirectResponse(auth_url)
+
+
+@router.get("/connect/facebook-ads/callback")
+async def facebook_ads_callback(
+    code: Optional[str] = Query(None),
+    state: Optional[str] = Query(None),
+    error: Optional[str] = Query(None),
+    error_reason: Optional[str] = Query(None),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """Exchanges the auth code for an ads-scoped Page token, stores the pending
+    connection, and — if URI's Business Manager id is configured — requests
+    ADVERTISE-only access to the page for it."""
+    import urllib.parse
+    import httpx
+    from datetime import timezone
+    from app.services.MetaAdsService import BusinessManagerNotConfigured, share_page_with_business_manager
+
+    web_app_url = settings.WEB_APP_URL.strip("'\"")
+    base_redirect = f"{web_app_url}/workspace?tab=connections"
+
+    if error:
+        msg = urllib.parse.quote(error_reason or error)
+        return RedirectResponse(f"{base_redirect}&connected=false&error={msg}")
+
+    if not code:
+        return RedirectResponse(f"{base_redirect}&connected=false&error=missing_code")
+
+    _base = (settings.PUBLIC_API_URL or settings.URI_GATEWAY_BASE_API_URL).rstrip("/")
+    redirect_uri = f"{_base}/social-media/connect/facebook-ads/callback"
+    app_id = settings.META_APP_ID
+    app_secret = settings.META_APP_SECRET
+    graph_base = f"https://graph.facebook.com/{settings.FACEBOOK_API_VERSION}"
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            token_resp = await client.get(
+                f"{graph_base}/oauth/access_token",
+                params={
+                    "client_id": app_id,
+                    "client_secret": app_secret,
+                    "redirect_uri": redirect_uri,
+                    "code": code,
+                },
+            )
+            token_data = token_resp.json()
+            if "error" in token_data:
+                raise ValueError(f"Token exchange error: {token_data['error'].get('message')}")
+            short_token = token_data["access_token"]
+
+            ll_resp = await client.get(
+                f"{graph_base}/oauth/access_token",
+                params={
+                    "grant_type": "fb_exchange_token",
+                    "client_id": app_id,
+                    "client_secret": app_secret,
+                    "fb_exchange_token": short_token,
+                },
+            )
+            ll_data = ll_resp.json()
+            long_token = ll_data.get("access_token", short_token)
+
+            pages_resp = await client.get(
+                f"{graph_base}/me/accounts",
+                params={"access_token": long_token, "fields": "id,name,access_token,picture"},
+            )
+            pages_data = pages_resp.json()
+            pages = pages_data.get("data", [])
+
+            if not pages:
+                err_msg = urllib.parse.quote("No Facebook Pages found. You need a Facebook Page to connect.")
+                return RedirectResponse(f"{base_redirect}&connected=false&error={err_msg}")
+
+            page = pages[0]
+            page_id = page["id"]
+            page_name = page["name"]
+            page_token = page["access_token"]
+            profile_pic = page.get("picture", {}).get("data", {}).get("url", "") if isinstance(page.get("picture"), dict) else ""
+
+            business_manager_shared = False
+            business_manager_error = None
+            try:
+                await share_page_with_business_manager(page_id, page_token)
+                business_manager_shared = True
+                print(f"[FBAdsOAuth] ✅ Granted URI Business Manager ADVERTISE access to page {page_id}")
+            except BusinessManagerNotConfigured:
+                print(f"[FBAdsOAuth] ⚠️ META_BUSINESS_MANAGER_ID not set — page {page_id} token stored, BM share deferred")
+            except Exception as e:
+                business_manager_error = str(e)
+                print(f"[FBAdsOAuth] ❌ Business Manager share failed for page {page_id}: {e}")
+
+            now = datetime.now(timezone.utc).isoformat()
+            conn_doc = {
+                "id": f"fbads_{page_id}",
+                "user_id": None,               # set by finalize
+                "platform": "facebook_ads",
+                "connected_via": "facebook_ads_oauth",
+                "page_id": page_id,
+                "page_access_token": page_token,
+                "account_name": page_name,
+                "profile_picture_url": profile_pic,
+                "connection_status": "pending_user_match",
+                "business_manager_shared": business_manager_shared,
+                "business_manager_error": business_manager_error,
+                "connected_at": now,
+                "updated_at": now,
+            }
+            await db["social_connections"].update_one(
+                {"id": f"fbads_{page_id}"},
+                {"$set": conn_doc},
+                upsert=True,
+            )
+            print(f"[FBAdsOAuth] ✅ Stored ads-scoped page '{page_name}' (page_id={page_id}) pending user match")
+
+            params_out = (
+                f"connected=facebook_ads"
+                f"&fb_page_id={urllib.parse.quote(page_id)}"
+                f"&page_name={urllib.parse.quote(page_name)}"
+            )
+            return RedirectResponse(f"{base_redirect}&{params_out}")
+
+    except Exception as e:
+        print(f"[FBAdsOAuth] ❌ Error: {e}")
+        return RedirectResponse(
+            f"{base_redirect}&connected=false&error={urllib.parse.quote(str(e))}"
+        )
+
+
+@router.post("/connect/facebook-ads/finalize")
+async def facebook_ads_finalize(
+    fb_page_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    ctx: dict = Depends(get_active_brand_context),
+):
+    """Associates the pending ads-scoped connection with the authenticated user
+    and active brand — same pattern as /connect/facebook-direct/finalize."""
+    from app.models.brand_account import BrandAccount
+    user_id = ctx["user_id"]
+    brand_id = ctx["brand_id"]
+    is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
+
+    update_fields: dict = {"user_id": user_id, "connection_status": "active", "updated_at": datetime.utcnow().isoformat()}
+    if not is_personal:
+        update_fields["brand_id"] = brand_id
+
+    result = await db["social_connections"].update_one(
+        {"id": f"fbads_{fb_page_id}"},
+        {"$set": update_fields},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Facebook ads connection not found — try reconnecting")
+
+    return UriResponse.get_single_data_response("facebook_ads_connected", {"fb_page_id": fb_page_id})
+
+
 @router.get("/connect/instagram-direct/initiate")
 async def instagram_direct_initiate(source: Optional[str] = Query("settings")):
     """
