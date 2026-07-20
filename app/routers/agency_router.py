@@ -11,6 +11,7 @@ Endpoints (all under /agency):
   POST   /agency/brands/duplicate        duplicate from existing brand (admin)
   PATCH  /agency/brands/{brand_id}       update a brand (admin)
   DELETE /agency/brands/{brand_id}       archive a brand (admin)
+  DELETE /agency/brands/{brand_id}/permanent  permanently delete an archived brand (admin)
   GET    /agency/members                 list members (admin)
   POST   /agency/members                 invite member (admin)
   DELETE /agency/members/{member_id}     remove member (admin)
@@ -234,6 +235,35 @@ async def archive_brand(
         raise HTTPException(status_code=403, detail="No access to brand")
     ok = await BrandAccountService.archive_brand(brand_id, db)
     return UriResponse.update_response("brand", {"brand_id": brand_id, "archived": ok})
+
+
+@router.delete("/brands/{brand_id}/permanent")
+async def delete_brand_permanently(
+    brand_id: str,
+    token: dict = Depends(JWTBearer()),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """Permanently and irreversibly delete a brand and all its data (profile,
+    playbook, social connections, member access grants). The brand must already
+    be archived first via DELETE /agency/brands/{brand_id} — a deliberate
+    two-step gate before anything irreversible happens."""
+    await _require_admin(_uid(token), db)
+    if not await AgencyService.user_has_access_to_brand(_uid(token), brand_id, db):
+        raise HTTPException(status_code=403, detail="No access to brand")
+
+    brand = await BrandAccountService.get_brand(brand_id, db)
+    if not brand:
+        raise HTTPException(status_code=404, detail="Brand not found")
+    if brand.status != "archived":
+        raise HTTPException(
+            status_code=400,
+            detail="Brand must be archived first (DELETE /agency/brands/{brand_id}) before permanent deletion",
+        )
+
+    deleted_counts = await BrandAccountService.delete_brand_permanently(brand_id, db)
+    return UriResponse.update_response("brand", {
+        "brand_id": brand_id, "permanently_deleted": True, "deleted_counts": deleted_counts,
+    })
 
 
 # ── Roster (PRD §3.2) ────────────────────────────────────────────────────────
