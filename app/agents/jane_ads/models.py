@@ -145,6 +145,13 @@ class CampaignPlan(BaseModel):
     objective: CampaignObjective = CampaignObjective.CONVERSATIONS
     explanation: str = ""                   # required plain-language "why" (PRD §6)
     trace: list[str] = Field(default_factory=list)
+    page_id: str = ""                       # connected Facebook Page — the real Meta adapter
+                                             # needs this for Click-to-WhatsApp's promoted_object;
+                                             # attached after platform selection, same as geo
+    creative: Optional["AdCreative"] = None # the actual ad (image/video + copy) from creative.py —
+                                             # Meta rejects link-ad creation with no real media
+                                             # attached, so the real adapter needs this, not just
+                                             # the platform/budget decision
 
 
 class SpendAuthorization(BaseModel):
@@ -164,6 +171,36 @@ class PlanResult(BaseModel):
     decision: PlanDecision
     plan: Optional[CampaignPlan] = None
     advice: Optional[PlanAdvice] = None
+
+
+# ── Ad creative (split-doc 1.6) ───────────────────────────────────────────────
+
+class AdCopy(BaseModel):
+    """The written parts of an ad, plus the prompt used to generate its image."""
+    headline: str = ""              # ≤ ~5 words
+    primary_text: str = ""          # 1–2 sentence body
+    image_prompt: str = ""          # what the creative image should show
+
+
+class CreativeSource(str, Enum):
+    """Mirrors PRD Part D2 — the three ways a creative's image is sourced."""
+    GENERATE = "generate"    # Jane generates it via the brand playbook engine (default)
+    UPLOAD = "upload"        # the user's own uploaded photo/video
+    DRAFT = "draft"          # an existing content draft the user already liked
+
+
+class AdCreative(BaseModel):
+    """A complete ad ready to submit: a creative (image or video) + copy + the
+    WhatsApp CTA. Every ad routes to WhatsApp — the CTA is fixed, never up to the
+    user. GENERATE always produces an image (gpt-image-1 has no video mode); UPLOAD
+    and DRAFT can carry either — `is_video` says which."""
+    image_url: str = ""             # final creative media URL, hosted on Cloudinary
+    is_video: bool = False           # True when image_url is actually a video
+    headline: str = ""
+    primary_text: str = ""
+    cta: str = "Send WhatsApp Message"
+    source: CreativeSource = CreativeSource.GENERATE
+    generated: bool = True          # False when there's no media → copy-only fallback
 
 
 # ── Events (adapter → Shore) ──────────────────────────────────────────────────

@@ -12,22 +12,24 @@ from __future__ import annotations
 
 from typing import Optional
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Request
+from fastapi import APIRouter, Body, Depends, File, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from pydantic import BaseModel, Field
 
 from app.core.auth_bearer import JWTBearer
-from app.dependencies import get_db_dependency
+from app.dependencies import get_active_brand_context, get_db_dependency
 
 from .adapters.mock import MockAdPlatformAdapter
-from .decision_engine import plan_campaign
+from .decision_engine import apply_platform_override, plan_campaign
+from .instrumentation import InstrumentationService, MongoInstrumentationStore
 from .models import (
     CampaignRequest,
     CreativeContext,
     CreativeKind,
     Goal,
     PlanDecision,
+    Platform,
     PurchaseBehaviour,
 )
 from .payments import JaneAdsPayments
@@ -50,12 +52,104 @@ class PlanRequestBody(BaseModel):
     geo: str = ""
     city: str = ""                    # e.g. "Surulere" — enables pin-and-pocket geo
     conversation_cost_ngn: float = Field(500.0, gt=0)
+    override_platforms: Optional[list[Platform]] = None   # reject Jane's pick, choose your own
+    override_reason: str = ""
+
+
+async def _plan_and_simulate(
+    req: CampaignRequest,
+    city: str,
+    conversation_cost_ngn: float,
+    db: AsyncIOMotorDatabase,
+    override_platforms: Optional[list[Platform]] = None,
+    override_reason: str = "",
+) -> dict:
+    """Run the decision engine → geo refinement → a real-wallet/mock-adapter end-to-end.
+    Shared by /plan (form) and /understand (natural language). Every call is logged
+    (PRD §1.8); an explicit `override_platforms` also logs and applies an override."""
+    instrumentation = InstrumentationService(MongoInstrumentationStore(db))
+    result = plan_campaign(req, funded_amount_ngn=req.budget_ngn,
+                           total_funded_wallets_ngn=req.budget_ngn)
+    if result.decision == PlanDecision.ADVISE:
+        await instrumentation.record_decision(req.business_id, result)
+        return {"decision": "advise", "advice": result.advice.model_dump(),
+                "trace": result.advice.trace}
+
+    plan_obj = result.plan
+    jane_platforms = [p.platform for p in plan_obj.platforms]
+    if override_platforms:
+        plan_obj = apply_platform_override(plan_obj, override_platforms)
+        await instrumentation.record_override(
+            req.business_id, jane_platforms=jane_platforms,
+            user_platforms=override_platforms, reason=override_reason,
+        )
+    await instrumentation.record_decision(
+        req.business_id, result, final_platforms=[p.platform for p in plan_obj.platforms],
+    )
+
+    # Geo refinement — pin-and-pocket targeting within the chosen platform.
+    geo_dump = None
+    if city:
+        from .geo import geo_for_request
+        geo_plan = await geo_for_request(req.business_name, req.category, city,
+                                         req.goal, req.description)
+        plan_obj.geo = geo_plan
+        geo_dump = geo_plan.model_dump()
+
+    # Real wallet + mock adapter: fund, launch, charge each conversation (prepaid-first).
+    wallet = WalletService(InMemoryWalletStore())
+    await wallet.top_up(req.business_id, req.budget_ngn, reference="demo-topup")
+    adapter = MockAdPlatformAdapter(conversation_cost_ngn=conversation_cost_ngn)
+    auth = await wallet.authorization_for(req.business_id, req.budget_ngn)
+    launch = await adapter.launch_campaign(plan_obj, auth)
+    delivered = await adapter.poll_conversations(launch.campaign_id)
+
+    charged, prices = 0, []
+    for conv in delivered:
+        try:
+            txn = await wallet.charge_conversation(
+                req.business_id, campaign_id=launch.campaign_id, ad_id=conv.ad_id,
+                actual_platform_cost_ngn=conversation_cost_ngn,
+            )
+            charged += 1
+            prices.append(-txn.amount_ngn)
+        except InsufficientFundsError:
+            break
+    balance_after = await wallet.get_balance(req.business_id)
+    spent = round(req.budget_ngn - balance_after, 2)
+
+    return {
+        "decision": "plan",
+        "goal": plan_obj.goal.value,
+        "behaviour": plan_obj.behaviour.value,
+        "explanation": plan_obj.explanation,
+        "trace": plan_obj.trace,
+        "per_business_cap_ngn": plan_obj.per_business_cap_ngn,
+        "account_cap_ngn": plan_obj.account_cap_ngn,
+        "geo": geo_dump,
+        "platforms": [p.model_dump() for p in plan_obj.platforms],
+        "overridden": bool(override_platforms),
+        "jane_recommended_platforms": [p.value for p in jane_platforms] if override_platforms else None,
+        "simulation": {
+            "conversations_delivered": len(delivered),
+            "conversations_charged": charged,
+            "prepaid_stopped": charged < len(delivered),
+            "price_min_ngn": min(prices) if prices else 0,
+            "price_max_ngn": max(prices) if prices else 0,
+            "wallet_before_ngn": req.budget_ngn,
+            "wallet_after_ngn": balance_after,
+            "spent_ngn": spent,
+            "cap_respected": spent <= plan_obj.per_business_cap_ngn,
+        },
+    }
 
 
 @router.post("/plan")
-async def plan(body: PlanRequestBody) -> dict:
-    """Run the decision engine, then (if it produced a plan) a mock end-to-end so the
-    UI can show conversations delivered + wallet movement + cap enforcement."""
+async def plan(
+    body: PlanRequestBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+) -> dict:
+    """Form path: structured inputs → plan + geo + wallet simulation."""
     req = CampaignRequest(
         business_id="demo",
         business_name=body.business_name,
@@ -72,76 +166,167 @@ async def plan(body: PlanRequestBody) -> dict:
         has_existing_demand=body.has_existing_demand,
         geo=body.geo,
     )
-    result = plan_campaign(req, funded_amount_ngn=body.budget_ngn,
-                           total_funded_wallets_ngn=body.budget_ngn)
+    return await _plan_and_simulate(
+        req, body.city, body.conversation_cost_ngn, db,
+        override_platforms=body.override_platforms, override_reason=body.override_reason,
+    )
 
-    if result.decision == PlanDecision.ADVISE:
+
+class UnderstandBody(BaseModel):
+    message: str
+    business_name: str = ""
+    category: str = ""
+    conversation_cost_ngn: float = Field(500.0, gt=0)
+
+
+@router.post("/understand")
+async def understand(
+    body: UnderstandBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+) -> dict:
+    """Natural-language path: Jane reads a plain-English message, extracts the goal/
+    budget/behaviour/city herself, then runs the same plan. Asks a follow-up if the
+    budget is missing rather than guessing."""
+    from .nl import parse_message, to_campaign_request
+    parsed = await parse_message(body.message, body.business_name, body.category)
+    req = to_campaign_request(parsed, business_id="demo")
+    if req is None:
         return {
-            "decision": "advise",
-            "advice": result.advice.model_dump(),
-            "trace": result.advice.trace,
+            "decision": "need_more",
+            "understood": parsed.model_dump(),
+            "question": parsed.clarify or "How much would you like to spend?",
         }
+    result = await _plan_and_simulate(req, parsed.city, body.conversation_cost_ngn, db)
+    result["understood"] = parsed.model_dump()
+    return result
 
-    plan_obj = result.plan
 
-    # Geo refinement — pin-and-pocket targeting within the chosen platform.
-    geo_dump = None
-    if body.city:
-        from .geo import geo_for_request
-        geo_plan = await geo_for_request(
-            body.business_name, body.category, body.city, body.goal, body.description
+class CreativeBody(BaseModel):
+    business_name: str = ""
+    category: str = ""
+    goal: str = "messages"
+    description: str = ""
+    city: str = ""     # grounds the image in the real place — else a generic look
+
+
+@router.post("/creative")
+async def creative(body: CreativeBody) -> dict:
+    """Anonymous demo path: Jane writes copy + generates a generic (no-brand) image
+    and attaches the WhatsApp CTA. Falls back to copy-only if generation fails.
+    Real, brand-aware generation is the authenticated /creative/for-brand below."""
+    from .creative import generate_ad_creative
+    ad = await generate_ad_creative(body.business_name, body.category, body.goal,
+                                    body.description, city=body.city)
+    return ad.model_dump()
+
+
+# ── Authenticated ad creative — the brand playbook, uploads, and drafts ───────
+# Mirrors how normal content creation already works on the platform (PRD Part D2):
+# Jane generates via the SAME brand-aware engine, the user can upload their own
+# media, or reuse an existing draft they already liked. Always writes fresh copy
+# and always attaches the WhatsApp CTA.
+
+class CreativeForBrandBody(BaseModel):
+    business_name: str = ""
+    category: str = ""
+    goal: str = "messages"
+    description: str = ""
+    city: str = ""                     # grounds the GENERATE image in the real place
+    source: str = "generate"           # generate | upload | draft
+    reference_image_url: str = ""      # required for source=upload
+    is_video: bool = False             # is reference_image_url a video? (from /creative/upload)
+    draft_id: str = ""                 # required for source=draft
+
+
+@router.post("/creative/for-brand")
+async def creative_for_brand(
+    body: CreativeForBrandBody,
+    brand_ctx: dict = Depends(get_active_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+) -> dict:
+    """Generate/assemble an ad creative for the caller's real brand — pulls the brand
+    playbook (colours, voice, fonts) so ads look like the brand, not a template."""
+    from .creative import creative_from_draft, creative_from_upload, generate_ad_creative
+    user_id = brand_ctx["user_id"]
+    brand_id = brand_ctx.get("brand_id")
+
+    if body.source == "upload":
+        if not body.reference_image_url:
+            raise HTTPException(status_code=400, detail="reference_image_url is required for source=upload")
+        ad = await creative_from_upload(
+            body.business_name, body.category, body.reference_image_url, body.goal,
+            body.description, user_id=user_id, db=db, brand_id=brand_id,
+            is_video=body.is_video,
         )
-        plan_obj.geo = geo_plan
-        geo_dump = geo_plan.model_dump()
+    elif body.source == "draft":
+        if not body.draft_id:
+            raise HTTPException(status_code=400, detail="draft_id is required for source=draft")
+        ad = await creative_from_draft(
+            body.business_name, body.category, body.draft_id, user_id, db,
+            goal=body.goal, brand_id=brand_id,
+        )
+        if ad is None:
+            raise HTTPException(status_code=404, detail="Draft not found or has no image")
+    else:
+        ad = await generate_ad_creative(
+            body.business_name, body.category, body.goal, body.description,
+            user_id=user_id, db=db, brand_id=brand_id, city=body.city,
+        )
+    return ad.model_dump()
 
-    # End-to-end on the REAL wallet + mock adapter: fund the wallet, launch, then charge
-    # each delivered conversation through the actual WalletService — so the KPIs show
-    # genuine prepaid-first + dynamic pricing, not ad-hoc math.
-    wallet = WalletService(InMemoryWalletStore())
-    await wallet.top_up(req.business_id, body.budget_ngn, reference="demo-topup")
-    adapter = MockAdPlatformAdapter(conversation_cost_ngn=body.conversation_cost_ngn)
-    auth = await wallet.authorization_for(req.business_id, body.budget_ngn)
-    launch = await adapter.launch_campaign(plan_obj, auth)
-    delivered = await adapter.poll_conversations(launch.campaign_id)
 
-    charged = 0
-    prices: list[float] = []
-    for conv in delivered:
-        try:
-            txn = await wallet.charge_conversation(
-                req.business_id, campaign_id=launch.campaign_id, ad_id=conv.ad_id,
-                actual_platform_cost_ngn=body.conversation_cost_ngn,
-            )
-            charged += 1
-            prices.append(-txn.amount_ngn)
-        except InsufficientFundsError:
-            break   # prepaid-first — nothing runs once the wallet is empty
+@router.get("/creative/drafts")
+async def creative_drafts(
+    brand_ctx: dict = Depends(get_active_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    limit: int = 10,
+) -> dict:
+    """List the caller's recent drafts (with images) to pick from — 'maybe the user
+    saw something they liked there' — for the source=draft ad creative path."""
+    from .creative import list_recent_drafts
+    drafts = await list_recent_drafts(brand_ctx["user_id"], db, brand_ctx.get("brand_id"), limit)
+    return {"drafts": drafts}
 
-    balance_after = await wallet.get_balance(req.business_id)
-    spent = round(body.budget_ngn - balance_after, 2)
 
-    return {
-        "decision": "plan",
-        "goal": plan_obj.goal.value,
-        "behaviour": plan_obj.behaviour.value,
-        "explanation": plan_obj.explanation,
-        "trace": plan_obj.trace,
-        "per_business_cap_ngn": plan_obj.per_business_cap_ngn,
-        "account_cap_ngn": plan_obj.account_cap_ngn,
-        "geo": geo_dump,
-        "platforms": [p.model_dump() for p in plan_obj.platforms],
-        "simulation": {
-            "conversations_delivered": len(delivered),
-            "conversations_charged": charged,
-            "prepaid_stopped": charged < len(delivered),
-            "price_min_ngn": min(prices) if prices else 0,
-            "price_max_ngn": max(prices) if prices else 0,
-            "wallet_before_ngn": body.budget_ngn,
-            "wallet_after_ngn": balance_after,
-            "spent_ngn": spent,
-            "cap_respected": spent <= plan_obj.per_business_cap_ngn,
-        },
-    }
+_UPLOAD_IMAGE_TYPES = {
+    "image/png": "png", "image/jpeg": "jpg", "image/jpg": "jpg", "image/webp": "webp",
+}
+_UPLOAD_VIDEO_TYPES = {
+    "video/mp4": "mp4", "video/quicktime": "mov", "video/webm": "webm", "video/x-m4v": "m4v",
+}
+_MAX_UPLOAD_IMAGE_BYTES = 8 * 1024 * 1024     # 8 MB
+_MAX_UPLOAD_VIDEO_BYTES = 100 * 1024 * 1024   # 100 MB — short vertical ad clips
+
+
+@router.post("/creative/upload")
+async def creative_upload(
+    file: UploadFile = File(...),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Upload the user's own photo OR video for the source=upload ad creative path.
+    Returns a hosted URL (+ is_video) to pass to /creative/for-brand."""
+    is_video = file.content_type in _UPLOAD_VIDEO_TYPES
+    ext = _UPLOAD_VIDEO_TYPES.get(file.content_type) or _UPLOAD_IMAGE_TYPES.get(file.content_type)
+    if not ext:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type: {file.content_type}. Use PNG/JPG/WEBP or MP4/MOV/WEBM.",
+        )
+    contents = await file.read()
+    max_bytes = _MAX_UPLOAD_VIDEO_BYTES if is_video else _MAX_UPLOAD_IMAGE_BYTES
+    if len(contents) > max_bytes:
+        raise HTTPException(status_code=400, detail=f"File must be under {max_bytes // (1024*1024)} MB.")
+
+    from .creative import _upload_bytes_to_cloudinary
+    import uuid as _uuid
+    url = await _upload_bytes_to_cloudinary(
+        contents, f"upload-{_uuid.uuid4().hex[:12]}",
+        resource_type="video" if is_video else "image",
+        ext=ext, content_type=file.content_type,
+    )
+    if not url:
+        raise HTTPException(status_code=502, detail="Upload failed, please try again.")
+    return {"url": url, "is_video": is_video}
 
 
 # ── Real wallet funding via Squad ─────────────────────────────────────────────
@@ -206,6 +391,94 @@ async def wallet_balance(
         "business_id": business_id,
         "balance_ngn": balance,
         "transactions": [t.model_dump(mode="json") for t in txns[-20:]],
+    }
+
+
+@router.get("/instrumentation/{business_id}")
+async def instrumentation_log(
+    business_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    _token: dict = Depends(JWTBearer()),
+    limit: int = 100,
+) -> dict:
+    """Decision + override history for a business (PRD §1.8) — to measure and
+    improve Jane: how often she's overridden, and on what kind of call."""
+    instrumentation = InstrumentationService(MongoInstrumentationStore(db))
+    decisions = await instrumentation.decisions_for(business_id, limit)
+    overrides = await instrumentation.overrides_for(business_id, limit)
+    return {
+        "business_id": business_id,
+        "decisions": [d.model_dump(mode="json") for d in decisions],
+        "overrides": [o.model_dump(mode="json") for o in overrides],
+    }
+
+
+class MetaTestLaunchBody(BaseModel):
+    business_name: str = "Test Business"
+    budget_ngn: float = Field(15_000, gt=0)
+    days: int = Field(7, gt=0)
+    image_url: str
+    headline: str = "Chat With Us"
+    primary_text: str = "Chat with us on WhatsApp!"
+
+
+@router.post("/meta/test-launch")
+async def meta_test_launch(
+    body: MetaTestLaunchBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    _token: dict = Depends(JWTBearer()),
+) -> dict:
+    """Launches a REAL Meta campaign (created PAUSED — zero spend until a human
+    activates it in Ads Manager) against the configured ad account. Lets anyone test
+    the live Meta adapter directly rather than trusting a one-off script. Requires
+    META_AD_ACCOUNT_ID, META_ADS_ACCESS_TOKEN, and META_ADS_PAGE_ID to be configured."""
+    import uuid
+    from app.core.config import settings
+    from .adapters.meta import MetaAdPlatformAdapter, MetaAPIError
+    from .models import (
+        ABTestScope, AdCreative, CampaignPlan, CampaignObjective, Goal, PlatformPlan,
+        PurchaseBehaviour, SpendAuthorization,
+    )
+
+    if not (settings.META_AD_ACCOUNT_ID and settings.META_ADS_ACCESS_TOKEN and settings.META_ADS_PAGE_ID):
+        raise HTTPException(
+            status_code=400,
+            detail="Meta ads not configured — need META_AD_ACCOUNT_ID, META_ADS_ACCESS_TOKEN, META_ADS_PAGE_ID",
+        )
+
+    business_id = f"demo_meta_test_{uuid.uuid4().hex[:8]}"
+    plan = CampaignPlan(
+        business_id=business_id,
+        goal=Goal.MESSAGES,
+        behaviour=PurchaseBehaviour.DISCOVER,
+        platforms=[PlatformPlan(
+            platform=Platform.META, budget_ngn=body.budget_ngn, days=body.days,
+            variants=1, test_scope=ABTestScope.NONE, objective=CampaignObjective.CONVERSATIONS,
+        )],
+        per_business_cap_ngn=body.budget_ngn,
+        account_cap_ngn=body.budget_ngn,
+        page_id=settings.META_ADS_PAGE_ID,
+        creative=AdCreative(image_url=body.image_url, headline=body.headline, primary_text=body.primary_text),
+        explanation=f"Real Meta ads test launch for {body.business_name}",
+    )
+    auth = SpendAuthorization(business_id=business_id, funded_amount_ngn=body.budget_ngn, account_cap_ngn=body.budget_ngn)
+
+    adapter = MetaAdPlatformAdapter(db, access_token=settings.META_ADS_ACCESS_TOKEN)
+    try:
+        result = await adapter.launch_campaign(plan, auth)
+    except MetaAPIError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    except (ValueError, NotImplementedError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {
+        "campaign_id": result.campaign_id,
+        "ad_ids": result.ad_ids,
+        "note": "Created PAUSED — zero spend. Review and activate it yourself in Ads Manager if you want it live.",
+        "ads_manager_url": (
+            f"https://adsmanager.facebook.com/adsmanager/manage/campaigns"
+            f"?act={settings.META_AD_ACCOUNT_ID}&selected_campaign_ids={result.campaign_id}"
+        ),
     }
 
 
@@ -284,6 +557,36 @@ _DEMO_HTML = """<!DOCTYPE html>
   <h1>Jane + Ads — Decision Engine</h1>
   <p class="sub">Goal first, behaviour next, business type is only a hint — decided per campaign, always explained. Pick a scenario or fill it in; Jane reasons it out live from the real engine.</p>
 
+  <div class="card" id="authCard">
+    <label>🔑 Log in to use your real brand playbook, upload your own media, or pick a draft</label>
+    <div class="row">
+      <div><input type="email" id="authEmail" placeholder="email"/></div>
+      <div><input type="password" id="authPassword" placeholder="password"/></div>
+    </div>
+    <button onclick="doLogin()" style="margin-top:10px">Log in</button>
+    <div id="authStatus" style="font-size:12px;color:#888;margin-top:8px"></div>
+    <button type="button" onclick="viewLog()" style="margin-top:10px;width:auto;padding:9px 14px;background:#555">📋 View decision log</button>
+    <div id="logPanel"></div>
+  </div>
+
+  <div class="card" id="metaTestCard">
+    <label>🔴 Test REAL Meta ads (creates an actual campaign — always PAUSED, zero spend)</label>
+    <div class="row">
+      <div><label>Business name</label><input type="text" id="metaBizName" value="Test Business"/></div>
+      <div><label>Budget (₦, total)</label><input type="number" id="metaBudget" value="15000"/></div>
+    </div>
+    <div class="row">
+      <div><label>Days</label><input type="number" id="metaDays" value="7"/></div>
+      <div><label>Image URL (must be a real, public direct-image link)</label><input type="text" id="metaImageUrl" value="https://images.unsplash.com/photo-1506744038136-46273834b3fb?w=1200&amp;h=628&amp;fit=crop&amp;fm=jpg"/></div>
+    </div>
+    <div class="row">
+      <div><label>Headline</label><input type="text" id="metaHeadline" value="Chat With Us"/></div>
+      <div><label>Primary text</label><input type="text" id="metaPrimaryText" value="Chat with us on WhatsApp!"/></div>
+    </div>
+    <button type="button" onclick="launchRealMetaAd()" style="margin-top:10px;background:#C2185B">🔴 Launch real ad (paused)</button>
+    <div id="metaTestResult" style="font-size:13px;margin-top:10px"></div>
+  </div>
+
   <details class="tree-wrap">
     <summary>▸ How Jane decides — the logic</summary>
     <div class="tree">
@@ -315,6 +618,10 @@ _DEMO_HTML = """<!DOCTYPE html>
   </details>
 
   <div class="card">
+    <label>💬 Tell Jane what you want — in plain English</label>
+    <textarea id="msg" rows="2" style="width:100%;box-sizing:border-box;font-size:14px;padding:10px 12px;border:1.5px solid #C2185B55;border-radius:9px;resize:vertical;font-family:inherit;color:#111" placeholder="e.g. I run a small restaurant in Surulere, I want more lunch customers this week, I've got 10k"></textarea>
+    <button onclick="talk()" style="margin-top:10px">Talk to Jane</button>
+    <div style="text-align:center;font-size:12px;color:#aaa;margin:12px 0 2px">— or fill it in manually —</div>
     <div class="row">
       <div><label>Business name</label><input type="text" id="name" value="Ada's Closet"/></div>
       <div><label>Category (hint only)</label><input type="text" id="cat" value="fashion"/></div>
@@ -357,6 +664,45 @@ _DEMO_HTML = """<!DOCTYPE html>
   <div class="card out" id="out"></div>
 </div>
 <script>
+async function talk(){
+  const msg=document.getElementById('msg').value;
+  const out=document.getElementById('out');out.style.display='block';
+  const esc=t=>String(t||'').replace(/</g,'&lt;');
+  out.innerHTML='<p class="thinking">🧠 Jane is reading your message…</p>';
+  let d;
+  try{
+    const r=await fetch('/jane-ads/understand',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:msg})});
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    d=await r.json();
+  }catch(e){
+    out.innerHTML='<p class="verdict advise">Couldn\\'t reach Jane</p><p class="why">The server was busy reloading. Try again.</p>';return;
+  }
+  const u=d.understood||{};
+  // Fill the form from what Jane understood — visible proof she parsed the sentence.
+  if(u.business_name) document.getElementById('name').value=u.business_name;
+  if(u.category) document.getElementById('cat').value=u.category;
+  if(u.goal) document.getElementById('goal').value=u.goal;
+  if(u.budget_ngn) document.getElementById('budget').value=u.budget_ngn;
+  document.getElementById('beh').value=u.stated_behaviour||'';
+  if(u.city) document.getElementById('city').value=u.city;
+  document.getElementById('video').checked=!!u.has_video;
+  document.getElementById('newthing').checked=!!u.is_new_thing;
+  document.getElementById('demand').checked=!!u.has_existing_demand;
+  const chips='<div class="branchset" style="margin:6px 0 0">'+
+    (u.category?'<span class="chip">'+esc(u.category)+'</span>':'')+
+    (u.goal?'<span class="chip">goal: '+esc(u.goal)+'</span>':'')+
+    (u.budget_ngn?'<span class="chip">₦'+Number(u.budget_ngn).toLocaleString()+'</span>':'')+
+    (u.city?'<span class="chip">📍 '+esc(u.city)+'</span>':'')+
+    (u.stated_behaviour?'<span class="chip">'+esc(u.stated_behaviour)+'</span>':'')+'</div>';
+  if(d.decision==='need_more'){
+    out.innerHTML='<p class="thinking">🧠 Here\\'s what I understood</p>'+chips+
+      '<hr class="divider"/><p class="verdict advise">'+esc(d.question)+'</p>'+
+      '<p class="why">Add it above (or in the message) and I\\'ll plan it.</p>';
+    return;
+  }
+  // Understood everything → render the full plan (reuses the form path).
+  run();
+}
 function ex(o){
   document.getElementById('name').value=o.name||'';
   document.getElementById('cat').value=o.cat||'';
@@ -370,7 +716,7 @@ function ex(o){
   run();
 }
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
-async function run(){
+async function run(overridePlatforms, overrideReason){
   const beh=document.getElementById('beh').value;
   const body={business_name:document.getElementById('name').value,category:document.getElementById('cat').value,
     goal:document.getElementById('goal').value,
@@ -380,6 +726,9 @@ async function run(){
     has_existing_demand:document.getElementById('demand').checked,
     city:document.getElementById('city').value,
     stated_behaviour:beh||null};
+  if(overridePlatforms && overridePlatforms.length){
+    body.override_platforms=overridePlatforms; body.override_reason=overrideReason||'';
+  }
   const out=document.getElementById('out');out.style.display='block';
   const naira=n=>'₦'+Number(n).toLocaleString();
   const esc=t=>String(t).replace(/</g,'&lt;');
@@ -412,12 +761,21 @@ async function run(){
     return;
   }
   let html='<hr class="divider"/>'+
+    (d.overridden?'<p class="pill" style="background:#C2185B22;color:#C2185B;display:inline-block;margin-bottom:8px">↺ overridden — Jane recommended '+(d.jane_recommended_platforms||[]).map(p=>p.toUpperCase()).join(' + ')+'</p>':'')+
     '<p class="verdict">'+d.platforms.map(p=>p.platform.toUpperCase()).join(' + ')+'</p>'+
     '<span class="pill">goal: '+d.goal+'</span> <span class="pill">'+d.behaviour+'</span> '+
     '<span class="pill">cap '+naira(d.per_business_cap_ngn)+'</span>'+
     '<p class="why">"'+d.explanation+'"</p>';
   d.platforms.forEach(p=>{html+='<div class="plat"><b>'+p.platform.toUpperCase()+'</b>'+
     '<span class="meta">'+naira(p.budget_ngn)+' · '+p.days+' days · '+p.variants+' variant(s) · test: '+p.test_scope+'</span></div>';});
+  html+='<div style="margin-top:14px;padding:12px 14px;background:#f6f5f3;border-radius:10px">'+
+    '<div style="font-size:12px;font-weight:700;color:#555;margin-bottom:8px">Not what you expected? Override Jane\\'s platform choice:</div>'+
+    '<div class="branchset" id="ovrPlats">'+
+      ['meta','google','tiktok'].map(p=>'<label class="chip" style="cursor:pointer"><input type="checkbox" value="'+p+'" style="margin-right:4px"/>'+p.toUpperCase()+'</label>').join('')+
+    '</div>'+
+    '<input type="text" id="ovrReason" placeholder="why? (optional)" style="margin-top:8px;width:100%;box-sizing:border-box;padding:8px 10px;border:1.5px solid #e0dcd9;border-radius:8px;font-size:13px"/>'+
+    '<button type="button" onclick="runOverride()" style="background:#555;margin-top:8px;padding:9px 14px;width:auto">↺ Run with my choice instead</button>'+
+  '</div>';
   if(d.geo){
     const g=d.geo;
     html+='<p class="thinking" style="margin-top:18px">📍 Geo — '+(g.mode==='watering_hole'?'watering-hole (go to where they gather)':'own-radius (pull them in)')+'</p>';
@@ -443,7 +801,176 @@ async function run(){
     '<div class="kpi"><div class="n">'+naira(s.wallet_before_ngn)+' → '+naira(s.wallet_after_ngn)+'</div><div class="l">Wallet balance</div></div>'+
     '<div class="kpi"><div class="n '+(s.cap_respected?'ok':'')+'">'+(s.cap_respected?'✓ within cap':'✗ over cap')+'</div><div class="l">Spend ('+naira(s.spent_ngn)+')</div></div>'+
     '</div>';
+  const loggedIn=!!authToken;
+  html+='<div style="margin-top:16px">'+
+    '<div class="branchset" style="margin-bottom:8px">'+
+      '<button type="button" onclick="genCreative(\\'generate\\')" style="background:#111;width:auto;margin:0;padding:10px 16px">🎨 Generate'+(loggedIn?' (my brand)':'')+'</button>'+
+      '<button type="button" onclick="triggerUpload()" style="background:'+(loggedIn?'#555':'#ccc')+';width:auto;margin:0;padding:10px 16px" '+(loggedIn?'':'disabled title="log in first"')+'>📤 Upload my own photo/video</button>'+
+      '<button type="button" onclick="pickDraft()" style="background:'+(loggedIn?'#555':'#ccc')+';width:auto;margin:0;padding:10px 16px" '+(loggedIn?'':'disabled title="log in first"')+'>🗂️ Pick from my drafts</button>'+
+    '</div>'+
+    '<input type="file" id="uploadFile" accept="image/png,image/jpeg,image/webp,video/mp4,video/quicktime,video/webm" style="display:none" onchange="uploadAndGenerate()"/>'+
+  '</div><div id="creative"></div>';
   out.insertAdjacentHTML('beforeend',html);
+}
+function runOverride(){
+  const checked=[...document.querySelectorAll('#ovrPlats input:checked')].map(c=>c.value);
+  if(!checked.length){ alert('Pick at least one platform to override with.'); return; }
+  run(checked, document.getElementById('ovrReason').value);
+}
+async function viewLog(){
+  if(!authToken){ alert('Log in first to view the decision log.'); return; }
+  const panel=document.getElementById('logPanel');
+  const esc=t=>String(t||'').replace(/</g,'&lt;');
+  panel.innerHTML='<p class="thinking" style="margin-top:10px">📋 Loading…</p>';
+  let d;
+  try{
+    const r=await fetch('/jane-ads/instrumentation/demo',{headers:{'Authorization':'Bearer '+authToken}});
+    d=await r.json();
+    if(!r.ok) throw new Error(d.detail||('HTTP '+r.status));
+  }catch(e){ panel.innerHTML='<p class="why">Could not load the log: '+esc(e.message||e)+'</p>'; return; }
+  let h='<hr class="divider"/><p class="thinking">📋 Decisions ('+d.decisions.length+')</p>';
+  if(!d.decisions.length) h+='<p class="why">No decisions logged yet — run a plan above.</p>';
+  d.decisions.forEach(dec=>{
+    const plats=(dec.overridden?dec.final_platforms:dec.jane_platforms).map(p=>p.toUpperCase()).join(' + ')||'—';
+    h+='<div class="plat"><b>'+dec.decision.toUpperCase()+(dec.overridden?' <span class="pill" style="background:#C2185B22;color:#C2185B">overridden</span>':'')+'</b>'+
+      '<span class="meta">'+esc(plats)+' · '+new Date(dec.at).toLocaleString()+'</span></div>';
+  });
+  if(d.overrides.length){
+    h+='<p class="thinking" style="margin-top:14px">↺ Overrides ('+d.overrides.length+')</p>';
+    d.overrides.forEach(o=>{
+      h+='<div class="plat"><b>'+o.jane_platforms.map(p=>p.toUpperCase()).join(' + ')+' → '+o.user_platforms.map(p=>p.toUpperCase()).join(' + ')+'</b>'+
+        '<span class="meta">'+esc(o.reason||'no reason given')+'</span></div>';
+    });
+  }
+  panel.innerHTML=h;
+}
+
+async function launchRealMetaAd(){
+  if(!authToken){ alert('Log in first to launch a real Meta ad.'); return; }
+  const box=document.getElementById('metaTestResult');
+  const esc=t=>String(t||'').replace(/</g,'&lt;');
+  box.innerHTML='<p class="thinking">🔴 Creating a real (paused) campaign on Meta…</p>';
+  const body={
+    business_name: document.getElementById('metaBizName').value,
+    budget_ngn: parseFloat(document.getElementById('metaBudget').value||'0'),
+    days: parseInt(document.getElementById('metaDays').value||'7', 10),
+    image_url: document.getElementById('metaImageUrl').value,
+    headline: document.getElementById('metaHeadline').value,
+    primary_text: document.getElementById('metaPrimaryText').value,
+  };
+  let d;
+  try{
+    const r=await fetch('/jane-ads/meta/test-launch',{method:'POST',
+      headers:{'Content-Type':'application/json','Authorization':'Bearer '+authToken},
+      body:JSON.stringify(body)});
+    d=await r.json();
+    if(!r.ok) throw new Error(d.detail||('HTTP '+r.status));
+  }catch(e){ box.innerHTML='<p class="why">Launch failed: '+esc(e.message||e)+'</p>'; return; }
+  box.innerHTML='<div class="plat"><b>✅ Real campaign created</b>'+
+    '<span class="meta">campaign_id: '+esc(d.campaign_id)+'</span></div>'+
+    '<p class="why">'+esc(d.note)+'</p>'+
+    '<a href="'+d.ads_manager_url+'" target="_blank" rel="noopener">Open in Ads Manager →</a>';
+}
+
+// ── Auth (needed for brand-playbook / upload / draft sources) ────────────────
+let authToken = localStorage.getItem('janeAdsToken') || '';
+let authEmail = localStorage.getItem('janeAdsEmail') || '';
+function updateAuthStatus(){
+  document.getElementById('authStatus').textContent = authToken ? ('✓ Logged in as '+authEmail) : '';
+  document.getElementById('authEmail').style.display = authToken ? 'none' : '';
+  document.getElementById('authPassword').style.display = authToken ? 'none' : '';
+}
+updateAuthStatus();
+async function doLogin(){
+  const email=document.getElementById('authEmail').value;
+  const password=document.getElementById('authPassword').value;
+  const status=document.getElementById('authStatus');
+  status.textContent='Logging in…';
+  try{
+    const r=await fetch('/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email,password})});
+    const d=await r.json();
+    const token=d.responseData && d.responseData.accessToken;
+    if(!token) throw new Error(d.responseMessage||'login failed');
+    authToken=token; authEmail=email;
+    localStorage.setItem('janeAdsToken',token); localStorage.setItem('janeAdsEmail',email);
+    updateAuthStatus();
+  }catch(e){ status.textContent='Login failed — check your credentials.'; }
+}
+
+// ── Ad creative — anonymous (generate only) vs authenticated (all 3 sources) ─
+function renderCreative(a){
+  const esc=t=>String(t||'').replace(/</g,'&lt;');
+  const box=document.getElementById('creative');
+  let h='<hr class="divider"/>';
+  if(a.source) h+='<span class="pill">source: '+esc(a.source)+'</span>';
+  if(a.image_url && a.is_video){
+    h+='<video src="'+a.image_url+'" controls style="width:100%;max-width:280px;border-radius:12px;display:block;margin:10px auto"></video>';
+  } else if(a.image_url){
+    h+='<img src="'+a.image_url+'" alt="ad" style="width:100%;max-width:280px;border-radius:12px;display:block;margin:10px auto"/>';
+  } else {
+    h+='<p class="why">(Media unavailable — showing copy only.)</p>';
+  }
+  h+='<p class="verdict" style="font-size:16px">'+esc(a.headline)+'</p>'+
+     '<p class="why">"'+esc(a.primary_text)+'"</p>'+
+     '<div class="plat"><b>Call to action</b><span class="meta">'+esc(a.cta)+'</span></div>';
+  box.innerHTML=h;
+}
+async function genCreative(source, extra){
+  extra = extra || {};
+  const box=document.getElementById('creative');
+  box.innerHTML='<p class="thinking" style="margin-top:14px">🎨 Jane is making the ad…</p>';
+  const base={business_name:document.getElementById('name').value,category:document.getElementById('cat').value,
+    goal:document.getElementById('goal').value,description:'',city:document.getElementById('city').value};
+  let url='/jane-ads/creative', headers={'Content-Type':'application/json'}, body=base;
+  if(authToken){
+    url='/jane-ads/creative/for-brand';
+    headers['Authorization']='Bearer '+authToken;
+    body={...base, source, ...extra};
+  }
+  let a;
+  try{
+    const r=await fetch(url,{method:'POST',headers,body:JSON.stringify(body)});
+    a=await r.json();
+    if(!r.ok) throw new Error(a.detail||('HTTP '+r.status));
+  }catch(e){ box.innerHTML='<p class="why">Couldn\\'t generate the creative: '+String(e.message||e)+'</p>'; return; }
+  renderCreative(a);
+}
+function triggerUpload(){
+  if(!authToken){ alert('Log in first to upload your own photo.'); return; }
+  document.getElementById('uploadFile').click();
+}
+async function uploadAndGenerate(){
+  const input=document.getElementById('uploadFile');
+  const file=input.files[0];
+  if(!file) return;
+  const box=document.getElementById('creative');
+  const isVid=file.type.startsWith('video/');
+  box.innerHTML='<p class="thinking" style="margin-top:14px">📤 Uploading your '+(isVid?'video':'photo')+'…</p>';
+  const form=new FormData(); form.append('file',file);
+  try{
+    const r=await fetch('/jane-ads/creative/upload',{method:'POST',headers:{'Authorization':'Bearer '+authToken},body:form});
+    const d=await r.json();
+    if(!r.ok) throw new Error(d.detail||'upload failed');
+    await genCreative('upload',{reference_image_url:d.url,is_video:d.is_video});
+  }catch(e){ box.innerHTML='<p class="why">Upload failed: '+String(e.message||e)+'</p>'; }
+}
+async function pickDraft(){
+  if(!authToken){ alert('Log in first to pick from your drafts.'); return; }
+  const box=document.getElementById('creative');
+  box.innerHTML='<p class="thinking" style="margin-top:14px">🗂️ Loading your drafts…</p>';
+  try{
+    const r=await fetch('/jane-ads/creative/drafts',{headers:{'Authorization':'Bearer '+authToken}});
+    const d=await r.json();
+    const drafts=d.drafts||[];
+    if(!drafts.length){ box.innerHTML='<p class="why">No drafts with images found yet.</p>'; return; }
+    let h='<p class="thinking" style="margin-top:14px">🗂️ Pick a draft</p><div class="branchset">';
+    drafts.forEach(dr=>{
+      h+='<img src="'+dr.image_url+'" alt="draft" style="width:64px;height:96px;object-fit:cover;border-radius:6px;cursor:pointer;border:2px solid transparent" '+
+         'onclick="genCreative(\\'draft\\',{draft_id:\\''+dr.draft_id+'\\'})"/>';
+    });
+    h+='</div>';
+    box.innerHTML=h;
+  }catch(e){ box.innerHTML='<p class="why">Could not load drafts.</p>'; }
 }
 </script>
 </body></html>"""
