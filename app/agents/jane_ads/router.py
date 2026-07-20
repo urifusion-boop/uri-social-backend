@@ -413,6 +413,75 @@ async def instrumentation_log(
     }
 
 
+class MetaTestLaunchBody(BaseModel):
+    business_name: str = "Test Business"
+    budget_ngn: float = Field(15_000, gt=0)
+    days: int = Field(7, gt=0)
+    image_url: str
+    headline: str = "Chat With Us"
+    primary_text: str = "Chat with us on WhatsApp!"
+
+
+@router.post("/meta/test-launch")
+async def meta_test_launch(
+    body: MetaTestLaunchBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    _token: dict = Depends(JWTBearer()),
+) -> dict:
+    """Launches a REAL Meta campaign (created PAUSED — zero spend until a human
+    activates it in Ads Manager) against the configured ad account. Lets anyone test
+    the live Meta adapter directly rather than trusting a one-off script. Requires
+    META_AD_ACCOUNT_ID, META_ADS_ACCESS_TOKEN, and META_ADS_PAGE_ID to be configured."""
+    import uuid
+    from app.core.config import settings
+    from .adapters.meta import MetaAdPlatformAdapter, MetaAPIError
+    from .models import (
+        ABTestScope, AdCreative, CampaignPlan, CampaignObjective, Goal, PlatformPlan,
+        PurchaseBehaviour, SpendAuthorization,
+    )
+
+    if not (settings.META_AD_ACCOUNT_ID and settings.META_ADS_ACCESS_TOKEN and settings.META_ADS_PAGE_ID):
+        raise HTTPException(
+            status_code=400,
+            detail="Meta ads not configured — need META_AD_ACCOUNT_ID, META_ADS_ACCESS_TOKEN, META_ADS_PAGE_ID",
+        )
+
+    business_id = f"demo_meta_test_{uuid.uuid4().hex[:8]}"
+    plan = CampaignPlan(
+        business_id=business_id,
+        goal=Goal.MESSAGES,
+        behaviour=PurchaseBehaviour.DISCOVER,
+        platforms=[PlatformPlan(
+            platform=Platform.META, budget_ngn=body.budget_ngn, days=body.days,
+            variants=1, test_scope=ABTestScope.NONE, objective=CampaignObjective.CONVERSATIONS,
+        )],
+        per_business_cap_ngn=body.budget_ngn,
+        account_cap_ngn=body.budget_ngn,
+        page_id=settings.META_ADS_PAGE_ID,
+        creative=AdCreative(image_url=body.image_url, headline=body.headline, primary_text=body.primary_text),
+        explanation=f"Real Meta ads test launch for {body.business_name}",
+    )
+    auth = SpendAuthorization(business_id=business_id, funded_amount_ngn=body.budget_ngn, account_cap_ngn=body.budget_ngn)
+
+    adapter = MetaAdPlatformAdapter(db, access_token=settings.META_ADS_ACCESS_TOKEN)
+    try:
+        result = await adapter.launch_campaign(plan, auth)
+    except MetaAPIError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    except (ValueError, NotImplementedError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {
+        "campaign_id": result.campaign_id,
+        "ad_ids": result.ad_ids,
+        "note": "Created PAUSED — zero spend. Review and activate it yourself in Ads Manager if you want it live.",
+        "ads_manager_url": (
+            f"https://adsmanager.facebook.com/adsmanager/manage/campaigns"
+            f"?act={settings.META_AD_ACCOUNT_ID}&selected_campaign_ids={result.campaign_id}"
+        ),
+    }
+
+
 @router.get("/demo", response_class=HTMLResponse)
 async def demo_page() -> str:
     return _DEMO_HTML
@@ -498,6 +567,24 @@ _DEMO_HTML = """<!DOCTYPE html>
     <div id="authStatus" style="font-size:12px;color:#888;margin-top:8px"></div>
     <button type="button" onclick="viewLog()" style="margin-top:10px;width:auto;padding:9px 14px;background:#555">📋 View decision log</button>
     <div id="logPanel"></div>
+  </div>
+
+  <div class="card" id="metaTestCard">
+    <label>🔴 Test REAL Meta ads (creates an actual campaign — always PAUSED, zero spend)</label>
+    <div class="row">
+      <div><label>Business name</label><input type="text" id="metaBizName" value="Test Business"/></div>
+      <div><label>Budget (₦, total)</label><input type="number" id="metaBudget" value="15000"/></div>
+    </div>
+    <div class="row">
+      <div><label>Days</label><input type="number" id="metaDays" value="7"/></div>
+      <div><label>Image URL (must be a real, public direct-image link)</label><input type="text" id="metaImageUrl" value="https://images.unsplash.com/photo-1506744038136-46273834b3fb?w=1200&amp;h=628&amp;fit=crop&amp;fm=jpg"/></div>
+    </div>
+    <div class="row">
+      <div><label>Headline</label><input type="text" id="metaHeadline" value="Chat With Us"/></div>
+      <div><label>Primary text</label><input type="text" id="metaPrimaryText" value="Chat with us on WhatsApp!"/></div>
+    </div>
+    <button type="button" onclick="launchRealMetaAd()" style="margin-top:10px;background:#C2185B">🔴 Launch real ad (paused)</button>
+    <div id="metaTestResult" style="font-size:13px;margin-top:10px"></div>
   </div>
 
   <details class="tree-wrap">
@@ -756,6 +843,33 @@ async function viewLog(){
     });
   }
   panel.innerHTML=h;
+}
+
+async function launchRealMetaAd(){
+  if(!authToken){ alert('Log in first to launch a real Meta ad.'); return; }
+  const box=document.getElementById('metaTestResult');
+  const esc=t=>String(t||'').replace(/</g,'&lt;');
+  box.innerHTML='<p class="thinking">🔴 Creating a real (paused) campaign on Meta…</p>';
+  const body={
+    business_name: document.getElementById('metaBizName').value,
+    budget_ngn: parseFloat(document.getElementById('metaBudget').value||'0'),
+    days: parseInt(document.getElementById('metaDays').value||'7', 10),
+    image_url: document.getElementById('metaImageUrl').value,
+    headline: document.getElementById('metaHeadline').value,
+    primary_text: document.getElementById('metaPrimaryText').value,
+  };
+  let d;
+  try{
+    const r=await fetch('/jane-ads/meta/test-launch',{method:'POST',
+      headers:{'Content-Type':'application/json','Authorization':'Bearer '+authToken},
+      body:JSON.stringify(body)});
+    d=await r.json();
+    if(!r.ok) throw new Error(d.detail||('HTTP '+r.status));
+  }catch(e){ box.innerHTML='<p class="why">Launch failed: '+esc(e.message||e)+'</p>'; return; }
+  box.innerHTML='<div class="plat"><b>✅ Real campaign created</b>'+
+    '<span class="meta">campaign_id: '+esc(d.campaign_id)+'</span></div>'+
+    '<p class="why">'+esc(d.note)+'</p>'+
+    '<a href="'+d.ads_manager_url+'" target="_blank" rel="noopener">Open in Ads Manager →</a>';
 }
 
 // ── Auth (needed for brand-playbook / upload / draft sources) ────────────────
