@@ -59,6 +59,23 @@ COLLECTION = "jane_ads_meta_campaigns"
 # Standard Meta insight action type for Click-to-WhatsApp conversation starts.
 _CONVERSATION_ACTION_TYPE = "onsite_conversion.messaging_conversation_started_7d"
 
+# Meta's `effective_status` values, translated to plain language for the campaign-
+# list view — callers never see raw Ads-Manager jargon.
+_DELIVERY_LABELS = {
+    "ACTIVE": "Active",
+    "PAUSED": "Paused",
+    "CAMPAIGN_PAUSED": "Paused",
+    "ADSET_PAUSED": "Paused",
+    "PENDING_REVIEW": "In review",
+    "DISAPPROVED": "Needs changes",
+    "PREAPPROVED": "Scheduled",
+    "PENDING_BILLING_INFO": "Needs billing info",
+    "ARCHIVED": "Archived",
+    "DELETED": "Deleted",
+    "IN_PROCESS": "Processing",
+    "WITH_ISSUES": "Needs attention",
+}
+
 
 class MetaAPIError(Exception):
     """A Graph API call returned an error payload, or the adapter is misconfigured."""
@@ -259,6 +276,79 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
             for row in rows
         ]
 
+    async def fetch_campaign_summary(self, campaign_id: str) -> dict:
+        """One combined snapshot for the campaign-list (management) view — real
+        delivery status, reach/impressions, spend, and conversation results/cost,
+        pulled directly from Meta's read APIs and translated to plain figures (no
+        Ads-Manager jargon) for the caller to render. Best-effort per sub-call: a
+        failed piece (e.g. insights not ready yet for a brand-new campaign) degrades
+        to a sensible default rather than failing the whole summary."""
+        record = await self._get_campaign_record(campaign_id)
+        delivery = "Paused"
+        ends_at = None
+        row: dict = {}
+
+        async with httpx.AsyncClient(timeout=30) as client:
+            try:
+                status_resp = await client.get(
+                    f"{self._graph_base}/{campaign_id}",
+                    params={"access_token": self._access_token, "fields": "effective_status"},
+                )
+                status_data = status_resp.json()
+                _raise_for_error(status_data, "campaign status fetch")
+                raw_status = status_data.get("effective_status", "")
+                delivery = _DELIVERY_LABELS.get(raw_status, raw_status.replace("_", " ").title() or "Paused")
+            except Exception as e:
+                print(f"[Meta] status fetch failed for {campaign_id}: {e}", flush=True)
+
+            if record.get("adset_id"):
+                try:
+                    adset_resp = await client.get(
+                        f"{self._graph_base}/{record['adset_id']}",
+                        params={"access_token": self._access_token, "fields": "end_time"},
+                    )
+                    adset_data = adset_resp.json()
+                    _raise_for_error(adset_data, "ad set fetch")
+                    ends_at = adset_data.get("end_time")
+                except Exception as e:
+                    print(f"[Meta] ad set fetch failed for {campaign_id}: {e}", flush=True)
+
+            try:
+                insights_resp = await client.get(
+                    f"{self._graph_base}/{campaign_id}/insights",
+                    params={
+                        "access_token": self._access_token,
+                        "fields": "impressions,reach,spend,actions,cost_per_action_type",
+                    },
+                )
+                insights_data = insights_resp.json()
+                _raise_for_error(insights_data, "insights fetch")
+                rows = insights_data.get("data", [])
+                row = rows[0] if rows else {}
+            except Exception as e:
+                print(f"[Meta] insights fetch failed for {campaign_id}: {e}", flush=True)
+
+        conversations = 0
+        for action in row.get("actions", []):
+            if action.get("action_type") == _CONVERSATION_ACTION_TYPE:
+                conversations = int(float(action.get("value", 0)))
+                break
+        cost_per_conversation = None
+        for c in row.get("cost_per_action_type", []):
+            if c.get("action_type") == _CONVERSATION_ACTION_TYPE:
+                cost_per_conversation = float(c.get("value", 0))
+                break
+
+        return {
+            "delivery": delivery,
+            "spend_ngn": float(row.get("spend", 0.0)),
+            "impressions": int(row.get("impressions", 0)),
+            "reach": int(row.get("reach", 0)),
+            "conversations": conversations,
+            "cost_per_conversation_ngn": cost_per_conversation,
+            "ends_at": ends_at,
+        }
+
     async def poll_conversations(self, campaign_id: str) -> list[ConversationDelivered]:
         """Conversations delivered SINCE THE LAST POLL. No live webhook yet (that's
         work-split item 2.4, a separate WhatsApp Cloud API migration) — falls back to
@@ -323,4 +413,46 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
             )
             data = resp.json()
             _raise_for_error(data, "pause ad")
+        return bool(data.get("success"))
+
+    async def set_delivery(self, campaign_id: str, active: bool) -> dict:
+        """Turn a campaign on or off, from the caller's own campaign-management UI —
+        not via Ads Manager. Cascades the SAME status to the campaign, its ad set, and
+        its ad, since Meta only actually delivers when all three levels are ACTIVE;
+        pausing any one of them stops delivery. Going active is the one genuinely
+        consequential action in this whole feature — real money can start being
+        spent from that point on."""
+        record = await self._get_campaign_record(campaign_id)
+        status = "ACTIVE" if active else "PAUSED"
+        updated: dict[str, bool] = {}
+        async with httpx.AsyncClient(timeout=30) as client:
+            for node_id, label in (
+                (campaign_id, "campaign"),
+                (record.get("adset_id"), "adset"),
+                (record.get("ad_id"), "ad"),
+            ):
+                if not node_id:
+                    continue
+                resp = await client.post(
+                    f"{self._graph_base}/{node_id}",
+                    params={"access_token": self._access_token},
+                    json={"status": status},
+                )
+                data = resp.json()
+                _raise_for_error(data, f"{label} status update")
+                updated[label] = bool(data.get("success"))
+        return {"status": status, "updated": updated}
+
+    async def delete_campaign(self, campaign_id: str) -> bool:
+        """Permanently delete the campaign on Meta's side (cascades to its ad set and
+        ad automatically — Meta doesn't require deleting those separately). The Mongo
+        record is left in place so it still shows up (as DELETED) if the caller lists
+        it again right after; the router removes it from OUR list."""
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.delete(
+                f"{self._graph_base}/{campaign_id}",
+                params={"access_token": self._access_token},
+            )
+            data = resp.json()
+            _raise_for_error(data, "campaign delete")
         return bool(data.get("success"))
