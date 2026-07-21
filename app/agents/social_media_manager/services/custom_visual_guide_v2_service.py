@@ -197,13 +197,6 @@ A. MEDIUM FIRST - CRITICAL. You MUST match the exact medium from the
 
 B. OVERALL AESTHETIC. Translate overall_aesthetic and mood into
    opening descriptive language that sets the visual register.
-   CRITICAL: mood is NON-NEGOTIABLE, exactly like the medium in step A —
-   it must NOT drift toward whatever tone the new content's subject matter
-   typically implies. A "serious"/"professional" mood must stay serious and
-   professional even if the new content is about something inherently
-   cheerful; a "playful" mood must stay playful even for serious subject
-   matter. The new CONTENT changes WHAT is shown; the style profile's mood
-   governs HOW it feels — never let the former override the latter.
 
 C. COMPOSITION & STRUCTURE. Apply layout_structure — the composition,
    information density, focal strategy, and structural_devices.
