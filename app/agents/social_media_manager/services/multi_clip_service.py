@@ -590,15 +590,22 @@ _COMPOSE_FILLER_RE = re.compile(
     r"^(um+|uh+|ah+|hmm+|er+|erm+|mhm+|uhh+|umm+|huh|mm+)$",
     re.IGNORECASE,
 )
-_COMPOSE_SILENCE_THRESHOLD = 0.9   # seconds — matches video_production_service founder threshold
+_COMPOSE_SILENCE_THRESHOLD = 1.2   # seconds — conservative; 0.9s was cutting Whisper gaps
+_COMPOSE_MAX_CUT_DURATION  = 3.0   # seconds — gaps longer than this are likely Whisper misses, not real silence
 
 
-def _timing_cuts_from_clip_srt(srt: str, clip_offset: float, clip_duration: float) -> List[Dict]:
+def _timing_cuts_from_clip_srt(srt: str, clip_offset: float, clip_duration: float, clip_type: str = "speech") -> List[Dict]:
     """
     Parse a single clip's SRT string and return cuts (in global timeline coordinates)
     for silences (gaps between SRT entries) and whole-entry filler words.
-    This runs entirely on timing data — no GPT needed.
+
+    Only runs on speech clips — silent/still clips have no SRT so their
+    gaps would be misread as silence. Caps each cut at _COMPOSE_MAX_CUT_DURATION
+    to avoid removing sections where Whisper simply missed transcription.
     """
+    if clip_type != "speech":
+        return []
+
     def _parse_ts(ts: str) -> float:
         h, m, rest = ts.split(":")
         s, ms = rest.replace(",", ".").split(".")
@@ -621,34 +628,26 @@ def _timing_cuts_from_clip_srt(srt: str, clip_offset: float, clip_duration: floa
 
     cuts: List[Dict] = []
 
+    def _maybe_cut(at: float, end: float, reason: str) -> None:
+        duration = end - at
+        if _COMPOSE_SILENCE_THRESHOLD <= duration <= _COMPOSE_MAX_CUT_DURATION:
+            cuts.append({"at": round(at, 3), "end": round(end, 3), "reason": reason})
+
     # Leading silence before first word
-    if entries[0]["start"] > _COMPOSE_SILENCE_THRESHOLD:
-        cuts.append({
-            "at":     clip_offset,
-            "end":    round(clip_offset + entries[0]["start"], 3),
-            "reason": f"leading silence {entries[0]['start']:.1f}s",
-        })
+    _maybe_cut(clip_offset, clip_offset + entries[0]["start"],
+               f"leading silence {entries[0]['start']:.1f}s")
 
     # Gaps between SRT entries
     for i in range(1, len(entries)):
         gap_start = entries[i - 1]["end"]
         gap_end   = entries[i]["start"]
         gap = gap_end - gap_start
-        if gap > _COMPOSE_SILENCE_THRESHOLD:
-            cuts.append({
-                "at":     round(clip_offset + gap_start, 3),
-                "end":    round(clip_offset + gap_end,   3),
-                "reason": f"silence {gap:.1f}s",
-            })
+        _maybe_cut(clip_offset + gap_start, clip_offset + gap_end, f"silence {gap:.1f}s")
 
     # Trailing silence after last word
     trail = clip_duration - entries[-1]["end"]
-    if trail > _COMPOSE_SILENCE_THRESHOLD:
-        cuts.append({
-            "at":     round(clip_offset + entries[-1]["end"], 3),
-            "end":    round(clip_offset + clip_duration,       3),
-            "reason": f"trailing silence {trail:.1f}s",
-        })
+    _maybe_cut(clip_offset + entries[-1]["end"], clip_offset + clip_duration,
+               f"trailing silence {trail:.1f}s")
 
     # Whole-entry filler words (um, uh, etc.)
     for entry in entries:
@@ -703,8 +702,9 @@ async def _run_ai_analysis(clips_ordered: List[Dict], story_type: str) -> Dict:
             continue
         dur = float(c.get("duration_seconds") or 10)
         srt = c.get("srt") or ""
+        clip_type = c.get("clip_type", "speech")
         if srt:
-            timing_cuts.extend(_timing_cuts_from_clip_srt(srt, cumulative, dur))
+            timing_cuts.extend(_timing_cuts_from_clip_srt(srt, cumulative, dur, clip_type))
         clip_entries.append({
             "start": cumulative,
             "end": cumulative + dur,
