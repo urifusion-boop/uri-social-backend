@@ -635,24 +635,29 @@ def _srt_parse(srt: str) -> List[Dict]:
     return entries
 
 
-def _timing_cuts_from_clip_srt(srt: str, clip_offset: float, clip_duration: float, clip_type: str = "speech") -> List[Dict]:
+def _timing_cuts_from_clip(
+    srt: str,
+    clip_offset: float,
+    clip_duration: float,
+    clip_type: str = "speech",
+    words: Optional[List[Dict]] = None,
+) -> List[Dict]:
     """
-    Parse a single clip's SRT and return cuts (global timeline coordinates) for:
-      - Silences: gaps between SRT entries >= 1.2s and <= 3.0s
-      - Long pauses: leading/trailing silence within same bounds
+    Return cuts (global timeline coordinates) for a single clip covering:
+      - Silences / long pauses: detected from word-level gaps when available
+        (catches mid-sentence pauses SRT misses), otherwise from SRT entry gaps
       - Filler words: whole SRT entries that are just um/uh/hmm etc.
       - Repeated sentences: SRT entries with >= 65% content-word overlap
-        within a 60s window (second occurrence gets cut)
+        within a 60s window (second occurrence is cut)
 
-    Only runs on speech clips. Gaps > 3s are skipped — likely Whisper misses.
+    Only runs on speech clips. Gaps > 3s are skipped (likely Whisper misses).
+    Word-level data is strongly preferred — Whisper requests it with
+    timestamp_granularities=["word"] during ingest and stores it on each clip.
     """
     if clip_type != "speech":
         return []
 
     entries = _srt_parse(srt)
-    if not entries:
-        return []
-
     cuts: List[Dict] = []
 
     def _maybe_silence_cut(at: float, end: float, reason: str) -> None:
@@ -661,20 +666,38 @@ def _timing_cuts_from_clip_srt(srt: str, clip_offset: float, clip_duration: floa
             cuts.append({"at": round(at, 3), "end": round(end, 3), "reason": reason})
 
     # ── Silences and long pauses ──────────────────────────────────────────────
-    _maybe_silence_cut(clip_offset, clip_offset + entries[0]["start"],
-                       f"leading silence {entries[0]['start']:.1f}s")
-
-    for i in range(1, len(entries)):
-        gap = entries[i]["start"] - entries[i - 1]["end"]
-        _maybe_silence_cut(
-            clip_offset + entries[i - 1]["end"],
-            clip_offset + entries[i]["start"],
-            f"pause {gap:.1f}s",
-        )
-
-    trail = clip_duration - entries[-1]["end"]
-    _maybe_silence_cut(clip_offset + entries[-1]["end"], clip_offset + clip_duration,
-                       f"trailing silence {trail:.1f}s")
+    # Prefer word-level gaps — they catch mid-sentence pauses that SRT entry
+    # boundaries completely miss (Whisper groups several words per segment).
+    if words:
+        # Leading silence before first spoken word
+        _maybe_silence_cut(clip_offset, clip_offset + words[0]["start"],
+                           f"leading silence {words[0]['start']:.1f}s")
+        # Gap between consecutive words
+        for i in range(1, len(words)):
+            gap = words[i]["start"] - words[i - 1]["end"]
+            _maybe_silence_cut(
+                clip_offset + words[i - 1]["end"],
+                clip_offset + words[i]["start"],
+                f"pause {gap:.1f}s",
+            )
+        # Trailing silence after last word
+        trail = clip_duration - words[-1]["end"]
+        _maybe_silence_cut(clip_offset + words[-1]["end"], clip_offset + clip_duration,
+                           f"trailing silence {trail:.1f}s")
+    elif entries:
+        # Fallback: SRT segment boundaries (less precise)
+        _maybe_silence_cut(clip_offset, clip_offset + entries[0]["start"],
+                           f"leading silence {entries[0]['start']:.1f}s")
+        for i in range(1, len(entries)):
+            gap = entries[i]["start"] - entries[i - 1]["end"]
+            _maybe_silence_cut(
+                clip_offset + entries[i - 1]["end"],
+                clip_offset + entries[i]["start"],
+                f"pause {gap:.1f}s",
+            )
+        trail = clip_duration - entries[-1]["end"]
+        _maybe_silence_cut(clip_offset + entries[-1]["end"], clip_offset + clip_duration,
+                           f"trailing silence {trail:.1f}s")
 
     # ── Filler words ─────────────────────────────────────────────────────────
     for entry in entries:
@@ -687,8 +710,6 @@ def _timing_cuts_from_clip_srt(srt: str, clip_offset: float, clip_duration: floa
             })
 
     # ── Repeated sentences ────────────────────────────────────────────────────
-    # Compare each entry against earlier entries within the repeat window.
-    # If content-word Jaccard >= threshold, the later one is a repeat → cut it.
     already_flagged: set = set()
     for i in range(len(entries)):
         if i in already_flagged:
@@ -707,8 +728,7 @@ def _timing_cuts_from_clip_srt(srt: str, clip_offset: float, clip_duration: floa
             union = len(cw_i | cw_j)
             if union == 0:
                 continue
-            similarity = len(cw_i & cw_j) / union
-            if similarity >= _COMPOSE_REPEAT_THRESHOLD:
+            if len(cw_i & cw_j) / union >= _COMPOSE_REPEAT_THRESHOLD:
                 cuts.append({
                     "at":     round(clip_offset + entries[j]["start"], 3),
                     "end":    round(clip_offset + entries[j]["end"],   3),
@@ -760,10 +780,13 @@ async def _run_ai_analysis(clips_ordered: List[Dict], story_type: str) -> Dict:
         dur = float(c.get("duration_seconds") or 10)
         srt = c.get("srt") or ""
         clip_type = c.get("clip_type", "speech")
+        clip_words = c.get("words") or []
         # Parse SRT entries with global timestamps for GPT input
         srt_entries_global = []
-        if srt:
-            timing_cuts.extend(_timing_cuts_from_clip_srt(srt, cumulative, dur, clip_type))
+        if srt or clip_words:
+            timing_cuts.extend(
+                _timing_cuts_from_clip(srt, cumulative, dur, clip_type, clip_words or None)
+            )
             for e in _srt_parse(srt):
                 srt_entries_global.append({
                     "start": round(cumulative + e["start"], 2),
