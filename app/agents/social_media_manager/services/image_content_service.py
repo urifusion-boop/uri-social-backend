@@ -2413,8 +2413,6 @@ OVERALL:
                                     prompt=prompt,
                                     n=1,
                                     size=_gpt2_size,
-                                    quality="high",
-                                    output_format="webp",
                                 ),
                             ),
                             timeout=300,
