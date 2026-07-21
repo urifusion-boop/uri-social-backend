@@ -90,6 +90,33 @@ def _brand_prompt_bits(bc: dict) -> str:
     return " ".join(bits)
 
 
+def _brand_color_directive(bc: dict) -> str:
+    """A forceful (not a passing mention) instruction that the scene's props/wardrobe/
+    decor actually carry the brand's colours — matches how normal content generation
+    treats brand colours as a hard requirement, not a suggestion."""
+    colors = bc.get("brand_colors") or []
+    if not colors:
+        return ""
+    return (
+        f" The brand's colours ({', '.join(colors[:3])}) MUST be visibly prominent in "
+        "the scene — reflected in clothing, props, decor, packaging, or lighting accents, "
+        "not just present in the background."
+    )
+
+
+def _logo_reserve_directive(bc: dict) -> str:
+    """Leave a real, unobstructed corner for the brand logo to be composited onto
+    the finished image afterward (see generate_ad_image) — mirrors the logo-zone
+    reservation normal content generation does before its own overlay step."""
+    if not bc.get("logo_url"):
+        return ""
+    position = (bc.get("logo_position") or "bottom_right").replace("_", " ")
+    return (
+        f" Leave the {position} corner visually clear (no faces, text, or busy detail "
+        "there) — a brand logo will be composited onto that corner afterward."
+    )
+
+
 def _location_prompt_bit(city: str, category: str = "") -> str:
     """Ground the ad's visual setting in the real place it targets — without this,
     the image model defaults to a generic global stock-photo look. Two failure modes
@@ -214,7 +241,9 @@ def _as_ad_content(image_prompt: str, brand_context: Optional[dict] = None) -> s
     brand_bits = _brand_prompt_bits(bc)
     return (
         f"{image_prompt.strip()}"
-        f"{(' Reflect this brand: ' + brand_bits) if brand_bits else ''} "
+        f"{(' Reflect this brand: ' + brand_bits) if brand_bits else ''}"
+        f"{_brand_color_directive(bc)}"
+        f"{_logo_reserve_directive(bc)} "
         "Photorealistic, natural lighting, shallow depth of field, vertical 9:16. "
         "This is a paid ad photograph — NOT a poster, NOT a graphic design template. "
         "Absolutely no text, words, letters, headlines, captions, watermarks, logos, "
@@ -231,10 +260,14 @@ async def generate_ad_image(image_prompt: str, brand_context: Optional[dict] = N
     """Generate the ad image with gpt-image-1, enriched with the brand's colours/
     voice/region pulled from the same playbook normal posts use — a direct, literal
     call so the "no on-image text" rule is never at the mercy of another pipeline's
-    own creative judgment. Returns a Cloudinary URL, or None on failure."""
+    own creative judgment. When the brand has a logo, it's composited onto the
+    finished image afterward — the SAME real pixel-logo overlay normal content
+    generation uses (ImageContentService._overlay_logo), not an AI reinterpretation.
+    Returns a Cloudinary URL, or None on failure."""
     if not settings.OPENAI_API_KEY or not image_prompt.strip():
         return None
-    full_prompt = _as_ad_content(image_prompt, brand_context)
+    bc = brand_context or {}
+    full_prompt = _as_ad_content(image_prompt, bc)
     try:
         client = openai.AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
         resp = await client.images.generate(
@@ -243,9 +276,21 @@ async def generate_ad_image(image_prompt: str, brand_context: Optional[dict] = N
         b64 = resp.data[0].b64_json if resp.data else None
         if not b64:
             return None
+
+        logo_url = bc.get("logo_url")
+        ext, content_type = "png", "image/png"
+        if logo_url:
+            from app.agents.social_media_manager.services.image_content_service import ImageContentService
+            import asyncio
+            b64 = await asyncio.to_thread(
+                ImageContentService._overlay_logo, b64, logo_url,
+                bc.get("logo_position", "bottom_right"), bc.get("logo_size", "small"),
+            )
+            ext, content_type = "webp", "image/webp"  # _overlay_logo always re-encodes as WEBP
+
         import base64
         img_bytes = base64.b64decode(b64)
-        return await _upload_bytes_to_cloudinary(img_bytes, f"ad-{uuid.uuid4().hex[:12]}")
+        return await _upload_bytes_to_cloudinary(img_bytes, f"ad-{uuid.uuid4().hex[:12]}", ext=ext, content_type=content_type)
     except Exception as e:
         print(f"[Creative] image error: {e}", flush=True)
         return None

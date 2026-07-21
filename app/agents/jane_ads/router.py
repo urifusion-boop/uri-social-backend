@@ -482,6 +482,301 @@ async def meta_test_launch(
     }
 
 
+class MetaLaunchFromMessageBody(BaseModel):
+    message: str                          # plain-English ask, e.g. "get me lunch customers in Surulere, ₦15k"
+    business_name: str = ""
+    category: str = ""
+    page_id: str = ""                     # override the target page (multi-client); defaults to META_ADS_PAGE_ID
+    conversation_cost_ngn: float = Field(500.0, gt=0)
+    creative_source: str = "generate"     # generate | upload | draft
+    reference_image_url: str = ""         # required for creative_source=upload (from /creative/upload)
+    is_video: bool = False                # is reference_image_url a video?
+    draft_id: str = ""                    # required for creative_source=draft (from /creative/drafts)
+
+
+@router.post("/meta/launch-from-message")
+async def meta_launch_from_message(
+    body: MetaLaunchFromMessageBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """The full one-shot flow, for the demo: plain-English message → Jane understands it
+    → decides the platform (with her reasoning) → generates a real branded ad creative
+    → pushes a REAL campaign to Meta (created PAUSED, zero spend) → returns everything,
+    including a direct Ads Manager link. `page_id` can target a specific client's Page
+    (the multi-client model); it defaults to URI's own configured page."""
+    import uuid
+    from app.core.config import settings
+    from .adapters.meta import MetaAdPlatformAdapter, MetaAPIError
+    from .creative import creative_from_draft, creative_from_upload, generate_ad_creative
+    from .decision_engine import apply_platform_override, plan_campaign
+    from .models import PlanDecision, SpendAuthorization
+    from .nl import parse_message, to_campaign_request
+
+    if not (settings.META_AD_ACCOUNT_ID and settings.META_ADS_ACCESS_TOKEN):
+        raise HTTPException(status_code=400, detail="Meta ads not configured — need META_AD_ACCOUNT_ID and META_ADS_ACCESS_TOKEN")
+    page_id = body.page_id or settings.META_ADS_PAGE_ID
+    if not page_id:
+        raise HTTPException(status_code=400, detail="No target page — set META_ADS_PAGE_ID or pass page_id")
+    if body.creative_source == "upload" and not body.reference_image_url:
+        raise HTTPException(status_code=400, detail="reference_image_url is required for creative_source=upload")
+    if body.creative_source == "draft" and not body.draft_id:
+        raise HTTPException(status_code=400, detail="draft_id is required for creative_source=draft")
+
+    # 1. Jane reads the plain-English message.
+    parsed = await parse_message(body.message, body.business_name, body.category)
+    # Tie the campaign to the caller's active brand so it shows up in their
+    # campaign list; fall back to a random id only if there's no brand context.
+    business_id = brand_ctx.get("brand_id") or f"oneshot_{uuid.uuid4().hex[:8]}"
+    req = to_campaign_request(parsed, business_id=business_id)
+    if req is None:
+        return {"stage": "need_more", "understood": parsed.model_dump(),
+                "question": parsed.clarify or "How much would you like to spend?"}
+
+    # 2. Jane decides the platform + budget split, with her reasoning.
+    result = plan_campaign(req, funded_amount_ngn=req.budget_ngn, total_funded_wallets_ngn=req.budget_ngn)
+    if result.decision == PlanDecision.ADVISE:
+        return {"stage": "advise", "understood": parsed.model_dump(),
+                "advice": result.advice.model_dump(), "trace": result.advice.trace}
+    plan = result.plan
+
+    # For now, always launch on Meta — it's the only platform with a live adapter
+    # (Google/TikTok are still pending, #7/#8). If Jane's decision landed elsewhere,
+    # force the plan onto Meta so the demo always produces a real ad. Jane's original
+    # recommendation is still surfaced in the response for transparency.
+    jane_platforms = [p.platform.value for p in plan.platforms]
+    forced_to_meta = not any(p.platform == Platform.META for p in plan.platforms)
+    if forced_to_meta:
+        plan = apply_platform_override(plan, [Platform.META])
+    else:
+        plan.platforms = [p for p in plan.platforms if p.platform == Platform.META]
+
+    # 3. Geo refinement (pin-and-pocket) — best-effort, never blocks the launch.
+    geo_dump = None
+    if parsed.city:
+        try:
+            from .geo import geo_for_request
+            geo_plan = await geo_for_request(req.business_name, req.category, parsed.city, req.goal, req.description)
+            plan.geo = geo_plan
+            geo_dump = geo_plan.model_dump()
+        except Exception as e:
+            print(f"[oneshot] geo skipped: {e}", flush=True)
+
+    # 4. The ad creative — Jane generates it, or the caller supplies their own upload/draft.
+    business_name = req.business_name or body.business_name or "Your Business"
+    category = req.category or body.category
+    user_id = brand_ctx.get("user_id", "")
+    brand_id = brand_ctx.get("brand_id")
+    if body.creative_source == "upload":
+        creative = await creative_from_upload(
+            business_name, category, body.reference_image_url, req.goal.value, req.description,
+            user_id=user_id, db=db, brand_id=brand_id, is_video=body.is_video,
+        )
+    elif body.creative_source == "draft":
+        creative = await creative_from_draft(
+            business_name, category, body.draft_id, user_id, db,
+            goal=req.goal.value, brand_id=brand_id,
+        )
+        if creative is None:
+            raise HTTPException(status_code=404, detail="Draft not found or has no image")
+    else:
+        creative = await generate_ad_creative(
+            business_name, category, req.goal.value, req.description,
+            user_id=user_id, db=db, brand_id=brand_id, city=parsed.city,
+        )
+    if not creative.image_url:
+        raise HTTPException(status_code=502, detail="Jane couldn't generate the ad image (creative service). Try again.")
+
+    # 5. Push a REAL campaign to Meta (paused).
+    plan.page_id = page_id
+    plan.creative = creative
+    auth = SpendAuthorization(business_id=business_id, funded_amount_ngn=req.budget_ngn, account_cap_ngn=req.budget_ngn)
+    adapter = MetaAdPlatformAdapter(db, access_token=settings.META_ADS_ACCESS_TOKEN)
+    try:
+        launch = await adapter.launch_campaign(plan, auth)
+    except MetaAPIError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    except (ValueError, NotImplementedError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # Enrich the stored campaign record with display fields so the campaign-list
+    # view can render name/creative/budget without re-deriving them.
+    await db["jane_ads_meta_campaigns"].update_one(
+        {"campaign_id": launch.campaign_id},
+        {"$set": {
+            "brand_id": brand_ctx.get("brand_id"),
+            "user_id": brand_ctx.get("user_id"),
+            "display_name": req.business_name or body.business_name or "Campaign",
+            "headline": creative.headline,
+            "primary_text": creative.primary_text,
+            "image_url": creative.image_url,
+            "budget_ngn": req.budget_ngn,
+            "goal": plan.goal.value,
+            "city": parsed.city,
+            "message": body.message,
+        }},
+    )
+
+    return {
+        "stage": "launched",
+        "understood": parsed.model_dump(),
+        "jane_recommended_platforms": jane_platforms,
+        "forced_to_meta": forced_to_meta,
+        "plan": {
+            "goal": plan.goal.value,
+            "behaviour": plan.behaviour.value,
+            "explanation": plan.explanation,
+            "platforms": [p.model_dump(mode="json") for p in plan.platforms],
+            "per_business_cap_ngn": plan.per_business_cap_ngn,
+            "account_cap_ngn": plan.account_cap_ngn,
+            "geo": geo_dump,
+            "trace": plan.trace,
+        },
+        "creative": creative.model_dump(mode="json"),
+        "launch": {
+            "campaign_id": launch.campaign_id,
+            "ad_ids": launch.ad_ids,
+            "page_id": page_id,
+            "status": "PAUSED",
+            "note": "Created PAUSED — zero spend. Review and activate in Ads Manager to go live.",
+            "ads_manager_url": (
+                f"https://adsmanager.facebook.com/adsmanager/manage/campaigns"
+                f"?act={settings.META_AD_ACCOUNT_ID}&selected_campaign_ids={launch.campaign_id}"
+            ),
+        },
+    }
+
+
+@router.get("/meta/campaigns")
+async def meta_campaigns(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+    with_metrics: bool = True,
+) -> dict:
+    """List the active brand's campaigns for the management view. Each row carries
+    its display fields (name, creative, budget) plus — when with_metrics — live
+    reach/conversation/spend numbers pulled from the platform. Metrics failures per
+    campaign are swallowed so one bad campaign never blanks the whole list."""
+    from app.core.config import settings
+    from .adapters.meta import MetaAdPlatformAdapter
+
+    brand_id = brand_ctx.get("brand_id")
+    if not brand_id:
+        return {"campaigns": []}
+
+    records = await (db["jane_ads_meta_campaigns"]
+                     .find({"brand_id": brand_id}, {"_id": 0})
+                     .sort("created_at", -1).to_list(length=200))
+
+    adapter = None
+    if with_metrics and settings.META_ADS_ACCESS_TOKEN and settings.META_AD_ACCOUNT_ID:
+        adapter = MetaAdPlatformAdapter(db, access_token=settings.META_ADS_ACCESS_TOKEN)
+
+    out = []
+    for r in records:
+        created = r.get("created_at")
+        row = {
+            "campaign_id": r.get("campaign_id"),
+            "name": r.get("display_name") or "Campaign",
+            "headline": r.get("headline", ""),
+            "primary_text": r.get("primary_text", ""),
+            "image_url": r.get("image_url", ""),
+            "budget_ngn": r.get("budget_ngn"),
+            "goal": r.get("goal", ""),
+            "city": r.get("city", ""),
+            "status": "paused",   # everything is created PAUSED for now
+            "created_at": created.isoformat() if hasattr(created, "isoformat") else created,
+            "ads_manager_url": (
+                f"https://adsmanager.facebook.com/adsmanager/manage/campaigns"
+                f"?act={settings.META_AD_ACCOUNT_ID}&selected_campaign_ids={r.get('campaign_id')}"
+            ),
+            "metrics": None,
+        }
+        if adapter and r.get("campaign_id"):
+            try:
+                summary = await adapter.fetch_campaign_summary(r["campaign_id"])
+                row["status"] = summary["delivery"].lower()
+                row["metrics"] = {
+                    "spend_ngn": round(summary["spend_ngn"], 2),
+                    "conversations": summary["conversations"],
+                    "cost_per_conversation_ngn": (
+                        round(summary["cost_per_conversation_ngn"], 2)
+                        if summary["cost_per_conversation_ngn"] is not None else None
+                    ),
+                    "impressions": summary["impressions"],
+                    "reach": summary["reach"],
+                    "delivery": summary["delivery"],
+                    "ends_at": summary["ends_at"],
+                }
+            except Exception as e:
+                print(f"[campaigns] metrics failed for {r.get('campaign_id')}: {e}", flush=True)
+        out.append(row)
+
+    return {"campaigns": out}
+
+
+class CampaignStatusBody(BaseModel):
+    active: bool
+
+
+@router.post("/meta/campaigns/{campaign_id}/status")
+async def set_meta_campaign_status(
+    campaign_id: str,
+    body: CampaignStatusBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Turn a campaign on or off from the caller's own campaign-management view —
+    no Ads Manager needed. Scoped to the caller's active brand so a campaign_id
+    can't be toggled by anyone outside the brand that owns it. Going active is the
+    one genuinely consequential action here — real budget can start being spent."""
+    from app.core.config import settings
+    from .adapters.meta import MetaAdPlatformAdapter, MetaAPIError
+
+    brand_id = brand_ctx.get("brand_id")
+    record = await db["jane_ads_meta_campaigns"].find_one({"campaign_id": campaign_id})
+    if not record or record.get("brand_id") != brand_id:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if not (settings.META_AD_ACCOUNT_ID and settings.META_ADS_ACCESS_TOKEN):
+        raise HTTPException(status_code=400, detail="Meta ads not configured")
+
+    adapter = MetaAdPlatformAdapter(db, access_token=settings.META_ADS_ACCESS_TOKEN)
+    try:
+        result = await adapter.set_delivery(campaign_id, body.active)
+    except MetaAPIError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    return result
+
+
+@router.delete("/meta/campaigns/{campaign_id}")
+async def delete_meta_campaign(
+    campaign_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Permanently delete a campaign — from the caller's own campaign-management view,
+    scoped to their active brand so a campaign_id can't be deleted by anyone outside
+    the brand that owns it. Removes it from OUR list too, not just Meta's side."""
+    from app.core.config import settings
+    from .adapters.meta import MetaAdPlatformAdapter, MetaAPIError
+
+    brand_id = brand_ctx.get("brand_id")
+    record = await db["jane_ads_meta_campaigns"].find_one({"campaign_id": campaign_id})
+    if not record or record.get("brand_id") != brand_id:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if not (settings.META_AD_ACCOUNT_ID and settings.META_ADS_ACCESS_TOKEN):
+        raise HTTPException(status_code=400, detail="Meta ads not configured")
+
+    adapter = MetaAdPlatformAdapter(db, access_token=settings.META_ADS_ACCESS_TOKEN)
+    try:
+        await adapter.delete_campaign(campaign_id)
+    except MetaAPIError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+    await db["jane_ads_meta_campaigns"].delete_one({"campaign_id": campaign_id})
+    return {"deleted": True}
+
+
 @router.get("/demo", response_class=HTMLResponse)
 async def demo_page() -> str:
     return _DEMO_HTML
@@ -569,8 +864,20 @@ _DEMO_HTML = """<!DOCTYPE html>
     <div id="logPanel"></div>
   </div>
 
+  <div class="card" id="oneShotCard" style="border:2px solid #C2185B">
+    <label>🎤 Talk to Jane → real ad in Ads Manager (the full flow, one shot)</label>
+    <p class="sub" style="margin:2px 0 10px">Type a plain-English ask. Jane understands it, decides the platform, writes the copy, generates the image, and pushes a real campaign to Meta — created PAUSED, zero spend.</p>
+    <textarea id="osMsg" rows="2" style="width:100%;box-sizing:border-box;font-size:14px;padding:10px 12px;border:1.5px solid #C2185B55;border-radius:9px;resize:vertical;font-family:inherit;color:#111" placeholder="e.g. I run a skincare brand in Lekki, I want people to discover us, budget 20k">I run a skincare brand in Lekki, I want people to discover us this week, budget 20k</textarea>
+    <div class="row">
+      <div><label>Business name</label><input type="text" id="osBizName" value="GlowUp Skincare"/></div>
+      <div><label>Category (hint)</label><input type="text" id="osCategory" value="skincare"/></div>
+    </div>
+    <button type="button" onclick="launchFromMessage()" style="margin-top:10px;background:linear-gradient(135deg,#C2185B,#8E1545)">🎤 Jane, make &amp; launch this ad</button>
+    <div id="osResult" style="margin-top:12px"></div>
+  </div>
+
   <div class="card" id="metaTestCard">
-    <label>🔴 Test REAL Meta ads (creates an actual campaign — always PAUSED, zero spend)</label>
+    <label>🔴 Test REAL Meta ads — manual inputs (creates an actual campaign — always PAUSED, zero spend)</label>
     <div class="row">
       <div><label>Business name</label><input type="text" id="metaBizName" value="Test Business"/></div>
       <div><label>Budget (₦, total)</label><input type="number" id="metaBudget" value="15000"/></div>
@@ -870,6 +1177,64 @@ async function launchRealMetaAd(){
     '<span class="meta">campaign_id: '+esc(d.campaign_id)+'</span></div>'+
     '<p class="why">'+esc(d.note)+'</p>'+
     '<a href="'+d.ads_manager_url+'" target="_blank" rel="noopener">Open in Ads Manager →</a>';
+}
+
+async function launchFromMessage(){
+  if(!authToken){ alert('Log in first (top card) to run the full flow.'); return; }
+  const box=document.getElementById('osResult');
+  const esc=t=>String(t||'').replace(/</g,'&lt;');
+  const naira=n=>'₦'+Number(n).toLocaleString();
+  box.innerHTML='<p class="thinking">🧠 Jane is reading your message → deciding the platform → writing copy → generating a real AI image → pushing to Meta.<br/>This takes ~60–90s (the AI image is the slow part). Hang tight…</p>';
+  const body={
+    message: document.getElementById('osMsg').value,
+    business_name: document.getElementById('osBizName').value,
+    category: document.getElementById('osCategory').value,
+  };
+  let d;
+  try{
+    const r=await fetch('/jane-ads/meta/launch-from-message',{method:'POST',
+      headers:{'Content-Type':'application/json','Authorization':'Bearer '+authToken},
+      body:JSON.stringify(body)});
+    d=await r.json();
+    if(!r.ok) throw new Error(d.detail||('HTTP '+r.status));
+  }catch(e){ box.innerHTML='<p class="why">Failed: '+esc(e.message||e)+'</p>'; return; }
+
+  if(d.stage==='need_more'){
+    box.innerHTML='<p class="verdict advise">'+esc(d.question)+'</p><p class="why">Add it to the message and try again.</p>';
+    return;
+  }
+  if(d.stage==='advise'){
+    box.innerHTML='<p class="verdict advise">Jane advises: don\\'t run yet</p><p class="why">'+esc(d.advice.reason)+'</p>';
+    return;
+  }
+  const u=d.understood||{}, pl=d.plan||{}, cr=d.creative||{}, la=d.launch||{};
+  let h='<hr class="divider"/>';
+  // 1. What Jane understood
+  h+='<p class="thinking">🧠 What Jane understood</p><div class="branchset">'+
+    (u.business_name?'<span class="chip">'+esc(u.business_name)+'</span>':'')+
+    (u.category?'<span class="chip">'+esc(u.category)+'</span>':'')+
+    (u.goal?'<span class="chip">goal: '+esc(u.goal)+'</span>':'')+
+    (u.budget_ngn?'<span class="chip">'+naira(u.budget_ngn)+'</span>':'')+
+    (u.city?'<span class="chip">📍 '+esc(u.city)+'</span>':'')+'</div>';
+  // 2. Jane's decision
+  h+='<p class="thinking" style="margin-top:14px">🎯 Jane\\'s plan</p>';
+  if(d.forced_to_meta) h+='<p class="pill" style="background:#C2185B22;color:#C2185B;display:inline-block">Jane leaned '+(d.jane_recommended_platforms||[]).join(' + ').toUpperCase()+' — forced to META (only live adapter for now)</p>';
+  h+='<p class="why">"'+esc(pl.explanation)+'"</p>';
+  (pl.platforms||[]).forEach(p=>{h+='<div class="plat"><b>'+p.platform.toUpperCase()+'</b><span class="meta">'+naira(p.budget_ngn)+' · '+p.days+' days · '+p.variants+' variant(s) · test: '+p.test_scope+'</span></div>';});
+  if(pl.geo && pl.geo.pins && pl.geo.pins.length){
+    h+='<p class="why" style="margin-top:6px">📍 Targeting: '+pl.geo.pins.map(x=>esc(x.name)).join(', ')+'</p>';
+  }
+  // 3. The generated creative
+  h+='<p class="thinking" style="margin-top:14px">🎨 The ad Jane made</p>';
+  if(cr.image_url){ h+='<img src="'+cr.image_url+'" alt="ad" style="width:100%;max-width:260px;border-radius:12px;display:block;margin:8px 0"/>'; }
+  h+='<p class="verdict" style="font-size:16px">'+esc(cr.headline)+'</p>'+
+     '<p class="why">"'+esc(cr.primary_text)+'"</p>'+
+     '<div class="plat"><b>Call to action</b><span class="meta">'+esc(cr.cta)+'</span></div>';
+  // 4. The live campaign
+  h+='<hr class="divider"/><div class="plat"><b>✅ Pushed to Meta (PAUSED)</b><span class="meta">campaign '+esc(la.campaign_id)+'</span></div>'+
+     '<p class="why">'+esc(la.note)+'</p>'+
+     '<a href="'+la.ads_manager_url+'" target="_blank" rel="noopener" style="font-weight:800;color:#C2185B">Open in Ads Manager →</a>';
+  box.innerHTML=h;
 }
 
 // ── Auth (needed for brand-playbook / upload / draft sources) ────────────────
