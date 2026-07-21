@@ -454,6 +454,51 @@ Return only the JSON. No preamble, no explanation."""
             )
 
     @staticmethod
+    async def reanalyze_style_profile(
+        guide_id: str,
+        user_id: str,
+        db: AsyncIOMotorDatabase,
+    ) -> Dict[str, Any]:
+        """
+        Re-run GPT-4o Vision extraction on an existing guide's already-uploaded
+        reference image, replacing its stored style_profile in place.
+
+        Exists because the upload endpoint's duplicate-detection (by image
+        hash) means re-uploading the same file never re-triggers extraction —
+        it either 409s (already active) or silently restores the old guide
+        with its old profile. Without this, a guide analyzed before an
+        extraction-prompt improvement is permanently stuck on the old,
+        possibly-misclassified profile; there was no way to benefit from a
+        better prompt without deleting the guide and sourcing a new image.
+
+        Returns the updated guide document.
+        """
+        from bson import ObjectId
+
+        guide = await db["custom_visual_guides"].find_one({
+            "_id": ObjectId(guide_id),
+            "user_id": user_id,
+            "version": "v2",
+        })
+        if not guide:
+            raise HTTPException(status_code=404, detail="Custom Visual Guide V2 not found")
+
+        print(f"[V2] Re-analyzing guide {guide_id} ({guide.get('name')})")
+        old_medium = (guide.get("style_profile") or {}).get("medium")
+
+        new_profile = await CustomVisualGuideV2Service.extract_style_profile(guide["original_image_url"])
+
+        await db["custom_visual_guides"].update_one(
+            {"_id": ObjectId(guide_id)},
+            {"$set": {"style_profile": new_profile, "updated_at": datetime.utcnow()}},
+        )
+        print(f"[V2] ✅ Re-analyzed guide {guide_id}: medium {old_medium!r} → {new_profile.get('medium')!r}")
+
+        guide["style_profile"] = new_profile
+        guide["id"] = str(guide["_id"])
+        return guide
+
+    @staticmethod
     async def generate_image_with_v2_guide(
         guide_id: str,
         brand_context: Dict[str, Any],

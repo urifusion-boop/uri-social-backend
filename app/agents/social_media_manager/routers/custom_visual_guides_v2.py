@@ -298,6 +298,53 @@ async def archive_guide_v2(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.post("/social-media/custom-guides-v2/{guide_id}/reanalyze")
+async def reanalyze_guide_v2(
+    guide_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Re-run GPT-4o Vision style extraction on an existing guide's reference
+    image, replacing its stored style profile in place.
+
+    Re-uploading the same file doesn't do this — duplicate detection (by
+    image hash) either 409s or silently restores the guide with its old
+    profile, without ever re-running extraction. Use this to pick up an
+    extraction-prompt improvement on a guide that was already analyzed, or
+    to retry a guide whose style was misclassified the first time.
+    """
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    try:
+        guide = await CustomVisualGuideV2Service.reanalyze_style_profile(guide_id, user_id, db)
+        style_profile = guide.get("style_profile", {})
+
+        return UriResponse.create_response(
+            entity_name="Custom Visual Guide V2",
+            data={
+                "id": guide["id"],
+                "name": guide["name"],
+                "style_summary": {
+                    "medium": style_profile.get("medium"),
+                    "overall_aesthetic": style_profile.get("overall_aesthetic"),
+                    "mood": style_profile.get("mood"),
+                    "color_system": style_profile.get("color_system"),
+                    "typography_character": style_profile.get("typography", {}).get("character"),
+                },
+            },
+            message="Style profile re-analyzed successfully"
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[V2 API] ❌ Error re-analyzing V2 guide: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.post("/social-media/custom-guides-v2/generate")
 async def generate_with_v2_guide(
     request: GenerateWithV2GuideRequest,
