@@ -4611,6 +4611,7 @@ async def upload_sample_template(
     import os, uuid
 
     user_id = ctx["user_id"]
+    brand_id = ctx.get("brand_id")
 
     allowed_types = {"image/png", "image/jpeg", "image/jpg", "image/webp", "application/pdf"}
     if file.content_type not in allowed_types:
@@ -4628,11 +4629,30 @@ async def upload_sample_template(
         resource_type = "raw" if file.content_type == "application/pdf" else "image"
         file_url = await upload_bytes(contents, folder="uri-social/templates", resource_type=resource_type)
 
+        # Scope the write to the ACTIVE brand — same cross-brand bug as the logo
+        # endpoint had: a bare {"user_id": user_id} $push would append the template
+        # to whichever brand profile matched first, not the one being edited.
+        from app.models.brand_account import BrandAccount
+        personal_bid = BrandAccount.personal_brand_id(user_id)
+        if brand_id and brand_id != personal_bid:
+            scope = {"brand_id": brand_id}
+            on_insert = {"brand_id": brand_id, "user_id": user_id}
+        else:
+            legacy = await db["brand_profiles"].find_one(
+                {"user_id": user_id, "brand_id": {"$exists": False}}, {"_id": 1})
+            if legacy:
+                scope = {"user_id": user_id, "brand_id": {"$exists": False}}
+                on_insert = {"user_id": user_id}
+            else:
+                scope = {"brand_id": personal_bid}
+                on_insert = {"brand_id": personal_bid, "user_id": user_id}
+
         await db["brand_profiles"].update_one(
-            {"user_id": user_id},
+            scope,
             {
                 "$push": {"sample_template_urls": file_url},
                 "$set": {"updated_at": datetime.utcnow()},
+                "$setOnInsert": on_insert,
             },
             upsert=True,
         )
