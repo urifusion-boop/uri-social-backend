@@ -709,6 +709,14 @@ async def meta_campaigns(
         if adapter and r.get("campaign_id"):
             try:
                 summary = await adapter.fetch_campaign_summary(r["campaign_id"])
+                # A campaign can be deleted by means we never see (directly in Ads
+                # Manager, or a manual cleanup) — once Meta itself reports it as
+                # gone, drop our own record too instead of showing a stale "Deleted"
+                # ghost card forever. This is the ONLY status we self-heal on;
+                # everything else (paused/active/in review/etc.) still renders.
+                if summary["delivery"] == "Deleted":
+                    await db["jane_ads_meta_campaigns"].delete_one({"campaign_id": r["campaign_id"]})
+                    continue
                 row["status"] = summary["delivery"].lower()
                 row["metrics"] = {
                     "spend_ngn": round(summary["spend_ngn"], 2),
