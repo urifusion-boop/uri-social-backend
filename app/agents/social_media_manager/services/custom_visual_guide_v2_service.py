@@ -38,7 +38,7 @@ Your job is to document HOW this design looks, feels, and is structured — so a
 Return ONLY this JSON structure (no markdown, no code blocks, just raw JSON):
 
 {
-  "medium": "photographic | illustrated | hand_drawn | flat_graphic | 3d_render | mixed_media | collage | typography_driven",
+  "medium": "photographic (real photo) | illustrated (clean vector/digital illustration — smooth shapes, precise even linework, no wobble) | hand_drawn (sketchy doodle style — visible pen/marker linework, loose imperfect lines, hand-sketched wobble/texture, looks drawn by hand not built in vector software) | flat_graphic (solid flat color shapes, minimal/no linework) | 3d_render | mixed_media | collage | typography_driven — look closely at the linework quality before choosing between illustrated and hand_drawn, they are commonly confused",
   "aesthetic_dominance": "low | medium | high",
   "overall_aesthetic": "minimalist | bold | vintage | modern | organic | industrial | playful | elegant | dramatic | warm | energetic | luxurious | casual | professional | artistic",
   "mood": "professional | playful | dramatic | warm | energetic | luxurious | calm | serious | friendly | sophisticated | edgy | nostalgic | futuristic | authentic | aspirational",
