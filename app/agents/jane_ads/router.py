@@ -39,6 +39,20 @@ from .wallet import InsufficientFundsError, MinimumTopUpError, WalletService
 router = APIRouter(prefix="/jane-ads", tags=["Jane + Ads (demo)"])
 
 
+def _raise_http_for_meta_error(e: "MetaAPIError") -> None:
+    """Meta's ad-account-level rate limit ("too many calls to this ad-account")
+    is shared across every caller of that account — heavy testing/usage can trip
+    it — and is temporary, unlike a real failure. Surface it as a distinct 429
+    with a plain-language message instead of a generic 502, so the caller knows
+    to wait rather than assume something is broken."""
+    if e.is_rate_limited:
+        raise HTTPException(
+            status_code=429,
+            detail="Meta is briefly rate-limiting this ad account from heavy usage — please wait a few minutes and try again.",
+        )
+    raise HTTPException(status_code=502, detail=str(e))
+
+
 class PlanRequestBody(BaseModel):
     business_name: str = "My Business"
     category: str = ""
@@ -467,7 +481,7 @@ async def meta_test_launch(
     try:
         result = await adapter.launch_campaign(plan, auth)
     except MetaAPIError as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        _raise_http_for_meta_error(e)
     except (ValueError, NotImplementedError) as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -595,7 +609,7 @@ async def meta_launch_from_message(
     try:
         launch = await adapter.launch_campaign(plan, auth)
     except MetaAPIError as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        _raise_http_for_meta_error(e)
     except (ValueError, NotImplementedError) as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -744,7 +758,7 @@ async def set_meta_campaign_status(
     try:
         result = await adapter.set_delivery(campaign_id, body.active)
     except MetaAPIError as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        _raise_http_for_meta_error(e)
     return result
 
 
@@ -771,7 +785,7 @@ async def delete_meta_campaign(
     try:
         await adapter.delete_campaign(campaign_id)
     except MetaAPIError as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        _raise_http_for_meta_error(e)
 
     await db["jane_ads_meta_campaigns"].delete_one({"campaign_id": campaign_id})
     return {"deleted": True}
