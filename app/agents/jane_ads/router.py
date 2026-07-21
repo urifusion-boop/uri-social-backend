@@ -494,7 +494,7 @@ class MetaLaunchFromMessageBody(BaseModel):
 async def meta_launch_from_message(
     body: MetaLaunchFromMessageBody,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    _token: dict = Depends(JWTBearer()),
+    brand_ctx: dict = Depends(get_active_brand_context),
 ) -> dict:
     """The full one-shot flow, for the demo: plain-English message → Jane understands it
     → decides the platform (with her reasoning) → generates a real branded ad creative
@@ -517,7 +517,9 @@ async def meta_launch_from_message(
 
     # 1. Jane reads the plain-English message.
     parsed = await parse_message(body.message, body.business_name, body.category)
-    business_id = f"demo_oneshot_{uuid.uuid4().hex[:8]}"
+    # Tie the campaign to the caller's active brand so it shows up in their
+    # campaign list; fall back to a random id only if there's no brand context.
+    business_id = brand_ctx.get("brand_id") or f"oneshot_{uuid.uuid4().hex[:8]}"
     req = to_campaign_request(parsed, business_id=business_id)
     if req is None:
         return {"stage": "need_more", "understood": parsed.model_dump(),
@@ -572,6 +574,24 @@ async def meta_launch_from_message(
     except (ValueError, NotImplementedError) as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    # Enrich the stored campaign record with display fields so the campaign-list
+    # view can render name/creative/budget without re-deriving them.
+    await db["jane_ads_meta_campaigns"].update_one(
+        {"campaign_id": launch.campaign_id},
+        {"$set": {
+            "brand_id": brand_ctx.get("brand_id"),
+            "user_id": brand_ctx.get("user_id"),
+            "display_name": req.business_name or body.business_name or "Campaign",
+            "headline": creative.headline,
+            "primary_text": creative.primary_text,
+            "image_url": creative.image_url,
+            "budget_ngn": req.budget_ngn,
+            "goal": plan.goal.value,
+            "city": parsed.city,
+            "message": body.message,
+        }},
+    )
+
     return {
         "stage": "launched",
         "understood": parsed.model_dump(),
@@ -600,6 +620,64 @@ async def meta_launch_from_message(
             ),
         },
     }
+
+
+@router.get("/meta/campaigns")
+async def meta_campaigns(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+    with_metrics: bool = True,
+) -> dict:
+    """List the active brand's campaigns for the management view. Each row carries
+    its display fields (name, creative, budget) plus — when with_metrics — live
+    reach/conversation/spend numbers pulled from the platform. Metrics failures per
+    campaign are swallowed so one bad campaign never blanks the whole list."""
+    from app.core.config import settings
+    from .adapters.meta import MetaAdPlatformAdapter
+
+    brand_id = brand_ctx.get("brand_id")
+    if not brand_id:
+        return {"campaigns": []}
+
+    records = await (db["jane_ads_meta_campaigns"]
+                     .find({"brand_id": brand_id}, {"_id": 0})
+                     .sort("created_at", -1).to_list(length=200))
+
+    adapter = None
+    if with_metrics and settings.META_ADS_ACCESS_TOKEN and settings.META_AD_ACCOUNT_ID:
+        adapter = MetaAdPlatformAdapter(db, access_token=settings.META_ADS_ACCESS_TOKEN)
+
+    out = []
+    for r in records:
+        created = r.get("created_at")
+        row = {
+            "campaign_id": r.get("campaign_id"),
+            "name": r.get("display_name") or "Campaign",
+            "headline": r.get("headline", ""),
+            "primary_text": r.get("primary_text", ""),
+            "image_url": r.get("image_url", ""),
+            "budget_ngn": r.get("budget_ngn"),
+            "goal": r.get("goal", ""),
+            "city": r.get("city", ""),
+            "status": "paused",   # everything is created PAUSED for now
+            "created_at": created.isoformat() if hasattr(created, "isoformat") else created,
+            "ads_manager_url": (
+                f"https://adsmanager.facebook.com/adsmanager/manage/campaigns"
+                f"?act={settings.META_AD_ACCOUNT_ID}&selected_campaign_ids={r.get('campaign_id')}"
+            ),
+            "metrics": None,
+        }
+        if adapter and r.get("campaign_id"):
+            try:
+                spends = await adapter.fetch_per_ad_spend(r["campaign_id"])
+                total_spend = round(sum(s.spend_ngn for s in spends), 2)
+                convos = int(r.get("last_conversation_count", 0))
+                row["metrics"] = {"spend_ngn": total_spend, "conversations": convos}
+            except Exception as e:
+                print(f"[campaigns] metrics failed for {r.get('campaign_id')}: {e}", flush=True)
+        out.append(row)
+
+    return {"campaigns": out}
 
 
 @router.get("/demo", response_class=HTMLResponse)
