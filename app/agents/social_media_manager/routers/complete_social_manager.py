@@ -4983,13 +4983,15 @@ async def _generate_image_bg(
         # For story posts pass image_type="story" so we get 1080x1920 dimensions
         image_type = "story" if post_type == "story" else "post_image"
 
-        # Extract V2 guide ID and reference image from brand_context if present
+        # ========== REFERENCE IMAGE vs V2 GUIDE PRIORITY ==========
+        # Priority: User-uploaded reference image > V2 guide > Standard generation.
+        # This check must run BEFORE ever touching custom_guide_v2_reference_image —
+        # assigning the V2 guide's own image into `reference_image` first (as this
+        # code used to) made every V2 guide selection immediately look like "the
+        # user uploaded their own image", permanently discarding the V2 guide and
+        # falling through to the standard generation flow instead — the guide's
+        # reference image was detected, then thrown away in the very next check.
         v2_guide_id = brand_context.get("custom_guide_v2_id")
-        v2_reference_image = brand_context.get("custom_guide_v2_reference_image")
-        print(f"[V2 DEBUG] v2_guide_id={v2_guide_id}, v2_reference_image={v2_reference_image[:100] if v2_reference_image else None}, reference_image={reference_image}")
-        if v2_reference_image:
-            reference_image = v2_reference_image
-            print(f"📸 Using V2 reference image: {reference_image[:80]}...")
 
         if reference_image:
             # User explicitly uploaded reference image - highest priority
