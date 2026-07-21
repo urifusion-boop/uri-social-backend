@@ -80,13 +80,31 @@ _DELIVERY_LABELS = {
 class MetaAPIError(Exception):
     """A Graph API call returned an error payload, or the adapter is misconfigured."""
 
+    def __init__(self, message: str, code: Optional[int] = None, subcode: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.subcode = subcode
+
+    # Meta's ad-account-level throttle ("There have been too many calls to this
+    # ad-account") — code 80004 is the specific ads-management rate limit; codes
+    # 4/17/32/613 are the general API-wide rate limits Meta also uses. Distinct
+    # from a real failure: it's temporary and clears on its own, so callers
+    # should tell the user to wait rather than treating it as a hard error.
+    _RATE_LIMIT_CODES = {80004, 4, 17, 32, 613}
+
+    @property
+    def is_rate_limited(self) -> bool:
+        return self.code in self._RATE_LIMIT_CODES
+
 
 def _raise_for_error(data: dict, context: str) -> None:
     if "error" in data:
         err = data["error"]
         raise MetaAPIError(
             f"{context}: {err.get('message')} (code={err.get('code')}, "
-            f"subcode={err.get('error_subcode')})"
+            f"subcode={err.get('error_subcode')})",
+            code=err.get("code"),
+            subcode=err.get("error_subcode"),
         )
 
 
@@ -279,54 +297,37 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
     async def fetch_campaign_summary(self, campaign_id: str) -> dict:
         """One combined snapshot for the campaign-list (management) view — real
         delivery status, reach/impressions, spend, and conversation results/cost,
-        pulled directly from Meta's read APIs and translated to plain figures (no
-        Ads-Manager jargon) for the caller to render. Best-effort per sub-call: a
-        failed piece (e.g. insights not ready yet for a brand-new campaign) degrades
-        to a sensible default rather than failing the whole summary."""
-        record = await self._get_campaign_record(campaign_id)
-        delivery = "Paused"
-        ends_at = None
-        row: dict = {}
-
+        pulled from Meta's read API. Uses field expansion to get the campaign's
+        status, its ad set's end_time, AND its insights in a SINGLE Graph API
+        call instead of three separate round trips — the ad-account-level rate
+        limit (Meta's own cap on calls per account, not something we control) is
+        shared across every caller of this account, so cutting our call volume
+        3x directly reduces how often the list view runs into it. Raises
+        MetaAPIError (callers should treat `is_rate_limited` on it as a
+        transient "try again shortly", not a hard failure)."""
         async with httpx.AsyncClient(timeout=30) as client:
-            try:
-                status_resp = await client.get(
-                    f"{self._graph_base}/{campaign_id}",
-                    params={"access_token": self._access_token, "fields": "effective_status"},
-                )
-                status_data = status_resp.json()
-                _raise_for_error(status_data, "campaign status fetch")
-                raw_status = status_data.get("effective_status", "")
-                delivery = _DELIVERY_LABELS.get(raw_status, raw_status.replace("_", " ").title() or "Paused")
-            except Exception as e:
-                print(f"[Meta] status fetch failed for {campaign_id}: {e}", flush=True)
+            resp = await client.get(
+                f"{self._graph_base}/{campaign_id}",
+                params={
+                    "access_token": self._access_token,
+                    "fields": (
+                        "effective_status,"
+                        "adsets{end_time},"
+                        "insights{impressions,reach,spend,actions,cost_per_action_type}"
+                    ),
+                },
+            )
+            data = resp.json()
+            _raise_for_error(data, "campaign summary fetch")
 
-            if record.get("adset_id"):
-                try:
-                    adset_resp = await client.get(
-                        f"{self._graph_base}/{record['adset_id']}",
-                        params={"access_token": self._access_token, "fields": "end_time"},
-                    )
-                    adset_data = adset_resp.json()
-                    _raise_for_error(adset_data, "ad set fetch")
-                    ends_at = adset_data.get("end_time")
-                except Exception as e:
-                    print(f"[Meta] ad set fetch failed for {campaign_id}: {e}", flush=True)
+        raw_status = data.get("effective_status", "")
+        delivery = _DELIVERY_LABELS.get(raw_status, raw_status.replace("_", " ").title() or "Paused")
 
-            try:
-                insights_resp = await client.get(
-                    f"{self._graph_base}/{campaign_id}/insights",
-                    params={
-                        "access_token": self._access_token,
-                        "fields": "impressions,reach,spend,actions,cost_per_action_type",
-                    },
-                )
-                insights_data = insights_resp.json()
-                _raise_for_error(insights_data, "insights fetch")
-                rows = insights_data.get("data", [])
-                row = rows[0] if rows else {}
-            except Exception as e:
-                print(f"[Meta] insights fetch failed for {campaign_id}: {e}", flush=True)
+        adsets = data.get("adsets", {}).get("data", [])
+        ends_at = adsets[0].get("end_time") if adsets else None
+
+        insight_rows = data.get("insights", {}).get("data", [])
+        row = insight_rows[0] if insight_rows else {}
 
         conversations = 0
         for action in row.get("actions", []):
