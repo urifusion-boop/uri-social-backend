@@ -152,6 +152,59 @@ async def _check_quality(path: str, probe: Dict) -> Tuple[List[str], float]:
     return flags, mean_db
 
 
+# ── FFmpeg silence detection ──────────────────────────────────────────────────
+
+async def _detect_silences_ffmpeg(
+    path: str,
+    noise_db: float = -30,
+    min_duration: float = 0.5,
+) -> List[Dict]:
+    """
+    Detect silence ranges in a clip by measuring actual audio amplitude.
+    Returns [{start, end}] in clip-local seconds for every section where the
+    audio drops below noise_db for at least min_duration seconds.
+
+    Unlike Whisper word-gap detection, this catches completely silent sections
+    that Whisper never transcribed — e.g. the person walked away, paused for
+    5 seconds, looked at their notes.
+    """
+    cmd = [
+        "ffmpeg", "-i", path,
+        "-af", f"silencedetect=noise={noise_db}dB:d={min_duration}",
+        "-f", "null", "-",
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=60)
+        output = stderr_bytes.decode("utf-8", errors="replace")
+    except Exception as exc:
+        print(f"[MultiClip/silencedetect] FFmpeg error: {exc}", flush=True)
+        return []
+
+    silences: List[Dict] = []
+    pending_start: Optional[float] = None
+    for line in output.splitlines():
+        if "silence_start:" in line:
+            try:
+                pending_start = float(line.split("silence_start:")[1].strip().split()[0])
+            except (ValueError, IndexError):
+                pass
+        elif "silence_end:" in line and pending_start is not None:
+            try:
+                end = float(line.split("silence_end:")[1].strip().split("|")[0].strip())
+                silences.append({"start": round(pending_start, 3), "end": round(end, 3)})
+                pending_start = None
+            except (ValueError, IndexError):
+                pass
+
+    print(f"[MultiClip/silencedetect] {path[-30:]} → {len(silences)} silence range(s)", flush=True)
+    return silences
+
+
 # ── Speech detection ──────────────────────────────────────────────────────────
 
 async def _detect_clip_type(path: str, probe: Dict) -> str:
@@ -641,18 +694,22 @@ def _timing_cuts_from_clip(
     clip_duration: float,
     clip_type: str = "speech",
     words: Optional[List[Dict]] = None,
+    silence_ranges: Optional[List[Dict]] = None,
 ) -> List[Dict]:
     """
     Return cuts (global timeline coordinates) for a single clip covering:
-      - Silences / long pauses: detected from word-level gaps when available
-        (catches mid-sentence pauses SRT misses), otherwise from SRT entry gaps
+      - Silences / non-talking sections: three-tier detection in priority order:
+          1. FFmpeg silencedetect (amplitude-based, catches ALL non-talking —
+             the person walking away, a 10-second pause, sections Whisper never saw)
+          2. Whisper word-level gaps (mid-sentence pauses SRT misses)
+          3. SRT segment gaps (coarsest fallback)
       - Filler words: whole SRT entries that are just um/uh/hmm etc.
       - Repeated sentences: SRT entries with >= 65% content-word overlap
         within a 60s window (second occurrence is cut)
 
-    Only runs on speech clips. Gaps > 3s are skipped (likely Whisper misses).
-    Word-level data is strongly preferred — Whisper requests it with
-    timestamp_granularities=["word"] during ingest and stores it on each clip.
+    Only runs on speech clips. FFmpeg silence ranges have no duration cap —
+    they come from real audio measurement. Word/SRT gaps cap at 3s to guard
+    against Whisper transcript holes being mistaken for silence.
     """
     if clip_type != "speech":
         return []
@@ -660,44 +717,55 @@ def _timing_cuts_from_clip(
     entries = _srt_parse(srt)
     cuts: List[Dict] = []
 
-    def _maybe_silence_cut(at: float, end: float, reason: str) -> None:
-        dur = end - at
-        if _COMPOSE_SILENCE_THRESHOLD <= dur <= _COMPOSE_MAX_CUT_DURATION:
-            cuts.append({"at": round(at, 3), "end": round(end, 3), "reason": reason})
-
     # ── Silences and long pauses ──────────────────────────────────────────────
-    # Prefer word-level gaps — they catch mid-sentence pauses that SRT entry
-    # boundaries completely miss (Whisper groups several words per segment).
-    if words:
-        # Leading silence before first spoken word
-        _maybe_silence_cut(clip_offset, clip_offset + words[0]["start"],
-                           f"leading silence {words[0]['start']:.1f}s")
-        # Gap between consecutive words
-        for i in range(1, len(words)):
-            gap = words[i]["start"] - words[i - 1]["end"]
-            _maybe_silence_cut(
-                clip_offset + words[i - 1]["end"],
-                clip_offset + words[i]["start"],
-                f"pause {gap:.1f}s",
-            )
-        # Trailing silence after last word
-        trail = clip_duration - words[-1]["end"]
-        _maybe_silence_cut(clip_offset + words[-1]["end"], clip_offset + clip_duration,
-                           f"trailing silence {trail:.1f}s")
-    elif entries:
-        # Fallback: SRT segment boundaries (less precise)
-        _maybe_silence_cut(clip_offset, clip_offset + entries[0]["start"],
-                           f"leading silence {entries[0]['start']:.1f}s")
-        for i in range(1, len(entries)):
-            gap = entries[i]["start"] - entries[i - 1]["end"]
-            _maybe_silence_cut(
-                clip_offset + entries[i - 1]["end"],
-                clip_offset + entries[i]["start"],
-                f"pause {gap:.1f}s",
-            )
-        trail = clip_duration - entries[-1]["end"]
-        _maybe_silence_cut(clip_offset + entries[-1]["end"], clip_offset + clip_duration,
-                           f"trailing silence {trail:.1f}s")
+    if silence_ranges:
+        # Primary: FFmpeg amplitude analysis — catches everything including
+        # completely silent sections that Whisper never produced words for.
+        # No _COMPOSE_MAX_CUT_DURATION cap: these ranges are measured from
+        # the actual audio waveform and are reliable.
+        for sr in silence_ranges:
+            dur = sr["end"] - sr["start"]
+            if dur >= _COMPOSE_SILENCE_THRESHOLD:
+                cuts.append({
+                    "at":     round(clip_offset + sr["start"], 3),
+                    "end":    round(clip_offset + sr["end"],   3),
+                    "reason": f"silence {dur:.1f}s (audio)",
+                })
+    else:
+        # Fallback path for clips ingested before silence_ranges was stored.
+        def _maybe_silence_cut(at: float, end: float, reason: str) -> None:
+            dur = end - at
+            # Cap at 3s: Whisper/SRT gaps beyond this are likely transcript holes,
+            # not real silence the speaker is in.
+            if _COMPOSE_SILENCE_THRESHOLD <= dur <= _COMPOSE_MAX_CUT_DURATION:
+                cuts.append({"at": round(at, 3), "end": round(end, 3), "reason": reason})
+
+        if words:
+            _maybe_silence_cut(clip_offset, clip_offset + words[0]["start"],
+                               f"leading silence {words[0]['start']:.1f}s")
+            for i in range(1, len(words)):
+                gap = words[i]["start"] - words[i - 1]["end"]
+                _maybe_silence_cut(
+                    clip_offset + words[i - 1]["end"],
+                    clip_offset + words[i]["start"],
+                    f"pause {gap:.1f}s",
+                )
+            trail = clip_duration - words[-1]["end"]
+            _maybe_silence_cut(clip_offset + words[-1]["end"], clip_offset + clip_duration,
+                               f"trailing silence {trail:.1f}s")
+        elif entries:
+            _maybe_silence_cut(clip_offset, clip_offset + entries[0]["start"],
+                               f"leading silence {entries[0]['start']:.1f}s")
+            for i in range(1, len(entries)):
+                gap = entries[i]["start"] - entries[i - 1]["end"]
+                _maybe_silence_cut(
+                    clip_offset + entries[i - 1]["end"],
+                    clip_offset + entries[i]["start"],
+                    f"pause {gap:.1f}s",
+                )
+            trail = clip_duration - entries[-1]["end"]
+            _maybe_silence_cut(clip_offset + entries[-1]["end"], clip_offset + clip_duration,
+                               f"trailing silence {trail:.1f}s")
 
     # ── Filler words ─────────────────────────────────────────────────────────
     for entry in entries:
@@ -781,11 +849,16 @@ async def _run_ai_analysis(clips_ordered: List[Dict], story_type: str) -> Dict:
         srt = c.get("srt") or ""
         clip_type = c.get("clip_type", "speech")
         clip_words = c.get("words") or []
+        clip_silence_ranges = c.get("silence_ranges") or []
         # Parse SRT entries with global timestamps for GPT input
         srt_entries_global = []
-        if srt or clip_words:
+        if srt or clip_words or clip_silence_ranges:
             timing_cuts.extend(
-                _timing_cuts_from_clip(srt, cumulative, dur, clip_type, clip_words or None)
+                _timing_cuts_from_clip(
+                    srt, cumulative, dur, clip_type,
+                    clip_words or None,
+                    clip_silence_ranges or None,
+                )
             )
             for e in _srt_parse(srt):
                 srt_entries_global.append({
@@ -1426,19 +1499,30 @@ async def _ingest_one_clip(
         clip_type = await _detect_clip_type(tmp_path, probe)
         volume_boost = _compute_volume_boost(mean_db) if clip_type == "speech" else 1.0
 
-        # Run subject detection + cloudinary upload in parallel (independent)
+        # Run subject detection + cloudinary upload + silence detection in parallel.
+        # _detect_silences_ffmpeg runs on all speech clips regardless of story type —
+        # it only needs the local file and produces silence_ranges used at stitch time.
         if story_type == "founder" and clip_type == "speech":
-            subject_pos, cloud_url, transcript_data = await asyncio.gather(
+            subject_pos, cloud_url, transcript_data, silence_ranges = await asyncio.gather(
                 _detect_subject_position(tmp_path),
                 _upload_clip_to_cloudinary(raw_bytes, clip_id, filename),
                 _transcribe_clip(tmp_path),
+                _detect_silences_ffmpeg(tmp_path),
             )
+        elif clip_type == "speech":
+            subject_pos, cloud_url, silence_ranges = await asyncio.gather(
+                _detect_subject_position(tmp_path),
+                _upload_clip_to_cloudinary(raw_bytes, clip_id, filename),
+                _detect_silences_ffmpeg(tmp_path),
+            )
+            transcript_data = {"text": "", "srt": "", "words": []}
         else:
             subject_pos, cloud_url = await asyncio.gather(
                 _detect_subject_position(tmp_path),
                 _upload_clip_to_cloudinary(raw_bytes, clip_id, filename),
             )
             transcript_data = {"text": "", "srt": "", "words": []}
+            silence_ranges = []
 
         if not cloud_url:
             quality_flags.append("upload_failed")
@@ -1470,6 +1554,7 @@ async def _ingest_one_clip(
             "transcript": transcript_data["text"],
             "srt": transcript_data["srt"],
             "words": transcript_data["words"],
+            "silence_ranges": silence_ranges,
             "frame_url": None,
             "vision_description": None,
             "vision_role": None,
