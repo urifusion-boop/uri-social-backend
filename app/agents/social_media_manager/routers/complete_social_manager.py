@@ -5158,7 +5158,7 @@ async def _generate_image_bg(
                 else:
                     cta = brand_context.get("default_link", "Learn more")
 
-            image_result = await CustomVisualGuideV2Service.generate_image_with_v2_guide(
+            _v2_result = await CustomVisualGuideV2Service.generate_image_with_v2_guide(
                 guide_id=v2_guide_id,
                 seed_content=seed_content,
                 brand_context=minimal_brand_context,  # Minimal context for pure cloning
@@ -5168,6 +5168,20 @@ async def _generate_image_bg(
                 cta=cta,
                 db=db,
             )
+            # generate_image_with_v2_guide() returns its own {"success", "image_url",
+            # ...} shape (also used as-is by the standalone /custom-guides-v2/generate
+            # endpoint) — normalize it to the {"status", "responseData", "responseMessage"}
+            # shape the rest of this function expects from the standard generation flow.
+            # Without this, every successful V2 generation read as a failure below
+            # (status was never set on the raw V2 dict), so the real image was silently
+            # discarded and the draft was marked image_failed even though generation
+            # had already succeeded (confirmed live on production: "[V2] ✅ Image
+            # generated successfully" immediately followed by "BG image gen failed... None").
+            image_result = {
+                "status": _v2_result.get("success", False),
+                "responseData": {"image_url": _v2_result.get("image_url")},
+                "responseMessage": None if _v2_result.get("success") else "V2 guide image generation failed",
+            }
         else:
             # Standard generation flow (V1 guides or no custom guide)
             # Extract V2 reference image from brand_context if present (legacy fallback)
