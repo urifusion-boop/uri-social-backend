@@ -590,26 +590,36 @@ _COMPOSE_FILLER_RE = re.compile(
     r"^(um+|uh+|ah+|hmm+|er+|erm+|mhm+|uhh+|umm+|huh|mm+)$",
     re.IGNORECASE,
 )
-_COMPOSE_SILENCE_THRESHOLD = 1.2   # seconds — conservative; 0.9s was cutting Whisper gaps
-_COMPOSE_MAX_CUT_DURATION  = 3.0   # seconds — gaps longer than this are likely Whisper misses, not real silence
+_COMPOSE_SILENCE_THRESHOLD = 1.2   # seconds — gaps shorter than this are natural pauses, leave them
+_COMPOSE_MAX_CUT_DURATION  = 3.0   # seconds — longer gaps are likely Whisper misses, not real silence
+_COMPOSE_REPEAT_WINDOW     = 60.0  # seconds — scan this far ahead for repeated sentences
+_COMPOSE_REPEAT_THRESHOLD  = 0.65  # Jaccard similarity on content words to flag a repetition
+_COMPOSE_REPEAT_MIN_WORDS  = 4     # minimum content words before repetition check fires
+
+# Common words excluded from repetition similarity so "I think we should" doesn't
+# match "I think you should" as a repetition.
+_STOP_WORDS: set = {
+    "a", "an", "the", "is", "was", "are", "were", "i", "to", "of", "and",
+    "or", "in", "on", "at", "it", "this", "that", "my", "me", "we", "you",
+    "he", "she", "they", "but", "so", "if", "as", "for", "with", "be",
+    "have", "has", "had", "do", "did", "not", "from", "by", "about", "just",
+    "like", "what", "when", "how", "all", "there", "their", "your", "our",
+    "its", "up", "out", "which", "who", "then", "than", "into", "also",
+    "very", "really", "actually", "basically", "right", "yeah", "okay",
+}
 
 
-def _timing_cuts_from_clip_srt(srt: str, clip_offset: float, clip_duration: float, clip_type: str = "speech") -> List[Dict]:
-    """
-    Parse a single clip's SRT string and return cuts (in global timeline coordinates)
-    for silences (gaps between SRT entries) and whole-entry filler words.
+def _content_words(text: str) -> set:
+    words = re.sub(r"[^\w\s]", "", text.lower()).split()
+    return {w for w in words if w not in _STOP_WORDS and len(w) > 2}
 
-    Only runs on speech clips — silent/still clips have no SRT so their
-    gaps would be misread as silence. Caps each cut at _COMPOSE_MAX_CUT_DURATION
-    to avoid removing sections where Whisper simply missed transcription.
-    """
-    if clip_type != "speech":
-        return []
 
-    def _parse_ts(ts: str) -> float:
-        h, m, rest = ts.split(":")
-        s, ms = rest.replace(",", ".").split(".")
-        return int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000
+def _srt_parse(srt: str) -> List[Dict]:
+    """Parse an SRT string into [{start, end, text}] entries."""
+    def _ts(s: str) -> float:
+        h, m, rest = s.split(":")
+        sec, ms = rest.replace(",", ".").split(".")
+        return int(h) * 3600 + int(m) * 60 + int(sec) + int(ms) / 1000
 
     entries = []
     for block in [b.strip() for b in srt.strip().split("\n\n") if b.strip()]:
@@ -618,38 +628,55 @@ def _timing_cuts_from_clip_srt(srt: str, clip_offset: float, clip_duration: floa
             continue
         parts = lines[1].split(" --> ")
         entries.append({
-            "start": _parse_ts(parts[0].strip()),
-            "end":   _parse_ts(parts[1].strip()),
+            "start": _ts(parts[0].strip()),
+            "end":   _ts(parts[1].strip()),
             "text":  " ".join(lines[2:]).strip(),
         })
+    return entries
 
+
+def _timing_cuts_from_clip_srt(srt: str, clip_offset: float, clip_duration: float, clip_type: str = "speech") -> List[Dict]:
+    """
+    Parse a single clip's SRT and return cuts (global timeline coordinates) for:
+      - Silences: gaps between SRT entries >= 1.2s and <= 3.0s
+      - Long pauses: leading/trailing silence within same bounds
+      - Filler words: whole SRT entries that are just um/uh/hmm etc.
+      - Repeated sentences: SRT entries with >= 65% content-word overlap
+        within a 60s window (second occurrence gets cut)
+
+    Only runs on speech clips. Gaps > 3s are skipped — likely Whisper misses.
+    """
+    if clip_type != "speech":
+        return []
+
+    entries = _srt_parse(srt)
     if not entries:
         return []
 
     cuts: List[Dict] = []
 
-    def _maybe_cut(at: float, end: float, reason: str) -> None:
-        duration = end - at
-        if _COMPOSE_SILENCE_THRESHOLD <= duration <= _COMPOSE_MAX_CUT_DURATION:
+    def _maybe_silence_cut(at: float, end: float, reason: str) -> None:
+        dur = end - at
+        if _COMPOSE_SILENCE_THRESHOLD <= dur <= _COMPOSE_MAX_CUT_DURATION:
             cuts.append({"at": round(at, 3), "end": round(end, 3), "reason": reason})
 
-    # Leading silence before first word
-    _maybe_cut(clip_offset, clip_offset + entries[0]["start"],
-               f"leading silence {entries[0]['start']:.1f}s")
+    # ── Silences and long pauses ──────────────────────────────────────────────
+    _maybe_silence_cut(clip_offset, clip_offset + entries[0]["start"],
+                       f"leading silence {entries[0]['start']:.1f}s")
 
-    # Gaps between SRT entries
     for i in range(1, len(entries)):
-        gap_start = entries[i - 1]["end"]
-        gap_end   = entries[i]["start"]
-        gap = gap_end - gap_start
-        _maybe_cut(clip_offset + gap_start, clip_offset + gap_end, f"silence {gap:.1f}s")
+        gap = entries[i]["start"] - entries[i - 1]["end"]
+        _maybe_silence_cut(
+            clip_offset + entries[i - 1]["end"],
+            clip_offset + entries[i]["start"],
+            f"pause {gap:.1f}s",
+        )
 
-    # Trailing silence after last word
     trail = clip_duration - entries[-1]["end"]
-    _maybe_cut(clip_offset + entries[-1]["end"], clip_offset + clip_duration,
-               f"trailing silence {trail:.1f}s")
+    _maybe_silence_cut(clip_offset + entries[-1]["end"], clip_offset + clip_duration,
+                       f"trailing silence {trail:.1f}s")
 
-    # Whole-entry filler words (um, uh, etc.)
+    # ── Filler words ─────────────────────────────────────────────────────────
     for entry in entries:
         clean = entry["text"].lower().strip(".,!?;:\"' ")
         if _COMPOSE_FILLER_RE.match(clean):
@@ -658,6 +685,36 @@ def _timing_cuts_from_clip_srt(srt: str, clip_offset: float, clip_duration: floa
                 "end":    round(clip_offset + entry["end"],   3),
                 "reason": f'filler: "{entry["text"]}"',
             })
+
+    # ── Repeated sentences ────────────────────────────────────────────────────
+    # Compare each entry against earlier entries within the repeat window.
+    # If content-word Jaccard >= threshold, the later one is a repeat → cut it.
+    already_flagged: set = set()
+    for i in range(len(entries)):
+        if i in already_flagged:
+            continue
+        cw_i = _content_words(entries[i]["text"])
+        if len(cw_i) < _COMPOSE_REPEAT_MIN_WORDS:
+            continue
+        for j in range(i + 1, len(entries)):
+            if entries[j]["start"] - entries[i]["end"] > _COMPOSE_REPEAT_WINDOW:
+                break
+            if j in already_flagged:
+                continue
+            cw_j = _content_words(entries[j]["text"])
+            if len(cw_j) < _COMPOSE_REPEAT_MIN_WORDS:
+                continue
+            union = len(cw_i | cw_j)
+            if union == 0:
+                continue
+            similarity = len(cw_i & cw_j) / union
+            if similarity >= _COMPOSE_REPEAT_THRESHOLD:
+                cuts.append({
+                    "at":     round(clip_offset + entries[j]["start"], 3),
+                    "end":    round(clip_offset + entries[j]["end"],   3),
+                    "reason": f'repeated: "{entries[j]["text"][:60]}"',
+                })
+                already_flagged.add(j)
 
     return cuts
 
@@ -693,7 +750,7 @@ async def _run_ai_analysis(clips_ordered: List[Dict], story_type: str) -> Dict:
     import json as _json
     from openai import AsyncOpenAI
 
-    # ── Layer 1: timing-based silence + filler detection ─────────────────────
+    # ── Layer 1: timing-based silence, pause, filler, repetition detection ───
     timing_cuts: List[Dict] = []
     cumulative = 0.0
     clip_entries = []
@@ -703,13 +760,22 @@ async def _run_ai_analysis(clips_ordered: List[Dict], story_type: str) -> Dict:
         dur = float(c.get("duration_seconds") or 10)
         srt = c.get("srt") or ""
         clip_type = c.get("clip_type", "speech")
+        # Parse SRT entries with global timestamps for GPT input
+        srt_entries_global = []
         if srt:
             timing_cuts.extend(_timing_cuts_from_clip_srt(srt, cumulative, dur, clip_type))
+            for e in _srt_parse(srt):
+                srt_entries_global.append({
+                    "start": round(cumulative + e["start"], 2),
+                    "end":   round(cumulative + e["end"],   2),
+                    "text":  e["text"],
+                })
         clip_entries.append({
-            "start": cumulative,
-            "end": cumulative + dur,
-            "clip_type": c.get("clip_type", "speech"),
-            "transcript": (c.get("transcript") or "").strip()[:300],
+            "start":      cumulative,
+            "end":        cumulative + dur,
+            "clip_type":  clip_type,
+            "transcript": (c.get("transcript") or "").strip(),   # full text, no truncation
+            "srt_lines":  srt_entries_global,
         })
         cumulative += dur
 
@@ -718,37 +784,53 @@ async def _run_ai_analysis(clips_ordered: List[Dict], story_type: str) -> Dict:
 
     total_duration = cumulative
 
-    # ── Layer 2: GPT content analysis ─────────────────────────────────────────
-    clips_text = "\n".join([
-        f"Clip {i + 1} ({e['start']:.1f}s–{e['end']:.1f}s, {e['clip_type']}): "
-        + (f'"{e["transcript"]}"' if e["transcript"] else "(no speech)")
-        for i, e in enumerate(clip_entries)
-    ])
+    # ── Layer 2: GPT content analysis with timestamped transcript ─────────────
+    # Build a per-clip block showing every SRT line with its exact timestamps.
+    # GPT uses these timestamps directly for cut coordinates.
+    clip_blocks: List[str] = []
+    for i, e in enumerate(clip_entries):
+        header = f"Clip {i + 1} ({e['start']:.1f}s–{e['end']:.1f}s, {e['clip_type']})"
+        if e["srt_lines"]:
+            lines = "\n".join(
+                f"  [{sl['start']:.1f}s–{sl['end']:.1f}s] \"{sl['text']}\""
+                for sl in e["srt_lines"]
+            )
+            clip_blocks.append(f"{header}:\n{lines}")
+        elif e["transcript"]:
+            clip_blocks.append(f"{header}: \"{e['transcript']}\"")
+        else:
+            clip_blocks.append(f"{header}: (no speech)")
+    clips_text = "\n\n".join(clip_blocks)
 
-    # Tell GPT about already-detected timing cuts so it focuses on content cuts only
-    timing_cut_summary = (
-        f"Timing-based cuts already detected (silences/fillers): "
-        + ", ".join(f"{c['at']:.1f}s–{c['end']:.1f}s" for c in timing_cuts[:8])
-        if timing_cuts else "No timing-based cuts detected."
+    already_cut_str = (
+        "Already cut by timing analysis (silences/pauses/fillers/repeats detected from audio timing):\n"
+        + "\n".join(f"  {c['at']:.1f}s–{c['end']:.1f}s — {c['reason']}" for c in timing_cuts[:12])
+        if timing_cuts else "No timing-based cuts detected yet."
     )
 
     prompt = (
-        f"You are a professional video editor. Analyze this {story_type} style video "
-        f"({total_duration:.0f}s total) and return editing decisions.\n\n"
-        f"Clips:\n{clips_text}\n\n"
-        f"{timing_cut_summary}\n\n"
-        f"Return ONLY a JSON object — no extra text, no markdown:\n"
-        f'{{"cuts": [{{"at": <float>, "end": <float>, "reason": "<why>"}}], '
-        f'"zooms": [{{"at": <float>, "duration": <float>, "reason": "<impactful moment>"}}], '
-        f'"transition_style": "cut" | "fade" | "slide" | "zoom", '
-        f'"summary": "<one sentence summary of the video>"}}\n\n'
-        f"Rules:\n"
-        f"- 0–3 ADDITIONAL content cuts for repetitions, off-topic tangents, or contradictions. "
-        f"Do NOT re-cut ranges already covered by the timing cuts above. at >= 0, end <= {total_duration:.1f}.\n"
-        f"- 1–3 zoom moments on the most compelling or emotional phrases. duration 1.0–3.0 s.\n"
-        f"- Cuts must not overlap each other or the timing cuts. Zooms must stay within clip bounds.\n"
-        f"- transition_style must match the energy: founder → cut or slide, product → fade or zoom.\n"
-        f"- Only the JSON object."
+        f"You are a professional video editor cutting a {story_type} video ({total_duration:.0f}s).\n"
+        f"The transcript below shows every spoken sentence with its exact timestamp in the final video.\n\n"
+        f"TRANSCRIPT:\n{clips_text}\n\n"
+        f"ALREADY HANDLED:\n{already_cut_str}\n\n"
+        f"Return ONLY valid JSON — no markdown, no extra text:\n"
+        f'{{"cuts":[{{"at":<float>,"end":<float>,"reason":"<why>"}}],'
+        f'"zooms":[{{"at":<float>,"duration":<float>,"reason":"<phrase>"}}],'
+        f'"transition_style":"cut"|"fade"|"slide"|"zoom",'
+        f'"summary":"<one sentence>"}}\n\n'
+        f"RULES FOR CUTS — be aggressive, this should feel tight:\n"
+        f"1. Repeated sentences or phrases: if the same idea or sentence (≥4 key words) appears "
+        f"more than once, cut every occurrence AFTER the first. Use the exact [Xs–Ys] timestamps shown.\n"
+        f"2. Meandering or off-topic tangents: sentences that don't advance the main point.\n"
+        f"3. Contradictions or take-backs: 'actually no, what I meant was...' — cut the false start.\n"
+        f"4. Do NOT cut ranges already listed in ALREADY HANDLED.\n"
+        f"5. Do NOT cut anything not in the transcript. at >= 0, end <= {total_duration:.1f}.\n"
+        f"6. Each kept segment between cuts must be ≥ 2s.\n\n"
+        f"RULES FOR ZOOMS:\n"
+        f"- 1–3 moments where the speaker makes their strongest or most emotional point.\n"
+        f"- duration 1.0–3.0s. Must fall within a clip that has speech.\n\n"
+        f"transition_style: match the energy — founder → 'cut' or 'slide', product → 'fade' or 'zoom'.\n"
+        f"Only the JSON object."
     )
 
     gpt_cuts: List[Dict] = []
@@ -762,7 +844,7 @@ async def _run_ai_analysis(clips_ordered: List[Dict], story_type: str) -> Dict:
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
-            max_tokens=700,
+            max_tokens=1200,
         )
         raw = resp.choices[0].message.content.strip()
         if raw.startswith("```"):
