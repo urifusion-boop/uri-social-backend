@@ -488,6 +488,10 @@ class MetaLaunchFromMessageBody(BaseModel):
     category: str = ""
     page_id: str = ""                     # override the target page (multi-client); defaults to META_ADS_PAGE_ID
     conversation_cost_ngn: float = Field(500.0, gt=0)
+    creative_source: str = "generate"     # generate | upload | draft
+    reference_image_url: str = ""         # required for creative_source=upload (from /creative/upload)
+    is_video: bool = False                # is reference_image_url a video?
+    draft_id: str = ""                    # required for creative_source=draft (from /creative/drafts)
 
 
 @router.post("/meta/launch-from-message")
@@ -504,7 +508,7 @@ async def meta_launch_from_message(
     import uuid
     from app.core.config import settings
     from .adapters.meta import MetaAdPlatformAdapter, MetaAPIError
-    from .creative import generate_ad_creative
+    from .creative import creative_from_draft, creative_from_upload, generate_ad_creative
     from .decision_engine import apply_platform_override, plan_campaign
     from .models import PlanDecision, SpendAuthorization
     from .nl import parse_message, to_campaign_request
@@ -514,6 +518,10 @@ async def meta_launch_from_message(
     page_id = body.page_id or settings.META_ADS_PAGE_ID
     if not page_id:
         raise HTTPException(status_code=400, detail="No target page — set META_ADS_PAGE_ID or pass page_id")
+    if body.creative_source == "upload" and not body.reference_image_url:
+        raise HTTPException(status_code=400, detail="reference_image_url is required for creative_source=upload")
+    if body.creative_source == "draft" and not body.draft_id:
+        raise HTTPException(status_code=400, detail="draft_id is required for creative_source=draft")
 
     # 1. Jane reads the plain-English message.
     parsed = await parse_message(body.message, body.business_name, body.category)
@@ -554,11 +562,28 @@ async def meta_launch_from_message(
         except Exception as e:
             print(f"[oneshot] geo skipped: {e}", flush=True)
 
-    # 4. Jane generates a real, branded ad creative (image hosted on Cloudinary).
-    creative = await generate_ad_creative(
-        req.business_name or body.business_name or "Your Business",
-        req.category or body.category, req.goal.value, req.description, city=parsed.city,
-    )
+    # 4. The ad creative — Jane generates it, or the caller supplies their own upload/draft.
+    business_name = req.business_name or body.business_name or "Your Business"
+    category = req.category or body.category
+    user_id = brand_ctx.get("user_id", "")
+    brand_id = brand_ctx.get("brand_id")
+    if body.creative_source == "upload":
+        creative = await creative_from_upload(
+            business_name, category, body.reference_image_url, req.goal.value, req.description,
+            user_id=user_id, db=db, brand_id=brand_id, is_video=body.is_video,
+        )
+    elif body.creative_source == "draft":
+        creative = await creative_from_draft(
+            business_name, category, body.draft_id, user_id, db,
+            goal=req.goal.value, brand_id=brand_id,
+        )
+        if creative is None:
+            raise HTTPException(status_code=404, detail="Draft not found or has no image")
+    else:
+        creative = await generate_ad_creative(
+            business_name, category, req.goal.value, req.description,
+            user_id=user_id, db=db, brand_id=brand_id, city=parsed.city,
+        )
     if not creative.image_url:
         raise HTTPException(status_code=502, detail="Jane couldn't generate the ad image (creative service). Try again.")
 
@@ -669,15 +694,87 @@ async def meta_campaigns(
         }
         if adapter and r.get("campaign_id"):
             try:
-                spends = await adapter.fetch_per_ad_spend(r["campaign_id"])
-                total_spend = round(sum(s.spend_ngn for s in spends), 2)
-                convos = int(r.get("last_conversation_count", 0))
-                row["metrics"] = {"spend_ngn": total_spend, "conversations": convos}
+                summary = await adapter.fetch_campaign_summary(r["campaign_id"])
+                row["status"] = summary["delivery"].lower()
+                row["metrics"] = {
+                    "spend_ngn": round(summary["spend_ngn"], 2),
+                    "conversations": summary["conversations"],
+                    "cost_per_conversation_ngn": (
+                        round(summary["cost_per_conversation_ngn"], 2)
+                        if summary["cost_per_conversation_ngn"] is not None else None
+                    ),
+                    "impressions": summary["impressions"],
+                    "reach": summary["reach"],
+                    "delivery": summary["delivery"],
+                    "ends_at": summary["ends_at"],
+                }
             except Exception as e:
                 print(f"[campaigns] metrics failed for {r.get('campaign_id')}: {e}", flush=True)
         out.append(row)
 
     return {"campaigns": out}
+
+
+class CampaignStatusBody(BaseModel):
+    active: bool
+
+
+@router.post("/meta/campaigns/{campaign_id}/status")
+async def set_meta_campaign_status(
+    campaign_id: str,
+    body: CampaignStatusBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Turn a campaign on or off from the caller's own campaign-management view —
+    no Ads Manager needed. Scoped to the caller's active brand so a campaign_id
+    can't be toggled by anyone outside the brand that owns it. Going active is the
+    one genuinely consequential action here — real budget can start being spent."""
+    from app.core.config import settings
+    from .adapters.meta import MetaAdPlatformAdapter, MetaAPIError
+
+    brand_id = brand_ctx.get("brand_id")
+    record = await db["jane_ads_meta_campaigns"].find_one({"campaign_id": campaign_id})
+    if not record or record.get("brand_id") != brand_id:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if not (settings.META_AD_ACCOUNT_ID and settings.META_ADS_ACCESS_TOKEN):
+        raise HTTPException(status_code=400, detail="Meta ads not configured")
+
+    adapter = MetaAdPlatformAdapter(db, access_token=settings.META_ADS_ACCESS_TOKEN)
+    try:
+        result = await adapter.set_delivery(campaign_id, body.active)
+    except MetaAPIError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    return result
+
+
+@router.delete("/meta/campaigns/{campaign_id}")
+async def delete_meta_campaign(
+    campaign_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Permanently delete a campaign — from the caller's own campaign-management view,
+    scoped to their active brand so a campaign_id can't be deleted by anyone outside
+    the brand that owns it. Removes it from OUR list too, not just Meta's side."""
+    from app.core.config import settings
+    from .adapters.meta import MetaAdPlatformAdapter, MetaAPIError
+
+    brand_id = brand_ctx.get("brand_id")
+    record = await db["jane_ads_meta_campaigns"].find_one({"campaign_id": campaign_id})
+    if not record or record.get("brand_id") != brand_id:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if not (settings.META_AD_ACCOUNT_ID and settings.META_ADS_ACCESS_TOKEN):
+        raise HTTPException(status_code=400, detail="Meta ads not configured")
+
+    adapter = MetaAdPlatformAdapter(db, access_token=settings.META_ADS_ACCESS_TOKEN)
+    try:
+        await adapter.delete_campaign(campaign_id)
+    except MetaAPIError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+    await db["jane_ads_meta_campaigns"].delete_one({"campaign_id": campaign_id})
+    return {"deleted": True}
 
 
 @router.get("/demo", response_class=HTMLResponse)
