@@ -5046,22 +5046,11 @@ async def _generate_image_bg(
 
             from app.agents.social_media_manager.services.custom_visual_guide_v2_service import CustomVisualGuideV2Service
 
-            # Style cloning with the brand's real identity — the art-director
-            # meta-prompt maps the reference's color STRATEGY onto these colors
-            # (and describes the logo/font/tone), so omitting them here doesn't
-            # mean "no color guidance" — it means the template's hardcoded
-            # fallback colors (#000000/#FFFFFF/#FF0000) get used instead, which
-            # is why V2 renders used to come out black/white/red regardless of
-            # the brand's actual palette.
+            # Pure style cloning - minimal brand context (no colors, no styles)
             minimal_brand_context = {
                 "brand_name": brand_context.get("brand_name", ""),
                 "logo_url": brand_context.get("logo_url", ""),
                 "logo_position": brand_context.get("logo_position", "bottom_right"),
-                "logo_description": brand_context.get("logo_description", "brand logo"),
-                "brand_colors": brand_context.get("brand_colors") or [],
-                "font_style": brand_context.get("font_style") or brand_context.get("primary_font", ""),
-                "tone": brand_context.get("brand_voice") or brand_context.get("tone", "professional"),
-                "default_link": brand_context.get("default_link", ""),
             }
 
             # Extract headline/subtext/cta from content if available
