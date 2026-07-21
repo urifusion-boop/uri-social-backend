@@ -4549,6 +4549,7 @@ async def upload_brand_logo(
     import os, uuid
 
     user_id = ctx["user_id"]
+    brand_id = ctx.get("brand_id")
 
     allowed_types = {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/svg+xml"}
     if file.content_type not in allowed_types:
@@ -4562,11 +4563,31 @@ async def upload_brand_logo(
         from app.utils.cloudinary_upload import upload_bytes
         logo_url = await upload_bytes(contents, folder="uri-social/logos")
 
-        await db["brand_profiles"].update_one(
-            {"user_id": user_id},
-            {"$set": {"logo_url": logo_url, "updated_at": datetime.utcnow()}},
-            upsert=True,
-        )
+        # Scope the write to the ACTIVE brand. This previously updated
+        # {"user_id": user_id} with no brand_id, so for a multi-brand account
+        # update_one wrote the logo onto whichever profile matched first — a
+        # DIFFERENT brand than the one being edited (observed live: two brands
+        # under one account ended up sharing a single logo).
+        from app.models.brand_account import BrandAccount
+        personal_bid = BrandAccount.personal_brand_id(user_id)
+        if brand_id and brand_id != personal_bid:
+            scope = {"brand_id": brand_id}
+            set_fields = {"logo_url": logo_url, "brand_id": brand_id,
+                          "user_id": user_id, "updated_at": datetime.utcnow()}
+        else:
+            # personal/solo brand — prefer the brand_id-keyed doc, else the
+            # legacy user_id-only doc (from before brand_id existed).
+            legacy = await db["brand_profiles"].find_one(
+                {"user_id": user_id, "brand_id": {"$exists": False}}, {"_id": 1})
+            if legacy:
+                scope = {"user_id": user_id, "brand_id": {"$exists": False}}
+                set_fields = {"logo_url": logo_url, "updated_at": datetime.utcnow()}
+            else:
+                scope = {"brand_id": personal_bid}
+                set_fields = {"logo_url": logo_url, "brand_id": personal_bid,
+                              "user_id": user_id, "updated_at": datetime.utcnow()}
+
+        await db["brand_profiles"].update_one(scope, {"$set": set_fields}, upsert=True)
 
         return UriResponse.get_single_data_response("logo_upload", {"logo_url": logo_url})
 
