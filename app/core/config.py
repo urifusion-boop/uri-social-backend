@@ -154,6 +154,9 @@ class Settings(BaseSettings):
     SMTP_FROM_NAME: str = "URI Social"
     SMTP_USE_TLS: bool = True
     ADMIN_NOTIFICATION_EMAIL: str = ""
+    # Comma-separated emails allowed to see the Jane Ads admin billing report
+    # (all-users ad spend / margin). Empty = the report is disabled.
+    JANE_ADS_ADMIN_EMAILS: str = ""
 
     # Sentry (optional)
     SENTRY_DSN: Optional[str] = None
