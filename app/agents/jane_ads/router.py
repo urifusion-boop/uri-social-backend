@@ -621,8 +621,17 @@ async def _build_campaign_plan(
     # already learned launching their last campaign here (PRD §6). Only meaningful
     # for a real brand context; a one-shot anonymous business_id has no history.
     history = await get_campaign_history(db, business_id) if brand_ctx.get("brand_id") else []
-    known_business_name = body.business_name or remembered_business_name(history)
-    known_category = body.category or remembered_category(history)
+    # The logged-in brand already has its name + industry on file (the SAME brand
+    # playbook normal content generation reads), so Jane must never ask a signed-in
+    # brand "what's your business?" — that's the whole point of being logged in.
+    # Precedence: what they said in THIS request → what a past campaign remembered →
+    # the brand profile on the account.
+    brand_profile = (await get_brand_context(brand_ctx.get("user_id", ""), db, brand_ctx.get("brand_id"))
+                     if brand_ctx.get("user_id") else {})
+    known_business_name = (body.business_name or remembered_business_name(history)
+                           or brand_profile.get("brand_name", ""))
+    known_category = (body.category or remembered_category(history)
+                      or brand_profile.get("industry", ""))
     known_budget = remembered_budget_ngn(history)
 
     # 1. Jane reads the plain-English message.
