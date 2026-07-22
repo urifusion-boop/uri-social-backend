@@ -626,6 +626,19 @@ Return only the JSON. No preamble, no explanation."""
             # sameness.
             variation_directive = random.choice(CustomVisualGuideV2Service.VARIATION_DIRECTIVES)
 
+            # Identity instruction — the reference photo often shows one specific
+            # person or product. Without calling that out explicitly, the same
+            # face/pose/outfit or the same product packaging kept reappearing in
+            # every generation, since the model is editing that literal photo.
+            imagery_style = style_profile.get("imagery_style", {})
+            subject_type = imagery_style.get("subject_type", "")
+            if subject_type == "person":
+                identity_instruction = "The reference features a specific person — depict a DIFFERENT person (different face, pose, and outfit) of the same general type and mood. Never reproduce the same individual."
+            elif subject_type == "product":
+                identity_instruction = "The reference features a specific product — depict a DIFFERENT specific product of the same general category. Never reproduce the same packaging, label, or exact product shape."
+            else:
+                identity_instruction = ""
+
             # Build structured prompt similar to standard generation
             # Use sections to separate style instructions from content (prevents verbatim rendering)
 
@@ -638,6 +651,7 @@ Typography: {text_placement} placement, {text_treatment} style
 
 Match the reference image's medium, mood, and overall composition family closely —
 but this is a NEW piece, not a duplicate of the reference. {variation_directive}
+{identity_instruction}
 Include MINIMAL text - just a short headline and small CTA.
 Do NOT copy logos or brand names from the reference."""
 
@@ -672,12 +686,17 @@ Do NOT style it as a button or banner."""
             image_height = specs.get("height", 630)
             print(f"[V2] Platform dimensions: {image_width}x{image_height} ({specs.get('format', 'unknown')})")
 
-            # Generate with platform-specific dimensions + reference image for style
+            # Generate with platform-specific dimensions + reference image for style.
+            # input_fidelity="low" tells GPT-Image-2 to treat the reference as loose
+            # inspiration (composition/color/mood) rather than a photo to reproduce
+            # closely — without this, a specific face or product in the guide's
+            # reference photo came out looking nearly identical in every generation.
             image_response = await ImageContentService._call_dalle_api(
                 prompt=final_prompt,
                 size=f"{image_width}x{image_height}",
                 reference_image=reference_image_url,  # ← ACTUAL reference image for style
                 image_model="openai/gpt-image-2",
+                input_fidelity="low",
             )
 
             if not image_response.get('success'):
