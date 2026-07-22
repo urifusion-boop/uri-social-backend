@@ -538,7 +538,7 @@ async def _build_campaign_plan(
     failures (bad config, unsupported creative, policy block, generation failure)."""
     import uuid
     from app.core.config import settings
-    from .creative import creative_from_draft, creative_from_upload, generate_ad_creative
+    from .creative import creative_from_draft, creative_from_upload, generate_ad_creative, get_brand_context, write_shoot_script
     from .decision_engine import apply_platform_override, plan_campaign
     from .history import get_campaign_history, remembered_budget_ngn, remembered_business_name, remembered_category
     from .nl import parse_message, to_campaign_request
@@ -688,7 +688,23 @@ async def _build_campaign_plan(
     plan.page_id = page_id
     plan.creative = creative
     if creative.video_recommendation:
-        plan.explanation = f"{plan.explanation} {creative.video_recommendation} You can upload a video instead before launching if you'd like."
+        # Path C (PRD §4.1): gpt-image-1 can't shoot the recommended video itself, so
+        # hand the user a phone-filmable script instead of just a suggestion — film
+        # it, upload it (POST /creative/upload), then swap it into this plan via
+        # POST /meta/plan/{plan_id}/creative before launching.
+        try:
+            plan.shoot_script = await write_shoot_script(
+                business_name, category, req.goal.value, creative.video_recommendation,
+                req.description, await get_brand_context(user_id, db, brand_id) if user_id else {},
+            )
+        except Exception as e:
+            print(f"[oneshot] shoot script skipped: {e}", flush=True)
+        nudge = (
+            "Film this yourself and I'll turn it into your ad — see the shoot script."
+            if plan.shoot_script and plan.shoot_script.shots
+            else "You can upload a video instead before launching if you'd like."
+        )
+        plan.explanation = f"{plan.explanation} {creative.video_recommendation} {nudge}"
 
     return _PlanBuildResult(
         business_id=business_id, req=req, plan=plan, jane_platforms=jane_platforms,
@@ -730,6 +746,7 @@ def _plan_response_dict(built: _PlanBuildResult) -> dict:
             "trace": plan.trace,
         },
         "creative": plan.creative.model_dump(mode="json"),
+        "shoot_script": plan.shoot_script.model_dump(mode="json") if plan.shoot_script else None,
         "budget_estimate": built.budget_estimate,
     }
 
@@ -873,6 +890,49 @@ async def meta_plan_from_message(
             "sufficient": sufficient,
         },
     }
+
+
+class PlanCreativeUpdateBody(BaseModel):
+    reference_image_url: str        # from POST /creative/upload — the user's own shot footage
+    is_video: bool = True
+
+
+@router.post("/meta/plan/{plan_id}/creative")
+async def meta_plan_update_creative(
+    plan_id: str,
+    body: PlanCreativeUpdateBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Path C, step 2 — fold the user's own shot footage back into a pending plan
+    before launch: Jane wrote the shoot script (see plan.shoot_script), the user
+    filmed it and uploaded it via POST /creative/upload, and this swaps that media
+    into the plan in place of the AI-generated photo. Copy/headline/CTA are kept —
+    only the media and source change. Policy is re-checked again anyway at launch."""
+    from .models import AdCreative, CreativeSource
+
+    doc = await db["jane_ads_pending_plans"].find_one({"plan_id": plan_id})
+    if not doc or doc.get("brand_id") != brand_ctx.get("brand_id"):
+        raise HTTPException(status_code=404, detail="Plan not found")
+    if doc["status"] != "pending":
+        raise HTTPException(status_code=409, detail=f"This plan is already {doc['status']} — describe a new campaign to Jane to plan another.")
+    if not body.reference_image_url:
+        raise HTTPException(status_code=400, detail="reference_image_url is required — upload the footage via /creative/upload first.")
+
+    plan = CampaignPlan.model_validate(doc["plan"])
+    plan.creative = AdCreative(
+        image_url=body.reference_image_url,
+        is_video=body.is_video,
+        headline=plan.creative.headline,
+        primary_text=plan.creative.primary_text,
+        cta=plan.creative.cta,
+        source=CreativeSource.UPLOAD,
+        generated=True,
+    )
+    await db["jane_ads_pending_plans"].update_one(
+        {"plan_id": plan_id}, {"$set": {"plan": plan.model_dump(mode="json")}},
+    )
+    return {"plan_id": plan_id, "creative": plan.creative.model_dump(mode="json")}
 
 
 @router.post("/meta/plan/{plan_id}/launch")
