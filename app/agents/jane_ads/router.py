@@ -24,6 +24,7 @@ from .adapters.mock import MockAdPlatformAdapter
 from .decision_engine import apply_platform_override, plan_campaign
 from .instrumentation import InstrumentationService, MongoInstrumentationStore
 from .models import (
+    CampaignPlan,
     CampaignRequest,
     CreativeContext,
     CreativeKind,
@@ -508,27 +509,37 @@ class MetaLaunchFromMessageBody(BaseModel):
     draft_id: str = ""                    # required for creative_source=draft (from /creative/drafts)
 
 
-@router.post("/meta/launch-from-message")
-async def meta_launch_from_message(
-    body: MetaLaunchFromMessageBody,
-    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    brand_ctx: dict = Depends(get_active_brand_context),
-) -> dict:
-    """The full one-shot flow, for the demo: plain-English message → Jane understands it
-    → decides the platform (with her reasoning) → generates a real branded ad creative
-    → pushes a REAL campaign to Meta (created PAUSED, zero spend) → returns everything,
-    including a direct Ads Manager link. `page_id` can target a specific client's Page
-    (the multi-client model); it defaults to URI's own configured page."""
+class _PlanBuildResult(BaseModel):
+    """Everything both the one-shot endpoint and the plan-then-launch endpoints need,
+    after Jane has understood the message and worked out what to do — but before
+    either of them decides whether/when to actually touch Meta. `plan` already has
+    `page_id` and `creative` attached, so callers can persist or launch it as-is."""
+    business_id: str
+    req: CampaignRequest
+    plan: CampaignPlan
+    jane_platforms: list[str]
+    forced_to_meta: bool
+    geo_dump: Optional[dict] = None
+    understood: dict
+
+
+async def _build_campaign_plan(
+    body: MetaLaunchFromMessageBody, brand_ctx: dict, db: AsyncIOMotorDatabase,
+) -> "_PlanBuildResult | dict":
+    """Shared by /meta/launch-from-message (plan + launch in one call) and
+    /meta/plan-from-message (plan only, launched later via /meta/plan/{id}/launch) —
+    understand the message, decide the platform, refine geo, and produce the ad
+    creative, ending with the policy gate (one bad ad risks the whole pooled ad
+    account, so it's checked here regardless of which caller is planning).
+    Returns a dict with an "early_return" key for the need_more/advise stages —
+    the caller should return that dict directly. Raises HTTPException for hard
+    failures (bad config, unsupported creative, policy block, generation failure)."""
     import uuid
     from app.core.config import settings
-    from .adapters.meta import MetaAdPlatformAdapter, MetaAPIError
     from .creative import creative_from_draft, creative_from_upload, generate_ad_creative
     from .decision_engine import apply_platform_override, plan_campaign
-    from .models import PlanDecision
     from .nl import parse_message, to_campaign_request
     from .policy import Severity, review_ad_creative
-    from .store import MongoWalletStore
-    from .wallet import WalletService
 
     if not (settings.META_AD_ACCOUNT_ID and settings.META_ADS_ACCESS_TOKEN):
         raise HTTPException(status_code=400, detail="Meta ads not configured — need META_AD_ACCOUNT_ID and META_ADS_ACCESS_TOKEN")
@@ -542,9 +553,9 @@ async def meta_launch_from_message(
     if body.creative_source == "upload" and body.is_video:
         # MetaAdPlatformAdapter.launch_campaign already rejects this safely (Meta
         # needs a /advideos + video_data shape, not built yet) before creating
-        # anything on Meta — but only after the wallet/geo/policy work below runs,
-        # with an implementation-detail message. Fail fast here instead, with a
-        # message the caller can actually act on.
+        # anything on Meta — but only after the geo/creative work below runs, with
+        # an implementation-detail message. Fail fast here instead, with a message
+        # the caller can actually act on.
         raise HTTPException(status_code=400, detail="Video ads aren't supported yet — please upload a photo instead.")
 
     # 1. Jane reads the plain-English message.
@@ -554,14 +565,14 @@ async def meta_launch_from_message(
     business_id = brand_ctx.get("brand_id") or f"oneshot_{uuid.uuid4().hex[:8]}"
     req = to_campaign_request(parsed, business_id=business_id)
     if req is None:
-        return {"stage": "need_more", "understood": parsed.model_dump(),
-                "question": parsed.clarify or "How much would you like to spend?"}
+        return {"early_return": {"stage": "need_more", "understood": parsed.model_dump(),
+                "question": parsed.clarify or "How much would you like to spend?"}}
 
     # 2. Jane decides the platform + budget split, with her reasoning.
     result = plan_campaign(req, funded_amount_ngn=req.budget_ngn, total_funded_wallets_ngn=req.budget_ngn)
     if result.decision == PlanDecision.ADVISE:
-        return {"stage": "advise", "understood": parsed.model_dump(),
-                "advice": result.advice.model_dump(), "trace": result.advice.trace}
+        return {"early_return": {"stage": "advise", "understood": parsed.model_dump(),
+                "advice": result.advice.model_dump(), "trace": result.advice.trace}}
     plan = result.plan
 
     # For now, always launch on Meta — it's the only platform with a live adapter
@@ -575,23 +586,7 @@ async def meta_launch_from_message(
     else:
         plan.platforms = [p for p in plan.platforms if p.platform == Platform.META]
 
-    # 2.5. Wallet gate — the ad wallet must actually have the money before Jane does
-    # any more work. Blocks with the exact shortfall rather than silently launching
-    # a campaign whose real Meta daily budget got clamped to less than requested.
-    wallet = WalletService(MongoWalletStore(db))
-    wallet_balance = await wallet.get_balance(business_id)
-    if wallet_balance < req.budget_ngn:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Your ad wallet has ₦{wallet_balance:,.0f} — top up ₦"
-                f"{(req.budget_ngn - wallet_balance):,.0f} more via /jane-ads/wallet/topup "
-                f"before launching a ₦{req.budget_ngn:,.0f} campaign."
-            ),
-        )
-    auth = await wallet.authorization_for(business_id, total_funded_wallets_ngn=req.budget_ngn)
-
-    # 3. Geo refinement (pin-and-pocket) — best-effort, never blocks the launch.
+    # 3. Geo refinement (pin-and-pocket) — best-effort, never blocks planning.
     geo_dump = None
     if parsed.city:
         try:
@@ -628,21 +623,77 @@ async def meta_launch_from_message(
         raise HTTPException(status_code=502, detail="Jane couldn't generate the ad image (creative service). Try again.")
 
     # 4.5. Policy gate — one bad ad can suspend the whole pooled ad account, so this
-    # runs before anything reaches Meta. BLOCK severity aborts with the specific
-    # guidance; WARN-only violations are logged but don't stop the launch.
+    # runs before a plan is ever shown as ready, not just right before launch.
+    # BLOCK severity aborts with the specific guidance; WARN-only violations are
+    # logged but don't stop planning (re-checked again at commit in /plan/{id}/launch).
     policy_result = review_ad_creative(creative.headline, creative.primary_text)
     blocking = [v for v in policy_result.violations if v.severity == Severity.BLOCK]
     if blocking:
         raise HTTPException(
             status_code=400,
-            detail=f"Can't launch this ad — {blocking[0].guidance}",
+            detail=f"Can't use this creative — {blocking[0].guidance}",
         )
     for v in policy_result.violations:
-        print(f"[policy] WARN on launch for {business_id}: {v.category} — matched '{v.matched_text}'", flush=True)
+        print(f"[policy] WARN on plan for {business_id}: {v.category} — matched '{v.matched_text}'", flush=True)
 
-    # 5. Push a REAL campaign to Meta (paused).
     plan.page_id = page_id
     plan.creative = creative
+
+    return _PlanBuildResult(
+        business_id=business_id, req=req, plan=plan, jane_platforms=jane_platforms,
+        forced_to_meta=forced_to_meta, geo_dump=geo_dump, understood=parsed.model_dump(),
+    )
+
+
+async def _wallet_status(db: AsyncIOMotorDatabase, business_id: str, budget_ngn: float) -> tuple[float, bool]:
+    """(balance, sufficient) — the real Mongo-backed balance, not the claimed budget."""
+    from .store import MongoWalletStore
+    from .wallet import WalletService
+
+    wallet = WalletService(MongoWalletStore(db))
+    balance = await wallet.get_balance(business_id)
+    return balance, balance >= budget_ngn
+
+
+def _wallet_shortfall_message(balance: float, budget_ngn: float) -> str:
+    return (
+        f"Your ad wallet has ₦{balance:,.0f} — top up ₦{(budget_ngn - balance):,.0f} more "
+        f"via /jane-ads/wallet/topup before launching a ₦{budget_ngn:,.0f} campaign."
+    )
+
+
+def _plan_response_dict(built: _PlanBuildResult) -> dict:
+    """The `plan`+`creative` shape shared by every stage that returns a built plan
+    (planned, launched) — kept in one place so the two endpoints can't drift apart."""
+    plan = built.plan
+    return {
+        "plan": {
+            "goal": plan.goal.value,
+            "behaviour": plan.behaviour.value,
+            "explanation": plan.explanation,
+            "platforms": [p.model_dump(mode="json") for p in plan.platforms],
+            "per_business_cap_ngn": plan.per_business_cap_ngn,
+            "account_cap_ngn": plan.account_cap_ngn,
+            "geo": built.geo_dump,
+            "trace": plan.trace,
+        },
+        "creative": plan.creative.model_dump(mode="json"),
+    }
+
+
+async def _do_launch(built: _PlanBuildResult, body_message: str, body_business_name: str, brand_ctx: dict, db: AsyncIOMotorDatabase) -> dict:
+    """The actual Meta launch + campaign-record enrichment — shared by the one-shot
+    endpoint and /meta/plan/{id}/launch, both of which have already done their own
+    wallet-gate check by the time they call this."""
+    from app.core.config import settings
+    from .adapters.meta import MetaAdPlatformAdapter, MetaAPIError
+    from .wallet import WalletService
+    from .store import MongoWalletStore
+
+    plan, req, business_id = built.plan, built.req, built.business_id
+    wallet = WalletService(MongoWalletStore(db))
+    auth = await wallet.authorization_for(business_id, total_funded_wallets_ngn=req.budget_ngn)
+
     adapter = MetaAdPlatformAdapter(db, access_token=settings.META_ADS_ACCESS_TOKEN)
     try:
         launch = await adapter.launch_campaign(plan, auth)
@@ -658,37 +709,27 @@ async def meta_launch_from_message(
         {"$set": {
             "brand_id": brand_ctx.get("brand_id"),
             "user_id": brand_ctx.get("user_id"),
-            "display_name": req.business_name or body.business_name or "Campaign",
-            "headline": creative.headline,
-            "primary_text": creative.primary_text,
-            "image_url": creative.image_url,
+            "display_name": req.business_name or body_business_name or "Campaign",
+            "headline": plan.creative.headline,
+            "primary_text": plan.creative.primary_text,
+            "image_url": plan.creative.image_url,
             "budget_ngn": req.budget_ngn,
             "goal": plan.goal.value,
-            "city": parsed.city,
-            "message": body.message,
+            "city": req.geo,
+            "message": body_message,
         }},
     )
 
     return {
         "stage": "launched",
-        "understood": parsed.model_dump(),
-        "jane_recommended_platforms": jane_platforms,
-        "forced_to_meta": forced_to_meta,
-        "plan": {
-            "goal": plan.goal.value,
-            "behaviour": plan.behaviour.value,
-            "explanation": plan.explanation,
-            "platforms": [p.model_dump(mode="json") for p in plan.platforms],
-            "per_business_cap_ngn": plan.per_business_cap_ngn,
-            "account_cap_ngn": plan.account_cap_ngn,
-            "geo": geo_dump,
-            "trace": plan.trace,
-        },
-        "creative": creative.model_dump(mode="json"),
+        "understood": built.understood,
+        "jane_recommended_platforms": built.jane_platforms,
+        "forced_to_meta": built.forced_to_meta,
+        **_plan_response_dict(built),
         "launch": {
             "campaign_id": launch.campaign_id,
             "ad_ids": launch.ad_ids,
-            "page_id": page_id,
+            "page_id": plan.page_id,
             "status": "PAUSED",
             "note": "Created PAUSED — zero spend. Review and activate in Ads Manager to go live.",
             "ads_manager_url": (
@@ -697,6 +738,139 @@ async def meta_launch_from_message(
             ),
         },
     }
+
+
+@router.post("/meta/launch-from-message")
+async def meta_launch_from_message(
+    body: MetaLaunchFromMessageBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """The full one-shot flow: plain-English message → Jane understands it → decides
+    the platform (with her reasoning) → generates a real branded ad creative → pushes
+    a REAL campaign to Meta (created PAUSED, zero spend) → returns everything. For
+    reviewing a plan before committing to Meta, use /meta/plan-from-message +
+    /meta/plan/{id}/launch instead — this endpoint plans and launches in one call."""
+    built = await _build_campaign_plan(body, brand_ctx, db)
+    if isinstance(built, dict):
+        return built["early_return"]
+
+    # Wallet gate — the ad wallet must actually have the money before anything
+    # reaches Meta. Blocks with the exact shortfall rather than silently launching
+    # a campaign whose real Meta daily budget got clamped to less than requested.
+    balance, sufficient = await _wallet_status(db, built.business_id, built.req.budget_ngn)
+    if not sufficient:
+        raise HTTPException(status_code=400, detail=_wallet_shortfall_message(balance, built.req.budget_ngn))
+
+    return await _do_launch(built, body.message, body.business_name, brand_ctx, db)
+
+
+@router.post("/meta/plan-from-message")
+async def meta_plan_from_message(
+    body: MetaLaunchFromMessageBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Plan-before-launch, step 1: understand the message, decide the platform,
+    generate the creative — but never touch Meta. Returns a reviewable plan (persisted
+    so it can be launched later, or just abandoned — 'save for later', nothing lost)
+    plus an informational wallet check. Actually launching it is a separate, explicit
+    call: POST /meta/plan/{plan_id}/launch."""
+    import uuid
+    from datetime import datetime, timedelta, timezone
+
+    built = await _build_campaign_plan(body, brand_ctx, db)
+    if isinstance(built, dict):
+        return built["early_return"]
+
+    balance, sufficient = await _wallet_status(db, built.business_id, built.req.budget_ngn)
+
+    plan_id = f"plan_{uuid.uuid4().hex[:16]}"
+    now = datetime.now(timezone.utc)
+    await db["jane_ads_pending_plans"].insert_one({
+        "plan_id": plan_id,
+        "business_id": built.business_id,
+        "brand_id": brand_ctx.get("brand_id"),
+        "user_id": brand_ctx.get("user_id"),
+        "message": body.message,
+        "business_name": body.business_name,
+        "req": built.req.model_dump(mode="json"),
+        "plan": built.plan.model_dump(mode="json"),
+        "jane_platforms": built.jane_platforms,
+        "forced_to_meta": built.forced_to_meta,
+        "geo_dump": built.geo_dump,
+        "understood": built.understood,
+        "status": "pending",
+        "created_at": now,
+        "expires_at": now + timedelta(days=7),
+    })
+
+    return {
+        "stage": "planned",
+        "plan_id": plan_id,
+        "understood": built.understood,
+        "jane_recommended_platforms": built.jane_platforms,
+        "forced_to_meta": built.forced_to_meta,
+        **_plan_response_dict(built),
+        "wallet": {
+            "balance_ngn": balance,
+            "budget_ngn": built.req.budget_ngn,
+            "sufficient": sufficient,
+        },
+    }
+
+
+@router.post("/meta/plan/{plan_id}/launch")
+async def meta_launch_plan(
+    plan_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Plan-before-launch, step 2 — the ONLY place a plan actually becomes a real
+    Meta campaign. Re-validates wallet + policy here at commit time (not when the
+    plan was first built), since real time may have passed since planning."""
+    from datetime import datetime, timezone
+    from .policy import Severity, review_ad_creative
+
+    brand_id = brand_ctx.get("brand_id")
+    doc = await db["jane_ads_pending_plans"].find_one({"plan_id": plan_id})
+    if not doc or doc.get("brand_id") != brand_id:
+        raise HTTPException(status_code=404, detail="Plan not found")
+    if doc["status"] != "pending":
+        raise HTTPException(status_code=409, detail=f"This plan is already {doc['status']} — describe a new campaign to Jane to plan another.")
+    expires_at = doc["expires_at"]
+    if hasattr(expires_at, "tzinfo") and expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if datetime.now(timezone.utc) > expires_at:
+        await db["jane_ads_pending_plans"].update_one({"plan_id": plan_id}, {"$set": {"status": "expired"}})
+        raise HTTPException(status_code=410, detail="This plan has expired — describe the campaign to Jane again to make a fresh one.")
+
+    plan = CampaignPlan.model_validate(doc["plan"])
+    req = CampaignRequest.model_validate(doc["req"])
+
+    # Policy re-check at commit — cheap and deterministic, and real time has passed
+    # since the plan was built, so this is a genuine safety re-validation, not just
+    # a formality.
+    policy_result = review_ad_creative(plan.creative.headline, plan.creative.primary_text)
+    blocking = [v for v in policy_result.violations if v.severity == Severity.BLOCK]
+    if blocking:
+        raise HTTPException(status_code=400, detail=f"Can't launch this ad — {blocking[0].guidance}")
+
+    balance, sufficient = await _wallet_status(db, doc["business_id"], req.budget_ngn)
+    if not sufficient:
+        raise HTTPException(status_code=400, detail=_wallet_shortfall_message(balance, req.budget_ngn))
+
+    built = _PlanBuildResult(
+        business_id=doc["business_id"], req=req, plan=plan,
+        jane_platforms=doc["jane_platforms"], forced_to_meta=doc["forced_to_meta"],
+        geo_dump=doc.get("geo_dump"), understood=doc["understood"],
+    )
+    result = await _do_launch(built, doc["message"], doc["business_name"], brand_ctx, db)
+    await db["jane_ads_pending_plans"].update_one(
+        {"plan_id": plan_id},
+        {"$set": {"status": "launched", "campaign_id": result["launch"]["campaign_id"]}},
+    )
+    return result
 
 
 @router.get("/meta/campaigns")
