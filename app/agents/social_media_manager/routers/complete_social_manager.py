@@ -8269,6 +8269,40 @@ async def zapcap_job_status(
             "failure_reason": None,
         })
 
+    # ── Custom b-roll jobs: poll Shotstack instead of ZapCap ─────────────────
+    if job.get("render_type") == "custom_broll":
+        from app.agents.social_media_manager.services.video_production_service import (
+            ShotstackProvider,
+            _upload_to_cloudinary as _zc_upload_broll,
+        )
+        import httpx as _httpx_broll
+        shotstack = ShotstackProvider()
+        render_id = job.get("shotstack_render_id", "")
+        ss_status, ss_url = await shotstack.get_render(render_id)
+        print(f"[CustomBroll] poll job={job_id} render={render_id} status={ss_status}", flush=True)
+        # Map Shotstack statuses to the ZapCap-compatible statuses the frontend understands
+        status_map = {"queued": "pending", "fetching": "transcribing", "rendering": "rendering", "saving": "rendering", "done": "completed", "failed": "failed"}
+        mapped = status_map.get(ss_status, "pending")
+        if mapped == "completed" and ss_url:
+            # Upload to Cloudinary for a permanent URL
+            try:
+                async with _httpx_broll.AsyncClient(timeout=120, follow_redirects=True) as _cl:
+                    _r = await _cl.get(ss_url)
+                if _r.status_code == 200:
+                    import uuid as _uuid_broll
+                    cdn_url = await _zc_upload_broll(_r.content, f"broll-output-{_uuid_broll.uuid4().hex[:12]}")
+                    await db["zapcap_jobs"].update_one({"job_id": job_id}, {"$set": {"final_output_url": cdn_url, "status": "completed"}})
+                    ss_url = cdn_url
+            except Exception as _e:
+                print(f"[CustomBroll] Cloudinary upload failed: {_e}", flush=True)
+        elif mapped == "failed":
+            await db["zapcap_jobs"].update_one({"job_id": job_id}, {"$set": {"status": "failed"}})
+        return UriResponse.get_single_data_response("zapcap_job", {
+            "status": mapped,
+            "output_url": ss_url or None,
+            "failure_reason": "Shotstack render failed" if mapped == "failed" else None,
+        })
+
     headers = await _zapcap_headers()
     zapcap_video_id = job["zapcap_video_id"]
     zapcap_task_id = job["zapcap_task_id"]
@@ -8516,6 +8550,10 @@ async def zapcap_job_rerender(
     if quality != "standard":
         export_settings["quality"] = quality
 
+    # Caller can explicitly toggle b-roll on/off; fall back to the original job's setting
+    enable_broll_override = body.get("enable_broll")
+    use_broll = enable_broll_override if enable_broll_override is not None else job.get("enable_broll", False)
+
     task_payload: dict = {
         "templateId": template_id,
         "language": job.get("language", "en"),
@@ -8524,6 +8562,8 @@ async def zapcap_job_rerender(
     }
     if export_settings:
         task_payload["exportSettings"] = export_settings
+    if use_broll:
+        task_payload["transcribeSettings"] = {"broll": {"brollPercent": 50}}
 
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.post(
@@ -8548,8 +8588,9 @@ async def zapcap_job_rerender(
         "language": job.get("language", "en"),
         "output_mode": output_mode,
         "quality": quality,
-        "enable_broll": job.get("enable_broll", False),
+        "enable_broll": use_broll,
         "music_url": job.get("music_url"),
+        "video_url": job.get("video_url"),
         "status": "pending",
         "created_at": now,
     }
@@ -8560,5 +8601,124 @@ async def zapcap_job_rerender(
 
     await db["zapcap_jobs"].insert_one(new_doc)
     mode = "caption edits" if word_edits else "new template"
-    print(f"[ZapCap] rerender ({mode}) job={new_job_id} video={zapcap_video_id} task={zapcap_task_id} edits={len(word_edits)}", flush=True)
+    broll_mode = "broll=on" if use_broll else "broll=off"
+    print(f"[ZapCap] rerender ({mode}, {broll_mode}) job={new_job_id} video={zapcap_video_id} task={zapcap_task_id} edits={len(word_edits)}", flush=True)
     return UriResponse.get_single_data_response("zapcap_rerender", {"job_id": new_job_id})
+
+
+@router.post("/zapcap-job/{job_id}/custom-broll")
+async def zapcap_job_custom_broll(
+    job_id: str,
+    clips: List[UploadFile] = File(...),
+    placements: str = Form(...),   # JSON: [{"clip_index": 0, "start_time": 3.5, "duration": 4.0}, ...]
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Overlay user-supplied b-roll clips on the existing ZapCap output at specified timestamps.
+    Uses Shotstack to composite: user clips (top layer) over ZapCap captioned video (base).
+    Returns a new job_id that can be polled via GET /zapcap-job/{job_id} (Shotstack branch).
+    """
+    import uuid as _uuid3
+    import json as _json
+    from datetime import datetime, timezone
+
+    from app.agents.social_media_manager.services.video_production_service import (
+        _upload_to_cloudinary,
+        ShotstackProvider,
+    )
+
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    job = await db["zapcap_jobs"].find_one({"job_id": job_id})
+    if not job:
+        raise HTTPException(status_code=404, detail="ZapCap job not found")
+
+    base_video_url = job.get("final_output_url") or job.get("video_url")
+    if not base_video_url:
+        raise HTTPException(status_code=422, detail="No output video found for this job — render it first.")
+
+    try:
+        placement_list: list = _json.loads(placements)
+    except Exception:
+        raise HTTPException(status_code=400, detail="placements must be valid JSON")
+
+    # Upload each clip to Cloudinary
+    clip_urls: list[str] = []
+    for i, clip_file in enumerate(clips):
+        clip_bytes = await clip_file.read()
+        clip_url = await _upload_to_cloudinary(clip_bytes, f"broll-custom-{job_id}-{i}")
+        clip_urls.append(clip_url)
+
+    if not clip_urls:
+        raise HTTPException(status_code=400, detail="No clips provided")
+
+    # Build Shotstack broll clips for the top track
+    broll_clips = []
+    for p in placement_list:
+        idx = int(p.get("clip_index", 0))
+        if idx >= len(clip_urls):
+            continue
+        start = float(p.get("start_time", 0))
+        duration = float(p.get("duration", 5))
+        broll_clips.append({
+            "asset": {"type": "video", "src": clip_urls[idx], "volume": 0},
+            "start": start,
+            "length": duration,
+            "fit": "cover",
+        })
+
+    if not broll_clips:
+        raise HTTPException(status_code=400, detail="No valid placements — check clip_index and start_time")
+
+    # We need the total video duration for the base track.
+    # Use placements to infer a minimum, plus a generous buffer.
+    max_end = max((p.get("start_time", 0) + p.get("duration", 5)) for p in placement_list) + 10
+    base_duration = float(job.get("video_duration", max_end))
+
+    timeline = {
+        "timeline": {
+            "tracks": [
+                # Track 0 (top): user b-roll clips
+                {"clips": broll_clips},
+                # Track 1 (base): ZapCap captioned output
+                {
+                    "clips": [{
+                        "asset": {"type": "video", "src": base_video_url, "volume": 1},
+                        "start": 0,
+                        "length": base_duration,
+                        "fit": "cover",
+                    }]
+                },
+            ]
+        },
+        "output": {
+            "format": "mp4",
+            "resolution": "hd",
+            "quality": "high",
+            "aspectRatio": job.get("aspect_ratio", "9:16"),
+            "fps": 30,
+        },
+    }
+
+    shotstack = ShotstackProvider()
+    render_id = await shotstack.render(timeline)
+
+    new_job_id = _uuid3.uuid4().hex
+    now = datetime.now(timezone.utc).isoformat()
+    await db["zapcap_jobs"].insert_one({
+        "job_id": new_job_id,
+        "user_id": user_id,
+        "render_type": "custom_broll",
+        "shotstack_render_id": render_id,
+        "parent_job_id": job_id,
+        "clip_urls": clip_urls,
+        "placements": placement_list,
+        "status": "pending",
+        "created_at": now,
+    })
+
+    print(f"[CustomBroll] job={new_job_id} parent={job_id} clips={len(clip_urls)} placements={len(broll_clips)} render={render_id}", flush=True)
+    return UriResponse.get_single_data_response("zapcap_job", {"job_id": new_job_id})
