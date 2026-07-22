@@ -793,20 +793,33 @@ async def _build_campaign_plan(
     )
 
 
+def _total_due_ngn(budget_ngn: float) -> float:
+    """What the customer's wallet must cover to run a `budget_ngn` campaign: the ad
+    budget PLUS URI's service fee (the AD_SPEND_MARKUP margin). Meta only ever spends
+    `budget_ngn`; billing (billing.py) debits the wallet up to budget × markup as the
+    campaign delivers, so the wallet is gated to exactly that here — which also makes
+    the wallet empty right when Meta's own budget is exhausted."""
+    return round(budget_ngn * C.AD_SPEND_MARKUP, 2)
+
+
 async def _wallet_status(db: AsyncIOMotorDatabase, business_id: str, budget_ngn: float) -> tuple[float, bool]:
-    """(balance, sufficient) — the real Mongo-backed balance, not the claimed budget."""
+    """(balance, sufficient) — the real Mongo-backed balance vs. the TOTAL due (ad
+    budget + service fee), not just the ad budget."""
     from .store import MongoWalletStore
     from .wallet import WalletService
 
     wallet = WalletService(MongoWalletStore(db))
     balance = await wallet.get_balance(business_id)
-    return balance, balance >= budget_ngn
+    return balance, balance >= _total_due_ngn(budget_ngn)
 
 
 def _wallet_shortfall_message(balance: float, budget_ngn: float) -> str:
+    due = _total_due_ngn(budget_ngn)
+    fee = round(due - budget_ngn, 2)
     return (
-        f"Your ad wallet has ₦{balance:,.0f} — top up ₦{(budget_ngn - balance):,.0f} more "
-        f"via /jane-ads/wallet/topup before launching a ₦{budget_ngn:,.0f} campaign."
+        f"Your ad wallet has ₦{balance:,.0f} — top up ₦{(due - balance):,.0f} more "
+        f"before launching. A ₦{budget_ngn:,.0f} campaign costs ₦{due:,.0f} "
+        f"(₦{budget_ngn:,.0f} ad spend + ₦{fee:,.0f} service fee)."
     )
 
 
@@ -969,6 +982,8 @@ async def meta_plan_from_message(
         "wallet": {
             "balance_ngn": balance,
             "budget_ngn": built.req.budget_ngn,
+            "service_fee_ngn": round(_total_due_ngn(built.req.budget_ngn) - built.req.budget_ngn, 2),
+            "total_due_ngn": _total_due_ngn(built.req.budget_ngn),
             "sufficient": sufficient,
         },
     }
