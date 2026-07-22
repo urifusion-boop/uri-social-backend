@@ -687,16 +687,15 @@ Do NOT style it as a button or banner."""
             print(f"[V2] Platform dimensions: {image_width}x{image_height} ({specs.get('format', 'unknown')})")
 
             # Generate with platform-specific dimensions + reference image for style.
-            # input_fidelity="low" tells GPT-Image-2 to treat the reference as loose
-            # inspiration (composition/color/mood) rather than a photo to reproduce
-            # closely — without this, a specific face or product in the guide's
-            # reference photo came out looking nearly identical in every generation.
+            # NOTE: gpt-image-2 rejects input_fidelity outright (400 error — that
+            # param only exists for gpt-image-1), so fidelity/variation for V2
+            # guides is steered entirely through the prompt text above
+            # (identity_instruction + variation_directive), not an API parameter.
             image_response = await ImageContentService._call_dalle_api(
                 prompt=final_prompt,
                 size=f"{image_width}x{image_height}",
                 reference_image=reference_image_url,  # ← ACTUAL reference image for style
                 image_model="openai/gpt-image-2",
-                input_fidelity="low",
             )
 
             if not image_response.get('success'):

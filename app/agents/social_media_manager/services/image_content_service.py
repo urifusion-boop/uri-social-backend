@@ -2441,7 +2441,6 @@ Answer with exactly one word: "yes" or "no"."""
         size: str = "1024x1024",
         reference_image: Optional[str] = None,
         image_model: Optional[str] = None,
-        input_fidelity: str = "high",
     ) -> Dict[str, Any]:
         """
         Generate an image using Nano Banana 2 (Google Imagen via Gemini API).
@@ -2582,7 +2581,7 @@ Answer with exactly one word: "yes" or "no"."""
                         _ref_img.save(_ref_png_buf, format="PNG")
                         _ref_png_buf.seek(0)
 
-                        print(f"🎨 GPT-Image-2 edit with reference ({_gpt2_size}, input_fidelity={input_fidelity})…")
+                        print(f"🎨 GPT-Image-2 edit with reference ({_gpt2_size})…")
                         loop = asyncio.get_running_loop()
                         _gpt2_resp = await asyncio.wait_for(
                             loop.run_in_executor(
@@ -2595,11 +2594,12 @@ Answer with exactly one word: "yes" or "no"."""
                                     size=_gpt2_size,
                                     quality="high",
                                     output_format="webp",
-                                    # "high" (default) keeps output close to the reference pixels —
-                                    # right for a user's own uploaded photo. V2 style guides pass
-                                    # "low" instead, so a specific face/product in the guide's
-                                    # reference isn't reproduced verbatim in every generation.
-                                    input_fidelity=input_fidelity,
+                                    # NOTE: gpt-image-2 does NOT support input_fidelity at all
+                                    # (OpenAI rejects it with a 400 — that param is gpt-image-1
+                                    # only). Do not add it back here; variation/fidelity for V2
+                                    # guides has to be steered through the prompt text instead
+                                    # (see identity_instruction/variation_directive in
+                                    # custom_visual_guide_v2_service.py).
                                 ),
                             ),
                             timeout=300,  # 5 minutes timeout for GPT-Image-2
