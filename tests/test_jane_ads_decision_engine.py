@@ -5,7 +5,7 @@ GOAL first, behaviour drives, business type is a hint, decided per campaign, alw
 explained. Pure logic — no network, no server, no DB.
 """
 from app.agents.jane_ads import constants as C
-from app.agents.jane_ads.decision_engine import default_behaviour, choose_platform
+from app.agents.jane_ads.decision_engine import default_behaviour, choose_platform, budget_tier_for
 from app.agents.jane_ads.models import (
     CampaignRequest,
     CreativeContext,
@@ -171,3 +171,30 @@ def test_budget_conserved_across_split():
         60_000, 60_000,
     )
     assert abs(sum(p.budget_ngn for p in res.plan.platforms) - 60_000) < 1.0
+
+
+# ── Budget tier (PRD §3.3) — same boundaries as A/B test scope ────────────────
+
+def test_budget_tier_below_light_test_is_starter():
+    assert budget_tier_for(C.AB_LIGHT_TEST_NGN - 1) == "starter"
+
+
+def test_budget_tier_at_light_test_boundary_is_standard():
+    assert budget_tier_for(C.AB_LIGHT_TEST_NGN) == "standard"
+
+
+def test_budget_tier_below_full_test_is_standard():
+    assert budget_tier_for(C.AB_FULL_TEST_NGN - 1) == "standard"
+
+
+def test_budget_tier_at_full_test_boundary_is_growth():
+    assert budget_tier_for(C.AB_FULL_TEST_NGN) == "growth"
+
+
+def test_budget_tier_well_above_full_test_is_growth():
+    assert budget_tier_for(C.AB_FULL_TEST_NGN * 5) == "growth"
+
+
+def test_plan_carries_its_own_budget_tier():
+    res = _plan(category="fashion", budget_ngn=C.AB_FULL_TEST_NGN)
+    assert res.plan.budget_tier == "growth"
