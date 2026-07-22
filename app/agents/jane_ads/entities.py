@@ -25,7 +25,10 @@ def _now() -> datetime:
 
 class TransactionType(str, Enum):
     TOPUP = "topup"                     # customer funds the wallet (credit)
-    CONVERSATION_CHARGE = "conversation_charge"   # a delivered CTWA conversation (debit)
+    AD_SPEND = "ad_spend"               # recoup real Meta ad spend × markup (debit) — the
+                                        # production billing meter, see billing.py
+    CONVERSATION_CHARGE = "conversation_charge"   # a delivered CTWA conversation (debit) —
+                                        # legacy per-conversation meter, kept for the /plan demo
     REFUND = "refund"                   # credit back
     ADJUSTMENT = "adjustment"           # manual correction
 

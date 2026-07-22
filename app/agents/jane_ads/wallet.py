@@ -167,6 +167,47 @@ class WalletService:
         await self._store.add_transaction(txn)
         return txn
 
+    async def charge_ad_spend(
+        self,
+        business_id: str,
+        amount_ngn: float,
+        campaign_id: str = "",
+        meta_spend_ngn: Optional[float] = None,
+        now: Optional[datetime] = None,
+    ) -> Transaction:
+        """Debit an EXACT amount for ad spend — the production billing meter (see
+        billing.py): recoup real Meta spend × markup from the prepaid wallet.
+        Prepaid-first: raises InsufficientFundsError if the balance can't cover the
+        full amount, so the caller charges min(want, balance) to take a partial slice
+        and pause. `meta_spend_ngn` is the raw Meta spend this charge covers, recorded
+        so the ledger reconciles against the ad account's amount_spent."""
+        now = now or _now()
+        amount = round(amount_ngn, 2)
+        if amount <= 0:
+            raise ValueError("charge amount must be positive")
+        await self.get_or_create(business_id)
+        # Atomic guard-and-decrement, same as charge_conversation.
+        wallet = await self._store.try_debit(business_id, amount, now)
+        if wallet is None:
+            current = await self._store.get_wallet(business_id)
+            if current and current.status != WalletStatus.ACTIVE:
+                raise InsufficientFundsError(f"Wallet {business_id} is {current.status.value}.")
+            balance = current.balance_ngn if current else 0.0
+            raise InsufficientFundsError(f"Balance ₦{balance:,.2f} < charge ₦{amount:,.2f}.")
+
+        txn = Transaction(
+            transaction_id=f"txn_{uuid.uuid4().hex[:16]}",
+            business_id=business_id,
+            type=TransactionType.AD_SPEND,
+            amount_ngn=round(-amount, 2),
+            balance_after_ngn=wallet.balance_ngn,
+            campaign_id=campaign_id,
+            actual_platform_cost_ngn=meta_spend_ngn,
+            created_at=now,
+        )
+        await self._store.add_transaction(txn)
+        return txn
+
     async def can_afford(self, business_id: str, price_ngn: float) -> bool:
         return (await self.get_balance(business_id)) >= price_ngn
 
