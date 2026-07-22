@@ -180,6 +180,13 @@ class AdCopy(BaseModel):
     headline: str = ""              # ≤ ~5 words
     primary_text: str = ""          # 1–2 sentence body
     image_prompt: str = ""          # what the creative image should show
+    video_recommended: bool = False       # creative-type reasoning (PRD §4.1) — true
+                                           # when a video would clearly serve this
+                                           # campaign better than the photo we're
+                                           # about to generate (gpt-image-1 has no
+                                           # video mode; this is a heads-up, not a
+                                           # capability)
+    video_recommendation_reason: str = ""
 
 
 class CreativeSource(str, Enum):
@@ -200,6 +207,11 @@ class AdCreative(BaseModel):
     primary_text: str = ""
     cta: str = "Send WhatsApp Message"
     source: CreativeSource = CreativeSource.GENERATE
+    video_recommendation: str = ""  # set only on a GENERATE creative when a video
+                                     # would clearly serve better — a heads-up so the
+                                     # user can choose to upload one instead; never
+                                     # set for UPLOAD/DRAFT (the media choice is
+                                     # already made there)
     generated: bool = True          # False when there's no media → copy-only fallback
 
 
