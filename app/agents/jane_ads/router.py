@@ -660,6 +660,7 @@ async def _build_campaign_plan(
         creative = await generate_ad_creative(
             business_name, category, req.goal.value, req.description,
             user_id=user_id, db=db, brand_id=brand_id, city=parsed.city,
+            behaviour=plan.behaviour.value,
         )
         if creative.image_url:
             # "reason" is a strict Literal on CreditTransaction — "campaign_generation"
@@ -686,6 +687,8 @@ async def _build_campaign_plan(
 
     plan.page_id = page_id
     plan.creative = creative
+    if creative.video_recommendation:
+        plan.explanation = f"{plan.explanation} {creative.video_recommendation} You can upload a video instead before launching if you'd like."
 
     return _PlanBuildResult(
         business_id=business_id, req=req, plan=plan, jane_platforms=jane_platforms,

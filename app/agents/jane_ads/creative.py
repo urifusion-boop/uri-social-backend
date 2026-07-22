@@ -150,10 +150,13 @@ def _location_prompt_bit(city: str, category: str = "") -> str:
 
 async def write_ad_copy(business_name: str, category: str, goal: str = "messages",
                         description: str = "", brand_context: Optional[dict] = None,
-                        city: str = "") -> AdCopy:
+                        city: str = "", behaviour: str = "") -> AdCopy:
     """Write a short headline, primary text, and an image prompt (used only for the
     GENERATE source). Voice-matched to the brand playbook when a profile exists, and
-    visually grounded in the real city/area the campaign targets."""
+    visually grounded in the real city/area the campaign targets. Also does the
+    creative-type reasoning (PRD §4.1): flags when a video would clearly serve this
+    ad better than the photo we're about to generate — gpt-image-1 can't produce
+    one, so this is a heads-up for the caller to offer an upload, not a capability."""
     if not settings.OPENAI_API_KEY:
         return AdCopy()
     bc = brand_context or {}
@@ -165,6 +168,7 @@ async def write_ad_copy(business_name: str, category: str, goal: str = "messages
         f"to message the business on WhatsApp.{(' ' + brand_bits) if brand_bits else ''}\n"
         f"{location_bit}\n"
         f"Context: {description or 'none'}\n"
+        f"How customers find this business: {behaviour or 'unknown'}.\n"
         "Return JSON with:\n"
         "- headline: punchy, <= 5 words, no ALL CAPS, no emoji spam\n"
         "- primary_text: 1–2 warm, concrete sentences in the brand voice above if given "
@@ -176,6 +180,17 @@ async def write_ad_copy(business_name: str, category: str, goal: str = "messages
         "kind (Meta adds the ad's headline and button separately; baked-in text is never "
         "wanted here, including on buildings/signs in the background). Not an "
         "illustration.\n"
+        "- video_recommended: boolean. Set true whenever the business is a movement/"
+        "performance/demonstration activity (dance, fitness classes, sports, cooking-"
+        "in-action, live music) or depends on personal trust in the founder (coaching, "
+        "therapy, consulting, medical/beauty procedures) where seeing the person move "
+        "or speak on camera would clearly beat a static photo. Set false for businesses "
+        "that are visually static (a shop, a static product) or for a 'search' "
+        "behaviour, where the offer/price matters more than the visual. Examples: a "
+        "Zumba instructor -> true. A life coach doing consultations -> true. A grocery "
+        "store -> false. A phone repair shop -> false.\n"
+        "- video_recommendation_reason: one short sentence why, ONLY if "
+        "video_recommended is true; else empty string.\n"
         "Return ONLY the JSON."
     )
     try:
@@ -191,6 +206,8 @@ async def write_ad_copy(business_name: str, category: str, goal: str = "messages
             headline=str(d.get("headline", "")).strip(),
             primary_text=str(d.get("primary_text", "")).strip(),
             image_prompt=str(d.get("image_prompt", "")).strip(),
+            video_recommended=bool(d.get("video_recommended")),
+            video_recommendation_reason=str(d.get("video_recommendation_reason", "")).strip(),
         )
     except Exception as e:
         print(f"[Creative] copy error: {e}", flush=True)
@@ -358,7 +375,9 @@ def assemble_creative(copy: AdCopy, image_url: Optional[str],
     """Combine copy + media into a submittable creative. The WhatsApp CTA is always
     attached; `generated` is False when there's no media (copy-only fallback).
     `is_video` should be passed explicitly when the caller already knows the media
-    type (e.g. from the upload's content-type); otherwise it's guessed from the URL."""
+    type (e.g. from the upload's content-type); otherwise it's guessed from the URL.
+    The video recommendation only ever applies to GENERATE — UPLOAD/DRAFT already
+    have a real media choice made, so there's nothing to recommend."""
     url = image_url or ""
     return AdCreative(
         image_url=url,
@@ -368,6 +387,9 @@ def assemble_creative(copy: AdCopy, image_url: Optional[str],
         cta=WHATSAPP_CTA,
         source=source,
         generated=bool(url),
+        video_recommendation=copy.video_recommendation_reason if (
+            source == CreativeSource.GENERATE and copy.video_recommended
+        ) else "",
     )
 
 
@@ -376,15 +398,18 @@ def assemble_creative(copy: AdCopy, image_url: Optional[str],
 async def generate_ad_creative(
     business_name: str, category: str, goal: str = "messages", description: str = "",
     user_id: str = "", db=None, brand_id: Optional[str] = None, city: str = "",
+    behaviour: str = "",
 ) -> AdCreative:
     """SOURCE 1 (default) — Jane writes the copy and generates the image herself,
     using the brand playbook's colours/voice/region/industry, grounded in `city` (the
     campaign's geo target, e.g. from the decision engine's geo pins) so the scene
-    reflects the real place, not a generic global look. For "use my own photo", see
-    SOURCE 2 (creative_from_upload) — a distinct source, not a reference nudge on
-    generation. Never raises — falls back to copy-only if image generation fails."""
+    reflects the real place, not a generic global look. `behaviour` (search/discover/
+    mixed, from the decision engine) informs the creative-type reasoning (PRD §4.1) —
+    see write_ad_copy. For "use my own photo", see SOURCE 2 (creative_from_upload) —
+    a distinct source, not a reference nudge on generation. Never raises — falls back
+    to copy-only if image generation fails."""
     brand_context = await get_brand_context(user_id, db, brand_id) if user_id else {}
-    copy = await write_ad_copy(business_name, category, goal, description, brand_context, city)
+    copy = await write_ad_copy(business_name, category, goal, description, brand_context, city, behaviour)
     image_url = await generate_ad_image(copy.image_prompt, brand_context)
     return assemble_creative(copy, image_url, source=CreativeSource.GENERATE)
 
