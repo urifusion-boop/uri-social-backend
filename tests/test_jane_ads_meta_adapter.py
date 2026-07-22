@@ -135,11 +135,48 @@ def test_launch_campaign_requires_creative_image_even_when_creative_present():
         _run(adapter.launch_campaign(plan, _auth()))
 
 
-def test_launch_campaign_rejects_video_creatives_for_now():
+def test_launch_campaign_uploads_video_and_builds_video_data_creative():
+    db = FakeDb()
+    adapter = _adapter(db)
+    plan = _plan(creative=AdCreative(image_url="https://cdn/ad.mp4", is_video=True, headline="h", primary_text="p"))
+    responses = [
+        {"id": "vid_1"},                                                    # video upload
+        {"status": {"video_status": "ready"}},                              # first poll — ready immediately
+        {"data": [{"uri": "https://thumb/1.jpg", "is_preferred": True}]},   # thumbnails
+        {"id": "cmp_1"},      # campaign
+        {"id": "adset_1"},    # ad set
+        {"id": "creative_1"}, # creative
+        {"id": "ad_1"},       # ad
+    ]
+    with patch("httpx.AsyncClient") as MockClient, \
+         patch("app.agents.jane_ads.adapters.meta.asyncio.sleep", new=AsyncMock()):
+        mock_client = _mock_client(responses)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        result = _run(adapter.launch_campaign(plan, _auth()))
+
+    assert result.campaign_id == "cmp_1"
+    # POST call order: advideos, campaigns, adsets, adcreatives, ads — the
+    # ad-creative call must carry video_data, not link_data, with the uploaded
+    # video_id and fetched thumbnail.
+    creative_call = mock_client.post.call_args_list[3]
+    spec = creative_call.kwargs["json"]["object_story_spec"]
+    assert "video_data" in spec
+    assert spec["video_data"]["video_id"] == "vid_1"
+    assert spec["video_data"]["image_url"] == "https://thumb/1.jpg"
+
+
+def test_launch_campaign_raises_when_video_processing_errors():
     adapter = _adapter()
     plan = _plan(creative=AdCreative(image_url="https://cdn/ad.mp4", is_video=True))
-    with pytest.raises(NotImplementedError, match="Video creatives"):
-        _run(adapter.launch_campaign(plan, _auth()))
+    responses = [
+        {"id": "vid_1"},
+        {"status": {"video_status": "error"}},
+    ]
+    with patch("httpx.AsyncClient") as MockClient, \
+         patch("app.agents.jane_ads.adapters.meta.asyncio.sleep", new=AsyncMock()):
+        MockClient.return_value.__aenter__.return_value = _mock_client(responses)
+        with pytest.raises(MetaAPIError, match="failed to process"):
+            _run(adapter.launch_campaign(plan, _auth()))
 
 
 def test_launch_campaign_creates_full_chain_and_stores_record():
