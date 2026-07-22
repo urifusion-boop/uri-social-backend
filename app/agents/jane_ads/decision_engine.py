@@ -96,6 +96,19 @@ _LEAN: dict[PurchaseBehaviour, list[Platform]] = {
 }
 
 
+def budget_tier_for(total_budget_ngn: float) -> str:
+    """A plain-language size label for the total campaign budget (PRD §3.3's
+    `budgetTier`) — reuses the SAME boundaries that already decide A/B test scope
+    (constants.AB_LIGHT_TEST_NGN/AB_FULL_TEST_NGN) so the label a user sees always
+    matches the variant/test-scope decision underneath it, instead of drifting from
+    a second, independently-tuned set of thresholds."""
+    if total_budget_ngn >= C.AB_FULL_TEST_NGN:
+        return "growth"
+    if total_budget_ngn >= C.AB_LIGHT_TEST_NGN:
+        return "standard"
+    return "starter"
+
+
 def _days_for(total_budget: float) -> int:
     if total_budget >= C.AB_FULL_TEST_NGN:
         return C.MAX_CAMPAIGN_DAYS
@@ -197,6 +210,7 @@ def choose_platform(
         platforms=platform_plans,
         per_business_cap_ngn=funded_amount_ngn,
         account_cap_ngn=total_funded_wallets_ngn,
+        budget_tier=budget_tier_for(budget),
         explanation=_explain(request, behaviour, platform_plans),
         trace=trace,
     )
