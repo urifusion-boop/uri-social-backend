@@ -182,3 +182,31 @@ def test_assemble_creative_explicit_flag_overrides_guess():
     # without an extension) should respect the caller's explicit answer.
     c = assemble_creative(AdCopy(headline="h"), "https://cdn/weird-no-ext", is_video=False)
     assert c.is_video is False
+
+
+# ── Creative-type reasoning (PRD §4.1) ────────────────────────────────────────
+
+def test_assemble_creative_surfaces_video_recommendation_on_generate():
+    copy = AdCopy(headline="h", video_recommended=True,
+                  video_recommendation_reason="A founder talking to camera builds trust fast.")
+    c = assemble_creative(copy, "https://cdn/ad.png", source=CreativeSource.GENERATE)
+    assert c.video_recommendation == "A founder talking to camera builds trust fast."
+
+
+def test_assemble_creative_no_recommendation_when_not_flagged():
+    copy = AdCopy(headline="h", video_recommended=False, video_recommendation_reason="")
+    c = assemble_creative(copy, "https://cdn/ad.png", source=CreativeSource.GENERATE)
+    assert c.video_recommendation == ""
+
+
+def test_assemble_creative_recommendation_suppressed_for_upload():
+    # UPLOAD already has a real media choice made — nothing to recommend.
+    copy = AdCopy(headline="h", video_recommended=True, video_recommendation_reason="ignored")
+    c = assemble_creative(copy, "https://cdn/ad.png", source=CreativeSource.UPLOAD)
+    assert c.video_recommendation == ""
+
+
+def test_assemble_creative_recommendation_suppressed_for_draft():
+    copy = AdCopy(headline="h", video_recommended=True, video_recommendation_reason="ignored")
+    c = assemble_creative(copy, "https://cdn/ad.png", source=CreativeSource.DRAFT)
+    assert c.video_recommendation == ""
