@@ -56,11 +56,18 @@ _NO_BUDGET_CLARIFY = (
     "\"around 15 people\"? Or tell me your budget directly if you'd rather."
 )
 
+_NO_BUSINESS_CLARIFY = (
+    "What would you like to promote? Tell me a bit about your business or what you're selling."
+)
+
 
 async def parse_message(message: str, business_name: str = "", category: str = "") -> ParsedCampaign:
     """Extract structured campaign fields from a plain-language message."""
     if not settings.OPENAI_API_KEY or not (message or "").strip():
-        return ParsedCampaign(missing=["budget_ngn"], clarify=_NO_BUDGET_CLARIFY)
+        if not business_name and not category:
+            return ParsedCampaign(missing=["business_name"], clarify=_NO_BUSINESS_CLARIFY)
+        return ParsedCampaign(business_name=business_name, category=category,
+                               missing=["budget_ngn"], clarify=_NO_BUDGET_CLARIFY)
 
     prompt = (
         "You are Jane, an ad assistant for Nigerian SMEs. Read the message and extract "
@@ -94,9 +101,20 @@ async def parse_message(message: str, business_name: str = "", category: str = "
         data = json.loads(resp.choices[0].message.content or "{}")
     except Exception as e:
         print(f"[NL] parse error: {e}", flush=True)
-        return ParsedCampaign(missing=["budget_ngn"], clarify=_NO_BUDGET_CLARIFY)
+        if not business_name and not category:
+            return ParsedCampaign(missing=["business_name"], clarify=_NO_BUSINESS_CLARIFY)
+        return ParsedCampaign(business_name=business_name, category=category,
+                               missing=["budget_ngn"], clarify=_NO_BUDGET_CLARIFY)
 
     parsed = _coerce(data, business_name, category)
+    # Business identity comes first — asking about budget before Jane knows what's
+    # being promoted produces a generic, placeholder campaign (a goal alone, e.g. from
+    # a quick-reply chip, isn't enough). Only fall through to the budget check once
+    # Jane actually knows what this is for, from either the message or history.
+    if not parsed.business_name and not parsed.category:
+        parsed.missing = ["business_name"]
+        parsed.clarify = _NO_BUSINESS_CLARIFY
+        return parsed
     # A stated Naira budget always wins. Without one, a stated customer-count is enough to
     # proceed — the router converts it to a budget using real cost-per-conversation data
     # before this reaches to_campaign_request. Only ask again when NEITHER is given.
@@ -135,8 +153,13 @@ def _coerce(data: dict, business_name: str, category: str) -> ParsedCampaign:
 
 
 def to_campaign_request(parsed: ParsedCampaign, business_id: str = "demo") -> Optional[CampaignRequest]:
-    """Deterministic map from parsed fields → CampaignRequest. Returns None if the
-    budget is missing (the one field we can't proceed without). Pure & unit-tested."""
+    """Deterministic map from parsed fields → CampaignRequest. Returns None if Jane
+    doesn't know what's being promoted yet (business_name AND category both empty) or
+    if the budget is missing — the two things we can't proceed without. Gated here
+    directly (not just via parse_message's `missing`/`clarify`) so this stays correct
+    even if a caller skips that ordering. Pure & unit-tested."""
+    if not parsed.business_name and not parsed.category:
+        return None
     if not parsed.budget_ngn or parsed.budget_ngn <= 0:
         return None
     return CampaignRequest(
