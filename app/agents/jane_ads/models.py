@@ -152,6 +152,9 @@ class CampaignPlan(BaseModel):
                                              # Meta rejects link-ad creation with no real media
                                              # attached, so the real adapter needs this, not just
                                              # the platform/budget decision
+    shoot_script: Optional["ShootScript"] = None  # Path C — set only when creative.video_recommendation
+                                             # fired; the user can film this and swap it in via
+                                             # POST /meta/plan/{id}/creative before launching
 
 
 class SpendAuthorization(BaseModel):
@@ -213,6 +216,25 @@ class AdCreative(BaseModel):
                                      # set for UPLOAD/DRAFT (the media choice is
                                      # already made there)
     generated: bool = True          # False when there's no media → copy-only fallback
+
+
+# ── Path C: script-and-shoot (PRD §4.1) ───────────────────────────────────────
+
+class ShootShot(BaseModel):
+    """One shot in a phone-filmable script — no crew, no equipment assumed."""
+    direction: str = ""      # what to film / how to frame it (e.g. "you, mid-shot, at the counter")
+    say: str = ""            # what to say on camera, if anything; empty for a silent b-roll shot
+    seconds: int = 5         # rough duration, so the whole script sums to a realistic ad length
+
+
+class ShootScript(BaseModel):
+    """Jane's shoot script — written when a video was recommended over a photo, so
+    the business owner can film it themselves instead of relying on the (photo-only)
+    AI generator. Filmed footage is then uploaded via the existing upload path and
+    folded back into the pending plan; this is guidance for the shoot, not media."""
+    hook_line: str = ""                          # the first ~2 seconds — what stops the scroll
+    shots: list[ShootShot] = Field(default_factory=list)
+    caption_idea: str = ""                       # optional on-screen caption/text overlay idea
 
 
 # ── Events (adapter → Shore) ──────────────────────────────────────────────────
