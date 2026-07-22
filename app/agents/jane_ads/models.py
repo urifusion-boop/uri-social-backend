@@ -141,6 +141,16 @@ class CampaignPlan(BaseModel):
     platforms: list[PlatformPlan]
     per_business_cap_ngn: float
     account_cap_ngn: float
+    budget_tier: str = ""                   # "starter" | "standard" | "growth" — same
+                                             # ₦10k/₦20k boundaries the A/B test scope
+                                             # already uses (constants.AB_LIGHT_TEST_NGN/
+                                             # AB_FULL_TEST_NGN), so the label always
+                                             # matches the variant/test-scope decision
+    estimated_conversations: Optional[int] = None  # ALWAYS an estimate, never a promise
+                                             # (PRD §3.3) — total budget ÷ this business's
+                                             # real per-conversation price; attached
+                                             # regardless of whether the user stated a
+                                             # budget or a desired outcome
     geo: Optional[GeoPlan] = None           # attached after platform selection
     objective: CampaignObjective = CampaignObjective.CONVERSATIONS
     explanation: str = ""                   # required plain-language "why" (PRD §6)

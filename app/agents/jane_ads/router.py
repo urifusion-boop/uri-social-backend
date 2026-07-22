@@ -607,6 +607,18 @@ async def _build_campaign_plan(
             f"per conversation, ₦{budget_estimate['estimated_budget_ngn']:,.0f} should get you around "
             f"{budget_estimate['desired_conversions']} conversations. {plan.explanation}"
         )
+        price_per_conversation = budget_estimate["price_per_conversation_ngn"]
+    else:
+        # Forward-looking estimate (PRD §3.3) — the user gave a budget directly, so
+        # show what it should buy too, using this business's own real per-conversation
+        # price. ALWAYS an estimate, never a promise — never used to gate anything.
+        from .wallet import WalletService
+        from .store import MongoWalletStore
+
+        wallet = WalletService(MongoWalletStore(db))
+        trailing_cost = await wallet.trailing_cost_per_conversation(business_id)
+        price_per_conversation = WalletService.price_conversation(trailing_cost)
+    plan.estimated_conversations = max(1, round(req.budget_ngn / price_per_conversation))
 
     # For now, always launch on Meta — it's the only platform with a live adapter
     # (Google/TikTok are still pending, #7/#8). If Jane's decision landed elsewhere,
@@ -742,6 +754,8 @@ def _plan_response_dict(built: _PlanBuildResult) -> dict:
             "platforms": [p.model_dump(mode="json") for p in plan.platforms],
             "per_business_cap_ngn": plan.per_business_cap_ngn,
             "account_cap_ngn": plan.account_cap_ngn,
+            "budget_tier": plan.budget_tier,
+            "estimated_conversations": plan.estimated_conversations,
             "geo": built.geo_dump,
             "trace": plan.trace,
         },
