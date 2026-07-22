@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 from app.core.auth_bearer import JWTBearer
 from app.dependencies import get_active_brand_context, get_db_dependency
 
+from . import constants as C
 from .adapters.mock import MockAdPlatformAdapter
 from .decision_engine import apply_platform_override, plan_campaign
 from .instrumentation import InstrumentationService, MongoInstrumentationStore
@@ -407,6 +408,64 @@ async def wallet_balance(
         "balance_ngn": balance,
         "transactions": [t.model_dump(mode="json") for t in txns[-20:]],
     }
+
+
+# ── Brand-scoped wallet (what the app UI calls) ───────────────────────────────
+# The two endpoints above take an explicit business_id (internal/demo use). The UI
+# instead uses these, which derive the wallet key from the active brand context —
+# the SAME id _build_campaign_plan spends against — so a user can only ever see and
+# fund their own brand's wallet (no business_id in the request to tamper with), and
+# the balance shown here is guaranteed to be the one a launch will actually check.
+
+@router.get("/wallet")
+async def jane_wallet(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """The active brand's ad-wallet balance + recent ledger, for the wallet view."""
+    business_id = brand_ctx.get("brand_id")
+    if not business_id:
+        return {"balance_ngn": 0.0, "currency": "NGN",
+                "min_topup_ngn": C.MIN_TOPUP_NGN, "transactions": []}
+    wallet = WalletService(MongoWalletStore(db))
+    balance = await wallet.get_balance(business_id)
+    txns = await wallet.list_transactions(business_id)
+    return {
+        "balance_ngn": balance,
+        "currency": "NGN",
+        "min_topup_ngn": C.MIN_TOPUP_NGN,
+        # Newest first — the ledger reads top-down like a bank statement.
+        "transactions": [t.model_dump(mode="json") for t in reversed(txns[-20:])],
+    }
+
+
+class JaneWalletFundBody(BaseModel):
+    amount_ngn: float = Field(..., gt=0)
+
+
+@router.post("/wallet/fund")
+async def jane_wallet_fund(
+    body: JaneWalletFundBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+    token: dict = Depends(JWTBearer()),
+) -> dict:
+    """Start a Squad checkout to fund the active brand's ad wallet. Returns the
+    checkout URL for the client to open. Nothing is credited until Squad confirms
+    (via the callback's verify call, or the webhook — both idempotent)."""
+    business_id = brand_ctx.get("brand_id")
+    if not business_id:
+        raise HTTPException(status_code=400, detail="No active brand to fund a wallet for.")
+    email = (token.get("claims", {}) or {}).get("email", "")
+    if not email:
+        raise HTTPException(status_code=400, detail="No billing email on your account.")
+    try:
+        result = await JaneAdsPayments(db).initialize_topup(business_id, body.amount_ngn, email)
+    except MinimumTopUpError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Could not start payment: {e}")
+    return {"status": "checkout_created", **result}
 
 
 @router.get("/instrumentation/{business_id}")

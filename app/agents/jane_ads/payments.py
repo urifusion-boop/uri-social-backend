@@ -66,7 +66,11 @@ class JaneAdsPayments:
             "currency": "NGN",
             "initiate_type": "inline",
             "transaction_ref": reference,
-            "callback_url": f"{web_app_url}/workspace?tab=ads-wallet",
+            # Squad appends ?reference=<ref> to this on return; the campaigns page
+            # reads it, calls verify, and refreshes the wallet. Landing on the
+            # campaigns tab (not a standalone page) keeps the user in the same flow
+            # they were funding the wallet for.
+            "callback_url": f"{web_app_url}/workspace?tab=campaigns",
         }
         async with httpx.AsyncClient() as client:
             resp = await client.post(
