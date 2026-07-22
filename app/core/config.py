@@ -154,6 +154,10 @@ class Settings(BaseSettings):
     SMTP_FROM_NAME: str = "URI Social"
     SMTP_USE_TLS: bool = True
     ADMIN_NOTIFICATION_EMAIL: str = ""
+    # Comma-separated emails allowed to see the Jane Ads admin billing report
+    # (all-users ad spend / margin). Overridable by the env var of the same name;
+    # the default seeds the current admins so the report works without server config.
+    JANE_ADS_ADMIN_EMAILS: str = "shorekoya@gmail.com,urisocialingsight@gmail.com"
 
     # Sentry (optional)
     SENTRY_DSN: Optional[str] = None
