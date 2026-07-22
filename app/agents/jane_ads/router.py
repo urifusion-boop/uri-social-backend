@@ -538,6 +538,7 @@ async def _build_campaign_plan(
     from app.core.config import settings
     from .creative import creative_from_draft, creative_from_upload, generate_ad_creative
     from .decision_engine import apply_platform_override, plan_campaign
+    from .history import get_campaign_history, remembered_budget_ngn, remembered_business_name, remembered_category
     from .nl import parse_message, to_campaign_request
     from .policy import Severity, review_ad_creative
 
@@ -558,15 +559,26 @@ async def _build_campaign_plan(
         # the caller can actually act on.
         raise HTTPException(status_code=400, detail="Video ads aren't supported yet — please upload a photo instead.")
 
-    # 1. Jane reads the plain-English message.
-    parsed = await parse_message(body.message, body.business_name, body.category)
     # Tie the campaign to the caller's active brand so it shows up in their
     # campaign list; fall back to a random id only if there's no brand context.
     business_id = brand_ctx.get("brand_id") or f"oneshot_{uuid.uuid4().hex[:8]}"
+
+    # 0.5. Recall — a returning business shouldn't have to re-explain what Jane
+    # already learned launching their last campaign here (PRD §6). Only meaningful
+    # for a real brand context; a one-shot anonymous business_id has no history.
+    history = await get_campaign_history(db, business_id) if brand_ctx.get("brand_id") else []
+    known_business_name = body.business_name or remembered_business_name(history)
+    known_category = body.category or remembered_category(history)
+    known_budget = remembered_budget_ngn(history)
+
+    # 1. Jane reads the plain-English message.
+    parsed = await parse_message(body.message, known_business_name, known_category)
     req = to_campaign_request(parsed, business_id=business_id)
     if req is None:
-        return {"early_return": {"stage": "need_more", "understood": parsed.model_dump(),
-                "question": parsed.clarify or "How much would you like to spend?"}}
+        clarify = parsed.clarify or "How much would you like to spend?"
+        if known_budget and "spend" in clarify.lower():
+            clarify += f" Last time you spent ₦{known_budget:,.0f} — want to do the same again?"
+        return {"early_return": {"stage": "need_more", "understood": parsed.model_dump(), "question": clarify}}
 
     # 2. Jane decides the platform + budget split, with her reasoning.
     result = plan_campaign(req, funded_amount_ngn=req.budget_ngn, total_funded_wallets_ngn=req.budget_ngn)
@@ -710,6 +722,7 @@ async def _do_launch(built: _PlanBuildResult, body_message: str, body_business_n
             "brand_id": brand_ctx.get("brand_id"),
             "user_id": brand_ctx.get("user_id"),
             "display_name": req.business_name or body_business_name or "Campaign",
+            "category": req.category,
             "headline": plan.creative.headline,
             "primary_text": plan.creative.primary_text,
             "image_url": plan.creative.image_url,
