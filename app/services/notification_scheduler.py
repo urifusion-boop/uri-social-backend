@@ -9,6 +9,7 @@ Runs daily batch jobs:
 - PRD 8.3: Trial expiry checks (every 6 hours)
 - PRD 8.3: Subscription expiry checks (daily at 00:00 UTC)
 - WhatsApp daily content push (08:00 UTC / 09:00 WAT)
+- Jane + Ads mid-flight monitoring (every 4 hours) — campaign roadmap Tier 4
 
 Note: publish_scheduled_content is intentionally NOT in this scheduler.
 It is triggered every 5 minutes by the GitHub Actions workflow
@@ -66,6 +67,18 @@ def _job_whatsapp_daily_push():
         db = get_db()
         result = await WhatsAppFlowService.send_daily_push(db)
         print(f"📱 WhatsApp daily push complete: {result}")
+    _run_async(_run)
+
+
+def _job_jane_ads_monitoring():
+    """Jane + Ads mid-flight monitoring (campaign roadmap Tier 4) — flags
+    underperforming campaigns and announces finished ones."""
+    async def _run():
+        from app.database import get_db
+        from app.agents.jane_ads.monitoring import check_active_campaigns
+        db = get_db()
+        result = await check_active_campaigns(db)
+        print(f"📊 Jane Ads monitoring: {result}")
     _run_async(_run)
 
 
@@ -129,8 +142,17 @@ def start_notification_scheduler():
         **_JOB_DEFAULTS,
     )
 
+    # Jane + Ads mid-flight monitoring every 4 hours — ad campaigns move faster
+    # than subscription/trial checks, so this runs more often than those.
+    _scheduler.add_job(
+        _job_jane_ads_monitoring,
+        CronTrigger(hour="*/4", minute=30),
+        id="jane_ads_monitoring",
+        **_JOB_DEFAULTS,
+    )
+
     _scheduler.start()
-    print("📅 Notification scheduler started with 5 jobs")
+    print("📅 Notification scheduler started with 6 jobs")
 
 
 def stop_notification_scheduler():
