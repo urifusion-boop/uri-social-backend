@@ -37,7 +37,7 @@ payload.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import httpx
@@ -156,6 +156,14 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
         # budget will come back as a descriptive error from the API, not a silent
         # failure, so this is intentionally not pre-validated here.
         daily_budget_minor = max(int((total_budget_ngn / days) * 100), 100)
+        # A real end date, not just a `days` number in copy — without this the ad
+        # set has no natural stop and would run (and spend) indefinitely once
+        # activated. Measured from creation, not activation: if a campaign sits
+        # PAUSED for a while before someone activates it, its window is simply
+        # shorter (or already elapsed, in which case it safely won't deliver) —
+        # that's a minor UX gap, not a spend-safety one, since PAUSED never spends.
+        start_time = datetime.now(timezone.utc)
+        end_time = start_time + timedelta(days=days)
 
         async with httpx.AsyncClient(timeout=30) as client:
             campaign_resp = await client.post(
@@ -189,6 +197,8 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                     "promoted_object": {"page_id": plan.page_id},
                     "targeting": {"geo_locations": {"countries": ["NG"]}},
                     "status": "PAUSED",
+                    "start_time": start_time.isoformat(),
+                    "end_time": end_time.isoformat(),
                 },
             )
             adset_data = adset_resp.json()
