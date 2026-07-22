@@ -49,6 +49,11 @@ DEFAULT_CAMPAIGN_DAYS: int = 5
 
 # ── Wallet / billing (PRD A4, B3) ────────────────────────────────────────────
 MIN_TOPUP_NGN: float = 5_000.0
+# Production billing meter: recoup real Meta ad spend × this markup from the
+# customer's prepaid wallet (see billing.py). >1 guarantees URI is made whole on
+# every campaign plus margin — no basis risk from underperforming campaigns, unlike
+# the per-conversation meter below.
+AD_SPEND_MARKUP: float = 1.5
 CONVERSATION_PRICE_FLOOR_NGN: float = 400.0   # MAX(₦400, trailing-7d cost × 1.5)
 CONVERSATION_PRICE_MULTIPLIER: float = 1.5
 TRAILING_COST_WINDOW_DAYS: int = 7
