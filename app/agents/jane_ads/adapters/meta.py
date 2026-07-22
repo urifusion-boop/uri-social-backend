@@ -30,13 +30,16 @@ falls back to Meta's own aggregate "messaging_conversation_started" insight metr
 returning only the DELTA since the last poll (tracked per campaign in Mongo) so
 callers never double-charge a conversation that was already reported.
 
-Video creatives aren't supported yet (Meta needs a video_data creative shape via
-/advideos, not the link_data+picture shape used here) — launch_campaign raises
-NotImplementedError for plan.creative.is_video rather than silently building a broken
-payload.
+Video creatives (campaign roadmap Tier 3b) upload the hosted video to Meta via
+`/advideos` (file_url — Meta fetches it directly, no re-streaming needed here),
+poll until processing finishes, fetch a thumbnail, then build the ad creative's
+`video_data` shape instead of `link_data`+picture. Verified live end-to-end
+against the real Ad Account with a real (tiny, generated) test clip.
 """
 from __future__ import annotations
 
+import asyncio
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -58,6 +61,11 @@ COLLECTION = "jane_ads_meta_campaigns"
 
 # Standard Meta insight action type for Click-to-WhatsApp conversation starts.
 _CONVERSATION_ACTION_TYPE = "onsite_conversion.messaging_conversation_started_7d"
+
+# Meta processes uploaded video asynchronously (verified live: a short vertical
+# clip is typically ready in well under a minute) — poll rather than assume.
+_VIDEO_POLL_ATTEMPTS = 20
+_VIDEO_POLL_INTERVAL_SECONDS = 5
 
 # Meta's `effective_status` values, translated to plain language for the campaign-
 # list view — callers never see raw Ads-Manager jargon.
@@ -128,6 +136,51 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
         if not self._access_token:
             raise MetaAPIError("META_SYSTEM_TOKEN is not configured")
 
+    async def _upload_video_to_meta(self, video_url: str) -> tuple[str, str]:
+        """Upload an already-hosted video (Cloudinary) to Meta via `file_url` (Meta
+        fetches it directly — no need to re-stream the bytes ourselves), poll until
+        processing finishes, and grab a thumbnail for the ad creative's required
+        `image_url`. Returns (video_id, thumbnail_url). Raises MetaAPIError if
+        processing fails, produces no thumbnail, or doesn't finish in time."""
+        async with httpx.AsyncClient(timeout=60) as client:
+            upload_resp = await client.post(
+                f"{self._graph_base}/act_{self._ad_account_id}/advideos",
+                params={"access_token": self._access_token},
+                data={"file_url": video_url, "name": f"JaneAds-video-{uuid.uuid4().hex[:8]}"},
+            )
+            upload_data = upload_resp.json()
+            _raise_for_error(upload_data, "video upload")
+            video_id = upload_data["id"]
+
+            for _ in range(_VIDEO_POLL_ATTEMPTS):
+                await asyncio.sleep(_VIDEO_POLL_INTERVAL_SECONDS)
+                status_resp = await client.get(
+                    f"{self._graph_base}/{video_id}",
+                    params={"access_token": self._access_token, "fields": "status"},
+                )
+                status_data = status_resp.json()
+                _raise_for_error(status_data, "video status fetch")
+                video_status = status_data.get("status", {}).get("video_status")
+                if video_status == "ready":
+                    break
+                if video_status == "error":
+                    raise MetaAPIError(f"Meta failed to process the uploaded video ({video_id})")
+            else:
+                raise MetaAPIError(f"Video {video_id} did not finish processing in time")
+
+            thumb_resp = await client.get(
+                f"{self._graph_base}/{video_id}/thumbnails",
+                params={"access_token": self._access_token},
+            )
+            thumb_data = thumb_resp.json()
+            _raise_for_error(thumb_data, "video thumbnail fetch")
+            thumbs = thumb_data.get("data", [])
+            if not thumbs:
+                raise MetaAPIError(f"No thumbnail available for video {video_id}")
+            thumbnail_url = next((t["uri"] for t in thumbs if t.get("is_preferred")), thumbs[0]["uri"])
+
+        return video_id, thumbnail_url
+
     async def launch_campaign(
         self, plan: CampaignPlan, auth: SpendAuthorization
     ) -> LaunchResult:
@@ -141,12 +194,6 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
             # attached ("Please specify the media to run with this ad"), so this
             # can't fall back to a text-only placeholder.
             raise ValueError("CampaignPlan.creative.image_url is required to launch a real Meta campaign")
-        if plan.creative.is_video:
-            raise NotImplementedError(
-                "Video creatives need Meta's video_data creative shape (upload via "
-                "/advideos, reference the resulting video_id) — not yet implemented; "
-                "only image creatives (link_data + picture) are supported."
-            )
         platform_plan = meta_plans[0]
 
         total_budget_ngn = min(platform_plan.budget_ngn, auth.funded_amount_ngn)
@@ -164,6 +211,14 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
         # that's a minor UX gap, not a spend-safety one, since PAUSED never spends.
         start_time = datetime.now(timezone.utc)
         end_time = start_time + timedelta(days=days)
+
+        # Video needs its own upload + processing step BEFORE anything is created
+        # on Meta — if the video fails to process, nothing (campaign/ad set) gets
+        # created only to be orphaned.
+        video_id: Optional[str] = None
+        video_thumbnail_url: Optional[str] = None
+        if plan.creative.is_video:
+            video_id, video_thumbnail_url = await self._upload_video_to_meta(plan.creative.image_url)
 
         async with httpx.AsyncClient(timeout=30) as client:
             campaign_resp = await client.post(
@@ -205,20 +260,33 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
             _raise_for_error(adset_data, "ad set creation")
             adset_id = adset_data["id"]
 
+            message = plan.creative.primary_text or plan.creative.headline or "Chat with us on WhatsApp!"
+            if plan.creative.is_video:
+                object_story_spec = {
+                    "page_id": plan.page_id,
+                    "video_data": {
+                        "video_id": video_id,
+                        "image_url": video_thumbnail_url,
+                        "message": message,
+                        "call_to_action": {"type": "WHATSAPP_MESSAGE"},
+                    },
+                }
+            else:
+                object_story_spec = {
+                    "page_id": plan.page_id,
+                    "link_data": {
+                        "message": message,
+                        "link": "https://wa.me/",
+                        "picture": plan.creative.image_url,
+                        "call_to_action": {"type": "WHATSAPP_MESSAGE"},
+                    },
+                }
             creative_resp = await client.post(
                 f"{self._graph_base}/act_{self._ad_account_id}/adcreatives",
                 params={"access_token": self._access_token},
                 json={
                     "name": f"JaneAds-{plan.business_id}-creative",
-                    "object_story_spec": {
-                        "page_id": plan.page_id,
-                        "link_data": {
-                            "message": plan.creative.primary_text or plan.creative.headline or "Chat with us on WhatsApp!",
-                            "link": "https://wa.me/",
-                            "picture": plan.creative.image_url,
-                            "call_to_action": {"type": "WHATSAPP_MESSAGE"},
-                        },
-                    },
+                    "object_story_spec": object_story_spec,
                 },
             )
             creative_data = creative_resp.json()

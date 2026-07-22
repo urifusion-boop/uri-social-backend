@@ -553,13 +553,6 @@ async def _build_campaign_plan(
         raise HTTPException(status_code=400, detail="reference_image_url is required for creative_source=upload")
     if body.creative_source == "draft" and not body.draft_id:
         raise HTTPException(status_code=400, detail="draft_id is required for creative_source=draft")
-    if body.creative_source == "upload" and body.is_video:
-        # MetaAdPlatformAdapter.launch_campaign already rejects this safely (Meta
-        # needs a /advideos + video_data shape, not built yet) before creating
-        # anything on Meta — but only after the geo/creative work below runs, with
-        # an implementation-detail message. Fail fast here instead, with a message
-        # the caller can actually act on.
-        raise HTTPException(status_code=400, detail="Video ads aren't supported yet — please upload a photo instead.")
 
     # Tie the campaign to the caller's active brand so it shows up in their
     # campaign list; fall back to a random id only if there's no brand context.
