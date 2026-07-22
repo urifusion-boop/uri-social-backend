@@ -108,9 +108,16 @@ class MetaAPIError(Exception):
 def _raise_for_error(data: dict, context: str) -> None:
     if "error" in data:
         err = data["error"]
+        # Meta's `error_user_msg`/`error_user_title` are the human-readable, actionable
+        # reason (e.g. "Budget is too low — Your ad set budget must be more than
+        # NGN1,400.00"); the generic `message` is usually just "Invalid parameter".
+        # Prefer the human copy so the reason reaches the user instead of a code.
+        user_title = err.get("error_user_title")
+        user_msg = err.get("error_user_msg")
+        human = " — ".join(p for p in (user_title, user_msg) if p)
+        detail = human or err.get("message") or "unknown error"
         raise MetaAPIError(
-            f"{context}: {err.get('message')} (code={err.get('code')}, "
-            f"subcode={err.get('error_subcode')})",
+            f"{context}: {detail} (code={err.get('code')}, subcode={err.get('error_subcode')})",
             code=err.get("code"),
             subcode=err.get("error_subcode"),
         )

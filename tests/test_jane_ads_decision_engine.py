@@ -5,7 +5,7 @@ GOAL first, behaviour drives, business type is a hint, decided per campaign, alw
 explained. Pure logic — no network, no server, no DB.
 """
 from app.agents.jane_ads import constants as C
-from app.agents.jane_ads.decision_engine import default_behaviour, choose_platform, budget_tier_for
+from app.agents.jane_ads.decision_engine import default_behaviour, choose_platform, budget_tier_for, _days_for
 from app.agents.jane_ads.models import (
     CampaignRequest,
     CreativeContext,
@@ -143,6 +143,30 @@ def test_light_test_at_mid_budget():
 def test_full_test_at_large_budget():
     res = _plan(category="fashion", budget_ngn=20_000)
     assert res.plan.platforms[0].test_scope == ABTestScope.AUDIENCE_AND_CREATIVE
+
+
+# ── Meta daily-budget floor: duration is capped so total/days clears it ────────
+
+def test_days_capped_so_small_budget_clears_meta_daily_floor():
+    # ₦5,000 over the default 4 days = ₦1,250/day, under Meta's ₦1,610 floor →
+    # Meta rejects the ad set (subcode 1885272). Duration must shorten to 3 days.
+    assert _days_for(5_000) == 3
+    assert 5_000 / _days_for(5_000) >= C.META_MIN_DAILY_NGN
+
+
+def test_days_unchanged_when_budget_already_clears_floor():
+    # ₦10,000 over 5 days = ₦2,000/day (clears the floor) — unchanged.
+    assert _days_for(10_000) == C.DEFAULT_CAMPAIGN_DAYS
+    # ₦20,000+ still gets the full 7-day run.
+    assert _days_for(20_000) == C.MAX_CAMPAIGN_DAYS
+
+
+def test_every_runnable_budget_produces_a_deliverable_daily_budget():
+    # Any budget the engine will actually run (≥ the useful minimum) must yield a
+    # daily budget at/above Meta's floor after the day-cap.
+    for budget in (5_000, 6_000, 8_000, 10_000, 15_000, 20_000, 50_000):
+        daily = budget / _days_for(budget)
+        assert daily >= C.META_MIN_DAILY_NGN, f"₦{budget} → ₦{daily:.0f}/day under floor"
 
 
 # ── Caps, explanation, trace ──────────────────────────────────────────────────

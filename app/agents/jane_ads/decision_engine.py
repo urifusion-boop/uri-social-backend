@@ -111,10 +111,19 @@ def budget_tier_for(total_budget_ngn: float) -> str:
 
 def _days_for(total_budget: float) -> int:
     if total_budget >= C.AB_FULL_TEST_NGN:
-        return C.MAX_CAMPAIGN_DAYS
-    if total_budget <= C.USEFUL_MIN_NGN["meta"]:
-        return C.MIN_CAMPAIGN_DAYS
-    return C.DEFAULT_CAMPAIGN_DAYS
+        days = C.MAX_CAMPAIGN_DAYS
+    elif total_budget <= C.USEFUL_MIN_NGN["meta"]:
+        days = C.MIN_CAMPAIGN_DAYS
+    else:
+        days = C.DEFAULT_CAMPAIGN_DAYS
+    # Meta rejects an ad set whose daily budget (total ÷ days) is below its floor,
+    # so a small budget spread over the default number of days would fail to launch
+    # (e.g. ₦5,000 over 4 days = ₦1,250/day, under the ₦1,610 floor). Shorten the
+    # run so each day clears the floor — a delivered 3-day campaign beats a rejected
+    # 4-day one. Never below 1 day; the useful-minimum gate keeps total ≥ ₦5,000, so
+    # at least one day always clears.
+    max_days = int(total_budget // C.META_MIN_DAILY_NGN)
+    return max(1, min(days, max_days))
 
 
 def _variant_plan(platform_budget: float, useful_min: float) -> tuple[int, ABTestScope]:
