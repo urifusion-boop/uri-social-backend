@@ -33,6 +33,15 @@ HARD_FLOOR_DAILY_NGN: dict[str, float] = {
 # TikTok is video-only; no video → no TikTok regardless of budget (PRD C1).
 TIKTOK_REQUIRES_VIDEO: bool = True
 
+# ── Meta minimum daily budget ─────────────────────────────────────────────────
+# Meta rejects an ad set whose daily budget is at/below its per-currency minimum
+# (observed live 2026-07 as "must be more than NGN1,400.00", API error subcode
+# 1885272 "Budget is too low"). We clear it by CAPPING campaign DURATION so
+# total/days stays above this — never by inflating the daily budget past what the
+# user authorised. Set a touch above the observed floor for headroom, matching the
+# FB hard floor already noted in HARD_FLOOR_DAILY_NGN.
+META_MIN_DAILY_NGN: float = 1_610.0
+
 # ── Campaign duration (PRD C: 4–7 days) ──────────────────────────────────────
 MIN_CAMPAIGN_DAYS: int = 4
 MAX_CAMPAIGN_DAYS: int = 7
