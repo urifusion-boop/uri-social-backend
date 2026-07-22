@@ -655,10 +655,25 @@ async def _build_campaign_plan(
         if creative is None:
             raise HTTPException(status_code=404, detail="Draft not found or has no image")
     else:
+        # AI generation is the one creative path that costs a content credit — an
+        # uploaded photo/video or a reused draft (PRD §5.1) doesn't touch this at all.
+        from app.services.CreditService import credit_service
+
+        if not await credit_service.check_sufficient_credits(user_id, required=1):
+            raise HTTPException(
+                status_code=402,
+                detail="You're out of content credits — top up to generate a new ad image, or upload your own photo/video instead.",
+            )
         creative = await generate_ad_creative(
             business_name, category, req.goal.value, req.description,
             user_id=user_id, db=db, brand_id=brand_id, city=parsed.city,
         )
+        if creative.image_url:
+            # "reason" is a strict Literal on CreditTransaction — "campaign_generation"
+            # (the function's own default) is the closest existing match; there's no
+            # ad-specific reason value and adding one is a shared-model change beyond
+            # this feature's scope.
+            await credit_service.deduct_credit(user_id, campaign_id=business_id, reason="campaign_generation")
     if not creative.image_url:
         raise HTTPException(status_code=502, detail="Jane couldn't generate the ad image (creative service). Try again.")
 
