@@ -39,6 +39,9 @@ class ParsedCampaign(BaseModel):
     category: str = ""
     goal: Optional[str] = None
     budget_ngn: Optional[float] = None
+    desired_conversions: Optional[int] = None   # "20 customers" — a result, not a Naira amount;
+                                                 # the router converts this to a budget when
+                                                 # budget_ngn wasn't stated (PRD §3.1)
     city: str = ""
     stated_behaviour: Optional[str] = None
     is_new_thing: bool = False
@@ -48,10 +51,16 @@ class ParsedCampaign(BaseModel):
     clarify: str = ""
 
 
+_NO_BUDGET_CLARIFY = (
+    "About how many new customers would make this feel like a win — e.g. \"20 customers\" or "
+    "\"around 15 people\"? Or tell me your budget directly if you'd rather."
+)
+
+
 async def parse_message(message: str, business_name: str = "", category: str = "") -> ParsedCampaign:
     """Extract structured campaign fields from a plain-language message."""
     if not settings.OPENAI_API_KEY or not (message or "").strip():
-        return ParsedCampaign(missing=["budget_ngn"], clarify="How much would you like to spend?")
+        return ParsedCampaign(missing=["budget_ngn"], clarify=_NO_BUDGET_CLARIFY)
 
     prompt = (
         "You are Jane, an ad assistant for Nigerian SMEs. Read the message and extract "
@@ -61,7 +70,12 @@ async def parse_message(message: str, business_name: str = "", category: str = "
         "Extract JSON with these keys:\n"
         "- business_name (string)\n- category (e.g. restaurant, fashion, plumber, clinic)\n"
         f"- goal (one of {sorted(_GOALS)}; infer from intent, else null)\n"
-        "- budget_ngn (number in Naira; parse '₦10k','10,000','ten thousand' → 10000; else null)\n"
+        "- budget_ngn (a NAIRA amount they'll spend; parse '₦10k','10,000','ten thousand' → 10000; "
+        "else null — do NOT put a plain customer/people count here)\n"
+        "- desired_conversions (a NUMBER OF PEOPLE/CUSTOMERS/ORDERS they want as a RESULT — e.g. "
+        "'20 customers' → 20, 'around 15 people' → 15, 'get me 30 orders' → 30; else null — do NOT "
+        "put a Naira amount here, and do NOT guess this from a bare number with no people/customer "
+        "unit attached)\n"
         "- city (the place/area mentioned, e.g. Surulere, Lekki; else empty)\n"
         f"- stated_behaviour (one of {sorted(_BEHAVIOURS)} ONLY if they say how customers find them; else null)\n"
         "- is_new_thing (true if launching something new nobody searches for yet)\n"
@@ -80,12 +94,15 @@ async def parse_message(message: str, business_name: str = "", category: str = "
         data = json.loads(resp.choices[0].message.content or "{}")
     except Exception as e:
         print(f"[NL] parse error: {e}", flush=True)
-        return ParsedCampaign(missing=["budget_ngn"], clarify="How much would you like to spend?")
+        return ParsedCampaign(missing=["budget_ngn"], clarify=_NO_BUDGET_CLARIFY)
 
     parsed = _coerce(data, business_name, category)
-    if not parsed.budget_ngn or parsed.budget_ngn <= 0:
+    # A stated Naira budget always wins. Without one, a stated customer-count is enough to
+    # proceed — the router converts it to a budget using real cost-per-conversation data
+    # before this reaches to_campaign_request. Only ask again when NEITHER is given.
+    if (not parsed.budget_ngn or parsed.budget_ngn <= 0) and not parsed.desired_conversions:
         parsed.missing = ["budget_ngn"]
-        parsed.clarify = "About how much would you like to spend on this?"
+        parsed.clarify = _NO_BUDGET_CLARIFY
     return parsed
 
 
@@ -97,6 +114,10 @@ def _coerce(data: dict, business_name: str, category: str) -> ParsedCampaign:
         except (TypeError, ValueError):
             return None
 
+    def _int(v):
+        n = _num(v)
+        return int(n) if n and n > 0 else None
+
     goal = str(data.get("goal") or "").lower().replace("-", "_") or None
     beh = str(data.get("stated_behaviour") or "").lower() or None
     return ParsedCampaign(
@@ -104,6 +125,7 @@ def _coerce(data: dict, business_name: str, category: str) -> ParsedCampaign:
         category=str(data.get("category") or category or "").strip(),
         goal=goal if goal in _GOALS else None,
         budget_ngn=_num(data.get("budget_ngn")),
+        desired_conversions=_int(data.get("desired_conversions")),
         city=str(data.get("city") or "").strip(),
         stated_behaviour=beh if beh in _BEHAVIOURS else None,
         is_new_thing=bool(data.get("is_new_thing")),
