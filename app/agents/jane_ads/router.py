@@ -521,6 +521,8 @@ class _PlanBuildResult(BaseModel):
     forced_to_meta: bool
     geo_dump: Optional[dict] = None
     understood: dict
+    budget_estimate: Optional[dict] = None   # set when budget_ngn was computed from a stated
+                                              # customer-count rather than a stated Naira amount
 
 
 async def _build_campaign_plan(
@@ -573,6 +575,26 @@ async def _build_campaign_plan(
 
     # 1. Jane reads the plain-English message.
     parsed = await parse_message(body.message, known_business_name, known_category)
+
+    # 1.5. Backwards budget (PRD §3.1) — the user described an outcome ("20 customers"),
+    # not a Naira amount. Convert using this business's own real cost-per-conversation
+    # (falls back to the platform floor for a brand-new business with no history yet),
+    # so "how much should I spend" is answered from data, not a guess.
+    budget_estimate = None
+    if (not parsed.budget_ngn or parsed.budget_ngn <= 0) and parsed.desired_conversions:
+        from .wallet import WalletService
+        from .store import MongoWalletStore
+
+        wallet = WalletService(MongoWalletStore(db))
+        trailing_cost = await wallet.trailing_cost_per_conversation(business_id)
+        price_per_conversation = WalletService.price_conversation(trailing_cost)
+        parsed.budget_ngn = round(parsed.desired_conversions * price_per_conversation, 2)
+        budget_estimate = {
+            "desired_conversions": parsed.desired_conversions,
+            "price_per_conversation_ngn": price_per_conversation,
+            "estimated_budget_ngn": parsed.budget_ngn,
+        }
+
     req = to_campaign_request(parsed, business_id=business_id)
     if req is None:
         clarify = parsed.clarify or "How much would you like to spend?"
@@ -586,6 +608,12 @@ async def _build_campaign_plan(
         return {"early_return": {"stage": "advise", "understood": parsed.model_dump(),
                 "advice": result.advice.model_dump(), "trace": result.advice.trace}}
     plan = result.plan
+    if budget_estimate:
+        plan.explanation = (
+            f"Based on similar campaigns costing about ₦{budget_estimate['price_per_conversation_ngn']:,.0f} "
+            f"per conversation, ₦{budget_estimate['estimated_budget_ngn']:,.0f} should get you around "
+            f"{budget_estimate['desired_conversions']} conversations. {plan.explanation}"
+        )
 
     # For now, always launch on Meta — it's the only platform with a live adapter
     # (Google/TikTok are still pending, #7/#8). If Jane's decision landed elsewhere,
@@ -654,6 +682,7 @@ async def _build_campaign_plan(
     return _PlanBuildResult(
         business_id=business_id, req=req, plan=plan, jane_platforms=jane_platforms,
         forced_to_meta=forced_to_meta, geo_dump=geo_dump, understood=parsed.model_dump(),
+        budget_estimate=budget_estimate,
     )
 
 
@@ -690,6 +719,7 @@ def _plan_response_dict(built: _PlanBuildResult) -> dict:
             "trace": plan.trace,
         },
         "creative": plan.creative.model_dump(mode="json"),
+        "budget_estimate": built.budget_estimate,
     }
 
 
@@ -813,6 +843,7 @@ async def meta_plan_from_message(
         "forced_to_meta": built.forced_to_meta,
         "geo_dump": built.geo_dump,
         "understood": built.understood,
+        "budget_estimate": built.budget_estimate,
         "status": "pending",
         "created_at": now,
         "expires_at": now + timedelta(days=7),
@@ -877,6 +908,7 @@ async def meta_launch_plan(
         business_id=doc["business_id"], req=req, plan=plan,
         jane_platforms=doc["jane_platforms"], forced_to_meta=doc["forced_to_meta"],
         geo_dump=doc.get("geo_dump"), understood=doc["understood"],
+        budget_estimate=doc.get("budget_estimate"),
     )
     result = await _do_launch(built, doc["message"], doc["business_name"], brand_ctx, db)
     await db["jane_ads_pending_plans"].update_one(
