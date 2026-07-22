@@ -524,8 +524,11 @@ async def meta_launch_from_message(
     from .adapters.meta import MetaAdPlatformAdapter, MetaAPIError
     from .creative import creative_from_draft, creative_from_upload, generate_ad_creative
     from .decision_engine import apply_platform_override, plan_campaign
-    from .models import PlanDecision, SpendAuthorization
+    from .models import PlanDecision
     from .nl import parse_message, to_campaign_request
+    from .policy import Severity, review_ad_creative
+    from .store import MongoWalletStore
+    from .wallet import WalletService
 
     if not (settings.META_AD_ACCOUNT_ID and settings.META_ADS_ACCESS_TOKEN):
         raise HTTPException(status_code=400, detail="Meta ads not configured — need META_AD_ACCOUNT_ID and META_ADS_ACCESS_TOKEN")
@@ -536,6 +539,13 @@ async def meta_launch_from_message(
         raise HTTPException(status_code=400, detail="reference_image_url is required for creative_source=upload")
     if body.creative_source == "draft" and not body.draft_id:
         raise HTTPException(status_code=400, detail="draft_id is required for creative_source=draft")
+    if body.creative_source == "upload" and body.is_video:
+        # MetaAdPlatformAdapter.launch_campaign already rejects this safely (Meta
+        # needs a /advideos + video_data shape, not built yet) before creating
+        # anything on Meta — but only after the wallet/geo/policy work below runs,
+        # with an implementation-detail message. Fail fast here instead, with a
+        # message the caller can actually act on.
+        raise HTTPException(status_code=400, detail="Video ads aren't supported yet — please upload a photo instead.")
 
     # 1. Jane reads the plain-English message.
     parsed = await parse_message(body.message, body.business_name, body.category)
@@ -564,6 +574,22 @@ async def meta_launch_from_message(
         plan = apply_platform_override(plan, [Platform.META])
     else:
         plan.platforms = [p for p in plan.platforms if p.platform == Platform.META]
+
+    # 2.5. Wallet gate — the ad wallet must actually have the money before Jane does
+    # any more work. Blocks with the exact shortfall rather than silently launching
+    # a campaign whose real Meta daily budget got clamped to less than requested.
+    wallet = WalletService(MongoWalletStore(db))
+    wallet_balance = await wallet.get_balance(business_id)
+    if wallet_balance < req.budget_ngn:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Your ad wallet has ₦{wallet_balance:,.0f} — top up ₦"
+                f"{(req.budget_ngn - wallet_balance):,.0f} more via /jane-ads/wallet/topup "
+                f"before launching a ₦{req.budget_ngn:,.0f} campaign."
+            ),
+        )
+    auth = await wallet.authorization_for(business_id, total_funded_wallets_ngn=req.budget_ngn)
 
     # 3. Geo refinement (pin-and-pocket) — best-effort, never blocks the launch.
     geo_dump = None
@@ -601,10 +627,22 @@ async def meta_launch_from_message(
     if not creative.image_url:
         raise HTTPException(status_code=502, detail="Jane couldn't generate the ad image (creative service). Try again.")
 
+    # 4.5. Policy gate — one bad ad can suspend the whole pooled ad account, so this
+    # runs before anything reaches Meta. BLOCK severity aborts with the specific
+    # guidance; WARN-only violations are logged but don't stop the launch.
+    policy_result = review_ad_creative(creative.headline, creative.primary_text)
+    blocking = [v for v in policy_result.violations if v.severity == Severity.BLOCK]
+    if blocking:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Can't launch this ad — {blocking[0].guidance}",
+        )
+    for v in policy_result.violations:
+        print(f"[policy] WARN on launch for {business_id}: {v.category} — matched '{v.matched_text}'", flush=True)
+
     # 5. Push a REAL campaign to Meta (paused).
     plan.page_id = page_id
     plan.creative = creative
-    auth = SpendAuthorization(business_id=business_id, funded_amount_ngn=req.budget_ngn, account_cap_ngn=req.budget_ngn)
     adapter = MetaAdPlatformAdapter(db, access_token=settings.META_ADS_ACCESS_TOKEN)
     try:
         launch = await adapter.launch_campaign(plan, auth)
