@@ -10,6 +10,7 @@ Runs daily batch jobs:
 - PRD 8.3: Subscription expiry checks (daily at 00:00 UTC)
 - WhatsApp daily content push (08:00 UTC / 09:00 WAT)
 - Jane + Ads mid-flight monitoring (every 4 hours) — campaign roadmap Tier 4
+- Jane + Ads conversation billing (hourly) — recoup Meta spend from prepaid wallets
 
 Note: publish_scheduled_content is intentionally NOT in this scheduler.
 It is triggered every 5 minutes by the GitHub Actions workflow
@@ -82,6 +83,19 @@ def _job_jane_ads_monitoring():
     _run_async(_run)
 
 
+def _job_jane_ads_billing():
+    """Jane + Ads conversation billing — recoups Meta ad spend from each customer's
+    prepaid wallet per delivered conversation, and pauses any campaign whose wallet
+    can no longer cover it (so URI never fronts money it can't recoup)."""
+    async def _run():
+        from app.database import get_db
+        from app.agents.jane_ads.billing import reconcile_conversation_charges
+        db = get_db()
+        result = await reconcile_conversation_charges(db)
+        print(f"💳 Jane Ads billing: {result}")
+    _run_async(_run)
+
+
 def start_notification_scheduler():
     """Start the APScheduler with all notification batch jobs."""
     global _scheduler, _main_loop
@@ -151,8 +165,18 @@ def start_notification_scheduler():
         **_JOB_DEFAULTS,
     )
 
+    # Jane + Ads conversation billing hourly — recoups real Meta spend from the
+    # customer's prepaid wallet and pauses a campaign the moment its wallet can't
+    # cover more. Runs more often than monitoring to keep unrecouped spend small.
+    _scheduler.add_job(
+        _job_jane_ads_billing,
+        CronTrigger(minute=0),
+        id="jane_ads_billing",
+        **_JOB_DEFAULTS,
+    )
+
     _scheduler.start()
-    print("📅 Notification scheduler started with 6 jobs")
+    print("📅 Notification scheduler started with 7 jobs")
 
 
 def stop_notification_scheduler():
