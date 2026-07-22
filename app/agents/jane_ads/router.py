@@ -487,18 +487,34 @@ async def instrumentation_log(
     }
 
 
-def _require_ads_admin(token: dict) -> None:
-    """Gate the all-customers billing report behind an email allowlist (config
-    JANE_ADS_ADMIN_EMAILS). Empty allowlist = the report is disabled entirely, so it
-    can never leak every customer's financials by default."""
+def _is_ads_admin(token: dict) -> bool:
+    """True if the caller's email is on the billing-report allowlist
+    (config JANE_ADS_ADMIN_EMAILS). Empty allowlist = nobody (report disabled)."""
     from app.core.config import settings
 
     allowed = {e.strip().lower() for e in (settings.JANE_ADS_ADMIN_EMAILS or "").split(",") if e.strip()}
     if not allowed:
-        raise HTTPException(status_code=503, detail="Billing report is not configured.")
+        return False
     email = ((token.get("claims", {}) or {}).get("email") or "").lower()
-    if email not in allowed:
+    return email in allowed
+
+
+def _require_ads_admin(token: dict) -> None:
+    """Gate the all-customers billing report — 503 if unconfigured, 403 if not allowed,
+    so it can never leak every customer's financials by default."""
+    from app.core.config import settings
+
+    if not (settings.JANE_ADS_ADMIN_EMAILS or "").strip():
+        raise HTTPException(status_code=503, detail="Billing report is not configured.")
+    if not _is_ads_admin(token):
         raise HTTPException(status_code=403, detail="Not authorized for the billing report.")
+
+
+@router.get("/admin/access")
+async def admin_access(token: dict = Depends(JWTBearer())) -> dict:
+    """Whether the logged-in user may see the billing report — so the UI can show or
+    hide the admin view without a hardcoded email list of its own."""
+    return {"allowed": _is_ads_admin(token)}
 
 
 @router.get("/admin/billing-summary")
