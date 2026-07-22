@@ -28,28 +28,47 @@ def test_missing_budget_cannot_proceed():
 
 
 def test_zero_budget_rejected():
-    assert to_campaign_request(ParsedCampaign(budget_ngn=0)) is None
+    assert to_campaign_request(ParsedCampaign(category="fashion", budget_ngn=0)) is None
 
 
 def test_goal_defaults_to_messages_when_absent():
-    req = to_campaign_request(ParsedCampaign(budget_ngn=5_000))
+    req = to_campaign_request(ParsedCampaign(category="fashion", budget_ngn=5_000))
     assert req.goal == Goal.MESSAGES
 
 
 def test_stated_behaviour_maps_when_present():
-    req = to_campaign_request(ParsedCampaign(budget_ngn=15_000, stated_behaviour="search"))
+    req = to_campaign_request(ParsedCampaign(category="fashion", budget_ngn=15_000, stated_behaviour="search"))
     assert req.stated_behaviour == PurchaseBehaviour.SEARCH
 
 
 def test_video_flag_sets_creative_kind():
-    req = to_campaign_request(ParsedCampaign(budget_ngn=60_000, has_video=True))
+    req = to_campaign_request(ParsedCampaign(category="fashion", budget_ngn=60_000, has_video=True))
     assert req.creative.kind == CreativeKind.VIDEO and req.creative.has_video is True
 
 
 def test_flags_thread_through():
     req = to_campaign_request(ParsedCampaign(
-        budget_ngn=10_000, is_new_thing=True, has_existing_demand=True))
+        category="fashion", budget_ngn=10_000, is_new_thing=True, has_existing_demand=True))
     assert req.is_new_thing is True and req.has_existing_demand is True
+
+
+# ── Business identity gate — asking for budget before Jane knows what's being
+# promoted produces a generic, placeholder campaign (e.g. a goal-only quick-reply
+# chip like "get me more messages" with no business context at all) ───────────
+
+def test_missing_business_identity_cannot_proceed_even_with_budget():
+    parsed = ParsedCampaign(budget_ngn=10_000)   # budget stated, but no business/category at all
+    assert to_campaign_request(parsed) is None
+
+
+def test_business_name_alone_is_enough_identity():
+    req = to_campaign_request(ParsedCampaign(business_name="Mama Kitchen", budget_ngn=10_000))
+    assert req is not None
+
+
+def test_category_alone_is_enough_identity():
+    req = to_campaign_request(ParsedCampaign(category="restaurant", budget_ngn=10_000))
+    assert req is not None
 
 
 # ── Backwards budget (PRD §3.1): a desired outcome, not yet a Naira amount ─────
