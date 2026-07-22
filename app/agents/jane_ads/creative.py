@@ -43,7 +43,7 @@ import openai
 
 from app.core.config import settings
 
-from .models import AdCopy, AdCreative, CreativeSource
+from .models import AdCopy, AdCreative, CreativeSource, ShootScript, ShootShot
 
 WHATSAPP_CTA = "Send WhatsApp Message"
 
@@ -212,6 +212,66 @@ async def write_ad_copy(business_name: str, category: str, goal: str = "messages
     except Exception as e:
         print(f"[Creative] copy error: {e}", flush=True)
         return AdCopy()
+
+
+async def write_shoot_script(business_name: str, category: str, goal: str,
+                             video_recommendation_reason: str, description: str = "",
+                             brand_context: Optional[dict] = None) -> ShootScript:
+    """Path C (PRD §4.1): when a video was recommended over the (photo-only)
+    AI generator, write a short, phone-filmable shoot script instead — no crew or
+    equipment assumed. The business owner films it themselves; the footage is
+    uploaded via the existing upload path and swapped into the pending plan via
+    POST /meta/plan/{plan_id}/creative. Never raises — an empty script just means
+    the user films freely instead."""
+    if not settings.OPENAI_API_KEY:
+        return ShootScript()
+    bc = brand_context or {}
+    brand_bits = _brand_prompt_bits(bc)
+    prompt = (
+        f"Write a short phone-filmable shoot script for a Meta/Instagram ad for "
+        f"'{business_name or bc.get('brand_name') or 'a business'}' (a "
+        f"{category or 'local business'}) whose goal is {goal}. Why video: "
+        f"{video_recommendation_reason}.{(' ' + brand_bits) if brand_bits else ''}\n"
+        f"Context: {description or 'none'}\n"
+        "The business owner will film this themselves on a phone — no crew, no "
+        "equipment, no editing skill assumed. Keep it to 3-5 short shots totalling "
+        "15-30 seconds.\n"
+        "Return JSON with:\n"
+        "- hook_line: the first ~2 seconds — what's said or shown to stop someone "
+        "scrolling\n"
+        "- shots: an array of 3-5 objects, each with: direction (what to film / how "
+        "to frame it, in plain language a non-filmmaker can follow), say (what to "
+        "say on camera — empty string if it's a silent b-roll shot), seconds (a "
+        "realistic rough duration, integer)\n"
+        "- caption_idea: one short on-screen text/caption idea, or empty string if "
+        "none needed\n"
+        "Return ONLY the JSON."
+    )
+    try:
+        client = openai.AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+        resp = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            response_format={"type": "json_object"},
+            messages=[{"role": "user", "content": prompt}],
+            timeout=15,
+        )
+        d = json.loads(resp.choices[0].message.content or "{}")
+        shots = [
+            ShootShot(
+                direction=str(s.get("direction", "")).strip(),
+                say=str(s.get("say", "")).strip(),
+                seconds=int(s.get("seconds") or 5),
+            )
+            for s in (d.get("shots") or []) if isinstance(s, dict)
+        ]
+        return ShootScript(
+            hook_line=str(d.get("hook_line", "")).strip(),
+            shots=shots,
+            caption_idea=str(d.get("caption_idea", "")).strip(),
+        )
+    except Exception as e:
+        print(f"[Creative] shoot script error: {e}", flush=True)
+        return ShootScript()
 
 
 # ── Source 1: GENERATE — brand data, direct controlled image call ────────────
