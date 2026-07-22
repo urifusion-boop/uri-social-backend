@@ -19,6 +19,7 @@ from typing import Dict, Any, List, Optional
 import asyncio
 import hashlib
 import json
+import random
 from datetime import datetime
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from pymongo.errors import DuplicateKeyError
@@ -264,6 +265,21 @@ Return ONLY this JSON (no markdown, no code blocks):
 }}
 
 Return only the JSON. No preamble, no explanation."""
+
+    # Composition variation directives for V2 generation. Without one of these,
+    # GPT-Image-2's edit call reproduces the reference's exact framing/pose
+    # every time (since it's editing the same input photo with a similar
+    # prompt each generation) — every post from a guide looked like the same
+    # shot with different text. One is picked at random per generation so
+    # repeated posts from the same guide stay in the same style family without
+    # being visually identical.
+    VARIATION_DIRECTIVES = [
+        "Use a different angle or framing than a plain straight-on centered shot — try a subtle three-quarter view or a slightly lower/higher camera angle.",
+        "Vary the pose and placement of the main subject within the frame rather than dead-center — shift it left, right, or change its orientation.",
+        "Vary the specific arrangement of the background and decorative details this time — same style family, not the identical layout.",
+        "Vary the framing and crop — zoom in slightly tighter or pull back slightly wider than a default centered shot.",
+        "Vary the specific action or moment being depicted, within the same subject type and mood — a different instant, not the identical pose.",
+    ]
 
     @staticmethod
     async def _compute_image_hash(image_url: str) -> str:
@@ -584,6 +600,32 @@ Return only the JSON. No preamble, no explanation."""
             text_placement = typography.get("text_placement", "overlay_center")
             text_treatment = typography.get("text_treatment", "plain")
 
+            # Brand colors — the ACTUAL colors, not just the reference's abstract
+            # color strategy label (e.g. "single_bright_accent"). Without this,
+            # the prompt never named a real color, so GPT-Image-2 had nothing to
+            # go on but the reference's own original colors, which is why V2
+            # renders came out ignoring the brand's actual palette.
+            brand_name = brand_context.get("brand_name") or "the brand"
+            brand_colors = brand_context.get("brand_colors") or []
+            if brand_colors:
+                color_list = ", ".join(brand_colors[:3])
+                color_instruction = (
+                    f"Use {brand_name}'s actual brand colors ({color_list}) — apply them "
+                    f"following the reference's color strategy ({accent_strategy or 'its accent placement'}), "
+                    f"but the colors themselves must be {brand_name}'s, not the reference's original colors."
+                )
+            else:
+                color_instruction = "match reference palette"
+
+            # Composition variation — without this, GPT-Image-2's edit call
+            # reproduces the reference's exact framing/pose every time (it's
+            # editing the same input photo with a similar prompt each
+            # generation), so every post from a guide looked like the same shot
+            # with different text pasted on. Picking one directive at random per
+            # generation keeps the style family intact while breaking the
+            # sameness.
+            variation_directive = random.choice(CustomVisualGuideV2Service.VARIATION_DIRECTIVES)
+
             # Build structured prompt similar to standard generation
             # Use sections to separate style instructions from content (prevents verbatim rendering)
 
@@ -591,10 +633,11 @@ Return only the JSON. No preamble, no explanation."""
 Design style: {medium}, {aesthetic} aesthetic
 Composition: {composition}
 Decorative elements: {decorative_elements if decorative_elements != "none" else "minimal"}
-Color approach: {accent_strategy if accent_strategy else "match reference palette"}
+Color approach: {color_instruction}
 Typography: {text_placement} placement, {text_treatment} style
 
-Match the reference image's visual style exactly.
+Match the reference image's medium, mood, and overall composition family closely —
+but this is a NEW piece, not a duplicate of the reference. {variation_directive}
 Include MINIMAL text - just a short headline and small CTA.
 Do NOT copy logos or brand names from the reference."""
 
