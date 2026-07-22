@@ -13,7 +13,7 @@ from __future__ import annotations
 from typing import Optional
 
 from fastapi import APIRouter, Body, Depends, File, HTTPException, Request, UploadFile
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from pydantic import BaseModel, Field
 
@@ -485,6 +485,76 @@ async def instrumentation_log(
         "decisions": [d.model_dump(mode="json") for d in decisions],
         "overrides": [o.model_dump(mode="json") for o in overrides],
     }
+
+
+def _require_ads_admin(token: dict) -> None:
+    """Gate the all-customers billing report behind an email allowlist (config
+    JANE_ADS_ADMIN_EMAILS). Empty allowlist = the report is disabled entirely, so it
+    can never leak every customer's financials by default."""
+    from app.core.config import settings
+
+    allowed = {e.strip().lower() for e in (settings.JANE_ADS_ADMIN_EMAILS or "").split(",") if e.strip()}
+    if not allowed:
+        raise HTTPException(status_code=503, detail="Billing report is not configured.")
+    email = ((token.get("claims", {}) or {}).get("email") or "").lower()
+    if email not in allowed:
+        raise HTTPException(status_code=403, detail="Not authorized for the billing report.")
+
+
+@router.get("/admin/billing-summary")
+async def admin_billing_summary(
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
+    format: str = "json",
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """Per-customer ad spend vs. what we billed them, plus grand totals — the finance
+    view. For each customer: real ad spend (what Meta charged us), billed (what we
+    charged their wallet), and margin (our service fee earned). Optional `from_date`/
+    `to_date` (YYYY-MM-DD) window; `format=csv` returns a spreadsheet download.
+    Admin-only (JANE_ADS_ADMIN_EMAILS)."""
+    from datetime import datetime, timezone
+
+    from .reporting import summarize_billing, to_csv
+
+    _require_ads_admin(token)
+
+    query: dict = {"type": "ad_spend"}
+    date_range: dict = {}
+    for key, raw in (("$gte", from_date), ("$lte", to_date)):
+        if raw:
+            try:
+                dt = datetime.fromisoformat(raw).replace(tzinfo=timezone.utc)
+            except ValueError:
+                raise HTTPException(status_code=400, detail=f"Bad date '{raw}' — use YYYY-MM-DD.")
+            date_range[key] = dt
+    if date_range:
+        query["created_at"] = date_range
+
+    txns = await db["jane_ads_transactions"].find(query, {"_id": 0}).to_list(length=100000)
+    summary = summarize_billing(txns)
+
+    # Best-effort human label per customer (email of the owning personal brand), so
+    # the report isn't just opaque ids. Never fails the report if a lookup misses.
+    for row in summary["per_user"]:
+        bid = row["business_id"]
+        label = ""
+        try:
+            if bid.startswith("brnd_personal_"):
+                user = await db["users"].find_one({"userId": bid[len("brnd_personal_"):]}, {"email": 1})
+                label = (user or {}).get("email", "")
+        except Exception:
+            label = ""
+        row["label"] = label
+
+    if format == "csv":
+        return Response(
+            content=to_csv(summary),
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=jane-ads-billing.csv"},
+        )
+    return {"from_date": from_date, "to_date": to_date, **summary}
 
 
 class MetaTestLaunchBody(BaseModel):
