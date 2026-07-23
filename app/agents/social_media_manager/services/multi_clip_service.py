@@ -365,8 +365,13 @@ async def _transcribe_clip(path: str) -> Dict[str, Any]:
                     "end": round(w.end, 3),
                 })
 
-        # Build SRT from segments
+        # Build SRT from segments and capture Whisper's per-segment confidence signals.
+        # no_speech_prob > 0.5 means Whisper thought this segment might not be speech
+        # at all — it transcribed something anyway (often a false start, mumble, or
+        # noise artefact). avg_logprob < -0.8 means very low token-level confidence.
+        # Both are signs Whisper may have silently papered over a disfluency.
         srt_lines = []
+        uncertain_segments = []
         if hasattr(response, "segments") and response.segments:
             for i, seg in enumerate(response.segments, 1):
                 def _fmt(t: float) -> str:
@@ -380,7 +385,25 @@ async def _transcribe_clip(path: str) -> Dict[str, Any]:
                 srt_lines.append(seg.text.strip())
                 srt_lines.append("")
 
-        return {"text": text, "srt": "\n".join(srt_lines), "words": words}
+                no_sp = getattr(seg, "no_speech_prob", 0.0) or 0.0
+                avg_lp = getattr(seg, "avg_logprob", 0.0) or 0.0
+                if no_sp > 0.5 or avg_lp < -0.8:
+                    uncertain_segments.append({
+                        "start":          round(seg.start, 3),
+                        "end":            round(seg.end, 3),
+                        "no_speech_prob": round(no_sp, 3),
+                        "avg_logprob":    round(avg_lp, 3),
+                        "text":           seg.text.strip(),
+                    })
+
+        if uncertain_segments:
+            print(
+                f"[MultiClip/transcribe] {len(uncertain_segments)} uncertain segment(s) "
+                f"(no_speech_prob>0.5 or avg_logprob<-0.8)",
+                flush=True,
+            )
+
+        return {"text": text, "srt": "\n".join(srt_lines), "words": words, "uncertain_segments": uncertain_segments}
 
     except Exception as e:
         print(f"[MultiClip] transcription error: {e}", flush=True)
@@ -695,6 +718,7 @@ def _timing_cuts_from_clip(
     clip_type: str = "speech",
     words: Optional[List[Dict]] = None,
     silence_ranges: Optional[List[Dict]] = None,
+    uncertain_segments: Optional[List[Dict]] = None,
 ) -> List[Dict]:
     """
     Return cuts (global timeline coordinates) for a single clip covering:
@@ -703,6 +727,9 @@ def _timing_cuts_from_clip(
              the person walking away, a 10-second pause, sections Whisper never saw)
           2. Whisper word-level gaps (mid-sentence pauses SRT misses)
           3. SRT segment gaps (coarsest fallback)
+      - Uncertain Whisper segments: segments Whisper transcribed but flagged with
+        no_speech_prob > 0.5 or avg_logprob < -0.8 — likely false starts or mumbles
+        that Whisper papered over into plausible-sounding words.
       - Filler words: whole SRT entries that are just um/uh/hmm etc.
       - Repeated sentences: SRT entries with >= 65% content-word overlap
         within a 60s window (second occurrence is cut)
@@ -766,6 +793,21 @@ def _timing_cuts_from_clip(
             trail = clip_duration - entries[-1]["end"]
             _maybe_silence_cut(clip_offset + entries[-1]["end"], clip_offset + clip_duration,
                                f"trailing silence {trail:.1f}s")
+
+    # ── Uncertain Whisper segments ────────────────────────────────────────────
+    # Whisper transcribed these but its own confidence signals say it wasn't sure:
+    # no_speech_prob > 0.5 (model thought this might not be speech) or
+    # avg_logprob < -0.8 (very low per-token probability — likely a mumble or
+    # false start that Whisper guessed at rather than clearly heard).
+    # These are routed through the LLM refinement layer so context can decide.
+    for us in (uncertain_segments or []):
+        dur = us["end"] - us["start"]
+        if dur >= 0.15:
+            cuts.append({
+                "at":     round(clip_offset + us["start"], 3),
+                "end":    round(clip_offset + us["end"],   3),
+                "reason": f'uncertain speech (no_speech_prob={us["no_speech_prob"]:.2f}, avg_logprob={us["avg_logprob"]:.2f})',
+            })
 
     # ── Filler words ─────────────────────────────────────────────────────────
     for entry in entries:
@@ -873,6 +915,10 @@ async def _refine_silence_cuts(
         f"- Gap before a punchline, number reveal, or emotional peak → KEEP\n"
         f"- Gap mid-sentence where speaker clearly lost their train of thought → CUT\n"
         f"- Gap > 3s → almost always CUT unless context strongly suggests a dramatic hold\n"
+        f"- 'uncertain speech' entries: Whisper transcribed something here but its own "
+        f"confidence was low (no_speech_prob > 0.5 or avg_logprob < -0.8). "
+        f"CUT if surrounding context suggests a false start, mumble, or restart. "
+        f"KEEP only if the before/after context reads like real, intentional speech.\n"
         f"- When uncertain → CUT (tighter is better for social video)\n"
         f"Only the JSON object."
     )
@@ -937,14 +983,16 @@ async def _run_ai_analysis(clips_ordered: List[Dict], story_type: str) -> Dict:
         clip_type = c.get("clip_type", "speech")
         clip_words = c.get("words") or []
         clip_silence_ranges = c.get("silence_ranges") or []
+        clip_uncertain = c.get("uncertain_segments") or []
         # Parse SRT entries with global timestamps for GPT input
         srt_entries_global = []
-        if srt or clip_words or clip_silence_ranges:
+        if srt or clip_words or clip_silence_ranges or clip_uncertain:
             timing_cuts.extend(
                 _timing_cuts_from_clip(
                     srt, cumulative, dur, clip_type,
                     clip_words or None,
                     clip_silence_ranges or None,
+                    clip_uncertain or None,
                 )
             )
             for e in _srt_parse(srt):
@@ -970,7 +1018,10 @@ async def _run_ai_analysis(clips_ordered: List[Dict], story_type: str) -> Dict:
     # ── Layer 1.5: LLM refinement — protect intentional dramatic pauses ───────
     # Filler and repeat cuts are always correct; only silence/pause cuts need
     # context-aware judgment (a 2s gap before a revenue reveal should stay).
-    _silence_reasons = ("silence", "pause", "leading silence", "trailing silence")
+    # uncertain speech goes through the refinement layer too — the LLM has context
+    # to judge whether Whisper's low-confidence transcription was a real false start
+    # or just quiet but genuine speech.
+    _silence_reasons = ("silence", "pause", "leading silence", "trailing silence", "uncertain speech")
     silence_pause_cuts = [c for c in timing_cuts if any(c["reason"].startswith(p) for p in _silence_reasons)]
     filler_repeat_cuts = [c for c in timing_cuts if not any(c["reason"].startswith(p) for p in _silence_reasons)]
 
@@ -1613,13 +1664,13 @@ async def _ingest_one_clip(
                 _upload_clip_to_cloudinary(raw_bytes, clip_id, filename),
                 _detect_silences_ffmpeg(tmp_path),
             )
-            transcript_data = {"text": "", "srt": "", "words": []}
+            transcript_data = {"text": "", "srt": "", "words": [], "uncertain_segments": []}
         else:
             subject_pos, cloud_url = await asyncio.gather(
                 _detect_subject_position(tmp_path),
                 _upload_clip_to_cloudinary(raw_bytes, clip_id, filename),
             )
-            transcript_data = {"text": "", "srt": "", "words": []}
+            transcript_data = {"text": "", "srt": "", "words": [], "uncertain_segments": []}
             silence_ranges = []
 
         if not cloud_url:
@@ -1652,6 +1703,7 @@ async def _ingest_one_clip(
             "transcript": transcript_data["text"],
             "srt": transcript_data["srt"],
             "words": transcript_data["words"],
+            "uncertain_segments": transcript_data.get("uncertain_segments", []),
             "silence_ranges": silence_ranges,
             "frame_url": None,
             "vision_description": None,
