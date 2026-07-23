@@ -5112,14 +5112,29 @@ async def _generate_image_bg(
         image_type = "story" if post_type == "story" else "post_image"
 
         # ========== REFERENCE IMAGE vs V2 GUIDE PRIORITY ==========
-        # Priority: User-uploaded reference image > V2 guide > Standard generation
-        # If user explicitly uploaded a reference image, use it (ignore V2 guide)
+        # If the user attaches their OWN reference photo to this post while a
+        # V2 guide is also selected, don't just discard the guide (as this
+        # used to) — keep its style, but let the photo go through the real
+        # reference-image pipeline (background removal + forensic product
+        # preservation) in the standard flow below, since that's what
+        # actually handles a caller-supplied photo correctly. The guide's
+        # OWN stored reference photo is untouched either way — this only
+        # fires when the caller supplies a second, separate photo.
         v2_guide_id = brand_context.get("custom_guide_v2_id")
 
-        if reference_image:
-            # User explicitly uploaded reference image - highest priority
-            # Use standard generation flow with reference image (skip V2 guide)
-            print(f"📸 User reference image detected - using standard generation (V2 guide ignored)")
+        if reference_image and v2_guide_id:
+            from app.agents.social_media_manager.services.custom_visual_guide_v2_service import CustomVisualGuideV2Service
+            guide_style_fragment = await CustomVisualGuideV2Service.build_style_prompt_fragment(v2_guide_id, brand_context, db)
+            if guide_style_fragment:
+                brand_context = {**brand_context, "style_prompt_fragment": guide_style_fragment}
+                print(f"📸🎨 Reference image + V2 guide both present — guide's style carried into standard reference-image pipeline")
+            else:
+                print(f"📸 Reference image + V2 guide both present, but guide style could not be loaded — using standard generation with no style")
+            v2_guide_id = None  # Fall through to standard flow below, now carrying the guide's style
+        elif reference_image:
+            # User explicitly uploaded reference image, no V2 guide selected —
+            # use standard generation flow with reference image as before.
+            print(f"📸 User reference image detected - using standard generation")
             v2_guide_id = None  # Override V2 guide when reference image is provided
 
         if v2_guide_id:

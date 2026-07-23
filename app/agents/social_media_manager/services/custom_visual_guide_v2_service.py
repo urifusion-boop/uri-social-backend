@@ -515,6 +515,81 @@ Return only the JSON. No preamble, no explanation."""
         return guide
 
     @staticmethod
+    async def build_style_prompt_fragment(
+        guide_id: str,
+        brand_context: Dict[str, Any],
+        db: AsyncIOMotorDatabase,
+    ) -> str:
+        """
+        Build a plain style-description text fragment from a V2 guide's
+        extracted profile — for callers that need the guide's STYLE without
+        going through generate_image_with_v2_guide()'s own image generation.
+
+        Exists for the case where a user attaches their OWN reference photo
+        to a specific post while a V2 guide is also selected: that photo
+        needs to go through the standard reference-image pipeline (background
+        removal + forensic product preservation), not the guide's stored
+        photo, but the guide's style should still shape the generated scene.
+        The standard pipeline already accepts style text via
+        brand_context["style_prompt_fragment"] (the same channel V1 custom
+        guides use) — this builds that fragment from a V2 guide instead.
+
+        Deliberately does NOT include the "depict a different person/product"
+        instruction generate_image_with_v2_guide() adds — that instruction
+        exists to stop the GUIDE's own reference photo from reappearing
+        verbatim; here, the caller's uploaded photo is the whole point of the
+        product-preservation pipeline, so it must be preserved, not varied.
+
+        Returns "" if the guide can't be loaded (caller should fall back to
+        no style fragment rather than fail generation over this).
+        """
+        from bson import ObjectId
+
+        guide = await db["custom_visual_guides"].find_one({
+            "_id": ObjectId(guide_id),
+            "version": "v2",
+        })
+        if not guide:
+            return ""
+
+        style_profile = guide.get("style_profile") or {}
+
+        medium = style_profile.get("medium", "photographic")
+        aesthetic = style_profile.get("overall_aesthetic", "modern")
+        mood = style_profile.get("mood", "professional")
+
+        layout = style_profile.get("layout_structure", {})
+        composition = layout.get("composition", "centered")
+
+        color_system = style_profile.get("color_system", {})
+        accent_strategy = color_system.get("accent_strategy", "")
+
+        graphic_elements = style_profile.get("graphic_elements", [])
+        decorative_elements = ", ".join(graphic_elements[:4]) if graphic_elements else "minimal"
+
+        typography = style_profile.get("typography", {})
+        text_placement = typography.get("text_placement", "overlay_center")
+        text_treatment = typography.get("text_treatment", "plain")
+
+        brand_name = brand_context.get("brand_name") or "the brand"
+        brand_colors = brand_context.get("brand_colors") or []
+        if brand_colors:
+            color_list = ", ".join(brand_colors[:3])
+            color_instruction = (
+                f"Use {brand_name}'s actual brand colors ({color_list}) — apply them "
+                f"following this strategy ({accent_strategy or 'accent placement'}), "
+                f"not the guide reference's original colors."
+            )
+        else:
+            color_instruction = "apply the described color strategy"
+
+        return f"""Design style: {medium}, {aesthetic} aesthetic, {mood} mood.
+Composition: {composition}.
+Decorative elements: {decorative_elements}.
+Color approach: {color_instruction}
+Typography: {text_placement} placement, {text_treatment} style."""
+
+    @staticmethod
     async def generate_image_with_v2_guide(
         guide_id: str,
         brand_context: Dict[str, Any],
