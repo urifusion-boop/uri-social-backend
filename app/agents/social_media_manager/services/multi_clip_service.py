@@ -273,7 +273,7 @@ async def _detect_subject_position(path: str) -> str:
         frame_b64 = base64.b64encode(frame_bytes).decode()
         client = openai.AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
         resp = await client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-5.6-luna",
             max_tokens=5,
             messages=[{
                 "role": "user",
@@ -432,7 +432,7 @@ Rules:
 
     try:
         resp = await client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-5.6-luna",
             messages=[{"role": "user", "content": prompt}],
             max_tokens=200,
             temperature=0.3,
@@ -880,7 +880,7 @@ async def _refine_silence_cuts(
     try:
         client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
         resp = await client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-5.6-luna",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
             max_tokens=600,
@@ -1035,7 +1035,7 @@ async def _run_ai_analysis(clips_ordered: List[Dict], story_type: str) -> Dict:
     try:
         client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
         resp = await client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-5.6-luna",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
             max_tokens=1200,
@@ -1335,7 +1335,7 @@ Shot type guide:
 
     try:
         resp = await client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-5.6-luna",
             messages=[{
                 "role": "user",
                 "content": [
@@ -1392,7 +1392,7 @@ Return JSON only:
 
     try:
         resp = await client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-5.6-luna",
             messages=[{"role": "user", "content": prompt}],
             max_tokens=300,
             temperature=0.7,
