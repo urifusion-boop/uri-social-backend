@@ -2,27 +2,17 @@
 
 """
 Custom Visual Guide V2 Service
-Style transfer via extraction, not literal reuse: the reference photo is
-analyzed once at upload time into a text style profile, and every
-generation after that is built from that description alone — the actual
-reference image is never sent back into image generation. This is
-deliberate: sending the literal photo into GPT-Image-2 as an edit target
-means editing that exact photo, so a specific face/product/pose in it
-would keep reappearing almost unchanged across every generated post.
+Advanced style transfer system using meta-prompts and direct image references.
 
 Key Differences from V1:
 - V1: Extracts aesthetic profile → Text prompt fragment → GPT-Image-2 generates
-- V2: Extracts a much richer style profile JSON (medium, mood, layout,
-      imagery treatment, color system, typography) → builds a detailed text
-      prompt from it (with the target brand's real colors mapped in) →
-      GPT-Image-2 generates from that prompt alone, no reference image
+- V2: Extracts style profile JSON → Meta-prompt → GPT-4o generates smart prompt
+      → Sends prompt + ACTUAL reference image → GPT-Image-2 edit mode
 
 V2 Flow:
 1. Upload: GPT-4o Vision extracts comprehensive style profile JSON
-2. Generation: style profile + target brand identity + new content are
-   composed into a single descriptive prompt
-3. GPT-Image-2 generates a brand-new image from that prompt (text-to-image,
-   not editing the reference photo)
+2. Generation: Art director meta-prompt transforms style + brand + content
+3. GPT-Image-2 edit mode uses reference image + generated prompt
 """
 
 from typing import Dict, Any, List, Optional
@@ -536,13 +526,13 @@ Return only the JSON. No preamble, no explanation."""
         db: AsyncIOMotorDatabase,
     ) -> Dict[str, Any]:
         """
-        Generate image using Custom Visual Guide V2's extracted style profile.
+        Generate image using Custom Visual Guide V2 + meta-prompt.
 
         Flow:
-        1. Load guide's style_profile (extracted at upload time)
-        2. Build a descriptive prompt from the profile + target brand identity
-           + new content — no reference image involved
-        3. GPT-Image-2 generates from that prompt alone (text-to-image)
+        1. Load guide (style_profile + reference_image_url)
+        2. Build art director meta-prompt
+        3. GPT-4o generates final image prompt
+        4. Send prompt + reference image → GPT-Image-2 edit mode
 
         Args:
             guide_id: Custom guide V2 ID
@@ -581,6 +571,7 @@ Return only the JSON. No preamble, no explanation."""
                 raise HTTPException(status_code=404, detail="Custom Visual Guide V2 not found")
 
             style_profile = guide.get("style_profile")
+            reference_image_url = guide.get("original_image_url")
 
             print(f"[V2] Loaded guide: {guide.get('name')}")
             print(f"[V2] Style: {style_profile.get('overall_aesthetic')}")
@@ -595,15 +586,10 @@ Return only the JSON. No preamble, no explanation."""
             # Layout structure
             layout = style_profile.get("layout_structure", {})
             composition = layout.get("composition", "centered")
-            information_density = layout.get("information_density", "moderate")
-            focal_strategy = layout.get("focal_strategy", "single_hero")
 
             # Color system
             color_system = style_profile.get("color_system", {})
             accent_strategy = color_system.get("accent_strategy", "")
-            color_temperature = color_system.get("temperature", "")
-            color_saturation = color_system.get("saturation", "")
-            color_contrast = color_system.get("contrast", "")
 
             # Graphic elements (decorative details)
             graphic_elements = style_profile.get("graphic_elements", [])
@@ -646,9 +632,6 @@ Return only the JSON. No preamble, no explanation."""
             # every generation, since the model is editing that literal photo.
             imagery_style = style_profile.get("imagery_style", {})
             subject_type = imagery_style.get("subject_type", "")
-            imagery_lighting = imagery_style.get("lighting", "")
-            imagery_treatment = imagery_style.get("treatment", "")
-            imagery_realism = imagery_style.get("realism_level", "")
             if subject_type == "person":
                 identity_instruction = "The reference features a specific person — depict a DIFFERENT person (different face, pose, and outfit) of the same general type and mood. Never reproduce the same individual."
             elif subject_type == "product":
@@ -656,38 +639,17 @@ Return only the JSON. No preamble, no explanation."""
             else:
                 identity_instruction = ""
 
-            # Imagery treatment — how realistic/stylized the subject should look and
-            # how it's lit. Extracted since generation no longer sees the actual
-            # reference photo (see note below), so this can't be left implicit.
-            imagery_bits = [b for b in (imagery_treatment, imagery_realism) if b]
-            imagery_description = ", ".join(imagery_bits) if imagery_bits else "true to the reference's visual treatment"
-            if imagery_lighting:
-                imagery_description += f", {imagery_lighting} lighting"
-
-            # Color detail beyond the strategy/hex — temperature/saturation/contrast
-            # round out what "the brand's colors, applied the reference's way" means.
-            color_detail_bits = [b for b in (color_temperature, color_saturation, color_contrast) if b]
-            color_detail = f" ({', '.join(color_detail_bits)})" if color_detail_bits else ""
-
             # Build structured prompt similar to standard generation
             # Use sections to separate style instructions from content (prevents verbatim rendering)
-            #
-            # NOTE: this prompt is now the ONLY description of the style the model
-            # sees — generation no longer sends the reference photo itself (see
-            # the _call_dalle_api call below), so every field extracted from the
-            # style profile needs to actually show up here. Missing mood, imagery
-            # treatment/realism/lighting, and color detail here (as earlier
-            # versions did) meant those attributes were silently dropped.
 
             style_instructions = f"""=== VISUAL STYLE (MATCH REFERENCE) ===
-Design style: {medium}, {aesthetic} aesthetic, {mood} mood
-Composition: {composition}, {information_density} information density, {focal_strategy} focal strategy
-Imagery treatment: {imagery_description}
+Design style: {medium}, {aesthetic} aesthetic
+Composition: {composition}
 Decorative elements: {decorative_elements if decorative_elements != "none" else "minimal"}
-Color approach: {color_instruction}{color_detail}
+Color approach: {color_instruction}
 Typography: {text_placement} placement, {text_treatment} style
 
-Match the reference's medium, mood, and overall composition family closely —
+Match the reference image's medium, mood, and overall composition family closely —
 but this is a NEW piece, not a duplicate of the reference. {variation_directive}
 {identity_instruction}
 Include MINIMAL text - just a short headline and small CTA.
@@ -724,21 +686,15 @@ Do NOT style it as a button or banner."""
             image_height = specs.get("height", 630)
             print(f"[V2] Platform dimensions: {image_width}x{image_height} ({specs.get('format', 'unknown')})")
 
-            # Generate from the style profile description alone — deliberately NOT
-            # passing reference_image here. Sending the actual reference photo to
-            # GPT-Image-2's edit endpoint meant editing that literal photo each
-            # time, so a specific face/pose/outfit or a specific product's exact
-            # packaging kept reappearing almost unchanged in every generation
-            # (input_fidelity, the one API lever for this, isn't supported by
-            # gpt-image-2 at all — confirmed via a live 400 error). Omitting
-            # reference_image makes _call_dalle_api take its .generate() path
-            # (text-to-image, no photo in the loop) instead of .edit() — the same
-            # proven path already used by the rest of the app's regular content
-            # generation. Style now has to come entirely from style_instructions
-            # above, which is why it was enriched with mood/imagery/color detail.
+            # Generate with platform-specific dimensions + reference image for style.
+            # NOTE: gpt-image-2 rejects input_fidelity outright (400 error — that
+            # param only exists for gpt-image-1), so fidelity/variation for V2
+            # guides is steered entirely through the prompt text above
+            # (identity_instruction + variation_directive), not an API parameter.
             image_response = await ImageContentService._call_dalle_api(
                 prompt=final_prompt,
                 size=f"{image_width}x{image_height}",
+                reference_image=reference_image_url,  # ← ACTUAL reference image for style
                 image_model="openai/gpt-image-2",
             )
 
