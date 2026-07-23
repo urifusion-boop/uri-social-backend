@@ -8167,8 +8167,10 @@ async def zapcap_produce(
 
     headers = await _zapcap_headers()
 
-    # Upload video URL to ZapCap → get videoId
-    async with httpx.AsyncClient(timeout=60) as client:
+    # Upload video URL to ZapCap → get videoId.
+    # ZapCap fetches and validates the video from the URL before responding,
+    # so large files can take well over 60s — use a 5-minute timeout here.
+    async with httpx.AsyncClient(timeout=300) as client:
         r = await client.post(
             f"{_ZAPCAP_BASE}/videos/url",
             json={"url": video_url},
