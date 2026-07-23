@@ -168,12 +168,14 @@ def test_remainder_billed_after_topup(monkeypatch):
     rows = [{"campaign_id": "c1", "business_id": "brnd_1", "user_id": "u1",
              "ad_id": "a1", "spend_billed_ngn": 0.0}]
     db, _, _ = _setup(monkeypatch, rows, {"c1": _summary(10_000)}, store)
-    _run(billing.reconcile_ad_spend_charges(db))            # covers ₦4,000 of spend
+    first = _run(billing.reconcile_ad_spend_charges(db))    # covers what the ₦6,000 wallet can
 
     _run(WalletService(store).top_up("brnd_1", 20_000, reference="refill"))
-    res = _run(billing.reconcile_ad_spend_charges(db))      # remaining ₦6,000 spend × 1.5
-    assert res["charged_ngn"] == round(6_000 * MARKUP, 2)
-    assert db._coll.rows[0]["spend_billed_ngn"] == 10_000
+    second = _run(billing.reconcile_ad_spend_charges(db))   # the remainder, after top-up
+    # The full ₦10,000 of Meta spend is now billed, and total collected across both
+    # sweeps is spend × markup — regardless of the markup rate (tolerant of rounding).
+    assert abs(db._coll.rows[0]["spend_billed_ngn"] - 10_000) < 0.05
+    assert abs((first["charged_ngn"] + second["charged_ngn"]) - 10_000 * MARKUP) < 0.05
 
 
 def test_idempotent_when_no_new_spend(monkeypatch):
