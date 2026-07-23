@@ -823,15 +823,102 @@ def _merge_cuts(cuts: List[Dict]) -> List[Dict]:
     return [c for c in merged if c["end"] - c["at"] >= 0.1]
 
 
+async def _refine_silence_cuts(
+    silence_cuts: List[Dict],
+    srt_global: List[Dict],
+    total_duration: float,
+) -> List[Dict]:
+    """
+    LLM refinement pass on FFmpeg/Whisper-detected silence and pause cuts.
+
+    Uses the spoken words immediately before and after each gap to decide
+    whether it's dead air (cut) or an intentional dramatic pause (keep).
+    Falls back to the full unfiltered list on any error — never drops cuts silently.
+    """
+    if not silence_cuts:
+        return silence_cuts
+
+    import json as _json
+    from openai import AsyncOpenAI
+
+    cut_contexts = []
+    for i, cut in enumerate(silence_cuts):
+        before = [e for e in srt_global if e["end"] <= cut["at"]][-2:]
+        after  = [e for e in srt_global if e["start"] >= cut["end"]][:2]
+        cut_contexts.append({
+            "index":    i,
+            "at":       cut["at"],
+            "end":      cut["end"],
+            "duration": round(cut["end"] - cut["at"], 1),
+            "before":   " ".join(f'"{e["text"]}"' for e in before) or "(start of video)",
+            "after":    " ".join(f'"{e["text"]}"' for e in after) or "(end of video)",
+        })
+
+    cuts_text = "\n".join(
+        f'{c["index"] + 1}. [{c["at"]:.1f}s–{c["end"]:.1f}s, {c["duration"]}s]\n'
+        f'   Before: {c["before"]}\n'
+        f'   After:  {c["after"]}'
+        for c in cut_contexts
+    )
+
+    prompt = (
+        f"You are reviewing proposed silence/pause cuts in a {total_duration:.0f}s social video.\n"
+        f"For each gap you see what was said immediately before and after.\n"
+        f"Decide: CUT (dead air, lost train of thought, awkward gap) or "
+        f"KEEP (intentional — dramatic hold, reaction beat, building tension before a reveal).\n\n"
+        f"GAPS TO REVIEW:\n{cuts_text}\n\n"
+        f"Return ONLY valid JSON, no markdown:\n"
+        f'{{"verdicts":[{{"index":0,"decision":"cut"|"keep","reason":"<short>"}}]}}\n\n'
+        f"Rules:\n"
+        f"- Gap before a punchline, number reveal, or emotional peak → KEEP\n"
+        f"- Gap mid-sentence where speaker clearly lost their train of thought → CUT\n"
+        f"- Gap > 3s → almost always CUT unless context strongly suggests a dramatic hold\n"
+        f"- When uncertain → CUT (tighter is better for social video)\n"
+        f"Only the JSON object."
+    )
+
+    try:
+        client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+        resp = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_tokens=600,
+        )
+        raw = resp.choices[0].message.content.strip()
+        if raw.startswith("```"):
+            raw = "\n".join(raw.split("\n")[1:])
+            raw = raw.rsplit("```", 1)[0].strip()
+        verdicts: Dict[int, str] = {
+            v["index"]: v["decision"]
+            for v in _json.loads(raw).get("verdicts", [])
+            if "index" in v and "decision" in v
+        }
+    except Exception as exc:
+        print(f"[MultiClip/refine_cuts] GPT error: {exc} — passing all cuts through", flush=True)
+        return silence_cuts
+
+    approved = [silence_cuts[c["index"]] for c in cut_contexts if verdicts.get(c["index"], "cut") == "cut"]
+    n_protected = len(silence_cuts) - len(approved)
+    print(
+        f"[MultiClip/refine_cuts] {len(silence_cuts)} silence cuts → "
+        f"{len(approved)} confirmed, {n_protected} protected as intentional pauses",
+        flush=True,
+    )
+    return approved
+
+
 async def _run_ai_analysis(clips_ordered: List[Dict], story_type: str) -> Dict:
     """
     Analyze ordered clips and return {cuts, zooms, transition_style, summary}.
 
-    Two-layer approach:
-    1. Timing-based: parse each clip's SRT to detect silences and filler words
-       deterministically (no GPT, catches pauses GPT cannot see from text alone).
-    2. GPT-4o-mini: content analysis for contextual cuts (repetitions, off-topic
-       tangents), zoom moments, transition style, and summary.
+    Three-layer approach:
+    1. Timing-based: FFmpeg silencedetect + Whisper word-gaps detect every silence
+       and pause deterministically (no GPT, measures actual audio).
+    2. LLM refinement: GPT-4o-mini audits each silence/pause cut using transcript
+       context — protects intentional dramatic pauses from being removed.
+    3. GPT content analysis: contextual cuts (repetitions, tangents), zoom moments,
+       transition style, summary.
 
     Results are merged and deduplicated before returning.
     """
@@ -879,6 +966,17 @@ async def _run_ai_analysis(clips_ordered: List[Dict], story_type: str) -> Dict:
         return {"cuts": [], "zooms": [], "transition_style": "fade", "summary": ""}
 
     total_duration = cumulative
+
+    # ── Layer 1.5: LLM refinement — protect intentional dramatic pauses ───────
+    # Filler and repeat cuts are always correct; only silence/pause cuts need
+    # context-aware judgment (a 2s gap before a revenue reveal should stay).
+    _silence_reasons = ("silence", "pause", "leading silence", "trailing silence")
+    silence_pause_cuts = [c for c in timing_cuts if any(c["reason"].startswith(p) for p in _silence_reasons)]
+    filler_repeat_cuts = [c for c in timing_cuts if not any(c["reason"].startswith(p) for p in _silence_reasons)]
+
+    all_srt_global = [entry for clip in clip_entries for entry in clip["srt_lines"]]
+    refined_silence_cuts = await _refine_silence_cuts(silence_pause_cuts, all_srt_global, total_duration)
+    timing_cuts = refined_silence_cuts + filler_repeat_cuts
 
     # ── Layer 2: GPT content analysis with timestamped transcript ─────────────
     # Build a per-clip block showing every SRT line with its exact timestamps.
