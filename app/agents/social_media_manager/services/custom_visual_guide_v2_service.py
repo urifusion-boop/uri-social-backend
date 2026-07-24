@@ -736,22 +736,8 @@ Typography: {text_placement} placement, {text_treatment} style
 Include MINIMAL text - just a short headline and small CTA.
 Do NOT copy logos or brand names from the reference."""
 
-            # CONTENT describes what the imagery should depict/be about — it is
-            # NOT text to render. Without a separate, explicit TEXT TO RENDER
-            # section giving the model an actual pre-written headline, it had
-            # nothing else to go on and would just lift the user's raw request
-            # wording as the on-image headline (e.g. "create a happy skating
-            # spree" rendered almost verbatim instead of a real short headline
-            # being written). headline/subtext are computed by the caller from
-            # the real generated caption — use them here instead of leaving
-            # them unused.
-            content_section = f"""=== CONTENT (for imagery only — depict this, do not render it as text) ===
-{seed_content.strip()}
-
-=== TEXT TO RENDER (use exactly this, do not paraphrase or invent wording) ===
-Headline (large, primary): "{headline}\""""
-            if subtext:
-                content_section += f'\nSubtext (smaller, secondary): "{subtext}"'
+            content_section = f"""=== CONTENT ===
+{seed_content.strip()}"""
 
             # CTA instruction (same format as regular generation)
             cta_instruction = f"""=== CALL-TO-ACTION ===
