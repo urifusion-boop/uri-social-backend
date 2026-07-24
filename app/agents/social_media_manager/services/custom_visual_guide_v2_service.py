@@ -594,9 +594,49 @@ Return only the JSON. No preamble, no explanation."""
             aesthetic = style_profile.get("overall_aesthetic", "modern")
             mood = style_profile.get("mood", "professional")
 
-            # Layout structure
+            # Aesthetic dominance — how much the style itself should dominate
+            # the frame vs. let the subject/content lead. Extracted at upload
+            # time but never previously read anywhere in this prompt.
+            _DOMINANCE_NOTES = {
+                "low": "subtle — let the subject/content lead, keep decorative treatment minimal",
+                "medium": "balanced — style and subject share the frame roughly equally",
+                "high": "bold — style is the dominant visual feature throughout, not just accents",
+            }
+            dominance_note = _DOMINANCE_NOTES.get(style_profile.get("aesthetic_dominance", ""), "")
+
+            # Layout structure — composition alone was the only layout field
+            # read; information_density and focal_strategy were extracted but
+            # unused, and structural_devices (badges, panels, frames — layout
+            # structuring, distinct from purely decorative graphic_elements)
+            # was never surfaced at all.
             layout = style_profile.get("layout_structure", {})
             composition = layout.get("composition", "centered")
+            information_density = layout.get("information_density", "")
+            focal_strategy = layout.get("focal_strategy", "")
+            composition_bits = [composition]
+            if information_density:
+                composition_bits.append(f"{information_density} information density")
+            if focal_strategy:
+                composition_bits.append(f"{focal_strategy} focal strategy")
+            composition_detail = ", ".join(composition_bits)
+            structural_devices = layout.get("structural_devices", [])
+            structural_devices_note = ", ".join(structural_devices[:4]) if structural_devices else ""
+
+            # Imagery style — subject_type was already used (identity
+            # instruction below); lighting/treatment/realism_level are also
+            # read here now instead of separately per-branch, so both the
+            # override and guide-only paths get the same descriptive detail.
+            imagery_style = style_profile.get("imagery_style", {})
+            imagery_lighting = imagery_style.get("lighting", "")
+            imagery_treatment = imagery_style.get("treatment", "")
+            imagery_realism = imagery_style.get("realism_level", "")
+            imagery_bits = [b for b in (imagery_treatment, imagery_realism) if b]
+            imagery_treatment_note = ", ".join(imagery_bits)
+            if imagery_lighting:
+                imagery_treatment_note = (
+                    f"{imagery_treatment_note}, {imagery_lighting} lighting"
+                    if imagery_treatment_note else f"{imagery_lighting} lighting"
+                )
 
             # Color system — accent_strategy alone only describes WHERE accent
             # color goes, not whether the reference has a bold, dominant
@@ -606,6 +646,7 @@ Return only the JSON. No preamble, no explanation."""
             # color dominance at all — only about accent placement — which is
             # why a guide with a strong colored background produced output
             # with brand-colored accents but a plain/generic background.
+            # temperature/saturation/contrast were also extracted but unused.
             color_system = style_profile.get("color_system", {})
             accent_strategy = color_system.get("accent_strategy", "")
             palette_role = color_system.get("palette_role", "")
@@ -616,6 +657,14 @@ Return only the JSON. No preamble, no explanation."""
                 "imagery_dominant": "color comes mainly from the imagery itself, not flat background fills",
             }
             palette_role_note = _PALETTE_ROLE_DESCRIPTIONS.get(palette_role, "")
+            color_detail_bits = [
+                b for b in (
+                    color_system.get("temperature", ""),
+                    color_system.get("saturation", ""),
+                    color_system.get("contrast", ""),
+                ) if b
+            ]
+            color_detail = f" ({', '.join(color_detail_bits)})" if color_detail_bits else ""
 
             # Graphic elements (decorative details) — capped at 6 rather than 4
             # so a guide's more distinctive elements (badges, speech bubbles,
@@ -623,10 +672,22 @@ Return only the JSON. No preamble, no explanation."""
             graphic_elements = style_profile.get("graphic_elements", [])
             decorative_elements = ", ".join(graphic_elements[:6]) if graphic_elements else "none"
 
-            # Typography
+            # Typography — character (e.g. "modern_sans", "bold_condensed")
+            # and hierarchy (e.g. "strong") were extracted but unused; only
+            # placement/treatment were read.
             typography = style_profile.get("typography", {})
+            typography_character = typography.get("character", "")
+            typography_hierarchy = typography.get("hierarchy", "")
             text_placement = typography.get("text_placement", "overlay_center")
             text_treatment = typography.get("text_treatment", "plain")
+            typography_bits = []
+            if typography_character:
+                typography_bits.append(f"{typography_character} character")
+            typography_bits.append(f"{text_placement} placement")
+            typography_bits.append(f"{text_treatment} treatment")
+            if typography_hierarchy:
+                typography_bits.append(f"{typography_hierarchy} hierarchy")
+            typography_line = ", ".join(typography_bits)
 
             # Brand colors — the ACTUAL colors, not just the reference's abstract
             # color strategy label (e.g. "single_bright_accent"). Without this,
@@ -682,9 +743,6 @@ Return only the JSON. No preamble, no explanation."""
                     # one-size-fits-all paragraph, since this path runs for
                     # any subject type (person, product, scene...), not just
                     # people.
-                    imagery_style = style_profile.get("imagery_style", {})
-                    imagery_treatment = imagery_style.get("treatment", "")
-                    imagery_realism = imagery_style.get("realism_level", "")
                     qualifiers = ", ".join(q for q in (imagery_treatment, imagery_realism) if q)
                     medium_enforcement = (
                         f"CRITICAL: this must become a genuine {medium} rendering"
@@ -707,7 +765,6 @@ Return only the JSON. No preamble, no explanation."""
                 # person or product. Without calling that out explicitly, the same
                 # face/pose/outfit or the same product packaging kept reappearing in
                 # every generation, since the model is editing that literal photo.
-                imagery_style = style_profile.get("imagery_style", {})
                 subject_type = imagery_style.get("subject_type", "")
                 if subject_type == "person":
                     identity_instruction = "The reference features a specific person — depict a DIFFERENT person (different face, pose, and outfit) of the same general type and mood. Never reproduce the same individual."
@@ -721,20 +778,32 @@ Return only the JSON. No preamble, no explanation."""
                     f"but this is a NEW piece, not a duplicate of the reference. {variation_directive}"
                 )
 
-            # Build structured prompt similar to standard generation
-            # Use sections to separate style instructions from content (prevents verbatim rendering)
+            # Build structured prompt similar to standard generation. Assembled
+            # as a filtered list rather than one fixed f-string so an empty
+            # field (e.g. no structural_devices on this guide) just omits its
+            # line instead of leaving a blank/awkward one in the prompt.
+            style_lines = [
+                "=== VISUAL STYLE (MATCH REFERENCE) ===",
+                f"Design style: {medium}, {aesthetic} aesthetic, {mood} mood",
+            ]
+            if dominance_note:
+                style_lines.append(f"Aesthetic dominance: {dominance_note}")
+            style_lines.append(f"Composition: {composition_detail}")
+            if structural_devices_note:
+                style_lines.append(f"Structural devices: {structural_devices_note}")
+            if imagery_treatment_note:
+                style_lines.append(f"Imagery treatment: {imagery_treatment_note}")
+            style_lines.append(f"Decorative elements: {decorative_elements if decorative_elements != 'none' else 'minimal'}")
+            style_lines.append(f"Color approach: {color_instruction}{color_detail}")
+            style_lines.append(f"Typography: {typography_line}")
+            style_lines.append("")
+            style_lines.append(match_instruction)
+            if identity_instruction:
+                style_lines.append(identity_instruction)
+            style_lines.append("Include MINIMAL text - just a short headline and small CTA.")
+            style_lines.append("Do NOT copy logos or brand names from the reference.")
 
-            style_instructions = f"""=== VISUAL STYLE (MATCH REFERENCE) ===
-Design style: {medium}, {aesthetic} aesthetic, {mood} mood
-Composition: {composition}
-Decorative elements: {decorative_elements if decorative_elements != "none" else "minimal"}
-Color approach: {color_instruction}
-Typography: {text_placement} placement, {text_treatment} style
-
-{match_instruction}
-{identity_instruction}
-Include MINIMAL text - just a short headline and small CTA.
-Do NOT copy logos or brand names from the reference."""
+            style_instructions = "\n".join(style_lines)
 
             content_section = f"""=== CONTENT ===
 {seed_content.strip()}"""
