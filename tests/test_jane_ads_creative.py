@@ -12,9 +12,25 @@ from app.agents.jane_ads.creative import (
     _draft_to_summary,
     _location_prompt_bit,
     _looks_like_video,
+    _merge_brief_into_copy,
     assemble_creative,
 )
 from app.agents.jane_ads.models import AdCopy, CreativeSource
+
+
+def test_merge_brief_folds_image_prompt_and_video_reco_onto_copy():
+    # Tier B: the caption step writes only headline/body; the image brief carries the
+    # image_prompt + video recommendation. _merge_brief_into_copy folds them together
+    # so the assembled creative keeps both.
+    copy = AdCopy(headline="Fresh Lunch Daily", primary_text="Hot meals near you.")
+    brief = AdCopy(image_prompt="a bowl of jollof", video_recommended=True,
+                   video_recommendation_reason="show the sizzle")
+    merged = _merge_brief_into_copy(copy, brief)
+    assert merged.headline == "Fresh Lunch Daily"           # untouched
+    assert merged.primary_text == "Hot meals near you."     # untouched
+    assert merged.image_prompt == "a bowl of jollof"        # from brief
+    assert merged.video_recommended is True
+    assert merged.video_recommendation_reason == "show the sizzle"
 
 
 def test_assemble_with_image_defaults_to_generate_source():

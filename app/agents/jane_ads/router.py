@@ -755,7 +755,7 @@ async def _build_campaign_plan(
     failures (bad config, unsupported creative, policy block, generation failure)."""
     import uuid
     from app.core.config import settings
-    from .creative import creative_from_draft, creative_from_upload, generate_ad_creative, get_brand_context, write_shoot_script
+    from .creative import creative_from_draft, creative_from_upload, generate_ad_creative, get_brand_context, list_recent_drafts, write_shoot_script
     from .decision_engine import apply_platform_override, plan_campaign
     from .history import get_campaign_history, remembered_budget_ngn, remembered_business_name, remembered_category
     from .nl import parse_message, to_campaign_request, NlUnavailableError
@@ -878,15 +878,31 @@ async def _build_campaign_plan(
     category = req.category or body.category
     user_id = brand_ctx.get("user_id", "")
     brand_id = brand_ctx.get("brand_id")
+    offer_type = req.offer_type.value if req.offer_type else ""
+
+    # Tier B — image-choice step. Before committing to a visual, let the user choose
+    # where it comes from: their own photo/video, a past post, or Jane generating one.
+    # Only when the caller explicitly asks to be asked ("ask"); the one-shot endpoint
+    # and an already-made choice (upload/draft/generate) skip straight through. Nothing
+    # expensive (geo already ran cheaply; no image generated yet) is wasted if they pick
+    # upload/draft on the next turn.
+    if body.creative_source == "ask":
+        drafts = await list_recent_drafts(user_id, db, brand_id, limit=6) if user_id else []
+        return {"early_return": {
+            "stage": "choose_creative_source",
+            "understood": parsed.model_dump(),
+            "creative_options": {"can_generate": True, "drafts": drafts},
+        }}
+
     if body.creative_source == "upload":
         creative = await creative_from_upload(
-            business_name, category, body.reference_image_url, req.goal.value, req.description,
-            user_id=user_id, db=db, brand_id=brand_id, is_video=body.is_video,
+            business_name, category, body.reference_image_url, req.goal.value, offer_type,
+            req.description, user_id=user_id, db=db, brand_id=brand_id, is_video=body.is_video,
         )
     elif body.creative_source == "draft":
         creative = await creative_from_draft(
             business_name, category, body.draft_id, user_id, db,
-            goal=req.goal.value, brand_id=brand_id,
+            goal=req.goal.value, offer_type=offer_type, brand_id=brand_id,
         )
         if creative is None:
             raise HTTPException(status_code=404, detail="Draft not found or has no image")
@@ -901,7 +917,7 @@ async def _build_campaign_plan(
                 detail="You're out of content credits — top up to generate a new ad image, or upload your own photo/video instead.",
             )
         creative = await generate_ad_creative(
-            business_name, category, req.goal.value, req.description,
+            business_name, category, req.goal.value, offer_type, req.description,
             user_id=user_id, db=db, brand_id=brand_id, city=parsed.city,
             behaviour=plan.behaviour.value,
         )

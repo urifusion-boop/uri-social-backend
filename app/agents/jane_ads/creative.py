@@ -148,33 +148,36 @@ def _location_prompt_bit(city: str, category: str = "") -> str:
     )
 
 
-async def write_ad_copy(business_name: str, category: str, goal: str = "messages",
-                        description: str = "", brand_context: Optional[dict] = None,
-                        city: str = "", behaviour: str = "") -> AdCopy:
-    """Write a short headline, primary text, and an image prompt (used only for the
-    GENERATE source). Voice-matched to the brand playbook when a profile exists, and
-    visually grounded in the real city/area the campaign targets. Also does the
-    creative-type reasoning (PRD §4.1): flags when a video would clearly serve this
-    ad better than the photo we're about to generate — gpt-image-1 can't produce
-    one, so this is a heads-up for the caller to offer an upload, not a capability."""
+async def write_image_brief(business_name: str, category: str, goal: str = "messages",
+                            offer_type: str = "", description: str = "",
+                            brand_context: Optional[dict] = None, city: str = "",
+                            behaviour: str = "") -> AdCopy:
+    """Write ONLY the image prompt for the GENERATE source (headline/primary_text are
+    written LATER, once the final image is fixed, so the caption can reference what the
+    image actually shows — see write_ad_copy_for_image). Voice-matched to the brand
+    playbook, grounded in the real city/area, and shaped by what's being promoted
+    (offer_type). Also does the creative-type reasoning (PRD §4.1): flags when a video
+    would clearly serve this ad better than the photo — gpt-image-1 can't produce one,
+    so this is a heads-up, not a capability. Returns an AdCopy with only image_prompt +
+    the video-recommendation fields populated."""
     if not settings.jane_ads_openai_key:
         return AdCopy()
     bc = brand_context or {}
     brand_bits = _brand_prompt_bits(bc)
     location_bit = _location_prompt_bit(city or bc.get("region", ""), category)
     prompt = (
-        f"Write a Meta/Instagram ad for '{business_name or bc.get('brand_name') or 'a business'}' "
-        f"(a {category or 'local business'}) whose goal is {goal}. The ad drives people "
-        f"to message the business on WhatsApp.{(' ' + brand_bits) if brand_bits else ''}\n"
+        f"Design the visual for a Meta/Instagram ad for "
+        f"'{business_name or bc.get('brand_name') or 'a business'}' (a "
+        f"{category or 'local business'}) whose goal is {goal}. What's being promoted: "
+        f"{offer_type or 'their offering'}. The ad drives people to message the business "
+        f"on WhatsApp.{(' ' + brand_bits) if brand_bits else ''}\n"
         f"{location_bit}\n"
         f"Context: {description or 'none'}\n"
         f"How customers find this business: {behaviour or 'unknown'}.\n"
         "Return JSON with:\n"
-        "- headline: punchy, <= 5 words, no ALL CAPS, no emoji spam\n"
-        "- primary_text: 1–2 warm, concrete sentences in the brand voice above if given "
-        "(no hype, no clickbait)\n"
         "- image_prompt: a photorealistic scene for the creative image — real people/"
-        "products/workspace fitting the business, in the brand's colours/setting and the "
+        "products/workspace fitting the business and specifically what's being promoted "
+        f"({offer_type or 'their offering'}), in the brand's colours/setting and the "
         "LOCATION above. NO text anywhere in the image — no logos, no watermarks, no "
         "storefront signage/shop signs with the business name, no readable words of any "
         "kind (Meta adds the ad's headline and button separately; baked-in text is never "
@@ -203,11 +206,84 @@ async def write_ad_copy(business_name: str, category: str, goal: str = "messages
         )
         d = json.loads(resp.choices[0].message.content or "{}")
         return AdCopy(
-            headline=str(d.get("headline", "")).strip(),
-            primary_text=str(d.get("primary_text", "")).strip(),
             image_prompt=str(d.get("image_prompt", "")).strip(),
             video_recommended=bool(d.get("video_recommended")),
             video_recommendation_reason=str(d.get("video_recommendation_reason", "")).strip(),
+        )
+    except Exception as e:
+        print(f"[Creative] image brief error: {e}", flush=True)
+        return AdCopy()
+
+
+async def describe_ad_image(image_url: str) -> str:
+    """One-sentence description of what an UPLOADED or DRAFT image actually shows, via
+    a vision model — so the caption Jane writes afterward can reference the real visual
+    instead of being written blind. Best-effort: returns "" on any failure (the caller
+    falls back to whatever context it already has). Never used for the GENERATE source,
+    where the exact image_prompt Jane wrote already IS the description."""
+    if not settings.jane_ads_openai_key or not (image_url or "").strip():
+        return ""
+    try:
+        client = openai.AsyncOpenAI(api_key=settings.jane_ads_openai_key)
+        resp = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": [
+                {"type": "text", "text": (
+                    "Describe what this image shows in ONE concrete sentence — the "
+                    "subject, setting, and mood. This will be used to write an ad "
+                    "caption that references the image, so be specific and factual."
+                )},
+                {"type": "image_url", "image_url": {"url": image_url}},
+            ]}],
+            timeout=20,
+        )
+        return (resp.choices[0].message.content or "").strip()
+    except Exception as e:
+        print(f"[Creative] image describe error: {e}", flush=True)
+        return ""
+
+
+async def write_ad_copy_for_image(image_summary: str, business_name: str, category: str,
+                                  goal: str = "messages", offer_type: str = "",
+                                  description: str = "", brand_context: Optional[dict] = None,
+                                  city: str = "", behaviour: str = "") -> AdCopy:
+    """Write the headline + primary text AFTER the final image is fixed, so the copy
+    references what the image actually shows (`image_summary` — the image_prompt for a
+    GENERATE image, or a vision description for an upload/draft). Voice-matched to the
+    brand playbook. Returns an AdCopy with only headline + primary_text populated."""
+    if not settings.jane_ads_openai_key:
+        return AdCopy()
+    bc = brand_context or {}
+    brand_bits = _brand_prompt_bits(bc)
+    prompt = (
+        f"Write the copy for a Meta/Instagram ad for "
+        f"'{business_name or bc.get('brand_name') or 'a business'}' (a "
+        f"{category or 'local business'}) whose goal is {goal}. What's being promoted: "
+        f"{offer_type or 'their offering'}. The ad drives people to message the business "
+        f"on WhatsApp.{(' ' + brand_bits) if brand_bits else ''}\n"
+        f"The ad's IMAGE shows: {image_summary or 'a scene fitting the business'}.\n"
+        f"Context: {description or 'none'}\n"
+        f"How customers find this business: {behaviour or 'unknown'}.\n"
+        "Write copy that speaks to what's in the image above — the headline and body "
+        "should feel connected to the visual, not generic.\n"
+        "Return JSON with:\n"
+        "- headline: punchy, <= 5 words, no ALL CAPS, no emoji spam\n"
+        "- primary_text: 1–2 warm, concrete sentences in the brand voice above if given "
+        "(no hype, no clickbait) that reference what the image shows\n"
+        "Return ONLY the JSON."
+    )
+    try:
+        client = openai.AsyncOpenAI(api_key=settings.jane_ads_openai_key)
+        resp = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            response_format={"type": "json_object"},
+            messages=[{"role": "user", "content": prompt}],
+            timeout=15,
+        )
+        d = json.loads(resp.choices[0].message.content or "{}")
+        return AdCopy(
+            headline=str(d.get("headline", "")).strip(),
+            primary_text=str(d.get("primary_text", "")).strip(),
         )
     except Exception as e:
         print(f"[Creative] copy error: {e}", flush=True)
@@ -455,48 +531,65 @@ def assemble_creative(copy: AdCopy, image_url: Optional[str],
 
 # ── The three entry points ────────────────────────────────────────────────────
 
+def _merge_brief_into_copy(copy: AdCopy, brief: AdCopy) -> AdCopy:
+    """Fold the image brief's image_prompt + video recommendation back onto the copy so
+    the assembled creative carries both (the copy step only writes headline/body)."""
+    copy.image_prompt = brief.image_prompt
+    copy.video_recommended = brief.video_recommended
+    copy.video_recommendation_reason = brief.video_recommendation_reason
+    return copy
+
+
 async def generate_ad_creative(
-    business_name: str, category: str, goal: str = "messages", description: str = "",
-    user_id: str = "", db=None, brand_id: Optional[str] = None, city: str = "",
-    behaviour: str = "",
+    business_name: str, category: str, goal: str = "messages", offer_type: str = "",
+    description: str = "", user_id: str = "", db=None, brand_id: Optional[str] = None,
+    city: str = "", behaviour: str = "",
 ) -> AdCreative:
-    """SOURCE 1 (default) — Jane writes the copy and generates the image herself,
-    using the brand playbook's colours/voice/region/industry, grounded in `city` (the
-    campaign's geo target, e.g. from the decision engine's geo pins) so the scene
-    reflects the real place, not a generic global look. `behaviour` (search/discover/
-    mixed, from the decision engine) informs the creative-type reasoning (PRD §4.1) —
-    see write_ad_copy. For "use my own photo", see SOURCE 2 (creative_from_upload) —
-    a distinct source, not a reference nudge on generation. Never raises — falls back
-    to copy-only if image generation fails."""
+    """SOURCE 1 (default) — Jane writes the image brief, generates the image, THEN
+    writes the caption referencing that image (Tier B: caption is written last so it
+    speaks to the actual visual). Uses the brand playbook's colours/voice/region/
+    industry, grounded in `city` so the scene reflects the real place. `behaviour`
+    informs the creative-type reasoning (PRD §4.1). Never raises — falls back to
+    copy-only if image generation fails."""
     brand_context = await get_brand_context(user_id, db, brand_id) if user_id else {}
-    copy = await write_ad_copy(business_name, category, goal, description, brand_context, city, behaviour)
-    image_url = await generate_ad_image(copy.image_prompt, brand_context)
+    brief = await write_image_brief(business_name, category, goal, offer_type, description,
+                                    brand_context, city, behaviour)
+    image_url = await generate_ad_image(brief.image_prompt, brand_context)
+    # Caption last, referencing the scene we just generated (the image_prompt IS the
+    # description of what the image shows — no vision call needed for GENERATE).
+    copy = await write_ad_copy_for_image(brief.image_prompt, business_name, category, goal,
+                                         offer_type, description, brand_context, city, behaviour)
+    copy = _merge_brief_into_copy(copy, brief)
     return assemble_creative(copy, image_url, source=CreativeSource.GENERATE)
 
 
 async def creative_from_upload(
     business_name: str, category: str, image_url: str, goal: str = "messages",
-    description: str = "", user_id: str = "", db=None, brand_id: Optional[str] = None,
-    is_video: Optional[bool] = None,
+    offer_type: str = "", description: str = "", user_id: str = "", db=None,
+    brand_id: Optional[str] = None, is_video: Optional[bool] = None,
 ) -> AdCreative:
-    """SOURCE 2 — the user's own uploaded photo OR video (uploaded via
-    /jane-ads/creative/upload, or the existing /upload-user-content flow) becomes
-    the creative directly; Jane still writes fresh copy to match it. No location
-    grounding needed — the media IS the real place already."""
+    """SOURCE 2 — the user's own uploaded photo OR video becomes the creative directly;
+    Jane writes copy AFTER seeing what the media shows (a vision description for a
+    photo) so the caption references the real image (Tier B)."""
     brand_context = await get_brand_context(user_id, db, brand_id) if user_id else {}
-    copy = await write_ad_copy(business_name, category, goal, description, brand_context)
+    image_summary = "" if is_video else await describe_ad_image(image_url)
+    copy = await write_ad_copy_for_image(image_summary, business_name, category, goal,
+                                         offer_type, description, brand_context)
     return assemble_creative(copy, image_url, source=CreativeSource.UPLOAD, is_video=is_video)
 
 
 async def creative_from_draft(
     business_name: str, category: str, draft_id: str, user_id: str, db,
-    goal: str = "messages", brand_id: Optional[str] = None,
+    goal: str = "messages", offer_type: str = "", brand_id: Optional[str] = None,
 ) -> Optional[AdCreative]:
-    """SOURCE 3 — reuse a content draft the user already generated and liked.
-    Returns None if the draft can't be found (caller should 404)."""
+    """SOURCE 3 — reuse a content draft the user already generated and liked. Copy is
+    written after describing the draft's image (Tier B), falling back to the draft's own
+    text if the vision call fails. Returns None if the draft can't be found (caller 404s)."""
     draft = await get_draft_image(draft_id, user_id, db)
     if draft is None or not draft["image_url"]:
         return None
     brand_context = await get_brand_context(user_id, db, brand_id)
-    copy = await write_ad_copy(business_name, category, goal, draft["content"], brand_context)
+    image_summary = await describe_ad_image(draft["image_url"]) or draft["content"]
+    copy = await write_ad_copy_for_image(image_summary, business_name, category, goal,
+                                         offer_type, draft["content"], brand_context)
     return assemble_creative(copy, draft["image_url"], source=CreativeSource.DRAFT)
