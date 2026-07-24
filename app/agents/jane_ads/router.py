@@ -418,6 +418,70 @@ async def wallet_balance(
     }
 
 
+# ── Chat history (per brand) ──────────────────────────────────────────────────
+# The Campaigns chat is entirely client-orchestrated (the frontend calls plan/launch
+# endpoints itself and renders its own message list) — there's no single backend call
+# that "is" a chat turn to hook persistence into. So the frontend explicitly saves each
+# message as it's added, and loads the transcript back on mount. Keyed by brand, not
+# user, so it matches how everything else in Jane Ads is scoped (a shared brand inbox,
+# not a personal one) and survives a user switching devices.
+
+CHAT_HISTORY_COLLECTION = "jane_ads_chat_messages"
+
+
+@router.get("/chat/history")
+async def jane_chat_history(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """The active brand's saved Campaigns chat transcript, oldest first."""
+    brand_id = brand_ctx.get("brand_id")
+    if not brand_id:
+        return {"messages": []}
+    docs = await (db[CHAT_HISTORY_COLLECTION]
+                  .find({"brand_id": brand_id}, {"_id": 0, "brand_id": 0, "user_id": 0})
+                  .sort("created_at", 1).to_list(length=500))
+    return {"messages": docs}
+
+
+class ChatMessageBody(BaseModel):
+    message_id: str
+    role: str            # "user" | "jane"
+    kind: str             # "text" | "result"
+    text: str = ""
+    result: Optional[dict] = None   # the full LaunchFromMessageResult, for kind="result"
+
+
+@router.put("/chat/history/{message_id}")
+async def jane_chat_save_message(
+    message_id: str,
+    body: ChatMessageBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Save (or update) one chat message. PUT + upsert-by-id so this covers both a
+    brand-new message AND the existing message being edited in place — e.g. a plan
+    card that flips from 'planned' to 'launched' once the user confirms it reuses the
+    SAME message_id, so saving it again here just updates that one saved row instead
+    of creating a duplicate."""
+    from datetime import datetime, timezone
+
+    brand_id = brand_ctx.get("brand_id")
+    if not brand_id:
+        raise HTTPException(status_code=400, detail="No active brand to save chat history for.")
+    now = datetime.now(timezone.utc)
+    await db[CHAT_HISTORY_COLLECTION].update_one(
+        {"brand_id": brand_id, "message_id": message_id},
+        {"$set": {
+            "message_id": message_id, "brand_id": brand_id, "user_id": brand_ctx.get("user_id"),
+            "role": body.role, "kind": body.kind, "text": body.text, "result": body.result,
+            "updated_at": now,
+        }, "$setOnInsert": {"created_at": now}},
+        upsert=True,
+    )
+    return {"ok": True}
+
+
 # ── Brand-scoped wallet (what the app UI calls) ───────────────────────────────
 # The two endpoints above take an explicit business_id (internal/demo use). The UI
 # instead uses these, which derive the wallet key from the active brand context —
