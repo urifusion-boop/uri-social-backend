@@ -663,10 +663,42 @@ Return only the JSON. No preamble, no explanation."""
                 # every generation) would work against that here.
                 variation_directive = ""
                 identity_instruction = ""
+
+                if medium == "photographic":
+                    medium_enforcement = ""
+                else:
+                    # GPT-Image-2's edit endpoint has a strong built-in bias to
+                    # preserve what's actually in the input photo, since it's
+                    # editing real pixels rather than generating from scratch —
+                    # a soft "restyle this" request alone tends to produce a
+                    # photo with a filter/outline/posterize effect rather than
+                    # a genuine medium change (confirmed live: output looked
+                    # like a photo with a sticker-cutout filter, not real
+                    # {medium} illustration). input_fidelity isn't an option
+                    # here at all (gpt-image-2 rejects it outright), so an
+                    # explicit negative constraint is the only remaining lever
+                    # — built from the guide's OWN extracted imagery_style
+                    # fields (treatment/realism_level) rather than a generic,
+                    # one-size-fits-all paragraph, since this path runs for
+                    # any subject type (person, product, scene...), not just
+                    # people.
+                    imagery_style = style_profile.get("imagery_style", {})
+                    imagery_treatment = imagery_style.get("treatment", "")
+                    imagery_realism = imagery_style.get("realism_level", "")
+                    qualifiers = ", ".join(q for q in (imagery_treatment, imagery_realism) if q)
+                    medium_enforcement = (
+                        f"CRITICAL: this must become a genuine {medium} rendering"
+                        f"{f' ({qualifiers})' if qualifiers else ''} — fully redrawn, not a "
+                        f"photograph with a filter, outline, or posterize effect applied on top. "
+                        f"Photographic qualities (realistic shading, camera-like lighting and "
+                        f"depth) must be replaced entirely with {medium} rendering throughout."
+                    )
+
                 match_instruction = (
                     "Apply this visual style to the uploaded image's actual subject and "
                     "composition — keep what is being shown, restyle HOW it's rendered "
-                    "(medium, color treatment, mood) to match the style described above."
+                    f"(medium, color treatment, mood) to match the style described above. "
+                    f"{medium_enforcement}"
                 )
             else:
                 variation_directive = random.choice(CustomVisualGuideV2Service.VARIATION_DIRECTIVES)
