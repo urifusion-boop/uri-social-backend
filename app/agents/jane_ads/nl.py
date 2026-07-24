@@ -61,9 +61,23 @@ _NO_BUSINESS_CLARIFY = (
 )
 
 
+class NlUnavailableError(Exception):
+    """The language model couldn't be reached — quota exhausted, timeout, outage.
+    Distinct from a successful parse that's merely missing a field: the caller must
+    surface this as a temporary 'try again later', NOT as another follow-up question.
+    Treating an outage as "no budget given" is what made Jane loop forever on the
+    budget question when OpenAI was over quota."""
+
+
 async def parse_message(message: str, business_name: str = "", category: str = "") -> ParsedCampaign:
-    """Extract structured campaign fields from a plain-language message."""
-    if not settings.OPENAI_API_KEY or not (message or "").strip():
+    """Extract structured campaign fields from a plain-language message. Raises
+    NlUnavailableError if the model call fails (so an outage never masquerades as a
+    'need more info' follow-up)."""
+    if not settings.OPENAI_API_KEY:
+        raise NlUnavailableError("OPENAI_API_KEY is not configured")
+    if not (message or "").strip():
+        # Nothing to parse — ask what they want to promote (or for budget if the
+        # business is already known). This is a genuine need-more, not an outage.
         if not business_name and not category:
             return ParsedCampaign(missing=["business_name"], clarify=_NO_BUSINESS_CLARIFY)
         return ParsedCampaign(business_name=business_name, category=category,
@@ -101,10 +115,7 @@ async def parse_message(message: str, business_name: str = "", category: str = "
         data = json.loads(resp.choices[0].message.content or "{}")
     except Exception as e:
         print(f"[NL] parse error: {e}", flush=True)
-        if not business_name and not category:
-            return ParsedCampaign(missing=["business_name"], clarify=_NO_BUSINESS_CLARIFY)
-        return ParsedCampaign(business_name=business_name, category=category,
-                               missing=["budget_ngn"], clarify=_NO_BUDGET_CLARIFY)
+        raise NlUnavailableError(str(e)) from e
 
     parsed = _coerce(data, business_name, category)
     # Business identity comes first — asking about budget before Jane knows what's
