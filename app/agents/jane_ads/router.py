@@ -40,6 +40,11 @@ from .wallet import InsufficientFundsError, MinimumTopUpError, WalletService
 
 router = APIRouter(prefix="/jane-ads", tags=["Jane + Ads (demo)"])
 
+# Shown (via HTTP 503) whenever the AI backend Jane depends on is unreachable —
+# OpenAI over quota, timing out, or down. A plain "try again later", never a
+# follow-up question, so the UI can't loop pretending it just needs more info.
+_AI_DIFFICULTIES = "We're experiencing some difficulties on our end — please try again in a little while."
+
 
 def _raise_http_for_meta_error(e: "MetaAPIError") -> None:
     """Meta's ad-account-level rate limit ("too many calls to this ad-account")
@@ -203,8 +208,11 @@ async def understand(
     """Natural-language path: Jane reads a plain-English message, extracts the goal/
     budget/behaviour/city herself, then runs the same plan. Asks a follow-up if the
     budget is missing rather than guessing."""
-    from .nl import parse_message, to_campaign_request
-    parsed = await parse_message(body.message, body.business_name, body.category)
+    from .nl import parse_message, to_campaign_request, NlUnavailableError
+    try:
+        parsed = await parse_message(body.message, body.business_name, body.category)
+    except NlUnavailableError:
+        raise HTTPException(status_code=503, detail=_AI_DIFFICULTIES)
     req = to_campaign_request(parsed, business_id="demo")
     if req is None:
         return {
@@ -686,7 +694,7 @@ async def _build_campaign_plan(
     from .creative import creative_from_draft, creative_from_upload, generate_ad_creative, get_brand_context, write_shoot_script
     from .decision_engine import apply_platform_override, plan_campaign
     from .history import get_campaign_history, remembered_budget_ngn, remembered_business_name, remembered_category
-    from .nl import parse_message, to_campaign_request
+    from .nl import parse_message, to_campaign_request, NlUnavailableError
     from .policy import Severity, review_ad_creative
 
     if not (settings.META_AD_ACCOUNT_ID and settings.META_ADS_ACCESS_TOKEN):
@@ -720,8 +728,13 @@ async def _build_campaign_plan(
                       or brand_profile.get("industry", ""))
     known_budget = remembered_budget_ngn(history)
 
-    # 1. Jane reads the plain-English message.
-    parsed = await parse_message(body.message, known_business_name, known_category)
+    # 1. Jane reads the plain-English message. If the AI is unreachable (quota/outage),
+    # surface a clear "try again later" instead of falling through to a follow-up
+    # question — otherwise every answer re-triggers the same question (an infinite loop).
+    try:
+        parsed = await parse_message(body.message, known_business_name, known_category)
+    except NlUnavailableError:
+        raise HTTPException(status_code=503, detail=_AI_DIFFICULTIES)
 
     # 1.5. Backwards budget (PRD §3.1) — the user described an outcome ("20 customers"),
     # not a Naira amount. Convert using this business's own real cost-per-conversation
@@ -835,7 +848,9 @@ async def _build_campaign_plan(
             # this feature's scope.
             await credit_service.deduct_credit(user_id, campaign_id=business_id, reason="campaign_generation")
     if not creative.image_url:
-        raise HTTPException(status_code=502, detail="Jane couldn't generate the ad image (creative service). Try again.")
+        # Empty creative almost always means the image/copy model failed (often the
+        # same quota/outage that breaks parsing), so give the same clear message.
+        raise HTTPException(status_code=503, detail=_AI_DIFFICULTIES)
 
     # 4.5. Policy gate — one bad ad can suspend the whole pooled ad account, so this
     # runs before a plan is ever shown as ready, not just right before launch.
