@@ -598,13 +598,30 @@ Return only the JSON. No preamble, no explanation."""
             layout = style_profile.get("layout_structure", {})
             composition = layout.get("composition", "centered")
 
-            # Color system
+            # Color system — accent_strategy alone only describes WHERE accent
+            # color goes, not whether the reference has a bold, dominant
+            # colored background (palette_role: "background_dominant") versus
+            # a mostly neutral one with color used sparingly. Without
+            # palette_role, the prompt never said anything about background
+            # color dominance at all — only about accent placement — which is
+            # why a guide with a strong colored background produced output
+            # with brand-colored accents but a plain/generic background.
             color_system = style_profile.get("color_system", {})
             accent_strategy = color_system.get("accent_strategy", "")
+            palette_role = color_system.get("palette_role", "")
+            _PALETTE_ROLE_DESCRIPTIONS = {
+                "background_dominant": "a bold, dominant colored background fills most of the frame",
+                "balanced": "color is balanced between background and foreground elements",
+                "accent_driven": "mostly neutral/light, with color used only as accents",
+                "imagery_dominant": "color comes mainly from the imagery itself, not flat background fills",
+            }
+            palette_role_note = _PALETTE_ROLE_DESCRIPTIONS.get(palette_role, "")
 
-            # Graphic elements (decorative details)
+            # Graphic elements (decorative details) — capped at 6 rather than 4
+            # so a guide's more distinctive elements (badges, speech bubbles,
+            # sparkles) are less likely to be silently dropped from the prompt.
             graphic_elements = style_profile.get("graphic_elements", [])
-            decorative_elements = ", ".join(graphic_elements[:4]) if graphic_elements else "none"
+            decorative_elements = ", ".join(graphic_elements[:6]) if graphic_elements else "none"
 
             # Typography
             typography = style_profile.get("typography", {})
@@ -622,7 +639,8 @@ Return only the JSON. No preamble, no explanation."""
                 color_list = ", ".join(brand_colors[:3])
                 color_instruction = (
                     f"Use {brand_name}'s actual brand colors ({color_list}) — apply them "
-                    f"following the reference's color strategy ({accent_strategy or 'its accent placement'}), "
+                    f"following the reference's color strategy ({accent_strategy or 'its accent placement'})"
+                    f"{', where ' + palette_role_note if palette_role_note else ''}, "
                     f"but the colors themselves must be {brand_name}'s, not the reference's original colors."
                 )
             else:
@@ -675,7 +693,7 @@ Return only the JSON. No preamble, no explanation."""
             # Use sections to separate style instructions from content (prevents verbatim rendering)
 
             style_instructions = f"""=== VISUAL STYLE (MATCH REFERENCE) ===
-Design style: {medium}, {aesthetic} aesthetic
+Design style: {medium}, {aesthetic} aesthetic, {mood} mood
 Composition: {composition}
 Decorative elements: {decorative_elements if decorative_elements != "none" else "minimal"}
 Color approach: {color_instruction}
