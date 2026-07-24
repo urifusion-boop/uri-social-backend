@@ -274,7 +274,7 @@ async def _detect_subject_position(path: str) -> str:
         client = openai.AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
         resp = await client.chat.completions.create(
             model="gpt-5.6-luna",
-            max_tokens=5,
+            max_completion_tokens=5,
             messages=[{
                 "role": "user",
                 "content": [
@@ -457,7 +457,7 @@ Rules:
         resp = await client.chat.completions.create(
             model="gpt-5.6-luna",
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=200,
+            max_completion_tokens=200,
             temperature=0.3,
             response_format={"type": "json_object"},
         )
@@ -929,7 +929,7 @@ async def _refine_silence_cuts(
             model="gpt-5.6-luna",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
-            max_tokens=600,
+            max_completion_tokens=600,
         )
         raw = resp.choices[0].message.content.strip()
         if raw.startswith("```"):
@@ -1089,7 +1089,7 @@ async def _run_ai_analysis(clips_ordered: List[Dict], story_type: str) -> Dict:
             model="gpt-5.6-luna",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
-            max_tokens=1200,
+            max_completion_tokens=1200,
         )
         raw = resp.choices[0].message.content.strip()
         if raw.startswith("```"):
@@ -1394,7 +1394,7 @@ Shot type guide:
                     {"type": "text", "text": prompt},
                 ],
             }],
-            max_tokens=200,
+            max_completion_tokens=200,
             temperature=0.2,
             response_format={"type": "json_object"},
         )
@@ -1445,7 +1445,7 @@ Return JSON only:
         resp = await client.chat.completions.create(
             model="gpt-5.6-luna",
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=300,
+            max_completion_tokens=300,
             temperature=0.7,
             response_format={"type": "json_object"},
         )
