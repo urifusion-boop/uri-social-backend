@@ -157,7 +157,7 @@ async def write_ad_copy(business_name: str, category: str, goal: str = "messages
     creative-type reasoning (PRD §4.1): flags when a video would clearly serve this
     ad better than the photo we're about to generate — gpt-image-1 can't produce
     one, so this is a heads-up for the caller to offer an upload, not a capability."""
-    if not settings.OPENAI_API_KEY:
+    if not settings.jane_ads_openai_key:
         return AdCopy()
     bc = brand_context or {}
     brand_bits = _brand_prompt_bits(bc)
@@ -194,7 +194,7 @@ async def write_ad_copy(business_name: str, category: str, goal: str = "messages
         "Return ONLY the JSON."
     )
     try:
-        client = openai.AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+        client = openai.AsyncOpenAI(api_key=settings.jane_ads_openai_key)
         resp = await client.chat.completions.create(
             model="gpt-4o-mini",
             response_format={"type": "json_object"},
@@ -223,7 +223,7 @@ async def write_shoot_script(business_name: str, category: str, goal: str,
     uploaded via the existing upload path and swapped into the pending plan via
     POST /meta/plan/{plan_id}/creative. Never raises — an empty script just means
     the user films freely instead."""
-    if not settings.OPENAI_API_KEY:
+    if not settings.jane_ads_openai_key:
         return ShootScript()
     bc = brand_context or {}
     brand_bits = _brand_prompt_bits(bc)
@@ -248,7 +248,7 @@ async def write_shoot_script(business_name: str, category: str, goal: str,
         "Return ONLY the JSON."
     )
     try:
-        client = openai.AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+        client = openai.AsyncOpenAI(api_key=settings.jane_ads_openai_key)
         resp = await client.chat.completions.create(
             model="gpt-4o-mini",
             response_format={"type": "json_object"},
@@ -341,12 +341,12 @@ async def generate_ad_image(image_prompt: str, brand_context: Optional[dict] = N
     finished image afterward — the SAME real pixel-logo overlay normal content
     generation uses (ImageContentService._overlay_logo), not an AI reinterpretation.
     Returns a Cloudinary URL, or None on failure."""
-    if not settings.OPENAI_API_KEY or not image_prompt.strip():
+    if not settings.jane_ads_openai_key or not image_prompt.strip():
         return None
     bc = brand_context or {}
     full_prompt = _as_ad_content(image_prompt, bc)
     try:
-        client = openai.AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+        client = openai.AsyncOpenAI(api_key=settings.jane_ads_openai_key)
         resp = await client.images.generate(
             model="gpt-image-1", prompt=full_prompt, size="1024x1536", quality="high", n=1,
         )
