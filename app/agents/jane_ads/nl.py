@@ -73,7 +73,7 @@ async def parse_message(message: str, business_name: str = "", category: str = "
     """Extract structured campaign fields from a plain-language message. Raises
     NlUnavailableError if the model call fails (so an outage never masquerades as a
     'need more info' follow-up)."""
-    if not settings.OPENAI_API_KEY:
+    if not settings.jane_ads_openai_key:
         raise NlUnavailableError("OPENAI_API_KEY is not configured")
     if not (message or "").strip():
         # Nothing to parse — ask what they want to promote (or for budget if the
@@ -105,7 +105,7 @@ async def parse_message(message: str, business_name: str = "", category: str = "
         "Return ONLY the JSON object."
     )
     try:
-        client = openai.AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+        client = openai.AsyncOpenAI(api_key=settings.jane_ads_openai_key)
         resp = await client.chat.completions.create(
             model="gpt-4o-mini",
             response_format={"type": "json_object"},

@@ -127,7 +127,7 @@ class LLMPinProposer(PinProposer):
     invented street is dropped rather than pinned."""
 
     async def propose(self, business_name, category, city, mode, goal):
-        if not settings.OPENAI_API_KEY or not city:
+        if not settings.jane_ads_openai_key or not city:
             return []
         mode_hint = ("Find the PLACES this kind of customer gathers (offices, estates, "
                      "malls, hubs)." if mode == GeoMode.WATERING_HOLE
@@ -142,7 +142,7 @@ class LLMPinProposer(PinProposer):
             'Return JSON: {"pins":[{"name":"...","reason":"..."}]}'
         )
         try:
-            client = openai.AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+            client = openai.AsyncOpenAI(api_key=settings.jane_ads_openai_key)
             resp = await client.chat.completions.create(
                 model="gpt-4o-mini",
                 response_format={"type": "json_object"},

@@ -9,6 +9,10 @@ class Settings(BaseSettings):
     MONGODB_PASSWORD: str = ""
     MONGODB_HOST: str = ""
     OPENAI_API_KEY: str
+    # Optional dedicated OpenAI key for Jane + Ads only, isolated from the shared
+    # OPENAI_API_KEY the rest of the app uses. Empty → Jane Ads falls back to the
+    # shared key (see the jane_ads_openai_key property).
+    ADS_OPENAI_API_KEY: str = ""
     AUTHJWT_SECRET_KEY: str
 
     # URI microservices
@@ -165,6 +169,12 @@ class Settings(BaseSettings):
     # PostHog
     POSTHOG_API_KEY: str = ""
     POSTHOG_HOST: str = "https://us.i.posthog.com"
+
+    @property
+    def jane_ads_openai_key(self) -> str:
+        """The OpenAI key Jane + Ads uses — its own dedicated key when set, otherwise
+        the shared one. Keeps ad usage/quota isolated from the rest of the app."""
+        return self.ADS_OPENAI_API_KEY or self.OPENAI_API_KEY
 
     class Config:
         env_file = ".env"
