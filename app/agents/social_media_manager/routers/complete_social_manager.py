@@ -8642,6 +8642,7 @@ async def zapcap_job_custom_broll(
     """
     import uuid as _uuid3
     import json as _json
+    import httpx as _httpx_cb
     from datetime import datetime, timezone
     from app.agents.social_media_manager.services.video_production_service import (
         _upload_to_cloudinary as _upload_broll_clip,
@@ -8723,7 +8724,7 @@ async def zapcap_job_custom_broll(
     if export_settings:
         task_payload["exportSettings"] = export_settings
 
-    async with httpx.AsyncClient(timeout=60) as client:
+    async with _httpx_cb.AsyncClient(timeout=60) as client:
         r = await client.post(
             f"{_ZAPCAP_BASE}/videos/{zapcap_video_id}/task",
             json=task_payload,
