@@ -25,11 +25,13 @@ from .models import (
     CreativeContext,
     CreativeKind,
     Goal,
+    OfferType,
     PurchaseBehaviour,
 )
 
 _GOALS = {g.value for g in Goal}
 _BEHAVIOURS = {b.value for b in PurchaseBehaviour}
+_OFFER_TYPES = {o.value for o in OfferType}
 
 
 class ParsedCampaign(BaseModel):
@@ -38,6 +40,7 @@ class ParsedCampaign(BaseModel):
     business_name: str = ""
     category: str = ""
     goal: Optional[str] = None
+    offer_type: Optional[str] = None
     budget_ngn: Optional[float] = None
     desired_conversions: Optional[int] = None   # "20 customers" — a result, not a Naira amount;
                                                  # the router converts this to a budget when
@@ -58,6 +61,11 @@ _NO_BUDGET_CLARIFY = (
 
 _NO_BUSINESS_CLARIFY = (
     "What would you like to promote? Tell me a bit about your business or what you're selling."
+)
+
+_NO_OBJECTIVE_CLARIFY = (
+    "What are you advertising — a product, a service, a discount/promotion, an event, "
+    "a new business launch, or just brand awareness?"
 )
 
 
@@ -81,7 +89,7 @@ async def parse_message(message: str, business_name: str = "", category: str = "
         if not business_name and not category:
             return ParsedCampaign(missing=["business_name"], clarify=_NO_BUSINESS_CLARIFY)
         return ParsedCampaign(business_name=business_name, category=category,
-                               missing=["budget_ngn"], clarify=_NO_BUDGET_CLARIFY)
+                               missing=["offer_type"], clarify=_NO_OBJECTIVE_CLARIFY)
 
     prompt = (
         "You are Jane, an ad assistant for Nigerian SMEs. Read the message and extract "
@@ -91,6 +99,8 @@ async def parse_message(message: str, business_name: str = "", category: str = "
         "Extract JSON with these keys:\n"
         "- business_name (string)\n- category (e.g. restaurant, fashion, plumber, clinic)\n"
         f"- goal (one of {sorted(_GOALS)}; infer from intent, else null)\n"
+        f"- offer_type (WHAT is being promoted, one of {sorted(_OFFER_TYPES)}; infer from intent "
+        "when clearly stated, else null — do NOT guess if not indicated)\n"
         "- budget_ngn (a NAIRA amount they'll spend; parse '₦10k','10,000','ten thousand' → 10000; "
         "else null — do NOT put a plain customer/people count here)\n"
         "- desired_conversions (a NUMBER OF PEOPLE/CUSTOMERS/ORDERS they want as a RESULT — e.g. "
@@ -126,6 +136,13 @@ async def parse_message(message: str, business_name: str = "", category: str = "
         parsed.missing = ["business_name"]
         parsed.clarify = _NO_BUSINESS_CLARIFY
         return parsed
+    # Objective next — Jane needs to know WHAT's being promoted before she talks money;
+    # asking budget first produces a generic, placeholder campaign (PRD feedback: highest
+    # priority). Mirrors the exact early-return shape the business-identity check uses.
+    if not parsed.offer_type or parsed.offer_type not in _OFFER_TYPES:
+        parsed.missing = ["offer_type"]
+        parsed.clarify = _NO_OBJECTIVE_CLARIFY
+        return parsed
     # A stated Naira budget always wins. Without one, a stated customer-count is enough to
     # proceed — the router converts it to a budget using real cost-per-conversation data
     # before this reaches to_campaign_request. Only ask again when NEITHER is given.
@@ -148,11 +165,13 @@ def _coerce(data: dict, business_name: str, category: str) -> ParsedCampaign:
         return int(n) if n and n > 0 else None
 
     goal = str(data.get("goal") or "").lower().replace("-", "_") or None
+    offer_type = str(data.get("offer_type") or "").lower().replace("-", "_") or None
     beh = str(data.get("stated_behaviour") or "").lower() or None
     return ParsedCampaign(
         business_name=str(data.get("business_name") or business_name or "").strip(),
         category=str(data.get("category") or category or "").strip(),
         goal=goal if goal in _GOALS else None,
+        offer_type=offer_type if offer_type in _OFFER_TYPES else None,
         budget_ngn=_num(data.get("budget_ngn")),
         desired_conversions=_int(data.get("desired_conversions")),
         city=str(data.get("city") or "").strip(),
@@ -165,11 +184,13 @@ def _coerce(data: dict, business_name: str, category: str) -> ParsedCampaign:
 
 def to_campaign_request(parsed: ParsedCampaign, business_id: str = "demo") -> Optional[CampaignRequest]:
     """Deterministic map from parsed fields → CampaignRequest. Returns None if Jane
-    doesn't know what's being promoted yet (business_name AND category both empty) or
-    if the budget is missing — the two things we can't proceed without. Gated here
-    directly (not just via parse_message's `missing`/`clarify`) so this stays correct
-    even if a caller skips that ordering. Pure & unit-tested."""
+    doesn't know what's being promoted yet (business_name AND category both empty), the
+    objective (offer_type) is missing, or the budget is missing — the things we can't
+    proceed without. Gated here directly (not just via parse_message's `missing`/
+    `clarify`) so this stays correct even if a caller skips that ordering. Pure & unit-tested."""
     if not parsed.business_name and not parsed.category:
+        return None
+    if not parsed.offer_type or parsed.offer_type not in _OFFER_TYPES:
         return None
     if not parsed.budget_ngn or parsed.budget_ngn <= 0:
         return None
@@ -178,6 +199,7 @@ def to_campaign_request(parsed: ParsedCampaign, business_id: str = "demo") -> Op
         business_name=parsed.business_name,
         category=parsed.category,
         goal=Goal(parsed.goal) if parsed.goal in _GOALS else Goal.MESSAGES,
+        offer_type=OfferType(parsed.offer_type),
         budget_ngn=parsed.budget_ngn,
         creative=CreativeContext(
             kind=CreativeKind.VIDEO if parsed.has_video else CreativeKind.IMAGE,
