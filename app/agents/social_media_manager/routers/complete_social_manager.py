@@ -8643,6 +8643,9 @@ async def zapcap_job_custom_broll(
     import uuid as _uuid3
     import json as _json
     from datetime import datetime, timezone
+    from app.agents.social_media_manager.services.video_production_service import (
+        _upload_to_cloudinary as _upload_broll_clip,
+    )
 
     user_id = _get_user_id(token)
     if not user_id:
@@ -8668,7 +8671,7 @@ async def zapcap_job_custom_broll(
     clip_urls: list[str] = []
     for i, clip_file in enumerate(clips):
         clip_bytes = await clip_file.read()
-        clip_url = await _upload_audio_to_cloudinary(clip_bytes, f"broll-custom-{job_id}-{i}")
+        clip_url = await _upload_broll_clip(clip_bytes, f"broll-custom-{job_id}-{i}")
         clip_urls.append(clip_url)
 
     if not clip_urls:
