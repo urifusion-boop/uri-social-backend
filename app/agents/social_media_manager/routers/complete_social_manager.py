@@ -8630,23 +8630,19 @@ async def zapcap_job_rerender(
 async def zapcap_job_custom_broll(
     job_id: str,
     clips: List[UploadFile] = File(...),
-    placements: str = Form(...),   # JSON: [{"clip_index": 0, "start_time": 3.5, "duration": 4.0}, ...]
+    placements: str = Form(...),   # JSON: [{"clip_index": 0, "start_time": 3.5, "end_time": 7.5}]
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
     token: dict = Depends(JWTBearer()),
 ):
     """
-    Overlay user-supplied b-roll clips on the existing ZapCap output at specified timestamps.
-    Uses Shotstack to composite: user clips (top layer) over ZapCap captioned video (base).
-    Returns a new job_id that can be polled via GET /zapcap-job/{job_id} (Shotstack branch).
+    Re-render the ZapCap job with user-supplied b-roll clips at specified timestamps.
+    Uses ZapCap's native customBrolls API (transcribeSettings.broll.customBrolls) — no Shotstack.
+    Clips are uploaded to Cloudinary first so ZapCap can fetch them via public URL.
+    Returns a new job_id that polls via the standard GET /zapcap-job/{job_id} path.
     """
     import uuid as _uuid3
     import json as _json
     from datetime import datetime, timezone
-
-    from app.agents.social_media_manager.services.video_production_service import (
-        _upload_to_cloudinary,
-        ShotstackProvider,
-    )
 
     user_id = _get_user_id(token)
     if not user_id:
@@ -8656,83 +8652,98 @@ async def zapcap_job_custom_broll(
     if not job:
         raise HTTPException(status_code=404, detail="ZapCap job not found")
 
-    base_video_url = job.get("final_output_url") or job.get("video_url")
-    if not base_video_url:
-        raise HTTPException(status_code=422, detail="No output video found for this job — render it first.")
+    zapcap_video_id = job.get("zapcap_video_id")
+    if not zapcap_video_id:
+        raise HTTPException(status_code=422, detail="Original ZapCap video ID not found — re-render required.")
 
     try:
         placement_list: list = _json.loads(placements)
     except Exception:
         raise HTTPException(status_code=400, detail="placements must be valid JSON")
 
-    # Upload each clip to Cloudinary
+    if not placement_list:
+        raise HTTPException(status_code=400, detail="No placements provided")
+
+    # Upload each clip to Cloudinary so ZapCap can fetch them via public URL
     clip_urls: list[str] = []
     for i, clip_file in enumerate(clips):
         clip_bytes = await clip_file.read()
-        clip_url = await _upload_to_cloudinary(clip_bytes, f"broll-custom-{job_id}-{i}")
+        clip_url = await _upload_audio_to_cloudinary(clip_bytes, f"broll-custom-{job_id}-{i}")
         clip_urls.append(clip_url)
 
     if not clip_urls:
         raise HTTPException(status_code=400, detail="No clips provided")
 
-    # Build Shotstack broll clips for the top track
-    broll_clips = []
-    for p in placement_list:
+    # Map placements to ZapCap CustomBrollDto format
+    # ZapCap constraint: overlapping brolls are not allowed; sort by startTime
+    custom_brolls = []
+    for p in sorted(placement_list, key=lambda x: float(x.get("start_time", 0))):
         idx = int(p.get("clip_index", 0))
         if idx >= len(clip_urls):
             continue
         start = float(p.get("start_time", 0))
-        duration = float(p.get("duration", 5))
-        broll_clips.append({
-            "asset": {"type": "video", "src": clip_urls[idx], "volume": 0},
-            "start": start,
-            "length": duration,
-            "fit": "cover",
+        end = float(p.get("end_time", start + 5.0))
+        custom_brolls.append({
+            "startTime": start,
+            "endTime": end,
+            "url": clip_urls[idx],
         })
 
-    if not broll_clips:
-        raise HTTPException(status_code=400, detail="No valid placements — check clip_index and start_time")
+    if not custom_brolls:
+        raise HTTPException(status_code=400, detail="No valid placements after mapping — check clip_index values")
 
-    # We need the total video duration for the base track.
-    # Use placements to infer a minimum, plus a generous buffer.
-    max_end = max((p.get("start_time", 0) + p.get("duration", 5)) for p in placement_list) + 10
-    base_duration = float(job.get("video_duration", max_end))
-
-    timeline = {
-        "timeline": {
-            "tracks": [
-                # Track 0 (top): user b-roll clips
-                {"clips": broll_clips},
-                # Track 1 (base): ZapCap captioned output
-                {
-                    "clips": [{
-                        "asset": {"type": "video", "src": base_video_url, "volume": 1},
-                        "start": 0,
-                        "length": base_duration,
-                        "fit": "cover",
-                    }]
-                },
-            ]
-        },
-        "output": {
-            "format": "mp4",
-            "resolution": "hd",
-            "quality": "high",
-            "aspectRatio": job.get("aspect_ratio", "9:16"),
-            "fps": 30,
+    # Create a new ZapCap task on the same video with customBrolls
+    headers = await _zapcap_headers()
+    task_payload = {
+        "templateId": job.get("template_id", "beast"),
+        "language": job.get("language", "en"),
+        "autoApprove": True,
+        "transcribeSettings": {
+            "broll": {
+                "customBrolls": custom_brolls,
+            }
         },
     }
+    # Preserve export settings from parent job if present
+    output_mode = job.get("output_mode", "composited")
+    quality = job.get("quality", "standard")
+    export_settings: dict = {}
+    if output_mode == "transparent":
+        export_settings["outputMode"] = "transparent"
+        if job.get("video_width") and job.get("video_height"):
+            export_settings["width"] = job["video_width"]
+            export_settings["height"] = job["video_height"]
+    elif output_mode == "greenScreen":
+        export_settings["greenScreen"] = True
+    if quality != "standard":
+        export_settings["quality"] = quality
+    if export_settings:
+        task_payload["exportSettings"] = export_settings
 
-    shotstack = ShotstackProvider()
-    render_id = await shotstack.render(timeline)
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(
+            f"{_ZAPCAP_BASE}/videos/{zapcap_video_id}/task",
+            json=task_payload,
+            headers=headers,
+        )
+        if r.status_code not in (200, 201):
+            raise HTTPException(status_code=502, detail=f"ZapCap task failed: {r.text}")
+        zapcap_task_id = r.json().get("taskId") or r.json().get("id")
+        if not zapcap_task_id:
+            raise HTTPException(status_code=502, detail=f"ZapCap returned no taskId: {r.text}")
 
     new_job_id = _uuid3.uuid4().hex
     now = datetime.now(timezone.utc).isoformat()
     await db["zapcap_jobs"].insert_one({
         "job_id": new_job_id,
         "user_id": user_id,
-        "render_type": "custom_broll",
-        "shotstack_render_id": render_id,
+        "zapcap_video_id": zapcap_video_id,
+        "zapcap_task_id": zapcap_task_id,
+        "template_id": job.get("template_id", "beast"),
+        "language": job.get("language", "en"),
+        "output_mode": output_mode,
+        "quality": quality,
+        "video_url": job.get("video_url"),
         "parent_job_id": job_id,
         "clip_urls": clip_urls,
         "placements": placement_list,
@@ -8740,5 +8751,9 @@ async def zapcap_job_custom_broll(
         "created_at": now,
     })
 
-    print(f"[CustomBroll] job={new_job_id} parent={job_id} clips={len(clip_urls)} placements={len(broll_clips)} render={render_id}", flush=True)
+    print(
+        f"[CustomBroll] job={new_job_id} parent={job_id} video={zapcap_video_id} "
+        f"task={zapcap_task_id} clips={len(clip_urls)} brolls={len(custom_brolls)}",
+        flush=True,
+    )
     return UriResponse.get_single_data_response("zapcap_job", {"job_id": new_job_id})
