@@ -51,6 +51,19 @@ def test_ignores_non_ad_spend_rows():
     assert s["totals"]["real_spend_ngn"] == 1000 and s["totals"]["billed_ngn"] == 1500
 
 
+def test_refund_reduces_billed_and_margin_not_real_spend():
+    txns = [
+        _charge("brnd_A", spend=1000, billed=1500),           # billed 1500, real 1000
+        {"type": "refund", "business_id": "brnd_A", "amount_ngn": 500},   # credit back 500
+    ]
+    s = summarize_billing(txns)
+    a = s["per_user"][0]
+    assert a["real_spend_ngn"] == 1000        # Meta still cost us this
+    assert a["billed_ngn"] == 1000            # 1500 billed − 500 refunded
+    assert a["margin_ngn"] == 0               # 1000 net billed − 1000 real spend
+    assert s["totals"]["billed_ngn"] == 1000 and s["totals"]["margin_ngn"] == 0
+
+
 def test_empty_ledger():
     s = summarize_billing([])
     assert s["per_user"] == []
