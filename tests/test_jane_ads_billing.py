@@ -42,13 +42,29 @@ class _FakeCollection:
         return _FakeCursor([dict(r) for r in self.rows])
 
     def _match(self, r, f):
-        return all(r.get(k) == v for k, v in f.items())
+        for k, v in f.items():
+            if isinstance(v, dict) and "$ne" in v:
+                if r.get(k) == v["$ne"]:
+                    return False
+            elif r.get(k) != v:
+                return False
+        return True
 
     async def update_one(self, f, update):
         for r in self.rows:
             if self._match(r, f):
                 r.update(update.get("$set", {}))
                 return
+
+    async def find_one_and_update(self, f, update):
+        # Motor's atomic claim: match-and-set in one step. Returns the (pre-update)
+        # doc if a row matched, else None — exactly what the billing guard relies on.
+        for r in self.rows:
+            if self._match(r, f):
+                before = dict(r)
+                r.update(update.get("$set", {}))
+                return before
+        return None
 
     async def delete_one(self, f):
         self.rows = [r for r in self.rows if not self._match(r, f)]
@@ -211,3 +227,30 @@ def test_deleted_campaign_record_removed(monkeypatch):
 
     _run(billing.reconcile_ad_spend_charges(db))
     assert db._coll.rows == []
+
+
+def test_concurrent_sweeps_charge_a_slice_only_once(monkeypatch):
+    """The over-charge regression: the scheduler runs in several workers, so this
+    sweep can execute N times at once — all reading the same water mark before any
+    writes it. The atomic claim must ensure the spend is billed exactly once."""
+    store = InMemoryWalletStore()
+    _run(WalletService(store).top_up("brnd_1", 100_000, reference="seed"))
+    rows = [{"campaign_id": "c1", "business_id": "brnd_1", "user_id": "u1",
+             "ad_id": "a1", "spend_billed_ngn": 0.0}]
+    db, _, _ = _setup(monkeypatch, rows, {"c1": _summary(2_000)}, store)
+
+    coll = db._coll
+    # Simulate 4 concurrent sweeps that all observed the SAME prior mark (0.0):
+    # each claims against {spend_billed_ngn: 0.0}. Only the first claim can match.
+    claims = [_run(coll.find_one_and_update(
+        {"campaign_id": "c1", "spend_billed_ngn": 0.0},
+        {"$set": {"spend_billed_ngn": 2_000.0}},
+    )) for _ in range(4)]
+    winners = [c for c in claims if c is not None]
+    assert len(winners) == 1                       # exactly one sweep may charge
+    assert coll.rows[0]["spend_billed_ngn"] == 2_000.0
+
+    # And a normal full sweep afterwards adds nothing (mark already at 2,000).
+    res = _run(billing.reconcile_ad_spend_charges(db))
+    assert res["charged_ngn"] == 0
+    assert _run(WalletService(store).get_balance("brnd_1")) == 100_000
