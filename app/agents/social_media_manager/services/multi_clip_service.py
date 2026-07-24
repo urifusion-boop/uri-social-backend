@@ -668,9 +668,9 @@ _COMPOSE_FILLER_RE = re.compile(
 )
 _COMPOSE_SILENCE_THRESHOLD = 1.2   # seconds — gaps shorter than this are natural pauses, leave them
 _COMPOSE_MAX_CUT_DURATION  = 3.0   # seconds — longer gaps are likely Whisper misses, not real silence
-_COMPOSE_REPEAT_WINDOW     = 60.0  # seconds — scan this far ahead for repeated sentences
-_COMPOSE_REPEAT_THRESHOLD  = 0.65  # Jaccard similarity on content words to flag a repetition
-_COMPOSE_REPEAT_MIN_WORDS  = 4     # minimum content words before repetition check fires
+_COMPOSE_REPEAT_WINDOW     = 120.0  # seconds — scan this far ahead for repeated sentences
+_COMPOSE_REPEAT_THRESHOLD  = 0.55   # Jaccard similarity on content words to flag a repetition
+_COMPOSE_REPEAT_MIN_WORDS  = 3      # minimum content words before repetition check fires
 
 # Common words excluded from repetition similarity so "I think we should" doesn't
 # match "I think you should" as a repetition.
