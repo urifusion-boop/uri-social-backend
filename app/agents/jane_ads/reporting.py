@@ -14,6 +14,7 @@ from __future__ import annotations
 from typing import Iterable
 
 AD_SPEND = "ad_spend"
+REFUND = "refund"
 
 
 def summarize_billing(transactions: Iterable[dict]) -> dict:
@@ -22,23 +23,32 @@ def summarize_billing(transactions: Iterable[dict]) -> dict:
     `actual_platform_cost_ngn` (the Meta spend that charge covered). Non-AD_SPEND
     rows are ignored, so the caller can pass a mixed ledger safely.
 
+    A REFUND (credit back to the wallet) reduces what the customer NET paid, so it's
+    subtracted from that business's `billed` (and therefore its margin). Real ad spend
+    is unaffected — Meta still cost us that. Other transaction types are ignored.
+
     Returns {"per_user": [...sorted by billed desc...], "totals": {...}}."""
-    per_user: dict[str, dict] = {}
-    for t in transactions:
-        if t.get("type") != AD_SPEND:
-            continue
-        bid = t.get("business_id") or "unknown"
-        row = per_user.setdefault(bid, {
+    def _row(bid: str) -> dict:
+        return per_user.setdefault(bid, {
             "business_id": bid, "real_spend_ngn": 0.0, "billed_ngn": 0.0,
             "margin_ngn": 0.0, "charges": 0, "_campaigns": set(),
         })
-        real = float(t.get("actual_platform_cost_ngn") or 0.0)
-        billed = abs(float(t.get("amount_ngn") or 0.0))   # charges are stored negative
-        row["real_spend_ngn"] += real
-        row["billed_ngn"] += billed
-        row["charges"] += 1
-        if t.get("campaign_id"):
-            row["_campaigns"].add(t["campaign_id"])
+
+    per_user: dict[str, dict] = {}
+    for t in transactions:
+        typ = t.get("type")
+        bid = t.get("business_id") or "unknown"
+        if typ == AD_SPEND:
+            row = _row(bid)
+            row["real_spend_ngn"] += float(t.get("actual_platform_cost_ngn") or 0.0)
+            row["billed_ngn"] += abs(float(t.get("amount_ngn") or 0.0))   # charges stored negative
+            row["charges"] += 1
+            if t.get("campaign_id"):
+                row["_campaigns"].add(t["campaign_id"])
+        elif typ == REFUND:
+            # A refund only makes sense against a customer who was billed; net it off
+            # their billed total (credits are stored positive).
+            _row(bid)["billed_ngn"] -= abs(float(t.get("amount_ngn") or 0.0))
 
     rows = []
     totals = {"real_spend_ngn": 0.0, "billed_ngn": 0.0, "margin_ngn": 0.0,
