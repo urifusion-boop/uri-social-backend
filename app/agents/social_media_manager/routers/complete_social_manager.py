@@ -5113,24 +5113,26 @@ async def _generate_image_bg(
 
         # ========== REFERENCE IMAGE vs V2 GUIDE PRIORITY ==========
         # If the user attaches their OWN reference photo to this post while a
-        # V2 guide is also selected, don't just discard the guide (as this
-        # used to) — keep its style, but let the photo go through the real
-        # reference-image pipeline (background removal + forensic product
-        # preservation) in the standard flow below, since that's what
-        # actually handles a caller-supplied photo correctly. The guide's
-        # OWN stored reference photo is untouched either way — this only
-        # fires when the caller supplies a second, separate photo.
+        # V2 guide is also selected, don't discard the guide — clean the
+        # photo up the same way the standard flow does (background removal),
+        # then run it through the guide's OWN generation logic below, using
+        # this cleaned-up photo in place of the guide's own stored one. The
+        # guide's full style (medium/mood/color/etc.) still applies exactly
+        # as it does for a guide-only generation — only the subject content
+        # comes from the upload instead. The guide's OWN stored reference
+        # photo is untouched either way — this only fires when the caller
+        # supplies a second, separate photo.
         v2_guide_id = brand_context.get("custom_guide_v2_id")
+        v2_override_reference_image = None
 
         if reference_image and v2_guide_id:
-            from app.agents.social_media_manager.services.custom_visual_guide_v2_service import CustomVisualGuideV2Service
-            guide_style_fragment = await CustomVisualGuideV2Service.build_style_prompt_fragment(v2_guide_id, brand_context, db)
-            if guide_style_fragment:
-                brand_context = {**brand_context, "style_prompt_fragment": guide_style_fragment}
-                print(f"📸🎨 Reference image + V2 guide both present — guide's style carried into standard reference-image pipeline")
-            else:
-                print(f"📸 Reference image + V2 guide both present, but guide style could not be loaded — using standard generation with no style")
-            v2_guide_id = None  # Fall through to standard flow below, now carrying the guide's style
+            try:
+                from app.utils.background_removal import remove_background
+                v2_override_reference_image = await remove_background(reference_image, method="auto")
+                print(f"📸🎨 Reference image + V2 guide both present — cleaned up upload, applying guide's style to it")
+            except Exception as e:
+                print(f"⚠️ Background removal failed for guide+reference combo ({e}) — using original upload")
+                v2_override_reference_image = reference_image
         elif reference_image:
             # User explicitly uploaded reference image, no V2 guide selected —
             # use standard generation flow with reference image as before.
@@ -5193,6 +5195,7 @@ async def _generate_image_bg(
                 subtext=subtext,
                 cta=cta,
                 db=db,
+                override_reference_image=v2_override_reference_image,
             )
             # generate_image_with_v2_guide() returns its own {"success", "image_url",
             # ...} shape (also used as-is by the standalone /custom-guides-v2/generate

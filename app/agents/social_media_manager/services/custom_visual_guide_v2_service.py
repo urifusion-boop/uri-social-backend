@@ -515,81 +515,6 @@ Return only the JSON. No preamble, no explanation."""
         return guide
 
     @staticmethod
-    async def build_style_prompt_fragment(
-        guide_id: str,
-        brand_context: Dict[str, Any],
-        db: AsyncIOMotorDatabase,
-    ) -> str:
-        """
-        Build a plain style-description text fragment from a V2 guide's
-        extracted profile — for callers that need the guide's STYLE without
-        going through generate_image_with_v2_guide()'s own image generation.
-
-        Exists for the case where a user attaches their OWN reference photo
-        to a specific post while a V2 guide is also selected: that photo
-        needs to go through the standard reference-image pipeline (background
-        removal + forensic product preservation), not the guide's stored
-        photo, but the guide's style should still shape the generated scene.
-        The standard pipeline already accepts style text via
-        brand_context["style_prompt_fragment"] (the same channel V1 custom
-        guides use) — this builds that fragment from a V2 guide instead.
-
-        Deliberately does NOT include the "depict a different person/product"
-        instruction generate_image_with_v2_guide() adds — that instruction
-        exists to stop the GUIDE's own reference photo from reappearing
-        verbatim; here, the caller's uploaded photo is the whole point of the
-        product-preservation pipeline, so it must be preserved, not varied.
-
-        Returns "" if the guide can't be loaded (caller should fall back to
-        no style fragment rather than fail generation over this).
-        """
-        from bson import ObjectId
-
-        guide = await db["custom_visual_guides"].find_one({
-            "_id": ObjectId(guide_id),
-            "version": "v2",
-        })
-        if not guide:
-            return ""
-
-        style_profile = guide.get("style_profile") or {}
-
-        medium = style_profile.get("medium", "photographic")
-        aesthetic = style_profile.get("overall_aesthetic", "modern")
-        mood = style_profile.get("mood", "professional")
-
-        layout = style_profile.get("layout_structure", {})
-        composition = layout.get("composition", "centered")
-
-        color_system = style_profile.get("color_system", {})
-        accent_strategy = color_system.get("accent_strategy", "")
-
-        graphic_elements = style_profile.get("graphic_elements", [])
-        decorative_elements = ", ".join(graphic_elements[:4]) if graphic_elements else "minimal"
-
-        typography = style_profile.get("typography", {})
-        text_placement = typography.get("text_placement", "overlay_center")
-        text_treatment = typography.get("text_treatment", "plain")
-
-        brand_name = brand_context.get("brand_name") or "the brand"
-        brand_colors = brand_context.get("brand_colors") or []
-        if brand_colors:
-            color_list = ", ".join(brand_colors[:3])
-            color_instruction = (
-                f"Use {brand_name}'s actual brand colors ({color_list}) — apply them "
-                f"following this strategy ({accent_strategy or 'accent placement'}), "
-                f"not the guide reference's original colors."
-            )
-        else:
-            color_instruction = "apply the described color strategy"
-
-        return f"""Design style: {medium}, {aesthetic} aesthetic, {mood} mood.
-Composition: {composition}.
-Decorative elements: {decorative_elements}.
-Color approach: {color_instruction}
-Typography: {text_placement} placement, {text_treatment} style."""
-
-    @staticmethod
     async def generate_image_with_v2_guide(
         guide_id: str,
         brand_context: Dict[str, Any],
@@ -599,6 +524,7 @@ Typography: {text_placement} placement, {text_treatment} style."""
         cta: str,
         platform: str,
         db: AsyncIOMotorDatabase,
+        override_reference_image: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Generate image using Custom Visual Guide V2 + meta-prompt.
@@ -618,6 +544,14 @@ Typography: {text_placement} placement, {text_treatment} style."""
             cta: Call to action
             platform: Target platform
             db: Database connection
+            override_reference_image: when a user attaches their OWN photo to
+                a post that also has this guide selected, pass that photo
+                here (after the normal background-removal cleanup) to use it
+                as the edit base instead of the guide's own stored reference
+                photo — the guide's style still applies exactly as it does
+                for a guide-only generation, it's just applied to this photo
+                instead. None (default) uses the guide's own photo, unchanged
+                from before.
 
         Returns:
             {
@@ -646,7 +580,9 @@ Typography: {text_placement} placement, {text_treatment} style."""
                 raise HTTPException(status_code=404, detail="Custom Visual Guide V2 not found")
 
             style_profile = guide.get("style_profile")
-            reference_image_url = guide.get("original_image_url")
+            reference_image_url = override_reference_image or guide.get("original_image_url")
+            if override_reference_image:
+                print(f"[V2] Using caller-supplied reference image (guide's own photo not used this time)")
 
             print(f"[V2] Loaded guide: {guide.get('name')}")
             print(f"[V2] Style: {style_profile.get('overall_aesthetic')}")
@@ -699,20 +635,41 @@ Typography: {text_placement} placement, {text_treatment} style."""
             # with different text pasted on. Picking one directive at random per
             # generation keeps the style family intact while breaking the
             # sameness.
-            variation_directive = random.choice(CustomVisualGuideV2Service.VARIATION_DIRECTIVES)
-
-            # Identity instruction — the reference photo often shows one specific
-            # person or product. Without calling that out explicitly, the same
-            # face/pose/outfit or the same product packaging kept reappearing in
-            # every generation, since the model is editing that literal photo.
-            imagery_style = style_profile.get("imagery_style", {})
-            subject_type = imagery_style.get("subject_type", "")
-            if subject_type == "person":
-                identity_instruction = "The reference features a specific person — depict a DIFFERENT person (different face, pose, and outfit) of the same general type and mood. Never reproduce the same individual."
-            elif subject_type == "product":
-                identity_instruction = "The reference features a specific product — depict a DIFFERENT specific product of the same general category. Never reproduce the same packaging, label, or exact product shape."
-            else:
+            if override_reference_image:
+                # Using the caller's OWN uploaded photo as the edit base — the
+                # whole point is to keep ITS actual subject/content and just
+                # restyle how it's rendered (medium, color, mood) to match the
+                # guide. Varying the pose/composition or swapping in a
+                # different person/product (both needed when editing the
+                # GUIDE's own photo, to stop it reappearing verbatim across
+                # every generation) would work against that here.
+                variation_directive = ""
                 identity_instruction = ""
+                match_instruction = (
+                    "Apply this visual style to the uploaded image's actual subject and "
+                    "composition — keep what is being shown, restyle HOW it's rendered "
+                    "(medium, color treatment, mood) to match the style described above."
+                )
+            else:
+                variation_directive = random.choice(CustomVisualGuideV2Service.VARIATION_DIRECTIVES)
+
+                # Identity instruction — the reference photo often shows one specific
+                # person or product. Without calling that out explicitly, the same
+                # face/pose/outfit or the same product packaging kept reappearing in
+                # every generation, since the model is editing that literal photo.
+                imagery_style = style_profile.get("imagery_style", {})
+                subject_type = imagery_style.get("subject_type", "")
+                if subject_type == "person":
+                    identity_instruction = "The reference features a specific person — depict a DIFFERENT person (different face, pose, and outfit) of the same general type and mood. Never reproduce the same individual."
+                elif subject_type == "product":
+                    identity_instruction = "The reference features a specific product — depict a DIFFERENT specific product of the same general category. Never reproduce the same packaging, label, or exact product shape."
+                else:
+                    identity_instruction = ""
+
+                match_instruction = (
+                    f"Match the reference image's medium, mood, and overall composition family closely — "
+                    f"but this is a NEW piece, not a duplicate of the reference. {variation_directive}"
+                )
 
             # Build structured prompt similar to standard generation
             # Use sections to separate style instructions from content (prevents verbatim rendering)
@@ -724,8 +681,7 @@ Decorative elements: {decorative_elements if decorative_elements != "none" else 
 Color approach: {color_instruction}
 Typography: {text_placement} placement, {text_treatment} style
 
-Match the reference image's medium, mood, and overall composition family closely —
-but this is a NEW piece, not a duplicate of the reference. {variation_directive}
+{match_instruction}
 {identity_instruction}
 Include MINIMAL text - just a short headline and small CTA.
 Do NOT copy logos or brand names from the reference."""
