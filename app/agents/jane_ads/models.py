@@ -34,6 +34,20 @@ class Goal(str, Enum):
     AWARENESS = "awareness"
     SALES = "sales"
     FOLLOWERS = "followers"
+    TRAFFIC = "traffic"
+
+
+class OfferType(str, Enum):
+    """WHAT's being promoted — distinct from Goal (the campaign's intent). Asked
+    before budget so Jane understands the offer before talking money (PRD feedback:
+    objective-first flow)."""
+    PRODUCT = "product"
+    SERVICE = "service"
+    PROMOTION = "promotion"
+    EVENT = "event"
+    LAUNCH = "launch"
+    AWARENESS = "awareness"
+    OTHER = "other"
 
 
 class PurchaseBehaviour(str, Enum):
@@ -110,6 +124,7 @@ class CampaignRequest(BaseModel):
     description: str = ""
 
     goal: Goal = Goal.MESSAGES              # leads everything
+    offer_type: Optional[OfferType] = None  # WHAT's being promoted, distinct from goal
     budget_ngn: float = Field(..., gt=0)
     creative: CreativeContext = Field(default_factory=CreativeContext)
 
