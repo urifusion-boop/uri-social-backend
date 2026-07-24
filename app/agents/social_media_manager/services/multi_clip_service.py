@@ -954,6 +954,72 @@ async def _refine_silence_cuts(
     return approved
 
 
+async def _detect_transcript_repetitions(
+    all_srt: List[Dict],
+    total_duration: float,
+) -> List[Dict]:
+    """
+    Dedicated GPT pass focused solely on finding repeated content.
+
+    Works on the full merged transcript (all clips, all SRT entries) so it catches:
+    - Cross-clip repetitions that per-clip Jaccard comparison misses
+    - Paraphrased repeats (same idea, different words) below the Jaccard threshold
+    - False starts / mid-thought restarts ('Actually let me rephrase...')
+
+    Returns cuts in global timeline coordinates, fails open (returns []) on any error.
+    """
+    import json as _json
+    from openai import AsyncOpenAI
+
+    if not all_srt:
+        return []
+
+    transcript_lines = "\n".join(
+        f"[{e['start']:.1f}s–{e['end']:.1f}s] {e['text']}"
+        for e in all_srt
+    )
+    prompt = (
+        f"You are editing a {total_duration:.0f}s talking-head video. "
+        f"Your ONLY job: find every place the speaker repeats themselves — "
+        f"either exact repetitions or paraphrased repetitions (same idea said again), "
+        f"and false starts where they stop mid-sentence and restart it.\n\n"
+        f"TRANSCRIPT:\n{transcript_lines}\n\n"
+        f"Rules:\n"
+        f"1. For repeated content, cut the SECOND occurrence — keep the first.\n"
+        f"2. For a false start, cut from where the speaker trails off to where they cleanly restart.\n"
+        f"3. Use the EXACT [Xs–Ys] timestamps shown — do not invent timestamps.\n"
+        f"4. Only cut if you are confident it is truly repeated or is a restart.\n"
+        f"5. Minimum cut: 0.5s. Do not cut anything that would leave a segment under 1.5s.\n\n"
+        f"Return ONLY valid JSON:\n"
+        f'{{"cuts":[{{"at":<float>,"end":<float>,"reason":"repeated: <brief description>"}}]}}'
+    )
+
+    client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+    try:
+        resp = await client.chat.completions.create(
+            model="gpt-5.6-luna",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_completion_tokens=800,
+        )
+        raw = resp.choices[0].message.content.strip()
+        if raw.startswith("```"):
+            raw = "\n".join(raw.split("\n")[1:])
+            raw = raw.rsplit("```", 1)[0].strip()
+        result = _json.loads(raw)
+        cuts = result.get("cuts", [])
+        print(
+            f"[MultiClip/repeat_pass] {len(cuts)} repetition cuts from GPT: "
+            + (", ".join(f"{c['at']:.1f}s–{c['end']:.1f}s ({c.get('reason','')[:40]})" for c in cuts[:8])
+               if cuts else "none"),
+            flush=True,
+        )
+        return cuts
+    except Exception as exc:
+        print(f"[MultiClip/repeat_pass] error: {exc}", flush=True)
+        return []
+
+
 async def _run_ai_analysis(clips_ordered: List[Dict], story_type: str) -> Dict:
     """
     Analyze ordered clips and return {cuts, zooms, transition_style, summary}.
@@ -1029,6 +1095,22 @@ async def _run_ai_analysis(clips_ordered: List[Dict], story_type: str) -> Dict:
     refined_silence_cuts = await _refine_silence_cuts(silence_pause_cuts, all_srt_global, total_duration)
     timing_cuts = refined_silence_cuts + filler_repeat_cuts
 
+    # Log timing-cut breakdown so we can see what was detected
+    n_silence = len(refined_silence_cuts)
+    n_filler  = sum(1 for c in filler_repeat_cuts if c["reason"].startswith("filler"))
+    n_repeat  = sum(1 for c in filler_repeat_cuts if c["reason"].startswith("repeated"))
+    print(
+        f"[MultiClip/timing] silences={n_silence} fillers={n_filler} jaccard_repeats={n_repeat} "
+        + (f"| repeats: " + "; ".join(c['reason'][:60] for c in filler_repeat_cuts if c['reason'].startswith('repeated'))
+           if n_repeat else ""),
+        flush=True,
+    )
+
+    # ── Layer 1.6: dedicated transcript repetition pass ───────────────────────
+    # Works on the full merged transcript — catches paraphrased repeats and
+    # cross-clip repetitions that the per-entry Jaccard layer misses.
+    repeat_cuts = await _detect_transcript_repetitions(all_srt_global, total_duration)
+
     # ── Layer 2: GPT content analysis with timestamped transcript ─────────────
     # Build a per-clip block showing every SRT line with its exact timestamps.
     # GPT uses these timestamps directly for cut coordinates.
@@ -1100,15 +1182,21 @@ async def _run_ai_analysis(clips_ordered: List[Dict], story_type: str) -> Dict:
         gpt_zooms = gpt.get("zooms", [])
         transition_style = gpt.get("transition_style", "fade")
         summary = gpt.get("summary", "")
+        print(
+            f"[MultiClip/gpt_analysis] {len(gpt_cuts)} content cuts: "
+            + (", ".join(f"{c['at']:.1f}s–{c['end']:.1f}s ({c.get('reason','')[:40]})" for c in gpt_cuts[:8])
+               if gpt_cuts else "none"),
+            flush=True,
+        )
     except Exception as exc:
         print(f"[MultiClip/_run_ai_analysis] GPT error: {exc}", flush=True)
 
     # ── Merge and deduplicate ─────────────────────────────────────────────────
-    all_cuts = timing_cuts + gpt_cuts
+    all_cuts = timing_cuts + repeat_cuts + gpt_cuts
     merged = _merge_cuts(all_cuts)
     print(
-        f"[MultiClip/analyze] timing_cuts={len(timing_cuts)} gpt_cuts={len(gpt_cuts)} "
-        f"merged={len(merged)} zooms={len(gpt_zooms)}",
+        f"[MultiClip/analyze] timing={len(timing_cuts)} repeat_pass={len(repeat_cuts)} "
+        f"gpt={len(gpt_cuts)} merged={len(merged)} zooms={len(gpt_zooms)}",
         flush=True,
     )
     return {"cuts": merged, "zooms": gpt_zooms, "transition_style": transition_style, "summary": summary}
