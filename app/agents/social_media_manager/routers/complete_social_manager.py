@@ -8138,6 +8138,8 @@ async def zapcap_produce(
     enable_broll: str = Form("false"),
     enable_music: str = Form("false"),
     custom_music: Optional[UploadFile] = File(None),
+    custom_broll_clips: List[UploadFile] = File(default=[]),
+    custom_broll_estimated_duration: float = Form(60.0),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
     token: dict = Depends(JWTBearer()),
 ):
@@ -8219,7 +8221,31 @@ async def zapcap_produce(
     }
     if export_settings:
         task_payload["exportSettings"] = export_settings
-    if enable_broll.lower() == "true":
+
+    # Custom b-roll: upload clips to Cloudinary and spread them evenly across estimated duration.
+    # customBrolls is mutually exclusive with brollPercent — don't set both.
+    if custom_broll_clips:
+        clip_urls = []
+        for i, clip in enumerate(custom_broll_clips):
+            clip_bytes = await clip.read()
+            url = await _upload_to_cloudinary(clip_bytes, f"broll-preprod-{job_id}-{i}")
+            clip_urls.append(url)
+            print(f"[ZapCap/customBroll] uploaded clip {i} → {url[:60]}", flush=True)
+
+        clip_duration = 4.0
+        n = len(clip_urls)
+        step = custom_broll_estimated_duration / (n + 1)
+        custom_brolls = [
+            {"startTime": round(step * (i + 1), 2), "endTime": round(step * (i + 1) + clip_duration, 2), "url": clip_urls[i]}
+            for i in range(n)
+        ]
+        # Ensure no clip runs past the estimated end
+        custom_brolls = [c for c in custom_brolls if c["startTime"] < custom_broll_estimated_duration]
+        for c in custom_brolls:
+            c["endTime"] = min(c["endTime"], custom_broll_estimated_duration)
+        task_payload["transcribeSettings"] = {"broll": {"customBrolls": custom_brolls}}
+        print(f"[ZapCap/customBroll] {len(custom_brolls)} clips placed over ~{custom_broll_estimated_duration}s", flush=True)
+    elif enable_broll.lower() == "true":
         task_payload["transcribeSettings"] = {"broll": {"brollPercent": 50}}
 
     # Submit task → get taskId
@@ -8252,7 +8278,8 @@ async def zapcap_produce(
         "language": language,
         "output_mode": output_mode,
         "quality": quality,
-        "enable_broll": enable_broll.lower() == "true",
+        "enable_broll": enable_broll.lower() == "true" or bool(custom_broll_clips),
+        "has_custom_broll": bool(custom_broll_clips),
         "music_url": music_url,
         "video_url": video_url,
         "video_width": probed_width or None,
