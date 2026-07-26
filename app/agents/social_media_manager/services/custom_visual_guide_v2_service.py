@@ -801,11 +801,21 @@ Return only the JSON. No preamble, no explanation."""
                 "=== VISUAL STYLE (MATCH REFERENCE) ===",
                 f"Design style: {medium}, {aesthetic} aesthetic, {mood} mood",
             ]
-            if distinctive_signature:
+            if distinctive_signature and not override_reference_image:
                 # The single most important line in this whole section — a
                 # concrete description beats every category label above and
                 # below it combined for making output actually recognizable
                 # as related to this specific guide.
+                #
+                # Deliberately skipped when override_reference_image is set:
+                # this text often describes the GUIDE's own specific subject
+                # ("a series of gradient bottles", "a molecular structure
+                # illustration") — forcing that onto a user's own uploaded
+                # photo would push the model to replace their actual content
+                # with the guide's subject, exactly the bug variation_directive
+                # and identity_instruction below already exist to prevent. Only
+                # a guide-only generation (no competing uploaded content to
+                # preserve) can safely use it as-is.
                 style_lines.append(f"SIGNATURE ELEMENT (recreate this specifically): {distinctive_signature}")
             if dominance_note:
                 style_lines.append(f"Aesthetic dominance: {dominance_note}")
