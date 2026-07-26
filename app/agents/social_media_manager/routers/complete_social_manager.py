@@ -8139,6 +8139,7 @@ async def zapcap_produce(
     enable_music: str = Form("false"),
     custom_music: Optional[UploadFile] = File(None),
     custom_broll_clips: List[UploadFile] = File(default=[]),
+    custom_broll_placements: Optional[str] = Form(None),  # JSON: [{"clipIndex":0,"startTime":5.0,"duration":4}]
     custom_broll_estimated_duration: float = Form(60.0),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
     token: dict = Depends(JWTBearer()),
@@ -8232,19 +8233,33 @@ async def zapcap_produce(
             clip_urls.append(url)
             print(f"[ZapCap/customBroll] uploaded clip {i} → {url[:60]}", flush=True)
 
-        clip_duration = 4.0
-        n = len(clip_urls)
-        step = custom_broll_estimated_duration / (n + 1)
-        custom_brolls = [
-            {"startTime": round(step * (i + 1), 2), "endTime": round(step * (i + 1) + clip_duration, 2), "url": clip_urls[i]}
-            for i in range(n)
-        ]
-        # Ensure no clip runs past the estimated end
-        custom_brolls = [c for c in custom_brolls if c["startTime"] < custom_broll_estimated_duration]
-        for c in custom_brolls:
-            c["endTime"] = min(c["endTime"], custom_broll_estimated_duration)
+        import json as _json_broll
+        if custom_broll_placements:
+            raw = _json_broll.loads(custom_broll_placements)
+            custom_brolls = [
+                {
+                    "startTime": round(float(p["startTime"]), 2),
+                    "endTime": round(float(p["startTime"]) + float(p["duration"]), 2),
+                    "url": clip_urls[int(p["clipIndex"])],
+                }
+                for p in raw
+                if int(p["clipIndex"]) < len(clip_urls)
+            ]
+            print(f"[ZapCap/customBroll] {len(custom_brolls)} clips from explicit placements", flush=True)
+        else:
+            clip_duration = 4.0
+            n = len(clip_urls)
+            spread = custom_broll_estimated_duration / (n + 1)
+            custom_brolls = [
+                {"startTime": round(spread * (i + 1), 2), "endTime": round(spread * (i + 1) + clip_duration, 2), "url": clip_urls[i]}
+                for i in range(n)
+            ]
+            custom_brolls = [c for c in custom_brolls if c["startTime"] < custom_broll_estimated_duration]
+            for c in custom_brolls:
+                c["endTime"] = min(c["endTime"], custom_broll_estimated_duration)
+            print(f"[ZapCap/customBroll] {len(custom_brolls)} clips auto-spread over ~{custom_broll_estimated_duration}s", flush=True)
+        custom_brolls.sort(key=lambda c: c["startTime"])
         task_payload["transcribeSettings"] = {"broll": {"customBrolls": custom_brolls}}
-        print(f"[ZapCap/customBroll] {len(custom_brolls)} clips placed over ~{custom_broll_estimated_duration}s", flush=True)
     elif enable_broll.lower() == "true":
         task_payload["transcribeSettings"] = {"broll": {"brollPercent": 50}}
 
