@@ -43,6 +43,7 @@ Return ONLY this JSON structure (no markdown, no code blocks, just raw JSON):
   "aesthetic_dominance": "low | medium | high",
   "overall_aesthetic": "minimalist | bold | vintage | modern | organic | industrial | playful | elegant | dramatic | warm | energetic | luxurious | casual | professional | artistic",
   "mood": "professional | playful | dramatic | warm | energetic | luxurious | calm | serious | friendly | sophisticated | edgy | nostalgic | futuristic | authentic | aspirational",
+  "distinctive_signature": "One or two sentences, in your own words, describing the SINGLE most recognizable, specific visual device in this design — not a category label like the fields above, a concrete description of the actual thing you see. Example: 'A large soft-edged colored circle sits behind the subject, offset toward the upper-right, with small hand-drawn scribbles and dots scattered loosely around its edge.' Another example: 'A rounded rectangle card mockup with a subtle drop shadow floats in the lower third, styled like a phone notification.' This is the detail that makes the design instantly recognizable as ITSELF, beyond generic style categories — be concrete about shapes, placement, and how elements relate to each other, not just what category they fall into.",
 
   "layout_structure": {
     "composition": "centered | rule_of_thirds | asymmetric | grid | diagonal | circular | layered | split_screen | full_bleed | framed",
@@ -97,7 +98,11 @@ CRITICAL RULES:
 3. Identify ALL text placement patterns and graphic devices
 4. List everything in "what_to_leave_behind" that should NOT be copied
 5. The goal is to capture the AESTHETIC DNA so it can be applied to new content
-6. Return ONLY the JSON, no explanations"""
+6. For distinctive_signature specifically: do NOT just restate the category fields above in
+   different words. Describe the one concrete visual device an artist would need to know about
+   to make a recreation instantly recognizable as related to this reference — its shape,
+   position, and relationship to other elements — not its category.
+7. Return ONLY the JSON, no explanations"""
 
     # Art director meta-prompt template
     ART_DIRECTOR_TEMPLATE = """You are a senior art director creating a brand-new, original graphic
@@ -594,6 +599,16 @@ Return only the JSON. No preamble, no explanation."""
             aesthetic = style_profile.get("overall_aesthetic", "modern")
             mood = style_profile.get("mood", "professional")
 
+            # Distinctive signature — a free-text description of the one
+            # concrete visual device that makes this guide recognizable (e.g.
+            # "a large soft-edged color circle behind the subject, offset
+            # upper-right"), as opposed to the category fields above/below
+            # which are all fixed enums and inherently lose this kind of
+            # specific, actionable detail. Only present on guides analyzed
+            # (or re-analyzed) after this field was added — absent on older
+            # profiles, so this is empty and simply omitted for those.
+            distinctive_signature = style_profile.get("distinctive_signature", "")
+
             # Aesthetic dominance — how much the style itself should dominate
             # the frame vs. let the subject/content lead. Extracted at upload
             # time but never previously read anywhere in this prompt.
@@ -786,6 +801,12 @@ Return only the JSON. No preamble, no explanation."""
                 "=== VISUAL STYLE (MATCH REFERENCE) ===",
                 f"Design style: {medium}, {aesthetic} aesthetic, {mood} mood",
             ]
+            if distinctive_signature:
+                # The single most important line in this whole section — a
+                # concrete description beats every category label above and
+                # below it combined for making output actually recognizable
+                # as related to this specific guide.
+                style_lines.append(f"SIGNATURE ELEMENT (recreate this specifically): {distinctive_signature}")
             if dominance_note:
                 style_lines.append(f"Aesthetic dominance: {dominance_note}")
             style_lines.append(f"Composition: {composition_detail}")
