@@ -44,6 +44,7 @@ Return ONLY this JSON structure (no markdown, no code blocks, just raw JSON):
   "overall_aesthetic": "minimalist | bold | vintage | modern | organic | industrial | playful | elegant | dramatic | warm | energetic | luxurious | casual | professional | artistic",
   "mood": "professional | playful | dramatic | warm | energetic | luxurious | calm | serious | friendly | sophisticated | edgy | nostalgic | futuristic | authentic | aspirational",
   "distinctive_signature": "One or two sentences, in your own words, describing the SINGLE most recognizable, specific visual device in this design — not a category label like the fields above, a concrete description of the actual thing you see. Example: 'A large soft-edged colored circle sits behind the subject, offset toward the upper-right, with small hand-drawn scribbles and dots scattered loosely around its edge.' Another example: 'A rounded rectangle card mockup with a subtle drop shadow floats in the lower third, styled like a phone notification.' This is the detail that makes the design instantly recognizable as ITSELF, beyond generic style categories — be concrete about shapes, placement, and how elements relate to each other, not just what category they fall into.",
+  "background_treatment": "One sentence describing ONLY the background/ambient decorative treatment — colors, gradients, shapes, patterns — as if the main subject were removed from the frame. Do NOT mention the subject itself (no people, products, or specific objects) at all, only what surrounds it. Example: 'A smooth vertical gradient shifts from magenta at the top to deep orange at the bottom, with small white dot patterns scattered loosely across it.' Another example: 'A solid pale-blue background is broken up by a few large soft-edged darker blue circles overlapping in the corners.' If the background is plain/neutral with no notable treatment, say so plainly (e.g. 'Plain white background, no decorative treatment') rather than inventing detail that isn't there.",
 
   "layout_structure": {
     "composition": "centered | rule_of_thirds | asymmetric | grid | diagonal | circular | layered | split_screen | full_bleed | framed",
@@ -102,7 +103,11 @@ CRITICAL RULES:
    different words. Describe the one concrete visual device an artist would need to know about
    to make a recreation instantly recognizable as related to this reference — its shape,
    position, and relationship to other elements — not its category.
-7. Return ONLY the JSON, no explanations"""
+7. For background_treatment specifically: describe ONLY what's behind/around the subject —
+   never the subject itself. If distinctive_signature already described a background element
+   (e.g. a colored circle behind the subject), background_treatment can restate just that part,
+   with the subject left out entirely.
+8. Return ONLY the JSON, no explanations"""
 
     # Art director meta-prompt template
     ART_DIRECTOR_TEMPLATE = """You are a senior art director creating a brand-new, original graphic
@@ -609,6 +614,15 @@ Return only the JSON. No preamble, no explanation."""
             # profiles, so this is empty and simply omitted for those.
             distinctive_signature = style_profile.get("distinctive_signature", "")
 
+            # Background treatment — the subject-free counterpart to
+            # distinctive_signature: describes only what's behind/around the
+            # subject (colors, gradients, shapes), never the subject itself.
+            # This is what's safe to apply when a user uploads their own
+            # reference photo — it can't push the model toward the guide's
+            # own subject matter the way distinctive_signature would, since
+            # it was written to never mention a subject at all.
+            background_treatment = style_profile.get("background_treatment", "")
+
             # Aesthetic dominance — how much the style itself should dominate
             # the frame vs. let the subject/content lead. Extracted at upload
             # time but never previously read anywhere in this prompt.
@@ -767,10 +781,23 @@ Return only the JSON. No preamble, no explanation."""
                         f"depth) must be replaced entirely with {medium} rendering throughout."
                     )
 
+                # background_treatment is the subject-free counterpart to
+                # distinctive_signature (suppressed above) — safe to apply
+                # here since it was written to never mention a subject, only
+                # what surrounds one. Gives this path a real piece of the
+                # guide's specific look (its actual background colors/shapes)
+                # without pushing the model toward the guide's own subject.
+                background_note = (
+                    f" Behind/around the subject, use this specific background "
+                    f"treatment: {background_treatment}"
+                    if background_treatment else ""
+                )
+
                 match_instruction = (
                     "Apply this visual style to the uploaded image's actual subject and "
                     "composition — keep what is being shown, restyle HOW it's rendered "
-                    f"(medium, color treatment, mood) to match the style described above. "
+                    f"(medium, color treatment, mood) to match the style described above."
+                    f"{background_note} "
                     f"{medium_enforcement}"
                 )
             else:
