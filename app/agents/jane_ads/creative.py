@@ -348,7 +348,7 @@ async def generate_ad_image(image_prompt: str, brand_context: Optional[dict] = N
     try:
         client = openai.AsyncOpenAI(api_key=settings.jane_ads_openai_key)
         resp = await client.images.generate(
-            model="gpt-image-1", prompt=full_prompt, size="1024x1536", quality="high", n=1,
+            model="gpt-image-1", prompt=full_prompt, size="1024x1536", quality="medium", n=1,
         )
         b64 = resp.data[0].b64_json if resp.data else None
         if not b64:

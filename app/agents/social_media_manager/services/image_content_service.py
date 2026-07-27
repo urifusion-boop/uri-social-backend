@@ -2513,6 +2513,7 @@ Answer with exactly one word: "yes" or "no"."""
                                 prompt=prompt,
                                 n=1,
                                 size=edit_size,
+                                quality="medium",
                             )
                         ),
                         timeout=90,
@@ -2592,7 +2593,7 @@ Answer with exactly one word: "yes" or "no"."""
                                     prompt=prompt,
                                     n=1,
                                     size=_gpt2_size,
-                                    quality="high",
+                                    quality="medium",
                                     output_format="webp",
                                     # NOTE: gpt-image-2 does NOT support input_fidelity at all
                                     # (OpenAI rejects it with a 400 — that param is gpt-image-1
@@ -2618,7 +2619,7 @@ Answer with exactly one word: "yes" or "no"."""
                                     prompt=prompt,
                                     n=1,
                                     size=_gpt2_size,
-                                    quality="high",
+                                    quality="medium",
                                     output_format="webp",
                                 ),
                             ),
@@ -2801,7 +2802,7 @@ Answer with exactly one word: "yes" or "no"."""
                         prompt=prompt,
                         n=1,
                         size=image_size,
-                        quality="high",
+                        quality="medium",
                         output_format="webp",
                     )
                 ),

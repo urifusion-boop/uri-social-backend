@@ -87,7 +87,7 @@ class ImagePathService:
                     model="gpt-image-2",
                     prompt=prompt,
                     size=size,
-                    quality="high",
+                    quality="medium",
                     n=1
                 )
 
