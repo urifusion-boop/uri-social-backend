@@ -482,6 +482,43 @@ async def jane_chat_save_message(
     return {"ok": True}
 
 
+# ── Brand WhatsApp number (where leads route) ─────────────────────────────────
+# Ads link to wa.me/<this number>, so chats land in the brand's own WhatsApp, not the
+# shared Page's inbox. Stored once per brand and reused on every campaign.
+
+class WhatsAppBody(BaseModel):
+    whatsapp_number: str
+
+
+@router.get("/whatsapp")
+async def jane_get_whatsapp(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """The active brand's saved WhatsApp number (leads route here), or '' if unset."""
+    from .whatsapp import get_brand_whatsapp
+    return {"whatsapp_number": await get_brand_whatsapp(db, brand_ctx.get("brand_id"))}
+
+
+@router.put("/whatsapp")
+async def jane_set_whatsapp(
+    body: WhatsAppBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Set the active brand's WhatsApp number. Normalizes to the wa.me digits form and
+    rejects anything that can't be a real number."""
+    from .whatsapp import normalize_wa_number, set_brand_whatsapp
+    brand_id = brand_ctx.get("brand_id")
+    if not brand_id:
+        raise HTTPException(status_code=400, detail="No active brand to save a WhatsApp number for.")
+    number = normalize_wa_number(body.whatsapp_number)
+    if not number:
+        raise HTTPException(status_code=400, detail="That WhatsApp number doesn't look right — please type it in full, e.g. 0803 123 4567.")
+    await set_brand_whatsapp(db, brand_id, number)
+    return {"whatsapp_number": number}
+
+
 # ── Brand-scoped wallet (what the app UI calls) ───────────────────────────────
 # The two endpoints above take an explicit business_id (internal/demo use). The UI
 # instead uses these, which derive the wallet key from the active brand context —
@@ -720,10 +757,12 @@ class MetaLaunchFromMessageBody(BaseModel):
     category: str = ""
     page_id: str = ""                     # override the target page (multi-client); defaults to META_ADS_PAGE_ID
     conversation_cost_ngn: float = Field(500.0, gt=0)
-    creative_source: str = "generate"     # generate | upload | draft
+    creative_source: str = "generate"     # generate | upload | draft | ask
     reference_image_url: str = ""         # required for creative_source=upload (from /creative/upload)
     is_video: bool = False                # is reference_image_url a video?
     draft_id: str = ""                    # required for creative_source=draft (from /creative/drafts)
+    whatsapp_number: str = ""             # the brand's WhatsApp number leads route to; stored on
+                                          # the brand and reused, so it's only ever asked once
 
 
 class _PlanBuildResult(BaseModel):
@@ -832,6 +871,24 @@ async def _build_campaign_plan(
         return {"early_return": {"stage": "advise", "understood": parsed.model_dump(),
                 "advice": result.advice.model_dump(), "trace": result.advice.trace}}
     plan = result.plan
+
+    # 2.5. WhatsApp routing — the ad links to wa.me/<the brand's number>, so leads reach
+    # the brand directly instead of the shared Page's inbox. Ask for it once (then it's
+    # stored and reused). Blocks here rather than at launch so no plan is ever built that
+    # can't actually deliver a lead.
+    from .whatsapp import normalize_wa_number, get_brand_whatsapp, set_brand_whatsapp
+    brand_id_for_wa = brand_ctx.get("brand_id")
+    if body.whatsapp_number:
+        wa_number = normalize_wa_number(body.whatsapp_number) or ""
+        if not wa_number:
+            return {"early_return": {"stage": "need_whatsapp", "understood": parsed.model_dump(),
+                    "question": "That WhatsApp number doesn't look right — please type it in full, e.g. 0803 123 4567."}}
+        await set_brand_whatsapp(db, brand_id_for_wa, wa_number)
+    else:
+        wa_number = await get_brand_whatsapp(db, brand_id_for_wa)
+    if not wa_number:
+        return {"early_return": {"stage": "need_whatsapp", "understood": parsed.model_dump(),
+                "question": "Which WhatsApp number should I send your leads to? Anyone who taps your ad will message this number directly."}}
     if budget_estimate:
         plan.explanation = (
             f"Based on similar campaigns costing about ₦{budget_estimate['price_per_conversation_ngn']:,.0f} "
@@ -931,6 +988,7 @@ async def _build_campaign_plan(
         print(f"[policy] WARN on plan for {business_id}: {v.category} — matched '{v.matched_text}'", flush=True)
 
     plan.page_id = page_id
+    plan.whatsapp_number = wa_number
     plan.creative = creative
     if creative.video_recommendation:
         # Path C (PRD §4.1): gpt-image-1 can't shoot the recommended video itself, so
@@ -1310,6 +1368,12 @@ async def meta_campaigns(
                 row["status"] = summary["delivery"].lower()
                 row["metrics"] = {
                     "spend_ngn": round(summary["spend_ngn"], 2),
+                    # wa.me link ads: clicks are the real, brand-reaching result.
+                    "clicks": summary.get("clicks", 0),
+                    "cost_per_click_ngn": (
+                        round(summary["cost_per_click_ngn"], 2)
+                        if summary.get("cost_per_click_ngn") is not None else None
+                    ),
                     "conversations": summary["conversations"],
                     "cost_per_conversation_ngn": (
                         round(summary["cost_per_conversation_ngn"], 2)
