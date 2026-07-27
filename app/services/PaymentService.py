@@ -16,6 +16,7 @@ from typing import Optional, Dict
 from datetime import datetime
 from bson import ObjectId
 from motor.motor_asyncio import AsyncIOMotorDatabase
+from pymongo import ReturnDocument
 from app.database import get_db
 from app.domain.models.billing_models import (
     PaymentTransaction,
@@ -414,34 +415,39 @@ class PaymentService:
 
         IMPORTANT: Preserves trial credits as bonus credits when trial user subscribes
         """
-        # Get payment transaction to retrieve billing cycle and credits
-        payment_doc = await self.payment_transactions_collection.find_one(
-            {"transaction_ref": transaction_ref}
-        )
-
-        if not payment_doc:
-            raise ValueError(f"Payment transaction not found: {transaction_ref}")
-
-        if payment_doc.get("status") == "completed":
-            # verify_payment (frontend poll) and handle_webhook (SQUAD callback)
-            # can both race to complete the same transaction_ref — the first one
-            # in wins, this guards the second against re-allocating credits.
-            return
-
-        billing_cycle = payment_doc.get("billing_cycle", "monthly")
-        credits_allocated = payment_doc.get("credits_allocated")
-
-        # Update payment status
-        await self.payment_transactions_collection.update_one(
-            {"transaction_ref": transaction_ref},
+        # Atomically claim this transaction for completion. verify_payment
+        # (frontend poll) and handle_webhook (SQUAD callback) can both race to
+        # complete the same transaction_ref — a plain find_one check followed
+        # by a separate update_one (the previous approach) leaves a window
+        # where both callers can read "not yet completed" and both proceed to
+        # re-allocate credits. Folding the check into the update's filter
+        # makes only the first caller actually match and get a document back;
+        # the loser gets None and returns without touching credits.
+        payment_doc = await self.payment_transactions_collection.find_one_and_update(
+            {"transaction_ref": transaction_ref, "status": {"$ne": "completed"}},
             {
                 "$set": {
                     "status": "completed",
                     "completed_at": datetime.utcnow(),
                     "squad_response": squad_response
                 }
-            }
+            },
+            return_document=ReturnDocument.BEFORE,
         )
+
+        if not payment_doc:
+            # Either this transaction_ref doesn't exist, or another caller
+            # already completed it — check which, purely to raise the right
+            # error; the correctness guard above already closed the race.
+            existing = await self.payment_transactions_collection.find_one(
+                {"transaction_ref": transaction_ref}
+            )
+            if not existing:
+                raise ValueError(f"Payment transaction not found: {transaction_ref}")
+            return
+
+        billing_cycle = payment_doc.get("billing_cycle", "monthly")
+        credits_allocated = payment_doc.get("credits_allocated")
 
         # Check if user has remaining trial credits - preserve them as bonus credits
         trial_status = await trial_service.get_trial_status(user_id)
@@ -523,30 +529,33 @@ class PaymentService:
         `quantity` bonus credits (never expire) to the user's wallet.
 
         Idempotent — verify_payment (frontend poll) and handle_webhook (SQUAD
-        server callback) can both race to complete the same transaction_ref;
-        guard against double-crediting by checking status first.
+        server callback) can both race to complete the same transaction_ref.
+        Atomically claim the transaction via the update's own filter (rather
+        than a separate find_one check + update_one) so only the first caller
+        to actually match gets a document back — the loser gets None and
+        returns without re-crediting, closing the same race
+        _complete_payment() is guarded against.
         """
-        payment_doc = await self.payment_transactions_collection.find_one(
-            {"transaction_ref": transaction_ref}
-        )
-
-        if not payment_doc:
-            raise ValueError(f"Payment transaction not found: {transaction_ref}")
-
-        if payment_doc.get("status") == "completed":
-            # Already processed by the other completion path — don't re-credit.
-            return
-
-        await self.payment_transactions_collection.update_one(
-            {"transaction_ref": transaction_ref},
+        payment_doc = await self.payment_transactions_collection.find_one_and_update(
+            {"transaction_ref": transaction_ref, "status": {"$ne": "completed"}},
             {
                 "$set": {
                     "status": "completed",
                     "completed_at": datetime.utcnow(),
                     "squad_response": squad_response
                 }
-            }
+            },
+            return_document=ReturnDocument.BEFORE,
         )
+
+        if not payment_doc:
+            existing = await self.payment_transactions_collection.find_one(
+                {"transaction_ref": transaction_ref}
+            )
+            if not existing:
+                raise ValueError(f"Payment transaction not found: {transaction_ref}")
+            # Already completed by the other racer — nothing to do.
+            return
 
         if quantity > 0:
             await credit_service.add_bonus_credits(
