@@ -2334,6 +2334,7 @@ OVERALL:
                                 prompt=prompt,
                                 n=1,
                                 size=edit_size,
+                                quality="medium",
                             )
                         ),
                         timeout=90,
@@ -2413,6 +2414,7 @@ OVERALL:
                                     prompt=prompt,
                                     n=1,
                                     size=_gpt2_size,
+                                    quality="medium",
                                 ),
                             ),
                             timeout=300,
@@ -2429,7 +2431,7 @@ OVERALL:
                                     prompt=prompt,
                                     n=1,
                                     size=_gpt2_size,
-                                    quality="high",
+                                    quality="medium",
                                     output_format="webp",
                                 ),
                             ),
@@ -2609,7 +2611,7 @@ OVERALL:
                         prompt=prompt,
                         n=1,
                         size=image_size,
-                        quality="high",
+                        quality="medium",
                         output_format="webp",
                     )
                 ),
