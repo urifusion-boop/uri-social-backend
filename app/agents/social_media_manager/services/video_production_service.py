@@ -708,7 +708,7 @@ async def _generate_broll_image(image_prompt: str) -> Optional[str]:
             model="gpt-image-1",
             prompt=full_prompt,
             size="1024x1536",   # portrait, cover-fits 9:16
-            quality="high",
+            quality="medium",
             n=1,
         )
         b64 = resp.data[0].b64_json if resp.data else None
