@@ -403,6 +403,34 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
             for row in rows
         ]
 
+    async def get_delivery_estimate(self, targeting: Optional[dict] = None) -> Optional[dict]:
+        """Meta's projected audience size for a targeting spec + optimization goal, used
+        to show a real reach range on the campaign summary (Tier C). Best-effort: returns
+        None on any failure (the summary just omits reach rather than blocking the plan).
+        Matched to what a wa.me traffic ad actually optimizes for (LINK_CLICKS). Pass the
+        campaign's real `targeting` (geo pins) so the reach reflects the actual audience,
+        not all of Nigeria — falls back to country-level if none is given."""
+        import json as _json
+        targeting = targeting or {"geo_locations": {"countries": ["NG"]}}
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                resp = await client.get(
+                    f"{self._graph_base}/act_{self._ad_account_id}/delivery_estimate",
+                    params={
+                        "access_token": self._access_token,
+                        "optimization_goal": "LINK_CLICKS",
+                        "targeting_spec": _json.dumps(targeting),
+                    },
+                )
+            data = resp.json()
+            if "error" in data:
+                print(f"[meta] delivery_estimate error: {data['error'].get('message')}", flush=True)
+                return None
+            return data
+        except Exception as e:
+            print(f"[meta] delivery_estimate failed: {e}", flush=True)
+            return None
+
     async def fetch_campaign_summary(self, campaign_id: str) -> dict:
         """One combined snapshot for the campaign-list (management) view — real
         delivery status, reach/impressions, spend, and conversation results/cost,
