@@ -170,9 +170,13 @@ class CampaignPlan(BaseModel):
     objective: CampaignObjective = CampaignObjective.CONVERSATIONS
     explanation: str = ""                   # required plain-language "why" (PRD §6)
     trace: list[str] = Field(default_factory=list)
-    page_id: str = ""                       # connected Facebook Page — the real Meta adapter
-                                             # needs this for Click-to-WhatsApp's promoted_object;
-                                             # attached after platform selection, same as geo
+    page_id: str = ""                       # connected Facebook Page — owns the ad's identity
+                                             # (name/avatar shown on the ad); attached after
+                                             # platform selection, same as geo
+    whatsapp_number: str = ""               # the brand's own WhatsApp number (digits, country-
+                                             # coded) leads route to — the ad links to
+                                             # wa.me/<this>, so chats reach the brand directly
+                                             # instead of the shared Page's inbox
     creative: Optional["AdCreative"] = None # the actual ad (image/video + copy) from creative.py —
                                              # Meta rejects link-ad creation with no real media
                                              # attached, so the real adapter needs this, not just

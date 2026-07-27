@@ -42,6 +42,7 @@ import asyncio
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+from urllib.parse import quote
 
 import httpx
 from motor.motor_asyncio import AsyncIOMotorDatabase
@@ -61,6 +62,14 @@ COLLECTION = "jane_ads_meta_campaigns"
 
 # Standard Meta insight action type for Click-to-WhatsApp conversation starts.
 _CONVERSATION_ACTION_TYPE = "onsite_conversion.messaging_conversation_started_7d"
+# The result metric for wa.me link ads: a click that opens the brand's WhatsApp. This
+# is the honest, attributable number (vs. the old page-connected "conversations", which
+# both mis-routed leads AND over-counted button taps).
+_LINK_CLICK_ACTION_TYPE = "link_click"
+
+# Prefilled first message on the lead's WhatsApp, so the brand gets context, not a
+# blank "Hi". URL-encoded into the wa.me link at ad-creative time.
+_WA_PREFILL = "Hi! I saw your ad and I'm interested."
 
 # Meta processes uploaded video asynchronously (verified live: a short vertical
 # clip is typically ready in well under a minute) — poll rather than assume.
@@ -201,6 +210,11 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
             # attached ("Please specify the media to run with this ad"), so this
             # can't fall back to a text-only placeholder.
             raise ValueError("CampaignPlan.creative.image_url is required to launch a real Meta campaign")
+        # Without the brand's WhatsApp number there's nowhere for leads to go — the ad
+        # would link to a bare wa.me/. Blocked here too (the router gates on it first)
+        # so a missing number can never silently ship a dead-end ad.
+        if not plan.whatsapp_number:
+            raise ValueError("CampaignPlan.whatsapp_number is required — the ad links to wa.me/<number>")
         platform_plan = meta_plans[0]
 
         total_budget_ngn = min(platform_plan.budget_ngn, auth.funded_amount_ngn)
@@ -233,7 +247,10 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                 params={"access_token": self._access_token},
                 json={
                     "name": f"JaneAds-{plan.business_id}-{plan.goal.value}",
-                    "objective": "OUTCOME_ENGAGEMENT",
+                    # Traffic objective — the ad drives clicks to the brand's wa.me link.
+                    # (Was OUTCOME_ENGAGEMENT + page-connected WHATSAPP messaging, which
+                    # routed every brand's chats to the shared Page's one number.)
+                    "objective": "OUTCOME_TRAFFIC",
                     "status": "PAUSED",
                     "special_ad_categories": [],
                     # Budget lives on the ad set (per-business isolation via caps.py/
@@ -253,10 +270,11 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                     "campaign_id": campaign_id,
                     "daily_budget": daily_budget_minor,
                     "billing_event": "IMPRESSIONS",
-                    "optimization_goal": "CONVERSATIONS",
+                    # Optimize for clicks on the wa.me link. No destination_type/
+                    # promoted_object — those are the Page-connected messaging setup that
+                    # forced every ad onto the shared Page's single WhatsApp number.
+                    "optimization_goal": "LINK_CLICKS",
                     "bid_strategy": "LOWEST_COST_WITHOUT_CAP",
-                    "destination_type": "WHATSAPP",
-                    "promoted_object": {"page_id": plan.page_id},
                     "targeting": {"geo_locations": {"countries": ["NG"]}},
                     "status": "PAUSED",
                     "start_time": start_time.isoformat(),
@@ -268,6 +286,12 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
             adset_id = adset_data["id"]
 
             message = plan.creative.primary_text or plan.creative.headline or "Chat with us on WhatsApp!"
+            # The deep link that actually delivers the lead to the brand: opens WhatsApp
+            # straight to their number with a prefilled first message. `CONTACT_US` is a
+            # valid link-ad CTA (the page-connected `WHATSAPP_MESSAGE` CTA is only for the
+            # messaging-destination flow we deliberately moved off of).
+            wa_link = f"https://wa.me/{plan.whatsapp_number}?text={quote(_WA_PREFILL)}"
+            cta = {"type": "CONTACT_US", "value": {"link": wa_link}}
             if plan.creative.is_video:
                 object_story_spec = {
                     "page_id": plan.page_id,
@@ -275,7 +299,7 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                         "video_id": video_id,
                         "image_url": video_thumbnail_url,
                         "message": message,
-                        "call_to_action": {"type": "WHATSAPP_MESSAGE"},
+                        "call_to_action": cta,
                     },
                 }
             else:
@@ -283,9 +307,9 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                     "page_id": plan.page_id,
                     "link_data": {
                         "message": message,
-                        "link": "https://wa.me/",
+                        "link": wa_link,
                         "picture": plan.creative.image_url,
-                        "call_to_action": {"type": "WHATSAPP_MESSAGE"},
+                        "call_to_action": cta,
                     },
                 }
             creative_resp = await client.post(
@@ -414,23 +438,30 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
         insight_rows = data.get("insights", {}).get("data", [])
         row = insight_rows[0] if insight_rows else {}
 
-        conversations = 0
-        for action in row.get("actions", []):
-            if action.get("action_type") == _CONVERSATION_ACTION_TYPE:
-                conversations = int(float(action.get("value", 0)))
-                break
-        cost_per_conversation = None
-        for c in row.get("cost_per_action_type", []):
-            if c.get("action_type") == _CONVERSATION_ACTION_TYPE:
-                cost_per_conversation = float(c.get("value", 0))
-                break
+        def _action_value(rows: list, action_type: str):
+            for a in rows:
+                if a.get("action_type") == action_type:
+                    return float(a.get("value", 0))
+            return None
+
+        actions = row.get("actions", [])
+        cost_actions = row.get("cost_per_action_type", [])
+        # wa.me link ads: clicks are the real, brand-reaching result. `conversations`
+        # (the old page-connected metric) stays reported for any legacy campaign still
+        # on it, but new campaigns surface clicks.
+        clicks_val = _action_value(actions, _LINK_CLICK_ACTION_TYPE)
+        conversations_val = _action_value(actions, _CONVERSATION_ACTION_TYPE)
+        cost_per_click = _action_value(cost_actions, _LINK_CLICK_ACTION_TYPE)
+        cost_per_conversation = _action_value(cost_actions, _CONVERSATION_ACTION_TYPE)
 
         return {
             "delivery": delivery,
             "spend_ngn": float(row.get("spend", 0.0)),
             "impressions": int(row.get("impressions", 0)),
             "reach": int(row.get("reach", 0)),
-            "conversations": conversations,
+            "clicks": int(clicks_val) if clicks_val is not None else 0,
+            "cost_per_click_ngn": cost_per_click,
+            "conversations": int(conversations_val) if conversations_val is not None else 0,
             "cost_per_conversation_ngn": cost_per_conversation,
             "ends_at": ends_at,
         }
