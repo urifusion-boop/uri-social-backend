@@ -702,6 +702,7 @@ RULES FOR THIS EDIT:
                     prompt=prompt,
                     n=1,
                     size=size,
+                    quality="medium",
                 )
             )
 
