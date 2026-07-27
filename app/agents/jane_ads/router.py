@@ -1236,6 +1236,10 @@ async def _do_launch(built: _PlanBuildResult, body_message: str, body_business_n
             "city": req.geo,
             "message": body_message,
             "thread_id": built.thread_id,
+            # Where this campaign's leads route (wa.me/<this>) — so "My Campaigns" can show
+            # the user exactly where to find their conversations. Absent on legacy campaigns
+            # that predate wa.me routing (they went to the shared Page's inbox).
+            "whatsapp_number": plan.whatsapp_number,
         }},
     )
 
@@ -1479,6 +1483,9 @@ async def meta_campaigns(
             "budget_ngn": r.get("budget_ngn"),
             "goal": r.get("goal", ""),
             "city": r.get("city", ""),
+            # Where leads for this campaign land, so the user can find their conversations.
+            # Empty on legacy campaigns (pre-wa.me routing) — the UI flags those.
+            "whatsapp_number": r.get("whatsapp_number") or "",
             "status": "paused",   # everything is created PAUSED for now
             "created_at": created.isoformat() if hasattr(created, "isoformat") else created,
             "ads_manager_url": (
