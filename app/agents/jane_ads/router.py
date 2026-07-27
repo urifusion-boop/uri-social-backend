@@ -876,16 +876,24 @@ async def _build_campaign_plan(
     # the brand directly instead of the shared Page's inbox. Ask for it once (then it's
     # stored and reused). Blocks here rather than at launch so no plan is ever built that
     # can't actually deliver a lead.
-    from .whatsapp import normalize_wa_number, get_brand_whatsapp, set_brand_whatsapp
+    from .whatsapp import normalize_wa_number, get_brand_whatsapp, get_connected_whatsapp, set_brand_whatsapp
     brand_id_for_wa = brand_ctx.get("brand_id")
     if body.whatsapp_number:
+        # The user just typed/confirmed a number this turn.
         wa_number = normalize_wa_number(body.whatsapp_number) or ""
         if not wa_number:
             return {"early_return": {"stage": "need_whatsapp", "understood": parsed.model_dump(),
                     "question": "That WhatsApp number doesn't look right — please type it in full, e.g. 0803 123 4567."}}
         await set_brand_whatsapp(db, brand_id_for_wa, wa_number)
     else:
+        # Auto-resolve: this brand's saved number → else the number they already connected
+        # for the daily-push feature (adopted + saved so it's asked only if truly nothing's
+        # on file). Keeps the flow moving instead of asking for a number we already have.
         wa_number = await get_brand_whatsapp(db, brand_id_for_wa)
+        if not wa_number:
+            wa_number = await get_connected_whatsapp(db, brand_ctx.get("user_id"))
+            if wa_number:
+                await set_brand_whatsapp(db, brand_id_for_wa, wa_number)
     if not wa_number:
         return {"early_return": {"stage": "need_whatsapp", "understood": parsed.model_dump(),
                 "question": "Which WhatsApp number should I send your leads to? Anyone who taps your ad will message this number directly."}}
@@ -1066,6 +1074,9 @@ def _plan_response_dict(built: _PlanBuildResult) -> dict:
         "creative": plan.creative.model_dump(mode="json"),
         "shoot_script": plan.shoot_script.model_dump(mode="json") if plan.shoot_script else None,
         "budget_estimate": built.budget_estimate,
+        # So the review can show where leads land (and let the user catch a wrong
+        # auto-adopted number before launch).
+        "whatsapp_number": plan.whatsapp_number,
     }
 
 

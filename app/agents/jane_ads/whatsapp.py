@@ -56,6 +56,17 @@ async def get_brand_whatsapp(db, brand_id: Optional[str]) -> str:
     return (doc or {}).get("whatsapp_number", "") or ""
 
 
+async def get_connected_whatsapp(db, user_id: Optional[str]) -> str:
+    """The WhatsApp number the user already connected for the URI daily-push feature
+    (users.whatsapp_phone, stored as +E.164), normalized to the wa.me digits form — or
+    '' if they never connected one. Used as the automatic default so a brand that's
+    already given us their number isn't asked again."""
+    if not user_id or db is None:
+        return ""
+    doc = await db["users"].find_one({"userId": user_id}, {"_id": 0, "whatsapp_phone": 1})
+    return normalize_wa_number((doc or {}).get("whatsapp_phone", "")) or ""
+
+
 async def set_brand_whatsapp(db, brand_id: Optional[str], number: str) -> None:
     """Store (upsert) the brand's WhatsApp number so it's reused on every future
     campaign — the brand is asked for it once, not per campaign."""
