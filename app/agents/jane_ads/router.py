@@ -779,6 +779,8 @@ class _PlanBuildResult(BaseModel):
     understood: dict
     budget_estimate: Optional[dict] = None   # set when budget_ngn was computed from a stated
                                               # customer-count rather than a stated Naira amount
+    summary: Optional[dict] = None            # Tier C — the structured "Jane Campaign Summary"
+                                              # (each choice + its why, plus reach/click estimates)
 
 
 async def _build_campaign_plan(
@@ -1017,10 +1019,40 @@ async def _build_campaign_plan(
         )
         plan.explanation = f"{plan.explanation} {creative.video_recommendation} {nudge}"
 
+    # Tier C — the Jane Campaign Summary: every choice + its why, plus reach/click/lead
+    # estimates. Reach comes from Meta's real delivery_estimate (best-effort; the summary
+    # still renders without it). Never blocks the plan.
+    summary_dump = None
+    try:
+        from .summary import build_campaign_summary
+        from .adapters.meta import MetaAdPlatformAdapter
+
+        estimate = None
+        try:
+            est_adapter = MetaAdPlatformAdapter(db, access_token=settings.META_ADS_ACCESS_TOKEN)
+            # Reach the REAL audience: build the targeting from the plan's geo pins (radius
+            # around each validated coordinate) so the estimate isn't all of Nigeria.
+            custom_locations = [
+                {"latitude": pin.lat, "longitude": pin.lng,
+                 "radius": pin.radius_km, "distance_unit": "kilometer"}
+                for pin in (plan.geo.pins if plan.geo else [])
+                if pin.lat is not None and pin.lng is not None
+            ]
+            targeting = ({"geo_locations": {"custom_locations": custom_locations}}
+                         if custom_locations else {"geo_locations": {"countries": ["NG"]}})
+            estimate = await est_adapter.get_delivery_estimate(targeting)
+        except Exception as e:
+            print(f"[oneshot] delivery estimate skipped: {e}", flush=True)
+        summary = build_campaign_summary(plan, req, price_per_result_ngn=price_per_conversation,
+                                         delivery_estimate=estimate)
+        summary_dump = summary.model_dump(mode="json")
+    except Exception as e:
+        print(f"[oneshot] summary skipped: {e}", flush=True)
+
     return _PlanBuildResult(
         business_id=business_id, req=req, plan=plan, jane_platforms=jane_platforms,
         forced_to_meta=forced_to_meta, geo_dump=geo_dump, understood=parsed.model_dump(),
-        budget_estimate=budget_estimate,
+        budget_estimate=budget_estimate, summary=summary_dump,
     )
 
 
@@ -1077,6 +1109,8 @@ def _plan_response_dict(built: _PlanBuildResult) -> dict:
         # So the review can show where leads land (and let the user catch a wrong
         # auto-adopted number before launch).
         "whatsapp_number": plan.whatsapp_number,
+        # Tier C — the structured, explained summary (each choice + its why + estimates).
+        "summary": built.summary,
     }
 
 
@@ -1201,6 +1235,7 @@ async def meta_plan_from_message(
         "geo_dump": built.geo_dump,
         "understood": built.understood,
         "budget_estimate": built.budget_estimate,
+        "summary": built.summary,
         "status": "pending",
         "created_at": now,
         "expires_at": now + timedelta(days=7),
@@ -1310,7 +1345,7 @@ async def meta_launch_plan(
         business_id=doc["business_id"], req=req, plan=plan,
         jane_platforms=doc["jane_platforms"], forced_to_meta=doc["forced_to_meta"],
         geo_dump=doc.get("geo_dump"), understood=doc["understood"],
-        budget_estimate=doc.get("budget_estimate"),
+        budget_estimate=doc.get("budget_estimate"), summary=doc.get("summary"),
     )
     result = await _do_launch(built, doc["message"], doc["business_name"], brand_ctx, db)
     await db["jane_ads_pending_plans"].update_one(
