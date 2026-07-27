@@ -450,6 +450,7 @@ class ChatMessageBody(BaseModel):
     kind: str             # "text" | "result"
     text: str = ""
     result: Optional[dict] = None   # the full LaunchFromMessageResult, for kind="result"
+    thread_id: str = ""             # which campaign thread this belongs to (Tier E)
 
 
 @router.put("/chat/history/{message_id}")
@@ -463,8 +464,10 @@ async def jane_chat_save_message(
     brand-new message AND the existing message being edited in place — e.g. a plan
     card that flips from 'planned' to 'launched' once the user confirms it reuses the
     SAME message_id, so saving it again here just updates that one saved row instead
-    of creating a duplicate."""
+    of creating a duplicate. When a thread_id is given (Tier E), the message is tagged
+    to that thread and the thread's preview/status/title are kept current."""
     from datetime import datetime, timezone
+    from .threads import touch_thread, title_from_message
 
     brand_id = brand_ctx.get("brand_id")
     if not brand_id:
@@ -475,11 +478,89 @@ async def jane_chat_save_message(
         {"$set": {
             "message_id": message_id, "brand_id": brand_id, "user_id": brand_ctx.get("user_id"),
             "role": body.role, "kind": body.kind, "text": body.text, "result": body.result,
-            "updated_at": now,
+            "thread_id": body.thread_id, "updated_at": now,
         }, "$setOnInsert": {"created_at": now}},
         upsert=True,
     )
+    if body.thread_id:
+        # Keep the thread record fresh: title from the first user line, status as the
+        # campaign progresses, preview from the latest text.
+        stage = (body.result or {}).get("stage") if body.kind == "result" else None
+        status = "launched" if stage == "launched" else "planned" if stage == "planned" else None
+        title = title_from_message(body.text) if body.role == "user" else None
+        preview = body.text or (f"Plan: {stage}" if stage else None)
+        await touch_thread(db, brand_id, body.thread_id, title=title, status=status, preview_text=preview)
     return {"ok": True}
+
+
+# ── Campaign threads (Tier E) ─────────────────────────────────────────────────
+# Each campaign conversation is its own resumable thread. The rail lists them; opening
+# one loads its messages; a launched one can be duplicated into a fresh draft.
+
+class NewThreadBody(BaseModel):
+    title: str = "New campaign"
+
+
+@router.get("/threads")
+async def jane_list_threads(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """This brand's campaign threads, most-recently-active first."""
+    from .threads import list_threads
+    return {"threads": await list_threads(db, brand_ctx.get("brand_id"))}
+
+
+@router.post("/threads")
+async def jane_create_thread(
+    body: NewThreadBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Start a fresh campaign thread ('+ New')."""
+    from .threads import create_thread
+    brand_id = brand_ctx.get("brand_id")
+    if not brand_id:
+        raise HTTPException(status_code=400, detail="No active brand.")
+    return await create_thread(db, brand_id, brand_ctx.get("user_id"), body.title)
+
+
+@router.get("/threads/{thread_id}/history")
+async def jane_thread_history(
+    thread_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """The messages in one thread, oldest first."""
+    from .threads import thread_history
+    return {"messages": await thread_history(db, brand_ctx.get("brand_id"), thread_id)}
+
+
+@router.post("/threads/{thread_id}/duplicate")
+async def jane_duplicate_thread(
+    thread_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Clone a thread's launched campaign into a NEW draft thread, pre-filled with a
+    plain-English brief the user can tweak and relaunch. Returns the new thread plus the
+    seed message the frontend sends to rebuild the plan."""
+    from .threads import create_thread, seed_message_from_campaign, title_from_message
+    brand_id = brand_ctx.get("brand_id")
+    if not brand_id:
+        raise HTTPException(status_code=400, detail="No active brand.")
+    camp = await db["jane_ads_meta_campaigns"].find_one(
+        {"brand_id": brand_id, "thread_id": thread_id}, sort=[("created_at", -1)])
+    if not camp:
+        # Fall back to the most recent campaign for this brand if the thread isn't tagged
+        # (legacy campaigns created before threads existed).
+        camp = await db["jane_ads_meta_campaigns"].find_one(
+            {"$or": [{"brand_id": brand_id}, {"business_id": brand_id}]}, sort=[("created_at", -1)])
+    if not camp:
+        raise HTTPException(status_code=404, detail="No launched campaign found to duplicate.")
+    seed = seed_message_from_campaign(camp)
+    thread = await create_thread(db, brand_id, brand_ctx.get("user_id"), title_from_message(seed))
+    return {"thread": thread, "seed_message": seed}
 
 
 # ── Brand WhatsApp number (where leads route) ─────────────────────────────────
@@ -763,6 +844,8 @@ class MetaLaunchFromMessageBody(BaseModel):
     draft_id: str = ""                    # required for creative_source=draft (from /creative/drafts)
     whatsapp_number: str = ""             # the brand's WhatsApp number leads route to; stored on
                                           # the brand and reused, so it's only ever asked once
+    thread_id: str = ""                   # the campaign thread this plan belongs to (Tier E),
+                                          # tagged onto the pending plan + launched campaign
 
 
 class _PlanBuildResult(BaseModel):
@@ -781,6 +864,7 @@ class _PlanBuildResult(BaseModel):
                                               # customer-count rather than a stated Naira amount
     summary: Optional[dict] = None            # Tier C — the structured "Jane Campaign Summary"
                                               # (each choice + its why, plus reach/click estimates)
+    thread_id: str = ""                       # Tier E — the campaign thread this belongs to
 
 
 async def _build_campaign_plan(
@@ -1052,7 +1136,7 @@ async def _build_campaign_plan(
     return _PlanBuildResult(
         business_id=business_id, req=req, plan=plan, jane_platforms=jane_platforms,
         forced_to_meta=forced_to_meta, geo_dump=geo_dump, understood=parsed.model_dump(),
-        budget_estimate=budget_estimate, summary=summary_dump,
+        budget_estimate=budget_estimate, summary=summary_dump, thread_id=body.thread_id,
     )
 
 
@@ -1151,6 +1235,7 @@ async def _do_launch(built: _PlanBuildResult, body_message: str, body_business_n
             "goal": plan.goal.value,
             "city": req.geo,
             "message": body_message,
+            "thread_id": built.thread_id,
         }},
     )
 
@@ -1236,6 +1321,7 @@ async def meta_plan_from_message(
         "understood": built.understood,
         "budget_estimate": built.budget_estimate,
         "summary": built.summary,
+        "thread_id": built.thread_id,
         "status": "pending",
         "created_at": now,
         "expires_at": now + timedelta(days=7),
@@ -1346,6 +1432,7 @@ async def meta_launch_plan(
         jane_platforms=doc["jane_platforms"], forced_to_meta=doc["forced_to_meta"],
         geo_dump=doc.get("geo_dump"), understood=doc["understood"],
         budget_estimate=doc.get("budget_estimate"), summary=doc.get("summary"),
+        thread_id=doc.get("thread_id", ""),
     )
     result = await _do_launch(built, doc["message"], doc["business_name"], brand_ctx, db)
     await db["jane_ads_pending_plans"].update_one(
