@@ -509,39 +509,72 @@ class CreditService:
         self,
         user_id: str,
         campaign_id: str,
-        reason: str = "refund"
+        reason: str = "refund",
+        amount: int = 1,
     ) -> bool:
         """
-        Refund 1 credit to user (for failed campaigns, etc.)
+        Refund credits to user's wallet (for failed campaigns, etc.)
         PRD Section 2 allows for refunds in transaction types
-        """
-        wallet = await self.get_user_wallet(user_id)
 
-        if not wallet:
+        Refunded credits are added back as bonus_credits (never expire) —
+        the same pool add_bonus_credits uses. A deduction may have consumed
+        from either subscription_credits or bonus_credits and per-transaction
+        provenance isn't tracked, so bonus is the only pool that's always
+        safe to credit back regardless of where it originally came from.
+
+        Previously this only decremented credits_used and wrote a computed
+        credits_remaining — but get_user_wallet() always recomputes
+        credits_remaining fresh as bonus_credits + subscription_credits,
+        ignoring credits_used entirely, so that write was silently discarded
+        on the next read. The user's actual spendable balance never went up.
+        Atomic (single find_one_and_update), matching deduct_credit()'s
+        pattern, so a concurrent refund/deduction can't read a stale amount.
+        """
+        updated = await self.user_credits_collection.find_one_and_update(
+            {"user_id": user_id},
+            [
+                {
+                    "$set": {
+                        "bonus_credits": {
+                            "$add": [{"$ifNull": ["$bonus_credits", 0]}, amount]
+                        },
+                        "credits_used": {
+                            "$max": [
+                                {"$subtract": [{"$ifNull": ["$credits_used", 0]}, amount]},
+                                0,
+                            ]
+                        },
+                    }
+                },
+                {
+                    "$set": {
+                        "total_credits": {
+                            "$add": [{"$ifNull": ["$subscription_credits", 0]}, "$bonus_credits"]
+                        },
+                        "credits_remaining": {
+                            "$add": [{"$ifNull": ["$subscription_credits", 0]}, "$bonus_credits"]
+                        },
+                        "updated_at": datetime.utcnow(),
+                    }
+                },
+            ],
+            return_document=ReturnDocument.AFTER,
+        )
+
+        if not updated:
+            # No wallet for this user — never subscribed, nothing to refund into.
             return False
 
-        balance_before = wallet.credits_remaining
-        new_credits_used = max(0, wallet.credits_used - 1)
-        new_credits_remaining = wallet.total_credits - new_credits_used
-
-        await self.user_credits_collection.update_one(
-            {"user_id": user_id},
-            {
-                "$set": {
-                    "credits_used": new_credits_used,
-                    "credits_remaining": new_credits_remaining,
-                    "updated_at": datetime.utcnow()
-                }
-            }
-        )
+        balance_after = updated["credits_remaining"]
+        balance_before = balance_after - amount
 
         # Log refund transaction
         transaction = CreditTransaction(
             user_id=user_id,
             type="refund",
-            amount=1,
+            amount=amount,
             balance_before=balance_before,
-            balance_after=new_credits_remaining,
+            balance_after=balance_after,
             reason=reason,
             campaign_id=campaign_id,
             created_at=datetime.utcnow()
