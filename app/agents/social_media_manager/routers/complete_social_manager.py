@@ -8137,6 +8137,7 @@ async def zapcap_produce(
     quality: str = Form("standard"),
     enable_broll: str = Form("false"),
     enable_music: str = Form("false"),
+    caption_style: str = Form("bold"),
     custom_music: Optional[UploadFile] = File(None),
     custom_broll_clips: List[UploadFile] = File(default=[]),
     custom_broll_placements: Optional[str] = Form(None),  # JSON: [{"clipIndex":0,"startTime":5.0,"duration":4}]
@@ -8215,6 +8216,23 @@ async def zapcap_produce(
     if quality != "standard":
         export_settings["quality"] = quality
 
+    _CAPTION_RENDER_OPTIONS: dict = {
+        "bold": {
+            "styleOptions": {"fontUppercase": True, "fontWeight": 800, "stroke": "m", "fontShadow": "s"},
+            "subsOptions": {"animation": False, "emphasizeKeywords": True, "displayWords": 3},
+            "highlightOptions": {"randomColourOne": "#FFE600", "randomColourTwo": "#FF4136"},
+        },
+        "minimal": {
+            "styleOptions": {"fontUppercase": False, "fontWeight": 400, "stroke": "none", "fontShadow": "none"},
+            "subsOptions": {"animation": False, "emphasizeKeywords": False, "displayWords": 6},
+        },
+        "animated": {
+            "styleOptions": {"fontUppercase": False, "fontWeight": 700, "stroke": "s"},
+            "subsOptions": {"animation": True, "emphasizeKeywords": True, "displayWords": 4},
+            "highlightOptions": {"randomColourOne": "#FF6B9D", "randomColourTwo": "#A855F7", "randomColourThree": "#06B6D4"},
+        },
+    }
+
     task_payload: dict = {
         "templateId": template_id,
         "language": language,
@@ -8222,6 +8240,8 @@ async def zapcap_produce(
     }
     if export_settings:
         task_payload["exportSettings"] = export_settings
+    if caption_style in _CAPTION_RENDER_OPTIONS:
+        task_payload["renderOptions"] = _CAPTION_RENDER_OPTIONS[caption_style]
 
     # Custom b-roll: upload clips to Cloudinary and spread them evenly across estimated duration.
     # customBrolls is mutually exclusive with brollPercent — don't set both.
@@ -8295,6 +8315,7 @@ async def zapcap_produce(
         "quality": quality,
         "enable_broll": enable_broll.lower() == "true" or bool(custom_broll_clips),
         "has_custom_broll": bool(custom_broll_clips),
+        "caption_style": caption_style,
         "music_url": music_url,
         "video_url": video_url,
         "video_width": probed_width or None,
@@ -8626,6 +8647,25 @@ async def zapcap_job_rerender(
         task_payload["exportSettings"] = export_settings
     if use_broll:
         task_payload["transcribeSettings"] = {"broll": {"brollPercent": 50}}
+    _CAPTION_RENDER_OPTIONS_RR: dict = {
+        "bold": {
+            "styleOptions": {"fontUppercase": True, "fontWeight": 800, "stroke": "m", "fontShadow": "s"},
+            "subsOptions": {"animation": False, "emphasizeKeywords": True, "displayWords": 3},
+            "highlightOptions": {"randomColourOne": "#FFE600", "randomColourTwo": "#FF4136"},
+        },
+        "minimal": {
+            "styleOptions": {"fontUppercase": False, "fontWeight": 400, "stroke": "none", "fontShadow": "none"},
+            "subsOptions": {"animation": False, "emphasizeKeywords": False, "displayWords": 6},
+        },
+        "animated": {
+            "styleOptions": {"fontUppercase": False, "fontWeight": 700, "stroke": "s"},
+            "subsOptions": {"animation": True, "emphasizeKeywords": True, "displayWords": 4},
+            "highlightOptions": {"randomColourOne": "#FF6B9D", "randomColourTwo": "#A855F7", "randomColourThree": "#06B6D4"},
+        },
+    }
+    caption_style_rr = body.get("caption_style") or job.get("caption_style", "bold")
+    if caption_style_rr in _CAPTION_RENDER_OPTIONS_RR:
+        task_payload["renderOptions"] = _CAPTION_RENDER_OPTIONS_RR[caption_style_rr]
 
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.post(
