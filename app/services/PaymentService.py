@@ -101,7 +101,8 @@ class PaymentService:
         billing_cycle: str = "monthly",
         currency: str = "NGN",
         test_amount: int = None,
-        test_credits: int = None
+        test_credits: int = None,
+        for_inline_widget: bool = False
     ) -> InitializePaymentResponse:
         """
         Initialize SQUAD payment checkout with billing cycle and currency support
@@ -121,6 +122,14 @@ class PaymentService:
             currency: "NGN" or "USD" (default: "NGN")
             test_amount: Custom test amount (only for tier_id='test')
             test_credits: Custom test credits (only for tier_id='test')
+            for_inline_widget: True when the caller will open SQUAD's inline
+                JS widget itself (which initiates its own transaction) —
+                skips the REST /transaction/initiate call, since doing both
+                for the same transaction_ref double-initiates it and leaves
+                the widget's popup hanging. False (default) preserves the
+                original hosted-checkout-redirect behavior for callers
+                (e.g. the public /pricing → /checkout flow) that have no
+                inline widget and rely on the returned payment_url.
         """
         # Handle test tier with custom amounts (temporary testing feature)
         if tier_id == 'test':
@@ -177,7 +186,42 @@ class PaymentService:
         creds = await self._get_squad_credentials()
         print(f"💳 Initializing payment in {creds['mode'].upper()} mode")
 
-        # Initialize SQUAD payment
+        if for_inline_widget:
+            # Per SQUAD's own docs, the inline widget initiates the
+            # transaction itself client-side — no backend
+            # /transaction/initiate call here, since doing both
+            # double-initiates the same transaction_ref and leaves the
+            # widget's popup hanging indefinitely on its loading state.
+            return InitializePaymentResponse(
+                transaction_ref=transaction_ref,
+                amount=amount,
+                email=user_email,
+                currency=currency,
+                public_key=creds['public_key']
+            )
+
+        return await self._initiate_squad_checkout(
+            transaction_ref=transaction_ref,
+            amount=amount,
+            user_email=user_email,
+            currency=currency,
+            creds=creds
+        )
+
+    async def _initiate_squad_checkout(
+        self,
+        transaction_ref: str,
+        amount: int,
+        user_email: str,
+        currency: str,
+        creds: Dict
+    ) -> InitializePaymentResponse:
+        """
+        Hosted-checkout-redirect path (PRD 6.3) for callers with no inline
+        widget available (e.g. the public /pricing → /checkout flow) — calls
+        SQUAD's REST /transaction/initiate to get a checkout_url to redirect
+        to. Do NOT also use this transaction_ref with the inline widget.
+        """
         try:
             async with httpx.AsyncClient() as client:
                 headers = {
@@ -239,7 +283,8 @@ class PaymentService:
         self,
         user_id: str,
         user_email: str,
-        quantity: int
+        quantity: int,
+        for_inline_widget: bool = False
     ) -> InitializePaymentResponse:
         """
         Initialize a SQUAD checkout for an arbitrary quantity of bonus credits
@@ -251,6 +296,10 @@ class PaymentService:
         _complete_custom_credit_purchase). Reuses the same SQUAD
         initiate/verify/webhook plumbing as the subscription flow, disambiguated
         via `purchase_type` on the PaymentTransaction doc.
+
+        for_inline_widget: see initialize_payment — skips the REST
+            /transaction/initiate call for callers opening SQUAD's inline
+            widget themselves.
         """
         if quantity < 1:
             raise ValueError("quantity must be at least 1")
@@ -284,54 +333,25 @@ class PaymentService:
         creds = await self._get_squad_credentials()
         print(f"💳 Initializing custom credit payment in {creds['mode'].upper()} mode")
 
-        # Initialize SQUAD payment (same payload shape/flow as initialize_payment)
-        try:
-            async with httpx.AsyncClient() as client:
-                headers = {
-                    "Authorization": f"Bearer {creds['secret_key']}",
-                    "Content-Type": "application/json"
-                }
+        if for_inline_widget:
+            # Same reasoning as initialize_payment: the inline widget
+            # initiates the transaction itself — no backend
+            # /transaction/initiate call.
+            return InitializePaymentResponse(
+                transaction_ref=transaction_ref,
+                amount=amount,
+                email=user_email,
+                currency=currency,
+                public_key=creds['public_key']
+            )
 
-                payload = {
-                    "email": user_email,
-                    "amount": amount * 100,  # Kobo
-                    "currency": currency,
-                    "initiate_type": "inline",
-                    "transaction_ref": transaction_ref,
-                    "callback_url": self.callback_url
-                }
-
-                response = await client.post(
-                    f"{creds['api_url']}/transaction/initiate",
-                    json=payload,
-                    headers=headers,
-                    timeout=30.0
-                )
-
-                response_data = response.json()
-
-                if response.status_code == 200 and response_data.get("success"):
-                    data = response_data.get("data", {})
-                    checkout_url = data.get("checkout_url") or data.get("authorization_url")
-
-                    if not checkout_url:
-                        raise Exception(f"SQUAD response missing checkout_url: {response_data}")
-
-                    return InitializePaymentResponse(
-                        payment_url=checkout_url,
-                        transaction_ref=transaction_ref,
-                        amount=amount,
-                        email=user_email,
-                        currency=currency,
-                        public_key=creds['public_key']
-                    )
-                else:
-                    await self._mark_payment_failed(transaction_ref, response_data)
-                    raise Exception(f"SQUAD initialization failed: {response_data.get('message')}")
-
-        except httpx.RequestError as e:
-            await self._mark_payment_failed(transaction_ref, {"error": str(e)})
-            raise Exception(f"Payment gateway connection failed: {str(e)}")
+        return await self._initiate_squad_checkout(
+            transaction_ref=transaction_ref,
+            amount=amount,
+            user_email=user_email,
+            currency=currency,
+            creds=creds
+        )
 
     # ==================== Payment Verification ====================
 
