@@ -78,8 +78,7 @@ async def initialize_payment(
             billing_cycle=body.billing_cycle,  # PRD 8.1: Pass billing cycle
             currency=body.currency,  # Multi-currency support (NGN or USD)
             test_amount=body.test_amount,
-            test_credits=body.test_credits,
-            for_inline_widget=body.for_inline_widget
+            test_credits=body.test_credits
         )
         return result
     except ValueError as e:
@@ -141,8 +140,7 @@ async def purchase_custom_credits(
         result = await payment_service.initialize_custom_credit_payment(
             user_id=user_id,
             user_email=user_email,
-            quantity=body.quantity,
-            for_inline_widget=body.for_inline_widget
+            quantity=body.quantity
         )
         return result
     except ValueError as e:
