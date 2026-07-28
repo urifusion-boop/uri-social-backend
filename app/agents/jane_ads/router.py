@@ -891,10 +891,9 @@ async def _build_campaign_plan(
 
     if not (settings.META_AD_ACCOUNT_ID and settings.META_ADS_ACCESS_TOKEN):
         raise HTTPException(status_code=400, detail="Meta ads not configured — need META_AD_ACCOUNT_ID and META_ADS_ACCESS_TOKEN")
-    # The ad's Facebook Page is the BRAND's own connected page — its connected WhatsApp is
-    # where Click-to-WhatsApp conversations land. Resolved from the brand's Facebook OAuth
-    # connection; the gate below (section 2.5) asks them to connect one if they haven't.
-    page_id = body.page_id  # explicit override (internal); otherwise resolved per-brand below
+    page_id = body.page_id or settings.META_ADS_PAGE_ID
+    if not page_id:
+        raise HTTPException(status_code=400, detail="No target page — set META_ADS_PAGE_ID or pass page_id")
     if body.creative_source == "upload" and not body.reference_image_url:
         raise HTTPException(status_code=400, detail="reference_image_url is required for creative_source=upload")
     if body.creative_source == "draft" and not body.draft_id:
@@ -962,25 +961,31 @@ async def _build_campaign_plan(
                 "advice": result.advice.model_dump(), "trace": result.advice.trace}}
     plan = result.plan
 
-    # 2.5. Lead routing — Click-to-WhatsApp sends conversations to the WhatsApp connected
-    # to the ad's Facebook Page. For per-brand routing, that's the BRAND's own connected
-    # page, so leads reach them (not a shared inbox) AND Meta optimizes for + counts real
-    # conversations. Gate here (before any creative work) if they haven't connected a page.
-    from .pages import resolve_brand_facebook_page, ensure_page_shared_with_business_manager
-    if not page_id:
-        brand_page = await resolve_brand_facebook_page(db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"))
-        if not brand_page:
-            return {"early_return": {"stage": "need_facebook_page", "understood": parsed.model_dump(),
-                    "question": ("To send leads straight to your WhatsApp, connect your Facebook Page "
-                                 "(with WhatsApp linked to it) once — then I can run this. Connect it in "
-                                 "Connected Accounts, then come back and I'll launch.")}}
-        page_id = brand_page["page_id"]
-        # Let URI's ad account advertise with the brand's page (idempotent, best-effort).
-        await ensure_page_shared_with_business_manager(brand_page)
-    # The number leads land on is the page's connected WhatsApp; keep any known number for
-    # display only (not used for routing anymore).
-    from .whatsapp import get_brand_whatsapp
-    wa_number = await get_brand_whatsapp(db, brand_ctx.get("brand_id")) or ""
+    # 2.5. WhatsApp routing — the ad links to wa.me/<the brand's number>, so leads reach
+    # the brand directly instead of the shared Page's inbox. Ask for it once (then it's
+    # stored and reused). Blocks here rather than at launch so no plan is ever built that
+    # can't actually deliver a lead.
+    from .whatsapp import normalize_wa_number, get_brand_whatsapp, get_connected_whatsapp, set_brand_whatsapp
+    brand_id_for_wa = brand_ctx.get("brand_id")
+    if body.whatsapp_number:
+        # The user just typed/confirmed a number this turn.
+        wa_number = normalize_wa_number(body.whatsapp_number) or ""
+        if not wa_number:
+            return {"early_return": {"stage": "need_whatsapp", "understood": parsed.model_dump(),
+                    "question": "That WhatsApp number doesn't look right — please type it in full, e.g. 0803 123 4567."}}
+        await set_brand_whatsapp(db, brand_id_for_wa, wa_number)
+    else:
+        # Auto-resolve: this brand's saved number → else the number they already connected
+        # for the daily-push feature (adopted + saved so it's asked only if truly nothing's
+        # on file). Keeps the flow moving instead of asking for a number we already have.
+        wa_number = await get_brand_whatsapp(db, brand_id_for_wa)
+        if not wa_number:
+            wa_number = await get_connected_whatsapp(db, brand_ctx.get("user_id"))
+            if wa_number:
+                await set_brand_whatsapp(db, brand_id_for_wa, wa_number)
+    if not wa_number:
+        return {"early_return": {"stage": "need_whatsapp", "understood": parsed.model_dump(),
+                "question": "Which WhatsApp number should I send your leads to? Anyone who taps your ad will message this number directly."}}
     if budget_estimate:
         plan.explanation = (
             f"Based on similar campaigns costing about ₦{budget_estimate['price_per_conversation_ngn']:,.0f} "
@@ -1027,6 +1032,19 @@ async def _build_campaign_plan(
     category = req.category or body.category
     user_id = brand_ctx.get("user_id", "")
     brand_id = brand_ctx.get("brand_id")
+
+    # Image-selection step (PRD §2): don't silently generate once budget is set — ask the
+    # user how to source the image (upload their own / pick a past post / let Jane generate).
+    # Only when the caller hasn't already chosen ("ask"); a concrete source skips through.
+    if body.creative_source == "ask":
+        from .creative import list_recent_drafts
+        drafts = await list_recent_drafts(user_id, db, brand_id, limit=6) if user_id else []
+        return {"early_return": {
+            "stage": "choose_creative_source",
+            "understood": parsed.model_dump(),
+            "creative_options": {"can_generate": True, "drafts": drafts},
+        }}
+
     if body.creative_source == "upload":
         creative = await creative_from_upload(
             business_name, category, body.reference_image_url, req.goal.value, req.description,
