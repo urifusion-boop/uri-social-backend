@@ -11,6 +11,7 @@ from app.agents.jane_ads.geo import (
     StaticPinProposer,
     build_geo_plan,
     decide_geo_mode,
+    geo_plan_from_named_areas,
 )
 from app.agents.jane_ads.models import GeoMode, PinSource
 
@@ -103,3 +104,48 @@ def test_loose_match_resolves_axis_phrasing():
     plan = _run(build_geo_plan("Lunch", "restaurant", "Surulere", proposer, StaticGeocoder()))
     assert len(plan.pins) == 1
     assert plan.pins[0].lat is not None
+
+
+# ── geo_plan_from_named_areas — the consultant's own §7 judgment, geocoded ─────
+
+def test_named_areas_builds_a_plan_with_consultant_mode_and_reasoning():
+    plan = _run(geo_plan_from_named_areas(
+        "watering_hole", "Lekki",
+        [{"name": "Lekki Phase 1", "reason": "new estates fitting out"}],
+        "targeting where new construction happens",
+        geocoder=StaticGeocoder(),
+    ))
+    assert plan.mode == GeoMode.WATERING_HOLE
+    assert len(plan.pins) == 1
+    assert plan.pins[0].name == "Lekki Phase 1"
+    assert plan.explanation == "targeting where new construction happens"
+
+
+def test_named_areas_non_local_returns_none():
+    plan = _run(geo_plan_from_named_areas(
+        "non_local", "", [{"name": "anywhere", "reason": "n/a"}], "", geocoder=StaticGeocoder(),
+    ))
+    assert plan is None
+
+
+def test_named_areas_rejects_invalid_mode():
+    plan = _run(geo_plan_from_named_areas("not_a_mode", "Lagos", [], "", geocoder=StaticGeocoder()))
+    assert plan is None
+
+
+def test_named_areas_never_pins_unvalidated_place():
+    plan = _run(geo_plan_from_named_areas(
+        "own_radius", "Surulere", [{"name": "Definitely Not A Real Street Xyz", "reason": "made up"}],
+        "", geocoder=StaticGeocoder(),
+    ))
+    assert plan.pins == []
+    assert plan.fallback_area == "Surulere"
+
+
+def test_named_areas_skips_entries_with_no_name():
+    plan = _run(geo_plan_from_named_areas(
+        "own_radius", "Surulere", [{"reason": "no name"}, {"name": "Bode Thomas", "reason": "ok"}],
+        "", geocoder=StaticGeocoder(),
+    ))
+    assert len(plan.pins) == 1
+    assert plan.pins[0].name == "Bode Thomas"

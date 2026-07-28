@@ -81,6 +81,10 @@ class PlanDecision(str, Enum):
 class GeoMode(str, Enum):
     OWN_RADIUS = "own_radius"       # business PULLS customers to its spot (salon, clinic)
     WATERING_HOLE = "watering_hole" # business GOES to where customers gather (realtor, B2B)
+    MIXED = "mixed"                 # tight radius AND focused on specific pockets within it
+                                     # (e.g. a premium daycare: drop-off distance + affluent estates)
+    NON_LOCAL = "non_local"         # geography barely relevant — online-only, nationwide
+                                     # delivery, or a customer base outside the country
 
 
 class PinSource(str, Enum):

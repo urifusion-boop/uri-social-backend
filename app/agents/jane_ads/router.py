@@ -886,7 +886,8 @@ async def _build_campaign_plan(
     from .creative import creative_from_draft, creative_from_upload, generate_ad_creative, get_brand_context, write_shoot_script
     from .decision_engine import apply_platform_override, plan_campaign
     from .history import get_campaign_history, remembered_budget_ngn, remembered_business_name, remembered_category
-    from .nl import parse_message, to_campaign_request, NlUnavailableError
+    from .nl import to_campaign_request, NlUnavailableError
+    from .jane_consultant import consult
     from .policy import Severity, review_ad_creative
 
     if not (settings.META_AD_ACCOUNT_ID and settings.META_ADS_ACCESS_TOKEN):
@@ -920,11 +921,14 @@ async def _build_campaign_plan(
                       or brand_profile.get("industry", ""))
     known_budget = remembered_budget_ngn(history)
 
-    # 1. Jane reads the plain-English message. If the AI is unreachable (quota/outage),
+    # 1. Jane (the strategic consultant, jane-strategy-extraction v1.1.0) reads the
+    # accumulated brief — forms a hypothesis, hunts the intermediary/trigger, reasons
+    # about geography, and scales question depth to the budget tier — rather than
+    # extracting fields off a checklist. If the AI is unreachable (quota/outage),
     # surface a clear "try again later" instead of falling through to a follow-up
     # question — otherwise every answer re-triggers the same question (an infinite loop).
     try:
-        parsed = await parse_message(body.message, known_business_name, known_category)
+        parsed = await consult(body.message, known_business_name, known_category, known_budget)
     except NlUnavailableError:
         raise HTTPException(status_code=503, detail=_AI_DIFFICULTIES)
 
@@ -960,6 +964,15 @@ async def _build_campaign_plan(
         return {"early_return": {"stage": "advise", "understood": parsed.model_dump(),
                 "advice": result.advice.model_dump(), "trace": result.advice.trace}}
     plan = result.plan
+
+    # Consultant's own reasoning (jane-strategy-extraction §7.6/§8) — state the geography
+    # assumption back and flag any creative-fit concern, ahead of the deterministic
+    # engine's mechanical why, so the client sees the strategist's voice first.
+    consultant_notes = " ".join(filter(None, [
+        parsed.stated_plan, parsed.intermediary_note, parsed.creative_fit_warning,
+    ]))
+    if consultant_notes:
+        plan.explanation = f"{consultant_notes} {plan.explanation}"
 
     # 2.5. WhatsApp routing — the ad links to wa.me/<the brand's number>, so leads reach
     # the brand directly instead of the shared Page's inbox. Ask for it once (then it's
@@ -1016,16 +1029,27 @@ async def _build_campaign_plan(
     else:
         plan.platforms = [p for p in plan.platforms if p.platform == Platform.META]
 
-    # 3. Geo refinement (pin-and-pocket) — best-effort, never blocks planning.
+    # 3. Geo refinement — prefer the consultant's own §7 judgment (which of own-radius/
+    # watering-hole/mixed/non-local, and which named pockets), validated by real
+    # geocoding; fall back to the legacy heuristic if the consultant didn't set one
+    # (e.g. no city given at all). Best-effort — never blocks planning.
     geo_dump = None
-    if parsed.city:
-        try:
+    try:
+        if parsed.geo_mode:
+            from .geo import geo_plan_from_named_areas
+            geo_plan = await geo_plan_from_named_areas(
+                parsed.geo_mode, parsed.city, parsed.geo_areas, parsed.geo_explanation,
+            )
+            if geo_plan is not None:   # None for non_local — no geography to attach
+                plan.geo = geo_plan
+                geo_dump = geo_plan.model_dump()
+        elif parsed.city:
             from .geo import geo_for_request
             geo_plan = await geo_for_request(req.business_name, req.category, parsed.city, req.goal, req.description)
             plan.geo = geo_plan
             geo_dump = geo_plan.model_dump()
-        except Exception as e:
-            print(f"[oneshot] geo skipped: {e}", flush=True)
+    except Exception as e:
+        print(f"[oneshot] geo skipped: {e}", flush=True)
 
     # 4. The ad creative — Jane generates it, or the caller supplies their own upload/draft.
     business_name = req.business_name or body.business_name or "Your Business"
