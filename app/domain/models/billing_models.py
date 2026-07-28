@@ -321,10 +321,6 @@ class InitializePaymentRequest(BaseModel):
     currency: str = Field(default="NGN", description="NGN or USD")
     test_amount: Optional[int] = Field(None, description="Custom test amount in NGN (only for tier_id='test')")
     test_credits: Optional[int] = Field(None, description="Custom test credits (only for tier_id='test')")
-    for_inline_widget: bool = Field(
-        default=False,
-        description="True if the caller will open SQUAD's inline JS widget itself (skips server-side /transaction/initiate)"
-    )
 
     class Config:
         schema_extra = {
@@ -337,12 +333,8 @@ class InitializePaymentRequest(BaseModel):
 
 
 class InitializePaymentResponse(BaseModel):
-    """Response with SQUAD payment data for the frontend's inline widget"""
-    # The inline widget initiates its own transaction with SQUAD directly —
-    # we no longer pre-register via /transaction/initiate (doing so alongside
-    # the widget double-initiated the same transaction_ref and left the
-    # widget's popup hanging), so there's no separate hosted checkout URL.
-    payment_url: Optional[str] = Field(None, description="Unused — kept for API compatibility")
+    """Response with SQUAD payment data for inline modal"""
+    payment_url: str = Field(..., description="SQUAD hosted checkout page (fallback)")
     transaction_ref: str = Field(..., description="Reference for tracking")
     amount: int = Field(..., description="Payment amount in NGN")
     email: str = Field(..., description="Customer email")
@@ -374,10 +366,6 @@ class PurchaseCustomCreditsRequest(BaseModel):
     Credits are added as bonus_credits (never expire) once payment verifies.
     """
     quantity: int = Field(..., ge=1, le=1000, description="Number of credits to purchase (1-1000)")
-    for_inline_widget: bool = Field(
-        default=False,
-        description="True if the caller will open SQUAD's inline JS widget itself (skips server-side /transaction/initiate)"
-    )
 
     class Config:
         schema_extra = {
