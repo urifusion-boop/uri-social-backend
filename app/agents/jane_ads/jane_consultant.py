@@ -254,7 +254,20 @@ def _output_instructions() -> str:
         "real geo_mode with either geo_areas or an explicit non_local reason. These two are the "
         "ones a real media buyer NEVER guesses or skips, however deep into the conversation you "
         "are — if either is still missing, you MUST return stage=\"ask\" and request exactly the "
-        "missing one, no matter how many questions you've already asked."
+        "missing one, no matter how many questions you've already asked.\n\n"
+        "BUT — once budget_ngn (or desired_conversions) AND geography are BOTH genuinely "
+        "established, that is enough to build a first plan. Do not keep asking for MORE precision "
+        "on top of that:\n"
+        "- desired_conversions is a NICE-TO-HAVE, never a second requirement once budget_ngn is "
+        "real. If the client says something vague like \"as much as possible\" or \"as many as I "
+        "can get\", that means \"no specific target\" — leave desired_conversions null and move "
+        "on; do NOT ask again for an exact number.\n"
+        "- offer_type: if the category/business context already tells you what's being sold "
+        "(e.g. a social media marketing agency is obviously offering a SERVICE), infer it "
+        "yourself rather than asking again — only ask if it's genuinely ambiguous.\n"
+        "- Never ask two turns in a row for close variants of the same thing (e.g. \"what "
+        "service do you offer\" then \"can you specify the offer\") — if you already asked and "
+        "got any answer at all, however imperfect, use your best judgment and move forward."
     )
 
 
@@ -344,15 +357,20 @@ async def consult(message: str, business_name: str = "", category: str = "",
     )
     try:
         client = openai.AsyncOpenAI(api_key=settings.jane_ads_openai_key)
+        # This is a much harder job than the old mechanical field extraction (nl.py) —
+        # genuine multi-constraint synthesis and hypothesis tracking across turns.
+        # gpt-4o-mini was not reliably converging (re-asking near-identical questions
+        # even once budget and area were both already established); gpt-4o handles the
+        # long, nuanced system prompt far more coherently.
         resp = await client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4o",
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 *(history or []),
                 {"role": "user", "content": prompt},
             ],
-            timeout=25,
+            timeout=35,
         )
         data = json.loads(resp.choices[0].message.content or "{}")
     except Exception as e:
