@@ -42,7 +42,6 @@ import asyncio
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
-from urllib.parse import quote
 
 import httpx
 from motor.motor_asyncio import AsyncIOMotorDatabase
@@ -66,10 +65,6 @@ _CONVERSATION_ACTION_TYPE = "onsite_conversion.messaging_conversation_started_7d
 # is the honest, attributable number (vs. the old page-connected "conversations", which
 # both mis-routed leads AND over-counted button taps).
 _LINK_CLICK_ACTION_TYPE = "link_click"
-
-# Prefilled first message on the lead's WhatsApp, so the brand gets context, not a
-# blank "Hi". URL-encoded into the wa.me link at ad-creative time.
-_WA_PREFILL = "Hi! I saw your ad and I'm interested."
 
 # Meta processes uploaded video asynchronously (verified live: a short vertical
 # clip is typically ready in well under a minute) — poll rather than assume.
@@ -210,11 +205,12 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
             # attached ("Please specify the media to run with this ad"), so this
             # can't fall back to a text-only placeholder.
             raise ValueError("CampaignPlan.creative.image_url is required to launch a real Meta campaign")
-        # Without the brand's WhatsApp number there's nowhere for leads to go — the ad
-        # would link to a bare wa.me/. Blocked here too (the router gates on it first)
-        # so a missing number can never silently ship a dead-end ad.
-        if not plan.whatsapp_number:
-            raise ValueError("CampaignPlan.whatsapp_number is required — the ad links to wa.me/<number>")
+        # Click-to-WhatsApp routes conversations to the WhatsApp number connected to the
+        # ad's Facebook Page. That Page is the BRAND's own connected Page (page_id), so
+        # leads reach the brand — and it must be present, else there's nowhere to route.
+        # The router gates on it first; this is defense-in-depth.
+        if not plan.page_id:
+            raise ValueError("CampaignPlan.page_id is required — the brand's connected Facebook Page owns the WhatsApp leads route to")
         platform_plan = meta_plans[0]
 
         total_budget_ngn = min(platform_plan.budget_ngn, auth.funded_amount_ngn)
@@ -247,10 +243,11 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                 params={"access_token": self._access_token},
                 json={
                     "name": f"JaneAds-{plan.business_id}-{plan.goal.value}",
-                    # Traffic objective — the ad drives clicks to the brand's wa.me link.
-                    # (Was OUTCOME_ENGAGEMENT + page-connected WHATSAPP messaging, which
-                    # routed every brand's chats to the shared Page's one number.)
-                    "objective": "OUTCOME_TRAFFIC",
+                    # Click-to-WhatsApp (Engagement objective) — Meta optimizes delivery
+                    # toward people likely to actually MESSAGE, counts real conversations,
+                    # and routes them to the brand's connected Page's WhatsApp. Replaces the
+                    # wa.me traffic ad, which optimized for cheap clicks that never converted.
+                    "objective": "OUTCOME_ENGAGEMENT",
                     "status": "PAUSED",
                     "special_ad_categories": [],
                     # Budget lives on the ad set (per-business isolation via caps.py/
@@ -270,10 +267,12 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                     "campaign_id": campaign_id,
                     "daily_budget": daily_budget_minor,
                     "billing_event": "IMPRESSIONS",
-                    # Optimize for clicks on the wa.me link. No destination_type/
-                    # promoted_object — those are the Page-connected messaging setup that
-                    # forced every ad onto the shared Page's single WhatsApp number.
-                    "optimization_goal": "LINK_CLICKS",
+                    # Optimize for started WhatsApp conversations, routed to the brand's
+                    # own Page (destination_type WHATSAPP + promoted_object). Per-brand
+                    # routing works because each brand connects THEIR page (page_id).
+                    "optimization_goal": "CONVERSATIONS",
+                    "destination_type": "WHATSAPP",
+                    "promoted_object": {"page_id": plan.page_id},
                     "bid_strategy": "LOWEST_COST_WITHOUT_CAP",
                     "targeting": {"geo_locations": {"countries": ["NG"]}},
                     "status": "PAUSED",
@@ -286,12 +285,10 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
             adset_id = adset_data["id"]
 
             message = plan.creative.primary_text or plan.creative.headline or "Chat with us on WhatsApp!"
-            # The deep link that actually delivers the lead to the brand: opens WhatsApp
-            # straight to their number with a prefilled first message. `CONTACT_US` is a
-            # valid link-ad CTA (the page-connected `WHATSAPP_MESSAGE` CTA is only for the
-            # messaging-destination flow we deliberately moved off of).
-            wa_link = f"https://wa.me/{plan.whatsapp_number}?text={quote(_WA_PREFILL)}"
-            cta = {"type": "CONTACT_US", "value": {"link": wa_link}}
+            # Click-to-WhatsApp creative: the WHATSAPP_MESSAGE CTA + the ad set's WHATSAPP
+            # destination route the tap into a WhatsApp chat with the Page's connected
+            # number. The link is a formality (Meta uses the Page's WhatsApp, not this URL).
+            cta = {"type": "WHATSAPP_MESSAGE"}
             if plan.creative.is_video:
                 object_story_spec = {
                     "page_id": plan.page_id,
@@ -307,7 +304,7 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                     "page_id": plan.page_id,
                     "link_data": {
                         "message": message,
-                        "link": wa_link,
+                        "link": "https://wa.me/",
                         "picture": plan.creative.image_url,
                         "call_to_action": cta,
                     },
@@ -407,7 +404,7 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
         """Meta's projected audience size for a targeting spec + optimization goal, used
         to show a real reach range on the campaign summary (Tier C). Best-effort: returns
         None on any failure (the summary just omits reach rather than blocking the plan).
-        Matched to what a wa.me traffic ad actually optimizes for (LINK_CLICKS). Pass the
+        Matched to what the Click-to-WhatsApp ad optimizes for (CONVERSATIONS). Pass the
         campaign's real `targeting` (geo pins) so the reach reflects the actual audience,
         not all of Nigeria — falls back to country-level if none is given."""
         import json as _json
@@ -418,7 +415,7 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                     f"{self._graph_base}/act_{self._ad_account_id}/delivery_estimate",
                     params={
                         "access_token": self._access_token,
-                        "optimization_goal": "LINK_CLICKS",
+                        "optimization_goal": "CONVERSATIONS",
                         "targeting_spec": _json.dumps(targeting),
                     },
                 )
