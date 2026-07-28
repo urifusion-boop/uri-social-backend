@@ -247,7 +247,14 @@ def _output_instructions() -> str:
         "}\n"
         "Do NOT invent budget_ngn/desired_conversions — leave null if genuinely not stated. Do "
         "NOT assert a specific place name as verified fact; phrase geo_areas/stated_plan as "
-        "suggestions the client can correct."
+        "suggestions the client can correct.\n\n"
+        "NON-NEGOTIABLE before you say \"ready\": you must have a REAL budget_ngn or "
+        "desired_conversions THE CLIENT STATED FOR THIS CAMPAIGN (a remembered past campaign's "
+        "spend does not count — you may offer it as a suggestion, but never assume it), AND a "
+        "real geo_mode with either geo_areas or an explicit non_local reason. These two are the "
+        "ones a real media buyer NEVER guesses or skips, however deep into the conversation you "
+        "are — if either is still missing, you MUST return stage=\"ask\" and request exactly the "
+        "missing one, no matter how many questions you've already asked."
     )
 
 
@@ -305,29 +312,25 @@ async def consult(message: str, business_name: str = "", category: str = "",
     if category:
         known_bits.append(f"category: {category}")
     if known_budget:
-        known_bits.append(f"last campaign they spent ₦{known_budget:,.0f}")
+        known_bits.append(f"last campaign they spent ₦{known_budget:,.0f} (a PAST campaign — "
+                          "do not treat this as THIS campaign's budget; you may offer it as a "
+                          "suggestion, but only a budget the client states for THIS campaign counts)")
     known_line = (f"Already known about this client — {', '.join(known_bits)}."
                   if known_bits else "Nothing known about this client yet.")
 
-    # A hard nudge on the question cap (system prompt §4/§5.5). Left to its own judgment
-    # across a long conversation, gpt-4o-mini keeps finding one more thing to ask instead
-    # of converging — even re-asking for a budget it already wrote down in its own prior
-    # turn. Count what's ACTUALLY been asked (assistant turns in real history) and force
-    # a decision once that count is high, or once a budget number has appeared anywhere.
+    # A light nudge against genuinely unbounded looping — only once the conversation is
+    # ACTUALLY long (real questions asked, not a remembered past budget or an incidental
+    # digit). budget_ngn/desired_conversions and geography are still HARD requirements
+    # (enforced below in code, not just prompted) regardless of this nudge, because an
+    # earlier, more aggressive version of this nudge caused Jane to skip budget and area
+    # entirely and fabricate a plan — never repeat that failure mode.
     questions_asked = sum(1 for t in (history or []) if t.get("role") == "assistant")
-    budget_seen = bool(known_budget) or any(
-        ch.isdigit() for t in (history or []) if t.get("role") in ("user", "assistant") for ch in t.get("content", "")
-    )
     cap_nudge = ""
-    if questions_asked >= 2 or (questions_asked >= 1 and budget_seen):
+    if questions_asked >= 5:
         cap_nudge = (
-            f"\n\nYou have already asked {questions_asked} question(s) in this conversation "
-            "(see the turns above) — you are AT OR PAST this budget tier's question cap. "
-            "You MUST return stage=\"ready\" now. Use the most reasonable value already "
-            "mentioned anywhere above (by you OR the client) for anything unclear — including "
-            "budget_ngn if any Naira figure was mentioned in your own earlier turns — and state "
-            "any assumption plainly in stated_plan. Do not ask another question that resembles "
-            "one you already asked."
+            f"\n\nYou have asked {questions_asked} questions already — that's a lot for any "
+            "tier. If you genuinely still lack the budget or the area/geography, ask for "
+            "EXACTLY that (nothing else) one more time. Otherwise converge now."
         )
 
     # `message` is the frontend's flattened "brief so far" (every user reply in this
@@ -356,7 +359,50 @@ async def consult(message: str, business_name: str = "", category: str = "",
         print(f"[Consultant] error: {e}", flush=True)
         raise NlUnavailableError(str(e)) from e
 
-    return _coerce(data, business_name, category)
+    brief = _coerce(data, business_name, category)
+    return _enforce_hard_requirements(brief, message, history or [], known_budget)
+
+
+def _budget_grounded(amount: Optional[float], known_budget: Optional[float],
+                     message: str, history: list[dict]) -> bool:
+    """True if `amount` is actually something the CLIENT said in this conversation, not
+    the model silently carrying forward a remembered past campaign's spend. A budget
+    that differs from the remembered figure is presumably new and trusted outright; one
+    that matches it exactly only counts if the client's OWN words contain that number
+    (not just Jane's paraphrase of it)."""
+    if amount is None or amount <= 0:
+        return False
+    if known_budget is None or abs(amount - known_budget) > 1:
+        return True
+    needle = str(int(amount))
+    client_texts = [message] + [t.get("content", "") for t in history if t.get("role") == "user"]
+    return any(needle in txt for txt in client_texts)
+
+
+def _enforce_hard_requirements(brief: ConsultantBrief, message: str, history: list[dict],
+                               known_budget: Optional[float]) -> ConsultantBrief:
+    """A real media buyer never guesses or skips the budget and the area — enforced HERE,
+    not just prompted, because prompting alone already let two failure modes through
+    once: treating a remembered past-campaign spend as this campaign's confirmed budget,
+    and skipping geography/area entirely. If the model's "ready" claim doesn't actually
+    satisfy both, downgrade it back to "ask" for exactly the missing one."""
+    if brief.missing or brief.clarify:
+        return brief   # already an "ask" — nothing to enforce
+
+    if not (brief.desired_conversions or _budget_grounded(brief.budget_ngn, known_budget, message, history)):
+        return ConsultantBrief(
+            business_name=brief.business_name, category=brief.category,
+            goal=brief.goal, offer_type=brief.offer_type,
+            clarify="What budget would you like to spend on this specific campaign?",
+        )
+    if not brief.geo_mode and not brief.city:
+        return ConsultantBrief(
+            business_name=brief.business_name, category=brief.category,
+            goal=brief.goal, offer_type=brief.offer_type,
+            budget_ngn=brief.budget_ngn, desired_conversions=brief.desired_conversions,
+            clarify="Which area or city should I focus this campaign on — or is location not really relevant for this business?",
+        )
+    return brief
 
 
 def _coerce(data: dict, business_name: str, category: str) -> ConsultantBrief:
