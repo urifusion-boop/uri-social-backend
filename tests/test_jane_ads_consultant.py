@@ -5,7 +5,7 @@ JSON — in both the "ask" and "ready" shapes — normalizes correctly into a
 ConsultantBrief, and that the result stays a valid ParsedCampaign so
 to_campaign_request() keeps working unchanged downstream.
 """
-from app.agents.jane_ads.jane_consultant import ConsultantBrief, _coerce
+from app.agents.jane_ads.jane_consultant import ConsultantBrief, _coerce, build_history_turns
 from app.agents.jane_ads.nl import to_campaign_request
 
 
@@ -93,3 +93,53 @@ def test_desired_conversions_backwards_budget_still_works():
                 "desired_conversions": 20}, "", "")
     assert b.desired_conversions == 20
     assert b.budget_ngn is None
+
+
+# ── build_history_turns — the real conversation memory fix ────────────────────
+# Without this, the consultant only ever saw the frontend's flattened "brief so far"
+# (the CLIENT's fragments jammed together with no idea which answer matched which
+# question), and looped re-asking the same ground forever. This turns saved chat
+# messages into real, ordered role/content pairs so the model can track state.
+
+def test_text_messages_become_ordered_turns():
+    saved = [
+        {"role": "user", "kind": "text", "text": "hey"},
+        {"role": "jane", "kind": "text", "text": "What are you advertising?"},
+        {"role": "user", "kind": "text", "text": "the product"},
+    ]
+    turns = build_history_turns(saved)
+    assert turns == [
+        {"role": "user", "content": "hey"},
+        {"role": "assistant", "content": "What are you advertising?"},
+        {"role": "user", "content": "the product"},
+    ]
+
+
+def test_result_with_question_becomes_an_assistant_turn():
+    saved = [{"role": "jane", "kind": "result", "result": {"stage": "need_more", "question": "What's your budget?"}}]
+    turns = build_history_turns(saved)
+    assert turns == [{"role": "assistant", "content": "What's your budget?"}]
+
+
+def test_result_planned_becomes_a_summarized_assistant_turn():
+    saved = [{"role": "jane", "kind": "result", "result": {
+        "stage": "planned", "plan": {"explanation": "Targeting Lekki estates for solar leads."},
+    }}]
+    turns = build_history_turns(saved)
+    assert len(turns) == 1
+    assert turns[0]["role"] == "assistant"
+    assert "Targeting Lekki estates" in turns[0]["content"]
+
+
+def test_empty_text_is_skipped():
+    saved = [{"role": "user", "kind": "text", "text": "   "}, {"role": "user", "kind": "text", "text": "real answer"}]
+    turns = build_history_turns(saved)
+    assert turns == [{"role": "user", "content": "real answer"}]
+
+
+def test_caps_to_last_24_turns():
+    saved = [{"role": "user", "kind": "text", "text": f"turn {i}"} for i in range(30)]
+    turns = build_history_turns(saved)
+    assert len(turns) == 24
+    assert turns[0]["content"] == "turn 6"
+    assert turns[-1]["content"] == "turn 29"
