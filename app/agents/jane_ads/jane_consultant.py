@@ -256,11 +256,42 @@ _NO_BUSINESS_CLARIFY = (
 )
 
 
+def build_history_turns(saved: list[dict]) -> list[dict]:
+    """Turn a thread's saved chat messages into real OpenAI turns (role/content pairs),
+    oldest first. Without this, the consultant only ever sees the frontend's flattened
+    "brief so far" — a bag of the CLIENT's own fragments with no idea which answer went
+    with which question ("the product. 100. individuals. lekki. yes. yes.") — and can
+    never converge, re-asking overlapping questions forever. Jane's own prior questions
+    (kind="text" or a "result" carrying `question`) become assistant turns so the model
+    can actually track what it already asked and what was answered."""
+    turns: list[dict] = []
+    for m in saved:
+        role = m.get("role")
+        kind = m.get("kind")
+        if kind == "text":
+            text = (m.get("text") or "").strip()
+            if text:
+                turns.append({"role": "user" if role == "user" else "assistant", "content": text})
+        elif kind == "result" and role == "jane":
+            result = m.get("result") or {}
+            if result.get("question"):
+                turns.append({"role": "assistant", "content": result["question"]})
+            elif result.get("stage") in ("planned", "launched"):
+                expl = ((result.get("plan") or {}).get("explanation") or "").strip()
+                if expl:
+                    turns.append({"role": "assistant", "content": f"[I presented a plan: {expl[:500]}]"})
+    return turns[-24:]   # cap context size — recent turns matter most
+
+
 async def consult(message: str, business_name: str = "", category: str = "",
-                  known_budget: Optional[float] = None) -> ConsultantBrief:
-    """One consultant turn. Raises NlUnavailableError if the model call fails — same
-    contract as nl.py's parse_message, so an outage never masquerades as a 'need more
-    info' follow-up (the caller surfaces it as a clear 503 instead)."""
+                  known_budget: Optional[float] = None,
+                  history: Optional[list[dict]] = None) -> ConsultantBrief:
+    """One consultant turn. `history` — the real prior turns of THIS conversation
+    (see build_history_turns) — is what lets the consultant actually track state
+    across turns instead of re-deriving confusion from a jumbled flat string each
+    time. Raises NlUnavailableError if the model call fails — same contract as
+    nl.py's parse_message, so an outage never masquerades as a 'need more info'
+    follow-up (the caller surfaces it as a clear 503 instead)."""
     if not settings.jane_ads_openai_key:
         raise NlUnavailableError("OPENAI_API_KEY is not configured")
     if not (message or "").strip():
@@ -278,10 +309,35 @@ async def consult(message: str, business_name: str = "", category: str = "",
     known_line = (f"Already known about this client — {', '.join(known_bits)}."
                   if known_bits else "Nothing known about this client yet.")
 
+    # A hard nudge on the question cap (system prompt §4/§5.5). Left to its own judgment
+    # across a long conversation, gpt-4o-mini keeps finding one more thing to ask instead
+    # of converging — even re-asking for a budget it already wrote down in its own prior
+    # turn. Count what's ACTUALLY been asked (assistant turns in real history) and force
+    # a decision once that count is high, or once a budget number has appeared anywhere.
+    questions_asked = sum(1 for t in (history or []) if t.get("role") == "assistant")
+    budget_seen = bool(known_budget) or any(
+        ch.isdigit() for t in (history or []) if t.get("role") in ("user", "assistant") for ch in t.get("content", "")
+    )
+    cap_nudge = ""
+    if questions_asked >= 2 or (questions_asked >= 1 and budget_seen):
+        cap_nudge = (
+            f"\n\nYou have already asked {questions_asked} question(s) in this conversation "
+            "(see the turns above) — you are AT OR PAST this budget tier's question cap. "
+            "You MUST return stage=\"ready\" now. Use the most reasonable value already "
+            "mentioned anywhere above (by you OR the client) for anything unclear — including "
+            "budget_ngn if any Naira figure was mentioned in your own earlier turns — and state "
+            "any assumption plainly in stated_plan. Do not ask another question that resembles "
+            "one you already asked."
+        )
+
+    # `message` is the frontend's flattened "brief so far" (every user reply in this
+    # conversation, concatenated) — redundant with `history` above when history is
+    # present, but the only signal at all on the very first turn. Framed as a summary,
+    # not "their latest message", so the model doesn't mistake it for one new answer.
     prompt = (
         f"{known_line}\n\n"
-        "The client's message so far (their full brief, accumulated across this "
-        f'conversation): "{message}"\n\n{_output_instructions()}'
+        f'Everything the client has told you so far, summarized: "{message}"'
+        f"{cap_nudge}\n\n{_output_instructions()}"
     )
     try:
         client = openai.AsyncOpenAI(api_key=settings.jane_ads_openai_key)
@@ -290,6 +346,7 @@ async def consult(message: str, business_name: str = "", category: str = "",
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
+                *(history or []),
                 {"role": "user", "content": prompt},
             ],
             timeout=25,

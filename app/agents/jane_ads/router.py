@@ -887,7 +887,8 @@ async def _build_campaign_plan(
     from .decision_engine import apply_platform_override, plan_campaign
     from .history import get_campaign_history, remembered_budget_ngn, remembered_business_name, remembered_category
     from .nl import to_campaign_request, NlUnavailableError
-    from .jane_consultant import consult
+    from .jane_consultant import build_history_turns, consult
+    from .threads import thread_history
     from .policy import Severity, review_ad_creative
 
     if not (settings.META_AD_ACCOUNT_ID and settings.META_ADS_ACCESS_TOKEN):
@@ -922,13 +923,20 @@ async def _build_campaign_plan(
     known_budget = remembered_budget_ngn(history)
 
     # 1. Jane (the strategic consultant, jane-strategy-extraction v1.1.0) reads the
-    # accumulated brief — forms a hypothesis, hunts the intermediary/trigger, reasons
-    # about geography, and scales question depth to the budget tier — rather than
-    # extracting fields off a checklist. If the AI is unreachable (quota/outage),
-    # surface a clear "try again later" instead of falling through to a follow-up
-    # question — otherwise every answer re-triggers the same question (an infinite loop).
+    # REAL turn-by-turn conversation — forms a hypothesis, hunts the intermediary/
+    # trigger, reasons about geography, and scales question depth to the budget tier
+    # — rather than extracting fields off a checklist. The frontend's own flattened
+    # "brief so far" string is only the client's fragments with no idea which answer
+    # matched which question; feeding ONLY that (no history) made her re-ask the same
+    # ground forever. Fetch this thread's saved messages (Jane's own prior questions
+    # included) so she can actually track what's already been established.
+    thread_turns = (build_history_turns(await thread_history(db, brand_ctx.get("brand_id"), body.thread_id))
+                    if body.thread_id else [])
+    # If the AI is unreachable (quota/outage), surface a clear "try again later"
+    # instead of falling through to a follow-up question — otherwise every answer
+    # re-triggers the same question (an infinite loop).
     try:
-        parsed = await consult(body.message, known_business_name, known_category, known_budget)
+        parsed = await consult(body.message, known_business_name, known_category, known_budget, thread_turns)
     except NlUnavailableError:
         raise HTTPException(status_code=503, detail=_AI_DIFFICULTIES)
 
