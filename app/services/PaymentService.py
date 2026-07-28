@@ -611,8 +611,9 @@ class PaymentService:
         }
         """
         # Verify webhook signature (SQUAD HMAC-SHA512 via x-squad-encrypted-body header)
-        if signature and self.squad_secret_key:
-            if not self._verify_webhook_signature(payload, signature):
+        if signature:
+            creds = await self._get_squad_credentials()
+            if not self._verify_webhook_signature(payload, signature, creds["secret_key"]):
                 raise ValueError("Invalid webhook signature")
 
         # SQUAD webhook structure: Event + TransactionRef + Body
@@ -654,7 +655,7 @@ class PaymentService:
 
         return False
 
-    def _verify_webhook_signature(self, payload: Dict, signature: str) -> bool:
+    def _verify_webhook_signature(self, payload: Dict, signature: str, secret_key: str) -> bool:
         """
         Verify SQUAD webhook signature using HMAC-SHA512
 
@@ -669,7 +670,7 @@ class PaymentService:
 
         # Create HMAC-SHA512 hash
         expected_signature = hmac.new(
-            self.squad_secret_key.encode('utf-8'),
+            secret_key.encode('utf-8'),
             payload_string.encode('utf-8'),
             hashlib.sha512
         ).hexdigest().upper()  # SQUAD sends signature in UPPERCASE
