@@ -333,44 +333,104 @@ def _as_ad_content(image_prompt: str, brand_context: Optional[dict] = None) -> s
     )
 
 
-async def generate_ad_image(image_prompt: str, brand_context: Optional[dict] = None) -> Optional[str]:
-    """Generate the ad image with gpt-image-1, enriched with the brand's colours/
-    voice/region pulled from the same playbook normal posts use — a direct, literal
-    call so the "no on-image text" rule is never at the mercy of another pipeline's
-    own creative judgment. When the brand has a logo, it's composited onto the
-    finished image afterward — the SAME real pixel-logo overlay normal content
-    generation uses (ImageContentService._overlay_logo), not an AI reinterpretation.
-    Returns a Cloudinary URL, or None on failure."""
-    if not settings.jane_ads_openai_key or not image_prompt.strip():
+async def generate_ad_image(content: str, brand_context: Optional[dict] = None,
+                            seed: str = "") -> Optional[str]:
+    """Generate the ad image using the SAME content engine normal posts use
+    (ImageContentService._generate_platform_image) — richer, on-brand visuals than a bare
+    gpt-image-1 call, which is what the ad flow wanted (Jane's own images weren't good
+    enough). Rendered 9:16 (story) for ad placements, with the brand playbook applied by
+    the engine (colours, fonts, logo). Returns a hosted URL, or None on failure.
+
+    `content` is the theme/message the image should convey; `seed` is an optional scene
+    hint. The engine may render brand text into the graphic (that's how organic content
+    looks) — the ad's headline/primary_text are still separate fields the platform overlays."""
+    if not (content or "").strip():
         return None
     bc = brand_context or {}
-    full_prompt = _as_ad_content(image_prompt, bc)
     try:
-        client = openai.AsyncOpenAI(api_key=settings.jane_ads_openai_key)
-        resp = await client.images.generate(
-            model="gpt-image-1", prompt=full_prompt, size="1024x1536", quality="medium", n=1,
+        from app.agents.social_media_manager.services.image_content_service import ImageContentService
+        result = await ImageContentService._generate_platform_image(
+            platform="instagram",
+            content=content,
+            seed_content=seed or content,
+            brand_context=bc,
+            image_type="story",
         )
-        b64 = resp.data[0].b64_json if resp.data else None
-        if not b64:
-            return None
-
-        logo_url = bc.get("logo_url")
-        ext, content_type = "png", "image/png"
-        if logo_url:
-            from app.agents.social_media_manager.services.image_content_service import ImageContentService
-            import asyncio
-            b64 = await asyncio.to_thread(
-                ImageContentService._overlay_logo, b64, logo_url,
-                bc.get("logo_position", "bottom_right"), bc.get("logo_size", "small"),
-            )
-            ext, content_type = "webp", "image/webp"  # _overlay_logo always re-encodes as WEBP
-
-        import base64
-        img_bytes = base64.b64decode(b64)
-        return await _upload_bytes_to_cloudinary(img_bytes, f"ad-{uuid.uuid4().hex[:12]}", ext=ext, content_type=content_type)
+        if result.get("status"):
+            return (result.get("responseData") or {}).get("image_url")
+        print(f"[Creative] content-engine image failed: {result.get('error')}", flush=True)
+        return None
     except Exception as e:
         print(f"[Creative] image error: {e}", flush=True)
         return None
+
+
+async def describe_ad_image(image_url: str) -> str:
+    """One-sentence description of what a generated/uploaded image actually shows, via a
+    vision model — so the caption written afterward references the real visual instead of
+    being written blind. Best-effort; '' on any failure."""
+    if not settings.jane_ads_openai_key or not (image_url or "").strip():
+        return ""
+    try:
+        client = openai.AsyncOpenAI(api_key=settings.jane_ads_openai_key)
+        resp = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": [
+                {"type": "text", "text": (
+                    "Describe what this image shows in ONE concrete sentence — subject, "
+                    "setting, mood, and any visible text. This will be used to write a "
+                    "matching ad caption.")},
+                {"type": "image_url", "image_url": {"url": image_url}},
+            ]}],
+            timeout=20,
+        )
+        return (resp.choices[0].message.content or "").strip()
+    except Exception as e:
+        print(f"[Creative] image describe error: {e}", flush=True)
+        return ""
+
+
+async def write_ad_copy_for_image(image_summary: str, business_name: str, category: str,
+                                  goal: str = "messages", description: str = "",
+                                  brand_context: Optional[dict] = None) -> AdCopy:
+    """Write the headline + primary text to MATCH a specific image (its vision description),
+    so the caption references what's actually on screen instead of a generic line. Returns
+    an AdCopy with only headline + primary_text set."""
+    if not settings.jane_ads_openai_key or not image_summary.strip():
+        return AdCopy()
+    bc = brand_context or {}
+    brand_bits = _brand_prompt_bits(bc)
+    prompt = (
+        f"Write the copy for a Meta/Instagram ad for "
+        f"'{business_name or bc.get('brand_name') or 'a business'}' (a "
+        f"{category or 'local business'}) whose goal is {goal}. The ad drives people to "
+        f"message the business on WhatsApp.{(' ' + brand_bits) if brand_bits else ''}\n"
+        f"The ad's IMAGE shows: {image_summary}.\n"
+        f"Context: {description or 'none'}\n"
+        "Write copy that clearly connects to what's in the image above — the headline and "
+        "body should feel like they belong with that visual, not generic.\n"
+        "Return JSON with:\n"
+        "- headline: punchy, <= 5 words, no ALL CAPS, no emoji spam\n"
+        "- primary_text: 1–2 warm, concrete sentences in the brand voice above if given, "
+        "referencing what the image shows\n"
+        "Return ONLY the JSON."
+    )
+    try:
+        client = openai.AsyncOpenAI(api_key=settings.jane_ads_openai_key)
+        resp = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            response_format={"type": "json_object"},
+            messages=[{"role": "user", "content": prompt}],
+            timeout=15,
+        )
+        d = json.loads(resp.choices[0].message.content or "{}")
+        return AdCopy(
+            headline=str(d.get("headline", "")).strip(),
+            primary_text=str(d.get("primary_text", "")).strip(),
+        )
+    except Exception as e:
+        print(f"[Creative] image-matched copy error: {e}", flush=True)
+        return AdCopy()
 
 
 # ── Source 3: DRAFT — reuse an existing content draft ─────────────────────────
@@ -470,7 +530,21 @@ async def generate_ad_creative(
     to copy-only if image generation fails."""
     brand_context = await get_brand_context(user_id, db, brand_id) if user_id else {}
     copy = await write_ad_copy(business_name, category, goal, description, brand_context, city, behaviour)
-    image_url = await generate_ad_image(copy.image_prompt, brand_context)
+    # Image via the SAME content engine normal posts use (better visuals). Seed it with the
+    # scene idea; content conveys the theme/message so the graphic is on-topic.
+    content_for_image = copy.primary_text or copy.image_prompt or f"{business_name} — {description or category}"
+    image_url = await generate_ad_image(content_for_image, brand_context, seed=copy.image_prompt)
+    # Caption LAST, matched to the actual generated image (vision) so it references the
+    # real visual instead of a generic line ("caption doesn't add up"). Falls back to the
+    # original copy if the vision pass fails.
+    if image_url:
+        summary = await describe_ad_image(image_url)
+        if summary:
+            matched = await write_ad_copy_for_image(summary, business_name, category, goal, description, brand_context)
+            if matched.headline:
+                copy.headline = matched.headline
+            if matched.primary_text:
+                copy.primary_text = matched.primary_text
     return assemble_creative(copy, image_url, source=CreativeSource.GENERATE)
 
 
@@ -484,7 +558,13 @@ async def creative_from_upload(
     the creative directly; Jane still writes fresh copy to match it. No location
     grounding needed — the media IS the real place already."""
     brand_context = await get_brand_context(user_id, db, brand_id) if user_id else {}
-    copy = await write_ad_copy(business_name, category, goal, description, brand_context)
+    # Caption matched to what the uploaded photo actually shows (skip for video — no still
+    # to describe), so the copy references the real visual.
+    summary = "" if is_video else await describe_ad_image(image_url)
+    if summary:
+        copy = await write_ad_copy_for_image(summary, business_name, category, goal, description, brand_context)
+    else:
+        copy = await write_ad_copy(business_name, category, goal, description, brand_context)
     return assemble_creative(copy, image_url, source=CreativeSource.UPLOAD, is_video=is_video)
 
 
@@ -498,5 +578,8 @@ async def creative_from_draft(
     if draft is None or not draft["image_url"]:
         return None
     brand_context = await get_brand_context(user_id, db, brand_id)
-    copy = await write_ad_copy(business_name, category, goal, draft["content"], brand_context)
+    # Caption matched to what the chosen draft image shows, falling back to the draft's
+    # own text if the vision pass fails.
+    summary = await describe_ad_image(draft["image_url"]) or draft["content"]
+    copy = await write_ad_copy_for_image(summary, business_name, category, goal, draft["content"], brand_context)
     return assemble_creative(copy, draft["image_url"], source=CreativeSource.DRAFT)
