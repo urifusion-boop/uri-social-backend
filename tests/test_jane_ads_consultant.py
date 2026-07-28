@@ -5,7 +5,9 @@ JSON — in both the "ask" and "ready" shapes — normalizes correctly into a
 ConsultantBrief, and that the result stays a valid ParsedCampaign so
 to_campaign_request() keeps working unchanged downstream.
 """
-from app.agents.jane_ads.jane_consultant import ConsultantBrief, _coerce, build_history_turns
+from app.agents.jane_ads.jane_consultant import (
+    ConsultantBrief, _budget_grounded, _coerce, _enforce_hard_requirements, build_history_turns,
+)
 from app.agents.jane_ads.nl import to_campaign_request
 
 
@@ -143,3 +145,71 @@ def test_caps_to_last_24_turns():
     assert len(turns) == 24
     assert turns[0]["content"] == "turn 6"
     assert turns[-1]["content"] == "turn 29"
+
+
+# ── _budget_grounded / _enforce_hard_requirements ──────────────────────────────
+# Regression coverage for a REAL bug found in live testing: the model treated a
+# remembered past campaign's spend as if the client had restated it THIS campaign,
+# and separately skipped geography entirely — both must be code-enforced, not just
+# prompted, since prompting alone already let both through once.
+
+def test_budget_grounded_when_no_remembered_budget():
+    assert _budget_grounded(5000, None, "budget is 5000", []) is True
+
+
+def test_budget_grounded_when_it_differs_from_remembered():
+    # A genuinely different figure is presumed to come from THIS conversation.
+    assert _budget_grounded(10000, 5000, "anything", []) is True
+
+
+def test_budget_not_grounded_when_it_matches_remembered_and_client_never_said_it():
+    # This is the exact bug: Jane silently carried forward a past campaign's ₦5,000
+    # spend without the client ever restating it for the new campaign.
+    history = [{"role": "assistant", "content": "Last time you spent ₦5,000, want the same?"}]
+    assert _budget_grounded(5000, 5000, "yes sure", history) is False
+
+
+def test_budget_grounded_when_client_actually_restates_the_remembered_figure():
+    history = [{"role": "user", "content": "yes 5000 sounds good"}]
+    assert _budget_grounded(5000, 5000, "yes 5000 sounds good", history) is True
+
+
+def test_budget_not_grounded_when_none_or_zero():
+    assert _budget_grounded(None, None, "x", []) is False
+    assert _budget_grounded(0, None, "x", []) is False
+
+
+def test_enforce_downgrades_to_ask_when_budget_not_grounded():
+    ready = ConsultantBrief(business_name="Mama Kitchen", offer_type="product", budget_ngn=5000)
+    result = _enforce_hard_requirements(ready, "hey", [], known_budget=5000)
+    assert result.clarify
+    assert "budget" in result.clarify.lower()
+    assert to_campaign_request(result) is None
+
+
+def test_enforce_downgrades_to_ask_when_geography_missing():
+    ready = ConsultantBrief(business_name="Mama Kitchen", offer_type="product", budget_ngn=10000)
+    result = _enforce_hard_requirements(ready, "budget is 10000", [], known_budget=None)
+    assert result.clarify
+    assert "area" in result.clarify.lower() or "city" in result.clarify.lower()
+
+
+def test_enforce_passes_through_when_both_requirements_met():
+    ready = ConsultantBrief(business_name="Mama Kitchen", offer_type="product",
+                            budget_ngn=10000, city="Surulere", geo_mode="own_radius")
+    result = _enforce_hard_requirements(ready, "budget is 10000 in Surulere", [], known_budget=None)
+    assert result.city == "Surulere"
+    assert to_campaign_request(result) is not None
+
+
+def test_enforce_passes_through_non_local_without_a_city():
+    ready = ConsultantBrief(business_name="OnlineShop", offer_type="product",
+                            budget_ngn=10000, geo_mode="non_local")
+    result = _enforce_hard_requirements(ready, "budget is 10000, we ship nationwide", [], known_budget=None)
+    assert result.geo_mode == "non_local"
+
+
+def test_enforce_leaves_an_ask_stage_untouched():
+    asking = ConsultantBrief(clarify="What's your budget?")
+    result = _enforce_hard_requirements(asking, "hey", [], known_budget=None)
+    assert result is asking
