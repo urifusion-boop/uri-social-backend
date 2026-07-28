@@ -842,6 +842,9 @@ class MetaLaunchFromMessageBody(BaseModel):
     reference_image_url: str = ""         # required for creative_source=upload (from /creative/upload)
     is_video: bool = False                # is reference_image_url a video?
     draft_id: str = ""                    # required for creative_source=draft (from /creative/drafts)
+    reuse_image_url: str = ""             # a refinement — keep the prior plan's image instead of
+                                          # regenerating (a targeting/budget tweak shouldn't burn a
+                                          # credit or swap the visual). Ignored for upload/draft.
     whatsapp_number: str = ""             # the brand's WhatsApp number leads route to; stored on
                                           # the brand and reused, so it's only ever asked once
     thread_id: str = ""                   # the campaign thread this plan belongs to (Tier E),
@@ -1036,6 +1039,14 @@ async def _build_campaign_plan(
         )
         if creative is None:
             raise HTTPException(status_code=404, detail="Draft not found or has no image")
+    elif body.reuse_image_url:
+        # Refinement of an existing plan (e.g. "target lagos and abuja", "make it ₦10k") —
+        # keep the image from the prior plan. Copy is still rewritten to match any changed
+        # brief, but no image is generated, so no content credit is spent.
+        creative = await creative_from_upload(
+            business_name, category, body.reuse_image_url, req.goal.value, req.description,
+            user_id=user_id, db=db, brand_id=brand_id, is_video=False,
+        )
     else:
         # AI generation is the one creative path that costs a content credit — an
         # uploaded photo/video or a reused draft (PRD §5.1) doesn't touch this at all.
