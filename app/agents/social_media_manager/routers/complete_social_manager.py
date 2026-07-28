@@ -158,7 +158,7 @@ class StoryboardFramesRequest(BaseModel):
 
 class PublishVideoDraftRequest(BaseModel):
     draft_id: str
-    platform: str   # "instagram_reels" | "facebook_reels"
+    platform: str   # "instagram_reels" | "facebook_reels" | "tiktok"
     caption: Optional[str] = None
 
 class VideoFromStoryboardRequest(BaseModel):
@@ -5854,8 +5854,8 @@ async def publish_video_draft(
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    # Only Instagram and Facebook supported
-    SUPPORTED = {"instagram_reels", "facebook_reels"}
+    # Only Instagram, Facebook, and TikTok supported
+    SUPPORTED = {"instagram_reels", "facebook_reels", "tiktok"}
     if request.platform not in SUPPORTED:
         raise HTTPException(status_code=400, detail=f"Platform '{request.platform}' is not yet supported. Supported: {', '.join(SUPPORTED)}")
 
@@ -5878,6 +5878,7 @@ async def publish_video_draft(
     # facebook_reels  → look for "facebook" first; fall back to "instagram" because the
     #                   Instagram OAuth flow stores a Facebook Page access token that can
     #                   also be used to post videos to the Facebook Page.
+    # tiktok          → look for an Outstand-connected "tiktok" account (no direct API).
     if request.platform == "instagram_reels":
         conn = await db["social_connections"].find_one(
             {"user_id": user_id, "platform": "instagram"},
@@ -5887,6 +5888,13 @@ async def publish_video_draft(
             raise HTTPException(status_code=400, detail="No connected Instagram account found. Please connect your account first.")
         if not conn.get("ig_user_id"):
             raise HTTPException(status_code=400, detail="Instagram account missing ig_user_id. Please reconnect.")
+    elif request.platform == "tiktok":
+        conn = await db["social_connections"].find_one(
+            {"user_id": user_id, "platform": "tiktok", "connected_via": "outstand"},
+            {"_id": 0, "outstand_account_id": 1},
+        )
+        if not conn or not conn.get("outstand_account_id"):
+            raise HTTPException(status_code=400, detail="No connected TikTok account found. Please connect your account first.")
     else:  # facebook_reels
         conn = await db["social_connections"].find_one(
             {"user_id": user_id, "platform": "facebook"},
