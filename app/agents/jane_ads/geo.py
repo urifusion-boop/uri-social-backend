@@ -246,6 +246,51 @@ def default_providers() -> tuple[PinProposer, Geocoder]:
     return ChainedPinProposer(LLMPinProposer(), HeuristicPinProposer()), CompositeGeocoder()
 
 
+_GEO_MODE_MAP = {
+    "own_radius": GeoMode.OWN_RADIUS,
+    "watering_hole": GeoMode.WATERING_HOLE,
+    "mixed": GeoMode.MIXED,
+    "non_local": GeoMode.NON_LOCAL,
+}
+
+
+async def geo_plan_from_named_areas(
+    mode_str: str, city: str, areas: list[dict], explanation: str = "",
+    geocoder: Optional[Geocoder] = None,
+) -> Optional[GeoPlan]:
+    """Build a GeoPlan directly from the mode + named pockets the CONSULTANT already
+    reasoned about (system prompt §7) — skips decide_geo_mode/LLM-proposal entirely,
+    just validates what was already decided via real geocoding (still never pins an
+    unvalidated place). Returns None for NON_LOCAL — there's no geography to attach
+    when it's barely relevant to the business."""
+    mode = _GEO_MODE_MAP.get((mode_str or "").strip().lower())
+    if mode is None or mode == GeoMode.NON_LOCAL:
+        return None
+    geocoder = geocoder or CompositeGeocoder()
+    pins: list[GeoPin] = []
+    for a in areas[:4]:
+        name = (a.get("name") or "").strip()
+        if not name:
+            continue
+        coord = await geocoder.geocode(name, city)
+        if coord is None:
+            continue   # NEVER pin an unvalidated place
+        lat, lng, radius_km = coord
+        pins.append(GeoPin(name=name, lat=lat, lng=lng, radius_km=radius_km,
+                           source=PinSource.GEOCODED, reason=a.get("reason", "")))
+
+    if not pins:
+        fallback = city or "the wider area"
+        return GeoPlan(
+            mode=mode, city=city, pins=[], fallback_area=fallback,
+            explanation=explanation or (
+                f"I couldn't confirm specific pockets, so I'm targeting {fallback} broadly "
+                "rather than guess a location that might not exist."
+            ),
+        )
+    return GeoPlan(mode=mode, city=city, pins=pins, explanation=explanation or _explain(mode, city, pins))
+
+
 async def geo_for_request(business_name: str, category: str, city: str,
                           goal: Goal = Goal.MESSAGES, description: str = "") -> GeoPlan:
     """Convenience: LLM proposes; if its names don't validate, fall back to the
