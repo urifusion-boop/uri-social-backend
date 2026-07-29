@@ -107,6 +107,19 @@ async def touch_thread(db, brand_id: str, thread_id: str, *,
             {"$set": {"title": title[:_TITLE_MAX]}})
 
 
+async def delete_thread(db, brand_id: str, thread_id: str) -> bool:
+    """Remove a thread and its messages from the rail. Never touches
+    `jane_ads_meta_campaigns` — a launched campaign keeps running and stays in
+    'My Campaigns' regardless of whether its originating conversation is deleted;
+    this is purely tidying up the chat history list. Returns False if the thread
+    didn't belong to this brand (nothing deleted)."""
+    if not (brand_id and thread_id) or db is None:
+        return False
+    result = await db[THREADS_COLLECTION].delete_one({"brand_id": brand_id, "thread_id": thread_id})
+    await db[CHAT_COLLECTION].delete_many({"brand_id": brand_id, "thread_id": thread_id})
+    return result.deleted_count > 0
+
+
 async def thread_history(db, brand_id: str, thread_id: str) -> list[dict]:
     """The messages tagged to one thread, oldest first."""
     if not (brand_id and thread_id) or db is None:
