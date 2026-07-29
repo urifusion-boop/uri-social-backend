@@ -250,11 +250,18 @@ def _output_instructions() -> str:
         "suggestions the client can correct.\n\n"
         "NON-NEGOTIABLE before you say \"ready\": you must have a REAL budget_ngn or "
         "desired_conversions THE CLIENT STATED FOR THIS CAMPAIGN (a remembered past campaign's "
-        "spend does not count — you may offer it as a suggestion, but never assume it), AND a "
-        "real geo_mode with either geo_areas or an explicit non_local reason. These two are the "
-        "ones a real media buyer NEVER guesses or skips, however deep into the conversation you "
-        "are — if either is still missing, you MUST return stage=\"ask\" and request exactly the "
-        "missing one, no matter how many questions you've already asked.\n\n"
+        "spend does not count on its own — you may offer it as a suggestion, but never silently "
+        "assume it applies here), AND a real geo_mode with either geo_areas or an explicit "
+        "non_local reason. These two are the ones a real media buyer NEVER guesses or skips, "
+        "however deep into the conversation you are — if either is still missing, you MUST return "
+        "stage=\"ask\" and request exactly the missing one, no matter how many questions you've "
+        "already asked.\n\n"
+        "Exception that resolves this WITHOUT asking again: if you explicitly ASK the client "
+        "whether to reuse a remembered figure (\"want to do the same ₦5,000 again?\") and they "
+        "reply with a plain affirmative (\"yes\", \"sure\", \"that works\", \"same\", etc.), that "
+        "IS them stating it for THIS campaign — set budget_ngn to that figure and move on. Do NOT "
+        "ask the identical budget question again just because they answered with a word instead "
+        "of retyping the number; that reads as broken and repetitive to the client.\n\n"
         "BUT — once budget_ngn (or desired_conversions) AND geography are BOTH genuinely "
         "established, that is enough to build a first plan. Do not keep asking for MORE precision "
         "on top of that:\n"
@@ -346,6 +353,24 @@ async def consult(message: str, business_name: str = "", category: str = "",
             "EXACTLY that (nothing else) one more time. Otherwise converge now."
         )
 
+    # Pre-resolve the one ambiguity prompting alone couldn't reliably get the model to
+    # commit to (confirmed live: it kept re-asking the identical budget question even
+    # after being told a plain "yes" counts) — if the client's latest reply is a bare
+    # affirmative AND Jane's own last turn explicitly proposed reusing the remembered
+    # budget, tell the model plainly what just happened instead of leaving it to infer.
+    budget_confirmation_note = ""
+    if known_budget and _client_gave_affirmative(message):
+        last_assistant = next((t.get("content", "") for t in reversed(history or [])
+                               if t.get("role") == "assistant"), "")
+        if str(int(known_budget)) in last_assistant.replace(",", ""):
+            budget_confirmation_note = (
+                f"\n\nIMPORTANT: your last message asked the client whether to reuse their "
+                f"remembered budget of ₦{known_budget:,.0f}, and their reply above is a plain "
+                f"affirmative — they ARE confirming ₦{known_budget:,.0f} for THIS campaign. "
+                f"Set budget_ngn to {int(known_budget)} and move on to whatever's next (not "
+                "budget again)."
+            )
+
     # `message` is the frontend's flattened "brief so far" (every user reply in this
     # conversation, concatenated) — redundant with `history` above when history is
     # present, but the only signal at all on the very first turn. Framed as a summary,
@@ -353,7 +378,7 @@ async def consult(message: str, business_name: str = "", category: str = "",
     prompt = (
         f"{known_line}\n\n"
         f'Everything the client has told you so far, summarized: "{message}"'
-        f"{cap_nudge}\n\n{_output_instructions()}"
+        f"{cap_nudge}{budget_confirmation_note}\n\n{_output_instructions()}"
     )
     try:
         client = openai.AsyncOpenAI(api_key=settings.jane_ads_openai_key)
@@ -381,20 +406,46 @@ async def consult(message: str, business_name: str = "", category: str = "",
     return _enforce_hard_requirements(brief, message, history or [], known_budget)
 
 
+_AFFIRMATIVE_WORDS = {
+    "yes", "yeah", "yep", "yup", "sure", "ok", "okay", "correct", "right",
+    "same", "fine", "good", "confirmed", "please", "go",
+}
+
+
+def _client_gave_affirmative(message: str) -> bool:
+    """True if the client's most recent reply reads like a short yes/no-style
+    confirmation ('yes', 'that's fine') rather than a fresh, substantive answer —
+    the shape of reply Jane gets when she's just asked 'want to do the same again?'."""
+    tail = (message or "").strip().split(".")[-1].strip().lower()
+    if not tail or len(tail) > 40:
+        return False
+    words = {w.strip(",!?'\"") for w in tail.split()}
+    return bool(words & _AFFIRMATIVE_WORDS)
+
+
 def _budget_grounded(amount: Optional[float], known_budget: Optional[float],
                      message: str, history: list[dict]) -> bool:
     """True if `amount` is actually something the CLIENT said in this conversation, not
     the model silently carrying forward a remembered past campaign's spend. A budget
     that differs from the remembered figure is presumably new and trusted outright; one
     that matches it exactly only counts if the client's OWN words contain that number
-    (not just Jane's paraphrase of it)."""
+    (not just Jane's paraphrase of it) — OR the client gave a plain "yes" directly in
+    reply to JANE HERSELF proposing that figure ("want to do the same again?"). That's
+    still a genuine, deliberate answer for THIS campaign, not a silent carry-over —
+    without this, a client who answers "yes" instead of retyping the number gets asked
+    the identical budget question again and again (confirmed live)."""
     if amount is None or amount <= 0:
         return False
     if known_budget is None or abs(amount - known_budget) > 1:
         return True
     needle = str(int(amount))
     client_texts = [message] + [t.get("content", "") for t in history if t.get("role") == "user"]
-    return any(needle in txt for txt in client_texts)
+    if any(needle in txt for txt in client_texts):
+        return True
+    last_assistant = next((t.get("content", "") for t in reversed(history) if t.get("role") == "assistant"), "")
+    # Naira amounts in Jane's own text are comma-formatted ("₦5,000") — strip commas
+    # so the digit match isn't defeated by formatting alone.
+    return needle in last_assistant.replace(",", "") and _client_gave_affirmative(message)
 
 
 def _enforce_hard_requirements(brief: ConsultantBrief, message: str, history: list[dict],
