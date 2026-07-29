@@ -1119,6 +1119,11 @@ async def _build_campaign_plan(
             "stage": "choose_creative_source",
             "understood": parsed.model_dump(),
             "creative_options": {"can_generate": True, "drafts": drafts},
+            # Jane's geography/audience call (stated_plan, jane-strategy-extraction §7.6) is
+            # REQUIRED to be confirmed back to the client, never silently decided — this was
+            # being computed into plan.explanation but never reaching the client at this step,
+            # the exact point they'd otherwise see it before committing to an image.
+            "explanation": plan.explanation,
         }}
 
     if body.creative_source == "upload":
