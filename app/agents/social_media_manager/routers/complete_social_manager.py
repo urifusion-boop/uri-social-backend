@@ -1479,6 +1479,12 @@ async def facebook_ads_callback(
                 "connected_via": "facebook_ads_oauth",
                 "page_id": page_id,
                 "page_access_token": page_token,
+                # The USER-level long-lived token, kept separately from page_access_token —
+                # GET /me/permissions (the only way to read back which scopes were actually
+                # granted) only returns meaningful data for a user token; a Page token there
+                # comes back empty every time, which is exactly what silently broke the
+                # daily health check and the live pre-flight check before this was added.
+                "user_access_token": long_token,
                 "account_name": page_name,
                 "profile_picture_url": profile_pic,
                 "connection_status": "pending_user_match",
