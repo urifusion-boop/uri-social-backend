@@ -1524,6 +1524,19 @@ async def meta_launch_plan(
     plan = CampaignPlan.model_validate(doc["plan"])
     req = CampaignRequest.model_validate(doc["req"])
 
+    # Re-resolve the ads connection at commit time rather than trusting the page_id/
+    # whatsapp_number frozen into the plan when it was first built — real time has
+    # passed, and this is exactly the moment a client who just fixed a rejected
+    # WhatsApp number (Meta: "not linked to your account") needs the retry to
+    # actually pick up their correction, not silently resend the stale one.
+    from .ads_connection import AdsConnectionRequired, resolve_ads_page_for_launch
+    try:
+        ads_conn = await resolve_ads_page_for_launch(db, brand_ctx.get("user_id"), brand_id)
+    except AdsConnectionRequired as e:
+        raise HTTPException(status_code=409, detail=f"meta_connection_{e.state.value}")
+    plan.page_id = ads_conn["page_id"]
+    plan.whatsapp_number = ads_conn["whatsapp_number"]
+
     # Policy re-check at commit — cheap and deterministic, and real time has passed
     # since the plan was built, so this is a genuine safety re-validation, not just
     # a formality.
