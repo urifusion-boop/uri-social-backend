@@ -600,6 +600,57 @@ async def jane_set_whatsapp(
     return {"whatsapp_number": number}
 
 
+# ── Per-brand Meta ads connection (Per-Brand Page Connection plan) ───────────
+# Distinct from the /whatsapp pair above, which is the WhatsApp number Jane's own
+# lead-notification copy references — this is the ads-specific connection gating
+# campaign launch: which Facebook Page, ads permission health, and whether THAT
+# page's WhatsApp is linked (required for a real Click-to-WhatsApp destination).
+
+@router.get("/meta-connection/status")
+async def jane_meta_connection_status(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """The active brand's connection state — one of the six explicit states
+    (never inferred from a single boolean), so the frontend can render the exact
+    matching prompt. `connect_url` is only meaningful for states that need the
+    OAuth grant (NONE/CONTENT_ONLY/EXPIRED/NO_PAGE)."""
+    from .ads_connection import resolve_connection_state
+
+    state, ads = await resolve_connection_state(db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"))
+    return {
+        "state": state.value,
+        "page_name": (ads or {}).get("account_name", ""),
+        "whatsapp_number": (ads or {}).get("whatsapp_number", ""),
+        "connect_url": "/social-media/connect/facebook-ads/initiate",
+    }
+
+
+class MetaConnectionWhatsAppBody(BaseModel):
+    whatsapp_number: str
+
+
+@router.put("/meta-connection/whatsapp")
+async def jane_meta_connection_set_whatsapp(
+    body: MetaConnectionWhatsAppBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Link the brand's WhatsApp number to their ads connection — the step that
+    moves ADS_NO_WHATSAPP to READY. Does not itself prove the number is linked
+    to the Page in Meta (that's a manual OTP step in Meta's own Page Settings);
+    the next real ad-set create surfaces Meta's own rejection if it isn't."""
+    from .ads_connection import AdsConnectionRequired, set_whatsapp_number
+
+    try:
+        number = await set_whatsapp_number(db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"), body.whatsapp_number)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except AdsConnectionRequired as e:
+        raise HTTPException(status_code=409, detail=f"meta_connection_{e.state.value}")
+    return {"whatsapp_number": number}
+
+
 # ── Brand-scoped wallet (what the app UI calls) ───────────────────────────────
 # The two endpoints above take an explicit business_id (internal/demo use). The UI
 # instead uses these, which derive the wallet key from the active brand context —
@@ -770,6 +821,8 @@ class MetaTestLaunchBody(BaseModel):
     image_url: str
     headline: str = "Chat With Us"
     primary_text: str = "Chat with us on WhatsApp!"
+    page_id: str   # no shared-page fallback exists (Per-Brand Page Connection plan §7)
+                    # — pass the specific Page id you're testing against explicitly.
 
 
 @router.post("/meta/test-launch")
@@ -781,7 +834,8 @@ async def meta_test_launch(
     """Launches a REAL Meta campaign (created PAUSED — zero spend until a human
     activates it in Ads Manager) against the configured ad account. Lets anyone test
     the live Meta adapter directly rather than trusting a one-off script. Requires
-    META_AD_ACCOUNT_ID, META_ADS_ACCESS_TOKEN, and META_ADS_PAGE_ID to be configured."""
+    META_AD_ACCOUNT_ID and META_ADS_ACCESS_TOKEN to be configured, plus an explicit
+    page_id — there is no shared-page fallback (Per-Brand Page Connection plan §7)."""
     import uuid
     from app.core.config import settings
     from .adapters.meta import MetaAdPlatformAdapter, MetaAPIError
@@ -790,10 +844,10 @@ async def meta_test_launch(
         PurchaseBehaviour, SpendAuthorization,
     )
 
-    if not (settings.META_AD_ACCOUNT_ID and settings.META_ADS_ACCESS_TOKEN and settings.META_ADS_PAGE_ID):
+    if not (settings.META_AD_ACCOUNT_ID and settings.META_ADS_ACCESS_TOKEN):
         raise HTTPException(
             status_code=400,
-            detail="Meta ads not configured — need META_AD_ACCOUNT_ID, META_ADS_ACCESS_TOKEN, META_ADS_PAGE_ID",
+            detail="Meta ads not configured — need META_AD_ACCOUNT_ID and META_ADS_ACCESS_TOKEN",
         )
 
     business_id = f"demo_meta_test_{uuid.uuid4().hex[:8]}"
@@ -807,7 +861,7 @@ async def meta_test_launch(
         )],
         per_business_cap_ngn=body.budget_ngn,
         account_cap_ngn=body.budget_ngn,
-        page_id=settings.META_ADS_PAGE_ID,
+        page_id=body.page_id,
         creative=AdCreative(image_url=body.image_url, headline=body.headline, primary_text=body.primary_text),
         explanation=f"Real Meta ads test launch for {body.business_name}",
     )
@@ -836,7 +890,6 @@ class MetaLaunchFromMessageBody(BaseModel):
     message: str                          # plain-English ask, e.g. "get me lunch customers in Surulere, ₦15k"
     business_name: str = ""
     category: str = ""
-    page_id: str = ""                     # override the target page (multi-client); defaults to META_ADS_PAGE_ID
     conversation_cost_ngn: float = Field(500.0, gt=0)
     creative_source: str = "generate"     # generate | upload | draft | ask
     reference_image_url: str = ""         # required for creative_source=upload (from /creative/upload)
@@ -845,8 +898,6 @@ class MetaLaunchFromMessageBody(BaseModel):
     reuse_image_url: str = ""             # a refinement — keep the prior plan's image instead of
                                           # regenerating (a targeting/budget tweak shouldn't burn a
                                           # credit or swap the visual). Ignored for upload/draft.
-    whatsapp_number: str = ""             # the brand's WhatsApp number leads route to; stored on
-                                          # the brand and reused, so it's only ever asked once
     thread_id: str = ""                   # the campaign thread this plan belongs to (Tier E),
                                           # tagged onto the pending plan + launched campaign
 
@@ -883,6 +934,7 @@ async def _build_campaign_plan(
     failures (bad config, unsupported creative, policy block, generation failure)."""
     import uuid
     from app.core.config import settings
+    from .ads_connection import AdsConnectionRequired, resolve_ads_page_for_launch
     from .creative import creative_from_draft, creative_from_upload, generate_ad_creative, get_brand_context, write_shoot_script
     from .decision_engine import apply_platform_override, plan_campaign
     from .history import get_campaign_history, remembered_budget_ngn, remembered_business_name, remembered_category
@@ -893,9 +945,21 @@ async def _build_campaign_plan(
 
     if not (settings.META_AD_ACCOUNT_ID and settings.META_ADS_ACCESS_TOKEN):
         raise HTTPException(status_code=400, detail="Meta ads not configured — need META_AD_ACCOUNT_ID and META_ADS_ACCESS_TOKEN")
-    page_id = body.page_id or settings.META_ADS_PAGE_ID
-    if not page_id:
-        raise HTTPException(status_code=400, detail="No target page — set META_ADS_PAGE_ID or pass page_id")
+
+    # 0. Per-brand Meta ads connection — checked FIRST, before Jane says a word, so a
+    # client never designs a whole campaign only to hit a wall at the end (Per-Brand
+    # Page Connection plan §3). There is no shared-page fallback: a missing connection
+    # fails loudly with the exact state, mapped to its own prompt on the frontend.
+    try:
+        ads_conn = await resolve_ads_page_for_launch(db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"))
+    except AdsConnectionRequired as e:
+        return {"early_return": {
+            "stage": f"meta_connection_{e.state.value}",
+            "understood": {},
+            "page_name": e.page_name,
+        }}
+    page_id = ads_conn["page_id"]
+
     if body.creative_source == "upload" and not body.reference_image_url:
         raise HTTPException(status_code=400, detail="reference_image_url is required for creative_source=upload")
     if body.creative_source == "draft" and not body.draft_id:
@@ -982,31 +1046,11 @@ async def _build_campaign_plan(
     if consultant_notes:
         plan.explanation = f"{consultant_notes} {plan.explanation}"
 
-    # 2.5. WhatsApp routing — the ad links to wa.me/<the brand's number>, so leads reach
-    # the brand directly instead of the shared Page's inbox. Ask for it once (then it's
-    # stored and reused). Blocks here rather than at launch so no plan is ever built that
-    # can't actually deliver a lead.
-    from .whatsapp import normalize_wa_number, get_brand_whatsapp, get_connected_whatsapp, set_brand_whatsapp
-    brand_id_for_wa = brand_ctx.get("brand_id")
-    if body.whatsapp_number:
-        # The user just typed/confirmed a number this turn.
-        wa_number = normalize_wa_number(body.whatsapp_number) or ""
-        if not wa_number:
-            return {"early_return": {"stage": "need_whatsapp", "understood": parsed.model_dump(),
-                    "question": "That WhatsApp number doesn't look right — please type it in full, e.g. 0803 123 4567."}}
-        await set_brand_whatsapp(db, brand_id_for_wa, wa_number)
-    else:
-        # Auto-resolve: this brand's saved number → else the number they already connected
-        # for the daily-push feature (adopted + saved so it's asked only if truly nothing's
-        # on file). Keeps the flow moving instead of asking for a number we already have.
-        wa_number = await get_brand_whatsapp(db, brand_id_for_wa)
-        if not wa_number:
-            wa_number = await get_connected_whatsapp(db, brand_ctx.get("user_id"))
-            if wa_number:
-                await set_brand_whatsapp(db, brand_id_for_wa, wa_number)
-    if not wa_number:
-        return {"early_return": {"stage": "need_whatsapp", "understood": parsed.model_dump(),
-                "question": "Which WhatsApp number should I send your leads to? Anyone who taps your ad will message this number directly."}}
+    # 2.5. WhatsApp destination — resolved from the per-brand ads connection (step 0
+    # above already guarantees READY, which requires a linked number). This is a real
+    # Click-to-WhatsApp destination now, not a wa.me link — see the adapter.
+    wa_number = ads_conn["whatsapp_number"]
+
     if budget_estimate:
         plan.explanation = (
             f"Based on similar campaigns costing about ₦{budget_estimate['price_per_conversation_ngn']:,.0f} "
@@ -1564,12 +1608,6 @@ async def meta_campaigns(
                 row["status"] = summary["delivery"].lower()
                 row["metrics"] = {
                     "spend_ngn": round(summary["spend_ngn"], 2),
-                    # wa.me link ads: clicks are the real, brand-reaching result.
-                    "clicks": summary.get("clicks", 0),
-                    "cost_per_click_ngn": (
-                        round(summary["cost_per_click_ngn"], 2)
-                        if summary.get("cost_per_click_ngn") is not None else None
-                    ),
                     "conversations": summary["conversations"],
                     "cost_per_conversation_ngn": (
                         round(summary["cost_per_conversation_ngn"], 2)
