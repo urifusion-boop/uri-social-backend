@@ -237,12 +237,36 @@ async def get_flexible_brand_context(
 
     Returns {"user_id", "brand_id", "agency_id", "auth_type"}
     Raises 403 on denied access.
+
+    SDK multi-tenant mode (auth["is_multi_tenant"]): each end-user gets their
+    own brand, isolated from the developer's own personal brand and from
+    every other end-user under the same API key — the brand_id is derived
+    from the end_user_id, not the developer's user_id. Credits/billing still
+    attach to the developer (auth["user_id"]); only brand/content data is
+    end-user-scoped. Without this, every end-user silently shared the
+    developer's single personal brand.
     """
     from app.services.AgencyService import AgencyService
     from app.services.BrandAccountService import BrandAccountService
 
     user_id = auth["user_id"]
     requested = brand_id or x_brand_id
+
+    if auth.get("is_multi_tenant") and auth.get("end_user_id"):
+        from app.services.MultiTenantService import MultiTenantService
+
+        end_user_id = auth["end_user_id"]
+        brand = await BrandAccountService.get_or_create_personal_brand(end_user_id, db)
+        try:
+            await MultiTenantService.link_end_user_to_brand_profile(end_user_id, brand.brand_id, db)
+        except Exception as link_err:
+            print(f"⚠️ brand context: failed to link end_user {end_user_id} to brand {brand.brand_id}: {link_err}")
+        return {
+            "user_id": user_id,
+            "brand_id": brand.brand_id,
+            "agency_id": None,
+            "auth_type": auth["auth_type"],
+        }
 
     if requested and await AgencyService.user_has_access_to_brand(user_id, requested, db):
         brand = await BrandAccountService.get_brand(requested, db)
