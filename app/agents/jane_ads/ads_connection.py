@@ -90,13 +90,19 @@ async def get_ads_connection(db, user_id: Optional[str], brand_id: Optional[str]
     )
 
 
-async def verify_token_live(page_id: str, page_access_token: str) -> tuple[bool, set[str]]:
+async def verify_token_live(page_id: str, page_access_token: str, user_access_token: str = "") -> tuple[bool, set[str]]:
     """Live health check against the real Graph API — the ONLY reliable way to know a
     long-lived Page token is still valid and which of the granted scopes are actually
     still active (Meta can silently revoke via a password change, an app review, or the
     client removing the permission in their own Facebook settings). Returns
     (token_is_valid, granted_scope_names). Never raises — an unreachable API just
-    reports invalid, matching 'never let a token failure silently stop delivery'."""
+    reports invalid, matching 'never let a token failure silently stop delivery'.
+
+    GET /me/permissions only returns meaningful data for a USER access token — called
+    with a Page token it just returns an empty list every time (confirmed live), which
+    silently broke this check for every connection until user_access_token was added.
+    Falls back to the page token if no user token is on file (older connections from
+    before this fix), which will under-report scopes rather than over-trust them."""
     graph_base = f"https://graph.facebook.com/{settings.FACEBOOK_API_VERSION}"
     try:
         async with httpx.AsyncClient(timeout=15) as client:
@@ -105,7 +111,7 @@ async def verify_token_live(page_id: str, page_access_token: str) -> tuple[bool,
             if "error" in page_resp.json():
                 return False, set()
             perms_resp = await client.get(f"{graph_base}/me/permissions",
-                                          params={"access_token": page_access_token})
+                                          params={"access_token": user_access_token or page_access_token})
             perms_data = perms_resp.json()
             granted = {p["permission"] for p in perms_data.get("data", []) if p.get("status") == "granted"}
             return True, granted
@@ -130,7 +136,9 @@ async def resolve_connection_state(
         return ConnectionState.NO_PAGE, ads
 
     if live_check:
-        valid, granted = await verify_token_live(ads["page_id"], ads.get("page_access_token", ""))
+        valid, granted = await verify_token_live(
+            ads["page_id"], ads.get("page_access_token", ""), ads.get("user_access_token", ""),
+        )
         if not valid or not REQUIRED_ADS_SCOPES.issubset(granted):
             return ConnectionState.EXPIRED, ads
 
@@ -177,7 +185,7 @@ async def run_token_health_check(db) -> dict:
         if not page_id or not token:
             continue
         checked += 1
-        valid, granted = await verify_token_live(page_id, token)
+        valid, granted = await verify_token_live(page_id, token, conn.get("user_access_token", ""))
         if valid and REQUIRED_ADS_SCOPES.issubset(granted):
             continue
 
