@@ -1521,7 +1521,13 @@ async def facebook_ads_finalize(
     brand_id = ctx["brand_id"]
     is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
 
-    update_fields: dict = {"user_id": user_id, "connection_status": "active", "updated_at": datetime.utcnow().isoformat()}
+    update_fields: dict = {
+        "user_id": user_id, "connection_status": "active", "updated_at": datetime.utcnow().isoformat(),
+        # A fresh reconnect means the token is good again — clear the daily
+        # health-check job's one-time notice flag so a FUTURE expiry gets
+        # re-announced instead of being silently swallowed by the old flag.
+        "token_expired_notified": False,
+    }
     if not is_personal:
         update_fields["brand_id"] = brand_id
 
@@ -1529,6 +1535,15 @@ async def facebook_ads_finalize(
         {"id": f"fbads_{fb_page_id}"},
         {"$set": update_fields},
     )
+    if result.matched_count > 0:
+        # Any campaigns paused by the health-check job on the OLD token can now
+        # resume on their own next campaign-list load — clear the pause flag so
+        # the user isn't stuck manually re-activating each one after fixing the
+        # connection that broke them.
+        await db["jane_ads_meta_campaigns"].update_many(
+            {"brand_id": brand_id, "paused_for_token_health": True},
+            {"$set": {"paused_for_token_health": False}},
+        )
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Facebook ads connection not found — try reconnecting")
 

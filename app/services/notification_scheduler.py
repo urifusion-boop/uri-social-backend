@@ -83,6 +83,19 @@ def _job_jane_ads_monitoring():
     _run_async(_run)
 
 
+def _job_jane_ads_token_health():
+    """Jane + Ads per-brand connection token health (Per-Brand Page Connection
+    plan §8) — daily, since a token dying mid-flight is rare but silent otherwise:
+    pauses that brand's running campaigns and notifies the owner once."""
+    async def _run():
+        from app.database import get_db
+        from app.agents.jane_ads.ads_connection import run_token_health_check
+        db = get_db()
+        result = await run_token_health_check(db)
+        print(f"🔑 Jane Ads token health: {result}")
+    _run_async(_run)
+
+
 def _job_jane_ads_billing():
     """Jane + Ads ad-spend billing — recoups real Meta spend (× markup) from each
     customer's prepaid wallet and pauses any campaign whose wallet can no longer
@@ -175,8 +188,18 @@ def start_notification_scheduler():
         **_JOB_DEFAULTS,
     )
 
+    # Jane + Ads per-brand ads connection token health, daily at 06:00 UTC — a
+    # dead token doesn't stop a launched campaign from delivering wrong (or
+    # spending), so this is a proactive pause+notify, not just a read-time check.
+    _scheduler.add_job(
+        _job_jane_ads_token_health,
+        CronTrigger(hour=6, minute=0),
+        id="jane_ads_token_health",
+        **_JOB_DEFAULTS,
+    )
+
     _scheduler.start()
-    print("📅 Notification scheduler started with 7 jobs")
+    print("📅 Notification scheduler started with 8 jobs")
 
 
 def stop_notification_scheduler():

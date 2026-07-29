@@ -198,16 +198,18 @@ def test_launch_campaign_creates_full_chain_and_stores_record():
     assert result.ad_ids == {"b1": "ad_1"}
     assert result.platforms == [Platform.META]
 
-    # Campaign is a traffic campaign (drives clicks to the wa.me link), NOT the old
-    # page-connected messaging setup that mis-routed leads to the shared Page.
+    # Real Click-to-WhatsApp: the ad set promotes the brand's OWN Page + WhatsApp
+    # number (Per-Brand Page Connection plan) — no shared-page wa.me-link fallback.
     campaign_json = mock_client.post.call_args_list[0].kwargs["json"]
-    assert campaign_json["objective"] == "OUTCOME_TRAFFIC"
+    assert campaign_json["objective"] == "OUTCOME_ENGAGEMENT"
     adset_json = mock_client.post.call_args_list[1].kwargs["json"]
-    assert adset_json["optimization_goal"] == "LINK_CLICKS"
-    assert "destination_type" not in adset_json and "promoted_object" not in adset_json
-    # The ad links straight to the brand's own WhatsApp number.
-    link = mock_client.post.call_args_list[2].kwargs["json"]["object_story_spec"]["link_data"]["link"]
-    assert link.startswith("https://wa.me/2348031234567")
+    assert adset_json["optimization_goal"] == "CONVERSATIONS"
+    assert adset_json["destination_type"] == "WHATSAPP"
+    assert adset_json["promoted_object"] == {"page_id": "pg123", "whatsapp_phone_number": "2348031234567"}
+    creative_spec = mock_client.post.call_args_list[2].kwargs["json"]["object_story_spec"]
+    assert creative_spec["page_id"] == "pg123"
+    ad_json = mock_client.post.call_args_list[3].kwargs["json"]
+    assert ad_json  # ad creation call still happens after creative
 
     record = _run(db["jane_ads_meta_campaigns"].find_one({"campaign_id": "cmp_1"}))
     assert record["ad_id"] == "ad_1"
