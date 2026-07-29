@@ -16,6 +16,8 @@ import logging
 
 from app.models.api_key import APIKey, APIKeyScope
 from app.config.database import get_sdk_gateway_database
+from app.database import get_db
+from app.services.SdkDeveloperLinkService import resolve_or_create_user_for_developer
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +159,28 @@ class APIKeyAuthService:
 
         # Note: Rate limiting and usage tracking are handled by SDK Gateway
         # We only do read-only validation here
+
+        # api_key_obj.user_id is currently the raw SDK Gateway developer_id —
+        # a foreign ObjectId from a completely separate database with no
+        # corresponding users doc or credit wallet in THIS backend. Resolve
+        # (or create, on first use) the real, billable uri-social-backend
+        # user this developer maps to, and use that from here on. See
+        # SdkDeveloperLinkService for why this must never match an existing
+        # user by email.
+        developer_id = api_key_obj.user_id
+        try:
+            resolved_user_id = await resolve_or_create_user_for_developer(
+                developer_id=developer_id,
+                db=get_db(),
+                gateway_db=db,
+            )
+            api_key_obj.user_id = resolved_user_id
+        except Exception as e:
+            logger.error(f"Failed to resolve uri-social-backend user for SDK developer {developer_id}: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to resolve account for this API key. Please try again."
+            )
 
         logger.info(f"API key authenticated: {api_key_obj.key_prefix} for user {api_key_obj.user_id}")
         return api_key_obj
