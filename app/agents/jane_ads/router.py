@@ -563,6 +563,25 @@ async def jane_duplicate_thread(
     return {"thread": thread, "seed_message": seed}
 
 
+@router.delete("/threads/{thread_id}")
+async def jane_delete_thread(
+    thread_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Remove a conversation from the thread rail. Never touches the brand's actual
+    launched campaigns (jane_ads_meta_campaigns) — those keep running in 'My Campaigns'
+    regardless of whether their originating chat is deleted; this only clears clutter."""
+    from .threads import delete_thread
+    brand_id = brand_ctx.get("brand_id")
+    if not brand_id:
+        raise HTTPException(status_code=400, detail="No active brand.")
+    deleted = await delete_thread(db, brand_id, thread_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Thread not found.")
+    return {"deleted": True}
+
+
 # ── Brand WhatsApp number (where leads route) ─────────────────────────────────
 # Ads link to wa.me/<this number>, so chats land in the brand's own WhatsApp, not the
 # shared Page's inbox. Stored once per brand and reused on every campaign.
