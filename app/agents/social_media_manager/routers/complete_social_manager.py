@@ -4,7 +4,7 @@ import asyncio
 import json
 import subprocess
 import traceback
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query, Request, UploadFile, File, Form
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query, Request, Response, UploadFile, File, Form
 from fastapi.responses import RedirectResponse, StreamingResponse, JSONResponse
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from pydantic import BaseModel, Field
@@ -307,6 +307,22 @@ class BrandProfileRequest(BaseModel):
     canvas_editor_enabled: Optional[bool] = None
     use_v3_prompts: Optional[bool] = None
 
+def _report_sdk_credit_cost(response: Response, ctx: dict, credits: int = 1) -> None:
+    """
+    For gateway API-key-authenticated requests only: report the credit-equivalent
+    cost of this action via a response header, since real wallet deduction is
+    deliberately skipped for API-key auth on this branch (the SDK Gateway meters
+    and bills these developers instead — see the "skip for API key users" credit
+    blocks throughout this file). The SDK Gateway's proxy reads this header to
+    meter usage by actual cost instead of a flat per-request count.
+
+    No-ops entirely for JWT/dashboard requests (ctx["auth_type"] != "api_key") —
+    never touches their response.
+    """
+    if ctx.get("auth_type") == "api_key":
+        response.headers["X-URI-Credits-Consumed"] = str(credits)
+
+
 # ==============================================================================
 # CONTENT GENERATION ENDPOINTS
 # ==============================================================================
@@ -315,6 +331,7 @@ class BrandProfileRequest(BaseModel):
 async def generate_content(
     request: ContentGenerationRequest,
     background_tasks: BackgroundTasks,
+    response: Response,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
     ctx: dict = Depends(get_flexible_brand_context),
 ):
@@ -565,6 +582,8 @@ async def generate_content(
                 )
             except Exception as e:
                 print(f"⚠️ Content created notification failed: {e}")
+        elif result.get("status") and ctx.get("auth_type") == "api_key":
+            _report_sdk_credit_cost(response, ctx, credits=1)
 
         # If images were requested, mark drafts as has_image=True immediately so the
         # frontend shimmer shows right away, then kick off background generation.
