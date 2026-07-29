@@ -162,16 +162,33 @@ def test_budget_grounded_when_it_differs_from_remembered():
     assert _budget_grounded(10000, 5000, "anything", []) is True
 
 
-def test_budget_not_grounded_when_it_matches_remembered_and_client_never_said_it():
-    # This is the exact bug: Jane silently carried forward a past campaign's ₦5,000
-    # spend without the client ever restating it for the new campaign.
-    history = [{"role": "assistant", "content": "Last time you spent ₦5,000, want the same?"}]
-    assert _budget_grounded(5000, 5000, "yes sure", history) is False
+def test_budget_not_grounded_when_matching_remembered_with_no_proposal_and_no_confirmation():
+    # The original bug this guard exists for: Jane silently carries forward a past
+    # campaign's ₦5,000 spend, having never actually proposed it in THIS conversation
+    # and with no confirmation from the client either.
+    assert _budget_grounded(5000, 5000, "yes sure", []) is False
 
 
 def test_budget_grounded_when_client_actually_restates_the_remembered_figure():
     history = [{"role": "user", "content": "yes 5000 sounds good"}]
     assert _budget_grounded(5000, 5000, "yes 5000 sounds good", history) is True
+
+
+def test_budget_grounded_when_client_says_yes_to_janes_own_explicit_proposal():
+    # Live-reported bug: Jane explicitly asks "want to do the same again (₦5,000)?" —
+    # a deliberate, THIS-campaign confirmation, not a silent carry-over — and the
+    # client answers plainly. Without this, Jane re-asked the identical question
+    # forever because the client never retyped the digits themselves.
+    history = [{"role": "assistant", "content": "Last time you spent ₦5,000, want the same again?"}]
+    assert _budget_grounded(5000, 5000, "yes", history) is True
+
+
+def test_budget_not_grounded_when_yes_does_not_follow_a_proposal_of_that_figure():
+    # A bare "yes" with no assistant turn proposing the remembered figure at all must
+    # NOT ground it — otherwise any unrelated "yes" would silently confirm a budget
+    # the client never actually saw proposed.
+    history = [{"role": "assistant", "content": "What area should I focus on?"}]
+    assert _budget_grounded(5000, 5000, "yes", history) is False
 
 
 def test_budget_not_grounded_when_none_or_zero():
