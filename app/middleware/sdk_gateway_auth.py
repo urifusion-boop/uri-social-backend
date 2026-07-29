@@ -7,7 +7,10 @@ The SDK Gateway validates API keys and forwards requests with developer context.
 
 from fastapi import Request, HTTPException, status
 from typing import Optional
+import hmac
 import logging
+
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -17,15 +20,19 @@ class SDKGatewayAuth:
     Middleware to handle requests forwarded from SDK Gateway.
 
     SDK Gateway validates API keys and adds these headers:
-    - X-Internal-Service: sdk-gateway
+    - X-Internal-Service: <SDK_GATEWAY_INTERNAL_SECRET>
     - X-Developer-ID: <developer_id>
     - X-API-Key-ID: <api_key_id>
     - X-Workspace-ID: <workspace_id> (optional)
-    """
 
-    # Shared secret between SDK Gateway and Main Backend
-    # TODO: Move to environment variable in production
-    INTERNAL_SERVICE_SECRET = "sdk-gateway"
+    The value of X-Internal-Service must be a real, per-deployment secret
+    (SDK_GATEWAY_INTERNAL_SECRET, shared with the gateway's own config) —
+    NOT a fixed, publicly-documented literal. A static, guessable value
+    here would let anyone impersonate any developer directly against this
+    backend by simply sending that header plus an arbitrary
+    X-Developer-ID, bypassing the gateway's API-key validation, rate
+    limiting, and credit-quota checks entirely.
+    """
 
     @classmethod
     def extract_developer_context(cls, request: Request) -> Optional[dict]:
@@ -36,9 +43,12 @@ class SDKGatewayAuth:
             dict with developer_id, api_key_id, workspace_id if request is from SDK Gateway
             None if not from SDK Gateway
         """
-        # Check if request is from SDK Gateway
-        internal_service = request.headers.get("x-internal-service")
-        if internal_service != cls.INTERNAL_SERVICE_SECRET:
+        # Check if request is from SDK Gateway. Fails closed if the secret
+        # isn't configured (empty string never matches, even an empty
+        # header value) — see SDK_GATEWAY_INTERNAL_SECRET in core/config.py.
+        internal_service = request.headers.get("x-internal-service") or ""
+        expected = settings.SDK_GATEWAY_INTERNAL_SECRET
+        if not expected or not hmac.compare_digest(internal_service, expected):
             return None
 
         # Extract developer context
@@ -66,7 +76,9 @@ class SDKGatewayAuth:
     @classmethod
     def is_sdk_gateway_request(cls, request: Request) -> bool:
         """Check if request is from SDK Gateway"""
-        return request.headers.get("x-internal-service") == cls.INTERNAL_SERVICE_SECRET
+        internal_service = request.headers.get("x-internal-service") or ""
+        expected = settings.SDK_GATEWAY_INTERNAL_SECRET
+        return bool(expected) and hmac.compare_digest(internal_service, expected)
 
 
 async def get_sdk_developer_context(request: Request) -> Optional[dict]:
