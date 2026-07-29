@@ -16,6 +16,7 @@ from app.agents.jane_ads.ads_connection import (
     resolve_ads_page_for_launch,
     resolve_connection_state,
     set_whatsapp_number,
+    verify_token_live,
 )
 
 
@@ -92,6 +93,63 @@ def test_no_page_when_ads_connection_missing_page_id():
     db = FakeDb([_ads_doc(page_id="")])
     state, ads = _run(resolve_connection_state(db, None, "brnd_1"))
     assert state == ConnectionState.NO_PAGE
+
+
+def test_verify_token_live_calls_permissions_with_the_user_token_not_the_page_token():
+    # Live-confirmed: GET /me/permissions returns an empty list for a Page access token
+    # every time, regardless of what was actually granted — it only returns real scope
+    # data for a USER access token. Passing the page token there silently broke every
+    # connection's health check (always EXPIRED). This locks in the fix: the /me/permissions
+    # call must use user_access_token when one is on file, not page_access_token.
+    calls = []
+
+    class FakeResp:
+        def __init__(self, data):
+            self._data = data
+        def json(self):
+            return self._data
+
+    async def fake_get(url, params=None):
+        calls.append((url, params))
+        if url.endswith("/pg123"):
+            return FakeResp({"id": "pg123"})
+        return FakeResp({"data": [{"permission": "ads_management", "status": "granted"}]})
+
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(side_effect=fake_get)
+    with patch("httpx.AsyncClient") as MockClient:
+        MockClient.return_value.__aenter__.return_value = mock_client
+        valid, granted = _run(verify_token_live("pg123", "page-tok", "user-tok"))
+
+    assert valid is True
+    assert granted == {"ads_management"}
+    perms_call = next(c for c in calls if "permissions" in c[0])
+    assert perms_call[1]["access_token"] == "user-tok"
+
+
+def test_verify_token_live_falls_back_to_page_token_when_no_user_token_on_file():
+    calls = []
+
+    class FakeResp:
+        def __init__(self, data):
+            self._data = data
+        def json(self):
+            return self._data
+
+    async def fake_get(url, params=None):
+        calls.append((url, params))
+        if url.endswith("/pg123"):
+            return FakeResp({"id": "pg123"})
+        return FakeResp({"data": []})
+
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(side_effect=fake_get)
+    with patch("httpx.AsyncClient") as MockClient:
+        MockClient.return_value.__aenter__.return_value = mock_client
+        _run(verify_token_live("pg123", "page-tok", ""))
+
+    perms_call = next(c for c in calls if "permissions" in c[0])
+    assert perms_call[1]["access_token"] == "page-tok"
 
 
 def test_expired_when_live_check_fails():
