@@ -40,9 +40,12 @@ class Settings(BaseSettings):
     # (~60 day expiry) obtained via /connect/facebook-ads OAuth consent — confirmed
     # live to work where a system-user-generated token (META_SYSTEM_TOKEN) did not,
     # for reasons not yet root-caused. Needs periodic manual refresh until that's
-    # sorted out. The Facebook Page connected for Click-to-WhatsApp ads.
+    # sorted out. This is URI's OWN token (used to run the ads API calls) — the ad's
+    # Facebook Page is resolved per-brand (ads_connection.py), never from a shared
+    # env var; that shared-page fallback was deliberately removed (Per-Brand Page
+    # Connection plan §7) since it's exactly how one Page ended up serving every
+    # client's leads.
     META_ADS_ACCESS_TOKEN: str = ""
-    META_ADS_PAGE_ID: str = ""
 
     # Instagram Business Login (separate app credentials from the Instagram product)
     INSTAGRAM_APP_ID: str = ""
