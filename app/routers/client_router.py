@@ -9,8 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, status, Query
 from typing import List, Optional
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
-from app.dependencies import get_db_dependency
-from app.core.auth_bearer import JWTBearer
+from app.dependencies import get_db_dependency, flexible_auth
 from app.models.client import (
     Client,
     CreateClientRequest,
@@ -26,7 +25,7 @@ router = APIRouter(prefix="/social-media/clients", tags=["Clients"])
 @router.post("/", status_code=status.HTTP_201_CREATED)
 async def create_client(
     request: CreateClientRequest,
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
@@ -43,7 +42,7 @@ async def create_client(
         # Create client
         client = await ClientService.create_client(
             request=request,
-            owner_user_id=token["userId"],
+            owner_user_id=auth["user_id"],
             db=db
         )
 
@@ -77,7 +76,7 @@ async def create_client(
 @router.get("/{client_id}")
 async def get_client(
     client_id: str,
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
@@ -97,7 +96,7 @@ async def get_client(
 
     # TODO: Check if user has access to this client (owner or workspace member)
     # For now, only allow owner
-    if client.owner_user_id != token["userId"]:
+    if client.owner_user_id != auth["user_id"]:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You do not have access to this client"
@@ -108,7 +107,7 @@ async def get_client(
 
 @router.get("/")
 async def list_my_clients(
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
@@ -119,7 +118,7 @@ async def list_my_clients(
     Returns clients where the current user is the owner.
     """
     clients = await ClientService.get_clients_by_owner(
-        owner_user_id=token["userId"],
+        owner_user_id=auth["user_id"],
         db=db
     )
 
@@ -135,7 +134,7 @@ async def list_my_clients(
 async def update_client(
     client_id: str,
     request: UpdateClientRequest,
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
@@ -154,7 +153,7 @@ async def update_client(
         )
 
     # Check ownership
-    if client.owner_user_id != token["userId"]:
+    if client.owner_user_id != auth["user_id"]:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only the client owner can update client information"
@@ -182,7 +181,7 @@ async def update_client(
 @router.get("/{client_id}/usage")
 async def get_client_usage(
     client_id: str,
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
@@ -206,7 +205,7 @@ async def get_client_usage(
         )
 
     # Check access
-    if client.owner_user_id != token["userId"]:
+    if client.owner_user_id != auth["user_id"]:
         # TODO: Also allow workspace admins
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -222,7 +221,7 @@ async def get_client_usage(
 async def add_credits(
     client_id: str,
     amount: int = Query(..., ge=1, le=1000000, description="Number of credits to add"),
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
@@ -244,7 +243,7 @@ async def add_credits(
         )
 
     # Check ownership
-    if client.owner_user_id != token["userId"]:
+    if client.owner_user_id != auth["user_id"]:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only the client owner can add credits"
@@ -275,7 +274,7 @@ async def add_credits(
 @router.post("/{client_id}/suspend")
 async def suspend_client(
     client_id: str,
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
@@ -297,7 +296,7 @@ async def suspend_client(
             detail="Client not found"
         )
 
-    if client.owner_user_id != token["userId"]:
+    if client.owner_user_id != auth["user_id"]:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Insufficient permissions"
@@ -317,7 +316,7 @@ async def suspend_client(
 @router.post("/{client_id}/reactivate")
 async def reactivate_client(
     client_id: str,
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
@@ -336,7 +335,7 @@ async def reactivate_client(
             detail="Client not found"
         )
 
-    if client.owner_user_id != token["userId"]:
+    if client.owner_user_id != auth["user_id"]:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Insufficient permissions"
@@ -357,7 +356,7 @@ async def reactivate_client(
 async def delete_client(
     client_id: str,
     hard_delete: bool = Query(False, description="Permanently delete (cannot be undone)"),
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
@@ -381,7 +380,7 @@ async def delete_client(
         )
 
     # Check ownership
-    if client.owner_user_id != token["userId"]:
+    if client.owner_user_id != auth["user_id"]:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only the client owner can delete the client"
