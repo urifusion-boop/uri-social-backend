@@ -12,8 +12,7 @@ from typing import List, Optional, Dict, Any, AsyncGenerator
 from datetime import datetime
 from bson import ObjectId
 
-from app.dependencies import get_db_dependency, get_active_brand_context, get_flexible_brand_context
-from app.core.auth_bearer import JWTBearer
+from app.dependencies import get_db_dependency, get_flexible_brand_context, flexible_auth
 from app.core.config import settings
 from app.domain.responses.uri_response import UriResponse
 
@@ -79,33 +78,6 @@ def _apply_intelligent_fallbacks(profile_data: Dict[str, Any], missing_fields: L
         print(f"🌍 Fallback: Using West Africa, Nigeria as default region")
 
     return profile
-
-
-def _get_user_id(token: dict) -> str | None:
-    """
-    Extract user_id from JWT payload.
-    Supports common shapes:
-      - {"user_id": "..."} or {"userId": "..."} or {"id": "..."} or {"sub": "..."}
-      - {"claims": {"userId": "..."}} or {"claims": {"user_id": "..."}}
-    """
-    if not isinstance(token, dict):
-        return None
-
-    # 1) flat keys (top-level)
-    for k in ("user_id", "userId", "id", "sub"):
-        v = token.get(k)
-        if v:
-            return str(v)
-
-    # 2) nested claims
-    claims = token.get("claims") or {}
-    if isinstance(claims, dict):
-        for k in ("userId", "user_id", "id", "sub"):
-            v = claims.get(k)
-            if v:
-                return str(v)
-
-    return None
 
 
 def _brand_scope(user_id: str, brand_id: Optional[str]) -> Dict[str, Any]:
@@ -743,10 +715,10 @@ async def regenerate_content(
     draft_id: str,
     feedback: Optional[str] = None,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer())
+    auth: dict = Depends(flexible_auth)
 ):
     """Regenerate content with optional feedback"""
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -768,7 +740,7 @@ async def upload_user_content(
     request: Dict[str, Any],
     background_tasks: BackgroundTasks,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """
     Upload user-provided media (images/videos) and generate captions using brand playbook.
@@ -1734,7 +1706,7 @@ async def outstand_oauth_callback(
 async def get_pending_connection(
     session_token: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
 ):
     """
     Step 2 of the social connection flow.
@@ -1743,7 +1715,7 @@ async def get_pending_connection(
     The frontend shows these to the user for selection before finalising.
     Session tokens expire — call this promptly after the OAuth callback.
     """
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -1879,7 +1851,7 @@ async def disconnect_facebook_direct(
 @router.get("/onboarding/status")
 async def get_onboarding_status(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
 ):
     """
     Returns the user's onboarding completion state.
@@ -1888,7 +1860,7 @@ async def get_onboarding_status(
     step_2_complete — at least one social account connected
     current_step    — the step the user should be on (1, 2, or null if done)
     """
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -1903,7 +1875,7 @@ async def approve_content(
     request: ApprovalRequest,
     background_tasks: BackgroundTasks,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer())
+    auth: dict = Depends(flexible_auth)
 ):
     """
     Approve content drafts with scheduling options
@@ -1913,7 +1885,7 @@ async def approve_content(
     - schedule: Schedule for specific time
     - save_draft: Just approve without publishing
     """
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
     
@@ -1938,7 +1910,7 @@ async def regenerate_draft_image(
     request: Request,
     background_tasks: BackgroundTasks,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer())
+    auth: dict = Depends(flexible_auth)
 ):
     """
     Regenerate the image for an existing draft using user feedback.
@@ -1949,7 +1921,7 @@ async def regenerate_draft_image(
     Clears the current image immediately (frontend shows shimmer),
     then generates a new image in the background incorporating the feedback.
     """
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -2083,7 +2055,7 @@ async def edit_draft_image(
     draft_id: str,
     request: Request,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer())
+    auth: dict = Depends(flexible_auth)
 ):
     """
     Edit image in-place using user feedback
@@ -2101,7 +2073,7 @@ async def edit_draft_image(
     """
     from app.agents.social_media_manager.services.image_editing_service import ImageEditingService
 
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -2133,7 +2105,7 @@ async def edit_draft_image(
 async def undo_draft_image_edit(
     draft_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer())
+    auth: dict = Depends(flexible_auth)
 ):
     """
     Undo last image edit and restore previous version
@@ -2144,7 +2116,7 @@ async def undo_draft_image_edit(
     """
     from app.agents.social_media_manager.services.image_editing_service import ImageEditingService
 
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -2171,13 +2143,13 @@ async def update_carousel_slide(
     slide_index: int,
     request: Request,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer())
+    auth: dict = Depends(flexible_auth)
 ):
     """
     Update text (headline/body) of a single carousel slide.
     Does NOT regenerate the image - only updates text.
     """
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -2246,13 +2218,13 @@ async def regenerate_carousel_slide_image(
     request: Request,
     background_tasks: BackgroundTasks,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer())
+    auth: dict = Depends(flexible_auth)
 ):
     """
     Regenerate the image for a single carousel slide.
     Optionally accepts feedback for adjustments.
     """
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -2354,13 +2326,13 @@ async def delete_carousel_slide(
     draft_id: str,
     slide_index: int,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer())
+    auth: dict = Depends(flexible_auth)
 ):
     """
     Delete a single slide from a carousel.
     Minimum 2 slides required (can't delete if only 2 left).
     """
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -2413,7 +2385,7 @@ async def reorder_carousel_slides(
     draft_id: str,
     request: Request,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer())
+    auth: dict = Depends(flexible_auth)
 ):
     """
     Reorder carousel slides based on new index array.
@@ -2423,7 +2395,7 @@ async def reorder_carousel_slides(
         "new_order": [2, 0, 1, 3]  // New positions (0-indexed)
     }
     """
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -2493,10 +2465,10 @@ async def reorder_carousel_slides(
 async def delete_draft(
     draft_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer())
+    auth: dict = Depends(flexible_auth)
 ):
     """Permanently delete a content draft"""
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -2517,14 +2489,14 @@ class SyncImageRequest(BaseModel):
 async def sync_image_across_drafts(
     request: SyncImageRequest,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
 ):
     """
     Copy images from a source draft to one or more target drafts (same user only).
     For carousel drafts: syncs all slide image_urls (targets must have the same slide count).
     For feed/story drafts: syncs the single image_url.
     """
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -2592,10 +2564,10 @@ async def sync_image_across_drafts(
 async def deny_content(
     request: DenialRequest,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer())
+    auth: dict = Depends(flexible_auth)
 ):
     """Deny content drafts with optional regeneration request"""
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
     
@@ -2644,7 +2616,7 @@ async def unschedule_draft(
 async def refine_content(
     request: RefinementRequest,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer())
+    auth: dict = Depends(flexible_auth)
 ):
     """
     Refine/edit content before approval
@@ -2655,7 +2627,7 @@ async def refine_content(
     - Add/remove media
     - Add refinement notes
     """
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
     
@@ -2679,10 +2651,10 @@ async def refine_content(
 async def schedule_content(
     request: SchedulingRequest,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer())
+    auth: dict = Depends(flexible_auth)
 ):
     """Schedule approved content for future publishing"""
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
     
@@ -3061,10 +3033,10 @@ async def get_content_analytics(
     platform: Optional[str] = None,
     days: int = 30,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer())
+    auth: dict = Depends(flexible_auth)
 ):
     """Get content performance analytics"""
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
     
@@ -4207,7 +4179,7 @@ async def get_account_metrics(
 async def debug_outstand_account_metrics(
     account_id: str,
     days: int = 30,
-    token: dict = Depends(JWTBearer())
+    auth: dict = Depends(flexible_auth)
 ):
     """Return raw Outstand account metrics response for debugging field mapping."""
     import time as _time
@@ -4225,7 +4197,7 @@ async def debug_outstand_account_metrics(
 @router.get("/debug/outstand-post/{post_id}")
 async def debug_outstand_post(
     post_id: str,
-    token: dict = Depends(JWTBearer())
+    auth: dict = Depends(flexible_auth)
 ):
     """Fetch the live status of an Outstand post by its ID."""
     try:
@@ -4239,7 +4211,7 @@ async def debug_outstand_post(
 @router.get("/debug/outstand-analytics/{post_id}")
 async def debug_outstand_analytics(
     post_id: str,
-    token: dict = Depends(JWTBearer())
+    auth: dict = Depends(flexible_auth)
 ):
     """Return the raw Outstand analytics response for a post — shows exactly what fields are available."""
     try:
@@ -4253,10 +4225,10 @@ async def debug_outstand_analytics(
 @router.get("/debug/performance-raw")
 async def debug_performance_raw(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
 ):
     """Show raw published drafts + their platform_post_id and outstand markers for this user."""
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
     drafts = await db["content_drafts"].find(
@@ -4278,14 +4250,14 @@ async def debug_performance_raw(
 @router.get("/debug/connections-raw")
 async def debug_connections_raw(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
 ):
     """
     Show the raw social_connections documents for the current user.
     Exposes connected_via, ig_user_id, page_id, and whether page_access_token is present.
     Used to diagnose Instagram/Facebook routing issues.
     """
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -4381,7 +4353,7 @@ async def get_draft(
 async def stream_draft_image(
     draft_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
 ):
     """
     SSE stream — sends a `image_ready` event with the draft payload the moment
@@ -4392,7 +4364,7 @@ async def stream_draft_image(
         es.addEventListener('image_ready', e => { const draft = JSON.parse(e.data); es.close() })
         es.addEventListener('timeout', () => es.close())
     """
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -4457,10 +4429,10 @@ async def test_endpoint():
 @router.get("/auto-generate/settings")
 async def get_auto_generate_settings(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
 ):
     """Get (or create) the auto-content generation settings for the current user."""
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
     try:
@@ -4474,10 +4446,10 @@ async def get_auto_generate_settings(
 async def update_auto_generate_settings(
     request: AutoGenerateSettingsRequest,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
 ):
     """Update auto-content generation settings (upsert)."""
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
     try:
@@ -4494,7 +4466,7 @@ async def update_auto_generate_settings(
 async def connect_insights(
     request: ConnectInsightsRequest,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
 ):
     """
     Persist the AiMediaReport generated by account tracking analysis.
@@ -4503,7 +4475,7 @@ async def connect_insights(
     can use industry, content themes, engagement drivers, and the weekly
     campaign calendar as richer context when generating posts.
     """
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
     try:
@@ -4526,10 +4498,10 @@ async def connect_insights(
 async def trigger_auto_generate(
     background_tasks: BackgroundTasks,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
 ):
     """Manually trigger auto-content generation for the current user."""
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
     background_tasks.add_task(_run_auto_generate_background, user_id, db)
@@ -5431,7 +5403,7 @@ async def trigger_publish_scheduled(
 async def generate_storyboard(
     request: StoryboardRequest,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
 ):
     """
     Generate a GPT-4o Vision video storyboard from brand images.
@@ -5440,7 +5412,7 @@ async def generate_storyboard(
     Returns a structured storyboard JSON with per-scene video prompts, motion
     descriptions, reference image indices, and optional text overlays.
     """
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -5476,7 +5448,7 @@ async def generate_storyboard(
 async def generate_video_from_storyboard(
     request: VideoFromStoryboardRequest,
     background_tasks: BackgroundTasks,
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
 ):
     """
     Start Veo 3.1 video generation for every scene in a storyboard.
@@ -5486,7 +5458,7 @@ async def generate_video_from_storyboard(
         VideoGenerationService,
     )
 
-    _get_user_id(token)  # auth check
+    auth.get("user_id")  # auth check
 
     job_id = await VideoGenerationService.create_job(request.storyboard, request.model)
     background_tasks.add_task(
@@ -5505,7 +5477,7 @@ async def generate_video_from_storyboard(
 @router.get("/video-job/{job_id}")
 async def get_video_job(
     job_id: str,
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
 ):
     """
     Poll for video generation progress.
@@ -5515,7 +5487,7 @@ async def get_video_job(
     """
     from app.agents.social_media_manager.services.video_generation_service import get_job
 
-    _get_user_id(token)  # auth check
+    auth.get("user_id")  # auth check
 
     job = await get_job(job_id)
     if not job:
@@ -5528,7 +5500,7 @@ async def get_video_job(
 async def generate_storyboard_frames(
     request: StoryboardFramesRequest,
     background_tasks: BackgroundTasks,
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
 ):
     """
     Start background generation of a unique frame image for each storyboard scene.
@@ -5536,7 +5508,7 @@ async def generate_storyboard_frames(
     """
     from app.agents.social_media_manager.services.video_storyboard_service import VideoStoryboardService
 
-    _get_user_id(token)  # auth check
+    auth.get("user_id")  # auth check
 
     job_id = await VideoStoryboardService.create_frame_job(request.scenes)
     background_tasks.add_task(VideoStoryboardService.run_frame_job, job_id, request.scenes, request.brand_images)
@@ -5550,12 +5522,12 @@ async def generate_storyboard_frames(
 @router.get("/storyboard-frame-job/{job_id}")
 async def get_storyboard_frame_job(
     job_id: str,
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
 ):
     """Poll for storyboard frame image generation progress."""
     from app.agents.social_media_manager.services.video_storyboard_service import VideoStoryboardService
 
-    _get_user_id(token)  # auth check
+    auth.get("user_id")  # auth check
 
     job = await VideoStoryboardService.get_frame_job(job_id)
     if not job:
@@ -5567,7 +5539,7 @@ async def get_storyboard_frame_job(
 @router.post("/merge-video-job/{job_id}")
 async def merge_video_job(
     job_id: str,
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
 ):
     """
     Merge all completed clips from a finished video job into a single video.
@@ -5576,7 +5548,7 @@ async def merge_video_job(
     from app.agents.social_media_manager.services.video_generation_service import get_job
     from app.agents.social_media_manager.services.video_merge_service import VideoMergeService
 
-    _get_user_id(token)  # auth check
+    auth.get("user_id")  # auth check
 
     job = await get_job(job_id)
     if not job:
@@ -5606,10 +5578,10 @@ class SaveVideoDraftRequest(BaseModel):
 async def save_video_draft(
     request: SaveVideoDraftRequest,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
 ):
     """Save a merged video as a draft for later posting."""
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -5638,10 +5610,10 @@ async def save_video_draft(
 @router.get("/video-drafts")
 async def list_video_drafts(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
 ):
     """List all saved video drafts for the current user."""
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -5658,7 +5630,7 @@ async def publish_video_draft(
     request: PublishVideoDraftRequest,
     background_tasks: BackgroundTasks,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
 ):
     """
     Start async publishing of a saved video draft to Instagram Reels or Facebook.
@@ -5666,7 +5638,7 @@ async def publish_video_draft(
     """
     from app.agents.social_media_manager.services.video_publish_service import VideoPublishService
 
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -5735,12 +5707,12 @@ async def publish_video_draft(
 @router.get("/video-publish-job/{job_id}")
 async def get_video_publish_job(
     job_id: str,
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
 ):
     """Poll the status of a video publish job."""
     from app.agents.social_media_manager.services.video_publish_service import get_publish_job
 
-    _get_user_id(token)  # auth check
+    auth.get("user_id")  # auth check
     job = await get_publish_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Publish job not found")
@@ -5750,7 +5722,7 @@ async def get_video_publish_job(
 @router.post("/extract-image-text")
 async def extract_image_text(
     image_url: str = Query(..., description="URL of the image to extract text from"),
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
 ):
     """
     Extract text overlaid on an image using OpenAI Vision API.
@@ -5798,14 +5770,14 @@ async def extract_image_text(
 @router.post("/upload-custom-font")
 async def upload_custom_font(
     file: UploadFile = File(...),
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
 ):
     """
     Upload a custom font file (.ttf or .otf) for the user's brand.
     Typography System PRD - Phase 1: Custom Font Upload
     """
     try:
-        user_id = token.get("user_id")
+        user_id = auth.get("user_id")
 
         # Validate file type
         filename = file.filename.lower()
@@ -5846,7 +5818,7 @@ async def upload_custom_font(
 @router.post("/analyze-custom-font")
 async def analyze_custom_font(
     font_url: str = Query(..., description="Cloudinary URL of the uploaded font file"),
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
 ):
     """
     Analyze a custom font using GPT-4o-mini Vision API.
@@ -5888,7 +5860,7 @@ class BlogGenerationRequest(BaseModel):
 async def generate_blog_content(
     request: BlogGenerationRequest,
     background_tasks: BackgroundTasks,
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
@@ -5905,7 +5877,7 @@ async def generate_blog_content(
     Blog Generator Demo - Phase 1
     """
     try:
-        user_id = _get_user_id(token)
+        user_id = auth.get("user_id")
         if not user_id:
             return UriResponse.error_response("User ID not found in token")
 
@@ -6030,12 +6002,12 @@ async def generate_blog_content(
 
 @router.get("/blog-drafts")
 async def get_blog_drafts(
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """Get all blog drafts for the authenticated user"""
     try:
-        user_id = _get_user_id(token)
+        user_id = auth.get("user_id")
         if not user_id:
             return UriResponse.error_response("User ID not found in token")
 
@@ -6059,12 +6031,12 @@ async def get_blog_drafts(
 @router.get("/blog-drafts/{draft_id}")
 async def get_blog_draft(
     draft_id: str,
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """Get a single blog draft by ID (for polling image status)"""
     try:
-        user_id = _get_user_id(token)
+        user_id = auth.get("user_id")
         if not user_id:
             return UriResponse.error_response("User ID not found in token")
 
@@ -6254,12 +6226,12 @@ def _build_oai_messages(system_prompt: str, request: AgentChatRequest) -> list:
 @router.post("/agent/chat/upload")
 async def upload_chat_image(
     file: UploadFile = File(...),
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
 ):
     """Upload an image for use in the agent chat. Returns a Cloudinary URL."""
     from app.utils.cloudinary_upload import upload_bytes
 
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -6287,7 +6259,7 @@ async def upload_chat_image(
 @router.post("/agent/chat/stream")
 async def agent_chat_stream(
     request: AgentChatRequest,
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """Streaming version of agent chat — returns SSE tokens as they arrive."""
@@ -6295,7 +6267,7 @@ async def agent_chat_stream(
     from app.core.config import settings
     from fastapi.responses import StreamingResponse as _StreamingResponse
 
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -6370,11 +6342,11 @@ async def agent_chat_stream(
 
 @router.get("/agent/chat/history")
 async def get_agent_chat_history(
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """Return the last 100 persisted messages for this user."""
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -6388,11 +6360,11 @@ async def get_agent_chat_history(
 
 @router.delete("/agent/chat/history")
 async def clear_agent_chat_history(
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """Archive (delete) the current conversation so the user starts fresh."""
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -6403,14 +6375,14 @@ async def clear_agent_chat_history(
 @router.post("/agent/chat")
 async def agent_chat(
     request: AgentChatRequest,
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """URI Agent in-app assistant — answers questions and navigates the user."""
     from app.services.AIService import AIService
     from app.domain.models.chat_model import ChatMessage, ChatModel
 
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -6491,7 +6463,7 @@ async def edit_video(
     platform: str = Form("instagram_reels"),
     enhancements: str = Form("{}"),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
 ):
     """
     Accept a raw video upload, run the Level 1 FFmpeg editing pipeline
@@ -6501,7 +6473,7 @@ async def edit_video(
     """
     from app.agents.social_media_manager.services.video_edit_service import VideoEditService
 
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -6565,10 +6537,10 @@ async def edit_video(
 async def get_edit_video_job(
     job_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
 ):
     """Poll the status of a video editing job."""
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -6589,7 +6561,7 @@ async def get_edit_video_job(
 @router.get("/video-polish-styles")
 async def list_video_polish_styles(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
 ):
     """Return all available style presets for Video Polish."""
     from app.agents.social_media_manager.services.video_polish_service import VideoPolishService
@@ -6599,7 +6571,7 @@ async def list_video_polish_styles(
 
 @router.get("/video-polish-caption-presets")
 async def list_caption_presets(
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
 ):
     """Return all Reap caption style presets (system + user-created)."""
     from app.agents.social_media_manager.services.video_polish_service import VideoPolishService
@@ -6615,7 +6587,7 @@ async def polish_video(
     language: str = Form("en-NG"),
     captions_preset: str = Form("system_beasty"),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
 ):
     """
     Accept a raw video upload, run the Video Polish clipping-API pipeline
@@ -6632,7 +6604,7 @@ async def polish_video(
             detail="Video Polish is not yet configured. Please add REAP_API_KEY to the server environment."
         )
 
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -6674,12 +6646,12 @@ async def polish_video(
 async def get_polish_video_job(
     job_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
 ):
     """Poll the status of a Video Polish job."""
     from app.agents.social_media_manager.services.video_polish_service import VideoPolishService
 
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -6697,7 +6669,7 @@ async def restyle_polish_video(
     new_style_preset: str = Form(...),
     language: str = Form("en-NG"),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
 ):
     """
     Re-polish an already-processed video with a different style preset.
@@ -6705,7 +6677,7 @@ async def restyle_polish_video(
     """
     from app.agents.social_media_manager.services.video_polish_service import VideoPolishService
 
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -6744,7 +6716,7 @@ async def polish_video_clip_action(
     source_language: str = Form("en"),
     target_language: str = Form("es"),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
 ):
     """
     Trigger a secondary action (reframe or dub) on a specific clip.
@@ -6753,7 +6725,7 @@ async def polish_video_clip_action(
     from app.agents.social_media_manager.services.video_polish_service import VideoPolishService
     import uuid as _uuid
 
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -6790,10 +6762,10 @@ async def polish_video_clip_action(
 async def get_polish_video_clip_action(
     action_job_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
 ):
     """Poll a clip action job (reframe / dub) by its action_job_id."""
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -6812,7 +6784,7 @@ async def produce_video(
     video: UploadFile = File(...),
     video_type: str = Form("founder"),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
 ):
     """
     Start a full video production job.
@@ -6822,7 +6794,7 @@ async def produce_video(
     import uuid
     from app.agents.social_media_manager.services.video_production_service import run_production_job
 
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -6861,10 +6833,10 @@ async def produce_video(
 async def get_produce_video_job(
     job_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
 ):
     """Poll a video production job."""
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 

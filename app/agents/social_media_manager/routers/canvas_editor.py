@@ -15,8 +15,7 @@ from pydantic import BaseModel, Field
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 
-from app.dependencies import get_db_dependency
-from app.core.auth_bearer import JWTBearer
+from app.dependencies import get_db_dependency, flexible_auth
 from app.domain.responses.uri_response import UriResponse
 
 from ..services.layered_document_service import LayeredDocumentService
@@ -24,26 +23,6 @@ from ..services.document_edit_service import DocumentEditService
 from ..services.document_renderer_service import DocumentRendererService
 
 router = APIRouter(tags=["Canvas Editor"], prefix="/canvas-editor")
-
-
-def _get_user_id(token: dict) -> str | None:
-    """Extract user_id from JWT payload"""
-    if not isinstance(token, dict):
-        return None
-
-    for k in ("user_id", "userId", "id", "sub"):
-        v = token.get(k)
-        if v:
-            return str(v)
-
-    claims = token.get("claims") or {}
-    if isinstance(claims, dict):
-        for k in ("userId", "user_id", "id", "sub"):
-            v = claims.get(k)
-            if v:
-                return str(v)
-
-    return None
 
 
 def _build_draft_query(draft_id: str, user_id: str = None) -> Dict[str, Any]:
@@ -83,7 +62,7 @@ class ReorderLayersRequest(BaseModel):
 async def get_draft_document(
     draft_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer())
+    auth: dict = Depends(flexible_auth)
 ):
     """
     Get the layered document for a draft.
@@ -91,7 +70,7 @@ async def get_draft_document(
     Returns the complete layered JSON document with all layers,
     ready for canvas editor rendering.
     """
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -132,7 +111,7 @@ async def update_layer(
     layer_id: str,
     request: UpdateLayerRequest,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer())
+    auth: dict = Depends(flexible_auth)
 ):
     """
     Update a specific layer's properties.
@@ -147,7 +126,7 @@ async def update_layer(
 
     Automatically tracks the edit for undo/redo.
     """
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -243,7 +222,7 @@ async def update_layer(
 async def undo_edit(
     draft_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer())
+    auth: dict = Depends(flexible_auth)
 ):
     """
     Undo the last edit operation.
@@ -251,7 +230,7 @@ async def undo_edit(
     Reverts the document to the state before the last edit
     and marks the edit as undone (enabling redo).
     """
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -316,14 +295,14 @@ async def undo_edit(
 async def redo_edit(
     draft_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer())
+    auth: dict = Depends(flexible_auth)
 ):
     """
     Redo the last undone edit operation.
 
     Reapplies the edit that was previously undone.
     """
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -389,7 +368,7 @@ async def render_document(
     draft_id: str,
     request: RenderDocumentRequest,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer())
+    auth: dict = Depends(flexible_auth)
 ):
     """
     Render the layered document to a final PNG/JPG image.
@@ -402,7 +381,7 @@ async def render_document(
 
     Returns base64 encoded image ready for download/upload.
     """
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -477,14 +456,14 @@ async def reorder_layers(
     draft_id: str,
     request: ReorderLayersRequest,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer())
+    auth: dict = Depends(flexible_auth)
 ):
     """
     Reorder layers by providing new layer order.
 
     Useful for bringing layers to front/back.
     """
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -543,14 +522,14 @@ async def delete_layer(
     draft_id: str,
     layer_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer())
+    auth: dict = Depends(flexible_auth)
 ):
     """
     Delete a layer from the document.
 
     Note: Background layers (locked) cannot be deleted.
     """
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -621,14 +600,14 @@ async def get_edit_history(
     draft_id: str,
     limit: int = 50,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer())
+    auth: dict = Depends(flexible_auth)
 ):
     """
     Get edit history for a draft.
 
     Returns list of all edits (for debugging/analytics).
     """
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 

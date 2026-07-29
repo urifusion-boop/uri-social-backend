@@ -32,8 +32,7 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 
-from app.dependencies import get_db_dependency
-from app.core.auth_bearer import JWTBearer
+from app.dependencies import get_db_dependency, flexible_auth
 from app.core.config import settings
 from app.domain.responses.uri_response import UriResponse
 from app.services.EmailService import email_service
@@ -49,15 +48,22 @@ from app.services.AgencyCreditService import AgencyCreditService
 router = APIRouter(prefix="/agency", tags=["Agency"])
 
 
-def _uid(token: dict) -> str:
-    uid = (token.get("claims") or {}).get("userId")
+def _uid(auth: dict) -> str:
+    """auth is a flexible_auth result — accepts either API key or JWT."""
+    uid = auth.get("user_id")
     if not uid:
-        raise HTTPException(status_code=401, detail="User ID not found in token")
+        raise HTTPException(status_code=401, detail="User ID not found in authentication")
     return uid
 
 
-def _email(token: dict) -> Optional[str]:
-    return (token.get("claims") or {}).get("email")
+def _email(auth: dict) -> Optional[str]:
+    """Only JWT (dashboard) auth carries an email; API-key callers have none
+    here, which is fine — email is only used for invite auto-binding, a
+    dashboard-signup-time concept that doesn't apply to SDK callers."""
+    if auth.get("auth_type") != "jwt":
+        return None
+    jwt_payload = auth.get("jwt_payload") or {}
+    return (jwt_payload.get("claims") or {}).get("email")
 
 
 def _object_id_or_none(user_id: str) -> Optional[ObjectId]:
@@ -81,10 +87,10 @@ async def _require_admin(user_id: str, db: AsyncIOMotorDatabase):
 @router.post("")
 async def create_agency(
     body: CreateAgencyRequest,
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
-    user_id = _uid(token)
+    user_id = _uid(auth)
     existing = await AgencyService.get_agency_for_user(user_id, db)
     if existing:
         raise HTTPException(status_code=409, detail="User already belongs to an agency")
@@ -94,19 +100,19 @@ async def create_agency(
 
 @router.get("")
 async def get_agency(
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     # Claim any pending email invites addressed to this user before resolving
-    await AgencyService.bind_pending_invites(_uid(token), _email(token), db)
-    agency = await AgencyService.get_agency_for_user(_uid(token), db)
+    await AgencyService.bind_pending_invites(_uid(auth), _email(auth), db)
+    agency = await AgencyService.get_agency_for_user(_uid(auth), db)
     return UriResponse.get_single_data_response("agency", agency.to_public_dict() if agency else None)
 
 
 @router.post("/upgrade")
 async def upgrade_solo_to_agency(
     body: CreateAgencyRequest,
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """
@@ -115,7 +121,7 @@ async def upgrade_solo_to_agency(
     (nullable agency_id makes this clean — all existing Jane data stays scoped to
     the same brand_id, now owned by the agency).
     """
-    user_id = _uid(token)
+    user_id = _uid(auth)
     if await AgencyService.get_agency_for_user(user_id, db):
         raise HTTPException(status_code=409, detail="User already belongs to an agency")
 
@@ -135,10 +141,10 @@ async def upgrade_solo_to_agency(
 @router.patch("")
 async def update_agency(
     body: UpdateAgencyRequest,
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
-    agency = await _require_admin(_uid(token), db)
+    agency = await _require_admin(_uid(auth), db)
     await db["agencies"].update_one(
         {"agency_id": agency.agency_id},
         {"$set": {"name": body.name, "updated_at": datetime.utcnow()}},
@@ -150,10 +156,10 @@ async def update_agency(
 @router.patch("/settings")
 async def update_settings(
     per_brand_caps_enabled: bool,
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
-    agency = await _require_admin(_uid(token), db)
+    agency = await _require_admin(_uid(auth), db)
     await db["agencies"].update_one(
         {"agency_id": agency.agency_id},
         {"$set": {"per_brand_caps_enabled": per_brand_caps_enabled, "updated_at": datetime.utcnow()}},
@@ -165,27 +171,27 @@ async def update_settings(
 
 @router.get("/brands")
 async def list_brands(
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """Brand-switcher list — only brands the caller can access."""
-    brands = await BrandAccountService.list_brands_for_user(_uid(token), db)
+    brands = await BrandAccountService.list_brands_for_user(_uid(auth), db)
     return UriResponse.get_list_data_response("brand", [b.to_public_dict() for b in brands])
 
 
 @router.post("/brands")
 async def add_brand(
     body: CreateBrandRequest,
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
-    agency = await _require_admin(_uid(token), db)
+    agency = await _require_admin(_uid(auth), db)
     if agency.max_brands is not None:
         count = len(await BrandAccountService.list_brands_for_agency(agency.agency_id, db))
         if count >= agency.max_brands:
             raise HTTPException(status_code=403, detail="Brand limit reached for plan")
     brand = await BrandAccountService.create_brand(
-        owner_user_id=_uid(token), name=body.name, db=db, agency_id=agency.agency_id,
+        owner_user_id=_uid(auth), name=body.name, db=db, agency_id=agency.agency_id,
         industry=body.industry, logo_url=body.logo_url, monthly_credit_cap=body.monthly_credit_cap,
     )
     return UriResponse.create_response("brand", brand.to_public_dict())
@@ -194,15 +200,15 @@ async def add_brand(
 @router.post("/brands/duplicate")
 async def duplicate_brand(
     body: DuplicateBrandRequest,
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
-    agency = await _require_admin(_uid(token), db)
+    agency = await _require_admin(_uid(auth), db)
     # Template must belong to the same agency
-    if not await AgencyService.user_has_access_to_brand(_uid(token), body.template_brand_id, db):
+    if not await AgencyService.user_has_access_to_brand(_uid(auth), body.template_brand_id, db):
         raise HTTPException(status_code=403, detail="No access to template brand")
     brand = await BrandAccountService.duplicate_from_existing(
-        template_brand_id=body.template_brand_id, owner_user_id=_uid(token),
+        template_brand_id=body.template_brand_id, owner_user_id=_uid(auth),
         name=body.name, db=db, agency_id=agency.agency_id, industry=body.industry,
     )
     if not brand:
@@ -214,11 +220,11 @@ async def duplicate_brand(
 async def update_brand(
     brand_id: str,
     body: UpdateBrandRequest,
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
-    await _require_admin(_uid(token), db)
-    if not await AgencyService.user_has_access_to_brand(_uid(token), brand_id, db):
+    await _require_admin(_uid(auth), db)
+    if not await AgencyService.user_has_access_to_brand(_uid(auth), brand_id, db):
         raise HTTPException(status_code=403, detail="No access to brand")
     brand = await BrandAccountService.update_brand(brand_id, body.dict(exclude_none=True), db)
     return UriResponse.update_response("brand", brand.to_public_dict() if brand else None)
@@ -227,11 +233,11 @@ async def update_brand(
 @router.delete("/brands/{brand_id}")
 async def archive_brand(
     brand_id: str,
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
-    await _require_admin(_uid(token), db)
-    if not await AgencyService.user_has_access_to_brand(_uid(token), brand_id, db):
+    await _require_admin(_uid(auth), db)
+    if not await AgencyService.user_has_access_to_brand(_uid(auth), brand_id, db):
         raise HTTPException(status_code=403, detail="No access to brand")
     ok = await BrandAccountService.archive_brand(brand_id, db)
     return UriResponse.update_response("brand", {"brand_id": brand_id, "archived": ok})
@@ -240,15 +246,15 @@ async def archive_brand(
 @router.delete("/brands/{brand_id}/permanent")
 async def delete_brand_permanently(
     brand_id: str,
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """Permanently and irreversibly delete a brand and all its data (profile,
     playbook, social connections, member access grants). The brand must already
     be archived first via DELETE /agency/brands/{brand_id} — a deliberate
     two-step gate before anything irreversible happens."""
-    await _require_admin(_uid(token), db)
-    if not await AgencyService.user_has_access_to_brand(_uid(token), brand_id, db):
+    await _require_admin(_uid(auth), db)
+    if not await AgencyService.user_has_access_to_brand(_uid(auth), brand_id, db):
         raise HTTPException(status_code=403, detail="No access to brand")
 
     brand = await BrandAccountService.get_brand(brand_id, db)
@@ -270,11 +276,11 @@ async def delete_brand_permanently(
 
 @router.get("/roster")
 async def roster(
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """Morning-triage surface: each accessible brand + at-a-glance status."""
-    user_id = _uid(token)
+    user_id = _uid(auth)
     brands = await BrandAccountService.list_brands_for_user(user_id, db)
 
     today_start = datetime(datetime.utcnow().year, datetime.utcnow().month, datetime.utcnow().day)
@@ -302,10 +308,10 @@ async def roster(
 
 @router.get("/members")
 async def list_members(
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
-    agency = await _require_admin(_uid(token), db)
+    agency = await _require_admin(_uid(auth), db)
     members = await AgencyService.list_members(agency.agency_id, db)
     out = []
     for m in members:
@@ -319,10 +325,10 @@ async def list_members(
 @router.post("/members")
 async def invite_member(
     body: InviteAgencyMemberRequest,
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
-    agency = await _require_admin(_uid(token), db)
+    agency = await _require_admin(_uid(auth), db)
     # If the email already has an account, link immediately; otherwise store a
     # pending invite that auto-binds when they sign up / log in.
     user = await db["users"].find_one({"email": body.email})
@@ -330,12 +336,12 @@ async def invite_member(
         agency.agency_id,
         str(user["_id"]) if user else None,
         body.role,
-        _uid(token),
+        _uid(auth),
         db,
         email=body.email,
     )
 
-    inviter = await db["users"].find_one({"_id": _object_id_or_none(_uid(token))})
+    inviter = await db["users"].find_one({"_id": _object_id_or_none(_uid(auth))})
     asyncio.ensure_future(email_service.send_email(
         to_email=body.email,
         subject=f"You've been invited to join {agency.name} on URI Social",
@@ -363,10 +369,10 @@ async def invite_member(
 @router.delete("/members/{member_id}")
 async def remove_member(
     member_id: str,
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
-    await _require_admin(_uid(token), db)
+    await _require_admin(_uid(auth), db)
     ok = await AgencyService.remove_member(member_id, db)
     return UriResponse.update_response("agency_member", {"agency_member_id": member_id, "removed": ok})
 
@@ -375,10 +381,10 @@ async def remove_member(
 async def assign_member_brand(
     member_id: str,
     brand_id: str,
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
-    await _require_admin(_uid(token), db)
+    await _require_admin(_uid(auth), db)
     access = await AgencyService.assign_brand(member_id, brand_id, db)
     return UriResponse.create_response("member_brand_access", {
         "agency_member_id": member_id, "brand_id": brand_id, "assigned": True,
@@ -389,10 +395,10 @@ async def assign_member_brand(
 async def unassign_member_brand(
     member_id: str,
     brand_id: str,
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
-    await _require_admin(_uid(token), db)
+    await _require_admin(_uid(auth), db)
     ok = await AgencyService.unassign_brand(member_id, brand_id, db)
     return UriResponse.update_response("member_brand_access", {
         "agency_member_id": member_id, "brand_id": brand_id, "unassigned": ok,
@@ -404,10 +410,10 @@ async def unassign_member_brand(
 @router.post("/wallet/topup")
 async def topup_wallet(
     body: TopUpWalletRequest,
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
-    agency = await _require_admin(_uid(token), db)
+    agency = await _require_admin(_uid(auth), db)
     balance = await AgencyCreditService.top_up(agency.agency_id, body.credits, db)
     return UriResponse.update_response("agency_wallet", {"wallet_credits": balance})
 
@@ -416,10 +422,10 @@ async def topup_wallet(
 
 @router.get("/reports/portfolio")
 async def portfolio_report(
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
-    agency = await _require_admin(_uid(token), db)
+    agency = await _require_admin(_uid(auth), db)
     brands = await BrandAccountService.list_brands_for_agency(agency.agency_id, db)
 
     per_brand = []
@@ -451,10 +457,10 @@ async def portfolio_report(
 @router.get("/reports/brand/{brand_id}")
 async def brand_report(
     brand_id: str,
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
-    if not await AgencyService.user_has_access_to_brand(_uid(token), brand_id, db):
+    if not await AgencyService.user_has_access_to_brand(_uid(auth), brand_id, db):
         raise HTTPException(status_code=403, detail="No access to brand")
 
     brand = await BrandAccountService.get_brand(brand_id, db)
