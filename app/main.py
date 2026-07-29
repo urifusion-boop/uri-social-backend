@@ -68,6 +68,17 @@ async def startup_event():
     except Exception as e:
         print(f"⚠️  Warning: Failed to create email index: {e}")
 
+    # Ensure unique sparse index for SDK Gateway developer → user linking
+    # (see app/services/SdkDeveloperLinkService.py) — sparse because most
+    # users never have this field at all.
+    try:
+        from app.database import get_db
+        db = get_db()
+        await db["users"].create_index("sdk_gateway_developer_id", unique=True, sparse=True)
+        print("✅ Unique sdk_gateway_developer_id index ensured on users collection")
+    except Exception as e:
+        print(f"⚠️  Warning: Failed to create sdk_gateway_developer_id index: {e}")
+
     # Migrate social_connections index: old (user_id, platform, page_id) prevented the same
     # user from connecting the same platform to multiple agency brands. Replace with
     # (user_id, platform, brand_id, page_id) so each brand gets its own isolated connection.
