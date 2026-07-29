@@ -356,10 +356,23 @@ async def generate_ad_image(content: str, brand_context: Optional[dict] = None,
             brand_context=bc,
             image_type="story",
         )
-        if result.get("status"):
-            return (result.get("responseData") or {}).get("image_url")
-        print(f"[Creative] content-engine image failed: {result.get('error')}", flush=True)
-        return None
+        if not result.get("status"):
+            print(f"[Creative] content-engine image failed: {result.get('error')}", flush=True)
+            return None
+        image_url = (result.get("responseData") or {}).get("image_url")
+        # The content engine returns a raw base64 data: URL, not a hosted one (confirmed
+        # live: it's what caused Meta's ad-creative creation to fail with a generic,
+        # unhelpful "code=1, unknown error" — Meta's crawler can't fetch a data URI as a
+        # picture). Every OTHER caller of this same engine uploads to Cloudinary first;
+        # this one didn't. Mirror that here so ads always get a real hosted URL.
+        if image_url and image_url.startswith("data:"):
+            from app.utils.cloudinary_upload import upload_base64
+            try:
+                image_url = await upload_base64(image_url, folder="uri-social/jane-ads")
+            except Exception as e:
+                print(f"[Creative] Cloudinary upload failed, cannot use for a Meta ad: {e}", flush=True)
+                return None
+        return image_url
     except Exception as e:
         print(f"[Creative] image error: {e}", flush=True)
         return None
