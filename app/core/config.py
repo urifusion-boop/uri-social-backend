@@ -11,6 +11,13 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: str
     AUTHJWT_SECRET_KEY: str
 
+    # Shared secret between the SDK Gateway and this backend for internal
+    # service-to-service trust (see app/middleware/sdk_gateway_auth.py).
+    # Left empty by default so an unconfigured deployment fails closed
+    # (no value can ever match an empty secret) rather than trusting a
+    # guessable default.
+    SDK_GATEWAY_INTERNAL_SECRET: str = ""
+
     # URI microservices
     URI_GATEWAY_BASE_API_URL: str
     URI_BACKEND_BASE_URL: str
