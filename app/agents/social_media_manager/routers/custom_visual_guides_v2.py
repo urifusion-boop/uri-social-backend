@@ -12,35 +12,12 @@ from typing import List, Optional, Dict, Any
 from datetime import datetime
 from bson import ObjectId
 
-from app.dependencies import get_db_dependency
-from app.core.auth_bearer import JWTBearer
+from app.dependencies import get_db_dependency, flexible_auth
 from app.domain.responses.uri_response import UriResponse
 
 from ..services.custom_visual_guide_v2_service import CustomVisualGuideV2Service
 
 router = APIRouter(tags=["Custom Visual Guides V2"])
-
-
-def _get_user_id(token: dict) -> str | None:
-    """Extract user_id from JWT payload"""
-    if not isinstance(token, dict):
-        return None
-
-    # flat keys
-    for k in ("user_id", "userId", "id", "sub"):
-        v = token.get(k)
-        if v:
-            return str(v)
-
-    # nested claims
-    claims = token.get("claims") or {}
-    if isinstance(claims, dict):
-        for k in ("userId", "user_id", "id", "sub"):
-            v = claims.get(k)
-            if v:
-                return str(v)
-
-    return None
 
 
 # ============================================================================
@@ -70,7 +47,7 @@ class GenerateWithV2GuideRequest(BaseModel):
 async def upload_reference_image_v2(
     request: UploadReferenceImageV2Request,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
 ):
     """
     Upload and process reference image for Custom Visual Guide V2.
@@ -90,7 +67,7 @@ async def upload_reference_image_v2(
     Returns:
         Guide preview with style profile summary
     """
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -147,7 +124,7 @@ async def upload_reference_image_v2(
 async def get_user_guides_v2(
     status: Optional[str] = Query("active", description="Filter by status: active | archived"),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
 ):
     """
     Get all Custom Visual Guides V2 for the authenticated user.
@@ -155,7 +132,7 @@ async def get_user_guides_v2(
     Returns:
         List of V2 guides with style profile summaries
     """
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -204,7 +181,7 @@ async def get_user_guides_v2(
 async def get_guide_detail_v2(
     guide_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
 ):
     """
     Get detailed information for a specific Custom Visual Guide V2.
@@ -212,7 +189,7 @@ async def get_guide_detail_v2(
     Returns:
         Complete guide data including full style profile JSON
     """
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -256,12 +233,12 @@ async def get_guide_detail_v2(
 async def archive_guide_v2(
     guide_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
 ):
     """
     Archive (soft delete) a Custom Visual Guide V2.
     """
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
@@ -302,7 +279,7 @@ async def archive_guide_v2(
 async def generate_with_v2_guide(
     request: GenerateWithV2GuideRequest,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
 ):
     """
     Generate image using Custom Visual Guide V2 + art director meta-prompt.
@@ -328,7 +305,7 @@ async def generate_with_v2_guide(
             "style_profile_used": str
         }
     """
-    user_id = _get_user_id(token)
+    user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 

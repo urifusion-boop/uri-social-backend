@@ -9,8 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, status, Query
 from typing import List, Optional
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
-from app.dependencies import get_db_dependency
-from app.core.auth_bearer import JWTBearer
+from app.dependencies import get_db_dependency, flexible_auth
 from app.models.workspace_member import (
     WorkspaceMember,
     WorkspaceRole,
@@ -30,7 +29,7 @@ router = APIRouter(prefix="/social-media/workspaces", tags=["Workspace Members"]
 async def invite_member(
     workspace_id: str,
     request: InviteMemberRequest,
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
@@ -54,7 +53,7 @@ async def invite_member(
     # Check if current user has permission to invite
     has_permission = await WorkspaceService.check_permission(
         workspace_id=workspace_id,
-        user_id=token["userId"],
+        user_id=auth["user_id"],
         permission="can_invite_members",
         db=db
     )
@@ -93,7 +92,7 @@ async def invite_member(
         workspace_id=workspace_id,
         user_id=user_id_to_invite,
         role=request.role,
-        invited_by_user_id=token["userId"],
+        invited_by_user_id=auth["user_id"],
         db=db
     )
 
@@ -124,7 +123,7 @@ async def invite_member(
 async def get_member(
     workspace_id: str,
     user_id: str,
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
@@ -137,7 +136,7 @@ async def get_member(
     # Check if current user is a member
     current_member = await WorkspaceService.get_member(
         workspace_id=workspace_id,
-        user_id=token["userId"],
+        user_id=auth["user_id"],
         db=db
     )
 
@@ -176,7 +175,7 @@ async def update_member_role(
     workspace_id: str,
     user_id: str,
     request: UpdateMemberRoleRequest,
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
@@ -191,7 +190,7 @@ async def update_member_role(
     # Check permissions
     has_permission = await WorkspaceService.check_permission(
         workspace_id=workspace_id,
-        user_id=token["userId"],
+        user_id=auth["user_id"],
         permission="can_manage_members",
         db=db
     )
@@ -242,7 +241,7 @@ async def update_member_permissions(
     workspace_id: str,
     user_id: str,
     request: UpdateMemberPermissionsRequest,
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
@@ -257,7 +256,7 @@ async def update_member_permissions(
     # Check permissions
     has_permission = await WorkspaceService.check_permission(
         workspace_id=workspace_id,
-        user_id=token["userId"],
+        user_id=auth["user_id"],
         permission="can_manage_members",
         db=db
     )
@@ -301,7 +300,7 @@ async def suspend_member(
     workspace_id: str,
     user_id: str,
     reason: Optional[str] = Query(None, description="Reason for suspension"),
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
@@ -316,7 +315,7 @@ async def suspend_member(
     # Check permissions
     has_permission = await WorkspaceService.check_permission(
         workspace_id=workspace_id,
-        user_id=token["userId"],
+        user_id=auth["user_id"],
         permission="can_manage_members",
         db=db
     )
@@ -328,7 +327,7 @@ async def suspend_member(
         )
 
     # Cannot suspend yourself
-    if user_id == token["userId"]:
+    if user_id == auth["user_id"]:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Cannot suspend yourself"
@@ -365,7 +364,7 @@ async def suspend_member(
 async def reactivate_member(
     workspace_id: str,
     user_id: str,
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
@@ -378,7 +377,7 @@ async def reactivate_member(
     # Check permissions
     has_permission = await WorkspaceService.check_permission(
         workspace_id=workspace_id,
-        user_id=token["userId"],
+        user_id=auth["user_id"],
         permission="can_manage_members",
         db=db
     )
@@ -419,7 +418,7 @@ async def reactivate_member(
 async def remove_member(
     workspace_id: str,
     user_id: str,
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
@@ -432,13 +431,13 @@ async def remove_member(
     **Note**: Cannot remove the workspace owner. Owner must transfer ownership first.
     """
     # Check if user is removing themselves
-    is_self_removal = user_id == token["userId"]
+    is_self_removal = user_id == auth["user_id"]
 
     if not is_self_removal:
         # Check permissions for removing others
         has_permission = await WorkspaceService.check_permission(
             workspace_id=workspace_id,
-            user_id=token["userId"],
+            user_id=auth["user_id"],
             permission="can_manage_members",
             db=db
         )
@@ -481,7 +480,7 @@ async def remove_member(
 async def transfer_ownership(
     workspace_id: str,
     user_id: str,
-    token: dict = Depends(JWTBearer()),
+    auth: dict = Depends(flexible_auth),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency)
 ):
     """
@@ -496,7 +495,7 @@ async def transfer_ownership(
     # Check if current user is the owner
     current_member = await WorkspaceService.get_member(
         workspace_id=workspace_id,
-        user_id=token["userId"],
+        user_id=auth["user_id"],
         db=db
     )
 
@@ -523,7 +522,7 @@ async def transfer_ownership(
     # Transfer ownership
     success = await WorkspaceService.transfer_ownership(
         workspace_id=workspace_id,
-        current_owner_id=token["userId"],
+        current_owner_id=auth["user_id"],
         new_owner_id=user_id,
         db=db
     )
