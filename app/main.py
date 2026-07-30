@@ -28,6 +28,7 @@ from app.routers.workspace_member_router import router as workspace_member_route
 from app.agents.social_media_manager.routers.blog_router import router as blog_router
 from app.routers.agency_router import router as agency_router
 from app.agents.social_media_manager.routers.sdk_router import router as sdk_router
+from app.agents.social_media_manager.routers.jane_router import router as jane_router
 from app.routers.admin_router import router as admin_router
 
 # Initialize Sentry
@@ -244,6 +245,9 @@ app.include_router(agency_router, tags=["Agency"])
 
 # Include SDK router (API key authentication for external developers)
 app.include_router(sdk_router, tags=["SDK"])
+
+# Include Jane's First Message (personalized onboarding welcome message)
+app.include_router(jane_router, prefix="/social-media", tags=["Jane's First Message"])
 
 # Include multi-tenant routers (Enterprise/SDK features)
 app.include_router(client_router)
