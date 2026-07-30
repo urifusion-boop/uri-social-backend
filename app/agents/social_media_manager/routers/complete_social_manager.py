@@ -7388,7 +7388,8 @@ async def adjust_produce_video(
 @router.post("/multi-clip/start")
 async def multi_clip_start(
     background_tasks: BackgroundTasks,
-    clips: List[UploadFile] = File(...),
+    clips: Optional[List[UploadFile]] = File(None),
+    source_url: Optional[str] = Form(None),
     story_type: str = Form("founder"),
     target_duration: int = Form(30),
     orientation: str = Form("9:16"),
@@ -7400,7 +7401,10 @@ async def multi_clip_start(
 ):
     """
     Start a multi-clip composition job.
-    Upload 2–10 video clips; system transcribes each, suggests order, then stitches.
+    Upload 2–10 video clips, or pass source_url to re-ingest an already-hosted
+    video (e.g. re-running this pipeline on a previously stitched output —
+    fetched server-side so the browser never has to fetch a third-party host
+    itself and trip the CSP). System transcribes each, suggests order, then stitches.
     story_type: founder | product
     music_volume: Shotstack track volume 0.0-0.30 (0.06=quiet, 0.12=medium, 0.25=loud)
     Poll GET /multi-clip/job/{job_id} for status.
@@ -7412,18 +7416,29 @@ async def multi_clip_start(
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    if len(clips) < 1:
-        raise HTTPException(status_code=400, detail="At least 1 clip is required")
-    if len(clips) > 10:
-        raise HTTPException(status_code=400, detail="Maximum 10 clips allowed")
-
     # Read all clip bytes upfront before the background task starts
     clips_data: List[tuple] = []
-    for clip in clips:
-        raw = await clip.read()
+    if source_url:
+        import httpx
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.get(source_url)
+            resp.raise_for_status()
+        raw = resp.content
         if len(raw) < 1000:
-            raise HTTPException(status_code=400, detail=f"Clip '{clip.filename}' appears invalid or empty")
-        clips_data.append((clip.filename or "clip.mp4", raw))
+            raise HTTPException(status_code=400, detail="Fetched source_url appears invalid or empty")
+        filename = source_url.rsplit("/", 1)[-1].split("?")[0] or "clip.mp4"
+        clips_data.append((filename, raw))
+    else:
+        clips = clips or []
+        if len(clips) < 1:
+            raise HTTPException(status_code=400, detail="At least 1 clip is required")
+        if len(clips) > 10:
+            raise HTTPException(status_code=400, detail="Maximum 10 clips allowed")
+        for clip in clips:
+            raw = await clip.read()
+            if len(raw) < 1000:
+                raise HTTPException(status_code=400, detail=f"Clip '{clip.filename}' appears invalid or empty")
+            clips_data.append((clip.filename or "clip.mp4", raw))
 
     job_id = str(_uuid.uuid4())
     now = datetime.utcnow().isoformat()
