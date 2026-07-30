@@ -143,6 +143,14 @@ async def resolve_connection_state(
             ads["page_id"], ads.get("page_access_token", ""), ads.get("user_access_token", ""),
         )
         if not valid or not REQUIRED_ADS_SCOPES.issubset(granted):
+            # A live-diagnosed real case: the token itself was valid but Facebook's own
+            # consent screen didn't grant every requested permission (confirmed live —
+            # a client reconnected and still came back missing ads_management etc.).
+            # Stash which ones so the caller can show a precise reason instead of a
+            # generic "needs reconnecting" — transient (not persisted), so a shallow
+            # copy first.
+            ads = dict(ads)
+            ads["_missing_scopes"] = [] if not valid else sorted(REQUIRED_ADS_SCOPES - granted)
             return ConnectionState.EXPIRED, ads
 
     if require_whatsapp and not ads.get("whatsapp_page_linked"):

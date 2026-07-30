@@ -642,6 +642,11 @@ async def jane_meta_connection_status(
         "page_name": (ads or {}).get("account_name", ""),
         "whatsapp_number": (ads or {}).get("whatsapp_number", ""),
         "connect_url": "/social-media/connect/facebook-ads/initiate",
+        # Only meaningful when state == "expired" — which specific ads permissions
+        # weren't granted, so the client knows exactly what to re-check on Facebook's
+        # consent screen instead of just "reconnect and hope" (confirmed live: a token
+        # can be valid but still missing ads_management/pages_manage_ads etc.).
+        "missing_scopes": (ads or {}).get("_missing_scopes", []),
     }
 
 

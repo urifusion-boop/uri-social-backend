@@ -169,6 +169,29 @@ def test_expired_when_a_required_scope_is_missing():
     assert state == ConnectionState.EXPIRED
 
 
+def test_expired_carries_which_scopes_are_missing():
+    # Live-reported: a token can be valid but Facebook still doesn't grant every
+    # requested permission — surface exactly which ones, not just "expired".
+    db = FakeDb([_ads_doc()])
+    partial_scopes = REQUIRED_ADS_SCOPES - {"ads_management", "pages_manage_ads"}
+    with patch("app.agents.jane_ads.ads_connection.verify_token_live",
+               new=AsyncMock(return_value=(True, partial_scopes))):
+        state, ads = _run(resolve_connection_state(db, None, "brnd_1"))
+    assert state == ConnectionState.EXPIRED
+    assert ads["_missing_scopes"] == ["ads_management", "pages_manage_ads"]
+
+
+def test_expired_from_invalid_token_reports_no_specific_missing_scopes():
+    # An invalid/dead token isn't a "missing scope" situation — nothing was read at
+    # all, so there's nothing specific to report.
+    db = FakeDb([_ads_doc()])
+    with patch("app.agents.jane_ads.ads_connection.verify_token_live",
+               new=AsyncMock(return_value=(False, set()))):
+        state, ads = _run(resolve_connection_state(db, None, "brnd_1"))
+    assert state == ConnectionState.EXPIRED
+    assert ads["_missing_scopes"] == []
+
+
 def test_ads_no_whatsapp_when_number_not_linked():
     db = FakeDb([_ads_doc(whatsapp_page_linked=False)])
     with patch("app.agents.jane_ads.ads_connection.verify_token_live",
