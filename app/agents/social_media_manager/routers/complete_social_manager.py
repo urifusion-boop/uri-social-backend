@@ -2412,14 +2412,18 @@ async def reorder_carousel_slides(
 async def delete_draft(
     draft_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    auth: dict = Depends(flexible_auth)
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
-    """Permanently delete a content draft"""
-    user_id = auth.get("user_id")
-    if not user_id:
-        raise HTTPException(status_code=401, detail="User ID not found in token")
+    """Permanently delete a content draft — scoped to the active brand.
 
-    result = await db["content_drafts"].delete_one({"id": draft_id, "user_id": user_id})
+    Previously scoped by the bare developer user_id from flexible_auth, so
+    under multi-tenant mode any end-user could delete any other end-user's
+    draft by id. Now brand-scoped like GET/PATCH /drafts/{id} above.
+    """
+    user_id = ctx["user_id"]
+    scope = _brand_scope(user_id, ctx["brand_id"])
+
+    result = await db["content_drafts"].delete_one({**scope, "id": draft_id})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Draft not found")
 
