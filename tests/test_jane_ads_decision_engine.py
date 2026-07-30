@@ -222,3 +222,17 @@ def test_budget_tier_well_above_full_test_is_growth():
 def test_plan_carries_its_own_budget_tier():
     res = _plan(category="fashion", budget_ngn=C.AB_FULL_TEST_NGN)
     assert res.plan.budget_tier == "growth"
+
+
+# ── Followers goal gets the engagement objective, not Click-to-WhatsApp ────────
+
+def test_followers_goal_gets_engagement_objective():
+    from app.agents.jane_ads.models import CampaignObjective
+    res = _plan(goal=Goal.FOLLOWERS)
+    assert all(p.objective == CampaignObjective.ENGAGEMENT for p in res.plan.platforms)
+
+
+def test_non_followers_goal_still_gets_conversations_objective():
+    from app.agents.jane_ads.models import CampaignObjective
+    res = _plan(goal=Goal.MESSAGES)
+    assert all(p.objective == CampaignObjective.CONVERSATIONS for p in res.plan.platforms)

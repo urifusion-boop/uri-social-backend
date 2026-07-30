@@ -177,6 +177,16 @@ def test_ads_no_whatsapp_when_number_not_linked():
     assert state == ConnectionState.ADS_NO_WHATSAPP
 
 
+def test_ready_when_whatsapp_not_linked_but_not_required():
+    # A followers/engagement campaign never routes through WhatsApp — the Page
+    # connection alone is READY for it, whatsapp_page_linked or not.
+    db = FakeDb([_ads_doc(whatsapp_page_linked=False)])
+    with patch("app.agents.jane_ads.ads_connection.verify_token_live",
+               new=AsyncMock(return_value=(True, REQUIRED_ADS_SCOPES))):
+        state, ads = _run(resolve_connection_state(db, None, "brnd_1", require_whatsapp=False))
+    assert state == ConnectionState.READY
+
+
 def test_ready_when_everything_is_in_place():
     db = FakeDb([_ads_doc(whatsapp_page_linked=True, whatsapp_number="2348031234567")])
     with patch("app.agents.jane_ads.ads_connection.verify_token_live",

@@ -206,7 +206,7 @@ def choose_platform(
         platform_plans.append(PlatformPlan(
             platform=p, budget_ngn=round(per_platform_budget, 2), days=days,
             variants=variants, test_scope=scope,
-            objective=CampaignObjective.CONVERSATIONS,
+            objective=CampaignObjective.ENGAGEMENT if request.goal == Goal.FOLLOWERS else CampaignObjective.CONVERSATIONS,
         ))
 
     trace.append(f"Caps — per-business ₦{funded_amount_ngn:,.0f}, "
@@ -249,7 +249,7 @@ def apply_platform_override(plan: CampaignPlan, chosen: list[Platform]) -> Campa
         platform_plans.append(PlatformPlan(
             platform=p, budget_ngn=round(per_platform_budget, 2), days=days,
             variants=variants, test_scope=scope,
-            objective=CampaignObjective.CONVERSATIONS,
+            objective=CampaignObjective.ENGAGEMENT if plan.goal == Goal.FOLLOWERS else CampaignObjective.CONVERSATIONS,
         ))
     return plan.model_copy(update={"platforms": platform_plans})
 
