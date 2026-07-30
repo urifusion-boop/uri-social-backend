@@ -458,7 +458,6 @@ Rules:
             model="gpt-5.6-luna",
             messages=[{"role": "user", "content": prompt}],
             max_completion_tokens=200,
-            temperature=0.3,
             response_format={"type": "json_object"},
         )
         raw = (resp.choices[0].message.content or "").strip()
@@ -928,7 +927,6 @@ async def _refine_silence_cuts(
         resp = await client.chat.completions.create(
             model="gpt-5.6-luna",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
             max_completion_tokens=600,
         )
         raw = resp.choices[0].message.content.strip()
@@ -999,7 +997,6 @@ async def _detect_transcript_repetitions(
         resp = await client.chat.completions.create(
             model="gpt-5.6-luna",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
             max_completion_tokens=800,
         )
         raw = resp.choices[0].message.content.strip()
@@ -1170,7 +1167,6 @@ async def _run_ai_analysis(clips_ordered: List[Dict], story_type: str) -> Dict:
         resp = await client.chat.completions.create(
             model="gpt-5.6-luna",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.3,
             max_completion_tokens=1200,
         )
         raw = resp.choices[0].message.content.strip()
@@ -1483,7 +1479,6 @@ Shot type guide:
                 ],
             }],
             max_completion_tokens=200,
-            temperature=0.2,
             response_format={"type": "json_object"},
         )
         raw = resp.choices[0].message.content or "{}"
@@ -1534,7 +1529,6 @@ Return JSON only:
             model="gpt-5.6-luna",
             messages=[{"role": "user", "content": prompt}],
             max_completion_tokens=300,
-            temperature=0.7,
             response_format={"type": "json_object"},
         )
         raw = resp.choices[0].message.content or "{}"
