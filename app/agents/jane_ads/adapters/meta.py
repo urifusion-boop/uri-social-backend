@@ -51,6 +51,7 @@ from .base import AdPlatformAdapter
 from ..models import (
     CampaignPlan,
     ConversationDelivered,
+    Goal,
     LaunchResult,
     PerAdSpend,
     Platform,
@@ -201,10 +202,13 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
             # attached ("Please specify the media to run with this ad"), so this
             # can't fall back to a text-only placeholder.
             raise ValueError("CampaignPlan.creative.image_url is required to launch a real Meta campaign")
-        # Without the brand's WhatsApp number there's nowhere for a Click-to-WhatsApp
-        # ad to route to. Blocked here too (the router's ads_connection gate checks
-        # first) so a missing number can never silently ship a dead-end ad.
-        if not plan.whatsapp_number:
+        # A followers/engagement campaign never routes anywhere via WhatsApp — every
+        # other goal does. Without the brand's number there's nowhere for a
+        # Click-to-WhatsApp ad to route to. Blocked here too (the router's
+        # ads_connection gate checks first) so a missing number can never silently
+        # ship a dead-end ad.
+        is_followers_goal = plan.goal == Goal.FOLLOWERS
+        if not is_followers_goal and not plan.whatsapp_number:
             raise ValueError("CampaignPlan.whatsapp_number is required to launch a Click-to-WhatsApp campaign")
         platform_plan = meta_plans[0]
 
@@ -254,36 +258,50 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
             _raise_for_error(campaign_data, "campaign creation")
             campaign_id = campaign_data["id"]
 
+            adset_payload = {
+                "name": f"JaneAds-{plan.business_id}-adset",
+                "campaign_id": campaign_id,
+                "daily_budget": daily_budget_minor,
+                "billing_event": "IMPRESSIONS",
+                "bid_strategy": "LOWEST_COST_WITHOUT_CAP",
+                "targeting": {"geo_locations": {"countries": ["NG"]}},
+                "status": "PAUSED",
+                "start_time": start_time.isoformat(),
+                "end_time": end_time.isoformat(),
+            }
+            if is_followers_goal:
+                # Grow the Page's own following — confirmed live shape (Meta Marketing
+                # API docs): same OUTCOME_ENGAGEMENT campaign objective as a Click-to-
+                # WhatsApp ad, but POST_ENGAGEMENT optimization and no WhatsApp routing
+                # at all (no destination_type, no promoted_object.whatsapp_phone_number).
+                adset_payload["optimization_goal"] = "POST_ENGAGEMENT"
+            else:
+                # Optimize for started WhatsApp conversations, routed to the brand's
+                # own number. `promoted_object.whatsapp_phone_number` is confirmed live:
+                # Meta validates it's actually linked to this page/account and rejects
+                # with a specific, clear error if not — a free pre-flight check.
+                adset_payload["optimization_goal"] = "CONVERSATIONS"
+                adset_payload["destination_type"] = "WHATSAPP"
+                adset_payload["promoted_object"] = {"page_id": plan.page_id, "whatsapp_phone_number": plan.whatsapp_number}
             adset_resp = await client.post(
                 f"{self._graph_base}/act_{self._ad_account_id}/adsets",
                 params={"access_token": self._access_token},
-                json={
-                    "name": f"JaneAds-{plan.business_id}-adset",
-                    "campaign_id": campaign_id,
-                    "daily_budget": daily_budget_minor,
-                    "billing_event": "IMPRESSIONS",
-                    # Optimize for started WhatsApp conversations, routed to the brand's
-                    # own number. `promoted_object.whatsapp_phone_number` is confirmed live:
-                    # Meta validates it's actually linked to this page/account and rejects
-                    # with a specific, clear error if not — a free pre-flight check.
-                    "optimization_goal": "CONVERSATIONS",
-                    "destination_type": "WHATSAPP",
-                    "promoted_object": {"page_id": plan.page_id, "whatsapp_phone_number": plan.whatsapp_number},
-                    "bid_strategy": "LOWEST_COST_WITHOUT_CAP",
-                    "targeting": {"geo_locations": {"countries": ["NG"]}},
-                    "status": "PAUSED",
-                    "start_time": start_time.isoformat(),
-                    "end_time": end_time.isoformat(),
-                },
+                json=adset_payload,
             )
             adset_data = adset_resp.json()
             _raise_for_error(adset_data, "ad set creation")
             adset_id = adset_data["id"]
 
-            message = plan.creative.primary_text or plan.creative.headline or "Chat with us on WhatsApp!"
-            # WHATSAPP_MESSAGE routes the tap into a real WhatsApp chat with the number
-            # set in the ad set's promoted_object above — no link URL needed for this CTA.
-            cta = {"type": "WHATSAPP_MESSAGE"}
+            if is_followers_goal:
+                message = plan.creative.primary_text or plan.creative.headline or "Follow us for more!"
+                # LIKE_PAGE drives the tap straight to following the Page — confirmed
+                # live shape (Meta Marketing API docs), no link/WhatsApp routing at all.
+                cta = {"type": "LIKE_PAGE", "value": {"page": plan.page_id}}
+            else:
+                message = plan.creative.primary_text or plan.creative.headline or "Chat with us on WhatsApp!"
+                # WHATSAPP_MESSAGE routes the tap into a real WhatsApp chat with the number
+                # set in the ad set's promoted_object above — no link URL needed for this CTA.
+                cta = {"type": "WHATSAPP_MESSAGE"}
             if plan.creative.is_video:
                 object_story_spec = {
                     "page_id": plan.page_id,
@@ -299,7 +317,10 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                     "page_id": plan.page_id,
                     "link_data": {
                         "message": message,
-                        "link": "https://wa.me/",
+                        # LIKE_PAGE ignores this link (the button does the follow action
+                        # itself) — the Page's own URL is a reasonable placeholder, same
+                        # pattern as the wa.me/ placeholder for WHATSAPP_MESSAGE below.
+                        "link": f"https://www.facebook.com/{plan.page_id}" if is_followers_goal else "https://wa.me/",
                         "picture": plan.creative.image_url,
                         "call_to_action": cta,
                     },

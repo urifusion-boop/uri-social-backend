@@ -70,7 +70,8 @@ class ABTestScope(str, Enum):
 
 
 class CampaignObjective(str, Enum):
-    CONVERSATIONS = "conversations"     # Click-to-WhatsApp — the only objective we run
+    CONVERSATIONS = "conversations"     # Click-to-WhatsApp — every goal except FOLLOWERS
+    ENGAGEMENT = "engagement"           # Page-follower growth (Goal.FOLLOWERS) — no WhatsApp
 
 
 class PlanDecision(str, Enum):
