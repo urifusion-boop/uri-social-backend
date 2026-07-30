@@ -24,8 +24,43 @@ from math import ceil
 from typing import Optional, TypedDict
 
 from app.core.config import settings
+from app.database import get_db
 from app.services.CreditService import credit_service
 from app.services.TrialService import trial_service
+
+PLATFORM_SETTINGS_COLLECTION = "platform_settings"
+VIDEO_EDIT_RATE_KEY = "video_edit_credits_per_minute"
+
+
+async def get_video_edit_rate() -> int:
+    """
+    PRD §12 NFR: "The pricing rate should be configurable by an administrator
+    rather than permanently hard-coded." Reads the live rate from
+    platform_settings; falls back to the settings.py default only if no
+    admin has ever set one (fresh install / before first configuration).
+    """
+    db = get_db()
+    doc = await db[PLATFORM_SETTINGS_COLLECTION].find_one({"key": VIDEO_EDIT_RATE_KEY})
+    if doc and isinstance(doc.get("value"), int) and doc["value"] > 0:
+        return doc["value"]
+    return settings.VIDEO_EDIT_CREDITS_PER_MINUTE
+
+
+async def set_video_edit_rate(rate: int, updated_by: str) -> int:
+    """Admin-only write path — the caller (complete_social_manager.py's
+    PATCH /video-editing/pricing) gates this behind the JANE_ADS_ADMIN_EMAILS
+    allowlist before calling here. Upserts so the very first admin change
+    creates the document."""
+    if rate <= 0:
+        raise ValueError("rate must be a positive integer")
+    from datetime import datetime
+    db = get_db()
+    await db[PLATFORM_SETTINGS_COLLECTION].update_one(
+        {"key": VIDEO_EDIT_RATE_KEY},
+        {"$set": {"value": rate, "updated_by": updated_by, "updated_at": datetime.utcnow()}},
+        upsert=True,
+    )
+    return rate
 
 
 def probe_duration_strict(video_bytes: bytes) -> Optional[float]:
@@ -79,13 +114,15 @@ class VideoBillingResult(TypedDict):
     error: Optional[str]
 
 
-def compute_video_credits(duration_seconds: float) -> tuple[int, int]:
+async def compute_video_credits(duration_seconds: float) -> tuple[int, int]:
     """
     PRD §5: Credits required = ceiling(duration in minutes) x rate per minute.
-    Returns (billable_minutes, credits_required).
+    Rate is the live, admin-configurable value (see get_video_edit_rate) —
+    not a hard-coded constant. Returns (billable_minutes, credits_required).
     """
+    rate = await get_video_edit_rate()
     billable_minutes = max(1, ceil(max(duration_seconds, 0) / 60))
-    credits_required = billable_minutes * settings.VIDEO_EDIT_CREDITS_PER_MINUTE
+    credits_required = billable_minutes * rate
     return billable_minutes, credits_required
 
 
@@ -102,7 +139,7 @@ async def charge_for_video_job(
     `refund_video_job` with this same result if the submission then fails
     for a system reason.
     """
-    billable_minutes, credits_required = compute_video_credits(duration_seconds)
+    billable_minutes, credits_required = await compute_video_credits(duration_seconds)
 
     is_trial = await trial_service.has_active_trial(user_id)
 
@@ -182,15 +219,16 @@ async def refund_video_job(user_id: str, job_id: str, billing: VideoBillingResul
         await credit_service.refund_credit(user_id=user_id, campaign_id=job_id, reason=reason, amount=amount)
 
 
-def insufficient_credits_response(billing: VideoBillingResult) -> dict:
+async def insufficient_credits_response(billing: VideoBillingResult) -> dict:
     """PRD §11 error copy + UI requirements (§9): cost preview + balance."""
+    rate = await get_video_edit_rate()
+    needed = billing["billable_minutes"] * rate
     if billing.get("is_trial"):
         message = (
             "Your video editing free trial doesn't have enough credits left for "
-            f"this video ({billing['credits_charged'] or billing['billable_minutes'] * settings.VIDEO_EDIT_CREDITS_PER_MINUTE} credits needed)."
+            f"this video ({billing['credits_charged'] or needed} credits needed)."
         )
     else:
-        needed = billing["billable_minutes"] * settings.VIDEO_EDIT_CREDITS_PER_MINUTE
         message = (
             f"This video requires {needed} credits, but you currently have "
             f"{billing.get('credits_remaining') or 0} credits. Purchase more credits to continue."
@@ -202,9 +240,9 @@ def insufficient_credits_response(billing: VideoBillingResult) -> dict:
         "responseData": {
             "duration_seconds": billing["duration_seconds"],
             "billable_minutes": billing["billable_minutes"],
-            "credits_required": billing["billable_minutes"] * settings.VIDEO_EDIT_CREDITS_PER_MINUTE,
+            "credits_required": needed,
             "credits_remaining": billing.get("credits_remaining"),
-            "rate_per_minute": settings.VIDEO_EDIT_CREDITS_PER_MINUTE,
+            "rate_per_minute": rate,
             "upgrade_url": "/pricing",
         },
     }

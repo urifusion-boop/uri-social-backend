@@ -7017,6 +7017,52 @@ async def get_polish_video_clip_action(
     return UriResponse.get_single_data_response("clip_action", doc)
 
 
+# ── Video Editing Billing — pricing config ─────────────────────────────────
+# PRD §12 NFR: "The pricing rate should be configurable by an administrator
+# rather than permanently hard-coded." GET is open to any authenticated user
+# (the frontend cost preview needs it); PATCH is gated behind the same
+# email allowlist Jane Ads' billing report uses (JANE_ADS_ADMIN_EMAILS) —
+# there's no separate "platform admin" concept in this codebase yet, and
+# introducing one is out of scope of this PRD.
+
+def _is_billing_admin(token: dict) -> bool:
+    email = ((token.get("claims", {}) or {}).get("email") or "").lower()
+    allowed = {e.strip().lower() for e in (settings.JANE_ADS_ADMIN_EMAILS or "").split(",") if e.strip()}
+    return bool(allowed) and email in allowed
+
+
+@router.get("/video-editing/pricing")
+async def get_video_editing_pricing(token: dict = Depends(JWTBearer())):
+    """Current video-editing credit rate — used by the frontend cost preview
+    instead of hard-coding the rate client-side."""
+    from app.services.VideoBillingService import get_video_edit_rate
+
+    return UriResponse.get_single_data_response(
+        "video_editing_pricing", {"credits_per_minute": await get_video_edit_rate()}
+    )
+
+
+class UpdateVideoPricingRequest(BaseModel):
+    credits_per_minute: int = Field(..., gt=0, le=1000)
+
+
+@router.patch("/video-editing/pricing")
+async def update_video_editing_pricing(
+    body: UpdateVideoPricingRequest,
+    token: dict = Depends(JWTBearer()),
+):
+    """Admin-only: change the live video-editing credit rate without a
+    redeploy. See _is_billing_admin above for the allowlist."""
+    from app.services.VideoBillingService import set_video_edit_rate
+
+    if not _is_billing_admin(token):
+        raise HTTPException(status_code=403, detail="Not authorized to change billing configuration.")
+
+    email = (token.get("claims", {}) or {}).get("email") or "unknown"
+    rate = await set_video_edit_rate(body.credits_per_minute, updated_by=email)
+    return UriResponse.get_single_data_response("video_editing_pricing", {"credits_per_minute": rate})
+
+
 # ── Video Production (Phase 1 composed pipeline) ──────────────────────────────
 
 @router.post("/produce-video")
@@ -7087,7 +7133,7 @@ async def produce_video(
         user_id=user_id, duration_seconds=duration_seconds, job_id=job_id, reason="video_editing"
     )
     if not billing["success"]:
-        return JSONResponse(status_code=402, content=insufficient_credits_response(billing))
+        return JSONResponse(status_code=402, content=await insufficient_credits_response(billing))
 
     await db.video_production_jobs.insert_one({
         "job_id": job_id,
@@ -8074,7 +8120,7 @@ async def submagic_produce(
         user_id=user_id, duration_seconds=duration_seconds, job_id=job_id, reason="video_editing"
     )
     if not billing["success"]:
-        return JSONResponse(status_code=402, content=insufficient_credits_response(billing))
+        return JSONResponse(status_code=402, content=await insufficient_credits_response(billing))
 
     # Upload to Cloudinary to get a publicly accessible URL for Submagic
     public_id = f"submagic-{_uuid.uuid4().hex[:12]}"
@@ -8168,6 +8214,8 @@ async def get_submagic_job(
     token: dict = Depends(JWTBearer()),
 ):
     """Poll a Submagic production job for status and output URL."""
+    from app.services.VideoBillingService import refund_video_job, VideoBillingResult
+
     user_id = _get_user_id(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -8211,6 +8259,31 @@ async def get_submagic_job(
         {"job_id": job_id},
         {"$set": {"status": status, "output_url": output_url}},
     )
+
+    # Video Editing Billing PRD FR-10: refund when Submagic's own async
+    # processing fails, not just when the initial submit call fails. The
+    # atomic filter on billing_status="charged" claims the refund exactly
+    # once even if this poll fires again (or races another poll) before the
+    # update below lands — a second poll simply won't match and no-ops.
+    if status == "failed":
+        claimed = await db["submagic_jobs"].find_one_and_update(
+            {"job_id": job_id, "billing_status": "charged"},
+            {"$set": {"billing_status": "refunded"}},
+        )
+        if claimed:
+            await refund_video_job(
+                user_id, job_id,
+                VideoBillingResult(
+                    success=True,
+                    is_trial=claimed["billing_is_trial"],
+                    duration_seconds=claimed["billing_duration_seconds"],
+                    billable_minutes=claimed["billing_billable_minutes"],
+                    credits_charged=claimed["billing_credits_charged"],
+                    credits_remaining=None,
+                    error=None,
+                ),
+                reason="refund",
+            )
 
     # When complete and music was requested, mix it in and cache the result
     if status == "completed" and output_url and job.get("music_url"):
@@ -8323,7 +8396,7 @@ async def zapcap_produce(
         user_id=user_id, duration_seconds=duration_seconds, job_id=job_id, reason="video_editing"
     )
     if not billing["success"]:
-        return JSONResponse(status_code=402, content=insufficient_credits_response(billing))
+        return JSONResponse(status_code=402, content=await insufficient_credits_response(billing))
 
     headers = await _zapcap_headers()
 
@@ -8505,6 +8578,7 @@ async def zapcap_job_status(
     token: dict = Depends(JWTBearer()),
 ):
     import httpx
+    from app.services.VideoBillingService import refund_video_job, VideoBillingResult
 
     user_id = _get_user_id(token)
     if not user_id:
@@ -8513,6 +8587,30 @@ async def zapcap_job_status(
     job = await db["zapcap_jobs"].find_one({"job_id": job_id})
     if not job:
         raise HTTPException(status_code=404, detail="ZapCap job not found")
+
+    async def _refund_if_not_yet_refunded() -> None:
+        """Video Editing Billing PRD FR-10: refund when ZapCap's (or, for
+        custom-broll, Shotstack's) own async processing fails, not just when
+        the initial submit call fails. Atomic claim on billing_status so a
+        repeat poll (or a race between two polls) can't double-refund."""
+        claimed = await db["zapcap_jobs"].find_one_and_update(
+            {"job_id": job_id, "billing_status": "charged"},
+            {"$set": {"billing_status": "refunded"}},
+        )
+        if claimed:
+            await refund_video_job(
+                user_id, job_id,
+                VideoBillingResult(
+                    success=True,
+                    is_trial=claimed["billing_is_trial"],
+                    duration_seconds=claimed["billing_duration_seconds"],
+                    billable_minutes=claimed["billing_billable_minutes"],
+                    credits_charged=claimed["billing_credits_charged"],
+                    credits_remaining=None,
+                    error=None,
+                ),
+                reason="refund",
+            )
 
     # Return cached result if already complete
     if job.get("final_output_url"):
@@ -8550,6 +8648,7 @@ async def zapcap_job_status(
                 print(f"[CustomBroll] Cloudinary upload failed: {_e}", flush=True)
         elif mapped == "failed":
             await db["zapcap_jobs"].update_one({"job_id": job_id}, {"$set": {"status": "failed"}})
+            await _refund_if_not_yet_refunded()
         return UriResponse.get_single_data_response("zapcap_job", {
             "status": mapped,
             "output_url": ss_url or None,
@@ -8638,6 +8737,9 @@ async def zapcap_job_status(
         {"job_id": job_id},
         {"$set": {"status": status, "output_url": output_url}},
     )
+
+    if status == "failed":
+        await _refund_if_not_yet_refunded()
 
     # When complete, always get a permanent Cloudinary URL
     if status == "completed" and output_url:
