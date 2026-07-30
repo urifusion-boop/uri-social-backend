@@ -142,6 +142,11 @@ class Settings(BaseSettings):
     # Set to 'reap' | 'opusclip' | 'vizard' after Phase 0 Pidgin test picks a winner
     CLIPPING_API_PROVIDER: str = "reap"
 
+    # Video Editing Billing PRD §4: credits charged per billable minute of
+    # final video edited (rounded up to the next full minute). Configurable
+    # via env var rather than hard-coded in the billing logic.
+    VIDEO_EDIT_CREDITS_PER_MINUTE: int = 4
+
     # Bypass flags for local development
     BYPASS_SUBSCRIPTION_CHECK: bool = False
     BYPASS_FEATURE_LIMIT_CHECK: bool = False
