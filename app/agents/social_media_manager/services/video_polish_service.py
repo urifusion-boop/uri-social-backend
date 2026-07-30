@@ -227,6 +227,7 @@ class ReapProvider(AbstractClippingProvider):
                 upload_url,
                 data=video_bytes,
                 headers={"Content-Type": "video/mp4", "Content-Length": str(len(video_bytes))},
+                timeout=aiohttp.ClientTimeout(total=600, connect=30),
             ) as resp:
                 s3_body = await resp.text()
                 print(f"[Reap] S3 PUT response: status={resp.status} body={s3_body[:200]}", flush=True)
@@ -434,7 +435,8 @@ class ReapProvider(AbstractClippingProvider):
                         or urls.get("original")
                         or ""
                     )
-                    tracking_url = urls.get("trackingData", "")
+                    tracking_url = urls.get("trackingData") or ""
+                    print(f"[Reap] trackingData raw value={repr(tracking_url[:80] if tracking_url else tracking_url)}", flush=True)
 
                     srt_text = ""
                     tracking_data: dict = {}
@@ -447,12 +449,19 @@ class ReapProvider(AbstractClippingProvider):
                         try:
                             async with session.get(
                                 tracking_url,
-                                timeout=aiohttp.ClientTimeout(total=15),
+                                timeout=aiohttp.ClientTimeout(total=30),
                             ) as r:
-                                if r.ok:
-                                    tracking_data = await r.json(content_type=None)
+                                body = await r.text()
+                                print(
+                                    f"[Reap] trackingData status={r.status} len={len(body)} "
+                                    f"url_prefix={tracking_url[:60]}",
+                                    flush=True,
+                                )
+                                if r.ok and body.strip():
+                                    import json as _json
+                                    tracking_data = _json.loads(body)
                                     print(
-                                        f"[Reap] trackingData fetched ({len(str(tracking_data))} chars)",
+                                        f"[Reap] trackingData keys={list(tracking_data.keys())[:8]}",
                                         flush=True,
                                     )
                         except Exception as e:

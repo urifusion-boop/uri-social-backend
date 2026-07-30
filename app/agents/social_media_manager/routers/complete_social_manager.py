@@ -4,7 +4,7 @@ import asyncio
 import json
 import subprocess
 import traceback
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query, Request, Response, UploadFile, File, Form
+from fastapi import APIRouter, Body, Depends, HTTPException, BackgroundTasks, Query, Request, Response, UploadFile, File, Form
 from fastapi.responses import RedirectResponse, StreamingResponse, JSONResponse
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from pydantic import BaseModel, Field
@@ -130,7 +130,7 @@ class StoryboardFramesRequest(BaseModel):
 
 class PublishVideoDraftRequest(BaseModel):
     draft_id: str
-    platform: str   # "instagram_reels" | "facebook_reels"
+    platform: str   # "instagram_reels" | "facebook_reels" | "tiktok"
     caption: Optional[str] = None
 
 class VideoFromStoryboardRequest(BaseModel):
@@ -145,11 +145,14 @@ class ContentGenerationRequest(BaseModel):
     include_images: bool = False
     image_model: Optional[str] = None  # e.g. "fal-ai/flux-pro/v1.1", "fal-ai/flux/dev", "fal-ai/ideogram/v3", or None (default Imagen)
     brand_context: Optional[BrandContextRequest] = None
-    reference_image: Optional[str] = None  # base64 data URL uploaded by user for contextual reference
+    reference_image: Optional[str] = None  # DEPRECATED: use reference_images. Kept for backward compatibility.
+    reference_images: Optional[List[str]] = None  # base64 data URLs uploaded by user for contextual reference (multiple supported)
+    slide_image_map: Optional[List[Optional[int]]] = None  # carousel only: per-slide index into reference_images (or null for no image). Defaults to cycling image N -> slide N when omitted.
     post_type: str = "feed"   # feed | carousel | story
     num_slides: int = 3        # carousel only (2–5)
     acknowledged_incomplete_profile: bool = False  # OPTION 1: User acknowledged incomplete profile warning
     override_cta: Optional[str] = None  # One-time CTA for this generation only (not saved to brand playbook)
+    style_override: Optional[List[str]] = None  # One-time visual style slug(s) for this generation only (not saved to brand playbook). Carousel: cycles per slide. Single post: uses the first slug.
 
 class SocialConnectionRequest(BaseModel):
     platforms: List[str] = Field(..., min_items=1, max_items=10)
@@ -466,6 +469,27 @@ async def generate_content(
         post_type = request.post_type or "feed"
         num_slides = max(2, min(5, request.num_slides or 3))
 
+        # ── Reference images: normalise to a list, keep old single-image field working ──
+        ref_images: List[str] = request.reference_images or (
+            [request.reference_image] if request.reference_image else []
+        )
+
+        def _slide_reference_image(slide_index: int) -> Optional[str]:
+            """Which single reference image (if any) a given carousel slide should use.
+            Explicit slide_image_map wins; otherwise images cycle 1:1 across slides
+            (image 1 -> slide 1, image 2 -> slide 2, wrapping if there are fewer images
+            than slides)."""
+            if not ref_images:
+                return None
+            if request.slide_image_map is not None and slide_index < len(request.slide_image_map):
+                img_idx = request.slide_image_map[slide_index]
+                if img_idx is None:
+                    return None
+                if 0 <= img_idx < len(ref_images):
+                    return ref_images[img_idx]
+                return None
+            return ref_images[slide_index % len(ref_images)]
+
         if post_type == "carousel":
             from ..services.carousel_generation_service import CarouselGenerationService
             result = await CarouselGenerationService.generate_multi_platform(
@@ -485,7 +509,7 @@ async def generate_content(
                 seed_type=request.seed_type,
                 brand_context=brand_context_dict,
                 db=db,
-                reference_image=request.reference_image,
+                reference_image=ref_images[0] if ref_images else None,
             )
 
         # Stamp the ACTIVE BRAND on the request + every draft so content is isolated
@@ -571,85 +595,10 @@ async def generate_content(
                 for d in drafts:
                     d["has_image"] = True
 
-            # PRE-ASSIGN visual styles sequentially to avoid race condition when parallel tasks
-            # all read the same rotation_index simultaneously. Each draft gets a unique style,
-            # then they can generate images concurrently without conflicts.
-            #
-            # Custom guides (V1 + V2) take priority over library styles — same priority
-            # order the per-draft dynamic-assignment fallback below still uses — so this
-            # phase must resolve those first, not just always call pick_next_style().
-            from app.agents.social_media_manager.services.style_library import pick_next_style
-            from app.agents.social_media_manager.services.custom_visual_guide_service import CustomVisualGuideService
-            _bc_brand_id = brand_context_dict.get("brand_id", "")
-            _bc_user_id = brand_context_dict.get("user_id", "")
-            _style_profile_scope = {"brand_id": _bc_brand_id} if _bc_brand_id else {"user_id": _bc_user_id}
-
-            _style_profile = await db["brand_profiles"].find_one(
-                _style_profile_scope,
-                {"style_selections": 1, "style_prompt_fragments": 1, "style_rotation_index": 1,
-                 "industry": 1, "selected_custom_guides": 1, "selected_custom_guides_v2": 1}
-            ) or {}
-
-            _current_rotation_index = int(_style_profile.get("style_rotation_index") or 0)
-            _style_selections = _style_profile.get("style_selections") or []
-            _style_prompt_fragments = _style_profile.get("style_prompt_fragments") or []
-            _industry = _style_profile.get("industry") or brand_context_dict.get("industry", "")
-            _custom_guide_ids_v1 = _style_profile.get("selected_custom_guides") or []
-            _custom_guide_ids_v2 = _style_profile.get("selected_custom_guides_v2") or []
-            _all_custom_guide_ids = _custom_guide_ids_v1 + _custom_guide_ids_v2
-
-            # Pre-assign styles to each non-carousel draft. Each assignment is a dict:
-            # {"type": "library"|"custom_v1"|"custom_v2", "slug", "fragment"?,
-            #  "custom_guide_id"?, "reference_image"?}
-            _assigned_styles: Dict[str, Dict[str, Any]] = {}
-            _next_rotation_index = _current_rotation_index
-
-            for draft in drafts:
-                if post_type == "carousel":
-                    continue  # Carousels handle their own style assignment
-
-                if _all_custom_guide_ids:
-                    # Rotate through custom guides (V1 + V2) like library styles
-                    _custom_guide_id = _all_custom_guide_ids[_next_rotation_index % len(_all_custom_guide_ids)]
-                    _is_v2 = _custom_guide_id in _custom_guide_ids_v2
-                    _next_rotation_index = (_next_rotation_index + 1) % (len(_all_custom_guide_ids) + len(_style_selections))
-
-                    if _is_v2:
-                        _custom_guide = await db["custom_visual_guides"].find_one(
-                            {"_id": ObjectId(_custom_guide_id), "version": "v2"}
-                        )
-                        if _custom_guide:
-                            _assigned_styles[draft["id"]] = {
-                                "type": "custom_v2",
-                                "slug": f"custom_v2_{_custom_guide_id[:8]}",
-                                "custom_guide_id": _custom_guide_id,
-                                "reference_image": _custom_guide.get("original_image_url"),
-                            }
-                            print(f"🎨 Pre-assigned Custom V2 guide [{_custom_guide.get('name')}] to draft {draft['id'][:12]}...")
-                    else:
-                        _custom_guide = await CustomVisualGuideService.get_guide_detail(_custom_guide_id, db)
-                        if _custom_guide:
-                            _assigned_styles[draft["id"]] = {
-                                "type": "custom_v1",
-                                "slug": f"custom_{_custom_guide_id[:8]}",
-                                "fragment": _custom_guide.get("prompt_fragment", ""),
-                                "custom_guide_id": _custom_guide_id,
-                            }
-                            print(f"🎨 Pre-assigned Custom V1 guide [{_custom_guide.get('name')}] to draft {draft['id'][:12]}...")
-                            await CustomVisualGuideService.track_guide_usage(_custom_guide_id, False, db)
-                else:
-                    _slug, _fragment, _next_rotation_index = pick_next_style(
-                        _style_selections, _next_rotation_index, _industry, _style_prompt_fragments
-                    )
-                    _assigned_styles[draft["id"]] = {"type": "library", "slug": _slug, "fragment": _fragment}
-
-            # Save the final rotation index after all assignments
-            if _assigned_styles:
-                await db["brand_profiles"].update_one(
-                    _style_profile_scope,
-                    {"$set": {"style_rotation_index": _next_rotation_index}}
-                )
-                print(f"🎨 Pre-assigned {len(_assigned_styles)} styles, rotation index: {_current_rotation_index} → {_next_rotation_index}")
+            # Per-draft/per-slide style and custom-guide selection now happens inside
+            # _generate_image_bg() itself (see that function) — each concurrent task
+            # resolves its own index independently instead of racing on a shared
+            # rotation_index read here beforehand.
 
             # FastAPI's BackgroundTasks runs queued tasks one at a time, in order —
             # with several drafts that serializes their image generation instead of
@@ -676,17 +625,15 @@ async def generate_content(
                             seed_content=enriched_seed,  # Use enriched seed with both original context and slide-specific focus
                             brand_context=brand_context_dict,
                             db=db,
-                            reference_image=request.reference_image,
+                            reference_image=_slide_reference_image(slide_index),
                             post_type=post_type,
                             slide_index=slide_index,
                             image_model=request.image_model,
                             total_slides=total_slides,
                             carousel_id=carousel_id,
+                            style_override=request.style_override,
                         )))
                 else:
-                    # Get pre-assigned style for this draft
-                    _preassigned_style = _assigned_styles.get(draft["id"])
-                    print(f"🎨 Creating background image task for draft {draft['id'][:12]}... (auth_type={auth_type})")
                     _bg_image_tasks.append(asyncio.create_task(_generate_image_bg(
                         draft_id=draft["id"],
                         platform=draft["platform"],
@@ -694,10 +641,10 @@ async def generate_content(
                         seed_content=request.seed_content,
                         brand_context=brand_context_dict,
                         db=db,
-                        reference_image=request.reference_image,
+                        reference_image=ref_images[0] if ref_images else None,
                         post_type=post_type,
                         image_model=request.image_model,
-                        preassigned_style=_preassigned_style,
+                        style_override=request.style_override,
                     )))
             _BG_IMAGE_TASKS.update(_bg_image_tasks)
             for t in _bg_image_tasks:
@@ -4780,7 +4727,7 @@ async def _generate_image_bg(
     image_model: Optional[str] = None,
     total_slides: Optional[int] = None,
     carousel_id: Optional[str] = None,
-    preassigned_style: Optional[Dict[str, Any]] = None,
+    style_override: Optional[List[str]] = None,
 ):
     """
     Background task: generate an image for an existing draft and save it to DB.
@@ -4793,10 +4740,13 @@ async def _generate_image_bg(
     import os
     import base64
 
-    print(f"🚀 BG IMAGE TASK STARTED for draft {draft_id[:12]}... platform={platform}")
+    print(
+        f"🖼️📥 [REF-IMG TRACE] _generate_image_bg entry: draft={draft_id[:12]} post_type={post_type} "
+        f"slide_index={slide_index} reference_image={'<set, len=' + str(len(reference_image)) + '>' if reference_image else None}"
+    )
 
     try:
-        from app.agents.social_media_manager.services.style_library import pick_next_style
+        from app.agents.social_media_manager.services.style_library import pick_next_style, get_prompt_fragment
 
         # Build the correct brand profile scope for style lookups.
         # Using user_id alone returns the personal brand profile even when an agency
@@ -4805,228 +4755,258 @@ async def _generate_image_bg(
         _bc_user_id = brand_context.get("user_id", "")
         _style_profile_scope = {"brand_id": _bc_brand_id} if _bc_brand_id else {"user_id": _bc_user_id}
 
-        # ── Visual style rotation ─────────────────────────────────────────────
-        # For carousel posts: lock style to first slide, reuse for all subsequent slides
-        # For regular posts: rotate style normally
         if post_type == "carousel" and carousel_id and slide_index is not None:
-            if slide_index == 0:
-                # First slide: pick style and cache it for this carousel
-                _bp = await db["brand_profiles"].find_one(
-                    _style_profile_scope,
-                    {"style_selections": 1, "style_prompt_fragments": 1, "style_rotation_index": 1, "industry": 1, "selected_custom_guides": 1, "selected_custom_guides_v2": 1},
-                ) or {}
+            # ── Visual style: cycles PER SLIDE, not locked for the whole carousel ──
+            # slide 0 gets style_override[0] (or style_selections[0]), slide 1 gets
+            # [1], etc, wrapping if there are more slides than styles. Each slide
+            # computes its own index independently from the (explicit override or
+            # brand-profile) style list and its own slide_index — no cross-slide
+            # cache to race on, since these run concurrently as separate asyncio
+            # tasks. Custom visual guides are a different feature and still lock
+            # one guide for the whole carousel (unchanged) — mixing guides
+            # mid-carousel isn't what a "custom guide" selection is for, and an
+            # explicit style_override always means the user picked library styles
+            # for this generation, so it takes priority over any custom guide.
+            _bp = await db["brand_profiles"].find_one(
+                _style_profile_scope,
+                {"style_selections": 1, "style_prompt_fragments": 1, "style_rotation_index": 1, "industry": 1, "selected_custom_guides": 1, "selected_custom_guides_v2": 1},
+            ) or {}
 
-                # Check if user has selected custom guides (V1 or V2)
-                _custom_guide_ids_v1 = _bp.get("selected_custom_guides") or []
-                _custom_guide_ids_v2 = _bp.get("selected_custom_guides_v2") or []
-                _all_custom_guide_ids = _custom_guide_ids_v1 + _custom_guide_ids_v2
-                _custom_guide_id = None  # Initialize to avoid UnboundLocalError
+            _custom_guide_ids_v1 = _bp.get("selected_custom_guides") or []
+            _custom_guide_ids_v2 = _bp.get("selected_custom_guides_v2") or []
+            _all_custom_guide_ids = [] if style_override else (_custom_guide_ids_v1 + _custom_guide_ids_v2)
+            _custom_guide_id = None  # Initialize to avoid UnboundLocalError
 
-                if _all_custom_guide_ids:
-                    # Rotate through custom guides (V1 + V2) like library styles
+            if _all_custom_guide_ids:
+                # Custom guide: still locked to first slide, reused for the rest.
+                if slide_index == 0:
                     from app.agents.social_media_manager.services.custom_visual_guide_service import CustomVisualGuideService
                     from app.agents.social_media_manager.services.custom_visual_guide_v2_service import CustomVisualGuideV2Service
 
                     _rotation_index = int(_bp.get("style_rotation_index") or 0)
                     _custom_guide_id = _all_custom_guide_ids[_rotation_index % len(_all_custom_guide_ids)]
-
-                    # Determine if this is V1 or V2
                     is_v2 = _custom_guide_id in _custom_guide_ids_v2
 
                     if is_v2:
-                        # V2: Load guide and apply reference image
                         custom_guide = await db["custom_visual_guides"].find_one({"_id": ObjectId(_custom_guide_id), "version": "v2"})
                         if custom_guide:
-                            _fragment = ""  # V2 doesn't use prompt fragments
                             _slug = f"custom_v2_{_custom_guide_id[:8]}"
                             _next_index = (_rotation_index + 1) % (len(_all_custom_guide_ids) + len(_bp.get("style_selections") or []))
+                            _v2_ref = custom_guide.get("original_image_url")
                             brand_context = {
                                 **brand_context,
                                 "style_slug": _slug,
                                 "custom_guide_v2_id": _custom_guide_id,
-                                "custom_guide_v2_reference_image": custom_guide.get("original_image_url")
+                                "custom_guide_v2_reference_image": _v2_ref,
                             }
+                            await db["content_drafts"].update_one(
+                                {"id": carousel_id},
+                                {"$set": {"carousel_style_slug": _slug, "carousel_custom_guide_v2_id": _custom_guide_id, "carousel_custom_guide_v2_ref": _v2_ref}},
+                            )
+                            await db["brand_profiles"].update_one(_style_profile_scope, {"$set": {"style_rotation_index": _next_index}})
                             print(f"🎨 Custom V2 guide [{custom_guide.get('name')}] applied for all {total_slides} carousel slides")
                     else:
-                        # V1: Use prompt fragment
                         custom_guide = await CustomVisualGuideService.get_guide_detail(_custom_guide_id, db)
                         if custom_guide:
                             _fragment = custom_guide.get("prompt_fragment", "")
                             _slug = f"custom_{_custom_guide_id[:8]}"
                             _next_index = (_rotation_index + 1) % (len(_all_custom_guide_ids) + len(_bp.get("style_selections") or []))
                             brand_context = {**brand_context, "style_prompt_fragment": _fragment, "style_slug": _slug, "custom_guide_id": _custom_guide_id}
-                            print(f"🎨 Custom V1 guide [{custom_guide.get('name')}] applied for all {total_slides} carousel slides")
-
-                            # Track V1 usage
+                            await db["content_drafts"].update_one(
+                                {"id": carousel_id},
+                                {"$set": {"carousel_style_slug": _slug, "carousel_style_fragment": _fragment}},
+                            )
+                            await db["brand_profiles"].update_one(_style_profile_scope, {"$set": {"style_rotation_index": _next_index}})
                             await CustomVisualGuideService.track_guide_usage(_custom_guide_id, False, db)
+                            print(f"🎨 Custom V1 guide [{custom_guide.get('name')}] applied for all {total_slides} carousel slides")
                 else:
-                    # Fallback to library style rotation
-                    _style_selections = _bp.get("style_selections") or []
-                    _style_prompt_fragments = _bp.get("style_prompt_fragments") or []
-                    _rotation_index = int(_bp.get("style_rotation_index") or 0)
-                    _industry = _bp.get("industry") or brand_context.get("industry", "")
-
-                    _slug, _fragment, _next_index = pick_next_style(
-                        _style_selections, _rotation_index, _industry, _style_prompt_fragments
-                    )
-
-                if _fragment:
-                    # Cache style in draft document for subsequent slides
-                    await db["content_drafts"].update_one(
+                    draft = await db["content_drafts"].find_one(
                         {"id": carousel_id},
-                        {"$set": {
-                            "carousel_style_slug": _slug,
-                            "carousel_style_fragment": _fragment
-                        }}
+                        {"carousel_style_slug": 1, "carousel_style_fragment": 1, "carousel_custom_guide_v2_id": 1, "carousel_custom_guide_v2_ref": 1},
                     )
-
-                    # Only increment rotation index ONCE per carousel (not per slide) - skip for custom guides
-                    if not _custom_guide_id:
-                        print(f"🎨 Carousel style [{_slug}] applied for all {total_slides} slides (next index: {_next_index})")
-                        await db["brand_profiles"].update_one(
-                            _style_profile_scope,
-                            {"$set": {"style_rotation_index": _next_index}},
-                        )
-            else:
-                # Subsequent slides: reuse cached style from first slide
-                draft = await db["content_drafts"].find_one(
-                    {"id": carousel_id},
-                    {"carousel_style_slug": 1, "carousel_style_fragment": 1}
-                )
-                if draft:
-                    _slug = draft.get("carousel_style_slug")
-                    _fragment = draft.get("carousel_style_fragment")
-                    if _fragment:
-                        brand_context = {**brand_context, "style_prompt_fragment": _fragment, "style_slug": _slug}
-                        print(f"🎨 Reusing carousel style [{_slug}] for slide {slide_index + 1}/{total_slides}")
-        else:
-            # Regular post: use preassigned style if provided (avoids race condition),
-            # otherwise check for custom guides (V1 + V2) first, then fallback to style rotation
-            if preassigned_style:
-                # Use pre-assigned style/guide from the sequential assignment phase.
-                # Mirrors the three branches the dynamic fallback below handles.
-                _ptype = preassigned_style.get("type")
-                _slug = preassigned_style.get("slug", "")
-
-                if _ptype == "custom_v2":
-                    brand_context = {
-                        **brand_context,
-                        "style_slug": _slug,
-                        "custom_guide_v2_id": preassigned_style.get("custom_guide_id"),
-                        "custom_guide_v2_reference_image": preassigned_style.get("reference_image"),
-                    }
-                    print(f"🎨 Custom V2 guide [{_slug}] applied (pre-assigned to avoid race condition)")
-                elif _ptype == "custom_v1":
-                    _fragment = preassigned_style.get("fragment", "")
-                    brand_context = {
-                        **brand_context,
-                        "style_prompt_fragment": _fragment,
-                        "style_slug": _slug,
-                        "custom_guide_id": preassigned_style.get("custom_guide_id"),
-                    }
-                    print(f"🎨 Custom V1 guide [{_slug}] applied (pre-assigned to avoid race condition)")
-                else:
-                    _fragment = preassigned_style.get("fragment", "")
-                    if _fragment:
-                        brand_context = {**brand_context, "style_prompt_fragment": _fragment, "style_slug": _slug}
-                        print(f"🎨 Style [{_slug}] applied (pre-assigned to avoid race condition)")
-            else:
-                # Fallback to dynamic assignment (used by regenerate_image and other paths)
-                _bp = await db["brand_profiles"].find_one(
-                    _style_profile_scope,
-                    {"style_selections": 1, "style_prompt_fragments": 1, "style_rotation_index": 1, "industry": 1, "selected_custom_guides": 1, "selected_custom_guides_v2": 1},
-                ) or {}
-
-                # Check if user has selected custom guides (V1 or V2)
-                _custom_guide_ids_v1 = _bp.get("selected_custom_guides") or []
-                _custom_guide_ids_v2 = _bp.get("selected_custom_guides_v2") or []
-                _all_custom_guide_ids = _custom_guide_ids_v1 + _custom_guide_ids_v2
-                _custom_guide_id = None  # Initialize to avoid UnboundLocalError
-
-                if _all_custom_guide_ids:
-                    # Rotate through custom guides (V1 + V2) like library styles
-                    from app.agents.social_media_manager.services.custom_visual_guide_service import CustomVisualGuideService
-                    from app.agents.social_media_manager.services.custom_visual_guide_v2_service import CustomVisualGuideV2Service
-
-                    _rotation_index = int(_bp.get("style_rotation_index") or 0)
-                    _custom_guide_id = _all_custom_guide_ids[_rotation_index % len(_all_custom_guide_ids)]
-
-                    # Determine if this is V1 or V2
-                    is_v2 = _custom_guide_id in _custom_guide_ids_v2
-
-                    if is_v2:
-                        # V2: Load guide and apply reference image
-                        custom_guide = await db["custom_visual_guides"].find_one({"_id": ObjectId(_custom_guide_id), "version": "v2"})
-                        if custom_guide:
-                            _fragment = ""  # V2 doesn't use prompt fragments
-                            _slug = f"custom_v2_{_custom_guide_id[:8]}"
-                            _next_index = (_rotation_index + 1) % (len(_all_custom_guide_ids) + len(_bp.get("style_selections") or []))
+                    if draft:
+                        _slug = draft.get("carousel_style_slug")
+                        if draft.get("carousel_custom_guide_v2_id"):
                             brand_context = {
                                 **brand_context,
                                 "style_slug": _slug,
-                                "custom_guide_v2_id": _custom_guide_id,
-                                "custom_guide_v2_reference_image": custom_guide.get("original_image_url")
+                                "custom_guide_v2_id": draft["carousel_custom_guide_v2_id"],
+                                "custom_guide_v2_reference_image": draft.get("carousel_custom_guide_v2_ref"),
                             }
-                            print(f"🎨 Custom V2 guide [{custom_guide.get('name')}] applied for this image (next index: {_next_index})")
+                        elif draft.get("carousel_style_fragment"):
+                            brand_context = {**brand_context, "style_prompt_fragment": draft["carousel_style_fragment"], "style_slug": _slug}
+                        print(f"🎨 Reusing carousel custom guide [{_slug}] for slide {slide_index + 1}/{total_slides}")
+            else:
+                # Library styles (or an on-the-fly override): rotate per slide.
+                _style_selections = style_override or (_bp.get("style_selections") or [])
+                _style_prompt_fragments = [] if style_override else (_bp.get("style_prompt_fragments") or [])
+                _industry = _bp.get("industry") or brand_context.get("industry", "")
 
-                            # Update rotation index
-                            await db["brand_profiles"].update_one(
-                                _style_profile_scope,
-                                {"$set": {"style_rotation_index": _next_index}}
-                            )
+                if _style_selections:
+                    _idx = slide_index % len(_style_selections)
+                    _slug = _style_selections[_idx]
+                    if _style_prompt_fragments and _idx < len(_style_prompt_fragments) and _style_prompt_fragments[_idx]:
+                        _fragment = _style_prompt_fragments[_idx]
                     else:
-                        # V1: Use prompt fragment
-                        custom_guide = await CustomVisualGuideService.get_guide_detail(_custom_guide_id, db)
-                        if custom_guide:
-                            _fragment = custom_guide.get("prompt_fragment", "")
-                            _slug = f"custom_{_custom_guide_id[:8]}"
-                            _next_index = (_rotation_index + 1) % (len(_all_custom_guide_ids) + len(_bp.get("style_selections") or []))
-                            brand_context = {**brand_context, "style_prompt_fragment": _fragment, "style_slug": _slug, "custom_guide_id": _custom_guide_id}
-                            print(f"🎨 Custom V1 guide [{custom_guide.get('name')}] applied for this image (next index: {_next_index})")
-
-                            # Track V1 usage
-                            await CustomVisualGuideService.track_guide_usage(_custom_guide_id, False, db)
-
-                            # Update rotation index
-                            await db["brand_profiles"].update_one(
-                                _style_profile_scope,
-                                {"$set": {"style_rotation_index": _next_index}}
-                            )
+                        _fragment = get_prompt_fragment(_slug)
                 else:
-                    # Fallback to library style rotation
-                    _style_selections = _bp.get("style_selections") or []
-                    _style_prompt_fragments = _bp.get("style_prompt_fragments") or []
-                    _rotation_index = int(_bp.get("style_rotation_index") or 0)
-                    _industry = _bp.get("industry") or brand_context.get("industry", "")
+                    _slug, _fragment, _ = pick_next_style([], 0, _industry, [])
 
-                    _slug, _fragment, _next_index = pick_next_style(
-                        _style_selections, _rotation_index, _industry, _style_prompt_fragments
-                    )
+                if _fragment:
+                    brand_context = {**brand_context, "style_prompt_fragment": _fragment, "style_slug": _slug}
+                    _pos = f"{(_idx + 1) if _style_selections else 1}/{len(_style_selections) or 1}"
+                    print(f"🎨 Slide {slide_index + 1}/{total_slides} style [{_slug}] ({_pos} in rotation)")
 
-                    if _fragment:
-                        brand_context = {**brand_context, "style_prompt_fragment": _fragment, "style_slug": _slug}
-                        print(f"🎨 Style [{_slug}] applied for this image (next index: {_next_index})")
-                        # Persist incremented rotation index
+            # ── CTA: still locked once for the whole carousel ──
+            # _generate_platform_image() picks (and round-robin rotates) its own CTA
+            # every time it's called, and it's called once PER SLIDE, concurrently,
+            # all sharing the same brand_context dict — so without locking it here,
+            # each slide could race onto a different cta_rotation_index and end up
+            # with a different CTA than its neighbours in the same carousel.
+            if slide_index == 0:
+                _carousel_cta = brand_context.get("override_cta")
+                if not _carousel_cta:
+                    _cta_styles_list = brand_context.get("cta_styles", [])
+                    if isinstance(_cta_styles_list, list) and _cta_styles_list:
+                        _cta_rotation_index = int(brand_context.get("cta_rotation_index", 0) or 0)
+                        if _cta_rotation_index >= len(_cta_styles_list):
+                            _cta_rotation_index = 0
+                        _carousel_cta = _cta_styles_list[_cta_rotation_index]
+                        _cta_next_index = (_cta_rotation_index + 1) % len(_cta_styles_list)
                         await db["brand_profiles"].update_one(
                             _style_profile_scope,
-                            {"$set": {"style_rotation_index": _next_index}},
+                            {"$set": {"cta_rotation_index": _cta_next_index}},
                         )
+                    else:
+                        _carousel_cta = brand_context.get("default_link", "Link in bio")
+                await db["content_drafts"].update_one(
+                    {"id": carousel_id}, {"$set": {"carousel_cta_text": _carousel_cta}}
+                )
+                brand_context = {**brand_context, "override_cta": _carousel_cta}
+                print(f"🎯 CTA [{_carousel_cta}] locked for all {total_slides} carousel slides")
+            else:
+                draft = await db["content_drafts"].find_one({"id": carousel_id}, {"carousel_cta_text": 1})
+                _carousel_cta = draft.get("carousel_cta_text") if draft else None
+                if _carousel_cta:
+                    brand_context = {**brand_context, "override_cta": _carousel_cta}
+                    print(f"🎯 Reusing carousel CTA [{_carousel_cta}] for slide {slide_index + 1}/{total_slides}")
+        else:
+            # Regular post: check for custom guides (V1 + V2) first, then fallback to style rotation
+            _bp = await db["brand_profiles"].find_one(
+                _style_profile_scope,
+                {"style_selections": 1, "style_prompt_fragments": 1, "style_rotation_index": 1, "industry": 1, "selected_custom_guides": 1, "selected_custom_guides_v2": 1},
+            ) or {}
+
+            # An on-the-fly style override always takes priority over custom guides too.
+            _custom_guide_ids_v1 = _bp.get("selected_custom_guides") or []
+            _custom_guide_ids_v2 = _bp.get("selected_custom_guides_v2") or []
+            _all_custom_guide_ids = [] if style_override else (_custom_guide_ids_v1 + _custom_guide_ids_v2)
+            _custom_guide_id = None  # Initialize to avoid UnboundLocalError
+
+            if style_override:
+                _slug = style_override[0]
+                _fragment = get_prompt_fragment(_slug)
+                if _fragment:
+                    brand_context = {**brand_context, "style_prompt_fragment": _fragment, "style_slug": _slug}
+                    print(f"🎨 Style override [{_slug}] applied for this image")
+            elif _all_custom_guide_ids:
+                # Rotate through custom guides (V1 + V2) like library styles
+                from app.agents.social_media_manager.services.custom_visual_guide_service import CustomVisualGuideService
+                from app.agents.social_media_manager.services.custom_visual_guide_v2_service import CustomVisualGuideV2Service
+
+                _rotation_index = int(_bp.get("style_rotation_index") or 0)
+                _custom_guide_id = _all_custom_guide_ids[_rotation_index % len(_all_custom_guide_ids)]
+
+                # Determine if this is V1 or V2
+                is_v2 = _custom_guide_id in _custom_guide_ids_v2
+
+                if is_v2:
+                    # V2: Load guide and apply reference image
+                    custom_guide = await db["custom_visual_guides"].find_one({"_id": ObjectId(_custom_guide_id), "version": "v2"})
+                    if custom_guide:
+                        _fragment = ""  # V2 doesn't use prompt fragments
+                        _slug = f"custom_v2_{_custom_guide_id[:8]}"
+                        _next_index = (_rotation_index + 1) % (len(_all_custom_guide_ids) + len(_bp.get("style_selections") or []))
+                        brand_context = {
+                            **brand_context,
+                            "style_slug": _slug,
+                            "custom_guide_v2_id": _custom_guide_id,
+                            "custom_guide_v2_reference_image": custom_guide.get("original_image_url")
+                        }
+                        print(f"🎨 Custom V2 guide [{custom_guide.get('name')}] applied for this image (next index: {_next_index})")
+
+                        # Update rotation index
+                        await db["brand_profiles"].update_one(
+                            _style_profile_scope,
+                            {"$set": {"style_rotation_index": _next_index}}
+                        )
+                else:
+                    # V1: Use prompt fragment
+                    custom_guide = await CustomVisualGuideService.get_guide_detail(_custom_guide_id, db)
+                    if custom_guide:
+                        _fragment = custom_guide.get("prompt_fragment", "")
+                        _slug = f"custom_{_custom_guide_id[:8]}"
+                        _next_index = (_rotation_index + 1) % (len(_all_custom_guide_ids) + len(_bp.get("style_selections") or []))
+                        brand_context = {**brand_context, "style_prompt_fragment": _fragment, "style_slug": _slug, "custom_guide_id": _custom_guide_id}
+                        print(f"🎨 Custom V1 guide [{custom_guide.get('name')}] applied for this image (next index: {_next_index})")
+
+                        # Track V1 usage
+                        await CustomVisualGuideService.track_guide_usage(_custom_guide_id, False, db)
+
+                        # Update rotation index
+                        await db["brand_profiles"].update_one(
+                            _style_profile_scope,
+                            {"$set": {"style_rotation_index": _next_index}}
+                        )
+            else:
+                # Fallback to library style rotation
+                _style_selections = _bp.get("style_selections") or []
+                _style_prompt_fragments = _bp.get("style_prompt_fragments") or []
+                _rotation_index = int(_bp.get("style_rotation_index") or 0)
+                _industry = _bp.get("industry") or brand_context.get("industry", "")
+
+                _slug, _fragment, _next_index = pick_next_style(
+                    _style_selections, _rotation_index, _industry, _style_prompt_fragments
+                )
+
+                if _fragment:
+                    brand_context = {**brand_context, "style_prompt_fragment": _fragment, "style_slug": _slug}
+                    print(f"🎨 Style [{_slug}] applied for this image (next index: {_next_index})")
+                    # Persist incremented rotation index
+                    await db["brand_profiles"].update_one(
+                        _style_profile_scope,
+                        {"$set": {"style_rotation_index": _next_index}},
+                    )
 
         # For story posts pass image_type="story" so we get 1080x1920 dimensions
         image_type = "story" if post_type == "story" else "post_image"
 
-        # Extract V2 guide ID and reference image from brand_context if present
+        # ========== REFERENCE IMAGE vs V2 GUIDE PRIORITY ==========
+        # If the user attaches their OWN reference photo to this post while a
+        # V2 guide is also selected, don't discard the guide — clean the
+        # photo up the same way the standard flow does (background removal),
+        # then run it through the guide's OWN generation logic below, using
+        # this cleaned-up photo in place of the guide's own stored one. The
+        # guide's full style (medium/mood/color/etc.) still applies exactly
+        # as it does for a guide-only generation — only the subject content
+        # comes from the upload instead. The guide's OWN stored reference
+        # photo is untouched either way — this only fires when the caller
+        # supplies a second, separate photo.
         v2_guide_id = brand_context.get("custom_guide_v2_id")
-        v2_reference_image = brand_context.get("custom_guide_v2_reference_image")
-        print(f"[V2 DEBUG] v2_guide_id={v2_guide_id}, v2_reference_image={v2_reference_image[:100] if v2_reference_image else None}, reference_image={reference_image}")
-        if v2_reference_image:
-            reference_image = v2_reference_image
-            print(f"📸 Using V2 reference image: {reference_image[:80]}...")
+        v2_override_reference_image = None
 
-        if reference_image:
-            # User explicitly uploaded reference image - highest priority
-            # Use standard generation flow with reference image (skip V2 guide)
-            print(f"📸 User reference image detected - using standard generation (V2 guide ignored)")
+        if reference_image and v2_guide_id:
+            try:
+                from app.utils.background_removal import remove_background
+                v2_override_reference_image = await remove_background(reference_image, method="auto")
+                print(f"📸🎨 Reference image + V2 guide both present — cleaned up upload, applying guide's style to it")
+            except Exception as e:
+                print(f"⚠️ Background removal failed for guide+reference combo ({e}) — using original upload")
+                v2_override_reference_image = reference_image
+        elif reference_image:
+            # User explicitly uploaded reference image, no V2 guide selected —
+            # use standard generation flow with reference image as before.
+            print(f"📸 User reference image detected - using standard generation")
             v2_guide_id = None  # Override V2 guide when reference image is provided
 
         if v2_guide_id:
@@ -5035,11 +5015,22 @@ async def _generate_image_bg(
 
             from app.agents.social_media_manager.services.custom_visual_guide_v2_service import CustomVisualGuideV2Service
 
-            # Pure style cloning - minimal brand context (no colors, no styles)
+            # Style cloning with the brand's real identity — the art-director
+            # meta-prompt maps the reference's color STRATEGY onto these colors
+            # (and describes the logo/font/tone), so omitting them here doesn't
+            # mean "no color guidance" — it means the template's hardcoded
+            # fallback colors (#000000/#FFFFFF/#FF0000) get used instead, which
+            # is why V2 renders used to come out black/white/red regardless of
+            # the brand's actual palette.
             minimal_brand_context = {
                 "brand_name": brand_context.get("brand_name", ""),
                 "logo_url": brand_context.get("logo_url", ""),
                 "logo_position": brand_context.get("logo_position", "bottom_right"),
+                "logo_description": brand_context.get("logo_description", "brand logo"),
+                "brand_colors": brand_context.get("brand_colors") or [],
+                "font_style": brand_context.get("font_style") or brand_context.get("primary_font", ""),
+                "tone": brand_context.get("brand_voice") or brand_context.get("tone", "professional"),
+                "default_link": brand_context.get("default_link", ""),
             }
 
             # Extract headline/subtext/cta from content if available
@@ -5065,7 +5056,7 @@ async def _generate_image_bg(
                 else:
                     cta = brand_context.get("default_link", "Learn more")
 
-            image_result = await CustomVisualGuideV2Service.generate_image_with_v2_guide(
+            _v2_result = await CustomVisualGuideV2Service.generate_image_with_v2_guide(
                 guide_id=v2_guide_id,
                 seed_content=seed_content,
                 brand_context=minimal_brand_context,  # Minimal context for pure cloning
@@ -5074,7 +5065,22 @@ async def _generate_image_bg(
                 subtext=subtext,
                 cta=cta,
                 db=db,
+                override_reference_image=v2_override_reference_image,
             )
+            # generate_image_with_v2_guide() returns its own {"success", "image_url",
+            # ...} shape (also used as-is by the standalone /custom-guides-v2/generate
+            # endpoint) — normalize it to the {"status", "responseData", "responseMessage"}
+            # shape the rest of this function expects from the standard generation flow.
+            # Without this, every successful V2 generation read as a failure below
+            # (status was never set on the raw V2 dict), so the real image was silently
+            # discarded and the draft was marked image_failed even though generation
+            # had already succeeded (confirmed live on production: "[V2] ✅ Image
+            # generated successfully" immediately followed by "BG image gen failed... None").
+            image_result = {
+                "status": _v2_result.get("success", False),
+                "responseData": {"image_url": _v2_result.get("image_url")},
+                "responseMessage": None if _v2_result.get("success") else "V2 guide image generation failed",
+            }
         else:
             # Standard generation flow (V1 guides or no custom guide)
             # Extract V2 reference image from brand_context if present (legacy fallback)
@@ -5228,8 +5234,7 @@ async def _generate_image_bg(
                     {"id": draft_id},
                     {"$set": update_fields}
                 )
-                print(f"✅ BG IMAGE TASK COMPLETED for draft {draft_id[:12]}... matched={result.matched_count}")
-                print(f"   Image URL: {final_url[:80]}...")
+                print(f"✅ BG image saved for draft {draft_id}: matched={result.matched_count}")
                 if canvas_doc:
                     print(f"✅ Canvas document saved for draft {draft_id} with {len(canvas_doc.get('layers', []))} layers")
 
@@ -5574,6 +5579,73 @@ class SaveVideoDraftRequest(BaseModel):
     platforms: List[str] = Field(default_factory=list)
 
 
+class GenerateVideoCaptionRequest(BaseModel):
+    storyboard: Dict[str, Any]
+    platform: str = "instagram"  # instagram | facebook | tiktok | linkedin
+
+
+@router.post("/generate-video-caption")
+async def generate_video_caption(
+    request: GenerateVideoCaptionRequest,
+    auth: dict = Depends(flexible_auth),
+):
+    """
+    Generate a platform-optimised social media caption for a merged video
+    using the storyboard's scene descriptions and brand context.
+    """
+    import openai as _openai
+
+    auth.get("user_id")
+
+    scenes = request.storyboard.get("scenes", [])
+    brand_context = request.storyboard.get("brand_context", {})
+    brand_name = brand_context.get("brand_name", "")
+    target_platform = request.platform or request.storyboard.get("target_platform", "instagram")
+    target_audience = request.storyboard.get("target_audience", "")
+    total_duration = request.storyboard.get("total_duration_seconds", 0)
+
+    scene_lines = "\n".join(
+        f"Scene {s.get('scene_number', i + 1)}: {s.get('scene_description', s.get('description', ''))}"
+        for i, s in enumerate(scenes)
+    )
+
+    platform_guides = {
+        "instagram": "Instagram — max 2200 chars, conversational, 3–5 relevant hashtags at the end, 1–2 emojis in the body.",
+        "facebook":  "Facebook — max 500 chars, warm and conversational, 0–2 hashtags, no emoji overload.",
+        "tiktok":    "TikTok — punchy, max 150 chars, 3–5 trending hashtags, high-energy tone.",
+        "linkedin":  "LinkedIn — professional tone, 1–3 paragraphs, 3–5 industry hashtags, no excessive emojis.",
+    }
+    guide = platform_guides.get(target_platform, platform_guides["instagram"])
+
+    prompt = f"""You are a social media copywriter. Write a single ready-to-post caption for a video.
+
+PLATFORM: {target_platform.upper()}
+GUIDE: {guide}
+
+VIDEO INFO:
+- Brand: {brand_name or "the brand"}
+- Audience: {target_audience or "general"}
+- Duration: {total_duration}s
+- Scenes:
+{scene_lines}
+
+Rules:
+- Write ONLY the caption text — no labels, no explanation, no markdown wrapper.
+- Make it feel native to {target_platform}, not copy-paste generic.
+- Hashtags go at the very end, on a new line.
+- Do not include a trailing newline."""
+
+    client = _openai.AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+    response = await client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=600,
+        temperature=0.8,
+    )
+    caption = (response.choices[0].message.content or "").strip()
+    return UriResponse.get_single_data_response("caption", {"caption": caption})
+
+
 @router.post("/video-drafts")
 async def save_video_draft(
     request: SaveVideoDraftRequest,
@@ -5588,23 +5660,33 @@ async def save_video_draft(
     from datetime import datetime, timezone
     import uuid as _uuid
 
-    draft_id = _uuid.uuid4().hex
-    doc = {
-        "id": draft_id,
-        "request_id": draft_id,      # satisfies unique index on content_drafts
-        "platform": "video",          # satisfies compound index (request_id, platform)
-        "user_id": user_id,
-        "media_type": "video",
-        "video_url": request.merged_video_url,
-        "content": request.caption,
-        "platforms": request.platforms,
-        "status": "draft",
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-    await db["content_drafts"].insert_one(doc)
+    now = datetime.now(timezone.utc).isoformat()
+    platforms = request.platforms if request.platforms else ["instagram"]
+    request_id = _uuid.uuid4().hex
 
-    doc.pop("_id", None)
-    return UriResponse.get_single_data_response("video_draft", doc)
+    docs = []
+    for platform in platforms:
+        draft_id = _uuid.uuid4().hex
+        docs.append({
+            "id": draft_id,
+            "draft_id": draft_id,
+            "request_id": request_id,
+            "platform": platform,
+            "platforms": [platform],
+            "user_id": user_id,
+            "media_type": "video",
+            "video_url": request.merged_video_url,
+            "content": request.caption,
+            "status": "draft",
+            "post_type": "reel",
+            "created_at": now,
+        })
+
+    await db["content_drafts"].insert_many(docs)
+
+    for doc in docs:
+        doc.pop("_id", None)
+    return UriResponse.get_single_data_response("video_draft", docs[0])
 
 
 @router.get("/video-drafts")
@@ -5642,8 +5724,8 @@ async def publish_video_draft(
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    # Only Instagram and Facebook supported
-    SUPPORTED = {"instagram_reels", "facebook_reels"}
+    # Only Instagram, Facebook, and TikTok supported
+    SUPPORTED = {"instagram_reels", "facebook_reels", "tiktok"}
     if request.platform not in SUPPORTED:
         raise HTTPException(status_code=400, detail=f"Platform '{request.platform}' is not yet supported. Supported: {', '.join(SUPPORTED)}")
 
@@ -5666,6 +5748,7 @@ async def publish_video_draft(
     # facebook_reels  → look for "facebook" first; fall back to "instagram" because the
     #                   Instagram OAuth flow stores a Facebook Page access token that can
     #                   also be used to post videos to the Facebook Page.
+    # tiktok          → look for an Outstand-connected "tiktok" account (no direct API).
     if request.platform == "instagram_reels":
         conn = await db["social_connections"].find_one(
             {"user_id": user_id, "platform": "instagram"},
@@ -5675,6 +5758,13 @@ async def publish_video_draft(
             raise HTTPException(status_code=400, detail="No connected Instagram account found. Please connect your account first.")
         if not conn.get("ig_user_id"):
             raise HTTPException(status_code=400, detail="Instagram account missing ig_user_id. Please reconnect.")
+    elif request.platform == "tiktok":
+        conn = await db["social_connections"].find_one(
+            {"user_id": user_id, "platform": "tiktok", "connected_via": "outstand"},
+            {"_id": 0, "outstand_account_id": 1},
+        )
+        if not conn or not conn.get("outstand_account_id"):
+            raise HTTPException(status_code=400, detail="No connected TikTok account found. Please connect your account first.")
     else:  # facebook_reels
         conn = await db["social_connections"].find_one(
             {"user_id": user_id, "platform": "facebook"},
@@ -6781,24 +6871,46 @@ async def get_polish_video_clip_action(
 @router.post("/produce-video")
 async def produce_video(
     background_tasks: BackgroundTasks,
-    video: UploadFile = File(...),
+    video: Optional[UploadFile] = File(None),
+    source_url: Optional[str] = Form(None),
     video_type: str = Form("founder"),
+    template_id: str = Form("fast_founder"),
+    enable_music: str = Form("true"),
+    mute_original_audio: str = Form("false"),
+    enable_sfx: str = Form("true"),
+    enable_captions: str = Form("true"),
+    custom_music: Optional[UploadFile] = File(None),
+    transition_style: str = Form("auto"),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
     auth: dict = Depends(flexible_auth),
 ):
     """
     Start a full video production job.
+    Supply either a binary `video` file OR a `source_url` (e.g. from Multi-Clip Composer).
     video_type: tiktok | product | founder
     Poll GET /produce-video-job/{job_id} for status and output_url.
     """
     import uuid
+    import httpx
     from app.agents.social_media_manager.services.video_production_service import run_production_job
 
     user_id = auth.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    video_bytes = await video.read()
+    if video is not None:
+        video_bytes = await video.read()
+    elif source_url:
+        try:
+            async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+                r = await client.get(source_url)
+                r.raise_for_status()
+                video_bytes = r.content
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Could not fetch source_url: {exc}") from exc
+    else:
+        raise HTTPException(status_code=400, detail="Provide either a video file or source_url")
+
     if len(video_bytes) < 1000:
         raise HTTPException(status_code=400, detail="Invalid video file")
 
@@ -6809,6 +6921,7 @@ async def produce_video(
         "job_id": job_id,
         "user_id": user_id,
         "video_type": video_type,
+        "template_id": template_id,
         "status": "processing",
         "status_message": "Starting…",
         "progress": 0,
@@ -6822,7 +6935,21 @@ async def produce_video(
         "completed_at": None,
     })
 
-    background_tasks.add_task(run_production_job, job_id, video_bytes, video_type, db)
+    custom_music_bytes = b""
+    if custom_music is not None:
+        custom_music_bytes = await custom_music.read()
+        print(f"[CustomMusic] received {len(custom_music_bytes)//1024}KB — uploading to Cloudinary in background", flush=True)
+
+    background_tasks.add_task(
+        run_production_job, job_id, video_bytes, video_type, db,
+        enable_music=(enable_music.lower() != "false"),
+        mute_original_audio=(mute_original_audio.lower() == "true"),
+        enable_sfx=(enable_sfx.lower() != "false"),
+        enable_captions=(enable_captions.lower() != "false"),
+        custom_music_bytes=custom_music_bytes,
+        transition_style=transition_style,
+        template_id=template_id,
+    )
 
     return UriResponse.get_single_data_response(
         "produce_video", {"job_id": job_id, "status": "processing"}
@@ -6847,3 +6974,1617 @@ async def get_produce_video_job(
         raise HTTPException(status_code=404, detail="Job not found")
 
     return UriResponse.get_single_data_response("produce_video_job", doc)
+
+
+@router.get("/produce-video-job/{job_id}/capture-frame")
+async def capture_video_frame(
+    job_id: str,
+    t: float = Query(default=0.0, ge=0.0),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    auth: dict = Depends(flexible_auth),
+):
+    """Extract a JPEG frame at time t (seconds) from the produced video using ffmpeg."""
+    user_id = auth.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    doc = await db.video_production_jobs.find_one(
+        {"job_id": job_id, "user_id": user_id}, {"output_url": 1}
+    )
+    if not doc or not doc.get("output_url"):
+        raise HTTPException(status_code=404, detail="Job not found or video not ready")
+
+    output_url = doc["output_url"]
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-ss", str(t),
+                "-i", output_url,
+                "-vframes", "1",
+                "-f", "image2pipe",
+                "-vcodec", "mjpeg",
+                "pipe:1",
+            ],
+            capture_output=True,
+            timeout=30,
+        )
+        if not result.stdout:
+            raise HTTPException(status_code=500, detail="ffmpeg produced no output")
+        return Response(content=result.stdout, media_type="image/jpeg")
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="Frame capture timed out")
+    except FileNotFoundError:
+        raise HTTPException(status_code=500, detail="ffmpeg not available on server")
+
+
+@router.post("/produce-video-job/{job_id}/start-render")
+async def start_produce_video_render(
+    job_id: str,
+    background_tasks: BackgroundTasks,
+    payload: dict = Body(default={}),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    auth: dict = Depends(flexible_auth),
+):
+    """
+    Approve AI decisions and start the render phase.
+    Called after GET /produce-video-job returns status=awaiting_review.
+    Body: { "decisions": { "cuts": [...], "zooms": [...], "sound_effects": [...],
+                           "broll": [...], "hook_text": "...", "music_mood": "..." } }
+    Omit or send empty body to use the AI decisions as-is.
+    """
+    from app.agents.social_media_manager.services.video_production_service import run_render_phase
+
+    user_id = auth.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    doc = await db.video_production_jobs.find_one(
+        {"job_id": job_id, "user_id": user_id}, {"_id": 0, "status": 1, "ai_decisions": 1}
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if doc.get("status") != "awaiting_review":
+        raise HTTPException(status_code=409, detail=f"Job is not awaiting review (status={doc.get('status')})")
+
+    # Merge user edits on top of the stored AI decisions (user can remove/edit items)
+    approved = payload.get("decisions") if payload else None
+    if approved:
+        await db.video_production_jobs.update_one(
+            {"job_id": job_id},
+            {"$set": {"ai_decisions": approved}}
+        )
+
+    await db.video_production_jobs.update_one(
+        {"job_id": job_id},
+        {"$set": {"status": "processing", "status_message": "Rendering…", "progress": 56}}
+    )
+
+    background_tasks.add_task(run_render_phase, job_id, db)
+
+    return UriResponse.get_single_data_response(
+        "start_render", {"job_id": job_id, "status": "processing"}
+    )
+
+
+class AdjustVideoBody(BaseModel):
+    caption_color: Optional[str] = None
+    caption_font: Optional[str] = None
+    caption_text_edits: Optional[list] = None  # [{index: int, text: str}, ...]
+    hook_text: Optional[str] = None
+    hook_text_color: Optional[str] = None
+    hook_text_size: Optional[int] = None
+
+
+@router.post("/produce-video-job/{job_id}/adjust")
+async def adjust_produce_video(
+    job_id: str,
+    body: AdjustVideoBody,
+    background_tasks: BackgroundTasks,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    auth: dict = Depends(flexible_auth),
+):
+    """
+    Re-render a completed video with light adjustments (caption colour, caption text edits).
+    Reads the existing render_context, applies overrides, and re-submits to Shotstack.
+    Poll GET /produce-video-job/{job_id} for the updated status and output_url.
+    """
+    import json as _json
+    from app.agents.social_media_manager.services.video_production_service import run_render_phase
+    caption_color = body.caption_color
+    caption_font = body.caption_font
+    caption_text_edits = body.caption_text_edits
+    hook_text = body.hook_text.upper().strip() if body.hook_text else None
+    hook_text_color = body.hook_text_color
+    hook_text_size = body.hook_text_size
+
+    user_id = auth.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    doc = await db.video_production_jobs.find_one({"job_id": job_id, "user_id": user_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if doc.get("status") not in ("ready", "failed"):
+        raise HTTPException(status_code=409, detail="Job must be in ready state to adjust")
+
+    ctx = doc.get("render_context", {})
+    if not ctx:
+        raise HTTPException(status_code=400, detail="No render context — cannot re-render")
+
+    print(f"[Adjust] job={job_id} received: caption_color={caption_color!r} caption_font={caption_font!r} caption_text_edits={'yes' if caption_text_edits else 'no'}", flush=True)
+    print(f"[Adjust] ctx BEFORE: primary_color={ctx.get('primary_color')!r} caption_color={ctx.get('caption_color')!r} caption_font_family={ctx.get('caption_font_family')!r}", flush=True)
+
+    # Apply caption text colour override — also sync karaoke highlight (primary_color)
+    if caption_color:
+        ctx["caption_color"] = caption_color
+        ctx["primary_color"] = caption_color
+
+    # Apply caption font family override
+    if caption_font:
+        ctx["caption_font_family"] = caption_font
+
+    # Apply hook text style overrides
+    if hook_text_color:
+        ctx["hook_text_color"] = hook_text_color
+    if hook_text_size:
+        ctx["hook_text_size"] = hook_text_size
+
+    print(f"[Adjust] ctx AFTER:  primary_color={ctx.get('primary_color')!r} caption_color={ctx.get('caption_color')!r} caption_font_family={ctx.get('caption_font_family')!r}", flush=True)
+
+    # Apply caption text edits to the stored SRT
+    if caption_text_edits:
+        try:
+            edits = caption_text_edits  # already a list: [{index: int, text: str}, ...]
+            srt_lines = ctx.get("srt_text", "").split("\n")
+            # Parse SRT into blocks: each block is [num, timing, text..., ""]
+            blocks: list = []
+            current: list = []
+            for line in srt_lines:
+                if line.strip() == "" and current:
+                    blocks.append(current)
+                    current = []
+                else:
+                    current.append(line)
+            if current:
+                blocks.append(current)
+            # Build map from SRT 1-based sequence number → 0-based block index
+            seq_to_block = {
+                int(b[0].strip()): i
+                for i, b in enumerate(blocks)
+                if b and b[0].strip().isdigit()
+            }
+            # Apply text edits by SRT sequence number
+            for edit in edits:
+                seq = int(edit.get("index", -1))
+                block_i = seq_to_block.get(seq, -1)
+                new_text = str(edit.get("text", "")).strip()
+                if block_i >= 0 and len(blocks[block_i]) >= 3 and new_text:
+                    blocks[block_i][2] = new_text
+            # Reassemble SRT — blank line between blocks (standard SRT format)
+            ctx["srt_text"] = "\n\n".join("\n".join(b) for b in blocks) + "\n"
+        except Exception as e:
+            print(f"[Adjust] caption_text_edits parse error: {e}", flush=True)
+
+    # Persist the updated context and reset status
+    db_set: dict = {
+        "render_context": ctx,
+        "status": "processing",
+        "status_message": "Re-rendering with your changes…",
+        "progress": 60,
+        "output_url": None,
+    }
+    if hook_text:
+        db_set["ai_decisions.hook_text"] = hook_text
+    await db.video_production_jobs.update_one({"job_id": job_id}, {"$set": db_set})
+
+    background_tasks.add_task(run_render_phase, job_id, db)
+
+    return UriResponse.get_single_data_response(
+        "adjust_video", {"job_id": job_id, "status": "processing"}
+    )
+
+
+# ── Multi-Clip Composition (Phase 1 — Founder Story) ─────────────────────────
+
+@router.post("/multi-clip/start")
+async def multi_clip_start(
+    background_tasks: BackgroundTasks,
+    clips: List[UploadFile] = File(...),
+    story_type: str = Form("founder"),
+    target_duration: int = Form(30),
+    orientation: str = Form("9:16"),
+    enable_music: str = Form("true"),
+    music_mood: str = Form("chill"),
+    music_volume: float = Form(0.12),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    auth: dict = Depends(flexible_auth),
+):
+    """
+    Start a multi-clip composition job.
+    Upload 2–10 video clips; system transcribes each, suggests order, then stitches.
+    story_type: founder | product
+    music_volume: Shotstack track volume 0.0-0.30 (0.06=quiet, 0.12=medium, 0.25=loud)
+    Poll GET /multi-clip/job/{job_id} for status.
+    """
+    import uuid as _uuid
+    from app.agents.social_media_manager.services.multi_clip_service import run_multi_clip_ingest
+
+    user_id = auth.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    if len(clips) < 1:
+        raise HTTPException(status_code=400, detail="At least 1 clip is required")
+    if len(clips) > 10:
+        raise HTTPException(status_code=400, detail="Maximum 10 clips allowed")
+
+    # Read all clip bytes upfront before the background task starts
+    clips_data: List[tuple] = []
+    for clip in clips:
+        raw = await clip.read()
+        if len(raw) < 1000:
+            raise HTTPException(status_code=400, detail=f"Clip '{clip.filename}' appears invalid or empty")
+        clips_data.append((clip.filename or "clip.mp4", raw))
+
+    job_id = str(_uuid.uuid4())
+    now = datetime.utcnow().isoformat()
+
+    await db.multi_clip_jobs.insert_one({
+        "job_id": job_id,
+        "user_id": user_id,
+        "story_type": story_type,
+        "status": "analyzing",
+        "status_message": "Starting…",
+        "progress": 0,
+        "clips": [],
+        "suggested_order": [],
+        "target_duration_seconds": target_duration,
+        "orientation": orientation,
+        "enable_music": enable_music.lower() != "false",
+        "music_mood": music_mood,
+        "music_volume": max(0.0, min(0.30, float(music_volume))),
+        "output_url": None,
+        "render_id": None,
+        "created_at": now,
+        "updated_at": now,
+        "completed_at": None,
+    })
+
+    background_tasks.add_task(run_multi_clip_ingest, job_id, clips_data, db)
+
+    return UriResponse.get_single_data_response(
+        "multi_clip_start", {"job_id": job_id, "status": "analyzing"}
+    )
+
+
+@router.post("/multi-clip/job/{job_id}/reset")
+async def reset_multi_clip_job(
+    job_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    auth: dict = Depends(flexible_auth),
+):
+    """
+    Reset a completed (ready/failed) job back to awaiting_order so the user can
+    reorder clips and re-stitch without starting a new job.
+    Clips, script, and settings are preserved.
+    """
+    user_id = auth.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    doc = await db.multi_clip_jobs.find_one({"job_id": job_id, "user_id": user_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if doc.get("status") not in ("ready", "failed"):
+        raise HTTPException(status_code=400, detail="Only ready or failed jobs can be reset")
+
+    await db.multi_clip_jobs.update_one(
+        {"job_id": job_id},
+        {"$set": {
+            "status": "awaiting_order",
+            "status_message": "Ready to review",
+            "output_url": None,
+            "render_id": None,
+            "completed_at": None,
+            "updated_at": datetime.utcnow().isoformat(),
+        }},
+    )
+    return UriResponse.get_single_data_response(
+        "multi_clip_reset", {"job_id": job_id, "status": "awaiting_order"}
+    )
+
+
+@router.get("/multi-clip/job/{job_id}")
+async def get_multi_clip_job(
+    job_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    auth: dict = Depends(flexible_auth),
+):
+    """Poll a multi-clip composition job."""
+    user_id = auth.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    doc = await db.multi_clip_jobs.find_one(
+        {"job_id": job_id, "user_id": user_id}, {"_id": 0}
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    return UriResponse.get_single_data_response("multi_clip_job", doc)
+
+
+@router.post("/multi-clip/job/{job_id}/reorder")
+async def reorder_multi_clip_job(
+    job_id: str,
+    payload: dict = Body(...),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    auth: dict = Depends(flexible_auth),
+):
+    """
+    Set the user's chosen clip order.
+    Body: { "clip_ids": ["clip_abc", "clip_def", ...] }
+    """
+    user_id = auth.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    doc = await db.multi_clip_jobs.find_one(
+        {"job_id": job_id, "user_id": user_id}, {"_id": 0, "clips": 1, "status": 1}
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if doc.get("status") not in ("awaiting_order", "ready"):
+        raise HTTPException(status_code=409, detail=f"Cannot reorder in status={doc.get('status')}")
+
+    clip_ids: List[str] = payload.get("clip_ids", [])
+    clips: List[Dict] = doc.get("clips", [])
+
+    # Update order_index per clip
+    id_to_rank = {cid: rank for rank, cid in enumerate(clip_ids)}
+    updated_clips = []
+    for c in clips:
+        c = dict(c)
+        if c["clip_id"] in id_to_rank:
+            c["order_index"] = id_to_rank[c["clip_id"]]
+        updated_clips.append(c)
+
+    await db.multi_clip_jobs.update_one(
+        {"job_id": job_id},
+        {"$set": {"clips": updated_clips, "updated_at": datetime.utcnow().isoformat()}}
+    )
+
+    return UriResponse.get_single_data_response("reorder", {"accepted": True})
+
+
+class UpdateClipPositionRequest(BaseModel):
+    subject_position: str  # left | center | right
+
+
+@router.patch("/multi-clip/job/{job_id}/clip/{clip_id}/position")
+async def update_clip_position(
+    job_id: str,
+    clip_id: str,
+    req: UpdateClipPositionRequest,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    auth: dict = Depends(flexible_auth),
+):
+    """
+    Override the auto-detected subject_position for one clip.
+    Persisted to DB so it's used at stitch time.
+    """
+    user_id = auth.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if req.subject_position not in ("left", "center", "right"):
+        raise HTTPException(status_code=400, detail="subject_position must be left, center, or right")
+
+    result = await db.multi_clip_jobs.update_one(
+        {"job_id": job_id, "user_id": user_id, "clips.clip_id": clip_id},
+        {"$set": {
+            "clips.$.subject_position": req.subject_position,
+            "updated_at": datetime.utcnow().isoformat(),
+        }},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Job or clip not found")
+
+    return UriResponse.get_single_data_response(
+        "update_clip_position",
+        {"clip_id": clip_id, "subject_position": req.subject_position},
+    )
+
+
+@router.post("/multi-clip/job/{job_id}/drop-clip")
+async def drop_multi_clip(
+    job_id: str,
+    payload: dict = Body(...),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    auth: dict = Depends(flexible_auth),
+):
+    """
+    Mark a clip as dropped (excluded from stitch).
+    Body: { "clip_id": "clip_abc", "dropped": true }
+    """
+    user_id = auth.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    doc = await db.multi_clip_jobs.find_one(
+        {"job_id": job_id, "user_id": user_id}, {"_id": 0, "clips": 1}
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    clip_id = payload.get("clip_id")
+    dropped = bool(payload.get("dropped", True))
+    clips = [dict(c) for c in doc.get("clips", [])]
+    for c in clips:
+        if c["clip_id"] == clip_id:
+            c["dropped"] = dropped
+
+    await db.multi_clip_jobs.update_one(
+        {"job_id": job_id},
+        {"$set": {"clips": clips, "updated_at": datetime.utcnow().isoformat()}}
+    )
+
+    return UriResponse.get_single_data_response("drop_clip", {"clip_id": clip_id, "dropped": dropped})
+
+
+@router.post("/multi-clip/job/{job_id}/stitch")
+async def stitch_multi_clip_job(
+    job_id: str,
+    background_tasks: BackgroundTasks,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    auth: dict = Depends(flexible_auth),
+):
+    """
+    Trigger the render/stitch phase after the user has reviewed clip order and drops.
+    """
+    from app.agents.social_media_manager.services.multi_clip_service import run_multi_clip_stitch
+
+    user_id = auth.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    doc = await db.multi_clip_jobs.find_one(
+        {"job_id": job_id, "user_id": user_id}, {"_id": 0, "status": 1}
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    allowed = ("awaiting_order", "ready", "failed")
+    if doc.get("status") not in allowed:
+        raise HTTPException(status_code=409, detail=f"Cannot stitch in status={doc.get('status')}")
+
+    await db.multi_clip_jobs.update_one(
+        {"job_id": job_id},
+        {"$set": {"status": "stitching", "status_message": "Rendering…", "progress": 70,
+                  "output_url": None, "updated_at": datetime.utcnow().isoformat()}}
+    )
+
+    background_tasks.add_task(run_multi_clip_stitch, job_id, db)
+
+    return UriResponse.get_single_data_response(
+        "stitch", {"job_id": job_id, "status": "stitching"}
+    )
+
+
+@router.post("/multi-clip/job/{job_id}/analyze")
+async def analyze_multi_clip_job(
+    job_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    auth: dict = Depends(flexible_auth),
+):
+    """
+    AI analyzes a stitched multi-clip video using existing clip transcripts/metadata
+    and returns suggested cuts, zoom moments, and transition style.
+    Call after job status == 'ready'.
+    """
+    import json as _json
+    from openai import AsyncOpenAI
+
+    user_id = auth.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    job = await db.multi_clip_jobs.find_one({"job_id": job_id, "user_id": user_id}, {"_id": 0})
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.get("status") != "ready":
+        raise HTTPException(status_code=409, detail="Job must be in ready status to analyze")
+
+    clips = job.get("clips", [])
+    if not clips:
+        return UriResponse.get_single_data_response("multi_clip_decisions", {
+            "cuts": [], "zooms": [], "transition_style": "fade", "summary": "No clips to analyze."
+        })
+
+    # Return cached decisions applied during stitch — avoids a redundant GPT call
+    if job.get("ai_decisions"):
+        print(f"[MultiClip/analyze] returning cached decisions for job={job_id}", flush=True)
+        return UriResponse.get_single_data_response("multi_clip_decisions", job["ai_decisions"])
+
+    # Build per-clip time windows
+    cumulative = 0.0
+    clip_entries = []
+    for c in clips:
+        if c.get("dropped"):
+            continue
+        dur = float(c.get("duration_seconds") or 10)
+        clip_entries.append({
+            "start": cumulative,
+            "end": cumulative + dur,
+            "clip_type": c.get("clip_type", "speech"),
+            "transcript": (c.get("transcript") or "").strip()[:300],
+        })
+        cumulative += dur
+
+    total_duration = cumulative
+    story_type = job.get("story_type", "founder")
+
+    clips_text = "\n".join([
+        f"Clip {i + 1} ({e['start']:.1f}s–{e['end']:.1f}s, {e['clip_type']}): "
+        + (f'"{e["transcript"]}"' if e["transcript"] else "(no speech)")
+        for i, e in enumerate(clip_entries)
+    ])
+
+    prompt = f"""You are a professional video editor. Analyze this {story_type} style video ({total_duration:.0f}s total) and return editing decisions.
+
+Clips:
+{clips_text}
+
+Return ONLY a JSON object — no extra text, no markdown:
+{{
+  "cuts": [{{"at": <float>, "end": <float>, "reason": "<why>"}}],
+  "zooms": [{{"at": <float>, "duration": <float>, "reason": "<impactful moment>"}}],
+  "transition_style": "cut" | "fade" | "slide" | "zoom",
+  "summary": "<one sentence summary of the video>"
+}}
+
+Rules:
+- 2–4 cuts targeting filler, pauses, "um/uh", or repeated points. at >= 0, end <= {total_duration:.1f}.
+- 1–3 zoom moments on the most compelling or emotional phrases. duration 1.0–3.0 s.
+- Cuts must not overlap. Zooms must stay within clip bounds.
+- transition_style must match the energy: founder → cut or slide, product → fade or zoom.
+- Only the JSON object."""
+
+    try:
+        client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+        resp = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=700,
+        )
+        raw = resp.choices[0].message.content.strip()
+        # Strip markdown fences if GPT wraps the response
+        if raw.startswith("```"):
+            raw = "\n".join(raw.split("\n")[1:])
+            raw = raw.rsplit("```", 1)[0].strip()
+        decisions = _json.loads(raw)
+    except Exception as exc:
+        print(f"[MultiClip/analyze] GPT error: {exc}", flush=True)
+        decisions = {"cuts": [], "zooms": [], "transition_style": "fade", "summary": ""}
+
+    print(f"[MultiClip/analyze] job={job_id} cuts={len(decisions.get('cuts', []))} zooms={len(decisions.get('zooms', []))}", flush=True)
+    return UriResponse.get_single_data_response("multi_clip_decisions", decisions)
+
+
+class DraftScriptRequest(BaseModel):
+    description: str
+
+
+@router.post("/multi-clip/job/{job_id}/draft-script")
+async def draft_product_script(
+    job_id: str,
+    req: DraftScriptRequest,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    auth: dict = Depends(flexible_auth),
+):
+    """
+    Draft a short product video script from a user description using GPT-4o.
+    Synchronous — returns the draft immediately.
+    Also saves it to the job doc as script_draft / script_lines_draft.
+    """
+    from app.agents.social_media_manager.services.multi_clip_service import _draft_product_script
+
+    user_id = auth.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    doc = await db.multi_clip_jobs.find_one(
+        {"job_id": job_id, "user_id": user_id}, {"_id": 0, "clips": 1, "story_type": 1}
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if doc.get("story_type") != "product":
+        raise HTTPException(status_code=409, detail="Script drafting is only for Product Story jobs")
+
+    clip_count = len(doc.get("clips", []))
+    result = await _draft_product_script(req.description, clip_count)
+
+    await db.multi_clip_jobs.update_one(
+        {"job_id": job_id},
+        {"$set": {
+            "story_description": req.description,
+            "script_draft": result["draft"],
+            "script_lines_draft": result["lines"],
+            "updated_at": datetime.utcnow().isoformat(),
+        }}
+    )
+
+    return UriResponse.get_single_data_response("draft_script", result)
+
+
+class ApproveScriptRequest(BaseModel):
+    script: str
+    lines: List[str]
+
+
+@router.post("/multi-clip/job/{job_id}/approve-script")
+async def approve_product_script(
+    job_id: str,
+    req: ApproveScriptRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    auth: dict = Depends(flexible_auth),
+):
+    """
+    Save the approved script and kick off the vision-describe + ordering phase.
+    Job moves from awaiting_script → analyzing → awaiting_order.
+    """
+    from app.agents.social_media_manager.services.multi_clip_service import run_product_vision_phase
+
+    user_id = auth.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    doc = await db.multi_clip_jobs.find_one(
+        {"job_id": job_id, "user_id": user_id}, {"_id": 0, "status": 1, "story_type": 1}
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if doc.get("story_type") != "product":
+        raise HTTPException(status_code=409, detail="Script approval is only for Product Story jobs")
+
+    if doc.get("status") != "awaiting_script":
+        raise HTTPException(status_code=409, detail=f"Job is not in awaiting_script status")
+
+    await db.multi_clip_jobs.update_one(
+        {"job_id": job_id},
+        {"$set": {
+            "script": req.script,
+            "script_lines": req.lines,
+            "status": "analyzing",
+            "status_message": "Describing clips with AI vision…",
+            "progress": 60,
+            "updated_at": datetime.utcnow().isoformat(),
+        }}
+    )
+
+    background_tasks.add_task(run_product_vision_phase, job_id, db)
+
+    return UriResponse.get_single_data_response(
+        "approve_script", {"job_id": job_id, "status": "analyzing"}
+    )
+
+
+@router.post("/submagic-produce")
+async def submagic_produce(
+    video: UploadFile = File(...),
+    template_name: str = Form("Sara"),
+    language: str = Form("en"),
+    remove_silence_pace: Optional[str] = Form(None),
+    magic_zooms: bool = Form(False),
+    magic_brolls: bool = Form(False),
+    clean_audio: bool = Form(False),
+    remove_bad_takes: bool = Form(False),
+    enable_music: bool = Form(False),
+    custom_music: Optional[UploadFile] = File(None),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    auth: dict = Depends(flexible_auth),
+):
+    """Upload a video to Submagic for AI-powered captioning and editing."""
+    user_id = auth.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    api_key = settings.SUBMAGIC_API_KEY
+    if not api_key:
+        raise HTTPException(status_code=503, detail="Submagic API key not configured")
+
+    from datetime import datetime, timezone
+    import uuid as _uuid
+    from app.agents.social_media_manager.services.video_production_service import (
+        _upload_to_cloudinary,
+        _upload_audio_to_cloudinary,
+    )
+
+    job_id = _uuid.uuid4().hex
+    now = datetime.now(timezone.utc).isoformat()
+
+    video_bytes = await video.read()
+    if not video_bytes:
+        raise HTTPException(status_code=400, detail="Empty video file")
+
+    # Upload to Cloudinary to get a publicly accessible URL for Submagic
+    public_id = f"submagic-{_uuid.uuid4().hex[:12]}"
+    cloudinary_url = await _upload_to_cloudinary(video_bytes, public_id)
+    if not cloudinary_url:
+        raise HTTPException(status_code=502, detail="Could not upload video to storage")
+
+    # Upload music to Cloudinary
+    music_url = None
+    if enable_music and custom_music:
+        music_bytes = await custom_music.read()
+        if music_bytes:
+            music_url = await _upload_audio_to_cloudinary(music_bytes, f"submagic-{job_id}")
+            if not music_url:
+                print("[SubmagicMusic] Cloudinary upload failed — continuing without music", flush=True)
+
+    import httpx as _httpx
+    payload: dict = {
+        "title": (video.filename or "Produced Video").rsplit(".", 1)[0],
+        "language": language,
+        "videoUrl": cloudinary_url,
+        "templateName": template_name,
+    }
+    if remove_silence_pace and remove_silence_pace != "off":
+        payload["removeSilencePace"] = remove_silence_pace
+    if magic_zooms:
+        payload["magicZooms"] = True
+    if magic_brolls:
+        payload["magicBrolls"] = True
+    if clean_audio:
+        payload["cleanAudio"] = True
+    if remove_bad_takes:
+        payload["removeBadTakes"] = True
+
+    try:
+        async with _httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                "https://api.submagic.co/v1/projects",
+                headers={"x-api-key": api_key, "Content-Type": "application/json"},
+                json=payload,
+            )
+            if resp.status_code != 201:
+                print(f"[Submagic] create error {resp.status_code}: {resp.text}", flush=True)
+                raise HTTPException(status_code=502, detail=f"Submagic error: {resp.text}")
+            project = resp.json()
+    except _httpx.RequestError as exc:
+        raise HTTPException(status_code=502, detail=f"Submagic unreachable: {exc}")
+
+    project_id = project["id"]
+
+    job_doc: dict = {
+        "job_id": job_id,
+        "project_id": project_id,
+        "user_id": user_id,
+        "status": "processing",
+        "template_name": template_name,
+        "created_at": now,
+    }
+    if music_url:
+        job_doc["music_url"] = music_url
+
+    await db["submagic_jobs"].insert_one(job_doc)
+
+    print(f"[Submagic] job {job_id} → project {project_id} music={'yes' if music_url else 'no'}", flush=True)
+    return UriResponse.get_single_data_response("submagic_job", {"job_id": job_id})
+
+
+@router.get("/submagic-job/{job_id}")
+async def get_submagic_job(
+    job_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    auth: dict = Depends(flexible_auth),
+):
+    """Poll a Submagic production job for status and output URL."""
+    user_id = auth.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    job = await db["submagic_jobs"].find_one({"job_id": job_id, "user_id": user_id}, {"_id": 0})
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    # Already finished with music mixed — serve cached result
+    if job.get("final_output_url"):
+        return UriResponse.get_single_data_response("submagic_job", {
+            "status": "completed",
+            "output_url": job["final_output_url"],
+            "failure_reason": None,
+        })
+
+    api_key = settings.SUBMAGIC_API_KEY
+    if not api_key:
+        raise HTTPException(status_code=503, detail="Submagic API key not configured")
+
+    import httpx as _httpx
+    project_id = job["project_id"]
+
+    try:
+        async with _httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(
+                f"https://api.submagic.co/v1/projects/{project_id}",
+                headers={"x-api-key": api_key},
+            )
+            if resp.status_code != 200:
+                raise HTTPException(status_code=502, detail=f"Submagic error: {resp.text}")
+            project = resp.json()
+    except _httpx.RequestError as exc:
+        raise HTTPException(status_code=502, detail=f"Submagic unreachable: {exc}")
+
+    status = project.get("status", "processing")
+    output_url = project.get("downloadUrl") or project.get("directUrl")
+    failure_reason = project.get("failureReason")
+
+    await db["submagic_jobs"].update_one(
+        {"job_id": job_id},
+        {"$set": {"status": status, "output_url": output_url}},
+    )
+
+    # When complete and music was requested, mix it in and cache the result
+    if status == "completed" and output_url and job.get("music_url"):
+        print(f"[SubmagicMusic] mixing music into job {job_id}", flush=True)
+        mixed_url = await _mix_music_into_video(output_url, job["music_url"])
+        if mixed_url:
+            await db["submagic_jobs"].update_one(
+                {"job_id": job_id},
+                {"$set": {"final_output_url": mixed_url}},
+            )
+            output_url = mixed_url
+            print(f"[SubmagicMusic] done → {mixed_url[:60]}", flush=True)
+        else:
+            print(f"[SubmagicMusic] mix failed — returning raw Submagic URL", flush=True)
+
+    return UriResponse.get_single_data_response("submagic_job", {
+        "status": status,
+        "output_url": output_url,
+        "failure_reason": failure_reason,
+    })
+
+
+# ── ZapCap ────────────────────────────────────────────────────────────────────
+
+_ZAPCAP_BASE = "https://api.zapcap.ai"
+
+
+async def _zapcap_headers() -> dict:
+    key = settings.ZAPCAP_API_KEY
+    if not key:
+        raise HTTPException(status_code=503, detail="ZAPCAP_API_KEY not configured")
+    return {"x-api-key": key, "Accept": "application/json"}
+
+
+@router.get("/zapcap-templates")
+async def zapcap_templates(auth: dict = Depends(flexible_auth)):
+    import httpx
+    headers = await _zapcap_headers()
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(f"{_ZAPCAP_BASE}/templates", headers=headers)
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"ZapCap templates failed: {r.text}")
+    return UriResponse.get_single_data_response("zapcap_templates", {"templates": r.json()})
+
+
+@router.post("/zapcap-produce")
+async def zapcap_produce(
+    video: Optional[UploadFile] = File(None),
+    source_url: Optional[str] = Form(None),
+    template_id: str = Form("beast"),
+    language: str = Form("en"),
+    output_mode: str = Form("composited"),
+    quality: str = Form("standard"),
+    enable_broll: str = Form("false"),
+    enable_music: str = Form("false"),
+    caption_style: str = Form("bold"),
+    custom_music: Optional[UploadFile] = File(None),
+    custom_broll_clips: List[UploadFile] = File(default=[]),
+    custom_broll_placements: Optional[str] = Form(None),  # JSON: [{"clipIndex":0,"startTime":5.0,"duration":4}]
+    custom_broll_estimated_duration: float = Form(60.0),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    auth: dict = Depends(flexible_auth),
+):
+    import uuid as _uuid
+    import httpx
+    from datetime import datetime, timezone
+    from app.agents.social_media_manager.services.video_production_service import (
+        _upload_to_cloudinary,
+        _upload_audio_to_cloudinary,
+    )
+    from app.agents.social_media_manager.services.multi_clip_service import _probe_clip
+
+    user_id = auth.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    job_id = _uuid.uuid4().hex
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Resolve video URL — either upload the file to Cloudinary or use the provided URL directly
+    if video is not None:
+        video_bytes = await video.read()
+        video_public_id = f"zapcap-input-{job_id}"
+        video_url = await _upload_to_cloudinary(video_bytes, video_public_id)
+    elif source_url:
+        video_url = source_url
+        print(f"[ZapCap] using source_url directly: {source_url[:80]}", flush=True)
+    else:
+        raise HTTPException(status_code=400, detail="Provide either a video file or source_url")
+
+    headers = await _zapcap_headers()
+
+    # Upload video URL to ZapCap → get videoId.
+    # ZapCap fetches and validates the video from the URL before responding,
+    # so large files can take well over 60s — use a 5-minute timeout here.
+    async with httpx.AsyncClient(timeout=300) as client:
+        r = await client.post(
+            f"{_ZAPCAP_BASE}/videos/url",
+            json={"url": video_url},
+            headers=headers,
+        )
+        if r.status_code not in (200, 201):
+            raise HTTPException(status_code=502, detail=f"ZapCap upload failed: {r.text}")
+        zapcap_video_id = r.json().get("videoId") or r.json().get("id")
+        if not zapcap_video_id:
+            raise HTTPException(status_code=502, detail=f"ZapCap returned no videoId: {r.text}")
+
+    # Build task payload with correct ZapCap field structure
+    export_settings: dict = {}
+    probed_width = probed_height = 0
+    if output_mode == "transparent":
+        export_settings["outputMode"] = "transparent"
+        # ZapCap requires exportSettings.width/height whenever outputMode is
+        # "transparent" (confirmed against the live API: without them it
+        # 400s with "width and height are required when outputMode is
+        # transparent", which the client only ever saw as an opaque 502).
+        # ffprobe reads dimensions directly off the remote URL, no download needed.
+        probe = await _probe_clip(video_url)
+        probed_width, probed_height = probe.get("width", 0), probe.get("height", 0)
+        if probed_width and probed_height:
+            export_settings["width"] = probed_width
+            export_settings["height"] = probed_height
+        else:
+            # Never send a transparent task ZapCap will just reject — fail
+            # loudly here with a clear reason instead of a second opaque 502.
+            raise HTTPException(
+                status_code=422,
+                detail="Could not read this video's dimensions, which are required for transparent output. Try a different file."
+            )
+    elif output_mode == "greenScreen":
+        export_settings["greenScreen"] = True
+    if quality != "standard":
+        export_settings["quality"] = quality
+
+    _CAPTION_RENDER_OPTIONS: dict = {
+        "bold": {
+            "styleOptions": {"fontUppercase": True, "fontWeight": 800, "stroke": "m", "fontShadow": "s"},
+            "subsOptions": {"animation": False, "emphasizeKeywords": True, "displayWords": 3},
+            "highlightOptions": {"randomColourOne": "#FFE600", "randomColourTwo": "#FF4136"},
+        },
+        "minimal": {
+            "styleOptions": {"fontUppercase": False, "fontWeight": 400, "stroke": "none", "fontShadow": "none"},
+            "subsOptions": {"animation": False, "emphasizeKeywords": False, "displayWords": 6},
+        },
+        "animated": {
+            "styleOptions": {"fontUppercase": False, "fontWeight": 700, "stroke": "s"},
+            "subsOptions": {"animation": True, "emphasizeKeywords": True, "displayWords": 4},
+            "highlightOptions": {"randomColourOne": "#FF6B9D", "randomColourTwo": "#A855F7", "randomColourThree": "#06B6D4"},
+        },
+    }
+
+    task_payload: dict = {
+        "templateId": template_id,
+        "language": language,
+        "autoApprove": True,
+    }
+    if export_settings:
+        task_payload["exportSettings"] = export_settings
+    if caption_style in _CAPTION_RENDER_OPTIONS:
+        task_payload["renderOptions"] = _CAPTION_RENDER_OPTIONS[caption_style]
+
+    # Custom b-roll: upload clips to Cloudinary and spread them evenly across estimated duration.
+    # customBrolls is mutually exclusive with brollPercent — don't set both.
+    if custom_broll_clips:
+        clip_urls = []
+        for i, clip in enumerate(custom_broll_clips):
+            clip_bytes = await clip.read()
+            url = await _upload_to_cloudinary(clip_bytes, f"broll-preprod-{job_id}-{i}")
+            clip_urls.append(url)
+            print(f"[ZapCap/customBroll] uploaded clip {i} → {url[:60]}", flush=True)
+
+        import json as _json_broll
+        if custom_broll_placements:
+            raw = _json_broll.loads(custom_broll_placements)
+            custom_brolls = [
+                {
+                    "startTime": round(float(p["startTime"]), 2),
+                    "endTime": round(float(p["startTime"]) + float(p["duration"]), 2),
+                    "url": clip_urls[int(p["clipIndex"])],
+                }
+                for p in raw
+                if int(p["clipIndex"]) < len(clip_urls)
+            ]
+            print(f"[ZapCap/customBroll] {len(custom_brolls)} clips from explicit placements", flush=True)
+        else:
+            clip_duration = 4.0
+            n = len(clip_urls)
+            spread = custom_broll_estimated_duration / (n + 1)
+            custom_brolls = [
+                {"startTime": round(spread * (i + 1), 2), "endTime": round(spread * (i + 1) + clip_duration, 2), "url": clip_urls[i]}
+                for i in range(n)
+            ]
+            custom_brolls = [c for c in custom_brolls if c["startTime"] < custom_broll_estimated_duration]
+            for c in custom_brolls:
+                c["endTime"] = min(c["endTime"], custom_broll_estimated_duration)
+            print(f"[ZapCap/customBroll] {len(custom_brolls)} clips auto-spread over ~{custom_broll_estimated_duration}s", flush=True)
+        custom_brolls.sort(key=lambda c: c["startTime"])
+        task_payload["transcribeSettings"] = {"broll": {"customBrolls": custom_brolls}}
+    elif enable_broll.lower() == "true":
+        task_payload["transcribeSettings"] = {"broll": {"brollPercent": 50}}
+
+    # Submit task → get taskId
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(
+            f"{_ZAPCAP_BASE}/videos/{zapcap_video_id}/task",
+            json=task_payload,
+            headers=headers,
+        )
+        if r.status_code not in (200, 201):
+            raise HTTPException(status_code=502, detail=f"ZapCap task failed: {r.text}")
+        zapcap_task_id = r.json().get("taskId") or r.json().get("id")
+        if not zapcap_task_id:
+            raise HTTPException(status_code=502, detail=f"ZapCap returned no taskId: {r.text}")
+
+    # Handle optional background music
+    music_url: Optional[str] = None
+    if enable_music.lower() == "true" and custom_music:
+        music_bytes = await custom_music.read()
+        music_url = await _upload_audio_to_cloudinary(music_bytes, f"zapcap-{job_id}")
+        print(f"[ZapCap] music uploaded → {music_url[:60]}", flush=True)
+
+    # Persist job
+    await db["zapcap_jobs"].insert_one({
+        "job_id": job_id,
+        "user_id": user_id,
+        "zapcap_video_id": zapcap_video_id,
+        "zapcap_task_id": zapcap_task_id,
+        "template_id": template_id,
+        "language": language,
+        "output_mode": output_mode,
+        "quality": quality,
+        "enable_broll": enable_broll.lower() == "true" or bool(custom_broll_clips),
+        "has_custom_broll": bool(custom_broll_clips),
+        "caption_style": caption_style,
+        "music_url": music_url,
+        "video_url": video_url,
+        "video_width": probed_width or None,
+        "video_height": probed_height or None,
+        "status": "pending",
+        "created_at": now,
+    })
+
+    print(f"[ZapCap] job {job_id} submitted  video_id={zapcap_video_id}  task_id={zapcap_task_id}  music={'yes' if music_url else 'no'}", flush=True)
+    return UriResponse.get_single_data_response("zapcap_job", {"job_id": job_id})
+
+
+@router.get("/zapcap-job/{job_id}")
+async def zapcap_job_status(
+    job_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    auth: dict = Depends(flexible_auth),
+):
+    import httpx
+
+    user_id = auth.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    job = await db["zapcap_jobs"].find_one({"job_id": job_id})
+    if not job:
+        raise HTTPException(status_code=404, detail="ZapCap job not found")
+
+    # Return cached result if already complete
+    if job.get("final_output_url"):
+        return UriResponse.get_single_data_response("zapcap_job", {
+            "status": "completed",
+            "output_url": job["final_output_url"],
+            "failure_reason": None,
+        })
+
+    # ── Custom b-roll jobs: poll Shotstack instead of ZapCap ─────────────────
+    if job.get("render_type") == "custom_broll":
+        from app.agents.social_media_manager.services.video_production_service import (
+            ShotstackProvider,
+            _upload_to_cloudinary as _zc_upload_broll,
+        )
+        import httpx as _httpx_broll
+        shotstack = ShotstackProvider()
+        render_id = job.get("shotstack_render_id", "")
+        ss_status, ss_url = await shotstack.get_render(render_id)
+        print(f"[CustomBroll] poll job={job_id} render={render_id} status={ss_status}", flush=True)
+        # Map Shotstack statuses to the ZapCap-compatible statuses the frontend understands
+        status_map = {"queued": "pending", "fetching": "transcribing", "rendering": "rendering", "saving": "rendering", "done": "completed", "failed": "failed"}
+        mapped = status_map.get(ss_status, "pending")
+        if mapped == "completed" and ss_url:
+            # Upload to Cloudinary for a permanent URL
+            try:
+                async with _httpx_broll.AsyncClient(timeout=120, follow_redirects=True) as _cl:
+                    _r = await _cl.get(ss_url)
+                if _r.status_code == 200:
+                    import uuid as _uuid_broll
+                    cdn_url = await _zc_upload_broll(_r.content, f"broll-output-{_uuid_broll.uuid4().hex[:12]}")
+                    await db["zapcap_jobs"].update_one({"job_id": job_id}, {"$set": {"final_output_url": cdn_url, "status": "completed"}})
+                    ss_url = cdn_url
+            except Exception as _e:
+                print(f"[CustomBroll] Cloudinary upload failed: {_e}", flush=True)
+        elif mapped == "failed":
+            await db["zapcap_jobs"].update_one({"job_id": job_id}, {"$set": {"status": "failed"}})
+        return UriResponse.get_single_data_response("zapcap_job", {
+            "status": mapped,
+            "output_url": ss_url or None,
+            "failure_reason": "Shotstack render failed" if mapped == "failed" else None,
+        })
+
+    headers = await _zapcap_headers()
+    zapcap_video_id = job["zapcap_video_id"]
+    zapcap_task_id = job["zapcap_task_id"]
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(
+            f"{_ZAPCAP_BASE}/videos/{zapcap_video_id}/task/{zapcap_task_id}",
+            headers=headers,
+        )
+
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"ZapCap poll failed: {r.text}")
+
+    data = r.json()
+    status = data.get("status", "pending")
+    output_url = data.get("downloadUrl") or data.get("outputUrl") or data.get("url")
+    failure_reason = data.get("failureReason") or data.get("error")
+
+    print(f"[ZapCap] poll job={job_id}  status={status}  url={'yes' if output_url else 'no'}", flush=True)
+
+    # When transcription is done and waiting for approval, apply pending edits then approve (once only)
+    if status == "transcriptionCompleted" and not job.get("approved"):
+        pending_edits = job.get("pending_transcript_edits", [])
+        if pending_edits:
+            stored_words: list = job.get("transcript_words") or []
+            # Fetch fresh transcript words if not cached
+            if not stored_words:
+                async with httpx.AsyncClient(timeout=30) as client:
+                    tr = await client.get(
+                        f"{_ZAPCAP_BASE}/videos/{zapcap_video_id}/task/{zapcap_task_id}/transcript",
+                        headers=headers,
+                    )
+                if tr.status_code == 200:
+                    stored_words = tr.json() if isinstance(tr.json(), list) else []
+                    for i, w in enumerate(stored_words):
+                        if "id" not in w:
+                            w["id"] = str(i)
+            edit_map = {e["id"]: e["text"] for e in pending_edits if "id" in e and "text" in e}
+            updated_words = []
+            for w in stored_words:
+                word_copy = {k: v for k, v in w.items() if k != "id"}
+                if w.get("id") in edit_map:
+                    word_copy["text"] = edit_map[w["id"]]
+                updated_words.append(word_copy)
+            if updated_words:
+                async with httpx.AsyncClient(timeout=30) as client:
+                    put_r = await client.put(
+                        f"{_ZAPCAP_BASE}/videos/{zapcap_video_id}/task/{zapcap_task_id}/transcript",
+                        json=updated_words,
+                        headers=headers,
+                    )
+                print(f"[ZapCap] auto PUT transcript: {put_r.status_code} words={len(updated_words)} edits={len(pending_edits)}", flush=True)
+                if put_r.status_code in (200, 201, 204):
+                    # Re-index synthetic ids and persist updated words so editor shows correct text
+                    for i, w in enumerate(updated_words):
+                        w["id"] = str(i)
+                    await db["zapcap_jobs"].update_one(
+                        {"job_id": job_id},
+                        {"$set": {"transcript_words": updated_words}},
+                    )
+
+        async with httpx.AsyncClient(timeout=30) as client:
+            apr = await client.post(
+                f"{_ZAPCAP_BASE}/videos/{zapcap_video_id}/task/{zapcap_task_id}/approve-transcript",
+                headers=headers,
+            )
+        print(f"[ZapCap] approve-transcript: {apr.status_code}", flush=True)
+        await db["zapcap_jobs"].update_one(
+            {"job_id": job_id},
+            {"$set": {"status": "rendering", "approved": True}, "$unset": {"pending_transcript_edits": ""}},
+        )
+        # Return rendering so frontend keeps polling
+        return UriResponse.get_single_data_response("zapcap_job", {
+            "status": "rendering",
+            "output_url": None,
+            "failure_reason": None,
+        })
+
+    await db["zapcap_jobs"].update_one(
+        {"job_id": job_id},
+        {"$set": {"status": status, "output_url": output_url}},
+    )
+
+    # When complete, always get a permanent Cloudinary URL
+    if status == "completed" and output_url:
+        from app.agents.social_media_manager.services.video_production_service import (
+            _upload_to_cloudinary as _zc_upload,
+            _upload_audio_to_cloudinary as _zc_upload_audio,
+        )
+        import uuid as _uuid2
+
+        if job.get("music_url"):
+            print(f"[ZapCapMusic] mixing music into job {job_id}", flush=True)
+            mixed_url = await _mix_music_into_video(output_url, job["music_url"])
+            if mixed_url:
+                await db["zapcap_jobs"].update_one(
+                    {"job_id": job_id},
+                    {"$set": {"final_output_url": mixed_url}},
+                )
+                output_url = mixed_url
+                print(f"[ZapCapMusic] done → {mixed_url[:60]}", flush=True)
+            else:
+                print(f"[ZapCapMusic] mix failed — uploading raw video to Cloudinary", flush=True)
+                try:
+                    async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
+                        r2 = await client.get(output_url)
+                    if r2.status_code == 200:
+                        cdn_url = await _zc_upload(r2.content, f"zapcap-output-{_uuid2.uuid4().hex[:12]}")
+                        await db["zapcap_jobs"].update_one(
+                            {"job_id": job_id}, {"$set": {"final_output_url": cdn_url}}
+                        )
+                        output_url = cdn_url
+                except Exception as _e:
+                    print(f"[ZapCap] fallback Cloudinary upload failed: {_e}", flush=True)
+        else:
+            # No music — upload to Cloudinary for a permanent URL
+            print(f"[ZapCap] uploading output to Cloudinary for job {job_id}", flush=True)
+            try:
+                async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
+                    r2 = await client.get(output_url)
+                if r2.status_code == 200:
+                    cdn_url = await _zc_upload(r2.content, f"zapcap-output-{_uuid2.uuid4().hex[:12]}")
+                    await db["zapcap_jobs"].update_one(
+                        {"job_id": job_id}, {"$set": {"final_output_url": cdn_url}}
+                    )
+                    output_url = cdn_url
+                    print(f"[ZapCap] uploaded → {cdn_url[:60]}", flush=True)
+            except Exception as _e:
+                print(f"[ZapCap] Cloudinary upload failed: {_e}", flush=True)
+
+    return UriResponse.get_single_data_response("zapcap_job", {
+        "status": status,
+        "output_url": output_url,
+        "failure_reason": failure_reason,
+    })
+
+
+@router.get("/zapcap-job/{job_id}/transcript")
+async def zapcap_job_transcript(
+    job_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    auth: dict = Depends(flexible_auth),
+):
+    import httpx
+
+    user_id = auth.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    job = await db["zapcap_jobs"].find_one({"job_id": job_id})
+    if not job:
+        raise HTTPException(status_code=404, detail="ZapCap job not found")
+
+    # Use cached words from DB if available
+    cached_words = job.get("transcript_words")
+    if cached_words:
+        print(f"[ZapCap] transcript from DB cache job={job_id} words={len(cached_words)}", flush=True)
+        return UriResponse.get_single_data_response("zapcap_transcript", {"words": cached_words})
+
+    headers = await _zapcap_headers()
+    zapcap_video_id = job["zapcap_video_id"]
+    zapcap_task_id = job.get("zapcap_task_id")
+
+    if not zapcap_task_id:
+        return UriResponse.get_single_data_response("zapcap_transcript", {"words": []})
+
+    # Dedicated transcript endpoint returns a JSON array of word objects
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(
+            f"{_ZAPCAP_BASE}/videos/{zapcap_video_id}/task/{zapcap_task_id}/transcript",
+            headers=headers,
+        )
+
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"ZapCap transcript fetch failed: {r.text}")
+
+    words = r.json()  # array of {text, type, confidence, start_time, end_time, ...}
+    if not isinstance(words, list):
+        words = []
+
+    # Inject a stable id (index-based) so the frontend can key edits
+    for i, w in enumerate(words):
+        if "id" not in w:
+            w["id"] = str(i)
+
+    print(f"[ZapCap] transcript fetched job={job_id} words={len(words)}", flush=True)
+
+    if words:
+        await db["zapcap_jobs"].update_one({"job_id": job_id}, {"$set": {"transcript_words": words}})
+
+    return UriResponse.get_single_data_response("zapcap_transcript", {"words": words})
+
+
+@router.post("/zapcap-job/{job_id}/rerender")
+async def zapcap_job_rerender(
+    job_id: str,
+    body: dict,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    auth: dict = Depends(flexible_auth),
+):
+    import uuid as _uuid2
+    import httpx
+    from datetime import datetime, timezone
+    from app.agents.social_media_manager.services.multi_clip_service import _probe_clip
+
+    user_id = auth.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    job = await db["zapcap_jobs"].find_one({"job_id": job_id})
+    if not job:
+        raise HTTPException(status_code=404, detail="ZapCap job not found")
+
+    headers = await _zapcap_headers()
+    zapcap_video_id = job["zapcap_video_id"]
+    old_task_id = job.get("zapcap_task_id")
+    template_id = body.get("template_id") or job.get("template_id", "beast")
+    word_edits: list = body.get("word_edits", [])  # [{id, text}]
+
+    output_mode = job.get("output_mode", "composited")
+    quality = job.get("quality", "standard")
+
+    # Build export settings
+    export_settings: dict = {}
+    if output_mode == "transparent":
+        export_settings["outputMode"] = "transparent"
+        # Same ZapCap requirement as the initial produce call: transparent
+        # output needs width/height. Reuse what was probed at job creation;
+        # older job records (created before this field existed) fall back
+        # to re-probing the stored video_url.
+        width, height = job.get("video_width"), job.get("video_height")
+        if not (width and height) and job.get("video_url"):
+            probe = await _probe_clip(job["video_url"])
+            width, height = probe.get("width", 0), probe.get("height", 0)
+        if width and height:
+            export_settings["width"] = width
+            export_settings["height"] = height
+        else:
+            raise HTTPException(
+                status_code=422,
+                detail="Could not determine this video's dimensions, which are required for transparent output."
+            )
+    elif output_mode == "greenScreen":
+        export_settings["greenScreen"] = True
+    if quality != "standard":
+        export_settings["quality"] = quality
+
+    # Caller can explicitly toggle b-roll on/off; fall back to the original job's setting
+    enable_broll_override = body.get("enable_broll")
+    use_broll = enable_broll_override if enable_broll_override is not None else job.get("enable_broll", False)
+
+    task_payload: dict = {
+        "templateId": template_id,
+        "language": job.get("language", "en"),
+        # autoApprove: False so the poll handler can apply caption edits before rendering
+        "autoApprove": False if word_edits else True,
+    }
+    if export_settings:
+        task_payload["exportSettings"] = export_settings
+    if use_broll:
+        task_payload["transcribeSettings"] = {"broll": {"brollPercent": 50}}
+    _CAPTION_RENDER_OPTIONS_RR: dict = {
+        "bold": {
+            "styleOptions": {"fontUppercase": True, "fontWeight": 800, "stroke": "m", "fontShadow": "s"},
+            "subsOptions": {"animation": False, "emphasizeKeywords": True, "displayWords": 3},
+            "highlightOptions": {"randomColourOne": "#FFE600", "randomColourTwo": "#FF4136"},
+        },
+        "minimal": {
+            "styleOptions": {"fontUppercase": False, "fontWeight": 400, "stroke": "none", "fontShadow": "none"},
+            "subsOptions": {"animation": False, "emphasizeKeywords": False, "displayWords": 6},
+        },
+        "animated": {
+            "styleOptions": {"fontUppercase": False, "fontWeight": 700, "stroke": "s"},
+            "subsOptions": {"animation": True, "emphasizeKeywords": True, "displayWords": 4},
+            "highlightOptions": {"randomColourOne": "#FF6B9D", "randomColourTwo": "#A855F7", "randomColourThree": "#06B6D4"},
+        },
+    }
+    caption_style_rr = body.get("caption_style") or job.get("caption_style", "bold")
+    if caption_style_rr in _CAPTION_RENDER_OPTIONS_RR:
+        task_payload["renderOptions"] = _CAPTION_RENDER_OPTIONS_RR[caption_style_rr]
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(
+            f"{_ZAPCAP_BASE}/videos/{zapcap_video_id}/task",
+            json=task_payload,
+            headers=headers,
+        )
+        if r.status_code not in (200, 201):
+            raise HTTPException(status_code=502, detail=f"ZapCap rerender task failed: {r.text}")
+        zapcap_task_id = r.json().get("taskId") or r.json().get("id")
+        if not zapcap_task_id:
+            raise HTTPException(status_code=502, detail=f"ZapCap returned no taskId on rerender: {r.text}")
+
+    new_job_id = _uuid2.uuid4().hex
+    now = datetime.now(timezone.utc).isoformat()
+    new_doc: dict = {
+        "job_id": new_job_id,
+        "user_id": user_id,
+        "zapcap_video_id": zapcap_video_id,
+        "zapcap_task_id": zapcap_task_id,
+        "template_id": template_id,
+        "language": job.get("language", "en"),
+        "output_mode": output_mode,
+        "quality": quality,
+        "enable_broll": use_broll,
+        "music_url": job.get("music_url"),
+        "video_url": job.get("video_url"),
+        "status": "pending",
+        "created_at": now,
+    }
+    if word_edits:
+        # Store edits + original transcript so poll handler can apply them at transcriptionCompleted
+        new_doc["pending_transcript_edits"] = word_edits
+        new_doc["transcript_words"] = job.get("transcript_words", [])
+
+    await db["zapcap_jobs"].insert_one(new_doc)
+    mode = "caption edits" if word_edits else "new template"
+    broll_mode = "broll=on" if use_broll else "broll=off"
+    print(f"[ZapCap] rerender ({mode}, {broll_mode}) job={new_job_id} video={zapcap_video_id} task={zapcap_task_id} edits={len(word_edits)}", flush=True)
+    return UriResponse.get_single_data_response("zapcap_rerender", {"job_id": new_job_id})
+
+
+@router.post("/zapcap-job/{job_id}/custom-broll")
+async def zapcap_job_custom_broll(
+    job_id: str,
+    clips: List[UploadFile] = File(...),
+    placements: str = Form(...),   # JSON: [{"clip_index": 0, "start_time": 3.5, "end_time": 7.5}]
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    auth: dict = Depends(flexible_auth),
+):
+    """
+    Re-render the ZapCap job with user-supplied b-roll clips at specified timestamps.
+    Uses ZapCap's native customBrolls API (transcribeSettings.broll.customBrolls) — no Shotstack.
+    Clips are uploaded to Cloudinary first so ZapCap can fetch them via public URL.
+    Returns a new job_id that polls via the standard GET /zapcap-job/{job_id} path.
+    """
+    import uuid as _uuid3
+    import json as _json
+    import httpx as _httpx_cb
+    from datetime import datetime, timezone
+    from app.agents.social_media_manager.services.video_production_service import (
+        _upload_to_cloudinary as _upload_broll_clip,
+    )
+
+    user_id = auth.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    job = await db["zapcap_jobs"].find_one({"job_id": job_id})
+    if not job:
+        raise HTTPException(status_code=404, detail="ZapCap job not found")
+
+    zapcap_video_id = job.get("zapcap_video_id")
+    if not zapcap_video_id:
+        raise HTTPException(status_code=422, detail="Original ZapCap video ID not found — re-render required.")
+
+    try:
+        placement_list: list = _json.loads(placements)
+    except Exception:
+        raise HTTPException(status_code=400, detail="placements must be valid JSON")
+
+    if not placement_list:
+        raise HTTPException(status_code=400, detail="No placements provided")
+
+    # Upload each clip to Cloudinary so ZapCap can fetch them via public URL
+    clip_urls: list[str] = []
+    for i, clip_file in enumerate(clips):
+        clip_bytes = await clip_file.read()
+        clip_url = await _upload_broll_clip(clip_bytes, f"broll-custom-{job_id}-{i}")
+        clip_urls.append(clip_url)
+
+    if not clip_urls:
+        raise HTTPException(status_code=400, detail="No clips provided")
+
+    # Map placements to ZapCap CustomBrollDto format
+    # ZapCap constraint: overlapping brolls are not allowed; sort by startTime
+    custom_brolls = []
+    for p in sorted(placement_list, key=lambda x: float(x.get("start_time", 0))):
+        idx = int(p.get("clip_index", 0))
+        if idx >= len(clip_urls):
+            continue
+        start = float(p.get("start_time", 0))
+        end = float(p.get("end_time", start + 5.0))
+        custom_brolls.append({
+            "startTime": start,
+            "endTime": end,
+            "url": clip_urls[idx],
+        })
+
+    if not custom_brolls:
+        raise HTTPException(status_code=400, detail="No valid placements after mapping — check clip_index values")
+
+    # Create a new ZapCap task on the same video with customBrolls
+    headers = await _zapcap_headers()
+    task_payload = {
+        "templateId": job.get("template_id", "beast"),
+        "language": job.get("language", "en"),
+        "autoApprove": True,
+        "transcribeSettings": {
+            "broll": {
+                "customBrolls": custom_brolls,
+            }
+        },
+    }
+    # Preserve export settings from parent job if present
+    output_mode = job.get("output_mode", "composited")
+    quality = job.get("quality", "standard")
+    export_settings: dict = {}
+    if output_mode == "transparent":
+        export_settings["outputMode"] = "transparent"
+        if job.get("video_width") and job.get("video_height"):
+            export_settings["width"] = job["video_width"]
+            export_settings["height"] = job["video_height"]
+    elif output_mode == "greenScreen":
+        export_settings["greenScreen"] = True
+    if quality != "standard":
+        export_settings["quality"] = quality
+    if export_settings:
+        task_payload["exportSettings"] = export_settings
+
+    async with _httpx_cb.AsyncClient(timeout=60) as client:
+        r = await client.post(
+            f"{_ZAPCAP_BASE}/videos/{zapcap_video_id}/task",
+            json=task_payload,
+            headers=headers,
+        )
+        if r.status_code not in (200, 201):
+            raise HTTPException(status_code=502, detail=f"ZapCap task failed: {r.text}")
+        zapcap_task_id = r.json().get("taskId") or r.json().get("id")
+        if not zapcap_task_id:
+            raise HTTPException(status_code=502, detail=f"ZapCap returned no taskId: {r.text}")
+
+    new_job_id = _uuid3.uuid4().hex
+    now = datetime.now(timezone.utc).isoformat()
+    await db["zapcap_jobs"].insert_one({
+        "job_id": new_job_id,
+        "user_id": user_id,
+        "zapcap_video_id": zapcap_video_id,
+        "zapcap_task_id": zapcap_task_id,
+        "template_id": job.get("template_id", "beast"),
+        "language": job.get("language", "en"),
+        "output_mode": output_mode,
+        "quality": quality,
+        "video_url": job.get("video_url"),
+        "parent_job_id": job_id,
+        "clip_urls": clip_urls,
+        "placements": placement_list,
+        "status": "pending",
+        "created_at": now,
+    })
+
+    print(
+        f"[CustomBroll] job={new_job_id} parent={job_id} video={zapcap_video_id} "
+        f"task={zapcap_task_id} clips={len(clip_urls)} brolls={len(custom_brolls)}",
+        flush=True,
+    )
+    return UriResponse.get_single_data_response("zapcap_job", {"job_id": new_job_id})
