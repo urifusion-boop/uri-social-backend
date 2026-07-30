@@ -4376,26 +4376,36 @@ async def list_sdk_end_users(
 
     results = []
     for eu in end_users:
-        brand = await db["brand_profiles"].find_one(
-            {"end_user_id": eu.end_user_id},
-            {
-                "_id": 0,
-                "brand_name": 1,
-                "industry": 1,
-                "region": 1,
-                "derived_voice": 1,
-                "brand_colors": 1,
-                "logo_url": 1,
-                "onboarding_completed": 1,
-            },
-        )
+        # brand_profiles docs are looked up (and written) by brand_id, not by
+        # a stored end_user_id field — that field exists in the schema but
+        # nothing in the real onboarding/save path ever populates it, so
+        # querying by it here always returned nothing. brand_profile_id,
+        # cached on the end-user doc itself, is the real join key.
+        brand = None
+        if eu.brand_profile_id:
+            brand = await db["brand_profiles"].find_one(
+                {"brand_id": eu.brand_profile_id},
+                {
+                    "_id": 0,
+                    "brand_name": 1,
+                    "industry": 1,
+                    "region": 1,
+                    "derived_voice": 1,
+                    "brand_colors": 1,
+                    "logo_url": 1,
+                    "onboarding_completed": 1,
+                },
+            )
         results.append({
             "end_user_id": eu.end_user_id,
             "external_user_id": eu.external_user_id,
             "external_name": eu.external_name,
             "external_email": eu.external_email,
             "status": eu.status,
-            "onboarding_completed": eu.onboarding_completed,
+            # The brand profile's own onboarding_completed is the accurate
+            # signal — the copy on the end-user doc is never updated after
+            # creation (mark_end_user_onboarding_complete has no caller).
+            "onboarding_completed": bool(brand and brand.get("onboarding_completed")),
             "total_generations": eu.total_generations,
             "total_images": eu.total_images,
             "total_api_calls": eu.total_api_calls,
