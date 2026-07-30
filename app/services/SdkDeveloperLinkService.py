@@ -81,6 +81,12 @@ async def _create_linked_user(developer_id: str, db: AsyncIOMotorDatabase, gatew
             "password": None,
             "first_name": first_name or "SDK",
             "last_name": last_name or "Developer",
+            # users.referralCode has a unique, non-sparse index — omitting it
+            # collides with every other user missing the field (Mongo indexes
+            # a missing field as null), so every single insert here failed
+            # with DuplicateKeyError. Matches the signup-flow's own generation
+            # pattern (app/routers/auth_router.py).
+            "referralCode": uuid.uuid4().hex[:8].upper(),
             "sdk_gateway_developer_id": developer_id,
             "auth_provider": "sdk_gateway",
             "role": "user",
