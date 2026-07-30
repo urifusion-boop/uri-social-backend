@@ -122,11 +122,14 @@ async def verify_token_live(page_id: str, page_access_token: str, user_access_to
 
 async def resolve_connection_state(
     db, user_id: Optional[str], brand_id: Optional[str], *, live_check: bool = True,
+    require_whatsapp: bool = True,
 ) -> tuple[ConnectionState, Optional[dict]]:
     """The full state machine (Per-Brand Page Connection plan §3). Returns
     (state, ads_connection_doc_or_None). `live_check=False` skips the network round
     trip (used by fast, non-blocking reads like a status badge) — the real pre-flight
-    gate before a campaign is built always uses the default True."""
+    gate before a campaign is built always uses the default True. `require_whatsapp=False`
+    is for campaign goals that never route anywhere via WhatsApp (e.g. a followers/
+    engagement campaign) — the Page connection alone is READY; there's nothing to link."""
     ads = await get_ads_connection(db, user_id, brand_id)
     if not ads:
         content = await get_content_connection(db, user_id, brand_id)
@@ -142,18 +145,22 @@ async def resolve_connection_state(
         if not valid or not REQUIRED_ADS_SCOPES.issubset(granted):
             return ConnectionState.EXPIRED, ads
 
-    if not ads.get("whatsapp_page_linked"):
+    if require_whatsapp and not ads.get("whatsapp_page_linked"):
         return ConnectionState.ADS_NO_WHATSAPP, ads
 
     return ConnectionState.READY, ads
 
 
-async def resolve_ads_page_for_launch(db, user_id: Optional[str], brand_id: Optional[str]) -> dict:
+async def resolve_ads_page_for_launch(
+    db, user_id: Optional[str], brand_id: Optional[str], *, require_whatsapp: bool = True,
+) -> dict:
     """The pre-flight gate: returns {"page_id", "whatsapp_number", "page_name"} or
     raises AdsConnectionRequired with the exact state — called before ANY campaign
     plan is built, never at launch, so a client is never let all the way through a
-    conversation only to hit a wall (Per-Brand Page Connection plan §3)."""
-    state, ads = await resolve_connection_state(db, user_id, brand_id)
+    conversation only to hit a wall (Per-Brand Page Connection plan §3).
+    `require_whatsapp=False` for a campaign goal that never uses it (e.g. followers) —
+    `whatsapp_number` in the returned dict may then be empty."""
+    state, ads = await resolve_connection_state(db, user_id, brand_id, require_whatsapp=require_whatsapp)
     if state != ConnectionState.READY:
         raise AdsConnectionRequired(state, (ads or {}).get("account_name", ""))
     return {
