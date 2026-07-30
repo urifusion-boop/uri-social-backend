@@ -15,6 +15,8 @@ from bson import ObjectId
 from app.dependencies import get_db_dependency, get_flexible_brand_context, flexible_auth
 from app.core.config import settings
 from app.domain.responses.uri_response import UriResponse
+from app.middleware.api_key_auth import verify_api_key
+from app.models.api_key import APIKey
 
 from ..services.content_generation_service import ContentGenerationService
 from ..services.image_content_service import ImageContentService
@@ -4334,6 +4336,80 @@ async def update_draft(
 
     draft = await db["content_drafts"].find_one({**scope, "id": draft_id}, {"_id": 0})
     return UriResponse.get_single_data_response("draft", draft)
+
+
+# =====================================================
+# SDK CLIENT ADMIN — manage the end-users under this API key
+# =====================================================
+# Unlike every other endpoint in this file, these are NOT end-user scoped —
+# they authenticate at the API-key/developer level only (no X-End-User-ID
+# required) because this is the SDK client's own admin view over every
+# end-user provisioned under their key, not any single end-user's own data.
+
+@router.get("/sdk/end-users")
+async def list_sdk_end_users(
+    limit: int = Query(50, ge=1, le=100),
+    skip: int = Query(0, ge=0),
+    api_key: APIKey = Depends(verify_api_key),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """List every end-user provisioned under the calling API key, each with
+    a summary of their brand setup (name, industry, region, voice, colors,
+    onboarding status). This is the SDK client's own admin view — an
+    end-user never sees this, only the platform built on top of the SDK
+    would (e.g. Feest's own internal team, not an individual restaurant)."""
+    from app.services.MultiTenantService import MultiTenantService
+
+    sdk_client = await MultiTenantService.get_or_create_sdk_client(
+        api_key_hash=api_key.key_hash,
+        api_key_prefix=api_key.key_prefix,
+        developer_id=api_key.user_id,
+        company_name=api_key.name or "SDK Client",
+        db=db,
+    )
+    if not sdk_client:
+        raise HTTPException(status_code=500, detail="Failed to resolve SDK client")
+
+    end_users = await MultiTenantService.get_end_users_for_client(
+        sdk_client.sdk_client_id, limit, skip, db
+    )
+
+    results = []
+    for eu in end_users:
+        brand = await db["brand_profiles"].find_one(
+            {"end_user_id": eu.end_user_id},
+            {
+                "_id": 0,
+                "brand_name": 1,
+                "industry": 1,
+                "region": 1,
+                "derived_voice": 1,
+                "brand_colors": 1,
+                "logo_url": 1,
+                "onboarding_completed": 1,
+            },
+        )
+        results.append({
+            "end_user_id": eu.end_user_id,
+            "external_user_id": eu.external_user_id,
+            "external_name": eu.external_name,
+            "external_email": eu.external_email,
+            "status": eu.status,
+            "onboarding_completed": eu.onboarding_completed,
+            "total_generations": eu.total_generations,
+            "total_images": eu.total_images,
+            "total_api_calls": eu.total_api_calls,
+            "last_active_at": eu.last_active_at,
+            "created_at": eu.created_at,
+            "setup": brand,
+        })
+
+    return UriResponse.get_single_data_response("end_users", {
+        "sdk_client_id": sdk_client.sdk_client_id,
+        "company_name": sdk_client.company_name,
+        "total_end_users": sdk_client.stats.total_end_users if sdk_client.stats else len(results),
+        "users": results,
+    })
 
 
 @router.get("/drafts/{draft_id}/image-stream")
