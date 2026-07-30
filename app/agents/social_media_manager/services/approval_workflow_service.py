@@ -1648,6 +1648,16 @@ class ApprovalWorkflowService:
                 if platform in ("twitter", "x") and draft.get("is_twitter_thread") and draft.get("tweets"):
                     tweets = draft["tweets"]
 
+                # TikTok requires media be fetched from a domain verified in the TikTok
+                # developer portal — our own media hosts (e.g. Cloudinary) aren't verified,
+                # so route TikTok media through Outstand's own upload flow instead.
+                platform_config = None
+                if platform == "tiktok" and media_urls:
+                    media_urls = [await outstand.upload_media_from_url(u) for u in media_urls]
+                    # Default to DIRECT_POST so it goes live instead of sitting as an inbox
+                    # draft; unaudited TikTok apps can only Direct Post as SELF_ONLY.
+                    platform_config = {"tiktok": {"postMode": "DIRECT_POST", "privacyLevel": "SELF_ONLY"}}
+
                 print(f"📤 Publishing via Outstand | account_id={connection.get('outstand_account_id')} platform={platform} has_image={bool(media_urls)} thread={bool(tweets and len(tweets) > 1)}")
                 result = await outstand.publish_post(
                     outstand_account_ids=[connection["outstand_account_id"]],
@@ -1655,6 +1665,7 @@ class ApprovalWorkflowService:
                     scheduled_at=scheduled_at,
                     media_urls=media_urls,
                     tweets=tweets,
+                    platform_config=platform_config,
                 )
                 print(f"📬 Outstand publish response: {result}")
 
