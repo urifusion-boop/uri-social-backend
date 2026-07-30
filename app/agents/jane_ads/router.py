@@ -969,8 +969,14 @@ async def _build_campaign_plan(
     # client never designs a whole campaign only to hit a wall at the end (Per-Brand
     # Page Connection plan §3). There is no shared-page fallback: a missing connection
     # fails loudly with the exact state, mapped to its own prompt on the frontend.
+    # require_whatsapp=False here: whether WhatsApp is actually needed depends on the
+    # campaign's goal, which Jane hasn't determined yet at this point — a followers/
+    # engagement campaign never uses it at all. Re-checked strictly once the goal is
+    # known, at step 1.6 below.
     try:
-        ads_conn = await resolve_ads_page_for_launch(db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"))
+        ads_conn = await resolve_ads_page_for_launch(
+            db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"), require_whatsapp=False,
+        )
     except AdsConnectionRequired as e:
         return {"early_return": {
             "stage": f"meta_connection_{e.state.value}",
@@ -1048,6 +1054,20 @@ async def _build_campaign_plan(
         if known_budget and "spend" in clarify.lower():
             clarify += f" Last time you spent ₦{known_budget:,.0f} — want to do the same again?"
         return {"early_return": {"stage": "need_more", "understood": parsed.model_dump(), "question": clarify}}
+
+    # 1.6. Now that the goal is actually known: a followers/engagement campaign never
+    # routes through WhatsApp, so step 0 above deliberately let ADS_NO_WHATSAPP through.
+    # Every other goal DOES need it — re-check strictly now, catching it here instead of
+    # at launch.
+    if req.goal != Goal.FOLLOWERS and not ads_conn["whatsapp_number"]:
+        try:
+            ads_conn = await resolve_ads_page_for_launch(db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"))
+        except AdsConnectionRequired as e:
+            return {"early_return": {
+                "stage": f"meta_connection_{e.state.value}",
+                "understood": parsed.model_dump(),
+                "page_name": e.page_name,
+            }}
 
     # 2. Jane decides the platform + budget split, with her reasoning.
     result = plan_campaign(req, funded_amount_ngn=req.budget_ngn, total_funded_wallets_ngn=req.budget_ngn)
@@ -1550,7 +1570,9 @@ async def meta_launch_plan(
     # actually pick up their correction, not silently resend the stale one.
     from .ads_connection import AdsConnectionRequired, resolve_ads_page_for_launch
     try:
-        ads_conn = await resolve_ads_page_for_launch(db, brand_ctx.get("user_id"), brand_id)
+        ads_conn = await resolve_ads_page_for_launch(
+            db, brand_ctx.get("user_id"), brand_id, require_whatsapp=plan.goal != Goal.FOLLOWERS,
+        )
     except AdsConnectionRequired as e:
         raise HTTPException(status_code=409, detail=f"meta_connection_{e.state.value}")
     plan.page_id = ads_conn["page_id"]

@@ -217,6 +217,42 @@ def test_launch_campaign_creates_full_chain_and_stores_record():
     assert record["last_conversation_count"] == 0
 
 
+def test_launch_campaign_followers_goal_builds_engagement_not_whatsapp():
+    # Confirmed live shape (Meta Marketing API docs): a followers/engagement campaign
+    # uses the same OUTCOME_ENGAGEMENT objective, but POST_ENGAGEMENT optimization,
+    # LIKE_PAGE creative CTA, and no WhatsApp routing at all.
+    db = FakeDb()
+    adapter = _adapter(db)
+    responses = [
+        {"id": "cmp_1"}, {"id": "adset_1"}, {"id": "creative_1"}, {"id": "ad_1"},
+    ]
+    plan = _plan(goal=Goal.FOLLOWERS, whatsapp_number="")
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client(responses)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        result = _run(adapter.launch_campaign(plan, _auth()))
+
+    assert result.campaign_id == "cmp_1"
+    campaign_json = mock_client.post.call_args_list[0].kwargs["json"]
+    assert campaign_json["objective"] == "OUTCOME_ENGAGEMENT"
+    adset_json = mock_client.post.call_args_list[1].kwargs["json"]
+    assert adset_json["optimization_goal"] == "POST_ENGAGEMENT"
+    assert "destination_type" not in adset_json and "promoted_object" not in adset_json
+    creative_spec = mock_client.post.call_args_list[2].kwargs["json"]["object_story_spec"]
+    assert creative_spec["link_data"]["call_to_action"] == {"type": "LIKE_PAGE", "value": {"page": "pg123"}}
+    assert creative_spec["link_data"]["link"] == "https://www.facebook.com/pg123"
+
+
+def test_launch_campaign_followers_goal_does_not_require_whatsapp_number():
+    adapter = _adapter()
+    plan = _plan(goal=Goal.FOLLOWERS, whatsapp_number="")
+    responses = [{"id": "cmp_1"}, {"id": "adset_1"}, {"id": "creative_1"}, {"id": "ad_1"}]
+    with patch("httpx.AsyncClient") as MockClient:
+        MockClient.return_value.__aenter__.return_value = _mock_client(responses)
+        result = _run(adapter.launch_campaign(plan, _auth()))
+    assert result.campaign_id == "cmp_1"
+
+
 def test_launch_campaign_raises_on_meta_error():
     adapter = _adapter()
     responses = [{"error": {"message": "Invalid parameter", "code": 100}}]
