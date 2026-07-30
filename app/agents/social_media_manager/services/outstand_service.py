@@ -116,6 +116,64 @@ class OutstandService:
             resp.raise_for_status()
             return resp.json()
 
+    async def get_upload_url(
+        self,
+        filename: str,
+        content_type: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Request a presigned upload URL from Outstand's media API."""
+        body: Dict[str, Any] = {"filename": filename}
+        if content_type:
+            body["content_type"] = content_type
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            resp = await client.post(
+                f"{self.base_url}/v1/media/upload",
+                headers=self.headers,
+                json=body,
+            )
+            resp.raise_for_status()
+            return resp.json()["data"]
+
+    async def confirm_upload(self, media_id: str, size: Optional[int] = None) -> Dict[str, Any]:
+        """Mark a presigned upload as complete; returns the public media URL to attach to a post."""
+        body: Dict[str, Any] = {}
+        if size is not None:
+            body["size"] = size
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            resp = await client.post(
+                f"{self.base_url}/v1/media/{media_id}/confirm",
+                headers=self.headers,
+                json=body,
+            )
+            resp.raise_for_status()
+            return resp.json()["data"]
+
+    async def upload_media_from_url(self, source_url: str) -> str:
+        """
+        Download media from an externally-hosted URL and re-upload it through
+        Outstand's media API, returning an Outstand-hosted public URL.
+
+        TikTok's pull_by_url media transfer requires the source domain to be
+        verified in the TikTok developer portal — routing media through Outstand's
+        own upload flow avoids that requirement since Outstand's media domain is
+        already verified on their end.
+        """
+        filename = source_url.rsplit("/", 1)[-1].split("?")[0] or "media.mp4"
+
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            source_resp = await client.get(source_url)
+            source_resp.raise_for_status()
+            file_bytes = source_resp.content
+
+        upload_info = await self.get_upload_url(filename=filename)
+
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            put_resp = await client.put(upload_info["upload_url"], content=file_bytes)
+            put_resp.raise_for_status()
+
+        confirmed = await self.confirm_upload(upload_info["id"], size=len(file_bytes))
+        return confirmed["url"]
+
     async def get_post_analytics(self, post_id: str) -> Dict[str, Any]:
         """Fetch analytics for a published post from Outstand's GET /v1/posts/{id}/analytics."""
         async with httpx.AsyncClient(timeout=self.timeout) as client:
@@ -164,6 +222,7 @@ class OutstandService:
         scheduled_at: Optional[str] = None,
         media_urls: Optional[List[str]] = None,
         tweets: Optional[List[str]] = None,
+        platform_config: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         def _media_objects(urls: List[str]) -> List[Dict[str, str]]:
             result = []
@@ -189,6 +248,8 @@ class OutstandService:
         }
         if scheduled_at:
             payload["scheduledAt"] = scheduled_at
+        if platform_config:
+            payload.update(platform_config)
 
         print(f"📡 Outstand POST /v1/posts/ payload keys={list(payload.keys())} containers={len(containers)} media={media_urls}")
         async with httpx.AsyncClient(timeout=self.timeout) as client:
