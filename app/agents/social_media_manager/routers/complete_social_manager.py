@@ -7084,7 +7084,7 @@ async def produce_video(
 
     # PRD: charge before submitting for processing.
     billing = await charge_for_video_job(
-        user_id=user_id, duration_seconds=duration_seconds, job_id=job_id, reason="video_production"
+        user_id=user_id, duration_seconds=duration_seconds, job_id=job_id, reason="video_editing"
     )
     if not billing["success"]:
         return JSONResponse(status_code=402, content=insufficient_credits_response(billing))
@@ -7132,7 +7132,7 @@ async def produce_video(
         finally:
             doc = await db.video_production_jobs.find_one({"job_id": job_id}, {"status": 1})
             if doc and doc.get("status") == "failed":
-                await refund_video_job(user_id, job_id, billing, reason="video_production_failed")
+                await refund_video_job(user_id, job_id, billing, reason="refund")
                 await db.video_production_jobs.update_one(
                     {"job_id": job_id}, {"$set": {"billing_status": "refunded"}}
                 )
@@ -8056,7 +8056,7 @@ async def submagic_produce(
 
     # PRD: charge before submitting for processing.
     billing = await charge_for_video_job(
-        user_id=user_id, duration_seconds=duration_seconds, job_id=job_id, reason="video_editing_submagic"
+        user_id=user_id, duration_seconds=duration_seconds, job_id=job_id, reason="video_editing"
     )
     if not billing["success"]:
         return JSONResponse(status_code=402, content=insufficient_credits_response(billing))
@@ -8065,7 +8065,7 @@ async def submagic_produce(
     public_id = f"submagic-{_uuid.uuid4().hex[:12]}"
     cloudinary_url = await _upload_to_cloudinary(video_bytes, public_id)
     if not cloudinary_url:
-        await refund_video_job(user_id, job_id, billing, reason="video_editing_submagic_failed")
+        await refund_video_job(user_id, job_id, billing, reason="refund")
         raise HTTPException(status_code=502, detail="Could not upload video to storage")
 
     # Upload music to Cloudinary
@@ -8104,11 +8104,11 @@ async def submagic_produce(
             )
             if resp.status_code != 201:
                 print(f"[Submagic] create error {resp.status_code}: {resp.text}", flush=True)
-                await refund_video_job(user_id, job_id, billing, reason="video_editing_submagic_failed")
+                await refund_video_job(user_id, job_id, billing, reason="refund")
                 raise HTTPException(status_code=502, detail=f"Submagic error: {resp.text}")
             project = resp.json()
     except _httpx.RequestError as exc:
-        await refund_video_job(user_id, job_id, billing, reason="video_editing_submagic_failed")
+        await refund_video_job(user_id, job_id, billing, reason="refund")
         raise HTTPException(status_code=502, detail=f"Submagic unreachable: {exc}")
 
     project_id = project["id"]
@@ -8305,7 +8305,7 @@ async def zapcap_produce(
         return JSONResponse(status_code=422, content=duration_undetectable_response())
 
     billing = await charge_for_video_job(
-        user_id=user_id, duration_seconds=duration_seconds, job_id=job_id, reason="video_editing_zapcap"
+        user_id=user_id, duration_seconds=duration_seconds, job_id=job_id, reason="video_editing"
     )
     if not billing["success"]:
         return JSONResponse(status_code=402, content=insufficient_credits_response(billing))
@@ -8322,11 +8322,11 @@ async def zapcap_produce(
             headers=headers,
         )
         if r.status_code not in (200, 201):
-            await refund_video_job(user_id, job_id, billing, reason="video_editing_zapcap_failed")
+            await refund_video_job(user_id, job_id, billing, reason="refund")
             raise HTTPException(status_code=502, detail=f"ZapCap upload failed: {r.text}")
         zapcap_video_id = r.json().get("videoId") or r.json().get("id")
         if not zapcap_video_id:
-            await refund_video_job(user_id, job_id, billing, reason="video_editing_zapcap_failed")
+            await refund_video_job(user_id, job_id, billing, reason="refund")
             raise HTTPException(status_code=502, detail=f"ZapCap returned no videoId: {r.text}")
 
     # Build task payload with correct ZapCap field structure
@@ -8343,7 +8343,7 @@ async def zapcap_produce(
         else:
             # Never send a transparent task ZapCap will just reject — fail
             # loudly here with a clear reason instead of a second opaque 502.
-            await refund_video_job(user_id, job_id, billing, reason="video_editing_zapcap_failed")
+            await refund_video_job(user_id, job_id, billing, reason="refund")
             raise HTTPException(
                 status_code=422,
                 detail="Could not read this video's dimensions, which are required for transparent output. Try a different file."
@@ -8428,11 +8428,11 @@ async def zapcap_produce(
             headers=headers,
         )
         if r.status_code not in (200, 201):
-            await refund_video_job(user_id, job_id, billing, reason="video_editing_zapcap_failed")
+            await refund_video_job(user_id, job_id, billing, reason="refund")
             raise HTTPException(status_code=502, detail=f"ZapCap task failed: {r.text}")
         zapcap_task_id = r.json().get("taskId") or r.json().get("id")
         if not zapcap_task_id:
-            await refund_video_job(user_id, job_id, billing, reason="video_editing_zapcap_failed")
+            await refund_video_job(user_id, job_id, billing, reason="refund")
             raise HTTPException(status_code=502, detail=f"ZapCap returned no taskId: {r.text}")
 
     # Handle optional background music
