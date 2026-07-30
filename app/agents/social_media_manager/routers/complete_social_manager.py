@@ -7043,7 +7043,15 @@ async def produce_video(
     """
     import uuid
     import httpx
-    from app.agents.social_media_manager.services.video_production_service import run_production_job
+    from app.agents.social_media_manager.services.video_production_service import (
+        run_production_job,
+        _probe_duration,
+    )
+    from app.services.VideoBillingService import (
+        charge_for_video_job,
+        refund_video_job,
+        insufficient_credits_response,
+    )
 
     user_id = _get_user_id(token)
     if not user_id:
@@ -7068,6 +7076,15 @@ async def produce_video(
     job_id = str(uuid.uuid4())
     now = datetime.utcnow().isoformat()
 
+    # Video Editing Billing PRD: charge before submitting for processing —
+    # duration of the input video is already knowable here via ffprobe.
+    duration_seconds = _probe_duration(video_bytes)
+    billing = await charge_for_video_job(
+        user_id=user_id, duration_seconds=duration_seconds, job_id=job_id, reason="video_production"
+    )
+    if not billing["success"]:
+        return JSONResponse(status_code=402, content=insufficient_credits_response(billing))
+
     await db.video_production_jobs.insert_one({
         "job_id": job_id,
         "user_id": user_id,
@@ -7084,6 +7101,11 @@ async def produce_video(
         "srt": "",
         "created_at": now,
         "completed_at": None,
+        "billing_duration_seconds": billing["duration_seconds"],
+        "billing_billable_minutes": billing["billable_minutes"],
+        "billing_credits_charged": billing["credits_charged"],
+        "billing_is_trial": billing["is_trial"],
+        "billing_status": "charged",
     })
 
     custom_music_bytes = b""
@@ -7091,19 +7113,40 @@ async def produce_video(
         custom_music_bytes = await custom_music.read()
         print(f"[CustomMusic] received {len(custom_music_bytes)//1024}KB — uploading to Cloudinary in background", flush=True)
 
-    background_tasks.add_task(
-        run_production_job, job_id, video_bytes, video_type, db,
-        enable_music=(enable_music.lower() != "false"),
-        mute_original_audio=(mute_original_audio.lower() == "true"),
-        enable_sfx=(enable_sfx.lower() != "false"),
-        enable_captions=(enable_captions.lower() != "false"),
-        custom_music_bytes=custom_music_bytes,
-        transition_style=transition_style,
-        template_id=template_id,
-    )
+    async def _run_and_refund_on_failure():
+        try:
+            await run_production_job(
+                job_id, video_bytes, video_type, db,
+                enable_music=(enable_music.lower() != "false"),
+                mute_original_audio=(mute_original_audio.lower() == "true"),
+                enable_sfx=(enable_sfx.lower() != "false"),
+                enable_captions=(enable_captions.lower() != "false"),
+                custom_music_bytes=custom_music_bytes,
+                transition_style=transition_style,
+                template_id=template_id,
+            )
+        finally:
+            doc = await db.video_production_jobs.find_one({"job_id": job_id}, {"status": 1})
+            if doc and doc.get("status") == "failed":
+                await refund_video_job(user_id, job_id, billing, reason="video_production_failed")
+                await db.video_production_jobs.update_one(
+                    {"job_id": job_id}, {"$set": {"billing_status": "refunded"}}
+                )
+
+    background_tasks.add_task(_run_and_refund_on_failure)
 
     return UriResponse.get_single_data_response(
-        "produce_video", {"job_id": job_id, "status": "processing"}
+        "produce_video",
+        {
+            "job_id": job_id,
+            "status": "processing",
+            "billing": {
+                "duration_seconds": billing["duration_seconds"],
+                "billable_minutes": billing["billable_minutes"],
+                "credits_charged": billing["credits_charged"],
+                "is_trial": billing["is_trial"],
+            },
+        },
     )
 
 
@@ -7986,6 +8029,12 @@ async def submagic_produce(
     from app.agents.social_media_manager.services.video_production_service import (
         _upload_to_cloudinary,
         _upload_audio_to_cloudinary,
+        _probe_duration,
+    )
+    from app.services.VideoBillingService import (
+        charge_for_video_job,
+        refund_video_job,
+        insufficient_credits_response,
     )
 
     job_id = _uuid.uuid4().hex
@@ -7995,10 +8044,19 @@ async def submagic_produce(
     if not video_bytes:
         raise HTTPException(status_code=400, detail="Empty video file")
 
+    # Video Editing Billing PRD: charge before submitting for processing.
+    duration_seconds = _probe_duration(video_bytes)
+    billing = await charge_for_video_job(
+        user_id=user_id, duration_seconds=duration_seconds, job_id=job_id, reason="video_editing_submagic"
+    )
+    if not billing["success"]:
+        return JSONResponse(status_code=402, content=insufficient_credits_response(billing))
+
     # Upload to Cloudinary to get a publicly accessible URL for Submagic
     public_id = f"submagic-{_uuid.uuid4().hex[:12]}"
     cloudinary_url = await _upload_to_cloudinary(video_bytes, public_id)
     if not cloudinary_url:
+        await refund_video_job(user_id, job_id, billing, reason="video_editing_submagic_failed")
         raise HTTPException(status_code=502, detail="Could not upload video to storage")
 
     # Upload music to Cloudinary
@@ -8037,9 +8095,11 @@ async def submagic_produce(
             )
             if resp.status_code != 201:
                 print(f"[Submagic] create error {resp.status_code}: {resp.text}", flush=True)
+                await refund_video_job(user_id, job_id, billing, reason="video_editing_submagic_failed")
                 raise HTTPException(status_code=502, detail=f"Submagic error: {resp.text}")
             project = resp.json()
     except _httpx.RequestError as exc:
+        await refund_video_job(user_id, job_id, billing, reason="video_editing_submagic_failed")
         raise HTTPException(status_code=502, detail=f"Submagic unreachable: {exc}")
 
     project_id = project["id"]
@@ -8051,6 +8111,11 @@ async def submagic_produce(
         "status": "processing",
         "template_name": template_name,
         "created_at": now,
+        "billing_duration_seconds": billing["duration_seconds"],
+        "billing_billable_minutes": billing["billable_minutes"],
+        "billing_credits_charged": billing["credits_charged"],
+        "billing_is_trial": billing["is_trial"],
+        "billing_status": "charged",
     }
     if music_url:
         job_doc["music_url"] = music_url
@@ -8058,7 +8123,18 @@ async def submagic_produce(
     await db["submagic_jobs"].insert_one(job_doc)
 
     print(f"[Submagic] job {job_id} → project {project_id} music={'yes' if music_url else 'no'}", flush=True)
-    return UriResponse.get_single_data_response("submagic_job", {"job_id": job_id})
+    return UriResponse.get_single_data_response(
+        "submagic_job",
+        {
+            "job_id": job_id,
+            "billing": {
+                "duration_seconds": billing["duration_seconds"],
+                "billable_minutes": billing["billable_minutes"],
+                "credits_charged": billing["credits_charged"],
+                "is_trial": billing["is_trial"],
+            },
+        },
+    )
 
 
 @router.get("/submagic-job/{job_id}")
@@ -8182,6 +8258,11 @@ async def zapcap_produce(
         _upload_audio_to_cloudinary,
     )
     from app.agents.social_media_manager.services.multi_clip_service import _probe_clip
+    from app.services.VideoBillingService import (
+        charge_for_video_job,
+        refund_video_job,
+        insufficient_credits_response,
+    )
 
     user_id = _get_user_id(token)
     if not user_id:
@@ -8201,6 +8282,19 @@ async def zapcap_produce(
     else:
         raise HTTPException(status_code=400, detail="Provide either a video file or source_url")
 
+    # Video Editing Billing PRD: probe duration up front (also gives us
+    # dimensions for the transparent-output case below, one ffprobe instead
+    # of two) and charge before any paid ZapCap call is made.
+    probe = await _probe_clip(video_url)
+    probed_width, probed_height = probe.get("width", 0), probe.get("height", 0)
+    duration_seconds = probe.get("duration", 0)
+
+    billing = await charge_for_video_job(
+        user_id=user_id, duration_seconds=duration_seconds, job_id=job_id, reason="video_editing_zapcap"
+    )
+    if not billing["success"]:
+        return JSONResponse(status_code=402, content=insufficient_credits_response(billing))
+
     headers = await _zapcap_headers()
 
     # Upload video URL to ZapCap → get videoId.
@@ -8213,29 +8307,28 @@ async def zapcap_produce(
             headers=headers,
         )
         if r.status_code not in (200, 201):
+            await refund_video_job(user_id, job_id, billing, reason="video_editing_zapcap_failed")
             raise HTTPException(status_code=502, detail=f"ZapCap upload failed: {r.text}")
         zapcap_video_id = r.json().get("videoId") or r.json().get("id")
         if not zapcap_video_id:
+            await refund_video_job(user_id, job_id, billing, reason="video_editing_zapcap_failed")
             raise HTTPException(status_code=502, detail=f"ZapCap returned no videoId: {r.text}")
 
     # Build task payload with correct ZapCap field structure
     export_settings: dict = {}
-    probed_width = probed_height = 0
     if output_mode == "transparent":
         export_settings["outputMode"] = "transparent"
         # ZapCap requires exportSettings.width/height whenever outputMode is
         # "transparent" (confirmed against the live API: without them it
         # 400s with "width and height are required when outputMode is
         # transparent", which the client only ever saw as an opaque 502).
-        # ffprobe reads dimensions directly off the remote URL, no download needed.
-        probe = await _probe_clip(video_url)
-        probed_width, probed_height = probe.get("width", 0), probe.get("height", 0)
         if probed_width and probed_height:
             export_settings["width"] = probed_width
             export_settings["height"] = probed_height
         else:
             # Never send a transparent task ZapCap will just reject — fail
             # loudly here with a clear reason instead of a second opaque 502.
+            await refund_video_job(user_id, job_id, billing, reason="video_editing_zapcap_failed")
             raise HTTPException(
                 status_code=422,
                 detail="Could not read this video's dimensions, which are required for transparent output. Try a different file."
@@ -8320,9 +8413,11 @@ async def zapcap_produce(
             headers=headers,
         )
         if r.status_code not in (200, 201):
+            await refund_video_job(user_id, job_id, billing, reason="video_editing_zapcap_failed")
             raise HTTPException(status_code=502, detail=f"ZapCap task failed: {r.text}")
         zapcap_task_id = r.json().get("taskId") or r.json().get("id")
         if not zapcap_task_id:
+            await refund_video_job(user_id, job_id, billing, reason="video_editing_zapcap_failed")
             raise HTTPException(status_code=502, detail=f"ZapCap returned no taskId: {r.text}")
 
     # Handle optional background music
@@ -8351,10 +8446,26 @@ async def zapcap_produce(
         "video_height": probed_height or None,
         "status": "pending",
         "created_at": now,
+        "billing_duration_seconds": billing["duration_seconds"],
+        "billing_billable_minutes": billing["billable_minutes"],
+        "billing_credits_charged": billing["credits_charged"],
+        "billing_is_trial": billing["is_trial"],
+        "billing_status": "charged",
     })
 
     print(f"[ZapCap] job {job_id} submitted  video_id={zapcap_video_id}  task_id={zapcap_task_id}  music={'yes' if music_url else 'no'}", flush=True)
-    return UriResponse.get_single_data_response("zapcap_job", {"job_id": job_id})
+    return UriResponse.get_single_data_response(
+        "zapcap_job",
+        {
+            "job_id": job_id,
+            "billing": {
+                "duration_seconds": billing["duration_seconds"],
+                "billable_minutes": billing["billable_minutes"],
+                "credits_charged": billing["credits_charged"],
+                "is_trial": billing["is_trial"],
+            },
+        },
+    )
 
 
 @router.get("/zapcap-job/{job_id}")

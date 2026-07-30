@@ -196,6 +196,45 @@ class TrialService:
 
         return True
 
+    async def refund_trial_credit(
+        self,
+        user_id: str,
+        campaign_id: str,
+        reason: str = "refund",
+        amount: int = 1,
+    ) -> bool:
+        """
+        Refund N trial credits back to the user's trial balance (for jobs that
+        failed because of a system error after credits were already deducted).
+        Not gated on trial_end_date — a job that finishes processing after the
+        trial window closed should still return its credits.
+        """
+        now = datetime.utcnow()
+        updated = await self.trials_collection.find_one_and_update(
+            {"user_id": user_id},
+            {"$inc": {"credits_remaining": amount}},
+            return_document=ReturnDocument.AFTER,
+        )
+        if not updated:
+            return False
+
+        balance_after = updated["credits_remaining"]
+        balance_before = balance_after - amount
+
+        await self.credit_transactions_collection.insert_one(
+            CreditTransaction(
+                user_id=user_id,
+                type="refund",
+                amount=amount,
+                balance_before=balance_before,
+                balance_after=balance_after,
+                reason=reason,
+                campaign_id=campaign_id,
+                created_at=now,
+            ).dict(exclude_none=True)
+        )
+        return True
+
     # ==================== PRD 5.3 & 5.4: Access Control ====================
 
     async def can_generate(self, user_id: str) -> bool:
