@@ -126,6 +126,12 @@ class Settings(BaseSettings):
     ZAPCAP_API_KEY: Optional[str] = None
     OPUSCLIP_API_KEY: Optional[str] = None   # Phase 0 testing only
     VIZARD_API_KEY: Optional[str] = None      # Phase 0 testing only
+
+    # ── Video Editing Billing PRD — default rate, overridden at runtime by
+    # platform_settings once an admin sets one (see VideoBillingService.get_video_edit_rate) ──
+    VIDEO_EDIT_CREDITS_PER_MINUTE: int = 4
+    # Comma-separated allowlist gating PATCH /video-editing/pricing. Empty = nobody can change it.
+    BILLING_ADMIN_EMAILS: str = ""
     # Set to 'reap' | 'opusclip' | 'vizard' after Phase 0 Pidgin test picks a winner
     CLIPPING_API_PROVIDER: str = "reap"
 
