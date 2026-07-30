@@ -16,12 +16,57 @@ from their trial balance; if their trial doesn't have enough credits left
 for this specific job, the request is blocked rather than silently falling
 back to the paid wallet.
 """
+import json
+import os
+import subprocess
+import tempfile
 from math import ceil
 from typing import Optional, TypedDict
 
 from app.core.config import settings
 from app.services.CreditService import credit_service
 from app.services.TrialService import trial_service
+
+
+def probe_duration_strict(video_bytes: bytes) -> Optional[float]:
+    """
+    Billing-only duration probe. Unlike video_production_service._probe_duration
+    (which returns a fabricated 120.0s on any failure — fine for its own
+    pacing/analysis use, wrong for billing), this returns None on failure so
+    callers can surface PRD §11's "Video Duration Cannot Be Detected" error
+    and decline to charge, instead of silently billing a made-up duration
+    for a file that may not even be a valid video.
+    """
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+            f.write(video_bytes)
+            tmp = f.name
+        try:
+            result = subprocess.run(
+                ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", tmp],
+                capture_output=True, text=True, timeout=30,
+            )
+        finally:
+            os.unlink(tmp)
+        info = json.loads(result.stdout)
+        for stream in info.get("streams", []):
+            if stream.get("codec_type") == "video":
+                duration = stream.get("duration")
+                if duration is not None and float(duration) > 0:
+                    return float(duration)
+        return None
+    except Exception:
+        return None
+
+
+def duration_undetectable_response() -> dict:
+    """PRD §11: Video Duration Cannot Be Detected."""
+    return {
+        "status": False,
+        "responseCode": 422,
+        "responseMessage": "We could not determine the duration of this video. Please upload the video again.",
+        "responseData": None,
+    }
 
 
 class VideoBillingResult(TypedDict):

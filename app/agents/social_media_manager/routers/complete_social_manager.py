@@ -7043,14 +7043,13 @@ async def produce_video(
     """
     import uuid
     import httpx
-    from app.agents.social_media_manager.services.video_production_service import (
-        run_production_job,
-        _probe_duration,
-    )
+    from app.agents.social_media_manager.services.video_production_service import run_production_job
     from app.services.VideoBillingService import (
         charge_for_video_job,
         refund_video_job,
         insufficient_credits_response,
+        probe_duration_strict,
+        duration_undetectable_response,
     )
 
     user_id = _get_user_id(token)
@@ -7076,9 +7075,14 @@ async def produce_video(
     job_id = str(uuid.uuid4())
     now = datetime.utcnow().isoformat()
 
-    # Video Editing Billing PRD: charge before submitting for processing —
-    # duration of the input video is already knowable here via ffprobe.
-    duration_seconds = _probe_duration(video_bytes)
+    # Video Editing Billing PRD §11: don't charge for a video whose duration
+    # can't even be detected — that almost certainly means an invalid/corrupt
+    # file the render pipeline would fail on anyway.
+    duration_seconds = probe_duration_strict(video_bytes)
+    if duration_seconds is None:
+        return JSONResponse(status_code=422, content=duration_undetectable_response())
+
+    # PRD: charge before submitting for processing.
     billing = await charge_for_video_job(
         user_id=user_id, duration_seconds=duration_seconds, job_id=job_id, reason="video_production"
     )
@@ -8029,12 +8033,13 @@ async def submagic_produce(
     from app.agents.social_media_manager.services.video_production_service import (
         _upload_to_cloudinary,
         _upload_audio_to_cloudinary,
-        _probe_duration,
     )
     from app.services.VideoBillingService import (
         charge_for_video_job,
         refund_video_job,
         insufficient_credits_response,
+        probe_duration_strict,
+        duration_undetectable_response,
     )
 
     job_id = _uuid.uuid4().hex
@@ -8044,8 +8049,12 @@ async def submagic_produce(
     if not video_bytes:
         raise HTTPException(status_code=400, detail="Empty video file")
 
-    # Video Editing Billing PRD: charge before submitting for processing.
-    duration_seconds = _probe_duration(video_bytes)
+    # Video Editing Billing PRD §11: don't charge if duration can't be detected.
+    duration_seconds = probe_duration_strict(video_bytes)
+    if duration_seconds is None:
+        return JSONResponse(status_code=422, content=duration_undetectable_response())
+
+    # PRD: charge before submitting for processing.
     billing = await charge_for_video_job(
         user_id=user_id, duration_seconds=duration_seconds, job_id=job_id, reason="video_editing_submagic"
     )
@@ -8262,6 +8271,7 @@ async def zapcap_produce(
         charge_for_video_job,
         refund_video_job,
         insufficient_credits_response,
+        duration_undetectable_response,
     )
 
     user_id = _get_user_id(token)
@@ -8288,6 +8298,11 @@ async def zapcap_produce(
     probe = await _probe_clip(video_url)
     probed_width, probed_height = probe.get("width", 0), probe.get("height", 0)
     duration_seconds = probe.get("duration", 0)
+
+    # PRD §11: _probe_clip returns duration=0 on probe failure — don't charge
+    # for a video whose duration couldn't be detected.
+    if not duration_seconds or duration_seconds <= 0:
+        return JSONResponse(status_code=422, content=duration_undetectable_response())
 
     billing = await charge_for_video_job(
         user_id=user_id, duration_seconds=duration_seconds, job_id=job_id, reason="video_editing_zapcap"
