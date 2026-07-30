@@ -14,6 +14,7 @@ from typing import Optional
 from datetime import datetime, timedelta
 from math import ceil
 from motor.motor_asyncio import AsyncIOMotorDatabase
+from pymongo import ReturnDocument
 from app.database import get_db
 from app.domain.models.billing_models import (
     UserTrial,
@@ -185,52 +186,102 @@ class TrialService:
         user_id: str,
         campaign_id: str,
         reason: str = "campaign_generation",
+        amount: int = 1,  # NEW: Support deducting multiple credits (video editing bills 4/8/12+ per job)
     ) -> bool:
         """
-        Deduct 1 trial credit.
+        Deduct N trial credits (default 1).
         PRD 5.2: Works same as paid users — deduct 1 credit per campaign.
-        Returns False if trial expired or no credits left.
+        For carousels/video: deduct more than 1 in a single call.
+        Returns False if trial expired or insufficient credits.
+
+        Atomic check-and-decrement: the expiry/balance guard lives in the
+        filter, so two concurrent requests can't both read the same
+        credits_remaining and both succeed (the old find_one -> compute ->
+        update_one pattern allowed exactly that).
         """
-        trial_doc = await self.trials_collection.find_one({"user_id": user_id})
-        if not trial_doc:
-            return False
-
         now = datetime.utcnow()
-        end_date = trial_doc["trial_end_date"]
-        credits_remaining = trial_doc["credits_remaining"]
 
-        # PRD 2.3: Trial ends when 3 days elapsed OR credits = 0
-        if now >= end_date or credits_remaining <= 0:
-            # Trial expired - ensure user has a wallet with 0 credits
-            await self._ensure_wallet_on_trial_expiry(user_id)
+        updated = await self.trials_collection.find_one_and_update(
+            {
+                "user_id": user_id,
+                "trial_end_date": {"$gt": now},
+                "credits_remaining": {"$gte": amount},
+            },
+            {"$inc": {"credits_remaining": -amount}},
+            return_document=ReturnDocument.AFTER,
+        )
+
+        if not updated:
+            # Either no trial doc, trial expired, or insufficient credits —
+            # in the expired/exhausted case main previously ensured a 0-credit
+            # wallet exists here so subsequent (non-trial) checks don't break;
+            # preserve that even though the atomic filter can't tell us which
+            # case we're in without a second read.
+            trial_doc = await self.trials_collection.find_one({"user_id": user_id})
+            if not trial_doc or now >= trial_doc["trial_end_date"] or trial_doc["credits_remaining"] <= 0:
+                await self._ensure_wallet_on_trial_expiry(user_id)
             return False
 
-        balance_before = credits_remaining
-        new_remaining = credits_remaining - 1
+        balance_after = updated["credits_remaining"]
+        balance_before = balance_after + amount
 
         # If this deduction brings credits to 0, create wallet for when trial fully expires
-        if new_remaining == 0:
+        if balance_after == 0:
             await self._ensure_wallet_on_trial_expiry(user_id)
-
-        await self.trials_collection.update_one(
-            {"user_id": user_id},
-            {"$set": {"credits_remaining": new_remaining}},
-        )
 
         # Log deduction
         await self.credit_transactions_collection.insert_one(
             CreditTransaction(
                 user_id=user_id,
                 type="deduction",
-                amount=-1,
+                amount=-amount,
                 balance_before=balance_before,
-                balance_after=new_remaining,
+                balance_after=balance_after,
                 reason=reason,
                 campaign_id=campaign_id,
                 created_at=now,
             ).dict(exclude_none=True)
         )
 
+        return True
+
+    async def refund_trial_credit(
+        self,
+        user_id: str,
+        campaign_id: str,
+        reason: str = "refund",
+        amount: int = 1,
+    ) -> bool:
+        """
+        Refund N trial credits back to the user's trial balance (for jobs that
+        failed because of a system error after credits were already deducted).
+        Not gated on trial_end_date — a job that finishes processing after the
+        trial window closed should still return its credits.
+        """
+        now = datetime.utcnow()
+        updated = await self.trials_collection.find_one_and_update(
+            {"user_id": user_id},
+            {"$inc": {"credits_remaining": amount}},
+            return_document=ReturnDocument.AFTER,
+        )
+        if not updated:
+            return False
+
+        balance_after = updated["credits_remaining"]
+        balance_before = balance_after - amount
+
+        await self.credit_transactions_collection.insert_one(
+            CreditTransaction(
+                user_id=user_id,
+                type="refund",
+                amount=amount,
+                balance_before=balance_before,
+                balance_after=balance_after,
+                reason=reason,
+                campaign_id=campaign_id,
+                created_at=now,
+            ).dict(exclude_none=True)
+        )
         return True
 
     # ==================== PRD 5.3 & 5.4: Access Control ====================
