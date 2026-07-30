@@ -4296,6 +4296,42 @@ async def get_draft(
     return UriResponse.get_single_data_response("draft", draft)
 
 
+class UpdateDraftRequest(BaseModel):
+    text_content: Optional[List[Dict[str, Any]]] = None
+    image_url: Optional[str] = None
+
+
+@router.patch("/drafts/{draft_id}")
+async def update_draft(
+    draft_id: str,
+    body: UpdateDraftRequest,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    ctx: dict = Depends(get_flexible_brand_context),
+):
+    """Update a draft's text/image content — scoped to the active brand.
+
+    The SDK Gateway's legacy PATCH /api/v1/drafts/{id} only ever scoped by
+    the developer's shared account, so under multi-tenant mode every
+    end-user could read and overwrite every other end-user's drafts. This
+    is the brand-scoped replacement, mirroring GET/DELETE /drafts/{id}
+    above.
+    """
+    user_id = ctx["user_id"]
+    scope = _brand_scope(user_id, ctx["brand_id"])
+
+    updates = {k: v for k, v in body.dict(exclude_none=True).items()}
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields to update")
+    updates["updated_at"] = datetime.utcnow()
+
+    result = await db["content_drafts"].update_one({**scope, "id": draft_id}, {"$set": updates})
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Draft not found")
+
+    draft = await db["content_drafts"].find_one({**scope, "id": draft_id}, {"_id": 0})
+    return UriResponse.get_single_data_response("draft", draft)
+
+
 @router.get("/drafts/{draft_id}/image-stream")
 async def stream_draft_image(
     draft_id: str,
