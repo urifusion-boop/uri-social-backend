@@ -7,12 +7,17 @@ import httpx
 
 from app.core.config import settings
 from app.database import get_db
+from app.agents.social_media_manager.services.outstand_service import OutstandService
 
 GRAPH_BASE = f"https://graph.facebook.com/{settings.FACEBOOK_API_VERSION}"
 
 # Poll limits for Instagram container status
 _IG_POLL_INTERVAL = 8   # seconds between polls
 _IG_MAX_POLLS = 90      # 90 × 8s = 12 minutes max
+
+# Poll limits for Outstand post status (used for TikTok, which has no direct API)
+_OUTSTAND_POLL_INTERVAL = 8   # seconds between polls
+_OUTSTAND_MAX_POLLS = 90      # 90 × 8s = 12 minutes max
 
 
 def _jobs_col():
@@ -62,6 +67,10 @@ class VideoPublishService:
             elif platform == "facebook_reels":
                 post_id, post_url = await VideoPublishService._publish_facebook_video(
                     conn["page_access_token"], video_url, caption
+                )
+            elif platform == "tiktok":
+                post_id, post_url = await VideoPublishService._publish_tiktok(
+                    conn["outstand_account_id"], video_url, caption
                 )
             else:
                 raise ValueError(f"Unsupported platform: {platform}")
@@ -178,3 +187,43 @@ class VideoPublishService:
             video_id = post_data["id"]
             post_url = f"https://www.facebook.com/video/{video_id}"
             return video_id, post_url
+
+    # ── TikTok (via Outstand — no direct TikTok API) ───────────────────────────
+
+    @staticmethod
+    async def _publish_tiktok(
+        outstand_account_id: str,
+        video_url: str,
+        caption: str,
+    ):
+        outstand = OutstandService()
+
+        result = await outstand.publish_post(
+            outstand_account_ids=[outstand_account_id],
+            content=caption,
+            media_urls=[video_url],
+        )
+        post_obj = result.get("post") or result.get("data") or {}
+        if isinstance(post_obj, list):
+            post_obj = post_obj[0] if post_obj else {}
+        post_id = post_obj.get("id")
+        if not post_id:
+            raise ValueError(f"Outstand did not return a post id for TikTok publish: {result}")
+
+        # Poll Outstand until the video finishes processing/publishing on TikTok's side.
+        post_url = post_obj.get("url") or post_obj.get("permalink")
+        for _ in range(_OUTSTAND_MAX_POLLS):
+            post_data = await outstand.get_post(post_id)
+            post = post_data.get("post") or post_data.get("data") or {}
+            if isinstance(post, list):
+                post = post[0] if post else {}
+            if post.get("status") == "failed":
+                raise ValueError(f"TikTok publish failed via Outstand: {post}")
+            if post.get("publishedAt") and not post.get("isDraft"):
+                post_url = post.get("url") or post.get("permalink") or post_url
+                break
+            await asyncio.sleep(_OUTSTAND_POLL_INTERVAL)
+        else:
+            raise TimeoutError("TikTok publish via Outstand timed out")
+
+        return post_id, post_url

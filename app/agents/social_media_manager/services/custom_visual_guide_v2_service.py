@@ -19,6 +19,7 @@ from typing import Dict, Any, List, Optional
 import asyncio
 import hashlib
 import json
+import random
 from datetime import datetime
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from pymongo.errors import DuplicateKeyError
@@ -38,10 +39,12 @@ Your job is to document HOW this design looks, feels, and is structured — so a
 Return ONLY this JSON structure (no markdown, no code blocks, just raw JSON):
 
 {
-  "medium": "photographic | illustrated | hand_drawn | flat_graphic | 3d_render | mixed_media | collage | typography_driven",
+  "medium": "photographic (real photo) | illustrated (clean vector/digital illustration — smooth shapes, precise even linework, no wobble) | hand_drawn (sketchy doodle style — visible pen/marker linework, loose imperfect lines, hand-sketched wobble/texture, looks drawn by hand not built in vector software) | flat_graphic (solid flat color shapes, minimal/no linework) | 3d_render | mixed_media | collage | typography_driven — look closely at the linework quality before choosing between illustrated and hand_drawn, they are commonly confused",
   "aesthetic_dominance": "low | medium | high",
   "overall_aesthetic": "minimalist | bold | vintage | modern | organic | industrial | playful | elegant | dramatic | warm | energetic | luxurious | casual | professional | artistic",
   "mood": "professional | playful | dramatic | warm | energetic | luxurious | calm | serious | friendly | sophisticated | edgy | nostalgic | futuristic | authentic | aspirational",
+  "distinctive_signature": "One or two sentences, in your own words, describing the SINGLE most recognizable, specific visual device in this design — not a category label like the fields above, a concrete description of the actual thing you see. Example: 'A large soft-edged colored circle sits behind the subject, offset toward the upper-right, with small hand-drawn scribbles and dots scattered loosely around its edge.' Another example: 'A rounded rectangle card mockup with a subtle drop shadow floats in the lower third, styled like a phone notification.' This is the detail that makes the design instantly recognizable as ITSELF, beyond generic style categories — be concrete about shapes, placement, and how elements relate to each other, not just what category they fall into.",
+  "background_treatment": "One sentence describing ONLY the background/ambient decorative treatment — colors, gradients, shapes, patterns — as if the main subject were removed from the frame. Do NOT mention the subject itself (no people, products, or specific objects) at all, only what surrounds it. Example: 'A smooth vertical gradient shifts from magenta at the top to deep orange at the bottom, with small white dot patterns scattered loosely across it.' Another example: 'A solid pale-blue background is broken up by a few large soft-edged darker blue circles overlapping in the corners.' If the background is plain/neutral with no notable treatment, say so plainly (e.g. 'Plain white background, no decorative treatment') rather than inventing detail that isn't there.",
 
   "layout_structure": {
     "composition": "centered | rule_of_thirds | asymmetric | grid | diagonal | circular | layered | split_screen | full_bleed | framed",
@@ -96,7 +99,15 @@ CRITICAL RULES:
 3. Identify ALL text placement patterns and graphic devices
 4. List everything in "what_to_leave_behind" that should NOT be copied
 5. The goal is to capture the AESTHETIC DNA so it can be applied to new content
-6. Return ONLY the JSON, no explanations"""
+6. For distinctive_signature specifically: do NOT just restate the category fields above in
+   different words. Describe the one concrete visual device an artist would need to know about
+   to make a recreation instantly recognizable as related to this reference — its shape,
+   position, and relationship to other elements — not its category.
+7. For background_treatment specifically: describe ONLY what's behind/around the subject —
+   never the subject itself. If distinctive_signature already described a background element
+   (e.g. a colored circle behind the subject), background_treatment can restate just that part,
+   with the subject left out entirely.
+8. Return ONLY the JSON, no explanations"""
 
     # Art director meta-prompt template
     ART_DIRECTOR_TEMPLATE = """You are a senior art director creating a brand-new, original graphic
@@ -197,6 +208,13 @@ A. MEDIUM FIRST - CRITICAL. You MUST match the exact medium from the
 
 B. OVERALL AESTHETIC. Translate overall_aesthetic and mood into
    opening descriptive language that sets the visual register.
+   CRITICAL: mood is NON-NEGOTIABLE, exactly like the medium in step A —
+   it must NOT drift toward whatever tone the new content's subject matter
+   typically implies. A "serious"/"professional" mood must stay serious and
+   professional even if the new content is about something inherently
+   cheerful; a "playful" mood must stay playful even for serious subject
+   matter. The new CONTENT changes WHAT is shown; the style profile's mood
+   governs HOW it feels — never let the former override the latter.
 
 C. COMPOSITION & STRUCTURE. Apply layout_structure — the composition,
    information density, focal strategy, and structural_devices.
@@ -257,6 +275,21 @@ Return ONLY this JSON (no markdown, no code blocks):
 }}
 
 Return only the JSON. No preamble, no explanation."""
+
+    # Composition variation directives for V2 generation. Without one of these,
+    # GPT-Image-2's edit call reproduces the reference's exact framing/pose
+    # every time (since it's editing the same input photo with a similar
+    # prompt each generation) — every post from a guide looked like the same
+    # shot with different text. One is picked at random per generation so
+    # repeated posts from the same guide stay in the same style family without
+    # being visually identical.
+    VARIATION_DIRECTIVES = [
+        "Use a different angle or framing than a plain straight-on centered shot — try a subtle three-quarter view or a slightly lower/higher camera angle.",
+        "Vary the pose and placement of the main subject within the frame rather than dead-center — shift it left, right, or change its orientation.",
+        "Vary the specific arrangement of the background and decorative details this time — same style family, not the identical layout.",
+        "Vary the framing and crop — zoom in slightly tighter or pull back slightly wider than a default centered shot.",
+        "Vary the specific action or moment being depicted, within the same subject type and mood — a different instant, not the identical pose.",
+    ]
 
     @staticmethod
     async def _compute_image_hash(image_url: str) -> str:
@@ -447,6 +480,51 @@ Return only the JSON. No preamble, no explanation."""
             )
 
     @staticmethod
+    async def reanalyze_style_profile(
+        guide_id: str,
+        user_id: str,
+        db: AsyncIOMotorDatabase,
+    ) -> Dict[str, Any]:
+        """
+        Re-run GPT-4o Vision extraction on an existing guide's already-uploaded
+        reference image, replacing its stored style_profile in place.
+
+        Exists because the upload endpoint's duplicate-detection (by image
+        hash) means re-uploading the same file never re-triggers extraction —
+        it either 409s (already active) or silently restores the old guide
+        with its old profile. Without this, a guide analyzed before an
+        extraction-prompt improvement is permanently stuck on the old,
+        possibly-misclassified profile; there was no way to benefit from a
+        better prompt without deleting the guide and sourcing a new image.
+
+        Returns the updated guide document.
+        """
+        from bson import ObjectId
+
+        guide = await db["custom_visual_guides"].find_one({
+            "_id": ObjectId(guide_id),
+            "user_id": user_id,
+            "version": "v2",
+        })
+        if not guide:
+            raise HTTPException(status_code=404, detail="Custom Visual Guide V2 not found")
+
+        print(f"[V2] Re-analyzing guide {guide_id} ({guide.get('name')})")
+        old_medium = (guide.get("style_profile") or {}).get("medium")
+
+        new_profile = await CustomVisualGuideV2Service.extract_style_profile(guide["original_image_url"])
+
+        await db["custom_visual_guides"].update_one(
+            {"_id": ObjectId(guide_id)},
+            {"$set": {"style_profile": new_profile, "updated_at": datetime.utcnow()}},
+        )
+        print(f"[V2] ✅ Re-analyzed guide {guide_id}: medium {old_medium!r} → {new_profile.get('medium')!r}")
+
+        guide["style_profile"] = new_profile
+        guide["id"] = str(guide["_id"])
+        return guide
+
+    @staticmethod
     async def generate_image_with_v2_guide(
         guide_id: str,
         brand_context: Dict[str, Any],
@@ -456,6 +534,7 @@ Return only the JSON. No preamble, no explanation."""
         cta: str,
         platform: str,
         db: AsyncIOMotorDatabase,
+        override_reference_image: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Generate image using Custom Visual Guide V2 + meta-prompt.
@@ -475,6 +554,14 @@ Return only the JSON. No preamble, no explanation."""
             cta: Call to action
             platform: Target platform
             db: Database connection
+            override_reference_image: when a user attaches their OWN photo to
+                a post that also has this guide selected, pass that photo
+                here (after the normal background-removal cleanup) to use it
+                as the edit base instead of the guide's own stored reference
+                photo — the guide's style still applies exactly as it does
+                for a guide-only generation, it's just applied to this photo
+                instead. None (default) uses the guide's own photo, unchanged
+                from before.
 
         Returns:
             {
@@ -503,104 +590,379 @@ Return only the JSON. No preamble, no explanation."""
                 raise HTTPException(status_code=404, detail="Custom Visual Guide V2 not found")
 
             style_profile = guide.get("style_profile")
-            reference_image_url = guide.get("original_image_url")
+            reference_image_url = override_reference_image or guide.get("original_image_url")
+            if override_reference_image:
+                print(f"[V2] Using caller-supplied reference image (guide's own photo not used this time)")
 
             print(f"[V2] Loaded guide: {guide.get('name')}")
             print(f"[V2] Style: {style_profile.get('overall_aesthetic')}")
 
-            # Step 2: Build art director meta-prompt
-            purpose = f"{platform} post: {seed_content}"
-            format_map = {
-                "instagram": "1080x1080 square",
-                "facebook": "1200x630 landscape",
-                "twitter": "1200x675 landscape",
-                "x": "1200x675 landscape",
-                "linkedin": "1200x627 landscape",
+            # Step 2: Build structured style description from extracted profile
+            # Extract key attributes for precise style matching
+
+            medium = style_profile.get("medium", "photographic")
+            aesthetic = style_profile.get("overall_aesthetic", "modern")
+            mood = style_profile.get("mood", "professional")
+
+            # Distinctive signature — a free-text description of the one
+            # concrete visual device that makes this guide recognizable (e.g.
+            # "a large soft-edged color circle behind the subject, offset
+            # upper-right"), as opposed to the category fields above/below
+            # which are all fixed enums and inherently lose this kind of
+            # specific, actionable detail. Only present on guides analyzed
+            # (or re-analyzed) after this field was added — absent on older
+            # profiles, so this is empty and simply omitted for those.
+            distinctive_signature = style_profile.get("distinctive_signature", "")
+
+            # Background treatment — the subject-free counterpart to
+            # distinctive_signature: describes only what's behind/around the
+            # subject (colors, gradients, shapes), never the subject itself.
+            # This is what's safe to apply when a user uploads their own
+            # reference photo — it can't push the model toward the guide's
+            # own subject matter the way distinctive_signature would, since
+            # it was written to never mention a subject at all.
+            background_treatment = style_profile.get("background_treatment", "")
+
+            # Aesthetic dominance — how much the style itself should dominate
+            # the frame vs. let the subject/content lead. Extracted at upload
+            # time but never previously read anywhere in this prompt.
+            _DOMINANCE_NOTES = {
+                "low": "subtle — let the subject/content lead, keep decorative treatment minimal",
+                "medium": "balanced — style and subject share the frame roughly equally",
+                "high": "bold — style is the dominant visual feature throughout, not just accents",
             }
+            dominance_note = _DOMINANCE_NOTES.get(style_profile.get("aesthetic_dominance", ""), "")
 
-            meta_prompt = CustomVisualGuideV2Service.ART_DIRECTOR_TEMPLATE.format(
-                style_profile_json=json.dumps(style_profile, indent=2),
-                brand_name=brand_context.get("brand_name", ""),
-                primary_color=brand_context.get("brand_colors", ["#000000"])[0] if brand_context.get("brand_colors") else "#000000",
-                secondary_color=brand_context.get("brand_colors", ["#FFFFFF"])[1] if len(brand_context.get("brand_colors", [])) > 1 else "#FFFFFF",
-                accent_color=brand_context.get("brand_colors", ["#FF0000"])[2] if len(brand_context.get("brand_colors", [])) > 2 else "#FF0000",
-                logo_description=brand_context.get("logo_description", "brand logo"),
-                brand_font=brand_context.get("font_style", "modern sans-serif"),
-                brand_tone=brand_context.get("tone", "professional"),
-                brand_handle=brand_context.get("default_link", "@brand"),
-                purpose=purpose,
-                headline=headline,
-                subtext=subtext or "",
-                cta=cta or "Learn more",
-                format=format_map.get(platform, "1080x1080 square"),
-            )
+            # Layout structure — composition alone was the only layout field
+            # read; information_density and focal_strategy were extracted but
+            # unused, and structural_devices (badges, panels, frames — layout
+            # structuring, distinct from purely decorative graphic_elements)
+            # was never surfaced at all.
+            layout = style_profile.get("layout_structure", {})
+            composition = layout.get("composition", "centered")
+            information_density = layout.get("information_density", "")
+            focal_strategy = layout.get("focal_strategy", "")
+            composition_bits = [composition]
+            if information_density:
+                composition_bits.append(f"{information_density} information density")
+            if focal_strategy:
+                composition_bits.append(f"{focal_strategy} focal strategy")
+            composition_detail = ", ".join(composition_bits)
+            structural_devices = layout.get("structural_devices", [])
+            structural_devices_note = ", ".join(structural_devices[:4]) if structural_devices else ""
 
-            print(f"[V2] Meta-prompt generated ({len(meta_prompt)} chars)")
+            # Imagery style — subject_type was already used (identity
+            # instruction below); lighting/treatment/realism_level are also
+            # read here now instead of separately per-branch, so both the
+            # override and guide-only paths get the same descriptive detail.
+            imagery_style = style_profile.get("imagery_style", {})
+            imagery_lighting = imagery_style.get("lighting", "")
+            imagery_treatment = imagery_style.get("treatment", "")
+            imagery_realism = imagery_style.get("realism_level", "")
+            imagery_bits = [b for b in (imagery_treatment, imagery_realism) if b]
+            imagery_treatment_note = ", ".join(imagery_bits)
+            if imagery_lighting:
+                imagery_treatment_note = (
+                    f"{imagery_treatment_note}, {imagery_lighting} lighting"
+                    if imagery_treatment_note else f"{imagery_lighting} lighting"
+                )
 
-            # Step 3: GPT-4o generates final image prompt
-            print(f"[V2] Calling GPT-4o to generate art director prompt...")
+            # Color system — accent_strategy alone only describes WHERE accent
+            # color goes, not whether the reference has a bold, dominant
+            # colored background (palette_role: "background_dominant") versus
+            # a mostly neutral one with color used sparingly. Without
+            # palette_role, the prompt never said anything about background
+            # color dominance at all — only about accent placement — which is
+            # why a guide with a strong colored background produced output
+            # with brand-colored accents but a plain/generic background.
+            # temperature/saturation/contrast were also extracted but unused.
+            color_system = style_profile.get("color_system", {})
+            accent_strategy = color_system.get("accent_strategy", "")
+            palette_role = color_system.get("palette_role", "")
+            _PALETTE_ROLE_DESCRIPTIONS = {
+                "background_dominant": "a bold, dominant colored background fills most of the frame",
+                "balanced": "color is balanced between background and foreground elements",
+                "accent_driven": "mostly neutral/light, with color used only as accents",
+                "imagery_dominant": "color comes mainly from the imagery itself, not flat background fills",
+            }
+            palette_role_note = _PALETTE_ROLE_DESCRIPTIONS.get(palette_role, "")
+            color_detail_bits = [
+                b for b in (
+                    color_system.get("temperature", ""),
+                    color_system.get("saturation", ""),
+                    color_system.get("contrast", ""),
+                ) if b
+            ]
+            color_detail = f" ({', '.join(color_detail_bits)})" if color_detail_bits else ""
 
-            ai_request = AIService.build_ai_model(
-                messages=[{
-                    "role": "user",
-                    "content": meta_prompt
-                }],
-                model="gpt-4o",
-                temperature=0.7,
-            )
+            # Graphic elements (decorative details) — capped at 6 rather than 4
+            # so a guide's more distinctive elements (badges, speech bubbles,
+            # sparkles) are less likely to be silently dropped from the prompt.
+            graphic_elements = style_profile.get("graphic_elements", [])
+            decorative_elements = ", ".join(graphic_elements[:6]) if graphic_elements else "none"
 
-            ai_response = await AIService.chat_completion(ai_request)
+            # Typography — character (e.g. "modern_sans", "bold_condensed")
+            # and hierarchy (e.g. "strong") were extracted but unused; only
+            # placement/treatment were read.
+            typography = style_profile.get("typography", {})
+            typography_character = typography.get("character", "")
+            typography_hierarchy = typography.get("hierarchy", "")
+            text_placement = typography.get("text_placement", "overlay_center")
+            text_treatment = typography.get("text_treatment", "plain")
+            typography_bits = []
+            if typography_character:
+                typography_bits.append(f"{typography_character} character")
+            typography_bits.append(f"{text_placement} placement")
+            typography_bits.append(f"{text_treatment} treatment")
+            if typography_hierarchy:
+                typography_bits.append(f"{typography_hierarchy} hierarchy")
+            typography_line = ", ".join(typography_bits)
 
-            if isinstance(ai_response, dict) and "error" in ai_response:
-                raise Exception(ai_response["error"])
+            # Brand colors — the ACTUAL colors, not just the reference's abstract
+            # color strategy label (e.g. "single_bright_accent"). Without this,
+            # the prompt never named a real color, so GPT-Image-2 had nothing to
+            # go on but the reference's own original colors, which is why V2
+            # renders came out ignoring the brand's actual palette.
+            brand_name = brand_context.get("brand_name") or "the brand"
+            brand_colors = brand_context.get("brand_colors") or []
+            if brand_colors:
+                color_list = ", ".join(brand_colors[:3])
+                color_instruction = (
+                    f"Use {brand_name}'s actual brand colors ({color_list}) — apply them "
+                    f"following the reference's color strategy ({accent_strategy or 'its accent placement'})"
+                    f"{', where ' + palette_role_note if palette_role_note else ''}, "
+                    f"but the colors themselves must be {brand_name}'s, not the reference's original colors."
+                )
+            else:
+                color_instruction = "match reference palette"
 
-            raw_content = ai_response.choices[0].message.content.strip()
+            # Composition variation — without this, GPT-Image-2's edit call
+            # reproduces the reference's exact framing/pose every time (it's
+            # editing the same input photo with a similar prompt each
+            # generation), so every post from a guide looked like the same shot
+            # with different text pasted on. Picking one directive at random per
+            # generation keeps the style family intact while breaking the
+            # sameness.
+            if override_reference_image:
+                # Using the caller's OWN uploaded photo as the edit base — the
+                # whole point is to keep ITS actual subject/content and just
+                # restyle how it's rendered (medium, color, mood) to match the
+                # guide. Varying the pose/composition or swapping in a
+                # different person/product (both needed when editing the
+                # GUIDE's own photo, to stop it reappearing verbatim across
+                # every generation) would work against that here.
+                variation_directive = ""
+                identity_instruction = ""
 
-            # Remove markdown if present
-            if raw_content.startswith("```"):
-                lines = raw_content.split("\n")
-                json_lines = []
-                in_code_block = False
-                for line in lines:
-                    if line.startswith("```"):
-                        in_code_block = not in_code_block
-                        continue
-                    if in_code_block or "{" in line:
-                        json_lines.append(line)
-                raw_content = "\n".join(json_lines)
+                if medium == "photographic":
+                    medium_enforcement = ""
+                else:
+                    # GPT-Image-2's edit endpoint has a strong built-in bias to
+                    # preserve what's actually in the input photo, since it's
+                    # editing real pixels rather than generating from scratch —
+                    # a soft "restyle this" request alone tends to produce a
+                    # photo with a filter/outline/posterize effect rather than
+                    # a genuine medium change (confirmed live: output looked
+                    # like a photo with a sticker-cutout filter, not real
+                    # {medium} illustration). input_fidelity isn't an option
+                    # here at all (gpt-image-2 rejects it outright), so an
+                    # explicit negative constraint is the only remaining lever
+                    # — built from the guide's OWN extracted imagery_style
+                    # fields (treatment/realism_level) rather than a generic,
+                    # one-size-fits-all paragraph, since this path runs for
+                    # any subject type (person, product, scene...), not just
+                    # people.
+                    qualifiers = ", ".join(q for q in (imagery_treatment, imagery_realism) if q)
+                    medium_enforcement = (
+                        f"CRITICAL: this must become a genuine {medium} rendering"
+                        f"{f' ({qualifiers})' if qualifiers else ''} — fully redrawn, not a "
+                        f"photograph with a filter, outline, or posterize effect applied on top. "
+                        f"Photographic qualities (realistic shading, camera-like lighting and "
+                        f"depth) must be replaced entirely with {medium} rendering throughout."
+                    )
 
-            art_director_output = json.loads(raw_content)
-            final_prompt = art_director_output["image_prompt"]
+                # background_treatment is the subject-free counterpart to
+                # distinctive_signature (suppressed above) — safe to apply
+                # here since it was written to never mention a subject, only
+                # what surrounds one. Gives this path a real piece of the
+                # guide's specific look (its actual background colors/shapes)
+                # without pushing the model toward the guide's own subject.
+                background_note = (
+                    f" Behind/around the subject, use this specific background "
+                    f"treatment: {background_treatment}"
+                    if background_treatment else ""
+                )
 
-            print(f"[V2] ✅ Art director prompt generated ({len(final_prompt)} chars)")
+                match_instruction = (
+                    "Apply this visual style to the uploaded image's actual subject and "
+                    "composition — keep what is being shown, restyle HOW it's rendered "
+                    f"(medium, color treatment, mood) to match the style described above."
+                    f"{background_note} "
+                    f"{medium_enforcement}"
+                )
+            else:
+                variation_directive = random.choice(CustomVisualGuideV2Service.VARIATION_DIRECTIVES)
+
+                # Identity instruction — the reference photo often shows one specific
+                # person or product. Without calling that out explicitly, the same
+                # face/pose/outfit or the same product packaging kept reappearing in
+                # every generation, since the model is editing that literal photo.
+                subject_type = imagery_style.get("subject_type", "")
+                if subject_type == "person":
+                    identity_instruction = "The reference features a specific person — depict a DIFFERENT person (different face, pose, and outfit) of the same general type and mood. Never reproduce the same individual."
+                elif subject_type == "product":
+                    identity_instruction = "The reference features a specific product — depict a DIFFERENT specific product of the same general category. Never reproduce the same packaging, label, or exact product shape."
+                else:
+                    identity_instruction = ""
+
+                match_instruction = (
+                    f"Match the reference image's medium, mood, and overall composition family closely — "
+                    f"but this is a NEW piece, not a duplicate of the reference. {variation_directive}"
+                )
+
+            # Build structured prompt similar to standard generation. Assembled
+            # as a filtered list rather than one fixed f-string so an empty
+            # field (e.g. no structural_devices on this guide) just omits its
+            # line instead of leaving a blank/awkward one in the prompt.
+            style_lines = [
+                "=== VISUAL STYLE (MATCH REFERENCE) ===",
+                f"Design style: {medium}, {aesthetic} aesthetic, {mood} mood",
+            ]
+            if distinctive_signature and not override_reference_image:
+                # The single most important line in this whole section — a
+                # concrete description beats every category label above and
+                # below it combined for making output actually recognizable
+                # as related to this specific guide.
+                #
+                # Deliberately skipped when override_reference_image is set:
+                # this text often describes the GUIDE's own specific subject
+                # ("a series of gradient bottles", "a molecular structure
+                # illustration") — forcing that onto a user's own uploaded
+                # photo would push the model to replace their actual content
+                # with the guide's subject, exactly the bug variation_directive
+                # and identity_instruction below already exist to prevent. Only
+                # a guide-only generation (no competing uploaded content to
+                # preserve) can safely use it as-is.
+                style_lines.append(f"SIGNATURE ELEMENT (recreate this specifically): {distinctive_signature}")
+            if dominance_note:
+                style_lines.append(f"Aesthetic dominance: {dominance_note}")
+            style_lines.append(f"Composition: {composition_detail}")
+            if structural_devices_note:
+                style_lines.append(f"Structural devices: {structural_devices_note}")
+            if imagery_treatment_note:
+                style_lines.append(f"Imagery treatment: {imagery_treatment_note}")
+            style_lines.append(f"Decorative elements: {decorative_elements if decorative_elements != 'none' else 'minimal'}")
+            style_lines.append(f"Color approach: {color_instruction}{color_detail}")
+            style_lines.append(f"Typography: {typography_line}")
+            style_lines.append("")
+            style_lines.append(match_instruction)
+            if identity_instruction:
+                style_lines.append(identity_instruction)
+            style_lines.append("Include MINIMAL text - just a short headline and small CTA.")
+            style_lines.append("Do NOT copy logos or brand names from the reference.")
+
+            style_instructions = "\n".join(style_lines)
+
+            content_section = f"""=== CONTENT ===
+{seed_content.strip()}"""
+
+            # CTA instruction (same format as regular generation)
+            cta_instruction = f"""=== CALL-TO-ACTION ===
+Display the following CTA text at the bottom of the image in small clean sans-serif text: "{cta}"
+Style it subtle but legible, approximately 30% the size of the headline.
+Position: bottom-centre or bottom-right within safe zone.
+Do NOT style it as a button or banner."""
+
+            final_prompt = f"""{style_instructions}
+
+{content_section}
+
+{cta_instruction}"""
+
+            print(f"[V2] ✅ Pure style cloning prompt generated ({len(final_prompt)} chars)")
             print(f"[V2] Preview: {final_prompt[:200]}...")
 
-            # Step 4: Generate image with GPT-Image-2 edit mode
-            print(f"[V2] Calling GPT-Image-2 edit mode with reference image...")
+            # Step 4: Get platform-specific dimensions (same as other visual guides)
+            # Uses platform defaults: Instagram/Facebook = 1080x1350 portrait, LinkedIn/Twitter = landscape
+            print(f"[V2] Getting platform specs for {platform}...")
+            import httpx
+            from PIL import Image
+            import io
 
-            # Platform-specific dimensions
-            platform_specs = {
-                "instagram": {"width": 1080, "height": 1080},
-                "facebook": {"width": 1200, "height": 630},
-                "twitter": {"width": 1200, "height": 675},
-                "x": {"width": 1200, "height": 675},
-                "linkedin": {"width": 1200, "height": 627},
-            }
-            specs = platform_specs.get(platform, {"width": 1080, "height": 1080})
+            specs = ImageContentService._get_platform_image_specs(platform)  # Let it choose platform default
+            image_width = specs.get("width", 1200)
+            image_height = specs.get("height", 630)
+            print(f"[V2] Platform dimensions: {image_width}x{image_height} ({specs.get('format', 'unknown')})")
 
+            # Generate with platform-specific dimensions + reference image for style.
+            # NOTE: gpt-image-2 rejects input_fidelity outright (400 error — that
+            # param only exists for gpt-image-1), so fidelity/variation for V2
+            # guides is steered entirely through the prompt text above
+            # (identity_instruction + variation_directive), not an API parameter.
             image_response = await ImageContentService._call_dalle_api(
                 prompt=final_prompt,
-                size=f"{specs['width']}x{specs['height']}",
-                reference_image=reference_image_url,  # ← ACTUAL reference image
+                size=f"{image_width}x{image_height}",
+                reference_image=reference_image_url,  # ← ACTUAL reference image for style
                 image_model="openai/gpt-image-2",
             )
 
             if not image_response.get('success'):
                 raise Exception(image_response.get('error', 'Image generation failed'))
 
-            print(f"[V2] ✅ Image generated successfully")
+            generated_image_url = image_response['url']
+            print(f"[V2] ✅ Image generated successfully: {generated_image_url[:80]}...")
 
-            # Step 5: Update usage counter
+            # Step 5: Overlay logo on generated image
+            logo_url = brand_context.get("logo_url")
+            logo_position = brand_context.get("logo_position", "bottom_right")
+
+            if logo_url:
+                print(f"[V2] Overlaying logo at position: {logo_position}")
+
+                # Handle data URLs (base64) vs regular URLs
+                import base64
+                import re
+
+                if generated_image_url.startswith("data:"):
+                    # Extract base64 from data URL
+                    match = re.match(r'data:image/\w+;base64,(.+)', generated_image_url)
+                    if match:
+                        base64_image = match.group(1)
+                        print(f"[V2] Extracted base64 from data URL")
+                    else:
+                        raise Exception("Invalid data URL format")
+                else:
+                    # Download from regular URL and convert to base64
+                    async with httpx.AsyncClient(timeout=20) as client:
+                        img_response = await client.get(generated_image_url)
+                        base64_image = base64.b64encode(img_response.content).decode('utf-8')
+                        print(f"[V2] Downloaded image from URL and converted to base64")
+
+                # Overlay logo using ImageContentService (expects base64 string)
+                logo_result_b64 = ImageContentService._overlay_logo(
+                    b64=base64_image,
+                    logo_url=logo_url,
+                    position=logo_position,
+                )
+
+                # Upload final image with logo to Cloudinary
+                import cloudinary.uploader
+
+                # Decode base64 back to bytes for upload
+                final_image_bytes = base64.b64decode(logo_result_b64)
+
+                upload_result = cloudinary.uploader.upload(
+                    final_image_bytes,
+                    folder="uri-social/generated-images",
+                    resource_type="image",
+                )
+                final_image_url = upload_result['secure_url']
+                print(f"[V2] ✅ Logo overlaid and uploaded: {final_image_url[:80]}...")
+            else:
+                final_image_url = generated_image_url
+                print(f"[V2] ⚠️ No logo URL provided, skipping logo overlay")
+
+            # Step 6: Update usage counter
             await db["custom_visual_guides"].update_one(
                 {"_id": ObjectId(guide_id)},
                 {
@@ -611,12 +973,16 @@ Return only the JSON. No preamble, no explanation."""
 
             return {
                 "success": True,
-                "image_url": image_response['url'],
+                "status": True,  # For UriResponse compatibility
+                "image_url": final_image_url,
+                "responseData": {"image_url": final_image_url},  # For UriResponse compatibility
                 "image_prompt": final_prompt,
-                "reserved_text_zones": art_director_output.get("reserved_text_zones", []),
-                "brand_overlay": art_director_output.get("brand_overlay", {}),
-                "identity_safety_check": art_director_output.get("identity_safety_check", {}),
                 "style_profile_used": style_profile.get("overall_aesthetic"),
+                "medium_used": medium,
+                "mood_used": mood,
+                "generated_dimensions": f"{image_width}x{image_height}",
+                "platform": platform,
+                "logo_applied": bool(logo_url),
             }
 
         except json.JSONDecodeError as e:
