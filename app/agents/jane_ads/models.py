@@ -227,17 +227,20 @@ class AdCopy(BaseModel):
 
 
 class CreativeSource(str, Enum):
-    """Mirrors PRD Part D2 — the three ways a creative's image is sourced."""
-    GENERATE = "generate"    # Jane generates it via the brand playbook engine (default)
-    UPLOAD = "upload"        # the user's own uploaded photo/video
-    DRAFT = "draft"          # an existing content draft the user already liked
+    """Mirrors PRD Part D2, extended by the creative brief spec's four asset paths."""
+    GENERATE = "generate"        # Jane generates it via the brand playbook engine (default)
+    UPLOAD = "upload"            # the user's own uploaded photo/video, used as-is
+    DRAFT = "draft"              # an existing content draft the user already liked
+    RECOMPOSITE = "recomposite"  # the user's own real product photo, background cleaned/
+                                 # replaced — the product itself is never regenerated
+                                 # (product truthfulness rule, creative brief spec §7.1)
 
 
 class AdCreative(BaseModel):
     """A complete ad ready to submit: a creative (image or video) + copy + the
     WhatsApp CTA. Every ad routes to WhatsApp — the CTA is fixed, never up to the
-    user. GENERATE always produces an image (gpt-image-1 has no video mode); UPLOAD
-    and DRAFT can carry either — `is_video` says which."""
+    user. GENERATE always produces an image (gpt-image-1 has no video mode); UPLOAD,
+    DRAFT and RECOMPOSITE can carry either — `is_video` says which."""
     image_url: str = ""             # final creative media URL, hosted on Cloudinary
     is_video: bool = False           # True when image_url is actually a video
     headline: str = ""
@@ -250,6 +253,19 @@ class AdCreative(BaseModel):
                                      # set for UPLOAD/DRAFT (the media choice is
                                      # already made there)
     generated: bool = True          # False when there's no media → copy-only fallback
+
+    # Attribute tagging (creative brief spec §11/§6) — cheap, computed at assembly
+    # time (never model-generated), so later analysis can ask "does stating the
+    # price help", "which asset path performs", etc. without re-deriving from raw text.
+    asset_path: CreativeSource = CreativeSource.GENERATE  # same value as `source` today;
+                                                            # kept as its own field since
+                                                            # `source` may grow meanings
+                                                            # (e.g. a future re-edit) that
+                                                            # shouldn't retroactively change
+                                                            # what asset_path recorded
+    shows_price: bool = False       # a ₦ amount appears in the copy
+    shows_service_area: bool = False  # the resolved service_area string appears in the copy
+    copy_length: int = 0             # len(headline) + len(primary_text), for quick analysis
 
 
 # ── Path C: script-and-shoot (PRD §4.1) ───────────────────────────────────────
