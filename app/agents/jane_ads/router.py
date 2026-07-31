@@ -256,8 +256,8 @@ class CreativeForBrandBody(BaseModel):
     goal: str = "messages"
     description: str = ""
     city: str = ""                     # grounds the GENERATE image in the real place
-    source: str = "generate"           # generate | upload | draft
-    reference_image_url: str = ""      # required for source=upload
+    source: str = "generate"           # generate | upload | draft | recomposite
+    reference_image_url: str = ""      # required for source=upload/recomposite
     is_video: bool = False             # is reference_image_url a video? (from /creative/upload)
     draft_id: str = ""                 # required for source=draft
 
@@ -270,7 +270,7 @@ async def creative_for_brand(
 ) -> dict:
     """Generate/assemble an ad creative for the caller's real brand — pulls the brand
     playbook (colours, voice, fonts) so ads look like the brand, not a template."""
-    from .creative import creative_from_draft, creative_from_upload, generate_ad_creative
+    from .creative import creative_from_draft, creative_from_recomposite, creative_from_upload, generate_ad_creative
     user_id = brand_ctx["user_id"]
     brand_id = brand_ctx.get("brand_id")
 
@@ -280,14 +280,21 @@ async def creative_for_brand(
         ad = await creative_from_upload(
             body.business_name, body.category, body.reference_image_url, body.goal,
             body.description, user_id=user_id, db=db, brand_id=brand_id,
-            is_video=body.is_video,
+            is_video=body.is_video, city=body.city,
+        )
+    elif body.source == "recomposite":
+        if not body.reference_image_url:
+            raise HTTPException(status_code=400, detail="reference_image_url is required for source=recomposite")
+        ad = await creative_from_recomposite(
+            body.business_name, body.category, body.reference_image_url, body.goal,
+            body.description, user_id=user_id, db=db, brand_id=brand_id, city=body.city,
         )
     elif body.source == "draft":
         if not body.draft_id:
             raise HTTPException(status_code=400, detail="draft_id is required for source=draft")
         ad = await creative_from_draft(
             body.business_name, body.category, body.draft_id, user_id, db,
-            goal=body.goal, brand_id=brand_id,
+            goal=body.goal, brand_id=brand_id, city=body.city,
         )
         if ad is None:
             raise HTTPException(status_code=404, detail="Draft not found or has no image")
@@ -915,8 +922,9 @@ class MetaLaunchFromMessageBody(BaseModel):
     business_name: str = ""
     category: str = ""
     conversation_cost_ngn: float = Field(500.0, gt=0)
-    creative_source: str = "generate"     # generate | upload | draft | ask
-    reference_image_url: str = ""         # required for creative_source=upload (from /creative/upload)
+    creative_source: str = "generate"     # generate | upload | draft | recomposite | ask
+    reference_image_url: str = ""         # required for creative_source=upload/recomposite (from
+                                          # /creative/upload)
     is_video: bool = False                # is reference_image_url a video?
     draft_id: str = ""                    # required for creative_source=draft (from /creative/drafts)
     reuse_image_url: str = ""             # a refinement — keep the prior plan's image instead of
@@ -924,6 +932,10 @@ class MetaLaunchFromMessageBody(BaseModel):
                                           # credit or swap the visual). Ignored for upload/draft.
     thread_id: str = ""                   # the campaign thread this plan belongs to (Tier E),
                                           # tagged onto the pending plan + launched campaign
+    ignore_creative_fit_pushback: bool = False  # user already saw the creative_fit_pushback
+                                          # early-return (upload/draft/recomposite that Jane
+                                          # judges would do better as video) and chose to
+                                          # proceed anyway — skips the pushback on resubmit
 
 
 class _PlanBuildResult(BaseModel):
@@ -959,7 +971,7 @@ async def _build_campaign_plan(
     import uuid
     from app.core.config import settings
     from .ads_connection import AdsConnectionRequired, resolve_ads_page_for_launch
-    from .creative import creative_from_draft, creative_from_upload, generate_ad_creative, get_brand_context, write_shoot_script
+    from .creative import creative_from_draft, creative_from_recomposite, creative_from_upload, generate_ad_creative, get_brand_context, service_area_from_geo, write_shoot_script
     from .decision_engine import apply_platform_override, plan_campaign
     from .history import get_campaign_history, remembered_budget_ngn, remembered_business_name, remembered_category
     from .nl import to_campaign_request, NlUnavailableError
@@ -990,8 +1002,8 @@ async def _build_campaign_plan(
         }}
     page_id = ads_conn["page_id"]
 
-    if body.creative_source == "upload" and not body.reference_image_url:
-        raise HTTPException(status_code=400, detail="reference_image_url is required for creative_source=upload")
+    if body.creative_source in ("upload", "recomposite") and not body.reference_image_url:
+        raise HTTPException(status_code=400, detail=f"reference_image_url is required for creative_source={body.creative_source}")
     if body.creative_source == "draft" and not body.draft_id:
         raise HTTPException(status_code=400, detail="draft_id is required for creative_source=draft")
 
@@ -1147,6 +1159,11 @@ async def _build_campaign_plan(
     except Exception as e:
         print(f"[oneshot] geo skipped: {e}", flush=True)
 
+    # service_area (creative brief spec) — the one place a location legitimately
+    # belongs in customer-facing COPY, distinct from plan.geo/parsed.city which
+    # ground targeting and image generation but must never leak into copy.
+    service_area = service_area_from_geo(plan.geo, parsed.city)
+
     # 4. The ad creative — Jane generates it, or the caller supplies their own upload/draft.
     business_name = req.business_name or body.business_name or "Your Business"
     category = req.category or body.category
@@ -1174,11 +1191,19 @@ async def _build_campaign_plan(
         creative = await creative_from_upload(
             business_name, category, body.reference_image_url, req.goal.value, req.description,
             user_id=user_id, db=db, brand_id=brand_id, is_video=body.is_video,
+            city=parsed.city, service_area=service_area,
+        )
+    elif body.creative_source == "recomposite":
+        creative = await creative_from_recomposite(
+            business_name, category, body.reference_image_url, req.goal.value, req.description,
+            user_id=user_id, db=db, brand_id=brand_id,
+            city=parsed.city, service_area=service_area,
         )
     elif body.creative_source == "draft":
         creative = await creative_from_draft(
             business_name, category, body.draft_id, user_id, db,
             goal=req.goal.value, brand_id=brand_id,
+            city=parsed.city, service_area=service_area,
         )
         if creative is None:
             raise HTTPException(status_code=404, detail="Draft not found or has no image")
@@ -1189,6 +1214,7 @@ async def _build_campaign_plan(
         creative = await creative_from_upload(
             business_name, category, body.reuse_image_url, req.goal.value, req.description,
             user_id=user_id, db=db, brand_id=brand_id, is_video=False,
+            city=parsed.city, service_area=service_area,
         )
     else:
         # AI generation is the one creative path that costs a content credit — an
@@ -1203,7 +1229,7 @@ async def _build_campaign_plan(
         creative = await generate_ad_creative(
             business_name, category, req.goal.value, req.description,
             user_id=user_id, db=db, brand_id=brand_id, city=parsed.city,
-            behaviour=plan.behaviour.value,
+            behaviour=plan.behaviour.value, service_area=service_area,
         )
         if creative.image_url:
             # "reason" is a strict Literal on CreditTransaction — "campaign_generation"
@@ -1229,6 +1255,36 @@ async def _build_campaign_plan(
         )
     for v in policy_result.violations:
         print(f"[policy] WARN on plan for {business_id}: {v.category} — matched '{v.matched_text}'", flush=True)
+
+    # 4.6. Creative-fit pushback (creative brief spec §6.2/§9) — the user brought their
+    # own upload/draft/recomposited photo, but Jane judges this business would clearly
+    # do better as video. Never silently accept or silently downgrade: surface a real
+    # tappable choice (Case 3 style, same early-return shape as choose_creative_source),
+    # with the shoot script already written so "use it" has something concrete to show.
+    # GENERATE doesn't need this gate — there's no user-supplied media to reconcile
+    # against; it just gets the existing passive nudge below.
+    if (body.creative_source in ("upload", "draft", "recomposite")
+            and creative.video_recommendation and not body.ignore_creative_fit_pushback):
+        pushback_script = None
+        try:
+            pushback_script = await write_shoot_script(
+                business_name, category, req.goal.value, creative.video_recommendation,
+                req.description, await get_brand_context(user_id, db, brand_id) if user_id else {},
+            )
+        except Exception as e:
+            print(f"[oneshot] pushback shoot script skipped: {e}", flush=True)
+        return {"early_return": {
+            "stage": "creative_fit_pushback",
+            "understood": parsed.model_dump(),
+            "reason": creative.video_recommendation,
+            "options": ["keep_as_is", "use_script", "reconsider"],
+            "shoot_script": (pushback_script.model_dump()
+                             if pushback_script and pushback_script.shots else None),
+            "creative_preview": {
+                "headline": creative.headline, "primary_text": creative.primary_text,
+                "image_url": creative.image_url,
+            },
+        }}
 
     plan.page_id = page_id
     plan.whatsapp_number = wa_number
