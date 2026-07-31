@@ -236,12 +236,17 @@ app.include_router(custom_guides_v2_router)  # V2 - Advanced style transfer
 # Include Canvas Editor (layered document editing)
 app.include_router(canvas_editor_router, prefix="/social-media", tags=["Canvas Editor"])
 
-# Include Agency Accounts (agency layer wrapping Jane). No extra prefix here —
-# agency_router already declares its own "/agency" prefix (see agency_router.py's
-# own docstring: "Endpoints (all under /agency)"); adding "/social-media" on top
-# made every route live at /social-media/agency/* while every caller (SDK and
-# docs) expects plain /agency/* — a real, previously-shipped routing bug.
+# Include Agency Accounts (agency layer wrapping Jane) under both paths, same
+# dual-mount pattern as auth_router above. Bare /agency/* is what SDK/API-key
+# callers and the docs expect (see agency_router.py's own docstring). But the
+# dashboard frontend's AgencyService.ts goes through UriHttpClient the same
+# way every other social-media-agent call does, which in production actually
+# lands on /social-media/agency/* — confirmed via live prod logs showing
+# POST /social-media/agency 404ing when only the bare mount existed. Mounting
+# bare-only "fixed" the SDK path but silently broke agency creation from the
+# dashboard.
 app.include_router(agency_router, tags=["Agency"])
+app.include_router(agency_router, prefix="/social-media", tags=["Agency"])
 
 # Include SDK router (API key authentication for external developers)
 app.include_router(sdk_router, tags=["SDK"])
