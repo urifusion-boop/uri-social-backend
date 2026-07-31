@@ -1605,6 +1605,134 @@ async def meta_launch_plan(
     return result
 
 
+# ── Plan Defence — Jane can explain/defend a plan she already built ───────────
+
+class PlanAskBody(BaseModel):
+    question: str
+    confirm_correction: bool = False   # user already saw a challenge's re-derived
+                                       # preview and wants it to REPLACE the stored
+                                       # plan — never applied silently on first ask
+
+
+@router.post("/meta/plan/{plan_id}/ask")
+async def meta_plan_ask(
+    plan_id: str,
+    body: PlanAskBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Answer a question about an existing plan, run a what-if, or fold in a
+    corrected foundation fact — the three follow-up shapes a real client asks after
+    seeing a plan (Plan Defence spec). Never fabricates a number: questions/what-ifs
+    only ever reference the plan's own persisted derivation or re-run the real
+    decision engine; a challenge always shows its re-derived plan for confirmation
+    before it replaces anything stored."""
+    from datetime import datetime, timezone
+
+    from .plan_defence import NlUnavailableError, classify_followup, explain_plan, what_if
+    from .summary import CampaignSummary
+
+    brand_id = brand_ctx.get("brand_id")
+    doc = await db["jane_ads_pending_plans"].find_one({"plan_id": plan_id})
+    if not doc or doc.get("brand_id") != brand_id:
+        raise HTTPException(status_code=404, detail="Plan not found")
+    if not (body.question or "").strip():
+        raise HTTPException(status_code=400, detail="question is required")
+
+    plan = CampaignPlan.model_validate(doc["plan"])
+    req = CampaignRequest.model_validate(doc["req"])
+    summary = CampaignSummary.model_validate(doc["summary"]) if doc.get("summary") else None
+
+    intent = await classify_followup(body.question, current_budget_ngn=req.budget_ngn)
+    now = datetime.now(timezone.utc)
+
+    async def _log(kind: str, answer: str) -> None:
+        await db["jane_ads_pending_plans"].update_one(
+            {"plan_id": plan_id},
+            {"$push": {"qa_log": {"question": body.question, "kind": kind, "answer": answer, "at": now}}},
+        )
+
+    if intent.kind == "question":
+        if intent.what_if_budget_ngn:
+            try:
+                result = what_if(plan, req, intent.what_if_budget_ngn, summary)
+            except ValueError as e:
+                await _log("question", str(e))
+                return {"kind": "question", "answer": str(e)}
+            await _log("question", result.narrative)
+            return {
+                "kind": "question",
+                "answer": result.narrative,
+                "what_if": {
+                    "changed": result.changed,
+                    "original": result.original.model_dump(mode="json"),
+                    "hypothetical": result.hypothetical.model_dump(mode="json"),
+                },
+            }
+        try:
+            answer = await explain_plan(body.question, plan, req, summary, doc.get("understood"))
+        except NlUnavailableError:
+            raise HTTPException(status_code=503, detail=_AI_DIFFICULTIES)
+        await _log("question", answer)
+        return {"kind": "question", "answer": answer}
+
+    if intent.kind == "challenge":
+        if doc["status"] != "pending":
+            answer = (f"This campaign has already {doc['status']} — I can't fold a correction "
+                     "into it here. Describe a new campaign to Jane to plan an updated one.")
+            await _log("challenge", answer)
+            return {"kind": "challenge", "answer": answer}
+
+        # Reuse the whole existing re-plan machinery (Plan Defence spec §4) — fold the
+        # correction into the flattened brief the SAME way consult() already reads it,
+        # and reuse the existing creative image (no new content credit, no image churn)
+        # since a foundation-fact correction is about targeting/budget, not the visual.
+        synthetic_body = MetaLaunchFromMessageBody(
+            message=f"{doc['message']} {body.question}".strip(),
+            business_name=doc.get("business_name", ""),
+            category=req.category,
+            reuse_image_url=plan.creative.image_url if plan.creative else "",
+            thread_id=doc.get("thread_id", ""),
+        )
+        rebuilt = await _build_campaign_plan(synthetic_body, brand_ctx, db)
+        if isinstance(rebuilt, dict):
+            return {"kind": "challenge", **rebuilt["early_return"]}
+
+        preview = {
+            "kind": "challenge",
+            "stage": "challenge_preview" if not body.confirm_correction else "planned",
+            "plan_id": plan_id,
+            **_plan_response_dict(rebuilt),
+        }
+        if not body.confirm_correction:
+            preview["note"] = "This reflects your correction — resend with confirm_correction=true to replace the current plan."
+            await _log("challenge", rebuilt.plan.explanation)
+            return preview
+
+        await db["jane_ads_pending_plans"].update_one(
+            {"plan_id": plan_id},
+            {"$set": {
+                "req": rebuilt.req.model_dump(mode="json"),
+                "plan": rebuilt.plan.model_dump(mode="json"),
+                "jane_platforms": rebuilt.jane_platforms,
+                "forced_to_meta": rebuilt.forced_to_meta,
+                "geo_dump": rebuilt.geo_dump,
+                "understood": rebuilt.understood,
+                "budget_estimate": rebuilt.budget_estimate,
+                "summary": rebuilt.summary,
+                "message": synthetic_body.message,
+            }},
+        )
+        await _log("challenge", rebuilt.plan.explanation)
+        return preview
+
+    # "new_campaign" — never silently act on it as a correction to THIS plan.
+    answer = ("That sounds like a new campaign rather than something about this one — "
+             "describe it to Jane fresh and I'll plan it separately.")
+    await _log("new_campaign", answer)
+    return {"kind": "new_campaign", "answer": answer}
+
+
 @router.get("/meta/campaigns")
 async def meta_campaigns(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
