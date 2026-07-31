@@ -12,13 +12,21 @@ from unittest.mock import AsyncMock, patch
 from app.agents.jane_ads.creative import (
     WHATSAPP_CTA,
     _as_ad_content,
+    _check_leakage,
     _draft_to_summary,
+    _leakage_terms,
     _location_prompt_bit,
     _looks_like_video,
+    _strip_leaked_terms,
+    _zone_a_block,
     assemble_creative,
+    creative_from_recomposite,
     generate_ad_image,
+    service_area_from_geo,
+    write_ad_copy,
+    write_ad_copy_for_image,
 )
-from app.agents.jane_ads.models import AdCopy, CreativeSource
+from app.agents.jane_ads.models import AdCopy, CreativeSource, GeoMode, GeoPin, GeoPlan
 
 
 def _run(coro):
@@ -207,16 +215,24 @@ def test_assemble_creative_no_recommendation_when_not_flagged():
     assert c.video_recommendation == ""
 
 
-def test_assemble_creative_recommendation_suppressed_for_upload():
-    # UPLOAD already has a real media choice made — nothing to recommend.
-    copy = AdCopy(headline="h", video_recommended=True, video_recommendation_reason="ignored")
+def test_assemble_creative_recommendation_surfaces_for_still_upload():
+    # A static (non-video) upload still gets the pushback (creative brief spec §6.2/
+    # §9) — the SHOULD-vs-CAN tension applies to uploads/drafts too, not just GENERATE.
+    copy = AdCopy(headline="h", video_recommended=True, video_recommendation_reason="shown")
     c = assemble_creative(copy, "https://cdn/ad.png", source=CreativeSource.UPLOAD)
-    assert c.video_recommendation == ""
+    assert c.video_recommendation == "shown"
 
 
-def test_assemble_creative_recommendation_suppressed_for_draft():
-    copy = AdCopy(headline="h", video_recommended=True, video_recommendation_reason="ignored")
+def test_assemble_creative_recommendation_surfaces_for_draft():
+    copy = AdCopy(headline="h", video_recommended=True, video_recommendation_reason="shown")
     c = assemble_creative(copy, "https://cdn/ad.png", source=CreativeSource.DRAFT)
+    assert c.video_recommendation == "shown"
+
+
+def test_assemble_creative_recommendation_suppressed_when_already_video():
+    # Already a video — nothing left to recommend.
+    copy = AdCopy(headline="h", video_recommended=True, video_recommendation_reason="ignored")
+    c = assemble_creative(copy, "https://cdn/ad.mp4", source=CreativeSource.UPLOAD, is_video=True)
     assert c.video_recommendation == ""
 
 
@@ -265,3 +281,271 @@ def test_generate_ad_image_returns_none_when_cloudinary_upload_fails():
     ):
         url = _run(generate_ad_image("a vibrant workspace"))
     assert url is None
+
+
+# ── service_area_from_geo (creative brief spec §4) — pure ──────────────────────
+# The one place a location legitimately belongs in customer-facing COPY, distinct
+# from the raw geo_target/city used for targeting/image-grounding.
+
+def test_service_area_empty_for_non_local():
+    geo = GeoPlan(mode=GeoMode.NON_LOCAL, city="Lagos")
+    assert service_area_from_geo(geo, fallback_city="Lagos") == ""
+
+
+def test_service_area_uses_pin_names():
+    geo = GeoPlan(mode=GeoMode.OWN_RADIUS, city="Lagos",
+                  pins=[GeoPin(name="Yaba"), GeoPin(name="Surulere")])
+    assert service_area_from_geo(geo) == "Yaba, Surulere"
+
+
+def test_service_area_caps_at_three_pins():
+    geo = GeoPlan(mode=GeoMode.OWN_RADIUS, pins=[
+        GeoPin(name="A"), GeoPin(name="B"), GeoPin(name="C"), GeoPin(name="D"),
+    ])
+    assert service_area_from_geo(geo) == "A, B, C"
+
+
+def test_service_area_falls_back_to_fallback_area():
+    geo = GeoPlan(mode=GeoMode.WATERING_HOLE, fallback_area="Lekki-Ajah axis")
+    assert service_area_from_geo(geo) == "Lekki-Ajah axis"
+
+
+def test_service_area_falls_back_to_city():
+    geo = GeoPlan(mode=GeoMode.OWN_RADIUS, city="Ibadan")
+    assert service_area_from_geo(geo) == "Ibadan"
+
+
+def test_service_area_falls_back_to_caller_city_when_no_geo():
+    assert service_area_from_geo(None, fallback_city="Enugu") == "Enugu"
+
+
+# ── Leakage check (creative brief spec §4) — pure ──────────────────────────────
+
+def test_leakage_terms_drops_empty_values():
+    assert _leakage_terms("Lekki", "", "  ") == ["Lekki"]
+
+
+def test_check_leakage_detects_case_insensitive_substring():
+    leaked = _check_leakage("Lekki Creatives", "for creative professionals",
+                            ["Lekki", "creative professionals"])
+    assert "Lekki" in leaked
+    assert "creative professionals" in leaked
+
+
+def test_check_leakage_clean_copy_reports_nothing():
+    leaked = _check_leakage("Fresh bags, made to order", "Message us on WhatsApp today.",
+                            ["Lekki", "creative professionals"])
+    assert leaked == []
+
+
+def test_strip_leaked_terms_removes_and_collapses_whitespace():
+    out = _strip_leaked_terms("Lekki creatives, order now", ["Lekki", "creatives"])
+    assert "Lekki" not in out
+    assert "creatives" not in out
+    assert "  " not in out
+
+
+# ── Zone A block (creative brief spec §2) — pure ───────────────────────────────
+
+def test_zone_a_block_empty_when_nothing_known():
+    assert _zone_a_block("", "", "", "messages") == ""
+
+
+def test_zone_a_block_names_and_prohibits_each_value():
+    out = _zone_a_block("Lekki", "creative professionals", "design", "messages")
+    assert "Lekki" in out
+    assert "creative professionals" in out
+    assert "never write about this" in out
+
+
+# ── write_ad_copy: two-zone brief + leakage check (creative brief spec §2-4) ───
+# Live-confirmed bug: a campaign targeting Lekki for "creative professionals"
+# produced copy reading "Lekki creatives" — the fix is these three behaviours.
+
+def test_write_ad_copy_never_leaks_geo_or_audience_into_final_copy():
+    cases = [
+        ("Lekki", "creative professionals", "bags"),
+        ("Yaba", "students", "phone accessories"),
+        ("Surulere", "young families", "catering"),
+    ]
+    for geo_target, audience, category in cases:
+        clean = AsyncMock(return_value={
+            "headline": "Order fresh today", "primary_text": "Message us on WhatsApp to order.",
+            "image_prompt": "a product shot", "video_recommended": False,
+            "video_recommendation_reason": "",
+        })
+        with patch("app.agents.jane_ads.creative._call_ad_copy_model", new=clean):
+            copy = _run(write_ad_copy(
+                "Test Biz", category, city=geo_target,
+                brand_context={"target_audience": audience},
+            ))
+        assert geo_target.lower() not in copy.headline.lower()
+        assert geo_target.lower() not in copy.primary_text.lower()
+        assert audience.lower() not in copy.headline.lower()
+        assert audience.lower() not in copy.primary_text.lower()
+
+
+def test_write_ad_copy_service_area_appears_geo_target_does_not():
+    mock_call = AsyncMock(return_value={
+        "headline": "Bags made in Yaba", "primary_text": "I deliver around Yaba — message me on WhatsApp.",
+        "image_prompt": "a product shot", "video_recommended": False, "video_recommendation_reason": "",
+    })
+    with patch("app.agents.jane_ads.creative._call_ad_copy_model", new=mock_call):
+        copy = _run(write_ad_copy(
+            "Test Biz", "bags", city="Lekki", service_area="Yaba",
+            brand_context={"target_audience": "creative professionals"},
+        ))
+    assert "yaba" in copy.primary_text.lower()
+    assert "lekki" not in copy.primary_text.lower()
+    assert "creative professionals" not in copy.primary_text.lower()
+
+
+def test_write_ad_copy_retries_once_on_leak_then_accepts_clean_retry():
+    leaking = {"headline": "Lekki creatives", "primary_text": "for creative professionals",
+              "image_prompt": "p", "video_recommended": False, "video_recommendation_reason": ""}
+    clean = {"headline": "Bags made to order", "primary_text": "Message us on WhatsApp.",
+            "image_prompt": "p", "video_recommended": False, "video_recommendation_reason": ""}
+    mock_call = AsyncMock(side_effect=[leaking, clean])
+    with patch("app.agents.jane_ads.creative._call_ad_copy_model", new=mock_call):
+        copy = _run(write_ad_copy(
+            "Test Biz", "bags", city="Lekki",
+            brand_context={"target_audience": "creative professionals"},
+        ))
+    assert mock_call.await_count == 2
+    assert copy.headline == "Bags made to order"
+    assert "lekki" not in copy.headline.lower()
+
+
+def test_write_ad_copy_strips_leak_if_retry_still_leaks_never_loops_again():
+    always_leaking = {"headline": "Lekki creative professionals", "primary_text": "shop now",
+                      "image_prompt": "p", "video_recommended": False, "video_recommendation_reason": ""}
+    mock_call = AsyncMock(return_value=always_leaking)
+    with patch("app.agents.jane_ads.creative._call_ad_copy_model", new=mock_call):
+        copy = _run(write_ad_copy(
+            "Test Biz", "bags", city="Lekki",
+            brand_context={"target_audience": "creative professionals"},
+        ))
+    assert mock_call.await_count == 2   # one original call + exactly one retry, never more
+    assert "lekki" not in copy.headline.lower()
+    assert "creative professionals" not in copy.headline.lower()
+
+
+def test_write_ad_copy_video_recommendation_parsed():
+    mock_call = AsyncMock(return_value={
+        "headline": "h", "primary_text": "p", "image_prompt": "p",
+        "video_recommended": True, "video_recommendation_reason": "movement sells this",
+    })
+    with patch("app.agents.jane_ads.creative._call_ad_copy_model", new=mock_call):
+        copy = _run(write_ad_copy("Zumba Studio", "fitness classes"))
+    assert copy.video_recommended is True
+    assert copy.video_recommendation_reason == "movement sells this"
+
+
+# ── write_ad_copy_for_image: same leakage/register treatment (upload/draft path) ─
+
+def test_write_ad_copy_for_image_never_leaks_and_parses_video_signal():
+    mock_call = AsyncMock(return_value={
+        "headline": "Fresh catering, Surulere style", "primary_text": "for young families",
+        "video_recommended": True, "video_recommendation_reason": "seeing the food plated sells it",
+    })
+    with patch("app.agents.jane_ads.creative._call_ad_copy_model", new=mock_call):
+        copy = _run(write_ad_copy_for_image(
+            "a table of Nigerian dishes", "Test Caterer", "catering",
+            city="Surulere", brand_context={"target_audience": "young families"},
+        ))
+    assert "surulere" not in copy.headline.lower()
+    assert "young families" not in copy.primary_text.lower()
+    assert copy.video_recommended is True
+    assert copy.video_recommendation_reason == "seeing the food plated sells it"
+
+
+def test_write_ad_copy_for_image_retries_once_on_leak():
+    leaking = {"headline": "Lekki creatives here", "primary_text": "shop now"}
+    clean = {"headline": "Handmade bags", "primary_text": "Message us on WhatsApp."}
+    mock_call = AsyncMock(side_effect=[leaking, clean])
+    with patch("app.agents.jane_ads.creative._call_ad_copy_model", new=mock_call):
+        copy = _run(write_ad_copy_for_image(
+            "a shelf of bags", "Test Biz", "bags", city="Lekki",
+            brand_context={"target_audience": "creative professionals"},
+        ))
+    assert mock_call.await_count == 2
+    assert copy.headline == "Handmade bags"
+
+
+# ── creative_from_recomposite (SOURCE 4, creative brief spec §7) ──────────────
+# Product truthfulness rule: the real product photo is preserved, only the scene
+# around it is regenerated — reuses ImageContentService's existing reference_image
+# pipeline, not a new image-generation capability.
+
+def test_creative_from_recomposite_passes_reference_image_through():
+    fake_engine_result = {"status": True, "responseData": {"image_url": "https://cdn.example.com/recomposited.png"}}
+    with patch(
+        "app.agents.social_media_manager.services.image_content_service.ImageContentService._generate_platform_image",
+        new=AsyncMock(return_value=fake_engine_result),
+    ) as mock_gen, patch(
+        "app.agents.jane_ads.creative.describe_ad_image", new=AsyncMock(return_value="a leather bag on a table"),
+    ), patch(
+        "app.agents.jane_ads.creative.write_ad_copy_for_image",
+        new=AsyncMock(return_value=AdCopy(headline="Handmade bags", primary_text="Message us on WhatsApp.")),
+    ):
+        creative = _run(creative_from_recomposite(
+            "Test Biz", "bags", "https://cdn.example.com/my-real-bag.png",
+        ))
+    assert mock_gen.await_args.kwargs["reference_image"] == "https://cdn.example.com/my-real-bag.png"
+    assert creative.source == CreativeSource.RECOMPOSITE
+    assert creative.asset_path == CreativeSource.RECOMPOSITE
+    assert creative.image_url == "https://cdn.example.com/recomposited.png"
+
+
+def test_creative_from_recomposite_falls_back_to_reference_image_on_generation_failure():
+    with patch(
+        "app.agents.social_media_manager.services.image_content_service.ImageContentService._generate_platform_image",
+        new=AsyncMock(return_value={"status": False, "error": "boom"}),
+    ), patch(
+        "app.agents.jane_ads.creative.describe_ad_image", new=AsyncMock(return_value=""),
+    ), patch(
+        "app.agents.jane_ads.creative.write_ad_copy",
+        new=AsyncMock(return_value=AdCopy(headline="Handmade bags", primary_text="Message us on WhatsApp.")),
+    ):
+        creative = _run(creative_from_recomposite(
+            "Test Biz", "bags", "https://cdn.example.com/my-real-bag.png",
+        ))
+    # Product truthfulness: never lose the real product photo, even if regeneration fails.
+    assert creative.image_url == "https://cdn.example.com/my-real-bag.png"
+
+
+# ── Attribute tagging (creative brief spec §11) — computed at assembly, pure ──
+
+def test_assemble_creative_shows_price_true_when_naira_sign_present():
+    copy = AdCopy(headline="Bags from ₦12,000", primary_text="Message us on WhatsApp.")
+    c = assemble_creative(copy, "https://cdn/ad.png")
+    assert c.shows_price is True
+
+
+def test_assemble_creative_shows_price_false_without_naira_sign():
+    copy = AdCopy(headline="Bags for less", primary_text="Message us on WhatsApp.")
+    c = assemble_creative(copy, "https://cdn/ad.png")
+    assert c.shows_price is False
+
+
+def test_assemble_creative_shows_service_area_true_when_present():
+    copy = AdCopy(headline="Handmade bags", primary_text="I deliver around Yaba — message me.")
+    c = assemble_creative(copy, "https://cdn/ad.png", service_area="Yaba")
+    assert c.shows_service_area is True
+
+
+def test_assemble_creative_shows_service_area_false_when_absent():
+    copy = AdCopy(headline="Handmade bags", primary_text="Message me on WhatsApp.")
+    c = assemble_creative(copy, "https://cdn/ad.png", service_area="Yaba")
+    assert c.shows_service_area is False
+
+
+def test_assemble_creative_copy_length_matches_combined_text():
+    copy = AdCopy(headline="Hi", primary_text="There")
+    c = assemble_creative(copy, "https://cdn/ad.png")
+    assert c.copy_length == len("Hi There")
+
+
+def test_assemble_creative_asset_path_mirrors_source():
+    c = assemble_creative(AdCopy(headline="h"), "https://cdn/ad.png", source=CreativeSource.RECOMPOSITE)
+    assert c.asset_path == CreativeSource.RECOMPOSITE

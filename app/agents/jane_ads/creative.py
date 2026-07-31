@@ -43,7 +43,7 @@ import openai
 
 from app.core.config import settings
 
-from .models import AdCopy, AdCreative, CreativeSource, ShootScript, ShootShot
+from .models import AdCopy, AdCreative, CreativeSource, GeoMode, GeoPlan, ShootScript, ShootShot
 
 WHATSAPP_CTA = "Send WhatsApp Message"
 
@@ -148,38 +148,107 @@ def _location_prompt_bit(city: str, category: str = "") -> str:
     )
 
 
-async def write_ad_copy(business_name: str, category: str, goal: str = "messages",
-                        description: str = "", brand_context: Optional[dict] = None,
-                        city: str = "", behaviour: str = "") -> AdCopy:
-    """Write a short headline, primary text, and an image prompt (used only for the
-    GENERATE source). Voice-matched to the brand playbook when a profile exists, and
-    visually grounded in the real city/area the campaign targets. Also does the
-    creative-type reasoning (PRD §4.1): flags when a video would clearly serve this
-    ad better than the photo we're about to generate — gpt-image-1 can't produce
-    one, so this is a heads-up for the caller to offer an upload, not a capability."""
-    if not settings.jane_ads_openai_key:
-        return AdCopy()
-    bc = brand_context or {}
-    brand_bits = _brand_prompt_bits(bc)
-    location_bit = _location_prompt_bit(city or bc.get("region", ""), category)
-    prompt = (
-        f"Write a Meta/Instagram ad for '{business_name or bc.get('brand_name') or 'a business'}' "
-        f"(a {category or 'local business'}) whose goal is {goal}. The ad drives people "
-        f"to message the business on WhatsApp.{(' ' + brand_bits) if brand_bits else ''}\n"
-        f"{location_bit}\n"
-        f"Context: {description or 'none'}\n"
-        f"How customers find this business: {behaviour or 'unknown'}.\n"
-        "Return JSON with:\n"
-        "- headline: punchy, <= 5 words, no ALL CAPS, no emoji spam\n"
-        "- primary_text: 1–2 warm, concrete sentences in the brand voice above if given "
-        "(no hype, no clickbait)\n"
-        "- image_prompt: a photorealistic scene for the creative image — real people/"
-        "products/workspace fitting the business, in the brand's colours/setting and the "
-        "LOCATION above. NO text anywhere in the image — no logos, no watermarks, no "
-        "storefront signage/shop signs with the business name, no readable words of any "
-        "kind (Meta adds the ad's headline and button separately; baked-in text is never "
-        "wanted here, including on buildings/signs in the background). Not an "
-        "illustration.\n"
+def service_area_from_geo(geo: Optional[GeoPlan], fallback_city: str = "") -> str:
+    """The one place a location legitimately belongs in ad COPY — never the raw
+    geo-target used for targeting/image-grounding. Confirmed live bug: a campaign
+    targeting Lekki, aimed at 'creative professionals', produced copy reading 'Lekki
+    creatives' — the targeting parameter and an internal audience label, both
+    written straight into the ad. `service_area` is the same place name in a
+    different, customer-facing role: 'I deliver around X', not 'ad for X people'.
+    Empty for NON_LOCAL (nothing to tell a customer — geography isn't how they'll
+    find or reach the business)."""
+    if geo is not None:
+        if geo.mode == GeoMode.NON_LOCAL:
+            return ""
+        if geo.pins:
+            return ", ".join(p.name for p in geo.pins[:3])
+        if geo.fallback_area:
+            return geo.fallback_area
+        if geo.city:
+            return geo.city
+    return fallback_city
+
+
+# Forbidden abstraction/hype words — Nigerian commerce copy is specific and
+# transactional; ungoverned, the model defaults to a Western DTC register that
+# identifies nothing and asks for nothing ("Elevate your everyday").
+_FORBIDDEN_COPY_WORDS = (
+    "premium", "quality", "unmatched", "world-class", "trusted partner", "solutions",
+    "elevate", "transform your", "unlock", "experience the difference",
+    "limited time", "hurry now", "discover the difference",
+)
+
+
+def _register_rules_block() -> str:
+    """Nigerian commerce register (creative brief spec §5) — specific and
+    transactional beats fluent and abstract, and it's also what performs under
+    retrieval-driven delivery, since specificity is what tells the platform who
+    the ad is for."""
+    return (
+        "REGISTER — write like a real Nigerian business owner texting a customer on "
+        "WhatsApp, not a brand:\n"
+        "- Name what it actually is (\"bags\", not \"accessories solutions\") — category "
+        "words matter.\n"
+        "- If a specific price or starting price is mentioned in the context below, "
+        "state it plainly (e.g. \"₦12,000\", never \"12k\"). If no price was given, do "
+        "NOT invent one.\n"
+        "- End with a direct ask — \"Message me to order\", not \"reach out today\" or "
+        "\"get in touch to learn more\".\n"
+        "- Never use: " + ", ".join(f'"{w}"' for w in _FORBIDDEN_COPY_WORDS) + ".\n"
+        "- No manufactured urgency for an evergreen offer. No emoji spam (one is fine, "
+        "three fire emoji reads as a flyer)."
+    )
+
+
+def _leakage_terms(geo_target: str, audience_segment: str, interest_category: str) -> list[str]:
+    """The exact values that must never appear verbatim in generated copy — they are
+    targeting parameters, not message content. The reader already matches them;
+    restating one to someone who matches it is always wasted, and concatenating a
+    geo-target with an audience label is the exact observed bug ('Lekki creatives')."""
+    return [t.strip() for t in (geo_target, audience_segment, interest_category) if t and t.strip()]
+
+
+def _check_leakage(headline: str, primary_text: str, forbidden_terms: list[str]) -> list[str]:
+    """Deterministic, cheap check — catches the whole class of leakage bugs without
+    trusting the model's own restraint. Case-insensitive substring match against the
+    combined copy; returns which specific terms leaked, if any."""
+    combined = f"{headline} {primary_text}".lower()
+    return [t for t in forbidden_terms if t.lower() in combined]
+
+
+def _strip_leaked_terms(text: str, leaked: list[str]) -> str:
+    """Last-resort correction if a regenerate still leaks (never ship it, never loop
+    silently) — remove the exact phrase and tidy up double spaces/punctuation."""
+    import re as _re
+    for term in leaked:
+        text = _re.sub(_re.escape(term), "", text, flags=_re.IGNORECASE)
+    return _re.sub(r"\s{2,}", " ", text).strip(" ,.-")
+
+
+def _zone_a_block(geo_target: str, audience_segment: str, interest_category: str, goal: str) -> str:
+    """Delivery context — labelled and passed so the model can write knowingly (e.g.
+    'near you' makes sense because the reader is nearby), but explicitly barred from
+    appearing in copy. Never omitted-by-silence: naming it AND prohibiting it beats
+    just not mentioning it, per the creative brief spec's own reasoning."""
+    bits = [f"the reader is already in/near {geo_target}" if geo_target else "",
+            f"the reader already matches this audience: {audience_segment}" if audience_segment else "",
+            f"the reader is already interested in: {interest_category}" if interest_category else ""]
+    bits = [b for b in bits if b]
+    if not bits:
+        return ""
+    return (
+        "DELIVERY CONTEXT (never write about this — the reader already matches it; "
+        f"restating it is always wasted): {'; '.join(bits)}. Campaign goal: {goal}.\n"
+    )
+
+
+def _video_fit_fields_block() -> str:
+    """Shared instructions for the video_recommended/video_recommendation_reason JSON
+    fields — used by every copy-writing prompt (GENERATE and the image-matched path
+    for upload/draft/recomposite) so the SHOULD-vs-CAN pushback (creative brief spec
+    §6.2/§9) has a real signal regardless of which asset path the user picked, not
+    just when Jane generated the image herself."""
+    return (
         "- video_recommended: boolean. Set true whenever the business is a movement/"
         "performance/demonstration activity (dance, fitness classes, sports, cooking-"
         "in-action, live music) or depends on personal trust in the founder (coaching, "
@@ -191,8 +260,13 @@ async def write_ad_copy(business_name: str, category: str, goal: str = "messages
         "store -> false. A phone repair shop -> false.\n"
         "- video_recommendation_reason: one short sentence why, ONLY if "
         "video_recommended is true; else empty string.\n"
-        "Return ONLY the JSON."
     )
+
+
+async def _call_ad_copy_model(prompt: str) -> Optional[dict]:
+    """Shared model call for write_ad_copy — extracted so the leakage-check retry
+    (§4 of the creative brief spec) can call it twice without duplicating the
+    request/parse boilerplate. Returns None on any failure (caller falls back)."""
     try:
         client = openai.AsyncOpenAI(api_key=settings.jane_ads_openai_key)
         resp = await client.chat.completions.create(
@@ -201,17 +275,100 @@ async def write_ad_copy(business_name: str, category: str, goal: str = "messages
             messages=[{"role": "user", "content": prompt}],
             timeout=15,
         )
-        d = json.loads(resp.choices[0].message.content or "{}")
-        return AdCopy(
-            headline=str(d.get("headline", "")).strip(),
-            primary_text=str(d.get("primary_text", "")).strip(),
-            image_prompt=str(d.get("image_prompt", "")).strip(),
-            video_recommended=bool(d.get("video_recommended")),
-            video_recommendation_reason=str(d.get("video_recommendation_reason", "")).strip(),
-        )
+        return json.loads(resp.choices[0].message.content or "{}")
     except Exception as e:
         print(f"[Creative] copy error: {e}", flush=True)
+        return None
+
+
+async def write_ad_copy(business_name: str, category: str, goal: str = "messages",
+                        description: str = "", brand_context: Optional[dict] = None,
+                        city: str = "", behaviour: str = "", service_area: str = "") -> AdCopy:
+    """Write a short headline, primary text, and an image prompt (used only for the
+    GENERATE source). Voice-matched to the brand playbook when a profile exists, and
+    visually grounded in the real city/area the campaign targets. Also does the
+    creative-type reasoning (PRD §4.1): flags when a video would clearly serve this
+    ad better than the photo we're about to generate — gpt-image-1 can't produce
+    one, so this is a heads-up for the caller to offer an upload, not a capability.
+
+    Two-zone brief (creative brief spec §2): DELIVERY CONTEXT (geo/audience — never
+    written) is kept separate from MESSAGE (what the ad actually says), backed by a
+    deterministic post-generation leakage check — live-confirmed bug: a campaign
+    targeting Lekki for 'creative professionals' produced copy reading 'Lekki
+    creatives', the targeting parameters written straight into the ad."""
+    if not settings.jane_ads_openai_key:
         return AdCopy()
+    bc = brand_context or {}
+    brand_bits = _brand_prompt_bits(bc)
+    geo_target = city or bc.get("region", "")
+    audience_segment = bc.get("target_audience", "")
+    location_bit = _location_prompt_bit(geo_target, category)
+    # NOTE: `category` is deliberately NOT passed as the Zone A interest-category term
+    # here — it's what the business SELLS (Zone B's "sells" line names it on purpose,
+    # per the register rule "name what it actually is"), not an ad-targeting interest
+    # label. Conflating the two would make the leak check strip the business's own
+    # product name out of otherwise-correct copy. No distinct interest_categories
+    # signal is computed yet (out of scope this pass — see plan §2), so this stays "".
+    zone_a = _zone_a_block(geo_target, audience_segment, "", goal)
+    zone_b = (
+        "MESSAGE (headline/primary_text come from THIS section only):\n"
+        f"- sells: {category or 'local business'}{(' — ' + description) if description else ''}\n"
+        "- who_its_for: phrase how the customer would recognise themselves (e.g. "
+        "\"if you run a small business...\") — never the audience label above\n"
+        + (f"- service_area (mention this, not the delivery-context location above): "
+           f"{service_area}\n" if service_area else "")
+        + "- the_action: message on WhatsApp\n"
+    )
+    prompt = (
+        f"Write a Meta/Instagram ad for '{business_name or bc.get('brand_name') or 'a business'}' "
+        f"(a {category or 'local business'}) whose goal is {goal}.{(' ' + brand_bits) if brand_bits else ''}\n"
+        f"{zone_a}{zone_b}"
+        f"{location_bit}\n"
+        f"Context: {description or 'none'}\n"
+        f"How customers find this business: {behaviour or 'unknown'}.\n"
+        f"{_register_rules_block()}\n"
+        "Return JSON with:\n"
+        "- headline: punchy, <= 5 words, no ALL CAPS, no emoji spam, from MESSAGE only\n"
+        "- primary_text: 1–2 sentences in the brand voice above if given, following "
+        "REGISTER, from MESSAGE only — never the DELIVERY CONTEXT above\n"
+        "- image_prompt: a photorealistic scene for the creative image — real people/"
+        "products/workspace fitting the business, in the brand's colours/setting and the "
+        "LOCATION above. NO text anywhere in the image — no logos, no watermarks, no "
+        "storefront signage/shop signs with the business name, no readable words of any "
+        "kind (Meta adds the ad's headline and button separately; baked-in text is never "
+        "wanted here, including on buildings/signs in the background). Not an "
+        "illustration.\n"
+        f"{_video_fit_fields_block()}"
+        "Return ONLY the JSON."
+    )
+    d = await _call_ad_copy_model(prompt)
+    if d is None:
+        return AdCopy()
+    copy = AdCopy(
+        headline=str(d.get("headline", "")).strip(),
+        primary_text=str(d.get("primary_text", "")).strip(),
+        image_prompt=str(d.get("image_prompt", "")).strip(),
+        video_recommended=bool(d.get("video_recommended")),
+        video_recommendation_reason=str(d.get("video_recommendation_reason", "")).strip(),
+    )
+    leak_terms = _leakage_terms(geo_target, audience_segment, "")
+    leaked = _check_leakage(copy.headline, copy.primary_text, leak_terms)
+    if leaked:
+        retry_prompt = (
+            prompt + f"\n\nCORRECTION: your last attempt wrote {leaked!r} directly into the "
+            "copy — that's DELIVERY CONTEXT, forbidden in the message. Rewrite headline and "
+            "primary_text without it."
+        )
+        d2 = await _call_ad_copy_model(retry_prompt)
+        if d2 is not None:
+            copy.headline = str(d2.get("headline", "")).strip() or copy.headline
+            copy.primary_text = str(d2.get("primary_text", "")).strip() or copy.primary_text
+        leaked = _check_leakage(copy.headline, copy.primary_text, leak_terms)
+        if leaked:
+            # Never ship a known leak and never loop silently — strip and move on.
+            copy.headline = _strip_leaked_terms(copy.headline, leaked)
+            copy.primary_text = _strip_leaked_terms(copy.primary_text, leaked)
+    return copy
 
 
 async def write_shoot_script(business_name: str, category: str, goal: str,
@@ -334,7 +491,7 @@ def _as_ad_content(image_prompt: str, brand_context: Optional[dict] = None) -> s
 
 
 async def generate_ad_image(content: str, brand_context: Optional[dict] = None,
-                            seed: str = "") -> Optional[str]:
+                            seed: str = "", reference_image: Optional[str] = None) -> Optional[str]:
     """Generate the ad image using the SAME content engine normal posts use
     (ImageContentService._generate_platform_image) — richer, on-brand visuals than a bare
     gpt-image-1 call, which is what the ad flow wanted (Jane's own images weren't good
@@ -343,7 +500,13 @@ async def generate_ad_image(content: str, brand_context: Optional[dict] = None,
 
     `content` is the theme/message the image should convey; `seed` is an optional scene
     hint. The engine may render brand text into the graphic (that's how organic content
-    looks) — the ad's headline/primary_text are still separate fields the platform overlays."""
+    looks) — the ad's headline/primary_text are still separate fields the platform overlays.
+
+    `reference_image` (creative brief spec §7.2, RECOMPOSITE path) — when given a real
+    product photo URL, the engine's existing background-removal → forensic product
+    analysis → preservation pipeline keeps the product exact and regenerates only the
+    scene around it. This is the SAME parameter/pipeline the organic content engine
+    already uses for its own recompositing; not new image-generation work, just reuse."""
     if not (content or "").strip():
         return None
     bc = brand_context or {}
@@ -354,6 +517,7 @@ async def generate_ad_image(content: str, brand_context: Optional[dict] = None,
             content=content,
             seed_content=seed or content,
             brand_context=bc,
+            reference_image=reference_image,
             image_type="story",
         )
         if not result.get("status"):
@@ -405,45 +569,80 @@ async def describe_ad_image(image_url: str) -> str:
 
 async def write_ad_copy_for_image(image_summary: str, business_name: str, category: str,
                                   goal: str = "messages", description: str = "",
-                                  brand_context: Optional[dict] = None) -> AdCopy:
+                                  brand_context: Optional[dict] = None, city: str = "",
+                                  service_area: str = "") -> AdCopy:
     """Write the headline + primary text to MATCH a specific image (its vision description),
     so the caption references what's actually on screen instead of a generic line. Returns
-    an AdCopy with only headline + primary_text set."""
+    an AdCopy with only headline + primary_text set.
+
+    Same two-zone/leakage-check treatment as write_ad_copy (creative brief spec §2-4) —
+    this path (upload/draft/recomposite) has the identical leakage risk since it also
+    has geo/audience context available."""
     if not settings.jane_ads_openai_key or not image_summary.strip():
         return AdCopy()
     bc = brand_context or {}
     brand_bits = _brand_prompt_bits(bc)
+    geo_target = city or bc.get("region", "")
+    audience_segment = bc.get("target_audience", "")
+    # NOTE: `category` is deliberately NOT passed as the Zone A interest-category term
+    # here — it's what the business SELLS (Zone B's "sells" line names it on purpose,
+    # per the register rule "name what it actually is"), not an ad-targeting interest
+    # label. Conflating the two would make the leak check strip the business's own
+    # product name out of otherwise-correct copy. No distinct interest_categories
+    # signal is computed yet (out of scope this pass — see plan §2), so this stays "".
+    zone_a = _zone_a_block(geo_target, audience_segment, "", goal)
+    zone_b = (
+        "MESSAGE (headline/primary_text come from THIS section only):\n"
+        f"- sells: {category or 'local business'}{(' — ' + description) if description else ''}\n"
+        "- who_its_for: phrase how the customer would recognise themselves — never the "
+        "audience label above\n"
+        + (f"- service_area (mention this, not the delivery-context location above): "
+           f"{service_area}\n" if service_area else "")
+        + "- the_action: message on WhatsApp\n"
+    )
     prompt = (
         f"Write the copy for a Meta/Instagram ad for "
         f"'{business_name or bc.get('brand_name') or 'a business'}' (a "
-        f"{category or 'local business'}) whose goal is {goal}. The ad drives people to "
-        f"message the business on WhatsApp.{(' ' + brand_bits) if brand_bits else ''}\n"
+        f"{category or 'local business'}) whose goal is {goal}.{(' ' + brand_bits) if brand_bits else ''}\n"
+        f"{zone_a}{zone_b}"
         f"The ad's IMAGE shows: {image_summary}.\n"
         f"Context: {description or 'none'}\n"
+        f"{_register_rules_block()}\n"
         "Write copy that clearly connects to what's in the image above — the headline and "
         "body should feel like they belong with that visual, not generic.\n"
         "Return JSON with:\n"
-        "- headline: punchy, <= 5 words, no ALL CAPS, no emoji spam\n"
-        "- primary_text: 1–2 warm, concrete sentences in the brand voice above if given, "
-        "referencing what the image shows\n"
+        "- headline: punchy, <= 5 words, no ALL CAPS, no emoji spam, from MESSAGE only\n"
+        "- primary_text: 1–2 sentences in the brand voice above if given, following "
+        "REGISTER, referencing what the image shows — from MESSAGE only, never the "
+        "DELIVERY CONTEXT above\n"
+        f"{_video_fit_fields_block()}"
         "Return ONLY the JSON."
     )
-    try:
-        client = openai.AsyncOpenAI(api_key=settings.jane_ads_openai_key)
-        resp = await client.chat.completions.create(
-            model="gpt-4o-mini",
-            response_format={"type": "json_object"},
-            messages=[{"role": "user", "content": prompt}],
-            timeout=15,
-        )
-        d = json.loads(resp.choices[0].message.content or "{}")
-        return AdCopy(
-            headline=str(d.get("headline", "")).strip(),
-            primary_text=str(d.get("primary_text", "")).strip(),
-        )
-    except Exception as e:
-        print(f"[Creative] image-matched copy error: {e}", flush=True)
+    d = await _call_ad_copy_model(prompt)
+    if d is None:
         return AdCopy()
+    copy = AdCopy(
+        headline=str(d.get("headline", "")).strip(),
+        primary_text=str(d.get("primary_text", "")).strip(),
+        video_recommended=bool(d.get("video_recommended")),
+        video_recommendation_reason=str(d.get("video_recommendation_reason", "")).strip(),
+    )
+    leak_terms = _leakage_terms(geo_target, audience_segment, "")
+    leaked = _check_leakage(copy.headline, copy.primary_text, leak_terms)
+    if leaked:
+        retry_prompt = (
+            prompt + f"\n\nCORRECTION: your last attempt wrote {leaked!r} directly into the "
+            "copy — that's DELIVERY CONTEXT, forbidden in the message. Rewrite without it."
+        )
+        d2 = await _call_ad_copy_model(retry_prompt)
+        if d2 is not None:
+            copy.headline = str(d2.get("headline", "")).strip() or copy.headline
+            copy.primary_text = str(d2.get("primary_text", "")).strip() or copy.primary_text
+        leaked = _check_leakage(copy.headline, copy.primary_text, leak_terms)
+        if leaked:
+            copy.headline = _strip_leaked_terms(copy.headline, leaked)
+            copy.primary_text = _strip_leaked_terms(copy.primary_text, leaked)
+    return copy
 
 
 # ── Source 3: DRAFT — reuse an existing content draft ─────────────────────────
@@ -504,25 +703,38 @@ def _looks_like_video(url: str) -> bool:
 
 def assemble_creative(copy: AdCopy, image_url: Optional[str],
                       source: CreativeSource = CreativeSource.GENERATE,
-                      is_video: Optional[bool] = None) -> AdCreative:
+                      is_video: Optional[bool] = None,
+                      service_area: str = "") -> AdCreative:
     """Combine copy + media into a submittable creative. The WhatsApp CTA is always
     attached; `generated` is False when there's no media (copy-only fallback).
     `is_video` should be passed explicitly when the caller already knows the media
     type (e.g. from the upload's content-type); otherwise it's guessed from the URL.
-    The video recommendation only ever applies to GENERATE — UPLOAD/DRAFT already
-    have a real media choice made, so there's nothing to recommend."""
+    The video recommendation applies to ANY source whose media isn't already a video
+    (creative brief spec §6.2/§9 pushback reconciliation) — a static upload/draft/
+    recomposite that Jane judges would clearly work better as video gets the same
+    heads-up as GENERATE, since the SHOULD (video would serve better) vs CAN (the
+    user brought a photo) tension applies just as much there.
+
+    Attribute tagging (creative brief spec §11) computed here, cheaply, from the
+    final copy — never model-generated, so it's trustworthy for later analysis."""
     url = image_url or ""
+    resolved_is_video = is_video if is_video is not None else _looks_like_video(url)
+    combined = f"{copy.headline} {copy.primary_text}"
     return AdCreative(
         image_url=url,
-        is_video=is_video if is_video is not None else _looks_like_video(url),
+        is_video=resolved_is_video,
         headline=copy.headline,
         primary_text=copy.primary_text,
         cta=WHATSAPP_CTA,
         source=source,
         generated=bool(url),
         video_recommendation=copy.video_recommendation_reason if (
-            source == CreativeSource.GENERATE and copy.video_recommended
+            copy.video_recommended and not resolved_is_video
         ) else "",
+        asset_path=source,
+        shows_price="₦" in combined,
+        shows_service_area=bool(service_area) and service_area.lower() in combined.lower(),
+        copy_length=len(combined),
     )
 
 
@@ -531,18 +743,21 @@ def assemble_creative(copy: AdCopy, image_url: Optional[str],
 async def generate_ad_creative(
     business_name: str, category: str, goal: str = "messages", description: str = "",
     user_id: str = "", db=None, brand_id: Optional[str] = None, city: str = "",
-    behaviour: str = "",
+    behaviour: str = "", service_area: str = "",
 ) -> AdCreative:
     """SOURCE 1 (default) — Jane writes the copy and generates the image herself,
     using the brand playbook's colours/voice/region/industry, grounded in `city` (the
     campaign's geo target, e.g. from the decision engine's geo pins) so the scene
     reflects the real place, not a generic global look. `behaviour` (search/discover/
     mixed, from the decision engine) informs the creative-type reasoning (PRD §4.1) —
-    see write_ad_copy. For "use my own photo", see SOURCE 2 (creative_from_upload) —
-    a distinct source, not a reference nudge on generation. Never raises — falls back
-    to copy-only if image generation fails."""
+    see write_ad_copy. `service_area` (creative brief spec §4, from service_area_from_geo)
+    is the ONLY location string allowed to reach the copy itself — `city` stays targeting
+    context. For "use my own photo", see SOURCE 2 (creative_from_upload) — a distinct
+    source, not a reference nudge on generation. Never raises — falls back to copy-only
+    if image generation fails."""
     brand_context = await get_brand_context(user_id, db, brand_id) if user_id else {}
-    copy = await write_ad_copy(business_name, category, goal, description, brand_context, city, behaviour)
+    copy = await write_ad_copy(business_name, category, goal, description, brand_context,
+                               city, behaviour, service_area)
     # Image via the SAME content engine normal posts use (better visuals). Seed it with the
     # scene idea; content conveys the theme/message so the graphic is on-topic.
     content_for_image = copy.primary_text or copy.image_prompt or f"{business_name} — {description or category}"
@@ -553,37 +768,45 @@ async def generate_ad_creative(
     if image_url:
         summary = await describe_ad_image(image_url)
         if summary:
-            matched = await write_ad_copy_for_image(summary, business_name, category, goal, description, brand_context)
+            matched = await write_ad_copy_for_image(
+                summary, business_name, category, goal, description, brand_context, city, service_area,
+            )
             if matched.headline:
                 copy.headline = matched.headline
             if matched.primary_text:
                 copy.primary_text = matched.primary_text
-    return assemble_creative(copy, image_url, source=CreativeSource.GENERATE)
+    return assemble_creative(copy, image_url, source=CreativeSource.GENERATE, service_area=service_area)
 
 
 async def creative_from_upload(
     business_name: str, category: str, image_url: str, goal: str = "messages",
     description: str = "", user_id: str = "", db=None, brand_id: Optional[str] = None,
-    is_video: Optional[bool] = None,
+    is_video: Optional[bool] = None, city: str = "", service_area: str = "",
 ) -> AdCreative:
     """SOURCE 2 — the user's own uploaded photo OR video (uploaded via
     /jane-ads/creative/upload, or the existing /upload-user-content flow) becomes
     the creative directly; Jane still writes fresh copy to match it. No location
-    grounding needed — the media IS the real place already."""
+    grounding needed for the IMAGE — the media IS the real place already — but the
+    copy still needs `service_area`/`city` for the same leakage-check treatment as
+    every other path."""
     brand_context = await get_brand_context(user_id, db, brand_id) if user_id else {}
     # Caption matched to what the uploaded photo actually shows (skip for video — no still
     # to describe), so the copy references the real visual.
     summary = "" if is_video else await describe_ad_image(image_url)
     if summary:
-        copy = await write_ad_copy_for_image(summary, business_name, category, goal, description, brand_context)
+        copy = await write_ad_copy_for_image(
+            summary, business_name, category, goal, description, brand_context, city, service_area,
+        )
     else:
-        copy = await write_ad_copy(business_name, category, goal, description, brand_context)
-    return assemble_creative(copy, image_url, source=CreativeSource.UPLOAD, is_video=is_video)
+        copy = await write_ad_copy(business_name, category, goal, description, brand_context, city,
+                                   service_area=service_area)
+    return assemble_creative(copy, image_url, source=CreativeSource.UPLOAD, is_video=is_video,
+                             service_area=service_area)
 
 
 async def creative_from_draft(
     business_name: str, category: str, draft_id: str, user_id: str, db,
-    goal: str = "messages", brand_id: Optional[str] = None,
+    goal: str = "messages", brand_id: Optional[str] = None, city: str = "", service_area: str = "",
 ) -> Optional[AdCreative]:
     """SOURCE 3 — reuse a content draft the user already generated and liked.
     Returns None if the draft can't be found (caller should 404)."""
@@ -594,5 +817,37 @@ async def creative_from_draft(
     # Caption matched to what the chosen draft image shows, falling back to the draft's
     # own text if the vision pass fails.
     summary = await describe_ad_image(draft["image_url"]) or draft["content"]
-    copy = await write_ad_copy_for_image(summary, business_name, category, goal, draft["content"], brand_context)
-    return assemble_creative(copy, draft["image_url"], source=CreativeSource.DRAFT)
+    copy = await write_ad_copy_for_image(
+        summary, business_name, category, goal, draft["content"], brand_context, city, service_area,
+    )
+    return assemble_creative(copy, draft["image_url"], source=CreativeSource.DRAFT, service_area=service_area)
+
+
+async def creative_from_recomposite(
+    business_name: str, category: str, reference_image_url: str, goal: str = "messages",
+    description: str = "", user_id: str = "", db=None, brand_id: Optional[str] = None,
+    city: str = "", service_area: str = "",
+) -> AdCreative:
+    """SOURCE 4 — the user's own real product photo, recomposited: background
+    cleaned/replaced, the product itself preserved exactly (creative brief spec §7,
+    product truthfulness rule — a physical good the customer will receive is never
+    regenerated from text). Reuses the SAME pipeline the organic content engine
+    already has for this (`ImageContentService._generate_platform_image` with a
+    `reference_image` — background removal → forensic product analysis →
+    preservation block, confirmed already built and battle-tested); this is new
+    wiring, not a new image-generation capability."""
+    brand_context = await get_brand_context(user_id, db, brand_id) if user_id else {}
+    content_for_image = f"{business_name or category} — {description or category}"
+    image_url = await generate_ad_image(
+        content_for_image, brand_context, seed=description, reference_image=reference_image_url,
+    )
+    final_image = image_url or reference_image_url
+    summary = await describe_ad_image(final_image)
+    if summary:
+        copy = await write_ad_copy_for_image(
+            summary, business_name, category, goal, description, brand_context, city, service_area,
+        )
+    else:
+        copy = await write_ad_copy(business_name, category, goal, description, brand_context, city,
+                                   service_area=service_area)
+    return assemble_creative(copy, final_image, source=CreativeSource.RECOMPOSITE, service_area=service_area)
