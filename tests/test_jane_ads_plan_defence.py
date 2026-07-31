@@ -187,6 +187,21 @@ def test_what_if_narrative_reflects_real_duration_change():
     assert "days" in result.narrative
 
 
+def test_what_if_carries_the_leads_estimate_through_using_the_real_price():
+    # Live-caught bug: plan_campaign() never sets estimated_conversations itself (that's
+    # derived separately in router.py from a real per-business price-per-result), so
+    # without reusing that price here, every what-if silently lost the leads estimate
+    # ('n/a') — exactly the number the spec calls the highest-value part of a budget
+    # what-if. The original summary's cost_per_result_ngn carries that real price.
+    plan = _plan()
+    req = _req(budget_ngn=20_000)
+    summary = build_campaign_summary(plan, req, price_per_result_ngn=500.0)
+    result = what_if(plan, req, budget_ngn=10_000, summary=summary)
+    assert result.hypothetical.estimates.estimated_leads == 20   # 10,000 / 500
+    assert "20" in result.narrative
+    assert "n/a" not in result.narrative
+
+
 def test_what_if_raises_with_janes_own_reason_when_budget_is_unworkable():
     plan = _plan()
     req = _req()
