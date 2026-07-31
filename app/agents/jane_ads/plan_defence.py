@@ -193,15 +193,28 @@ def what_if(
     model-estimated difference (Plan Defence spec §4). Purely a read-side comparison;
     never touches the stored plan. Raises ValueError with Jane's own honest reason
     when the hypothetical budget doesn't clear a platform floor at all — that IS the
-    answer, not something to paper over."""
+    answer, not something to paper over.
+
+    plan_campaign() itself never sets estimated_conversations — router.py's
+    _build_campaign_plan derives it separately from a real per-business
+    price-per-result and threads it into build_campaign_summary(). Live-tested
+    (2026-07): without redoing that here, every what-if silently lost the leads
+    estimate ('n/a') — exactly the number the spec calls out as the highest-value
+    part of a budget what-if. The original summary's cost_per_result_ngn IS that
+    real price (see summary.py — always either the true price or back-derived from
+    it), so it's reused here rather than re-deriving it from scratch."""
     hypothetical_req = req.model_copy(update={"budget_ngn": budget_ngn})
     result = plan_campaign(hypothetical_req, plan.per_business_cap_ngn, plan.account_cap_ngn)
     if result.decision != PlanDecision.PLAN or result.plan is None:
         reason = result.advice.reason if result.advice else "That budget doesn't clear a platform minimum."
         raise ValueError(reason)
     hypothetical_plan = result.plan
-    hyp_summary = build_campaign_summary(hypothetical_plan, hypothetical_req)
     orig_summary = summary or build_campaign_summary(plan, req)
+    price_per_result_ngn = orig_summary.estimates.cost_per_result_ngn
+    if price_per_result_ngn:
+        hypothetical_plan.estimated_conversations = max(1, round(budget_ngn / price_per_result_ngn))
+    hyp_summary = build_campaign_summary(hypothetical_plan, hypothetical_req,
+                                         price_per_result_ngn=price_per_result_ngn)
     narrative = _diff_narrative(orig_summary, hyp_summary, req.budget_ngn, budget_ngn)
     return WhatIfResult(
         changed=f"budget_ngn: {req.budget_ngn:,.0f} -> {budget_ngn:,.0f}",
