@@ -8,6 +8,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.database import connect_to_mongo, connect_to_sdk_gateway_db
 from app.core.config import settings
+from app.middleware.sdk_cors import SdkCorsMiddleware
 from app.core.sentry_config import initialize_sentry
 from app.agents.social_media_manager.routers.complete_social_manager import router as social_media_router
 from app.agents.social_media_manager.routers.whatsapp_router import router as whatsapp_router
@@ -159,6 +160,15 @@ app.add_middleware(
     allow_headers=["*"],
     max_age=3600,
 )
+
+# The SDK's public, API-key-authenticated surface (/social-media, /agency,
+# /api/v1) needs to be callable from arbitrary third-party developer
+# origins the allowlist above can't enumerate — see sdk_cors.py. Registered
+# after CORSMiddleware so it wraps outside it (Starlette's add_middleware
+# makes the most-recently-added middleware outermost), letting it either
+# short-circuit the preflight itself or add its own header only when the
+# strict middleware above didn't already authorize the origin.
+app.add_middleware(SdkCorsMiddleware)
 
 # Respect X-Forwarded-For / X-Forwarded-Proto when behind a proxy/load-balancer.
 # Import inside a try/except so static analyzers or environments without the
