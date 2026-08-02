@@ -13,6 +13,7 @@ from typing import Optional, List, Dict
 from datetime import datetime, timedelta
 from bson import ObjectId
 from motor.motor_asyncio import AsyncIOMotorDatabase
+from pymongo import ReturnDocument
 from app.database import get_db
 from app.domain.models.billing_models import (
     UserCreditWallet,
@@ -225,10 +226,11 @@ class CreditService:
         user_id: str,
         campaign_id: str,
         reason: str = "campaign_generation",
-        retry_count: int = 0
+        retry_count: int = 0,
+        amount: int = 1  # NEW: Support deducting multiple credits (video editing bills 4/8/12+ per job)
     ) -> bool:
         """
-        Deduct 1 credit from user balance
+        Deduct N credits from user balance (default 1)
         PRD 7.2: Deduction Logic
         PRD 11: Must log all credit usage events
 
@@ -238,62 +240,103 @@ class CreditService:
 
         This ensures subscription credits are used before expiry.
 
-        Users without wallet are blocked (must have trial or subscription)
+        Legacy users (without wallet) are not deducted - backward compatibility
+
+        Args:
+            amount: Number of credits to deduct (default=1)
 
         Returns:
             bool: True if deduction successful, False if insufficient credits
         """
-        wallet = await self.get_user_wallet(user_id)
-
-        if not wallet:
-            # No wallet = never subscribed = blocked
-            return False
-
-        if wallet.credits_remaining < 1:
-            return False
-
-        # Get current credit breakdown
-        current_bonus = getattr(wallet, 'bonus_credits', 0)
-        current_subscription = getattr(wallet, 'subscription_credits', 0)
-        balance_before = wallet.credits_remaining
-
-        # Deduct from subscription first (use before expiry), then bonus (never expires)
-        if current_subscription > 0:
-            # Deduct from subscription credits first (use before monthly reset)
-            new_subscription = current_subscription - 1
-            new_bonus = current_bonus
-        else:
-            # Deduct from bonus credits (only when subscription is depleted)
-            new_subscription = 0
-            new_bonus = current_bonus - 1
-
-        # Calculate new totals
-        new_total = new_bonus + new_subscription
-        new_credits_used = wallet.credits_used + 1
-        new_credits_remaining = new_total
-
-        # Update wallet
-        await self.user_credits_collection.update_one(
-            {"user_id": user_id},
-            {
-                "$set": {
-                    "bonus_credits": new_bonus,
-                    "subscription_credits": new_subscription,
-                    "total_credits": new_total,
-                    "credits_used": new_credits_used,
-                    "credits_remaining": new_credits_remaining,
-                    "updated_at": datetime.utcnow()
-                }
-            }
+        # Cheap existence check only — decides the legacy-bypass branch. The
+        # actual balance guard below is atomic, so this read can go stale
+        # without opening a double-spend window.
+        wallet_exists = await self.user_credits_collection.find_one(
+            {"user_id": user_id}, {"_id": 1}
         )
+        if not wallet_exists:
+            # Legacy user from before billing system - skip deduction
+            return True
+
+        # Deduct from subscription first (use before expiry), then bonus
+        # (never expires). Guarded by $expr in the filter and computed via an
+        # update pipeline so the check-and-decrement is a single atomic
+        # operation — two concurrent requests can no longer both read the
+        # same balance and both succeed (the old read -> compute -> $set
+        # pattern allowed exactly that).
+        # Legacy documents may predate these fields entirely (the old code
+        # read them via getattr(wallet, field, 0)) — $ifNull keeps the
+        # pipeline equivalent to that default for any doc missing a field.
+        sub_credits = {"$ifNull": ["$subscription_credits", 0]}
+        bonus_credits = {"$ifNull": ["$bonus_credits", 0]}
+        credits_used = {"$ifNull": ["$credits_used", 0]}
+
+        updated = await self.user_credits_collection.find_one_and_update(
+            {
+                "user_id": user_id,
+                "$expr": {
+                    "$gte": [
+                        {"$add": [sub_credits, bonus_credits]},
+                        amount,
+                    ]
+                },
+            },
+            [
+                {
+                    "$set": {
+                        "_deduct_from_subscription": {
+                            "$min": [sub_credits, amount]
+                        }
+                    }
+                },
+                {
+                    "$set": {
+                        "subscription_credits": {
+                            "$subtract": [
+                                sub_credits,
+                                "$_deduct_from_subscription",
+                            ]
+                        },
+                        "bonus_credits": {
+                            "$subtract": [
+                                bonus_credits,
+                                {"$subtract": [amount, "$_deduct_from_subscription"]},
+                            ]
+                        },
+                        "credits_used": {"$add": [credits_used, amount]},
+                    }
+                },
+                {
+                    "$set": {
+                        "total_credits": {
+                            "$add": ["$subscription_credits", "$bonus_credits"]
+                        },
+                        "credits_remaining": {
+                            "$add": ["$subscription_credits", "$bonus_credits"]
+                        },
+                        "updated_at": datetime.utcnow(),
+                    }
+                },
+                {"$unset": "_deduct_from_subscription"},
+            ],
+            return_document=ReturnDocument.AFTER,
+        )
+
+        if not updated:
+            # Either the wallet vanished between the two reads, or the
+            # balance guard failed — both mean "insufficient credits" now.
+            return False
+
+        balance_after = updated["credits_remaining"]
+        balance_before = balance_after + amount
 
         # PRD 11: Log all credit usage events
         transaction = CreditTransaction(
             user_id=user_id,
             type="deduction",
-            amount=-1,
+            amount=-amount,  # Log actual amount deducted
             balance_before=balance_before,
-            balance_after=new_credits_remaining,
+            balance_after=balance_after,
             reason=reason,
             campaign_id=campaign_id,
             retry_count=retry_count,
@@ -440,39 +483,72 @@ class CreditService:
         self,
         user_id: str,
         campaign_id: str,
-        reason: str = "refund"
+        reason: str = "refund",
+        amount: int = 1,
     ) -> bool:
         """
-        Refund 1 credit to user (for failed campaigns, etc.)
+        Refund credits to user's wallet (for failed campaigns, etc.)
         PRD Section 2 allows for refunds in transaction types
-        """
-        wallet = await self.get_user_wallet(user_id)
 
-        if not wallet:
+        Refunded credits are added back as bonus_credits (never expire) —
+        the same pool add_bonus_credits uses. A deduction may have consumed
+        from either subscription_credits or bonus_credits and per-transaction
+        provenance isn't tracked, so bonus is the only pool that's always
+        safe to credit back regardless of where it originally came from.
+
+        Previously this only decremented credits_used and wrote a computed
+        credits_remaining — but get_user_wallet() always recomputes
+        credits_remaining fresh as bonus_credits + subscription_credits,
+        ignoring credits_used entirely, so that write was silently discarded
+        on the next read. The user's actual spendable balance never went up.
+        Atomic (single find_one_and_update), matching deduct_credit()'s
+        pattern, so a concurrent refund/deduction can't read a stale amount.
+        """
+        updated = await self.user_credits_collection.find_one_and_update(
+            {"user_id": user_id},
+            [
+                {
+                    "$set": {
+                        "bonus_credits": {
+                            "$add": [{"$ifNull": ["$bonus_credits", 0]}, amount]
+                        },
+                        "credits_used": {
+                            "$max": [
+                                {"$subtract": [{"$ifNull": ["$credits_used", 0]}, amount]},
+                                0,
+                            ]
+                        },
+                    }
+                },
+                {
+                    "$set": {
+                        "total_credits": {
+                            "$add": [{"$ifNull": ["$subscription_credits", 0]}, "$bonus_credits"]
+                        },
+                        "credits_remaining": {
+                            "$add": [{"$ifNull": ["$subscription_credits", 0]}, "$bonus_credits"]
+                        },
+                        "updated_at": datetime.utcnow(),
+                    }
+                },
+            ],
+            return_document=ReturnDocument.AFTER,
+        )
+
+        if not updated:
+            # No wallet for this user — never subscribed, nothing to refund into.
             return False
 
-        balance_before = wallet.credits_remaining
-        new_credits_used = max(0, wallet.credits_used - 1)
-        new_credits_remaining = wallet.total_credits - new_credits_used
-
-        await self.user_credits_collection.update_one(
-            {"user_id": user_id},
-            {
-                "$set": {
-                    "credits_used": new_credits_used,
-                    "credits_remaining": new_credits_remaining,
-                    "updated_at": datetime.utcnow()
-                }
-            }
-        )
+        balance_after = updated["credits_remaining"]
+        balance_before = balance_after - amount
 
         # Log refund transaction
         transaction = CreditTransaction(
             user_id=user_id,
             type="refund",
-            amount=1,
+            amount=amount,
             balance_before=balance_before,
-            balance_after=new_credits_remaining,
+            balance_after=balance_after,
             reason=reason,
             campaign_id=campaign_id,
             created_at=datetime.utcnow()
