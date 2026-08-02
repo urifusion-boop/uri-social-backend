@@ -455,3 +455,67 @@ class InstagramDirectService:
                     continue
                 return {"success": False, "error": f"Instagram story publish failed: {err.get('message', str(publish_data))}"}
             return {"success": False, "error": "Instagram story container was not ready after 60s. Try again."}
+
+    @staticmethod
+    async def publish_reel(
+        ig_user_id: str,
+        page_access_token: str,
+        video_url: str,
+        caption: str = "",
+        page_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Publish a Reel to Instagram via Graph API.
+
+        Steps:
+          1. POST /{ig_user_id}/media with media_type=REELS and video_url.
+          2. Wait 30s for Instagram to ingest the video.
+          3. Retry media_publish up to 6x (subcode 2207027 = not ready yet).
+        """
+        import asyncio as _asyncio
+
+        if not video_url:
+            return {"success": False, "error": "Instagram Reels require a video URL."}
+        if not video_url.startswith("https://"):
+            return {"success": False, "error": f"Reel video_url must be a public HTTPS URL (got: {video_url[:80]})."}
+
+        async with httpx.AsyncClient(timeout=60) as client:
+            container_resp = await client.post(
+                f"{GRAPH_BASE}/{ig_user_id}/media",
+                params={
+                    "media_type": "REELS",
+                    "video_url": video_url,
+                    "caption": caption,
+                    "share_to_feed": "true",
+                    "access_token": page_access_token,
+                },
+            )
+            container_data = container_resp.json()
+            creation_id = container_data.get("id")
+            if not creation_id:
+                error_msg = (container_data.get("error") or {}).get("message", str(container_data))
+                print(f"❌ Instagram reel container failed: {container_data}")
+                return {"success": False, "error": f"Reel container error: {error_msg}"}
+
+            print(f"⏳ Reel container {creation_id} created — waiting 30s for Instagram to ingest video...")
+            await _asyncio.sleep(30)
+
+            for attempt in range(6):
+                publish_resp = await client.post(
+                    f"{GRAPH_BASE}/{ig_user_id}/media_publish",
+                    params={"creation_id": creation_id, "access_token": page_access_token},
+                )
+                publish_data = publish_resp.json()
+                post_id = publish_data.get("id")
+                if post_id:
+                    print(f"✅ Instagram reel publish success: post_id={post_id} (attempt {attempt + 1})")
+                    return {"success": True, "post_id": post_id, "raw_response": publish_data}
+                err = publish_data.get("error") or {}
+                print(f"⚠️ Reel publish attempt {attempt + 1} failed: {publish_data}")
+                if err.get("error_subcode") == 2207027 or "2207027" in str(publish_data):
+                    wait = 15 * (attempt + 1)
+                    print(f"⏳ Reel not ready — retrying in {wait}s")
+                    await _asyncio.sleep(wait)
+                    continue
+                return {"success": False, "error": f"Instagram reel publish failed: {err.get('message', str(publish_data))}"}
+            return {"success": False, "error": "Instagram reel video was not ready after retries. Try again."}
