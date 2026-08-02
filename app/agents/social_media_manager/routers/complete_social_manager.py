@@ -7412,7 +7412,8 @@ async def adjust_produce_video(
 @router.post("/multi-clip/start")
 async def multi_clip_start(
     background_tasks: BackgroundTasks,
-    clips: List[UploadFile] = File(...),
+    clips: Optional[List[UploadFile]] = File(None),
+    source_url: Optional[str] = Form(None),
     story_type: str = Form("founder"),
     target_duration: int = Form(30),
     orientation: str = Form("9:16"),
@@ -7424,7 +7425,10 @@ async def multi_clip_start(
 ):
     """
     Start a multi-clip composition job.
-    Upload 2–10 video clips; system transcribes each, suggests order, then stitches.
+    Upload 2–10 video clips, or pass source_url to re-ingest an already-hosted
+    video (e.g. re-running this pipeline on a previously stitched output —
+    fetched server-side so the browser never has to fetch a third-party host
+    itself and trip the CSP). System transcribes each, suggests order, then stitches.
     story_type: founder | product
     music_volume: Shotstack track volume 0.0-0.30 (0.06=quiet, 0.12=medium, 0.25=loud)
     Poll GET /multi-clip/job/{job_id} for status.
@@ -7436,18 +7440,29 @@ async def multi_clip_start(
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    if len(clips) < 1:
-        raise HTTPException(status_code=400, detail="At least 1 clip is required")
-    if len(clips) > 10:
-        raise HTTPException(status_code=400, detail="Maximum 10 clips allowed")
-
     # Read all clip bytes upfront before the background task starts
     clips_data: List[tuple] = []
-    for clip in clips:
-        raw = await clip.read()
+    if source_url:
+        import httpx
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.get(source_url)
+            resp.raise_for_status()
+        raw = resp.content
         if len(raw) < 1000:
-            raise HTTPException(status_code=400, detail=f"Clip '{clip.filename}' appears invalid or empty")
-        clips_data.append((clip.filename or "clip.mp4", raw))
+            raise HTTPException(status_code=400, detail="Fetched source_url appears invalid or empty")
+        filename = source_url.rsplit("/", 1)[-1].split("?")[0] or "clip.mp4"
+        clips_data.append((filename, raw))
+    else:
+        clips = clips or []
+        if len(clips) < 1:
+            raise HTTPException(status_code=400, detail="At least 1 clip is required")
+        if len(clips) > 10:
+            raise HTTPException(status_code=400, detail="Maximum 10 clips allowed")
+        for clip in clips:
+            raw = await clip.read()
+            if len(raw) < 1000:
+                raise HTTPException(status_code=400, detail=f"Clip '{clip.filename}' appears invalid or empty")
+            clips_data.append((clip.filename or "clip.mp4", raw))
 
     job_id = str(_uuid.uuid4())
     now = datetime.utcnow().isoformat()
@@ -7893,6 +7908,147 @@ async def approve_product_script(
     return UriResponse.get_single_data_response(
         "approve_script", {"job_id": job_id, "status": "analyzing"}
     )
+
+
+@router.post("/fix-fractional-credits")
+async def fix_fractional_credits(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    auth: dict = Depends(flexible_auth),
+):
+    """
+    ADMIN ENDPOINT: Fix fractional credits in database.
+    Rounds all fractional credit values to integers.
+
+    Bulk-rewrites every wallet and credit_transactions record — gated behind
+    the same billing-admin allowlist as PATCH /video-editing/pricing (see
+    _is_billing_admin above). The version this was ported from had no auth
+    check at all despite the "ADMIN ENDPOINT" label.
+    """
+    if not _is_billing_admin(auth):
+        raise HTTPException(status_code=403, detail="Not authorized to run this operation.")
+    try:
+        # First, check for fractional values
+        sample_wallet = await db.user_credits.find_one({})
+        print(f"📊 Sample wallet before fix: {sample_wallet}")
+
+        # Count wallets with fractional values
+        fractional_count = await db.user_credits.count_documents({
+            "$or": [
+                {"subscription_credits": {"$type": "double"}},
+                {"bonus_credits": {"$type": "double"}},
+                {"credits_remaining": {"$type": "double"}}
+            ]
+        })
+        print(f"📊 Found {fractional_count} wallets with fractional (double) values")
+
+        # Fix user_credits collection
+        result = await db.user_credits.update_many(
+            {},
+            [
+                {"$set": {
+                    "subscription_credits": {"$toInt": {"$round": "$subscription_credits"}},
+                    "bonus_credits": {"$toInt": {"$round": "$bonus_credits"}},
+                    "total_credits": {"$toInt": {"$round": "$total_credits"}},
+                    "credits_used": {"$toInt": {"$round": "$credits_used"}},
+                    "credits_remaining": {"$toInt": {"$round": "$credits_remaining"}}
+                }}
+            ]
+        )
+        wallets_fixed = result.modified_count
+        print(f"✅ Modified {wallets_fixed} wallets")
+
+        # Fix credit_transactions collection
+        tx_result = await db.credit_transactions.update_many(
+            {},
+            [
+                {"$set": {
+                    "amount": {"$toInt": {"$round": "$amount"}},
+                    "balance_before": {"$toInt": {"$round": "$balance_before"}},
+                    "balance_after": {"$toInt": {"$round": "$balance_after"}}
+                }}
+            ]
+        )
+        transactions_fixed = tx_result.modified_count
+
+        return UriResponse.get_single_data_response(
+            "fix_fractional_credits",
+            {
+                "wallets_fixed": wallets_fixed,
+                "transactions_fixed": transactions_fixed
+            },
+            f"Fixed {wallets_fixed} wallets and {transactions_fixed} transactions"
+        )
+    except Exception as e:
+        print(f"❌ fix_fractional_credits error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Submagic Video Production ─────────────────────────────────────────────────
+
+async def _mix_music_into_video(video_url: str, music_url: str) -> Optional[str]:
+    """Download Submagic output + Cloudinary music, mix with ffmpeg, upload result to Cloudinary."""
+    import tempfile
+    import asyncio as _asyncio
+    import os as _os
+    import uuid as _uuid
+    import httpx as _httpx
+    from app.agents.social_media_manager.services.video_production_service import _upload_to_cloudinary
+
+    try:
+        async with _httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
+            video_resp = await client.get(video_url)
+            music_resp = await client.get(music_url)
+
+        if video_resp.status_code != 200:
+            print(f"[SubmagicMusic] video download failed {video_resp.status_code}", flush=True)
+            return None
+        if music_resp.status_code != 200:
+            print(f"[SubmagicMusic] music download failed {music_resp.status_code}", flush=True)
+            return None
+
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as vf:
+            vf.write(video_resp.content)
+            video_tmp = vf.name
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as mf:
+            mf.write(music_resp.content)
+            music_tmp = mf.name
+
+        output_path = f"/tmp/submagic-mixed-{_uuid.uuid4().hex[:8]}.mp4"
+
+        proc = await _asyncio.create_subprocess_exec(
+            "ffmpeg", "-y",
+            "-i", video_tmp,
+            "-stream_loop", "-1", "-i", music_tmp,
+            "-filter_complex", "[0:a]volume=2.0[va];[1:a]volume=0.3[ma];[va][ma]amix=inputs=2:duration=first[a]",
+            "-map", "0:v", "-map", "[a]",
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+            "-shortest",
+            output_path,
+            stdout=_asyncio.subprocess.DEVNULL,
+            stderr=_asyncio.subprocess.PIPE,
+        )
+        _, stderr = await _asyncio.wait_for(proc.communicate(), timeout=300)
+
+        if proc.returncode != 0:
+            print(f"[SubmagicMusic] ffmpeg failed: {stderr.decode()[-500:]}", flush=True)
+            for p in [video_tmp, music_tmp, output_path]:
+                try: _os.unlink(p)
+                except: pass
+            return None
+
+        with open(output_path, "rb") as f:
+            mixed_bytes = f.read()
+
+        for p in [video_tmp, music_tmp, output_path]:
+            try: _os.unlink(p)
+            except: pass
+
+        public_id = f"submagic-mixed-{_uuid.uuid4().hex[:12]}"
+        return await _upload_to_cloudinary(mixed_bytes, public_id)
+
+    except Exception as e:
+        print(f"[SubmagicMusic] error: {e}", flush=True)
+        return None
 
 
 @router.post("/submagic-produce")
