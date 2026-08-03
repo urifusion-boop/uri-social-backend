@@ -24,6 +24,7 @@ NotificationType = Literal[
     "trial_ending",        # Trial ending soon (24h before)
     "trial_expired",       # Trial ended
     "payment_success",     # Payment completed successfully
+    "connection_disconnected",  # A social connection was revoked on the provider's side
 ]
 
 NotificationChannel = Literal["email", "whatsapp"]
