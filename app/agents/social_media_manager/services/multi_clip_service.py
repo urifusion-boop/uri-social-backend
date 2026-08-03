@@ -953,7 +953,7 @@ async def _refine_silence_cuts(
 
 
 async def _detect_transcript_repetitions(
-    all_srt: List[Dict],
+    clip_entries: List[Dict],
     total_duration: float,
 ) -> List[Dict]:
     """
@@ -964,30 +964,44 @@ async def _detect_transcript_repetitions(
     - Paraphrased repeats (same idea, different words) below the Jaccard threshold
     - False starts / mid-thought restarts ('Actually let me rephrase...')
 
+    Clip boundaries are shown to the model so it can tell a within-clip false start
+    (aggressive — the same take restarting itself) from a cross-clip repeat (separate
+    uploads that may just cover related but distinct material — see rule 2 below).
+
     Returns cuts in global timeline coordinates, fails open (returns []) on any error.
     """
     import json as _json
     from openai import AsyncOpenAI
 
+    all_srt = [entry for clip in clip_entries for entry in clip.get("srt_lines", [])]
     if not all_srt:
         return []
 
-    transcript_lines = "\n".join(
-        f"[{e['start']:.1f}s–{e['end']:.1f}s] {e['text']}"
-        for e in all_srt
-    )
+    clip_blocks: List[str] = []
+    for i, e in enumerate(clip_entries):
+        if not e.get("srt_lines"):
+            continue
+        lines = "\n".join(f"[{sl['start']:.1f}s–{sl['end']:.1f}s] {sl['text']}" for sl in e["srt_lines"])
+        clip_blocks.append(f"Clip {i + 1} ({e['start']:.1f}s–{e['end']:.1f}s):\n{lines}")
+    transcript_text = "\n\n".join(clip_blocks)
+
     prompt = (
-        f"You are editing a {total_duration:.0f}s talking-head video. "
-        f"Your ONLY job: find every place the speaker repeats themselves — "
+        f"You are editing a {total_duration:.0f}s video stitched together from {len(clip_entries)} separately "
+        f"uploaded clips. Your ONLY job: find genuine repetition to remove — "
         f"either exact repetitions or paraphrased repetitions (same idea said again), "
-        f"and false starts where they stop mid-sentence and restart it.\n\n"
-        f"TRANSCRIPT:\n{transcript_lines}\n\n"
+        f"and false starts where the speaker stops mid-sentence and restarts it.\n\n"
+        f"TRANSCRIPT (grouped by clip):\n{transcript_text}\n\n"
         f"Rules:\n"
-        f"1. For repeated content, cut the SECOND occurrence — keep the first.\n"
-        f"2. For a false start, cut from where the speaker trails off to where they cleanly restart.\n"
-        f"3. Use the EXACT [Xs–Ys] timestamps shown — do not invent timestamps.\n"
-        f"4. Only cut if you are confident it is truly repeated or is a restart.\n"
-        f"5. Minimum cut: 0.5s. Do not cut anything that would leave a segment under 1.5s.\n\n"
+        f"1. WITHIN the same clip: if the speaker repeats a sentence or restarts mid-thought, "
+        f"cut the earlier/incomplete occurrence and keep the clean one.\n"
+        f"2. ACROSS different clips: these are separate uploads that may cover different material — "
+        f"do NOT cut just because two clips discuss a similar topic or make a similar point. Only cut a "
+        f"cross-clip repeat when the wording is near-identical (essentially the same sentence verbatim), "
+        f"and never cut most or all of one clip just because another clip covers similar ground.\n"
+        f"3. For a false start, cut from where the speaker trails off to where they cleanly restart.\n"
+        f"4. Use the EXACT [Xs–Ys] timestamps shown — do not invent timestamps.\n"
+        f"5. Only cut if you are confident it is truly repeated or is a restart — when unsure, don't cut.\n"
+        f"6. Minimum cut: 0.5s. Do not cut anything that would leave a segment under 1.5s.\n\n"
         f"Return ONLY valid JSON:\n"
         f'{{"cuts":[{{"at":<float>,"end":<float>,"reason":"repeated: <brief description>"}}]}}'
     )
@@ -1106,7 +1120,7 @@ async def _run_ai_analysis(clips_ordered: List[Dict], story_type: str) -> Dict:
     # ── Layer 1.6: dedicated transcript repetition pass ───────────────────────
     # Works on the full merged transcript — catches paraphrased repeats and
     # cross-clip repetitions that the per-entry Jaccard layer misses.
-    repeat_cuts = await _detect_transcript_repetitions(all_srt_global, total_duration)
+    repeat_cuts = await _detect_transcript_repetitions(clip_entries, total_duration)
 
     # ── Layer 2: GPT content analysis with timestamped transcript ─────────────
     # Build a per-clip block showing every SRT line with its exact timestamps.
@@ -1190,11 +1204,20 @@ async def _run_ai_analysis(clips_ordered: List[Dict], story_type: str) -> Dict:
     # ── Merge and deduplicate ─────────────────────────────────────────────────
     all_cuts = timing_cuts + repeat_cuts + gpt_cuts
     merged = _merge_cuts(all_cuts)
+    total_cut = sum(c["end"] - c["at"] for c in merged)
+    cut_pct = (total_cut / total_duration * 100) if total_duration > 0 else 0.0
     print(
         f"[MultiClip/analyze] timing={len(timing_cuts)} repeat_pass={len(repeat_cuts)} "
-        f"gpt={len(gpt_cuts)} merged={len(merged)} zooms={len(gpt_zooms)}",
+        f"gpt={len(gpt_cuts)} merged={len(merged)} zooms={len(gpt_zooms)} "
+        f"total_cut={total_cut:.1f}s/{total_duration:.1f}s ({cut_pct:.0f}%)",
         flush=True,
     )
+    if cut_pct > 50:
+        print(
+            f"[MultiClip/analyze] ⚠️ removing {cut_pct:.0f}% of total duration — unusually aggressive, "
+            f"check repeat_pass/gpt cuts above for false positives",
+            flush=True,
+        )
     return {"cuts": merged, "zooms": gpt_zooms, "transition_style": transition_style, "summary": summary}
 
 
@@ -1255,7 +1278,8 @@ def _build_founder_timeline(
     # ── Track: video clips ─────────────────────────────────────────────────────
     # Each clip is expanded into keep-segments after applying ai_cuts within it.
     video_clips: List[Dict] = []
-    global_cursor = 0.0
+    global_cursor = 0.0     # OUTPUT-timeline cursor (post-cut, post-trim) — used for Shotstack "start"
+    original_cursor = 0.0   # ORIGINAL-timeline cursor (untrimmed, uncut) — ai_cuts are expressed in this basis
     seg_index = 0          # counts all output segments for alternating slide direction
     cut_ranges: List[tuple] = []   # global (start, end) ranges removed — used for caption filtering
 
@@ -1267,14 +1291,19 @@ def _build_founder_timeline(
         position = clip.get("subject_position", "center")
         has_zoom = clip_idx in zoom_clip_indices
         clip_global_start = global_cursor
+        clip_original_start = original_cursor
 
-        # Collect ai_cuts that overlap with this clip's trimmed window
+        # Collect ai_cuts that overlap with this clip's trimmed window. ai_cuts are
+        # computed by _run_ai_analysis against the ORIGINAL untrimmed per-clip offsets
+        # (same basis as the zoom-moment mapping above), not the shrinking output
+        # timeline — so map against clip_original_start, then shift into the
+        # center-cropped 0..new_dur coordinate space that keep_parts below assumes.
         clip_local_cuts: List[tuple] = []
         for cut in (ai_cuts or []):
             cut_at = float(cut.get("at", 0))
             cut_end = float(cut.get("end", 0))
-            local_at = cut_at - clip_global_start
-            local_end = cut_end - clip_global_start
+            local_at = cut_at - clip_original_start - center_trim
+            local_end = cut_end - clip_original_start - center_trim
             if local_end > 0 and local_at < new_dur:
                 clip_local_cuts.append((max(0.0, local_at), min(new_dur, local_end)))
         clip_local_cuts.sort(key=lambda x: x[0])
@@ -1359,6 +1388,8 @@ def _build_founder_timeline(
             video_clips.append(clip_entry)
             global_cursor = round(global_cursor + seg_len, 3)
             seg_index += 1
+
+        original_cursor += orig_dur
 
     total_duration = global_cursor
     tracks.append({"clips": video_clips})
