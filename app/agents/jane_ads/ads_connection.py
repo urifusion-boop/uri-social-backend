@@ -171,6 +171,21 @@ async def resolve_ads_page_for_launch(
     conversation only to hit a wall (Per-Brand Page Connection plan §3).
     `require_whatsapp=False` for a campaign goal that never uses it (e.g. followers) —
     `whatsapp_number` in the returned dict may then be empty."""
+    # TEMPORARY (2026-08-03) — restores the shared-Page fallback used before
+    # per-brand Meta connections existed (commit a643c71 removed it). Lets
+    # conversation testing proceed on staging accounts with no real per-brand Meta
+    # OAuth connection, using the real shared METAADS_PAGE_ID (still set in the
+    # staging environment though dropped from Settings) plus this brand's own
+    # stored WhatsApp number (GET/PUT /jane-ads/whatsapp — independent of the Meta
+    # connection). MUST be reverted before this reaches prod.
+    import os
+    if os.getenv("ENV", "").lower() != "production":
+        shared_page_id = os.getenv("META_ADS_PAGE_ID", "")
+        if shared_page_id:
+            from .whatsapp import get_brand_whatsapp
+            wa_number = await get_brand_whatsapp(db, brand_id) if require_whatsapp else ""
+            return {"page_id": shared_page_id, "whatsapp_number": wa_number, "page_name": "URI Social (shared, temp)"}
+
     state, ads = await resolve_connection_state(db, user_id, brand_id, require_whatsapp=require_whatsapp)
     if state != ConnectionState.READY:
         raise AdsConnectionRequired(state, (ads or {}).get("account_name", ""))
