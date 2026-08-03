@@ -1683,6 +1683,54 @@ class ApprovalWorkflowService:
                 return {"success": success, "post_id": post_id, "outstand_status": post_status, "raw_response": result}
             except Exception as e:
                 print(f"❌ Outstand publish exception: {e}")
+                from app.agents.social_media_manager.services.outstand_service import OutstandPublishError
+
+                # "No social accounts found matching the provided account
+                # identifiers" is Outstand's signature for "this connection
+                # no longer exists on our side" — confirmed live against
+                # Outstand's own list_accounts API for several affected
+                # users: it was always revoked on Outstand's/the platform's
+                # side, never a transient error. Without this, the
+                # connection stays connection_status="active" forever and
+                # every future publish just fails silently again — up to 16
+                # times for one user before this was caught.
+                if (
+                    isinstance(e, OutstandPublishError)
+                    and "no social accounts found" in e.message.lower()
+                    and db is not None
+                ):
+                    user_id = connection.get("user_id")
+                    try:
+                        await db["social_connections"].update_one(
+                            {
+                                "user_id": user_id,
+                                # Match on whatever platform value is actually
+                                # stored for this connection — the Outstand
+                                # sync path stores the network name (e.g.
+                                # "x" for twitter), which can differ from
+                                # this function's own `platform` parameter.
+                                "platform": connection.get("platform", platform),
+                                "outstand_account_id": connection.get("outstand_account_id"),
+                            },
+                            {"$set": {"connection_status": "disconnected", "updated_at": datetime.utcnow()}},
+                        )
+                        print(f"⚠️ Marked {platform} connection disconnected for user_id={user_id} (Outstand no longer recognizes it)")
+                    except Exception as mark_err:
+                        print(f"⚠️ Failed to mark connection disconnected: {mark_err}")
+
+                    if user_id:
+                        try:
+                            from app.services.NotificationService import notification_service
+                            await notification_service.notify_connection_disconnected(
+                                user_id=user_id, platform=platform
+                            )
+                        except Exception as notify_err:
+                            print(f"⚠️ connection_disconnected notification failed: {notify_err}")
+
+                    return {
+                        "success": False,
+                        "error": f"Your {platform} connection is no longer valid. Please reconnect your account.",
+                    }
                 return {"success": False, "error": f"Outstand publish failed: {str(e)}"}
 
         # ── Legacy direct Facebook connection ─────────────────────────────────

@@ -392,6 +392,59 @@ class NotificationService:
             error="Email delivery failed" if not success else None,
         )
 
+    # ==================== Connection Disconnected ====================
+
+    async def notify_connection_disconnected(
+        self,
+        user_id: str,
+        platform: str = "",
+    ):
+        """
+        Sent when a publish attempt reveals the provider (Outstand) no
+        longer recognizes the connection — e.g. Outstand's own error "No
+        social accounts found matching the provided account identifiers",
+        which means the connection was revoked on the provider's side, not
+        something detectable ahead of time. Rate-limited/deduped the same
+        way as the other notify_* methods; the corresponding
+        social_connections doc gets connection_status="disconnected" set by
+        the caller so the dashboard can also show a reconnect prompt.
+        """
+        user = await self._get_user(user_id)
+        if not user or user.get("notification_opt_out"):
+            return
+
+        if not await self._check_rate_limit(user_id):
+            return
+
+        if await self._was_recently_sent(user_id, "connection_disconnected", hours=24):
+            return
+
+        app_url = settings.WEB_APP_URL or "https://app.urisocial.com"
+        user_name = user.get("first_name") or user.get("email", "").split("@")[0]
+
+        subject = f"Your {platform.capitalize()} connection needs attention"
+        success = await email_service.send_email(
+            to_email=user["email"],
+            subject=subject,
+            template_name="connection_disconnected",
+            template_vars={
+                "user_name": user_name,
+                "platform": platform,
+                "app_url": app_url,
+                "year": str(datetime.utcnow().year),
+            },
+        )
+
+        await self._log_notification(
+            user_id=user_id,
+            notification_type="connection_disconnected",
+            channel="email",
+            subject=subject,
+            status="sent" if success else "failed",
+            metadata={"platform": platform},
+            error="Email delivery failed" if not success else None,
+        )
+
     # ==================== PRD 4.4: Daily Suggestion ====================
 
     async def notify_daily_suggestion(
