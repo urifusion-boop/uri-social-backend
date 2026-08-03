@@ -28,12 +28,15 @@ CONNECTIONS = "social_connections"
 # Every "facebook_ads" connection was granted this same fixed set, so a connection's mere
 # existence implies the request was made for all of them — live-verified via
 # GET /me/permissions, not just assumed, since Meta's dialog can grant a subset.
+#
+# TEMPORARY (2026-08-03) — "ads_management" dropped so a staging connection that's
+# missing just that one scope doesn't get flagged EXPIRED, unblocking conversation
+# testing. MUST be restored before this reaches prod.
 REQUIRED_ADS_SCOPES = {
     "pages_show_list",
     "pages_read_engagement",
     "pages_manage_metadata",
     "business_management",
-    "ads_management",
     "pages_manage_ads",
 }
 
