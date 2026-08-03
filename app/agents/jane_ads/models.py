@@ -210,6 +210,44 @@ class PlanResult(BaseModel):
     advice: Optional[PlanAdvice] = None
 
 
+# ── Multi-Plan Audience Variants (plan-variants spec v1.0.0) ──────────────────
+# A candidate STRATEGY — a different buyer, trigger, place, and usually message —
+# produced after strategy extraction and BEFORE the platform/budget decision
+# (decision_engine.plan_campaign runs once PER selected variant, not once overall).
+# Deliberately NOT a CampaignPlan: nothing here has a platform/budget/geo-pin
+# decision yet, only the audience hypothesis a client picks from.
+
+class PlanVariant(BaseModel):
+    rank: int                          # 1 = best; also the display order
+    recommended: bool = False          # exactly one variant should carry this
+    who_its_for: str                   # customer's OWN words — Zone B material, e.g.
+                                        # "people fitting out a new place" — NEVER the
+                                        # segment label (spec §4.3)
+    audience_segment: str              # the underlying targeting label — Zone A, never
+                                        # written into copy (e.g. "homeowners 30-55")
+    geo_pockets: list[str] = Field(default_factory=list)  # named areas — Zone A,
+                                        # "suggestions to confirm" not hard commitments
+    trigger: str                       # the buying-moment hypothesis, not a description
+                                        # of the audience — e.g. "solar gets bought at the
+                                        # moment someone is setting up a new place"
+    why_this_could_work: str           # plain-language reasoning tying trigger to money
+    trade_off: str                     # MANDATORY (spec §4.4) — every plan has one
+    needs_video: bool = False          # creative feasibility signal (spec §4.3 "creative")
+    budget_alone_ngn: float = 0.0      # what this plan would cost run alone
+    budget_shared_ngn: Optional[float] = None  # what it would cost split with one other
+
+
+class PlanVariantSet(BaseModel):
+    """The full ranked set Jane presents, plus the computed (never generated)
+    selection rule for this budget (spec §6.1)."""
+    variants: list[PlanVariant]
+    recommendation_reason: str = ""    # argued, not asserted (spec §3) — why the
+                                        # recommended variant beats the others
+    max_selectable: int = 1
+    selection_rule_reason: str = ""    # e.g. "at ₦12,000 I'd pick just one — split it
+                                        # and neither gets enough to work properly"
+
+
 # ── Ad creative (split-doc 1.6) ───────────────────────────────────────────────
 
 class AdCopy(BaseModel):
