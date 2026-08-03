@@ -31,6 +31,7 @@ from .models import (
     CreativeKind,
     Goal,
     PlanDecision,
+    PlanVariant,
     Platform,
     PurchaseBehaviour,
 )
@@ -936,6 +937,19 @@ class MetaLaunchFromMessageBody(BaseModel):
                                           # early-return (upload/draft/recomposite that Jane
                                           # judges would do better as video) and chose to
                                           # proceed anyway — skips the pushback on resubmit
+    selected_plan_variant: Optional[dict] = None  # Multi-Plan Audience Variants (spec
+                                          # v1.0.0) — the client resends the EXACT
+                                          # PlanVariant dict it was shown in the
+                                          # choose_plan_variant stage, so this build uses
+                                          # that specific audience rather than the one
+                                          # Jane would've picked silently. None → present
+                                          # the ranked options instead of proceeding.
+    variant_group_id: str = ""           # ties multiple builds together when the client
+                                          # picked more than one variant (one call per
+                                          # selected variant, spec §7 "one creative per
+                                          # plan") — set by the server on the first
+                                          # choose_plan_variant response, echoed back on
+                                          # each follow-up selection call
 
 
 class _PlanBuildResult(BaseModel):
@@ -955,6 +969,13 @@ class _PlanBuildResult(BaseModel):
     summary: Optional[dict] = None            # Tier C — the structured "Jane Campaign Summary"
                                               # (each choice + its why, plus reach/click estimates)
     thread_id: str = ""                       # Tier E — the campaign thread this belongs to
+    variant_group_id: str = ""                # Multi-Plan Audience Variants — ties this
+                                              # build to sibling builds from the same
+                                              # variant-choice session, if any (spec §7)
+    selected_plan_variant: Optional[dict] = None  # the PlanVariant this build actually
+                                              # used, if any — surfaced back to the
+                                              # client so the plan card can show which
+                                              # audience it's for
 
 
 async def _build_campaign_plan(
@@ -1086,6 +1107,40 @@ async def _build_campaign_plan(
                 "page_name": e.page_name,
             }}
 
+    # 1.7. Multi-Plan Audience Variants (spec v1.0.0) — most businesses have more than
+    # one viable audience, and the client knows their customers better than Jane's
+    # reasoning does. Present up to five ranked, genuinely-distinct strategies with an
+    # argued recommendation, rather than silently picking one — the client picks one
+    # (or, budget permitting, more), and THAT audience's own segment/geo/trigger drive
+    # the rest of this build. Best-effort: an outage here never blocks planning, it
+    # just falls back to today's silent-pick behaviour.
+    selected_variant: Optional[PlanVariant] = None
+    if body.selected_plan_variant is not None:
+        try:
+            selected_variant = PlanVariant.model_validate(body.selected_plan_variant)
+        except Exception as e:
+            print(f"[oneshot] selected_plan_variant malformed, ignoring: {e}", flush=True)
+    if selected_variant is None:
+        try:
+            from .plan_variants import generate_plan_variants, PlanVariantsUnavailableError
+            variant_set = await generate_plan_variants(
+                parsed, business_name=req.business_name, description=req.description,
+            )
+        except Exception as e:
+            variant_set = None
+            print(f"[oneshot] plan variants skipped: {e}", flush=True)
+        if variant_set and len(variant_set.variants) > 1:
+            import uuid as _uuid
+            return {"early_return": {
+                "stage": "choose_plan_variant",
+                "understood": parsed.model_dump(),
+                "plan_variants": variant_set.model_dump(),
+                "variant_group_id": body.variant_group_id or f"vgrp_{_uuid.uuid4().hex[:16]}",
+            }}
+        # Only ever 0 or 1 genuinely distinct audience exists — nothing to choose
+        # between, so fall straight through with Jane's own single read (unchanged
+        # today's behaviour) rather than showing a pointless one-card "choice".
+
     # 2. Jane decides the platform + budget split, with her reasoning.
     result = plan_campaign(req, funded_amount_ngn=req.budget_ngn, total_funded_wallets_ngn=req.budget_ngn)
     if result.decision == PlanDecision.ADVISE:
@@ -1141,12 +1196,22 @@ async def _build_campaign_plan(
     # watering-hole/mixed/non-local, and which named pockets), validated by real
     # geocoding; fall back to the legacy heuristic if the consultant didn't set one
     # (e.g. no city given at all). Best-effort — never blocks planning.
+    #
+    # A selected audience-plan variant carries its OWN named pockets (spec §8:
+    # plan.geo_pockets → brief ZONE A) — a different audience within the same city
+    # can legitimately mean different areas (e.g. developers near active
+    # construction sites vs. homeowners in new estates). Override the consultant's
+    # areas with the variant's when one was selected; the geo MODE (own_radius/
+    # watering_hole/mixed) is still Jane's own read, not something a variant changes.
+    geo_areas = parsed.geo_areas
+    if selected_variant and selected_variant.geo_pockets:
+        geo_areas = [{"name": name, "reason": selected_variant.trigger} for name in selected_variant.geo_pockets]
     geo_dump = None
     try:
         if parsed.geo_mode:
             from .geo import geo_plan_from_named_areas
             geo_plan = await geo_plan_from_named_areas(
-                parsed.geo_mode, parsed.city, parsed.geo_areas, parsed.geo_explanation,
+                parsed.geo_mode, parsed.city, geo_areas, parsed.geo_explanation,
             )
             if geo_plan is not None:   # None for non_local — no geography to attach
                 plan.geo = geo_plan
@@ -1187,23 +1252,32 @@ async def _build_campaign_plan(
             "explanation": plan.explanation,
         }}
 
+    # A selected audience-plan variant's own phrasing drives Zone A/B here (spec §8)
+    # instead of the brand's generic target_audience — empty when no variant was
+    # selected, which is a no-op fallback to today's existing behaviour.
+    variant_segment = selected_variant.audience_segment if selected_variant else ""
+    variant_who_its_for = selected_variant.who_its_for if selected_variant else ""
+
     if body.creative_source == "upload":
         creative = await creative_from_upload(
             business_name, category, body.reference_image_url, req.goal.value, req.description,
             user_id=user_id, db=db, brand_id=brand_id, is_video=body.is_video,
             city=parsed.city, service_area=service_area,
+            audience_segment=variant_segment, who_its_for=variant_who_its_for,
         )
     elif body.creative_source == "recomposite":
         creative = await creative_from_recomposite(
             business_name, category, body.reference_image_url, req.goal.value, req.description,
             user_id=user_id, db=db, brand_id=brand_id,
             city=parsed.city, service_area=service_area,
+            audience_segment=variant_segment, who_its_for=variant_who_its_for,
         )
     elif body.creative_source == "draft":
         creative = await creative_from_draft(
             business_name, category, body.draft_id, user_id, db,
             goal=req.goal.value, brand_id=brand_id,
             city=parsed.city, service_area=service_area,
+            audience_segment=variant_segment, who_its_for=variant_who_its_for,
         )
         if creative is None:
             raise HTTPException(status_code=404, detail="Draft not found or has no image")
@@ -1215,6 +1289,7 @@ async def _build_campaign_plan(
             business_name, category, body.reuse_image_url, req.goal.value, req.description,
             user_id=user_id, db=db, brand_id=brand_id, is_video=False,
             city=parsed.city, service_area=service_area,
+            audience_segment=variant_segment, who_its_for=variant_who_its_for,
         )
     else:
         # AI generation is the one creative path that costs a content credit — an
@@ -1230,6 +1305,7 @@ async def _build_campaign_plan(
             business_name, category, req.goal.value, req.description,
             user_id=user_id, db=db, brand_id=brand_id, city=parsed.city,
             behaviour=plan.behaviour.value, service_area=service_area,
+            audience_segment=variant_segment, who_its_for=variant_who_its_for,
         )
         if creative.image_url:
             # "reason" is a strict Literal on CreditTransaction — "campaign_generation"
@@ -1342,6 +1418,8 @@ async def _build_campaign_plan(
         business_id=business_id, req=req, plan=plan, jane_platforms=jane_platforms,
         forced_to_meta=forced_to_meta, geo_dump=geo_dump, understood=parsed.model_dump(),
         budget_estimate=budget_estimate, summary=summary_dump, thread_id=body.thread_id,
+        variant_group_id=body.variant_group_id,
+        selected_plan_variant=selected_variant.model_dump() if selected_variant else None,
     )
 
 
@@ -1400,6 +1478,11 @@ def _plan_response_dict(built: _PlanBuildResult) -> dict:
         "whatsapp_number": plan.whatsapp_number,
         # Tier C — the structured, explained summary (each choice + its why + estimates).
         "summary": built.summary,
+        # Multi-Plan Audience Variants — which audience this specific build used, and
+        # the group tag linking it to any sibling builds from the same variant choice
+        # (spec §7 — one creative per selected plan, shown/launched as a set).
+        "variant_group_id": built.variant_group_id,
+        "selected_plan_variant": built.selected_plan_variant,
     }
 
 
@@ -1531,6 +1614,8 @@ async def meta_plan_from_message(
         "budget_estimate": built.budget_estimate,
         "summary": built.summary,
         "thread_id": built.thread_id,
+        "variant_group_id": built.variant_group_id,
+        "selected_plan_variant": built.selected_plan_variant,
         "status": "pending",
         "created_at": now,
         "expires_at": now + timedelta(days=7),

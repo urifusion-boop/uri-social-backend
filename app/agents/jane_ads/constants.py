@@ -66,3 +66,13 @@ VAT_RATE: float = 0.075
 # FULL  → test audiences AND creative.
 AB_LIGHT_TEST_NGN: float = 10_000.0
 AB_FULL_TEST_NGN: float = 20_000.0
+
+# ── Plan-variant selection tiers (Multi-Plan Audience Variants spec §6.1) ────
+# How many DIFFERENT AUDIENCE STRATEGIES a client can run at once — a distinct
+# question from the A/B tiers above (those govern creative/audience testing
+# WITHIN one platform's ad set; these govern how many separate ad sets, each a
+# different audience with its own creative brief, the total budget can support
+# without starving any of them below USEFUL_MIN_NGN).
+PLAN_VARIANT_TIER_2_NGN: float = 15_000.0    # below this: one plan only
+PLAN_VARIANT_TIER_3_NGN: float = 50_000.0    # at/above: two or three selectable
+PLAN_VARIANT_TIER_4_NGN: float = 250_000.0   # at/above: multiple, with proper structure
