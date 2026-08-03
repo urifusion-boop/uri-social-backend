@@ -283,7 +283,8 @@ async def _call_ad_copy_model(prompt: str) -> Optional[dict]:
 
 async def write_ad_copy(business_name: str, category: str, goal: str = "messages",
                         description: str = "", brand_context: Optional[dict] = None,
-                        city: str = "", behaviour: str = "", service_area: str = "") -> AdCopy:
+                        city: str = "", behaviour: str = "", service_area: str = "",
+                        audience_segment: str = "", who_its_for: str = "") -> AdCopy:
     """Write a short headline, primary text, and an image prompt (used only for the
     GENERATE source). Voice-matched to the brand playbook when a profile exists, and
     visually grounded in the real city/area the campaign targets. Also does the
@@ -295,13 +296,18 @@ async def write_ad_copy(business_name: str, category: str, goal: str = "messages
     written) is kept separate from MESSAGE (what the ad actually says), backed by a
     deterministic post-generation leakage check — live-confirmed bug: a campaign
     targeting Lekki for 'creative professionals' produced copy reading 'Lekki
-    creatives', the targeting parameters written straight into the ad."""
+    creatives', the targeting parameters written straight into the ad.
+
+    `audience_segment`/`who_its_for` (Multi-Plan Audience Variants spec §8): when a
+    client selected a specific audience-plan variant, its own segment/phrasing
+    override the brand-level default below — a plan named 'people fitting out a new
+    place' must drive Zone B here, not the brand's generic target_audience."""
     if not settings.jane_ads_openai_key:
         return AdCopy()
     bc = brand_context or {}
     brand_bits = _brand_prompt_bits(bc)
     geo_target = city or bc.get("region", "")
-    audience_segment = bc.get("target_audience", "")
+    audience_segment = audience_segment or bc.get("target_audience", "")
     location_bit = _location_prompt_bit(geo_target, category)
     # NOTE: `category` is deliberately NOT passed as the Zone A interest-category term
     # here — it's what the business SELLS (Zone B's "sells" line names it on purpose,
@@ -313,8 +319,10 @@ async def write_ad_copy(business_name: str, category: str, goal: str = "messages
     zone_b = (
         "MESSAGE (headline/primary_text come from THIS section only):\n"
         f"- sells: {category or 'local business'}{(' — ' + description) if description else ''}\n"
-        "- who_its_for: phrase how the customer would recognise themselves (e.g. "
-        "\"if you run a small business...\") — never the audience label above\n"
+        + (f"- who_its_for (phrase it exactly like this, in the customer's own words): "
+           f"{who_its_for}\n" if who_its_for else
+           "- who_its_for: phrase how the customer would recognise themselves (e.g. "
+           "\"if you run a small business...\") — never the audience label above\n")
         + (f"- service_area (mention this, not the delivery-context location above): "
            f"{service_area}\n" if service_area else "")
         + "- the_action: message on WhatsApp\n"
@@ -570,20 +578,22 @@ async def describe_ad_image(image_url: str) -> str:
 async def write_ad_copy_for_image(image_summary: str, business_name: str, category: str,
                                   goal: str = "messages", description: str = "",
                                   brand_context: Optional[dict] = None, city: str = "",
-                                  service_area: str = "") -> AdCopy:
+                                  service_area: str = "", audience_segment: str = "",
+                                  who_its_for: str = "") -> AdCopy:
     """Write the headline + primary text to MATCH a specific image (its vision description),
     so the caption references what's actually on screen instead of a generic line. Returns
     an AdCopy with only headline + primary_text set.
 
     Same two-zone/leakage-check treatment as write_ad_copy (creative brief spec §2-4) —
     this path (upload/draft/recomposite) has the identical leakage risk since it also
-    has geo/audience context available."""
+    has geo/audience context available. `audience_segment`/`who_its_for` — see
+    write_ad_copy's docstring (Multi-Plan Audience Variants spec §8)."""
     if not settings.jane_ads_openai_key or not image_summary.strip():
         return AdCopy()
     bc = brand_context or {}
     brand_bits = _brand_prompt_bits(bc)
     geo_target = city or bc.get("region", "")
-    audience_segment = bc.get("target_audience", "")
+    audience_segment = audience_segment or bc.get("target_audience", "")
     # NOTE: `category` is deliberately NOT passed as the Zone A interest-category term
     # here — it's what the business SELLS (Zone B's "sells" line names it on purpose,
     # per the register rule "name what it actually is"), not an ad-targeting interest
@@ -594,8 +604,10 @@ async def write_ad_copy_for_image(image_summary: str, business_name: str, catego
     zone_b = (
         "MESSAGE (headline/primary_text come from THIS section only):\n"
         f"- sells: {category or 'local business'}{(' — ' + description) if description else ''}\n"
-        "- who_its_for: phrase how the customer would recognise themselves — never the "
-        "audience label above\n"
+        + (f"- who_its_for (phrase it exactly like this, in the customer's own words): "
+           f"{who_its_for}\n" if who_its_for else
+           "- who_its_for: phrase how the customer would recognise themselves — never "
+           "the audience label above\n")
         + (f"- service_area (mention this, not the delivery-context location above): "
            f"{service_area}\n" if service_area else "")
         + "- the_action: message on WhatsApp\n"
@@ -743,7 +755,8 @@ def assemble_creative(copy: AdCopy, image_url: Optional[str],
 async def generate_ad_creative(
     business_name: str, category: str, goal: str = "messages", description: str = "",
     user_id: str = "", db=None, brand_id: Optional[str] = None, city: str = "",
-    behaviour: str = "", service_area: str = "",
+    behaviour: str = "", service_area: str = "", audience_segment: str = "",
+    who_its_for: str = "",
 ) -> AdCreative:
     """SOURCE 1 (default) — Jane writes the copy and generates the image herself,
     using the brand playbook's colours/voice/region/industry, grounded in `city` (the
@@ -752,12 +765,15 @@ async def generate_ad_creative(
     mixed, from the decision engine) informs the creative-type reasoning (PRD §4.1) —
     see write_ad_copy. `service_area` (creative brief spec §4, from service_area_from_geo)
     is the ONLY location string allowed to reach the copy itself — `city` stays targeting
-    context. For "use my own photo", see SOURCE 2 (creative_from_upload) — a distinct
-    source, not a reference nudge on generation. Never raises — falls back to copy-only
-    if image generation fails."""
+    context. `audience_segment`/`who_its_for` (Multi-Plan Audience Variants spec §8) —
+    when a client selected a specific audience-plan variant, its segment/phrasing
+    override the brand's generic target_audience for this one campaign. For "use my
+    own photo", see SOURCE 2 (creative_from_upload) — a distinct source, not a
+    reference nudge on generation. Never raises — falls back to copy-only if image
+    generation fails."""
     brand_context = await get_brand_context(user_id, db, brand_id) if user_id else {}
     copy = await write_ad_copy(business_name, category, goal, description, brand_context,
-                               city, behaviour, service_area)
+                               city, behaviour, service_area, audience_segment, who_its_for)
     # Image via the SAME content engine normal posts use (better visuals). Seed it with the
     # scene idea; content conveys the theme/message so the graphic is on-topic.
     content_for_image = copy.primary_text or copy.image_prompt or f"{business_name} — {description or category}"
@@ -769,7 +785,8 @@ async def generate_ad_creative(
         summary = await describe_ad_image(image_url)
         if summary:
             matched = await write_ad_copy_for_image(
-                summary, business_name, category, goal, description, brand_context, city, service_area,
+                summary, business_name, category, goal, description, brand_context, city,
+                service_area, audience_segment, who_its_for,
             )
             if matched.headline:
                 copy.headline = matched.headline
@@ -782,24 +799,28 @@ async def creative_from_upload(
     business_name: str, category: str, image_url: str, goal: str = "messages",
     description: str = "", user_id: str = "", db=None, brand_id: Optional[str] = None,
     is_video: Optional[bool] = None, city: str = "", service_area: str = "",
+    audience_segment: str = "", who_its_for: str = "",
 ) -> AdCreative:
     """SOURCE 2 — the user's own uploaded photo OR video (uploaded via
     /jane-ads/creative/upload, or the existing /upload-user-content flow) becomes
     the creative directly; Jane still writes fresh copy to match it. No location
     grounding needed for the IMAGE — the media IS the real place already — but the
     copy still needs `service_area`/`city` for the same leakage-check treatment as
-    every other path."""
+    every other path. `audience_segment`/`who_its_for` — see write_ad_copy's
+    docstring (Multi-Plan Audience Variants spec §8)."""
     brand_context = await get_brand_context(user_id, db, brand_id) if user_id else {}
     # Caption matched to what the uploaded photo actually shows (skip for video — no still
     # to describe), so the copy references the real visual.
     summary = "" if is_video else await describe_ad_image(image_url)
     if summary:
         copy = await write_ad_copy_for_image(
-            summary, business_name, category, goal, description, brand_context, city, service_area,
+            summary, business_name, category, goal, description, brand_context, city,
+            service_area, audience_segment, who_its_for,
         )
     else:
         copy = await write_ad_copy(business_name, category, goal, description, brand_context, city,
-                                   service_area=service_area)
+                                   service_area=service_area, audience_segment=audience_segment,
+                                   who_its_for=who_its_for)
     return assemble_creative(copy, image_url, source=CreativeSource.UPLOAD, is_video=is_video,
                              service_area=service_area)
 
@@ -807,6 +828,7 @@ async def creative_from_upload(
 async def creative_from_draft(
     business_name: str, category: str, draft_id: str, user_id: str, db,
     goal: str = "messages", brand_id: Optional[str] = None, city: str = "", service_area: str = "",
+    audience_segment: str = "", who_its_for: str = "",
 ) -> Optional[AdCreative]:
     """SOURCE 3 — reuse a content draft the user already generated and liked.
     Returns None if the draft can't be found (caller should 404)."""
@@ -818,7 +840,8 @@ async def creative_from_draft(
     # own text if the vision pass fails.
     summary = await describe_ad_image(draft["image_url"]) or draft["content"]
     copy = await write_ad_copy_for_image(
-        summary, business_name, category, goal, draft["content"], brand_context, city, service_area,
+        summary, business_name, category, goal, draft["content"], brand_context, city,
+        service_area, audience_segment, who_its_for,
     )
     return assemble_creative(copy, draft["image_url"], source=CreativeSource.DRAFT, service_area=service_area)
 
@@ -826,7 +849,7 @@ async def creative_from_draft(
 async def creative_from_recomposite(
     business_name: str, category: str, reference_image_url: str, goal: str = "messages",
     description: str = "", user_id: str = "", db=None, brand_id: Optional[str] = None,
-    city: str = "", service_area: str = "",
+    city: str = "", service_area: str = "", audience_segment: str = "", who_its_for: str = "",
 ) -> AdCreative:
     """SOURCE 4 — the user's own real product photo, recomposited: background
     cleaned/replaced, the product itself preserved exactly (creative brief spec §7,
@@ -845,9 +868,11 @@ async def creative_from_recomposite(
     summary = await describe_ad_image(final_image)
     if summary:
         copy = await write_ad_copy_for_image(
-            summary, business_name, category, goal, description, brand_context, city, service_area,
+            summary, business_name, category, goal, description, brand_context, city,
+            service_area, audience_segment, who_its_for,
         )
     else:
         copy = await write_ad_copy(business_name, category, goal, description, brand_context, city,
+                                   audience_segment=audience_segment, who_its_for=who_its_for,
                                    service_area=service_area)
     return assemble_creative(copy, final_image, source=CreativeSource.RECOMPOSITE, service_area=service_area)
