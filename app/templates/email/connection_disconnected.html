@@ -8,6 +8,6 @@
   <span style="display:inline-block; background:rgba(220,38,38,.08); color:#DC2626; font-size:12px; font-weight:700; padding:4px 10px; border-radius:999px;">Disconnected</span>
   <p style="font-size:14px; color:#1F2937; margin:12px 0 0; line-height:1.6;">Your posts to {{ platform | default('this account') }} won't go out until you reconnect it.</p>
 </div>
-<a href="{{ app_url | default('https://app.urisocial.com') }}/settings/connections" class="cta">Reconnect {{ platform | default('your account') | capitalize }} →</a>
+<a href="{{ app_url | default('https://app.urisocial.com') }}/workspace?tab=connections" class="cta">Reconnect {{ platform | default('your account') | capitalize }} →</a>
 <p style="font-size:13px; color:#9CA3AF; margin-top:12px;">Any posts scheduled for this account will stay queued until it's reconnected.</p>
 {% endblock %}
