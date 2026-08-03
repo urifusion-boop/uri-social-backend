@@ -27,9 +27,12 @@ from app.agents.social_media_manager.services.video_polish_service import (
 )
 
 # ── Shotstack ─────────────────────────────────────────────────────────────────
-
-SHOTSTACK_EDIT_BASE = "https://api.shotstack.io/edit/stage"
-SHOTSTACK_CREATE_BASE = "https://api.shotstack.io/create/stage"
+# Sandbox ("stage") is free but watermarked; production ("v1") consumes real
+# credits. Only the Production environment should ever hit the paid endpoint —
+# staging/dev stay on sandbox regardless of which API key is configured.
+_SHOTSTACK_ENV = "v1" if settings.ENV == "Production" else "stage"
+SHOTSTACK_EDIT_BASE = f"https://api.shotstack.io/edit/{_SHOTSTACK_ENV}"
+SHOTSTACK_CREATE_BASE = f"https://api.shotstack.io/create/{_SHOTSTACK_ENV}"
 
 
 SHOTSTACK_ASSET_LIMIT = 9 * 1024 * 1024  # 9MB — stay under the 10MB hard limit
