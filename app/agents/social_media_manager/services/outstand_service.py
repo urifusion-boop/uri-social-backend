@@ -4,6 +4,23 @@ from app.core.config import settings
 
 OUTSTAND_BASE_URL = "https://api.outstand.so"
 
+
+class OutstandPublishError(Exception):
+    """
+    Raised when Outstand rejects a publish request. Carries Outstand's own
+    error message (e.g. "No social accounts found matching the provided
+    account identifiers" — the signature of a connection that's been
+    revoked/deleted on Outstand's side), not just the generic
+    "400 Bad Request" httpx.raise_for_status() would otherwise produce.
+    Callers need the real message to detect specific failure reasons and
+    act on them (e.g. mark the connection disconnected).
+    """
+
+    def __init__(self, message: str, status_code: int):
+        self.message = message
+        self.status_code = status_code
+        super().__init__(message)
+
 # Maps our internal platform names → Outstand network identifiers
 PLATFORM_TO_NETWORK: Dict[str, str] = {
     "facebook":       "facebook",
@@ -198,5 +215,11 @@ class OutstandService:
                 json=payload,
             )
             print(f"📡 Outstand response status: {resp.status_code} body: {resp.text[:2000]}")
-            resp.raise_for_status()
+            if resp.status_code >= 400:
+                try:
+                    error_body = resp.json()
+                except Exception:
+                    error_body = {}
+                outstand_message = error_body.get("error") or resp.text[:500] or f"HTTP {resp.status_code}"
+                raise OutstandPublishError(outstand_message, status_code=resp.status_code)
             return resp.json()
