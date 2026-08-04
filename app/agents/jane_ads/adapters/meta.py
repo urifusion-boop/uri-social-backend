@@ -210,6 +210,10 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
         is_followers_goal = plan.goal == Goal.FOLLOWERS
         if not is_followers_goal and not plan.whatsapp_number:
             raise ValueError("CampaignPlan.whatsapp_number is required to launch a Click-to-WhatsApp campaign")
+        # The real ad destination for every non-followers goal: a chat with the brand's
+        # own number. normalize_wa_number (whatsapp.py) already stored it digits-only
+        # and country-coded, which is exactly the form wa.me expects.
+        wa_link = f"https://wa.me/{plan.whatsapp_number}" if plan.whatsapp_number else ""
         platform_plan = meta_plans[0]
 
         total_budget_ngn = min(platform_plan.budget_ngn, auth.funded_amount_ngn)
@@ -252,11 +256,11 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                     params={"access_token": self._access_token},
                     json={
                         "name": f"JaneAds-{plan.business_id}-{plan.goal.value}",
-                        # Click-to-WhatsApp — Meta optimizes delivery toward people likely to
-                        # actually MESSAGE (not just tap), and counts real conversations. Works
-                        # now because the Page + number are the BRAND's own (per-brand ads
-                        # connection), not a shared Page — see ads_connection.py.
-                        "objective": "OUTCOME_ENGAGEMENT",
+                        # A followers campaign is real Page engagement; every other goal
+                        # sends the tap to a wa.me link, which is traffic off-platform —
+                        # OUTCOME_TRAFFIC is the objective that allows LINK_CLICKS
+                        # optimisation (confirmed live against the real ad account).
+                        "objective": "OUTCOME_ENGAGEMENT" if is_followers_goal else "OUTCOME_TRAFFIC",
                         "status": "PAUSED",
                         "special_ad_categories": [],
                         # Budget lives on the ad set (per-business isolation via caps.py/
@@ -290,9 +294,22 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                     # own number. `promoted_object.whatsapp_phone_number` is confirmed live:
                     # Meta validates it's actually linked to this page/account and rejects
                     # with a specific, clear error if not — a free pre-flight check.
-                    adset_payload["optimization_goal"] = "CONVERSATIONS"
-                    adset_payload["destination_type"] = "WHATSAPP"
-                    adset_payload["promoted_object"] = {"page_id": plan.page_id, "whatsapp_phone_number": plan.whatsapp_number}
+                    # wa.me LINK ad, not Meta's native Click-to-WhatsApp. The native
+                    # form (destination_type=WHATSAPP + promoted_object.
+                    # whatsapp_phone_number) requires that exact number to be linked to
+                    # the Page inside Meta — a manual, per-number step with no partner
+                    # API — and it rejected every launch with "This WhatsApp phone
+                    # number is not linked to your account" (code=100, subcode=1487246),
+                    # live-confirmed on a real brand number. Since every brand now runs
+                    # from URI's ONE shared Page, that would mean hand-linking each
+                    # client's number to it, which does not scale.
+                    #
+                    # A plain https://wa.me/<number> link needs no linking at all and is
+                    # what whatsapp.py's own design already assumed ("no per-brand
+                    # Facebook Page required, just their number"). Optimising for
+                    # LINK_CLICKS is the matching goal — CONVERSATIONS only counts
+                    # native WhatsApp threads Meta can see.
+                    adset_payload["optimization_goal"] = "LINK_CLICKS"
                 adset_resp = await client.post(
                     f"{self._graph_base}/act_{self._ad_account_id}/adsets",
                     params={"access_token": self._access_token},
@@ -309,9 +326,13 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                     cta = {"type": "LIKE_PAGE", "value": {"page": plan.page_id}}
                 else:
                     message = plan.creative.primary_text or plan.creative.headline or "Chat with us on WhatsApp!"
-                    # WHATSAPP_MESSAGE routes the tap into a real WhatsApp chat with the number
-                    # set in the ad set's promoted_object above — no link URL needed for this CTA.
+                    # The tap opens a WhatsApp chat with the brand's OWN number through a
+                    # plain wa.me link (see the ad set above for why this is a link ad and
+                    # not Meta's native Click-to-WhatsApp). A video creative carries no
+                    # link_data.link of its own, so the destination has to ride on the CTA.
                     cta = {"type": "WHATSAPP_MESSAGE"}
+                    if plan.creative.is_video and wa_link:
+                        cta = {"type": "WHATSAPP_MESSAGE", "value": {"link": wa_link}}
                 if plan.creative.is_video:
                     object_story_spec = {
                         "page_id": plan.page_id,
@@ -328,9 +349,11 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                         "link_data": {
                             "message": message,
                             # LIKE_PAGE ignores this link (the button does the follow action
-                            # itself) — the Page's own URL is a reasonable placeholder, same
-                            # pattern as the wa.me/ placeholder for WHATSAPP_MESSAGE below.
-                            "link": f"https://www.facebook.com/{plan.page_id}" if is_followers_goal else "https://wa.me/",
+                            # itself), so the Page's own URL is the sensible placeholder
+                            # there. For every other goal this is the REAL destination:
+                            # wa.me/<the brand's number>. It used to be a bare
+                            # "https://wa.me/" with no number, which went nowhere.
+                            "link": f"https://www.facebook.com/{plan.page_id}" if is_followers_goal else wa_link,
                             "picture": plan.creative.image_url,
                             "call_to_action": cta,
                         },
