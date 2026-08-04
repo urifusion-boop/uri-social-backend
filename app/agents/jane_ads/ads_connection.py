@@ -138,6 +138,19 @@ async def resolve_connection_state(
     if not ads.get("page_id"):
         return ConnectionState.NO_PAGE, ads
 
+    # The OAuth callback (complete_social_manager.py) tries to grant URI's Business
+    # Manager ADVERTISE access to the page at connect time and records whether that
+    # actually succeeded — live-diagnosed real case: it can silently fail (e.g. Meta
+    # rejects the share as "duplicated asset") while every other part of the
+    # connection looks fine, and every real ad-account write (launch, pause/resume)
+    # goes through URI's own shared ad-account token, which needs that grant to act
+    # on this page. Missing the key entirely (older connections from before this was
+    # tracked) is treated as shared, not blocking.
+    if ads.get("business_manager_shared") is False:
+        ads = dict(ads)
+        ads["_business_manager_error"] = ads.get("business_manager_error") or ""
+        return ConnectionState.EXPIRED, ads
+
     if live_check:
         valid, granted = await verify_token_live(
             ads["page_id"], ads.get("page_access_token", ""), ads.get("user_access_token", ""),
