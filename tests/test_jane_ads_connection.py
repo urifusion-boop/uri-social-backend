@@ -95,6 +95,50 @@ def test_no_page_when_ads_connection_missing_page_id():
     assert state == ConnectionState.NO_PAGE
 
 
+def test_expired_when_business_manager_share_failed():
+    # Live-diagnosed real case: the OAuth callback's share-with-Business-Manager
+    # step can silently fail (Meta rejects it as a "duplicated asset") while every
+    # other part of the connection looks fine — every real ad-account write (launch,
+    # pause/resume) still needs that grant, so this must block READY, never quietly
+    # pass through to it.
+    db = FakeDb([_ads_doc(
+        business_manager_shared=False,
+        business_manager_error="Business Manager page-share failed: You are trying to assign a duplicated asset to this agency.",
+    )])
+    state, ads = _run(resolve_connection_state(db, None, "brnd_1"))
+    assert state == ConnectionState.EXPIRED
+    assert "duplicated asset" in ads["_business_manager_error"]
+
+
+def test_ready_when_business_manager_shared_is_true():
+    db = FakeDb([_ads_doc(
+        business_manager_shared=True, whatsapp_page_linked=True, whatsapp_number="2348031234567",
+    )])
+    with patch("app.agents.jane_ads.ads_connection.verify_token_live",
+               new=AsyncMock(return_value=(True, REQUIRED_ADS_SCOPES))):
+        state, ads = _run(resolve_connection_state(db, None, "brnd_1"))
+    assert state == ConnectionState.READY
+
+
+def test_ready_when_business_manager_shared_field_is_missing_entirely():
+    # Older connections predate this field being tracked at all — absence isn't
+    # itself a red flag, only an explicit False is.
+    db = FakeDb([_ads_doc(whatsapp_page_linked=True, whatsapp_number="2348031234567")])
+    with patch("app.agents.jane_ads.ads_connection.verify_token_live",
+               new=AsyncMock(return_value=(True, REQUIRED_ADS_SCOPES))):
+        state, ads = _run(resolve_connection_state(db, None, "brnd_1"))
+    assert state == ConnectionState.READY
+
+
+def test_business_manager_share_failure_is_checked_before_the_live_network_call():
+    db = FakeDb([_ads_doc(business_manager_shared=False, business_manager_error="dup asset")])
+    with patch("app.agents.jane_ads.ads_connection.verify_token_live",
+               new=AsyncMock(return_value=(True, REQUIRED_ADS_SCOPES))) as mock_verify:
+        state, ads = _run(resolve_connection_state(db, None, "brnd_1"))
+    assert state == ConnectionState.EXPIRED
+    mock_verify.assert_not_called()
+
+
 def test_verify_token_live_calls_permissions_with_the_user_token_not_the_page_token():
     # Live-confirmed: GET /me/permissions returns an empty list for a Page access token
     # every time, regardless of what was actually granted — it only returns real scope
