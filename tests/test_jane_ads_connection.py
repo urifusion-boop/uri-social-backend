@@ -95,19 +95,34 @@ def test_no_page_when_ads_connection_missing_page_id():
     assert state == ConnectionState.NO_PAGE
 
 
-def test_expired_when_business_manager_share_failed():
-    # Live-diagnosed real case: the OAuth callback's share-with-Business-Manager
-    # step can silently fail (Meta rejects it as a "duplicated asset") while every
-    # other part of the connection looks fine — every real ad-account write (launch,
-    # pause/resume) still needs that grant, so this must block READY, never quietly
-    # pass through to it.
+def test_expired_when_business_manager_share_genuinely_failed():
+    # A real share failure still blocks: the shared ad account cannot advertise for a
+    # Page it was never granted, so letting this reach READY would fail at ad time.
     db = FakeDb([_ads_doc(
         business_manager_shared=False,
-        business_manager_error="Business Manager page-share failed: You are trying to assign a duplicated asset to this agency.",
+        business_manager_error="Business Manager page-share failed: insufficient permissions.",
     )])
     state, ads = _run(resolve_connection_state(db, None, "brnd_1"))
     assert state == ConnectionState.EXPIRED
-    assert "duplicated asset" in ads["_business_manager_error"]
+    assert "insufficient permissions" in ads["_business_manager_error"]
+
+
+def test_duplicate_asset_share_error_is_treated_as_already_shared():
+    # "You are trying to assign a duplicated asset" is Meta refusing to re-share a Page
+    # the Business Manager ALREADY has — it reads like a failure and is stored as
+    # business_manager_shared=False, but the Page is in fact assigned. Live-confirmed:
+    # a Page with this exact error advertised fine, while a different Page with
+    # business_manager_shared=True was rejected at ad-creative time. Blocking on it
+    # would push a working brand Page back onto the shared URI Page.
+    db = FakeDb([_ads_doc(
+        business_manager_shared=False,
+        business_manager_error="Business Manager page-share failed: You are trying to assign a duplicated asset to this agency.",
+        whatsapp_page_linked=True, whatsapp_number="2348031234567",
+    )])
+    with patch("app.agents.jane_ads.ads_connection.verify_token_live",
+               new=AsyncMock(return_value=(True, REQUIRED_ADS_SCOPES))):
+        state, _ = _run(resolve_connection_state(db, None, "brnd_1"))
+    assert state == ConnectionState.READY
 
 
 def test_ready_when_business_manager_shared_is_true():
@@ -296,12 +311,14 @@ def test_resolve_ads_page_for_launch_skips_whatsapp_when_not_required():
     assert result == {"page_id": "pg_shared", "whatsapp_number": "", "page_name": "URI Social"}
 
 
-def test_resolve_ads_page_for_launch_raises_no_page_when_shared_page_not_configured():
+def test_resolve_ads_page_for_launch_surfaces_the_real_state_with_no_shared_page():
+    # Nothing to fall back to, so the brand's own connection state is what the caller
+    # needs in order to prompt precisely (connect vs reconnect vs no Page).
     db = FakeDb([{"brand_id": "brnd_1", "whatsapp_number": "2348031234567"}])
     with patch("app.agents.jane_ads.ads_connection.settings.META_ADS_PAGE_ID", ""):
         with pytest.raises(AdsConnectionRequired) as exc_info:
             _run(resolve_ads_page_for_launch(db, None, "brnd_1"))
-    assert exc_info.value.state == ConnectionState.NO_PAGE
+    assert exc_info.value.state == ConnectionState.NONE
 
 
 def test_set_whatsapp_number_normalizes_and_marks_linked():
@@ -324,3 +341,61 @@ def test_set_whatsapp_number_requires_an_existing_ads_connection():
     with pytest.raises(AdsConnectionRequired) as exc_info:
         _run(set_whatsapp_number(db, None, "brnd_1", "0803 123 4567"))
     assert exc_info.value.state == ConnectionState.NONE
+
+
+# ── Per-brand Page preference ─────────────────────────────────────────────────
+# Ads should publish under the CLIENT's own Page when they've connected one, so every
+# client's ad doesn't read "URI". Brands without a connection still fall back to the
+# shared Page so nobody is blocked from launching.
+
+def test_launch_prefers_the_brands_own_connected_page_over_the_shared_one():
+    db = FakeDb([
+        {"brand_id": "brnd_1", "whatsapp_number": "2348031234567"},
+        _ads_doc(page_id="pg_brand", account_name="Precious Cakes",
+                 business_manager_shared=True),
+    ])
+    with patch("app.agents.jane_ads.ads_connection.settings.META_ADS_PAGE_ID", "pg_shared"), \
+         patch("app.agents.jane_ads.ads_connection.verify_token_live",
+               new=AsyncMock(return_value=(True, REQUIRED_ADS_SCOPES))):
+        result = _run(resolve_ads_page_for_launch(db, None, "brnd_1"))
+    assert result["page_id"] == "pg_brand"
+    assert result["page_name"] == "Precious Cakes"
+    # The wa.me destination still comes from the brand's own saved number.
+    assert result["whatsapp_number"] == "2348031234567"
+
+
+def test_launch_falls_back_to_the_shared_page_when_the_brand_has_not_connected():
+    db = FakeDb([{"brand_id": "brnd_1", "whatsapp_number": "2348031234567"}])
+    with patch("app.agents.jane_ads.ads_connection.settings.META_ADS_PAGE_ID", "pg_shared"):
+        result = _run(resolve_ads_page_for_launch(db, None, "brnd_1"))
+    assert result["page_id"] == "pg_shared"
+    assert result["page_name"] == "URI Social"
+
+
+def test_an_unusable_brand_connection_falls_back_instead_of_blocking_the_launch():
+    # A dead/expired token on the brand's Page must not stop them advertising — the
+    # shared Page still works, and blocking would be worse than a generic identity.
+    db = FakeDb([
+        {"brand_id": "brnd_1", "whatsapp_number": "2348031234567"},
+        _ads_doc(page_id="pg_brand"),
+    ])
+    with patch("app.agents.jane_ads.ads_connection.settings.META_ADS_PAGE_ID", "pg_shared"), \
+         patch("app.agents.jane_ads.ads_connection.verify_token_live",
+               new=AsyncMock(return_value=(False, set()))):
+        result = _run(resolve_ads_page_for_launch(db, None, "brnd_1"))
+    assert result["page_id"] == "pg_shared"
+
+
+def test_brand_page_is_used_even_when_its_whatsapp_was_never_linked_in_meta():
+    # wa.me routing needs no Meta-side number linking, so whatsapp_page_linked must not
+    # gate the brand's own Page any more (it used to, via require_whatsapp).
+    db = FakeDb([
+        {"brand_id": "brnd_1", "whatsapp_number": "2348031234567"},
+        _ads_doc(page_id="pg_brand", account_name="Brand Page",
+                 whatsapp_page_linked=False, business_manager_shared=True),
+    ])
+    with patch("app.agents.jane_ads.ads_connection.settings.META_ADS_PAGE_ID", "pg_shared"), \
+         patch("app.agents.jane_ads.ads_connection.verify_token_live",
+               new=AsyncMock(return_value=(True, REQUIRED_ADS_SCOPES))):
+        result = _run(resolve_ads_page_for_launch(db, None, "brnd_1"))
+    assert result["page_id"] == "pg_brand"
