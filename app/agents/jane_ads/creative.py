@@ -381,11 +381,13 @@ async def write_ad_copy(business_name: str, category: str, goal: str = "messages
         "- primary_text: 1–2 sentences in the brand voice above if given, following "
         "REGISTER, from MESSAGE only — never the DELIVERY CONTEXT above\n"
         "- image_prompt: a photorealistic scene for the creative image — real people/"
-        "products/workspace fitting the business, in the brand's colours/setting and the "
-        "LOCATION above. NO text anywhere in the image — no logos, no watermarks, no "
-        "storefront signage/shop signs with the business name, no readable words of any "
-        "kind (Meta adds the ad's headline and button separately; baked-in text is never "
-        "wanted here, including on buildings/signs in the background). Not an "
+        "products/workspace fitting the business, in the brand's colours/setting, and "
+        "visually consistent with the LOCATION above (its real architecture, light, "
+        "street life, dress). Describe how the place LOOKS; never name it. Do NOT write "
+        "any place name, area name, city, or neighbourhood into this prompt — those are "
+        "DELIVERY CONTEXT and must never end up rendered as words in the picture (a "
+        "live-confirmed bug painted the targeted areas onto a billboard in the image). "
+        "Also no watermarks and no shop signage carrying the business name. Not an "
         "illustration.\n"
         f"{_video_fit_fields_block()}"
         "Return ONLY the JSON."
@@ -417,6 +419,15 @@ async def write_ad_copy(business_name: str, category: str, goal: str = "messages
             # Never ship a known leak and never loop silently — strip and move on.
             copy.headline = _strip_leaked_terms(copy.headline, leaked)
             copy.primary_text = _strip_leaked_terms(copy.primary_text, leaked)
+    # image_prompt needs the SAME deterministic guarantee, not just the instruction
+    # above. It becomes the content engine's seed_content, and that engine renders
+    # text INTO the graphic (that's how organic posts look) — so a place name left
+    # in here gets painted onto a billboard/sign in the picture even though the copy
+    # itself is clean. Live-confirmed: an ad image showed "Ikeja. Surulere. Victoria
+    # Island." as rendered text while headline/primary_text passed the check.
+    image_leaked = _check_leakage(copy.image_prompt, "", leak_terms)
+    if image_leaked:
+        copy.image_prompt = _strip_leaked_terms(copy.image_prompt, image_leaked)
     return copy
 
 
