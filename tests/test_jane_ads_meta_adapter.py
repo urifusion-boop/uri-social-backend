@@ -200,16 +200,22 @@ def test_launch_campaign_creates_full_chain_and_stores_record():
     assert result.ad_ids == {"b1": "ad_1"}
     assert result.platforms == [Platform.META]
 
-    # Real Click-to-WhatsApp: the ad set promotes the brand's OWN Page + WhatsApp
-    # number (Per-Brand Page Connection plan) — no shared-page wa.me-link fallback.
+    # wa.me LINK ad, not Meta's native Click-to-WhatsApp: the native form needs each
+    # number hand-linked to the Page inside Meta (no partner API), which rejected every
+    # launch with subcode 1487246 and cannot scale across brands on one shared Page.
     campaign_json = mock_client.post.call_args_list[0].kwargs["json"]
-    assert campaign_json["objective"] == "OUTCOME_ENGAGEMENT"
+    assert campaign_json["objective"] == "OUTCOME_TRAFFIC"
     adset_json = mock_client.post.call_args_list[1].kwargs["json"]
-    assert adset_json["optimization_goal"] == "CONVERSATIONS"
-    assert adset_json["destination_type"] == "WHATSAPP"
-    assert adset_json["promoted_object"] == {"page_id": "pg123", "whatsapp_phone_number": "2348031234567"}
+    assert adset_json["optimization_goal"] == "LINK_CLICKS"
+    # No native WhatsApp routing — that is precisely what required the linking.
+    assert "destination_type" not in adset_json
+    assert "promoted_object" not in adset_json
     creative_spec = mock_client.post.call_args_list[2].kwargs["json"]["object_story_spec"]
     assert creative_spec["page_id"] == "pg123"
+    # The tap goes to a real chat with the brand's own number (it used to be a bare
+    # "https://wa.me/" with no number, which went nowhere).
+    assert creative_spec["link_data"]["link"] == "https://wa.me/2348031234567"
+    assert creative_spec["link_data"]["call_to_action"]["type"] == "WHATSAPP_MESSAGE"
     ad_json = mock_client.post.call_args_list[3].kwargs["json"]
     assert ad_json  # ad creation call still happens after creative
 
@@ -425,3 +431,45 @@ def test_successful_launch_never_rolls_anything_back():
         result = _run(adapter.launch_campaign(_plan(), _auth()))
     assert result.campaign_id == "cmp_1"
     assert mock_client.delete.await_count == 0
+
+
+def test_followers_goal_keeps_engagement_objective_and_page_link():
+    # A followers campaign is genuine on-Page engagement — it must NOT be switched to
+    # traffic/wa.me, since there is no WhatsApp destination involved at all.
+    db = FakeDb()
+    adapter = _adapter(db)
+    responses = [{"id": "cmp_1"}, {"id": "adset_1"}, {"id": "creative_1"}, {"id": "ad_1"}]
+    plan = _plan(goal=Goal.FOLLOWERS, whatsapp_number="")
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client(responses)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        _run(adapter.launch_campaign(plan, _auth()))
+
+    assert mock_client.post.call_args_list[0].kwargs["json"]["objective"] == "OUTCOME_ENGAGEMENT"
+    assert mock_client.post.call_args_list[1].kwargs["json"]["optimization_goal"] == "POST_ENGAGEMENT"
+    link_data = mock_client.post.call_args_list[2].kwargs["json"]["object_story_spec"]["link_data"]
+    assert link_data["link"] == "https://www.facebook.com/pg123"
+    assert link_data["call_to_action"]["type"] == "LIKE_PAGE"
+
+
+def test_video_creative_carries_the_wa_link_on_the_cta():
+    # video_data has no link field of its own, so the wa.me destination has to ride on
+    # the call_to_action or the tap would go nowhere.
+    db = FakeDb()
+    adapter = _adapter(db)
+    responses = [
+        {"id": "vid_1"},                                                    # video upload
+        {"status": {"video_status": "ready"}},                              # poll
+        {"data": [{"uri": "https://thumb/1.jpg", "is_preferred": True}]},   # thumbnails
+        {"id": "cmp_1"}, {"id": "adset_1"}, {"id": "creative_1"}, {"id": "ad_1"},
+    ]
+    plan = _plan(creative=AdCreative(image_url="https://cdn/ad.mp4", is_video=True,
+                                     headline="h", primary_text="p"))
+    with patch("httpx.AsyncClient") as MockClient, \
+         patch("app.agents.jane_ads.adapters.meta.asyncio.sleep", new=AsyncMock()):
+        mock_client = _mock_client(responses)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        _run(adapter.launch_campaign(plan, _auth()))
+
+    video_data = mock_client.post.call_args_list[-2].kwargs["json"]["object_story_spec"]["video_data"]
+    assert video_data["call_to_action"]["value"]["link"] == "https://wa.me/2348031234567"
