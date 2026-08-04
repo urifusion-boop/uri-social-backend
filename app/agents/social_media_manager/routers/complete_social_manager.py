@@ -2883,7 +2883,13 @@ async def generate_calendar_plan(
     brand_id = ctx["brand_id"]
     try:
         profile_result = await BrandProfileService.get(user_id, db, brand_id=brand_id)
-        brand = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
+        raw_profile = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
+        # Use the curated playbook context (same transform create_draft_from_calendar_day
+        # already applies) instead of the raw DB document — the raw doc's key_dates is a
+        # list of {label, date} dicts that was landing in the AI prompt as an unreadable
+        # Python repr instead of real text, and this also gives consistent field names
+        # (business_description/brand_voice) instead of relying on per-field fallbacks.
+        brand = BrandProfileService.to_brand_context(raw_profile) if raw_profile else {}
         plan = await cal_svc.generate_plan(
             user_id=user_id,
             platforms=request.platforms,
@@ -2945,20 +2951,48 @@ async def create_draft_from_calendar_day(
         if not day:
             raise HTTPException(status_code=404, detail=f"Day {day_index} not found")
 
-        seed_content = f"{day['title']}. {day['description']}"
+        # Fold in the rest of the calendar entry, not just title/description —
+        # otherwise the hook/key_points/caption_direction/cta the calendar
+        # promised never actually reach the published draft.
+        seed_parts = [f"{day.get('title', '')}. {day.get('description', '')}"]
+        if day.get("hook"):
+            seed_parts.append(f"Opening hook to use: {day['hook']}")
+        if day.get("key_points"):
+            seed_parts.append(
+                "Key points to cover: " + "; ".join(str(p) for p in day["key_points"] if p)
+            )
+        if day.get("caption_direction"):
+            seed_parts.append(f"Caption direction: {day['caption_direction']}")
+        if day.get("cta"):
+            seed_parts.append(f"Call to action: {day['cta']}")
+        seed_content = "\n".join(seed_parts)
         profile_result = await BrandProfileService.get(user_id, db, brand_id=brand_id)
         brand = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
         brand_context = BrandProfileService.to_brand_context(brand) if brand else {}
         brand_context["brand_id"] = brand_id
 
-        result = await ContentGenerationService.generate_multi_platform_content(
-            user_id=user_id,
-            seed_content=seed_content,
-            platforms=request.platforms,
-            seed_type="calendar_idea",
-            brand_context=brand_context,
-            db=db,
-        )
+        # If this day was written for a carousel (its hook/caption may already say
+        # "swipe through..."), route to the same carousel pipeline the main
+        # generator uses — otherwise the draft silently comes back as a single
+        # image/text post even though the calendar copy describes slides.
+        if day.get("format") == "carousel":
+            from app.agents.social_media_manager.services.carousel_generation_service import CarouselGenerationService
+            result = await CarouselGenerationService.generate_multi_platform(
+                user_id=user_id,
+                seed_content=seed_content,
+                platforms=request.platforms,
+                brand_context=brand_context,
+                db=db,
+            )
+        else:
+            result = await ContentGenerationService.generate_multi_platform_content(
+                user_id=user_id,
+                seed_content=seed_content,
+                platforms=request.platforms,
+                seed_type="calendar_idea",
+                brand_context=brand_context,
+                db=db,
+            )
 
         if result.get("status"):
             drafts = result.get("responseData", {}).get("drafts", [])
