@@ -22,6 +22,7 @@ from app.agents.jane_ads.creative import (
     assemble_creative,
     creative_from_recomposite,
     generate_ad_image,
+    get_brand_context,
     service_area_from_geo,
     write_ad_copy,
     write_ad_copy_for_image,
@@ -549,3 +550,44 @@ def test_assemble_creative_copy_length_matches_combined_text():
 def test_assemble_creative_asset_path_mirrors_source():
     c = assemble_creative(AdCopy(headline="h"), "https://cdn/ad.png", source=CreativeSource.RECOMPOSITE)
     assert c.asset_path == CreativeSource.RECOMPOSITE
+
+
+def _profile_resp(**profile_fields):
+    return {"responseData": {"brand_name": "Test Brand", "industry": "retail", **profile_fields}}
+
+
+def test_get_brand_context_picks_a_style_from_the_brands_own_rotation():
+    # Live-diagnosed real gap: organic content always injects a style_slug (the
+    # brand's own configured rotation, or a sensible default) before generating —
+    # ads never did, silently falling back to the content engine's generic
+    # "immersive" composition with no style_desc at all. Same selection organic
+    # content uses, so an ad image is as considered as a normal post.
+    with patch("app.agents.social_media_manager.services.brand_profile_service.BrandProfileService.get",
+               new=AsyncMock(return_value=_profile_resp(style_selections=["street_editorial", "trust_builder"]))):
+        bc = _run(get_brand_context("u1", db=object(), brand_id="brnd_1"))
+    assert bc["style_slug"] == "street_editorial"
+    assert bc["style_prompt_fragment"]
+
+
+def test_get_brand_context_falls_back_to_a_sensible_default_style_with_no_selections():
+    with patch("app.agents.social_media_manager.services.brand_profile_service.BrandProfileService.get",
+               new=AsyncMock(return_value=_profile_resp(style_selections=[]))):
+        bc = _run(get_brand_context("u1", db=object(), brand_id="brnd_1"))
+    assert bc["style_slug"] == "trust_builder"
+    assert bc["style_prompt_fragment"]
+
+
+def test_get_brand_context_respects_the_brands_stored_rotation_index():
+    with patch("app.agents.social_media_manager.services.brand_profile_service.BrandProfileService.get",
+               new=AsyncMock(return_value=_profile_resp(
+                   style_selections=["street_editorial", "trust_builder"], style_rotation_index=1,
+               ))):
+        bc = _run(get_brand_context("u1", db=object(), brand_id="brnd_1"))
+    assert bc["style_slug"] == "trust_builder"
+
+
+def test_get_brand_context_returns_empty_dict_with_no_profile():
+    with patch("app.agents.social_media_manager.services.brand_profile_service.BrandProfileService.get",
+               new=AsyncMock(return_value={"responseData": None})):
+        bc = _run(get_brand_context("u1", db=object(), brand_id="brnd_1"))
+    assert bc == {}
