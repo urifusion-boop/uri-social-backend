@@ -1264,6 +1264,11 @@ async def _build_campaign_plan(
     # selected, which is a no-op fallback to today's existing behaviour.
     variant_segment = selected_variant.audience_segment if selected_variant else ""
     variant_who_its_for = selected_variant.who_its_for if selected_variant else ""
+    # The variant's own named areas are real targeting parameters (Zone A), just like
+    # geo_areas above — equally forbidden from appearing in copy. Live-confirmed leak:
+    # these reached Meta's real targeting but were never passed into the creative
+    # functions at all, so the leakage check had no way to catch them.
+    variant_geo_pockets = selected_variant.geo_pockets if selected_variant else None
 
     if body.creative_source == "upload":
         creative = await creative_from_upload(
@@ -1271,6 +1276,7 @@ async def _build_campaign_plan(
             user_id=user_id, db=db, brand_id=brand_id, is_video=body.is_video,
             city=parsed.city, service_area=service_area,
             audience_segment=variant_segment, who_its_for=variant_who_its_for,
+            geo_pockets=variant_geo_pockets,
         )
     elif body.creative_source == "recomposite":
         creative = await creative_from_recomposite(
@@ -1278,6 +1284,7 @@ async def _build_campaign_plan(
             user_id=user_id, db=db, brand_id=brand_id,
             city=parsed.city, service_area=service_area,
             audience_segment=variant_segment, who_its_for=variant_who_its_for,
+            geo_pockets=variant_geo_pockets,
         )
     elif body.creative_source == "draft":
         creative = await creative_from_draft(
@@ -1285,6 +1292,7 @@ async def _build_campaign_plan(
             goal=req.goal.value, brand_id=brand_id,
             city=parsed.city, service_area=service_area,
             audience_segment=variant_segment, who_its_for=variant_who_its_for,
+            geo_pockets=variant_geo_pockets,
         )
         if creative is None:
             raise HTTPException(status_code=404, detail="Draft not found or has no image")
@@ -1297,6 +1305,7 @@ async def _build_campaign_plan(
             user_id=user_id, db=db, brand_id=brand_id, is_video=False,
             city=parsed.city, service_area=service_area,
             audience_segment=variant_segment, who_its_for=variant_who_its_for,
+            geo_pockets=variant_geo_pockets,
         )
     else:
         # AI generation is the one creative path that costs a content credit — an
@@ -1313,6 +1322,7 @@ async def _build_campaign_plan(
             user_id=user_id, db=db, brand_id=brand_id, city=parsed.city,
             behaviour=plan.behaviour.value, service_area=service_area,
             audience_segment=variant_segment, who_its_for=variant_who_its_for,
+            geo_pockets=variant_geo_pockets,
         )
         if creative.image_url:
             # "reason" is a strict Literal on CreditTransaction — "campaign_generation"

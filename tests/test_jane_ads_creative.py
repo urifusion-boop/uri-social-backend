@@ -346,6 +346,34 @@ def test_strip_leaked_terms_removes_and_collapses_whitespace():
     assert "  " not in out
 
 
+# ── geo_pockets — a selected audience-variant's own named areas are equally
+# forbidden as the broader city (Multi-Plan Audience Variants spec §8). Live-
+# confirmed leak: a variant targeting "Yaba, Victoria Island, and Lekki" produced
+# copy stating those exact areas verbatim — geo_pockets were never checked at all
+# before this fix, even though the broader city (e.g. "Lagos") was already
+# correctly protected.
+
+def test_leakage_terms_includes_each_geo_pocket():
+    terms = _leakage_terms("Lagos", "", "", geo_pockets=["Yaba", "Victoria Island", "Lekki"])
+    assert terms == ["Lagos", "Yaba", "Victoria Island", "Lekki"]
+
+
+def test_leakage_terms_geo_pockets_drops_empty_values():
+    terms = _leakage_terms("Lagos", "", "", geo_pockets=["Yaba", "", "  "])
+    assert terms == ["Lagos", "Yaba"]
+
+
+def test_check_leakage_catches_a_geo_pocket_name():
+    leaked = _check_leakage(
+        "Create Content Daily",
+        "Freelancers and start-ups in Yaba, Victoria Island, and Lekki, message me to order.",
+        _leakage_terms("Lagos", "", "", geo_pockets=["Yaba", "Victoria Island", "Lekki"]),
+    )
+    assert "Yaba" in leaked
+    assert "Victoria Island" in leaked
+    assert "Lekki" in leaked
+
+
 # ── Zone A block (creative brief spec §2) — pure ───────────────────────────────
 
 def test_zone_a_block_empty_when_nothing_known():
@@ -356,6 +384,21 @@ def test_zone_a_block_names_and_prohibits_each_value():
     out = _zone_a_block("Lekki", "creative professionals", "design", "messages")
     assert "Lekki" in out
     assert "creative professionals" in out
+    assert "never write about this" in out
+
+
+def test_zone_a_block_includes_geo_pockets_alongside_the_city():
+    out = _zone_a_block("Lagos", "", "", "messages", geo_pockets=["Yaba", "Victoria Island"])
+    assert "Lagos" in out
+    assert "Yaba" in out
+    assert "Victoria Island" in out
+    assert "never write about this" in out
+
+
+def test_zone_a_block_geo_pockets_without_a_city_still_named():
+    # A variant's pockets can matter even when no broader city string was set.
+    out = _zone_a_block("", "", "", "messages", geo_pockets=["Yaba"])
+    assert "Yaba" in out
     assert "never write about this" in out
 
 
