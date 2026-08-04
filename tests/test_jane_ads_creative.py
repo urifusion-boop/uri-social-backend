@@ -634,3 +634,40 @@ def test_get_brand_context_returns_empty_dict_with_no_profile():
                new=AsyncMock(return_value={"responseData": None})):
         bc = _run(get_brand_context("u1", db=object(), brand_id="brnd_1"))
     assert bc == {}
+
+
+def test_write_ad_copy_strips_geo_from_image_prompt_not_just_copy():
+    # Live-confirmed bug (2026-08-04): headline/primary_text passed the leak check
+    # while the generated IMAGE showed "Ikeja. Surulere. Victoria Island." painted on
+    # a billboard. image_prompt becomes the content engine's seed_content, and that
+    # engine renders text INTO the graphic — so it needs the same deterministic
+    # guarantee the copy fields already had, not just a prompt instruction.
+    leaking_image_prompt = {
+        "headline": "Grow your business",
+        "primary_text": "Message us on WhatsApp to get started.",
+        "image_prompt": "a billboard reading Ikeja, Surulere and Victoria Island above a busy Lagos street",
+        "video_recommended": False, "video_recommendation_reason": "",
+    }
+    mock_call = AsyncMock(return_value=leaking_image_prompt)
+    with patch("app.agents.jane_ads.creative._call_ad_copy_model", new=mock_call):
+        copy = _run(write_ad_copy(
+            "Uri Social", "social media tool", city="Lagos",
+            geo_pockets=["Ikeja", "Surulere", "Victoria Island"],
+        ))
+    lowered = copy.image_prompt.lower()
+    for term in ("ikeja", "surulere", "victoria island", "lagos"):
+        assert term not in lowered, f"{term!r} still in image_prompt: {copy.image_prompt!r}"
+
+
+def test_write_ad_copy_leaves_a_clean_image_prompt_untouched():
+    clean = {
+        "headline": "Grow your business",
+        "primary_text": "Message us on WhatsApp to get started.",
+        "image_prompt": "four business owners laughing over laptops in bright natural light",
+        "video_recommended": False, "video_recommendation_reason": "",
+    }
+    with patch("app.agents.jane_ads.creative._call_ad_copy_model", new=AsyncMock(return_value=clean)):
+        copy = _run(write_ad_copy(
+            "Uri Social", "social media tool", city="Lagos", geo_pockets=["Ikeja"],
+        ))
+    assert copy.image_prompt == clean["image_prompt"]
