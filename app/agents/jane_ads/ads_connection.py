@@ -47,6 +47,20 @@ class ConnectionState(str, Enum):
     NO_PAGE = "no_page"                   # business has no Facebook Page at all
 
 
+def _bm_share_was_already_done(ads: dict) -> bool:
+    """Meta rejects re-sharing a Page that URI's Business Manager ALREADY has with
+    "You are trying to assign a duplicated asset to this agency". That reads like a
+    failure and gets stored as business_manager_shared=False, but it actually means
+    the Page is already assigned — i.e. exactly the state we wanted.
+
+    Live-confirmed the hard way: a Page carrying this error advertised perfectly, while
+    a different Page with business_manager_shared=True was rejected by Meta at ad-creative
+    time. Treating the duplicate-asset case as "not shared" would wrongly push a working
+    brand Page back to the shared URI Page."""
+    err = (ads.get("business_manager_error") or "").lower()
+    return "duplicated asset" in err or "already" in err
+
+
 class AdsConnectionRequired(Exception):
     """Raised when a campaign can't be built because the brand's Meta ads connection
     isn't READY. Carries the specific state so the caller can map it to the matching
@@ -146,7 +160,7 @@ async def resolve_connection_state(
     # goes through URI's own shared ad-account token, which needs that grant to act
     # on this page. Missing the key entirely (older connections from before this was
     # tracked) is treated as shared, not blocking.
-    if ads.get("business_manager_shared") is False:
+    if ads.get("business_manager_shared") is False and not _bm_share_was_already_done(ads):
         ads = dict(ads)
         ads["_business_manager_error"] = ads.get("business_manager_error") or ""
         return ConnectionState.EXPIRED, ads
@@ -180,26 +194,40 @@ async def resolve_ads_page_for_launch(
     at launch, so a client is never let all the way through a conversation only to
     hit a wall.
 
-    Every brand launches from URI's own shared Facebook Page and shared ad account
-    (settings.META_ADS_PAGE_ID / META_AD_ACCOUNT_ID) — that's the actual intended
-    architecture, not a fallback. A client never connects their own Facebook Page;
-    what distinguishes one brand's ads from another's is the WhatsApp number leads
-    land in (their own, saved via GET/PUT /jane-ads/whatsapp — already wired up in
-    the app) and the creative itself. `require_whatsapp=False` is for a campaign
-    goal that never routes anywhere via WhatsApp (e.g. followers) — `whatsapp_number`
-    in the returned dict may then be empty.
+    Prefers the brand's OWN connected Facebook Page, so their ads publish under their
+    own name instead of every client's ad reading "URI". A brand gets one by connecting
+    via /connect/facebook-ads (that grant requests ads_management + pages_manage_ads +
+    business_management and shares the Page with URI's Business Manager, which is what
+    lets the shared ad account advertise for it). Brands that haven't connected still
+    fall back to URI's shared Page, so nobody is blocked from launching.
 
-    (A brand can still separately connect their own Facebook Page via
-    /connect/facebook-ads — resolve_connection_state/ConnectionState is what tracks
-    and health-checks that. It's just not required to launch.)"""
+    The WhatsApp destination is deliberately NOT taken from the Page connection: ads
+    route through a plain wa.me link (see adapters/meta.py), so the number only has to
+    be saved against the brand (GET/PUT /jane-ads/whatsapp) and never linked to a Page
+    inside Meta. That's why whatsapp_page_linked is irrelevant here and the connection
+    is checked with require_whatsapp=False. `require_whatsapp=False` on THIS function is
+    for a goal that never routes via WhatsApp at all (e.g. followers) — `whatsapp_number`
+    in the returned dict may then be empty."""
     from .whatsapp import get_brand_whatsapp
-
-    if not settings.META_ADS_PAGE_ID:
-        raise AdsConnectionRequired(ConnectionState.NO_PAGE)
 
     wa_number = await get_brand_whatsapp(db, brand_id) if require_whatsapp else ""
     if require_whatsapp and not wa_number:
         raise AdsConnectionRequired(ConnectionState.ADS_NO_WHATSAPP)
+
+    # The brand's own Page wins when it's usable. WhatsApp linkage is not part of
+    # "usable" any more (wa.me needs none), hence require_whatsapp=False below.
+    state, ads = await resolve_connection_state(db, user_id, brand_id, require_whatsapp=False)
+    if state == ConnectionState.READY and (ads or {}).get("page_id"):
+        return {
+            "page_id": ads["page_id"],
+            "whatsapp_number": wa_number,
+            "page_name": ads.get("account_name", ""),
+        }
+
+    if not settings.META_ADS_PAGE_ID:
+        # No brand Page AND no shared Page configured — surface the brand's real state
+        # (NONE/CONTENT_ONLY/EXPIRED/NO_PAGE) so the caller can prompt precisely.
+        raise AdsConnectionRequired(state, (ads or {}).get("account_name", ""))
 
     return {
         "page_id": settings.META_ADS_PAGE_ID,
