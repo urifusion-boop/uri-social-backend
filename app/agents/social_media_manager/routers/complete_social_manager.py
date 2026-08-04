@@ -8145,7 +8145,45 @@ async def _mix_music_into_video(video_url: str, music_url: str) -> Optional[str]
         return None
 
 
-async def _add_hook_text_overlay(video_url: str, hook_text: str) -> Optional[str]:
+def _wrap_for_drawtext(text: str, video_width: int, fontsize: int) -> tuple:
+    """
+    Wrap hook text to at most 2 lines so it never overflows the video's actual
+    width, shrinking fontsize in steps if it still wouldn't fit. drawtext has
+    no auto-wrap of its own — a fixed fontsize with no wrapping (the original
+    bug here) overflows past both edges for anything longer than a couple words,
+    especially on a narrow/vertical video. ~0.65x fontsize per character is a
+    deliberately generous average-width estimate for DejaVu Sans Bold (erring
+    toward wrapping too eagerly rather than risking overflow again) — doesn't
+    need to be exact, box=1 pads around whatever renders.
+    """
+    margin = 120  # total horizontal padding to keep text off the video edges
+    usable_width = max(video_width - margin, 200)
+    words = text.split()
+
+    size = fontsize
+    lines: list = []
+    for _ in range(6):
+        max_chars = max(int(usable_width / (size * 0.65)), 4)
+        lines = []
+        line = ""
+        for word in words:
+            candidate = (line + " " + word).strip()
+            if len(candidate) <= max_chars:
+                line = candidate
+            else:
+                if line:
+                    lines.append(line)
+                line = word
+        if line:
+            lines.append(line)
+        if len(lines) <= 2:
+            break
+        size = int(size * 0.85)
+
+    return "\n".join(lines[:2]), size
+
+
+async def _add_hook_text_overlay(video_url: str, hook_text: str, video_width: Optional[int] = None) -> Optional[str]:
     """Download a finished video, burn hook_text into the first 2.5s via FFmpeg drawtext, re-upload to Cloudinary."""
     import tempfile
     import asyncio as _asyncio
@@ -8165,14 +8203,25 @@ async def _add_hook_text_overlay(video_url: str, hook_text: str) -> Optional[str
         with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as vf:
             vf.write(video_resp.content)
             video_tmp = vf.name
+
+        # video_width (from the job doc) reflects the ORIGINAL upload, probed before
+        # ZapCap touched it — its actual output can differ in resolution. Probe the
+        # real downloaded output file directly so wrapping is never wrong/stale.
+        from app.agents.social_media_manager.services.multi_clip_service import _probe_clip
+        probed = await _probe_clip(video_tmp)
+        actual_width = probed.get("width") or video_width or 1080
+
+        wrapped_text, fontsize = _wrap_for_drawtext(hook_text, actual_width, 52)
+        print(f"[HookOverlay] video_width={actual_width} fontsize={fontsize} text={wrapped_text!r}", flush=True)
+
         with tempfile.NamedTemporaryFile(suffix=".txt", mode="w", delete=False) as tf:
-            tf.write(hook_text)
+            tf.write(wrapped_text)
             text_tmp = tf.name
 
         output_path = f"/tmp/hook-overlay-{_uuid.uuid4().hex[:8]}.mp4"
         drawtext = (
             "drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:"
-            f"textfile={text_tmp}:fontsize=52:fontcolor=white:"
+            f"textfile={text_tmp}:fontsize={fontsize}:fontcolor=white:line_spacing=6:"
             "x=(w-text_w)/2:y=100:enable='between(t,0,2.5)':"
             "box=1:boxcolor=black@0.5:boxborderw=12"
         )
@@ -8956,7 +9005,7 @@ async def zapcap_job_status(
                 from app.agents.social_media_manager.services.video_production_service import _generate_hook_text
                 hook_text = await _generate_hook_text(transcript_text)
                 if hook_text:
-                    overlaid_url = await _add_hook_text_overlay(output_url, hook_text)
+                    overlaid_url = await _add_hook_text_overlay(output_url, hook_text, job.get("video_width"))
                     if overlaid_url:
                         await db["zapcap_jobs"].update_one(
                             {"job_id": job_id},
