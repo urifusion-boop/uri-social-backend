@@ -82,6 +82,8 @@ def _mock_client(responses):
 
     client.post = AsyncMock(side_effect=_next)
     client.get = AsyncMock(side_effect=_next)
+    # delete draws from the same queue so a rollback's DELETE can be asserted.
+    client.delete = AsyncMock(side_effect=_next)
     return client
 
 
@@ -341,3 +343,85 @@ def test_pause_ad_raises_on_error():
         MockClient.return_value.__aenter__.return_value = _mock_client(responses)
         with pytest.raises(MetaAPIError, match="pause ad"):
             _run(adapter.pause_ad("cmp_1", "ad_1"))
+
+
+# ── Partial-launch rollback ───────────────────────────────────────────────────
+# Meta has no transaction across campaign→adset→creative→ad. Live-confirmed on the
+# real ad account: six campaigns existed on Meta with NO row in our DB, left behind
+# by launches that died at the ad-set step (an unlinked WhatsApp number). They were
+# invisible in "My Campaigns" and unmanageable from the app.
+
+def test_launch_campaign_deletes_the_campaign_when_a_later_step_fails():
+    db = FakeDb()
+    adapter = _adapter(db)
+    responses = [
+        {"id": "cmp_1"},                                                      # campaign created
+        {"error": {"message": "WhatsApp number not linked", "code": 100,      # ad set REJECTED
+                   "error_subcode": 1487246}},
+        {"success": True},                                                    # rollback DELETE
+    ]
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client(responses)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        with pytest.raises(MetaAPIError, match="ad set creation"):
+            _run(adapter.launch_campaign(_plan(), _auth()))
+
+    # The orphan is cleaned up: the campaign we created is deleted on Meta.
+    assert mock_client.delete.await_count == 1
+    assert "cmp_1" in mock_client.delete.await_args.args[0]
+
+
+def test_launch_campaign_stores_no_record_when_a_later_step_fails():
+    db = FakeDb()
+    adapter = _adapter(db)
+    responses = [
+        {"id": "cmp_1"},
+        {"error": {"message": "WhatsApp number not linked", "code": 100}},
+        {"success": True},
+    ]
+    with patch("httpx.AsyncClient") as MockClient:
+        MockClient.return_value.__aenter__.return_value = _mock_client(responses)
+        with pytest.raises(MetaAPIError):
+            _run(adapter.launch_campaign(_plan(), _auth()))
+
+    assert _run(db["jane_ads_meta_campaigns"].find_one({"campaign_id": "cmp_1"})) is None
+
+
+def test_rollback_never_masks_the_original_error():
+    # The user needs Meta's real reason ("WhatsApp number not linked"), not a
+    # cleanup failure — so a failing rollback must stay silent about itself.
+    adapter = _adapter()
+    responses = [
+        {"id": "cmp_1"},
+        {"error": {"message": "WhatsApp number not linked", "code": 100}},
+    ]
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client(responses)
+        mock_client.delete = AsyncMock(side_effect=RuntimeError("network down"))
+        MockClient.return_value.__aenter__.return_value = mock_client
+        with pytest.raises(MetaAPIError, match="WhatsApp number not linked"):
+            _run(adapter.launch_campaign(_plan(), _auth()))
+
+
+def test_no_rollback_attempted_when_the_very_first_call_fails():
+    # Nothing was created yet, so there is nothing to undo.
+    adapter = _adapter()
+    responses = [{"error": {"message": "Invalid parameter", "code": 100}}]
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client(responses)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        with pytest.raises(MetaAPIError, match="campaign creation"):
+            _run(adapter.launch_campaign(_plan(), _auth()))
+    assert mock_client.delete.await_count == 0
+
+
+def test_successful_launch_never_rolls_anything_back():
+    db = FakeDb()
+    adapter = _adapter(db)
+    responses = [{"id": "cmp_1"}, {"id": "adset_1"}, {"id": "creative_1"}, {"id": "ad_1"}]
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client(responses)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        result = _run(adapter.launch_campaign(_plan(), _auth()))
+    assert result.campaign_id == "cmp_1"
+    assert mock_client.delete.await_count == 0
