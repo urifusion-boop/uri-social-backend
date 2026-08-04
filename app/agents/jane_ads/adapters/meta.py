@@ -236,120 +236,133 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
         if plan.creative.is_video:
             video_id, video_thumbnail_url = await self._upload_video_to_meta(plan.creative.image_url)
 
-        async with httpx.AsyncClient(timeout=30) as client:
-            campaign_resp = await client.post(
-                f"{self._graph_base}/act_{self._ad_account_id}/campaigns",
-                params={"access_token": self._access_token},
-                json={
-                    "name": f"JaneAds-{plan.business_id}-{plan.goal.value}",
-                    # Click-to-WhatsApp — Meta optimizes delivery toward people likely to
-                    # actually MESSAGE (not just tap), and counts real conversations. Works
-                    # now because the Page + number are the BRAND's own (per-brand ads
-                    # connection), not a shared Page — see ads_connection.py.
-                    "objective": "OUTCOME_ENGAGEMENT",
-                    "status": "PAUSED",
-                    "special_ad_categories": [],
-                    # Budget lives on the ad set (per-business isolation via caps.py/
-                    # fairness.py), not shared automatically across ad sets by Meta.
-                    "is_adset_budget_sharing_enabled": False,
-                },
-            )
-            campaign_data = campaign_resp.json()
-            _raise_for_error(campaign_data, "campaign creation")
-            campaign_id = campaign_data["id"]
-
-            adset_payload = {
-                "name": f"JaneAds-{plan.business_id}-adset",
-                "campaign_id": campaign_id,
-                "daily_budget": daily_budget_minor,
-                "billing_event": "IMPRESSIONS",
-                "bid_strategy": "LOWEST_COST_WITHOUT_CAP",
-                "targeting": {"geo_locations": {"countries": ["NG"]}},
-                "status": "PAUSED",
-                "start_time": start_time.isoformat(),
-                "end_time": end_time.isoformat(),
-            }
-            if is_followers_goal:
-                # Grow the Page's own following — confirmed live shape (Meta Marketing
-                # API docs): same OUTCOME_ENGAGEMENT campaign objective as a Click-to-
-                # WhatsApp ad, but POST_ENGAGEMENT optimization and no WhatsApp routing
-                # at all (no destination_type, no promoted_object.whatsapp_phone_number).
-                adset_payload["optimization_goal"] = "POST_ENGAGEMENT"
-            else:
-                # Optimize for started WhatsApp conversations, routed to the brand's
-                # own number. `promoted_object.whatsapp_phone_number` is confirmed live:
-                # Meta validates it's actually linked to this page/account and rejects
-                # with a specific, clear error if not — a free pre-flight check.
-                adset_payload["optimization_goal"] = "CONVERSATIONS"
-                adset_payload["destination_type"] = "WHATSAPP"
-                adset_payload["promoted_object"] = {"page_id": plan.page_id, "whatsapp_phone_number": plan.whatsapp_number}
-            adset_resp = await client.post(
-                f"{self._graph_base}/act_{self._ad_account_id}/adsets",
-                params={"access_token": self._access_token},
-                json=adset_payload,
-            )
-            adset_data = adset_resp.json()
-            _raise_for_error(adset_data, "ad set creation")
-            adset_id = adset_data["id"]
-
-            if is_followers_goal:
-                message = plan.creative.primary_text or plan.creative.headline or "Follow us for more!"
-                # LIKE_PAGE drives the tap straight to following the Page — confirmed
-                # live shape (Meta Marketing API docs), no link/WhatsApp routing at all.
-                cta = {"type": "LIKE_PAGE", "value": {"page": plan.page_id}}
-            else:
-                message = plan.creative.primary_text or plan.creative.headline or "Chat with us on WhatsApp!"
-                # WHATSAPP_MESSAGE routes the tap into a real WhatsApp chat with the number
-                # set in the ad set's promoted_object above — no link URL needed for this CTA.
-                cta = {"type": "WHATSAPP_MESSAGE"}
-            if plan.creative.is_video:
-                object_story_spec = {
-                    "page_id": plan.page_id,
-                    "video_data": {
-                        "video_id": video_id,
-                        "image_url": video_thumbnail_url,
-                        "message": message,
-                        "call_to_action": cta,
+        # Meta has no transaction across these four creates. Live-confirmed: a launch
+        # that failed at the ad-set step (Meta rejecting an unlinked WhatsApp number)
+        # left the already-created campaign behind on the ad account with NO row in
+        # our DB — invisible in 'My Campaigns' and unmanageable from the app. Six such
+        # orphans were found on the real account. Track what we created and undo it on
+        # any failure, so a partial launch never leaves anything behind.
+        campaign_id = ""
+        adset_id = ""
+        creative_id = ""
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                campaign_resp = await client.post(
+                    f"{self._graph_base}/act_{self._ad_account_id}/campaigns",
+                    params={"access_token": self._access_token},
+                    json={
+                        "name": f"JaneAds-{plan.business_id}-{plan.goal.value}",
+                        # Click-to-WhatsApp — Meta optimizes delivery toward people likely to
+                        # actually MESSAGE (not just tap), and counts real conversations. Works
+                        # now because the Page + number are the BRAND's own (per-brand ads
+                        # connection), not a shared Page — see ads_connection.py.
+                        "objective": "OUTCOME_ENGAGEMENT",
+                        "status": "PAUSED",
+                        "special_ad_categories": [],
+                        # Budget lives on the ad set (per-business isolation via caps.py/
+                        # fairness.py), not shared automatically across ad sets by Meta.
+                        "is_adset_budget_sharing_enabled": False,
                     },
-                }
-            else:
-                object_story_spec = {
-                    "page_id": plan.page_id,
-                    "link_data": {
-                        "message": message,
-                        # LIKE_PAGE ignores this link (the button does the follow action
-                        # itself) — the Page's own URL is a reasonable placeholder, same
-                        # pattern as the wa.me/ placeholder for WHATSAPP_MESSAGE below.
-                        "link": f"https://www.facebook.com/{plan.page_id}" if is_followers_goal else "https://wa.me/",
-                        "picture": plan.creative.image_url,
-                        "call_to_action": cta,
-                    },
-                }
-            creative_resp = await client.post(
-                f"{self._graph_base}/act_{self._ad_account_id}/adcreatives",
-                params={"access_token": self._access_token},
-                json={
-                    "name": f"JaneAds-{plan.business_id}-creative",
-                    "object_story_spec": object_story_spec,
-                },
-            )
-            creative_data = creative_resp.json()
-            _raise_for_error(creative_data, "ad creative creation")
-            creative_id = creative_data["id"]
+                )
+                campaign_data = campaign_resp.json()
+                _raise_for_error(campaign_data, "campaign creation")
+                campaign_id = campaign_data["id"]
 
-            ad_resp = await client.post(
-                f"{self._graph_base}/act_{self._ad_account_id}/ads",
-                params={"access_token": self._access_token},
-                json={
-                    "name": f"JaneAds-{plan.business_id}-ad",
-                    "adset_id": adset_id,
-                    "creative": {"creative_id": creative_id},
+                adset_payload = {
+                    "name": f"JaneAds-{plan.business_id}-adset",
+                    "campaign_id": campaign_id,
+                    "daily_budget": daily_budget_minor,
+                    "billing_event": "IMPRESSIONS",
+                    "bid_strategy": "LOWEST_COST_WITHOUT_CAP",
+                    "targeting": {"geo_locations": {"countries": ["NG"]}},
                     "status": "PAUSED",
-                },
-            )
-            ad_data = ad_resp.json()
-            _raise_for_error(ad_data, "ad creation")
-            ad_id = ad_data["id"]
+                    "start_time": start_time.isoformat(),
+                    "end_time": end_time.isoformat(),
+                }
+                if is_followers_goal:
+                    # Grow the Page's own following — confirmed live shape (Meta Marketing
+                    # API docs): same OUTCOME_ENGAGEMENT campaign objective as a Click-to-
+                    # WhatsApp ad, but POST_ENGAGEMENT optimization and no WhatsApp routing
+                    # at all (no destination_type, no promoted_object.whatsapp_phone_number).
+                    adset_payload["optimization_goal"] = "POST_ENGAGEMENT"
+                else:
+                    # Optimize for started WhatsApp conversations, routed to the brand's
+                    # own number. `promoted_object.whatsapp_phone_number` is confirmed live:
+                    # Meta validates it's actually linked to this page/account and rejects
+                    # with a specific, clear error if not — a free pre-flight check.
+                    adset_payload["optimization_goal"] = "CONVERSATIONS"
+                    adset_payload["destination_type"] = "WHATSAPP"
+                    adset_payload["promoted_object"] = {"page_id": plan.page_id, "whatsapp_phone_number": plan.whatsapp_number}
+                adset_resp = await client.post(
+                    f"{self._graph_base}/act_{self._ad_account_id}/adsets",
+                    params={"access_token": self._access_token},
+                    json=adset_payload,
+                )
+                adset_data = adset_resp.json()
+                _raise_for_error(adset_data, "ad set creation")
+                adset_id = adset_data["id"]
+
+                if is_followers_goal:
+                    message = plan.creative.primary_text or plan.creative.headline or "Follow us for more!"
+                    # LIKE_PAGE drives the tap straight to following the Page — confirmed
+                    # live shape (Meta Marketing API docs), no link/WhatsApp routing at all.
+                    cta = {"type": "LIKE_PAGE", "value": {"page": plan.page_id}}
+                else:
+                    message = plan.creative.primary_text or plan.creative.headline or "Chat with us on WhatsApp!"
+                    # WHATSAPP_MESSAGE routes the tap into a real WhatsApp chat with the number
+                    # set in the ad set's promoted_object above — no link URL needed for this CTA.
+                    cta = {"type": "WHATSAPP_MESSAGE"}
+                if plan.creative.is_video:
+                    object_story_spec = {
+                        "page_id": plan.page_id,
+                        "video_data": {
+                            "video_id": video_id,
+                            "image_url": video_thumbnail_url,
+                            "message": message,
+                            "call_to_action": cta,
+                        },
+                    }
+                else:
+                    object_story_spec = {
+                        "page_id": plan.page_id,
+                        "link_data": {
+                            "message": message,
+                            # LIKE_PAGE ignores this link (the button does the follow action
+                            # itself) — the Page's own URL is a reasonable placeholder, same
+                            # pattern as the wa.me/ placeholder for WHATSAPP_MESSAGE below.
+                            "link": f"https://www.facebook.com/{plan.page_id}" if is_followers_goal else "https://wa.me/",
+                            "picture": plan.creative.image_url,
+                            "call_to_action": cta,
+                        },
+                    }
+                creative_resp = await client.post(
+                    f"{self._graph_base}/act_{self._ad_account_id}/adcreatives",
+                    params={"access_token": self._access_token},
+                    json={
+                        "name": f"JaneAds-{plan.business_id}-creative",
+                        "object_story_spec": object_story_spec,
+                    },
+                )
+                creative_data = creative_resp.json()
+                _raise_for_error(creative_data, "ad creative creation")
+                creative_id = creative_data["id"]
+
+                ad_resp = await client.post(
+                    f"{self._graph_base}/act_{self._ad_account_id}/ads",
+                    params={"access_token": self._access_token},
+                    json={
+                        "name": f"JaneAds-{plan.business_id}-ad",
+                        "adset_id": adset_id,
+                        "creative": {"creative_id": creative_id},
+                        "status": "PAUSED",
+                    },
+                )
+                ad_data = ad_resp.json()
+                _raise_for_error(ad_data, "ad creation")
+                ad_id = ad_data["id"]
+        except Exception:
+            await self._rollback_partial_launch(campaign_id, creative_id)
+            raise
 
         await self._db[COLLECTION].update_one(
             {"campaign_id": campaign_id},
@@ -371,6 +384,37 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
             platforms=[Platform.META],
             launched=True,
         )
+
+    async def _rollback_partial_launch(self, campaign_id: str, creative_id: str = "") -> None:
+        """Undo a launch that failed midway, so Meta is never left holding a campaign
+        our DB doesn't know about (see launch_campaign). Deleting the campaign cascades
+        to its ad set and ad — same as delete_campaign — so only the campaign and the
+        account-level ad creative need removing.
+
+        Strictly best-effort and never raises: the caller is already unwinding a real
+        failure, and the ORIGINAL error is what the user needs to see (e.g. "this
+        WhatsApp number is not linked"). A cleanup problem must never mask it. Anything
+        that can't be removed is logged loudly so it can be reconciled by hand.
+        """
+        if not (campaign_id or creative_id):
+            return
+        for node_id, label in ((campaign_id, "campaign"), (creative_id, "ad creative")):
+            if not node_id:
+                continue
+            try:
+                async with httpx.AsyncClient(timeout=15) as client:
+                    resp = await client.delete(
+                        f"{self._graph_base}/{node_id}",
+                        params={"access_token": self._access_token},
+                    )
+                data = resp.json()
+                if "error" in data:
+                    print(f"[MetaAdapter] ORPHANED {label} {node_id} — rollback rejected: "
+                          f"{data['error'].get('message')}", flush=True)
+                else:
+                    print(f"[MetaAdapter] rolled back partial launch: deleted {label} {node_id}", flush=True)
+            except Exception as e:
+                print(f"[MetaAdapter] ORPHANED {label} {node_id} — rollback failed: {e}", flush=True)
 
     async def _get_campaign_record(self, campaign_id: str) -> dict:
         record = await self._db[COLLECTION].find_one({"campaign_id": campaign_id})

@@ -41,6 +41,10 @@ from .wallet import InsufficientFundsError, MinimumTopUpError, WalletService
 
 router = APIRouter(prefix="/jane-ads", tags=["Jane + Ads (demo)"])
 
+# Meta's "Deleted campaigns can't be edited" rejection (code=100). Confirmed live
+# against a real stale record — see set_meta_campaign_status, which self-heals on it.
+META_DELETED_CAMPAIGN_SUBCODE = 1487566
+
 # Shown (via HTTP 503) whenever the AI backend Jane depends on is unreachable —
 # OpenAI over quota, timing out, or down. A plain "try again later", never a
 # follow-up question, so the UI can't loop pretending it just needs more info.
@@ -2004,6 +2008,18 @@ async def set_meta_campaign_status(
     try:
         result = await adapter.set_delivery(campaign_id, body.active)
     except MetaAPIError as e:
+        # Same self-heal the campaign LIST already does, which this endpoint was
+        # missing: a campaign deleted on Meta's side (in Ads Manager, or a manual
+        # cleanup) left a stale row here, and pausing it surfaced Meta's raw
+        # "Deleted campaigns can't be edited" text as a 502 — live-confirmed on a
+        # real record. Drop our own row and tell the caller plainly instead.
+        if e.subcode == META_DELETED_CAMPAIGN_SUBCODE:
+            await db["jane_ads_meta_campaigns"].delete_one({"campaign_id": campaign_id})
+            raise HTTPException(
+                status_code=410,
+                detail="That campaign no longer exists on Meta — it was deleted. "
+                       "We've removed it from your list.",
+            )
         _raise_http_for_meta_error(e)
     return result
 
