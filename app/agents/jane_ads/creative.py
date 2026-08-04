@@ -62,10 +62,27 @@ async def get_brand_context(user_id: str, db, brand_id: Optional[str] = None) ->
     if not user_id or db is None:
         return {}
     from app.agents.social_media_manager.services.brand_profile_service import BrandProfileService
+    from app.agents.social_media_manager.services.style_library import pick_next_style
     try:
         resp = await BrandProfileService.get(user_id, db, brand_id)
         profile = resp.get("responseData") if isinstance(resp, dict) else None
-        return BrandProfileService.to_brand_context(profile)
+        bc = BrandProfileService.to_brand_context(profile)
+        if not bc:
+            return bc
+        # Organic content always picks a style (the brand's own rotation, or a
+        # sensible default) before generating — ads never did, silently falling
+        # back to _generate_platform_image's generic "immersive" composition with
+        # no style_desc at all, a real, visible quality gap versus organic posts
+        # from the same brand. Same selection the organic flow uses, so an ad
+        # image looks as considered as a normal post.
+        style_selections = bc.get("style_selections") or []
+        style_fragments = (profile or {}).get("style_prompt_fragments") or []
+        slug, fragment, _ = pick_next_style(
+            style_selections, bc.get("style_rotation_index", 0), bc.get("industry", ""), style_fragments,
+        )
+        if fragment:
+            bc = {**bc, "style_prompt_fragment": fragment, "style_slug": slug}
+        return bc
     except Exception as e:
         print(f"[Creative] brand context error: {e}", flush=True)
         return {}
