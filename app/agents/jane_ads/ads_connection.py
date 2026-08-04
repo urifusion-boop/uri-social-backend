@@ -176,18 +176,35 @@ async def resolve_ads_page_for_launch(
     db, user_id: Optional[str], brand_id: Optional[str], *, require_whatsapp: bool = True,
 ) -> dict:
     """The pre-flight gate: returns {"page_id", "whatsapp_number", "page_name"} or
-    raises AdsConnectionRequired with the exact state — called before ANY campaign
-    plan is built, never at launch, so a client is never let all the way through a
-    conversation only to hit a wall (Per-Brand Page Connection plan §3).
-    `require_whatsapp=False` for a campaign goal that never uses it (e.g. followers) —
-    `whatsapp_number` in the returned dict may then be empty."""
-    state, ads = await resolve_connection_state(db, user_id, brand_id, require_whatsapp=require_whatsapp)
-    if state != ConnectionState.READY:
-        raise AdsConnectionRequired(state, (ads or {}).get("account_name", ""))
+    raises AdsConnectionRequired — called before ANY campaign plan is built, never
+    at launch, so a client is never let all the way through a conversation only to
+    hit a wall.
+
+    Every brand launches from URI's own shared Facebook Page and shared ad account
+    (settings.META_ADS_PAGE_ID / META_AD_ACCOUNT_ID) — that's the actual intended
+    architecture, not a fallback. A client never connects their own Facebook Page;
+    what distinguishes one brand's ads from another's is the WhatsApp number leads
+    land in (their own, saved via GET/PUT /jane-ads/whatsapp — already wired up in
+    the app) and the creative itself. `require_whatsapp=False` is for a campaign
+    goal that never routes anywhere via WhatsApp (e.g. followers) — `whatsapp_number`
+    in the returned dict may then be empty.
+
+    (A brand can still separately connect their own Facebook Page via
+    /connect/facebook-ads — resolve_connection_state/ConnectionState is what tracks
+    and health-checks that. It's just not required to launch.)"""
+    from .whatsapp import get_brand_whatsapp
+
+    if not settings.META_ADS_PAGE_ID:
+        raise AdsConnectionRequired(ConnectionState.NO_PAGE)
+
+    wa_number = await get_brand_whatsapp(db, brand_id) if require_whatsapp else ""
+    if require_whatsapp and not wa_number:
+        raise AdsConnectionRequired(ConnectionState.ADS_NO_WHATSAPP)
+
     return {
-        "page_id": ads["page_id"],
-        "whatsapp_number": ads.get("whatsapp_number", ""),
-        "page_name": ads.get("account_name", ""),
+        "page_id": settings.META_ADS_PAGE_ID,
+        "whatsapp_number": wa_number,
+        "page_name": "URI Social",
     }
 
 

@@ -40,12 +40,17 @@ class Settings(BaseSettings):
     # (~60 day expiry) obtained via /connect/facebook-ads OAuth consent — confirmed
     # live to work where a system-user-generated token (META_SYSTEM_TOKEN) did not,
     # for reasons not yet root-caused. Needs periodic manual refresh until that's
-    # sorted out. This is URI's OWN token (used to run the ads API calls) — the ad's
-    # Facebook Page is resolved per-brand (ads_connection.py), never from a shared
-    # env var; that shared-page fallback was deliberately removed (Per-Brand Page
-    # Connection plan §7) since it's exactly how one Page ended up serving every
-    # client's leads.
+    # sorted out. This is URI's OWN token, used to run every ad-account write for
+    # every brand.
     META_ADS_ACCESS_TOKEN: str = ""
+    # URI's own Facebook Page — every brand's ads run from this one Page (the
+    # intended architecture: what distinguishes one brand's ads from another's is
+    # the WhatsApp number leads land in and the creative, never a separate Page
+    # identity). Must be a Page URI's Business Manager actually has ADVERTISE
+    # access to (ads_connection.py's business_manager_shared tracks this per any
+    # per-brand Page a client separately connects, but this shared Page's own
+    # access has to be confirmed manually in Meta Business Settings).
+    META_ADS_PAGE_ID: str = ""
 
     # Instagram Business Login (separate app credentials from the Instagram product)
     INSTAGRAM_APP_ID: str = ""
