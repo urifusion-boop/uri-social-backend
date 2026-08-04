@@ -655,6 +655,13 @@ async def jane_meta_connection_status(
         # consent screen instead of just "reconnect and hope" (confirmed live: a token
         # can be valid but still missing ads_management/pages_manage_ads etc.).
         "missing_scopes": (ads or {}).get("_missing_scopes", []),
+        # Also only meaningful when state == "expired": set instead of missing_scopes
+        # when the OAuth scopes/token are fine but URI's Business Manager never
+        # actually got ADVERTISE access to the page (e.g. Meta rejects the share as
+        # a "duplicated asset") — a different failure that needs a different fix
+        # (resolving the asset conflict in Meta Business Settings), not just
+        # re-consenting to the same scopes.
+        "business_manager_error": (ads or {}).get("_business_manager_error", ""),
     }
 
 
