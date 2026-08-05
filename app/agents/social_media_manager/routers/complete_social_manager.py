@@ -2890,6 +2890,11 @@ async def generate_calendar_plan(
         # Python repr instead of real text, and this also gives consistent field names
         # (business_description/brand_voice) instead of relying on per-field fallbacks.
         brand = BrandProfileService.to_brand_context(raw_profile) if raw_profile else {}
+        # to_brand_context collapses key_dates into a display string for the
+        # passive "extras" line — keep the raw {label, date} list too so the
+        # calendar can deterministically check whether one actually falls in
+        # the week being generated, instead of just mentioning it as text.
+        brand["key_dates_structured"] = raw_profile.get("key_dates") or []
         plan = await cal_svc.generate_plan(
             user_id=user_id,
             platforms=request.platforms,
@@ -2941,6 +2946,26 @@ async def create_draft_from_calendar_day(
     user_id = ctx["user_id"]
     brand_id = ctx["brand_id"]
     try:
+        # ==================== PRD 7.2 & 8: Credit Check ====================
+        # This endpoint was generating full drafts (including images) with zero
+        # credit enforcement — the same gate /generate-content already applies.
+        from app.services.CreditService import credit_service
+        from app.services.TrialService import trial_service
+
+        is_trial_user = await trial_service.has_active_trial(user_id)
+        if not is_trial_user:
+            has_credits = await credit_service.check_sufficient_credits(user_id)
+            if not has_credits:
+                return JSONResponse(
+                    status_code=402,
+                    content={
+                        "status": False,
+                        "responseCode": 402,
+                        "responseMessage": "You've run out of credits. Upgrade to continue.",
+                        "responseData": {"credits_remaining": 0, "upgrade_url": "/pricing"},
+                    },
+                )
+
         from app.agents.social_media_manager.services.content_calendar_service import _cal_scope
         plan = await db["content_calendar_plans"].find_one(
             {**_cal_scope(user_id, brand_id), "plan_id": plan_id}, {"_id": 0}
@@ -2998,6 +3023,27 @@ async def create_draft_from_calendar_day(
             drafts = result.get("responseData", {}).get("drafts", [])
             draft_ids = [d.get("draft_id") or d.get("id") for d in drafts if d]
             await cal_svc.mark_acted_on(plan_id, day_index, draft_ids, user_id, db, brand_id=brand_id)
+
+            # ==================== PRD 7.2: Credit Deduction ====================
+            request_id = result.get("responseData", {}).get("request_id")
+            credits_to_deduct = len(drafts) if (day.get("format") == "carousel" and drafts) else 1
+            if request_id:
+                if is_trial_user:
+                    await trial_service.deduct_trial_credit(
+                        user_id=user_id,
+                        campaign_id=request_id,
+                        reason="campaign_generation",
+                        amount=credits_to_deduct,
+                    )
+                else:
+                    await credit_service.deduct_credit(
+                        user_id=user_id,
+                        campaign_id=request_id,
+                        reason="campaign_generation",
+                        retry_count=0,
+                        amount=credits_to_deduct,
+                    )
+                print(f"✅ Deducted {credits_to_deduct} credit(s) from user {user_id} for calendar draft {request_id}")
 
             if request.include_images:
                 draft_ids = [d.get("draft_id") or d.get("id") for d in drafts if d]
