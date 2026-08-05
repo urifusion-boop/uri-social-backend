@@ -352,7 +352,10 @@ def _validate_day(idea: Dict[str, Any]) -> List[str]:
         issues.append("video_idea is missing")
     else:
         if video_idea.get("format") not in VIDEO_FORMATS:
-            issues.append(f"video_idea.format {video_idea.get('format')!r} is not a recognised format")
+            issues.append(
+                f"video_idea.format {video_idea.get('format')!r} is not a recognised format — "
+                f"it MUST be exactly one of: {', '.join(sorted(VIDEO_FORMATS))} (no other wording, no synonyms)"
+            )
         if len(str(video_idea.get("hook") or "").strip()) < 10:
             issues.append("video_idea.hook is missing or too short")
         if not video_idea.get("talking_points"):
@@ -518,6 +521,41 @@ async def _generate_ideas(
         "content, an established one can lean harder into authority/scale content."
     )
 
+    # ── User-saved key dates (req 4) ────────────────────────────────────────────
+    # These are dates the business owner explicitly saved in their Brand Playbook
+    # (product launches, sales, anniversaries) — unlike public holidays, we have
+    # the exact date already, so this is a deterministic Python match against the
+    # week being generated, not something left to the model to notice on its own.
+    user_date_block = ""
+    if _week_dt is not None:
+        _week_end_for_dates = _week_dt + timedelta(days=6)
+        user_date_matches: List[tuple] = []
+        for kd in (brand.get("key_dates_structured") or []):
+            label = str((kd or {}).get("label") or "").strip()
+            date_str = str((kd or {}).get("date") or "").strip()
+            if not label or not date_str:
+                continue
+            try:
+                kd_dt = datetime.strptime(date_str, "%Y-%m-%d")
+            except ValueError:
+                continue
+            if _week_dt <= kd_dt <= _week_end_for_dates:
+                user_date_matches.append(((kd_dt - _week_dt).days, label, date_str))
+        if user_date_matches:
+            lines = [
+                f"  Day {di} ({WEEK_DAYS[di]}, {ds}): MUST build this day's idea around \"{lbl}\" "
+                f"and set holiday_reference to {{\"name\": \"{lbl}\", \"why_relevant\": \"...\"}} on that day."
+                for di, lbl, ds in user_date_matches
+            ]
+            user_date_block = (
+                "=== MANDATORY: BUSINESS OWNER'S OWN SAVED DATES FALL IN THIS WEEK ===\n"
+                "These are NOT general public holidays — the business owner personally saved these "
+                "as important (product launches, sales, anniversaries). Unlike the general holiday "
+                "check above, this is non-negotiable:\n"
+                + "\n".join(lines)
+                + "\n======================================================================="
+            )
+
     # When force-regenerating, inject a random token so the model cannot return
     # a cached/memorised response identical to the previous generation.
     force_token_block = ""
@@ -648,6 +686,7 @@ specific about THIS business, not a generic instance of its content_type.
 {season_line}
 {country_block}
 {stage_block}
+{user_date_block}
 
 {performance_block}
 {content_focus_line}
@@ -1046,6 +1085,7 @@ async def generate_plan(
             "cta_styles":          brand.get("cta_styles") or [],
             "guardrails":          brand.get("guardrails") or {},
             "key_dates":           brand.get("key_dates"),
+            "key_dates_structured":brand.get("key_dates_structured") or [],
             "posting_cadence":     brand.get("posting_cadence"),
             "website":             brand.get("website"),
         },
@@ -1153,6 +1193,22 @@ async def regenerate_day(
         "authority/scale content)."
     )
 
+    # Same deterministic check as _generate_ideas — if the business owner saved a
+    # date that lands on THIS exact day, it's non-negotiable, not left to AI recall.
+    user_date_block = ""
+    day_date_str = day.get("date") or ""
+    for kd in (brand.get("key_dates_structured") or []):
+        label = str((kd or {}).get("label") or "").strip()
+        date_str = str((kd or {}).get("date") or "").strip()
+        if label and date_str and date_str == day_date_str:
+            user_date_block = (
+                f"MANDATORY: the business owner personally saved {day_date_str} as \"{label}\" "
+                f"in their Brand Playbook — this day's idea MUST be built around it (not a general "
+                f"public holiday, non-negotiable). Set holiday_reference to "
+                f'{{"name": "{label}", "why_relevant": "..."}}.'
+            )
+            break
+
     base_prompt = f"""You are a senior social media strategist.
 
 {brand_line}
@@ -1162,6 +1218,7 @@ Target audience: {audience}{f' | {region} market' if region else ''}
 Platforms: {platforms_str}
 {country_block}
 {stage_block}
+{user_date_block}
 {avoid_block}
 
 Generate ONE new, COMPLETE {CONTENT_TYPE_LABELS[content_type]} content brief for {day_name}
