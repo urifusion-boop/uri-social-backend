@@ -8546,6 +8546,7 @@ async def zapcap_produce(
     enable_broll: str = Form("false"),
     enable_music: str = Form("false"),
     enable_hook_text: str = Form("false"),
+    custom_hook_text: str = Form(""),
     caption_style: str = Form("bold"),
     custom_music: Optional[UploadFile] = File(None),
     custom_broll_clips: List[UploadFile] = File(default=[]),
@@ -8752,6 +8753,7 @@ async def zapcap_produce(
         "caption_style": caption_style,
         "music_url": music_url,
         "hook_text_enabled": enable_hook_text.lower() == "true",
+        "custom_hook_text": custom_hook_text.strip() or None,
         "video_url": video_url,
         "video_width": probed_width or None,
         "video_height": probed_height or None,
@@ -9000,21 +9002,26 @@ async def zapcap_job_status(
         # finished) and burn it into the first 2.5s. Chained after music so it operates
         # on whichever URL is current at this point. Best-effort — never blocks the render.
         if job.get("hook_text_enabled"):
-            print(f"[HookText] generating for job {job_id}", flush=True)
             try:
-                stored_words = job.get("transcript_words") or []
-                if not stored_words:
-                    async with httpx.AsyncClient(timeout=30) as client:
-                        tr = await client.get(
-                            f"{_ZAPCAP_BASE}/videos/{zapcap_video_id}/task/{zapcap_task_id}/transcript",
-                            headers=headers,
-                        )
-                    if tr.status_code == 200:
-                        stored_words = tr.json() if isinstance(tr.json(), list) else []
-                transcript_text = " ".join(w.get("text", "") for w in stored_words).strip()
+                hook_text = job.get("custom_hook_text")
+                if hook_text:
+                    print(f"[HookText] using user-provided text for job {job_id}: '{hook_text}'", flush=True)
+                else:
+                    print(f"[HookText] generating for job {job_id}", flush=True)
+                    stored_words = job.get("transcript_words") or []
+                    if not stored_words:
+                        async with httpx.AsyncClient(timeout=30) as client:
+                            tr = await client.get(
+                                f"{_ZAPCAP_BASE}/videos/{zapcap_video_id}/task/{zapcap_task_id}/transcript",
+                                headers=headers,
+                            )
+                        if tr.status_code == 200:
+                            stored_words = tr.json() if isinstance(tr.json(), list) else []
+                    transcript_text = " ".join(w.get("text", "") for w in stored_words).strip()
 
-                from app.agents.social_media_manager.services.video_production_service import _generate_hook_text
-                hook_text = await _generate_hook_text(transcript_text)
+                    from app.agents.social_media_manager.services.video_production_service import _generate_hook_text
+                    hook_text = await _generate_hook_text(transcript_text)
+
                 if hook_text:
                     overlaid_url = await _add_hook_text_overlay(output_url, hook_text, job.get("video_width"))
                     if overlaid_url:
