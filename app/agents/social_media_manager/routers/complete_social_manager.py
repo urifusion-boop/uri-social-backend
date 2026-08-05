@@ -1377,6 +1377,17 @@ async def facebook_ads_initiate(source: Optional[str] = Query("settings")):
         "scope": ",".join(scopes),
         "response_type": "code",
         "state": source or "settings",
+        # Facebook's consent dialog does NOT re-prompt for a permission the user
+        # already decided on (granted OR declined) in a past login, even across
+        # completely different Page connections — it silently reuses that old
+        # decision. Live-confirmed on real connections: the first-ever connect got
+        # ads_management + pages_manage_ads granted; every later connect by the same
+        # person, for different Pages, silently carried forward whatever was
+        # decided that first time and came back WITHOUT them. auth_type=rerequest
+        # forces Facebook to show every requested permission again on every call,
+        # regardless of prior history, which is exactly what a per-brand ads
+        # connection needs — one person may connect several distinct Pages.
+        "auth_type": "rerequest",
     }
     auth_url = f"https://www.facebook.com/{settings.FACEBOOK_API_VERSION}/dialog/oauth?" + urllib.parse.urlencode(params)
     return RedirectResponse(auth_url)
