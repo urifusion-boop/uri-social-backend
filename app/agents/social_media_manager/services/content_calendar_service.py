@@ -424,10 +424,10 @@ async def _generate_ideas(
         "offer":      "deals, discounts, limited-time sales, pricing savings — e.g. a money-saving tip, a promo breakdown, a 'best deal right now' angle",
         "technology": "practical tech tools, apps, automation, AI — e.g. a tool that saves time, an automation hack, a software comparison",
         "finance":    "money management, investing, savings, budgeting, profit margins — e.g. an investment tip, a budgeting mistake, a savings strategy",
-        "business":   "entrepreneurship, client acquisition, sales strategy, startup growth — e.g. how to land clients, a scaling lesson, a founder insight",
-        "education":  "step-by-step guides, how-to posts, common mistakes, beginner tips — e.g. a tutorial, a 'what I wish I knew' post, a myth-bust",
-        "marketing":  "audience growth tactics, brand-building, content strategy — e.g. an algorithm insight, a growth hack, a posting strategy",
-        "motivation": "mindset, discipline, resilience, goal-setting — e.g. a personal growth story, a hard truth about success, an anti-procrastination angle",
+        "business":   "the REAL day-to-day business side of running THIS specific business — an actual decision, tradeoff, cost, or lesson from operating it (e.g. a real pricing decision you made, a supplier/logistics lesson, a hiring moment) — NOT generic 'how to land clients' advice that could belong to any business",
+        "education":  "step-by-step guides, how-to posts, common mistakes, beginner tips — but taught using THIS brand's own product/process/materials as the concrete example, not a generic industry how-to",
+        "marketing":  "how THIS brand specifically grows its own audience — a real tactic it actually uses, a lesson from its own posting/sales history, a real before/after — NOT generic 'algorithm hack' advice any marketing account could post",
+        "motivation": "mindset, discipline, resilience, goal-setting — grounded in a real moment from running THIS business (a hard day, a decision that paid off, a lesson learned) — NOT a generic inspirational-quote-style post",
         "real estate":"property investing, rental income, mortgage tips, landlord lessons",
         "fashion":    "style tips, outfit ideas, trend breakdowns, wardrobe hacks",
         "food":       "recipes, meal prep, food business tips, catering insights",
@@ -656,12 +656,18 @@ async def _generate_ideas(
         topic_override_block = (
             f"=== MANDATORY TOPIC ASSIGNMENTS (derived from real engagement data) ===\n"
             f"Each day's post MUST be about the assigned topic — the definition in parentheses tells you exactly what the post should cover.\n"
-            f"CRITICAL: these topics are the SUBJECT MATTER of the post — they are not about this brand's own services or platform.\n"
+            f"These topics are the SUBJECT MATTER — don't force every day into a sales pitch for this "
+            f"brand's own product/platform if the topic doesn't call for one. But the post still needs "
+            f"to sound like THIS specific business wrote it: use its real voice, reference its actual "
+            f"products/experience/examples wherever that fits naturally, and connect the topic back to "
+            f"this business's own audience and context. A generic industry post that could belong to any "
+            f"brand in this space is a failure even if it's on-topic — 'technology' for a bakery should "
+            f"read like a baker talking about tech she actually uses, not a generic tech account.\n"
             f"The brand voice/audience tells you HOW and WHO to write for — the topic tells you WHAT to write about.\n"
             f"{_topic_lines}\n"
             f"======================================================================="
         )
-        content_focus_line = ""  # suppress pillars entirely — topics are set above
+        content_focus_line = f"Content pillars (secondary — still keep these in mind for voice/context even on assigned-topic days): {pillars_str}"
     else:
         topic_override_block = ""
         content_focus_line = f"Content pillars: {pillars_str}"
@@ -755,6 +761,7 @@ Rules:
 - Behind the scenes: ROTATE each week between these distinct angles — workspace setup, product/service creation process, team doing actual work (NOT "Meet the team" introductions), packaging/delivery moment, before-and-after of a real project, client prep or discovery call, tool/workflow walkthrough. Do NOT default to team introduction posts.
 - Match the brand voice exactly — if casual, be casual; if bold, be bold
 - Never be generic — every idea should be impossible to copy-paste to a different brand
+- SELF-CHECK before finalizing each day: point to one concrete, real detail unique to THIS brand in your own output — a named product/service, a specific number, a specific audience/location detail, or a direct reference to what this business actually does. If you can't point to one, rewrite the idea.
 - If you notice you are writing similar angles back-to-back, STOP and pick a completely different direction
 """
 
@@ -786,7 +793,16 @@ Rules:
     correction_block = ""
     ideas: List[Dict[str, Any]] = []
     for attempt in range(2):
-        ideas = await _call_and_parse(prompt + correction_block, force)
+        try:
+            ideas = await _call_and_parse(prompt + correction_block, force)
+        except Exception as exc:
+            if attempt == 0:
+                raise
+            # The retry itself failed to parse (e.g. truncated/malformed output) —
+            # fall back to attempt 0's result rather than crashing the whole plan,
+            # matching the "never leave the user with zero plan" design intent.
+            print(f"[Calendar] Retry attempt failed to parse ({exc}) — using attempt 1's best-effort result", flush=True)
+            break
 
         failures: Dict[int, List[str]] = {}
         for idea in ideas:
@@ -1270,7 +1286,13 @@ SAME idea — they must cohere as one thought, not read like separate templates 
     correction_block = ""
     new_idea: Dict[str, Any] = {}
     for attempt in range(2):
-        new_idea = await _call_and_parse(base_prompt + correction_block)
+        try:
+            new_idea = await _call_and_parse(base_prompt + correction_block)
+        except Exception as exc:
+            if attempt == 0:
+                raise
+            print(f"[Calendar] regenerate_day retry failed to parse ({exc}) — using attempt 1's best-effort result", flush=True)
+            break
         issues = _validate_day(new_idea)
         if not issues:
             break
