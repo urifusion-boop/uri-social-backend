@@ -454,7 +454,10 @@ def test_followers_goal_keeps_engagement_objective_and_page_link():
 
 def test_video_creative_carries_the_wa_link_on_the_cta():
     # video_data has no link field of its own, so the wa.me destination has to ride on
-    # the call_to_action or the tap would go nowhere.
+    # the call_to_action or the tap would go nowhere. Live-confirmed against the real
+    # Meta API: WHATSAPP_MESSAGE rejects a "link" in its value ("Too many parameters
+    # in Call to Action", code=105, subcode=1815630) — LEARN_MORE is the CTA type that
+    # actually accepts one for a video creative.
     db = FakeDb()
     adapter = _adapter(db)
     responses = [
@@ -472,4 +475,5 @@ def test_video_creative_carries_the_wa_link_on_the_cta():
         _run(adapter.launch_campaign(plan, _auth()))
 
     video_data = mock_client.post.call_args_list[-2].kwargs["json"]["object_story_spec"]["video_data"]
+    assert video_data["call_to_action"]["type"] == "LEARN_MORE"
     assert video_data["call_to_action"]["value"]["link"] == "https://wa.me/2348031234567"

@@ -328,11 +328,21 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                     message = plan.creative.primary_text or plan.creative.headline or "Chat with us on WhatsApp!"
                     # The tap opens a WhatsApp chat with the brand's OWN number through a
                     # plain wa.me link (see the ad set above for why this is a link ad and
-                    # not Meta's native Click-to-WhatsApp). A video creative carries no
-                    # link_data.link of its own, so the destination has to ride on the CTA.
+                    # not Meta's native Click-to-WhatsApp). For photo ads the destination
+                    # is link_data.link itself, so the CTA carries no value at all.
+                    # video_data has no link field of its own (confirmed against Meta's
+                    # AdCreativeVideoData reference — no such field exists), so the
+                    # destination has to ride on the CTA's value.link instead. Live-
+                    # confirmed WHATSAPP_MESSAGE rejects that: "Please remove the 'link'
+                    # parameter from the value of the WhatsApp message Call to Action"
+                    # (code=105, subcode=1815630) — that CTA type only supports a link via
+                    # its own native promoted_object routing, which this system doesn't use.
+                    # LEARN_MORE is a plain link-carrying CTA Meta accepts on video_data;
+                    # the button reads "Learn More" instead of "Send WhatsApp Message" for
+                    # video ads specifically, but the tap still opens the same wa.me chat.
                     cta = {"type": "WHATSAPP_MESSAGE"}
                     if plan.creative.is_video and wa_link:
-                        cta = {"type": "WHATSAPP_MESSAGE", "value": {"link": wa_link}}
+                        cta = {"type": "LEARN_MORE", "value": {"link": wa_link}}
                 if plan.creative.is_video:
                     object_story_spec = {
                         "page_id": plan.page_id,
