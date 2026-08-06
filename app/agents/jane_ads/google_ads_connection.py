@@ -49,6 +49,10 @@ class ConnectionState(str, Enum):
     NONE = "none"                                  # no google_ads connection of any kind
     OAUTH_PENDING = "oauth_pending"                 # OAuth doc stored, not yet finalized to a brand
     NO_WHATSAPP = "no_whatsapp"                     # connection healthy but no brand WhatsApp number saved
+    NEEDS_ACCOUNT_SELECTION = "needs_account_selection"  # OAuth finalized, but no customer_id chosen yet —
+                                                     # distinct from MANAGER_LINK_PENDING: nothing has been
+                                                     # sent to Google to wait on yet, the brand hasn't picked
+                                                     # link-existing vs. create-new
     MANAGER_LINK_PENDING = "manager_link_pending"   # link request sent, awaiting client accept
     MANAGER_LINK_REFUSED = "manager_link_refused"   # client account already linked to another manager
     EXPIRED = "expired"                             # refresh token invalid/revoked
@@ -194,6 +198,12 @@ async def resolve_connection_state(
 
     if conn.get("manager_link_status") == "refused":
         return ConnectionState.MANAGER_LINK_REFUSED, conn
+    if not conn.get("customer_id"):
+        # OAuth is done, but nothing has been sent to Google to wait on yet — the
+        # brand hasn't chosen link-existing vs. create-new. Checked BEFORE the
+        # "pending" branch below: a doc with manager_link_status="none" and no
+        # customer_id is NOT the same as one where an invitation was actually sent.
+        return ConnectionState.NEEDS_ACCOUNT_SELECTION, conn
     if conn.get("manager_link_status") in (None, "", "none", "pending"):
         return ConnectionState.MANAGER_LINK_PENDING, conn
 

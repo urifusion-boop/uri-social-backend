@@ -137,6 +137,26 @@ def test_resolve_connection_state_manager_link_pending():
     assert state == ConnectionState.MANAGER_LINK_PENDING
 
 
+def test_resolve_connection_state_needs_account_selection_right_after_oauth():
+    """A connection with OAuth done but no customer_id chosen yet — manager_link_status
+    is "none" here, NOT "pending", which must NOT be confused with a real invitation
+    already sent to Google (that's a separate state, tested above)."""
+    db = FakeDb()
+    db["social_connections"].docs.append(_conn_doc(manager_link_status="none", customer_id=""))
+    state, conn = _run(resolve_connection_state(db, "u1", "b1"))
+    assert state == ConnectionState.NEEDS_ACCOUNT_SELECTION
+
+
+def test_resolve_connection_state_refused_wins_even_with_customer_id_set():
+    """request_manager_link sets customer_id even on refusal — the refused check must
+    still take priority over needs_account_selection, since customer_id being truthy
+    would otherwise mask a real refusal."""
+    db = FakeDb()
+    db["social_connections"].docs.append(_conn_doc(manager_link_status="refused", customer_id="5551234567"))
+    state, conn = _run(resolve_connection_state(db, "u1", "b1"))
+    assert state == ConnectionState.MANAGER_LINK_REFUSED
+
+
 def test_resolve_connection_state_manager_link_refused():
     db = FakeDb()
     db["social_connections"].docs.append(_conn_doc(manager_link_status="refused"))
