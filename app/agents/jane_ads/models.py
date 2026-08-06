@@ -189,6 +189,11 @@ class CampaignPlan(BaseModel):
     shoot_script: Optional["ShootScript"] = None  # Path C — set only when creative.video_recommendation
                                              # fired; the user can film this and swap it in via
                                              # POST /meta/plan/{id}/creative before launching
+    google_keyword_context: Optional[dict] = None  # {category, description, geo} — CampaignPlan
+                                             # carries no raw business description otherwise (only
+                                             # goal/behaviour), and GoogleAdsAdapter's keyword
+                                             # translation needs it. Populated by the router at
+                                             # plan-build time; None for every non-Google plan.
 
 
 class SpendAuthorization(BaseModel):

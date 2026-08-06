@@ -13,7 +13,7 @@ from __future__ import annotations
 from typing import Optional
 
 from fastapi import APIRouter, Body, Depends, File, HTTPException, Request, UploadFile
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from pydantic import BaseModel, Field
 
@@ -750,6 +750,221 @@ async def jane_wallet_fund(
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Could not start payment: {e}")
     return {"status": "checkout_created", **result}
+
+
+# ── Google Ads connection (additive — does not touch the Meta/force-to-Meta code
+# below, or any of the /meta/* endpoints) ──────────────────────────────────────
+# Deliberately under /jane-ads/google/*, never generalizing the existing /jane-ads/
+# meta/* paths (those assume one platform on purpose — see the naming convention
+# note in the Google adapter design doc). Google Ads has two connection paths (link
+# an existing account under URI's MCC, or create a fresh one) — see
+# google_ads_connection.py for the full state machine.
+
+@router.get("/google/connect/initiate")
+async def jane_google_ads_connect_initiate(source: Optional[str] = "settings"):
+    """Redirect to Google's OAuth consent page requesting Ads-API access.
+    access_type=offline&prompt=consent is required or Google won't reliably
+    return a refresh_token."""
+    import urllib.parse
+    from app.core.config import settings
+
+    client_id = settings.GOOGLE_ADS_CLIENT_ID
+    if not client_id:
+        raise HTTPException(status_code=500, detail="GOOGLE_ADS_CLIENT_ID not configured")
+
+    _base = (settings.PUBLIC_API_URL or settings.URI_GATEWAY_BASE_API_URL).rstrip("/")
+    redirect_uri = f"{_base}/jane-ads/google/connect/callback"
+    params = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "scope": "https://www.googleapis.com/auth/adwords",
+        "response_type": "code",
+        "access_type": "offline",
+        "prompt": "consent",
+        "state": source or "settings",
+    }
+    auth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode(params)
+    return RedirectResponse(auth_url)
+
+
+@router.get("/google/connect/callback")
+async def jane_google_ads_connect_callback(
+    code: Optional[str] = None,
+    state: Optional[str] = None,
+    error: Optional[str] = None,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """Exchanges the auth code for tokens and stores a pending connection —
+    same two-step pending-doc-then-finalize pattern as
+    complete_social_manager.facebook_ads_callback."""
+    import urllib.parse
+    import uuid
+    from datetime import datetime, timedelta, timezone
+    from app.core.config import settings
+    from .google_ads_connection import exchange_code_for_tokens, GoogleAdsConnectionError
+
+    web_app_url = settings.WEB_APP_URL.strip("'\"")
+    base_redirect = f"{web_app_url}/workspace?tab=connections"
+
+    if error:
+        return RedirectResponse(f"{base_redirect}&connected=false&error={urllib.parse.quote(error)}")
+    if not code:
+        return RedirectResponse(f"{base_redirect}&connected=false&error=missing_code")
+
+    _base = (settings.PUBLIC_API_URL or settings.URI_GATEWAY_BASE_API_URL).rstrip("/")
+    redirect_uri = f"{_base}/jane-ads/google/connect/callback"
+
+    try:
+        tokens = await exchange_code_for_tokens(code, redirect_uri)
+    except GoogleAdsConnectionError as e:
+        return RedirectResponse(f"{base_redirect}&connected=false&error={urllib.parse.quote(str(e))}")
+
+    conn_id = f"gads_{uuid.uuid4().hex[:12]}"
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(seconds=int(tokens.get("expires_in", 3600)))
+
+    conn_doc = {
+        "id": conn_id,
+        "user_id": None,  # set by finalize
+        "platform": "google_ads",
+        "connected_via": "google_ads_oauth",
+        "refresh_token": tokens.get("refresh_token", ""),
+        "access_token": tokens.get("access_token", ""),
+        "token_expires_at": expires_at,
+        "customer_id": "",
+        "login_customer_id": settings.GOOGLE_ADS_MCC_CUSTOMER_ID,
+        "manager_link_status": "none",
+        "account_name": "",
+        "created_account_by_uri": False,
+        "connection_status": "pending_user_match",
+        "connected_at": now,
+        "updated_at": now,
+    }
+    await db["social_connections"].update_one({"id": conn_id}, {"$set": conn_doc}, upsert=True)
+
+    if not tokens.get("refresh_token"):
+        # Google only returns a refresh_token on the FIRST consent (or with
+        # prompt=consent, which is always set above) — flag loudly if it's
+        # still missing, since a connection with no refresh_token can never
+        # pass the live health check in resolve_connection_state.
+        print(f"[GoogleAdsOAuth] ⚠️ no refresh_token returned for {conn_id} — connection will show EXPIRED", flush=True)
+
+    params_out = f"connected=google_ads&conn_id={urllib.parse.quote(conn_id)}"
+    return RedirectResponse(f"{base_redirect}&{params_out}")
+
+
+class GoogleAdsFinalizeBody(BaseModel):
+    conn_id: str
+    customer_id: Optional[str] = None
+
+
+@router.post("/google/connect/finalize")
+async def jane_google_ads_connect_finalize(
+    body: GoogleAdsFinalizeBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Associates the pending connection with the active brand. If customer_id was
+    already supplied (the client told us their existing account), the caller
+    follows up with link-existing-account; otherwise with create-account."""
+    from datetime import datetime
+
+    update_fields: dict = {
+        "user_id": brand_ctx.get("user_id"),
+        "brand_id": brand_ctx.get("brand_id"),
+        "connection_status": "active",
+        "updated_at": datetime.utcnow(),
+    }
+    if body.customer_id:
+        update_fields["customer_id"] = body.customer_id
+    result = await db["social_connections"].update_one(
+        {"id": body.conn_id, "platform": "google_ads"}, {"$set": update_fields},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="No pending Google Ads connection with that id")
+    return {"status": "finalized"}
+
+
+class GoogleAdsLinkExistingBody(BaseModel):
+    customer_id: str
+
+
+@router.post("/google/connect/link-existing-account")
+async def jane_google_ads_link_existing(
+    body: GoogleAdsLinkExistingBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Path (a): client already has a Google Ads account — send a manager-link
+    invitation. On the known 'already linked to another manager' friction, returns
+    a specific, actionable message instead of a generic failure."""
+    from .google_ads_connection import AdsConnectionRequired, request_manager_link
+
+    try:
+        result = await request_manager_link(
+            db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"), body.customer_id,
+        )
+    except AdsConnectionRequired as e:
+        raise HTTPException(status_code=409, detail=f"google_ads_connection_{e.state.value}")
+
+    if result.get("manager_link_status") == "refused":
+        return {
+            "manager_link_status": "refused",
+            "detail": (
+                "This Google Ads account is already linked to another manager. "
+                "Ask the client to remove that link in their account "
+                "(Admin → Access and security → Managers) before reconnecting."
+            ),
+        }
+    return result
+
+
+class GoogleAdsCreateAccountBody(BaseModel):
+    account_name: str
+
+
+@router.post("/google/connect/create-account")
+async def jane_google_ads_create_account(
+    body: GoogleAdsCreateAccountBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Path (b): client has no Google Ads account — create one fresh under URI's
+    MCC (auto-linked, no accept step needed)."""
+    from .google_ads_connection import AdsConnectionRequired, create_client_account_under_mcc
+
+    try:
+        return await create_client_account_under_mcc(
+            db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"), body.account_name,
+        )
+    except AdsConnectionRequired as e:
+        raise HTTPException(status_code=409, detail=f"google_ads_connection_{e.state.value}")
+
+
+@router.get("/google/connection/status")
+async def jane_google_ads_connection_status(
+    live_check: bool = False,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """The active brand's Google Ads connection state. Always returns 200 with the
+    state in the body — this is a pure status read (fast badge, live_check=False by
+    default), not a pre-flight gate inside a build flow, so there's never a reason
+    to raise here (unlike resolve_customer_id_for_launch, which does)."""
+    from .google_ads_connection import resolve_connection_state
+    from .whatsapp import get_brand_whatsapp
+
+    state, conn = await resolve_connection_state(
+        db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"), live_check=live_check,
+    )
+    wa_number = await get_brand_whatsapp(db, brand_ctx.get("brand_id"))
+    return {
+        "state": state.value,
+        "account_name": (conn or {}).get("account_name", ""),
+        "customer_id": (conn or {}).get("customer_id", ""),
+        "whatsapp_number": wa_number,
+        "connect_url": "/jane-ads/google/connect/initiate",
+    }
 
 
 @router.get("/instrumentation/{business_id}")
