@@ -989,6 +989,20 @@ class _PlanBuildResult(BaseModel):
                                               # audience it's for
 
 
+def _last_known_understood(saved: list[dict]) -> dict:
+    """Fold every prior turn's `understood` into one running snapshot, oldest to
+    newest — the most recent non-empty value per field wins. See the regression note
+    where this is used in _build_campaign_plan: a single re-parse missing a field
+    already established earlier in this thread must not silently wipe it."""
+    merged: dict = {}
+    for m in saved:
+        if m.get("kind") == "result" and m.get("role") == "jane":
+            for k, v in ((m.get("result") or {}).get("understood") or {}).items():
+                if v not in (None, "", [], 0):
+                    merged[k] = v
+    return merged
+
+
 async def _build_campaign_plan(
     body: MetaLaunchFromMessageBody, brand_ctx: dict, db: AsyncIOMotorDatabase,
 ) -> "_PlanBuildResult | dict":
@@ -1068,8 +1082,9 @@ async def _build_campaign_plan(
     # matched which question; feeding ONLY that (no history) made her re-ask the same
     # ground forever. Fetch this thread's saved messages (Jane's own prior questions
     # included) so she can actually track what's already been established.
-    thread_turns = (build_history_turns(await thread_history(db, brand_ctx.get("brand_id"), body.thread_id))
-                    if body.thread_id else [])
+    saved_messages = (await thread_history(db, brand_ctx.get("brand_id"), body.thread_id)
+                      if body.thread_id else [])
+    thread_turns = build_history_turns(saved_messages)
     # If the AI is unreachable (quota/outage), surface a clear "try again later"
     # instead of falling through to a follow-up question — otherwise every answer
     # re-triggers the same question (an infinite loop).
@@ -1077,6 +1092,19 @@ async def _build_campaign_plan(
         parsed = await consult(body.message, known_business_name, known_category, known_budget, thread_turns)
     except NlUnavailableError:
         raise HTTPException(status_code=503, detail=_AI_DIFFICULTIES)
+
+    # Live-confirmed regression: budget_ngn (and sometimes city/goal) correctly parsed
+    # on one turn came back None/blank on the very next turn — build_history_turns only
+    # turns a prior "jane" result into a turn the model can see when it carries a
+    # `question` or is stage planned/launched, so a choose_plan_variant turn (no
+    # `question` field) is INVISIBLE to the re-parse, and the model re-derives from
+    # scratch and drops what it already knew. Backfill from the last turn that actually
+    # had each field, so an established fact never silently reverts to "still missing".
+    prior_understood = _last_known_understood(saved_messages)
+    for field in ("business_name", "category", "goal", "offer_type", "budget_ngn",
+                  "desired_conversions", "city", "geo_mode"):
+        if not getattr(parsed, field, None) and prior_understood.get(field):
+            setattr(parsed, field, prior_understood[field])
 
     # 1.5. Backwards budget (PRD §3.1) — the user described an outcome ("20 customers"),
     # not a Naira amount. Convert using this business's own real cost-per-conversation
