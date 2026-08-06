@@ -1339,6 +1339,17 @@ async def _build_campaign_plan(
         # same quota/outage that breaks parsing), so give the same clear message.
         raise HTTPException(status_code=503, detail=_AI_DIFFICULTIES)
 
+    # plan.explanation's "you have photos"/"video" phrase (decision_engine._explain) was
+    # written from the NL-guessed has_video BEFORE the user actually chose upload/generate
+    # here — a real upload of a video left it stuck saying "you have photos". Patch it now
+    # that the real creative kind is known.
+    if creative.is_video and "you have video" not in plan.explanation:
+        plan.explanation = (
+            plan.explanation
+            .replace("you have photos", "you have video")
+            .replace("no creative is needed for search", "you have video")
+        )
+
     # 4.5. Policy gate — one bad ad can suspend the whole pooled ad account, so this
     # runs before a plan is ever shown as ready, not just right before launch.
     # BLOCK severity aborts with the specific guidance; WARN-only violations are
