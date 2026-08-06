@@ -91,6 +91,29 @@ class Settings(BaseSettings):
     GOOGLE_CLIENT_ID: Optional[str] = None
     GOOGLE_CLIENT_SECRET: Optional[str] = None
 
+    # Google Ads (Jane + Ads Google adapter) — a DEDICATED OAuth client, deliberately
+    # separate from GOOGLE_CLIENT_ID/SECRET above (that pair is Sign-in-with-Google
+    # only: a one-shot code->token->userinfo exchange with no refresh-token persistence,
+    # almost certainly the wrong Google Cloud project/consent scope for the Ads API).
+    # See app/agents/jane_ads/google_ads_connection.py.
+    GOOGLE_ADS_CLIENT_ID: str = ""
+    GOOGLE_ADS_CLIENT_SECRET: str = ""
+    # Issued once per Manager Account (MCC), starts at Test Account Access tier until
+    # Basic Access is approved.
+    GOOGLE_ADS_DEVELOPER_TOKEN: str = ""
+    # URI's own Manager Account (MCC) customer id, digits only, no dashes — the account
+    # manager-link requests originate FROM and client accounts get created UNDER.
+    # Analogous to META_BUSINESS_MANAGER_ID, NOT to META_AD_ACCOUNT_ID/META_ADS_PAGE_ID:
+    # there is deliberately no "default ad account" setting here and never should be —
+    # every real call operates against a specific brand's own customer_id, resolved
+    # per-brand via google_ads_connection.resolve_customer_id_for_launch(), never a
+    # shared/default one (see tests/test_jane_ads_google_no_fallback_account.py, which
+    # fails the build if a shared- or default-account-shaped Google Ads setting ever
+    # appears anywhere in the codebase — Meta's own META_ADS_PAGE_ID shared-fallback
+    # is the exact mistake this guards against repeating).
+    GOOGLE_ADS_MCC_CUSTOMER_ID: str = ""
+    GOOGLE_ADS_API_VERSION: str = "v17"
+
     # SQUAD Payment Gateway (PRD Section 6.2: Payment Integration)
     # Production: Always use live mode for real payments
     SQUAD_MODE: str = "live"  # Options: "sandbox" or "live"
