@@ -1340,10 +1340,11 @@ def _build_founder_timeline(
                     "position": position,
                 }
             else:
-                # volume_boost is already clamped to [0.3, 2.5] by _compute_volume_boost —
-                # re-clamping to 1.0 here silently discarded any boost above 1.0, meaning
-                # quiet-clip leveling never actually took effect. Just pass it through.
-                clip_vol = 0.0 if mute_clips else clip.get("volume_boost", 1.0)
+                # Shotstack hard-rejects asset.volume > 1 ("Too big: expected number
+                # to be <=1"), so volume_boost (which _compute_volume_boost can return
+                # up to 2.5 for quiet clips) must stay capped at 1.0 here even though
+                # that means the boost is only ever partially applied.
+                clip_vol = 0.0 if mute_clips else min(1.0, clip.get("volume_boost", 1.0))
                 asset: Dict = {
                     "type": "video",
                     "src": clip["cloudinary_url"],
