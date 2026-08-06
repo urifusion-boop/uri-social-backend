@@ -1340,7 +1340,10 @@ def _build_founder_timeline(
                     "position": position,
                 }
             else:
-                clip_vol = 0.0 if mute_clips else min(1.0, clip.get("volume_boost", 1.0))
+                # volume_boost is already clamped to [0.3, 2.5] by _compute_volume_boost —
+                # re-clamping to 1.0 here silently discarded any boost above 1.0, meaning
+                # quiet-clip leveling never actually took effect. Just pass it through.
+                clip_vol = 0.0 if mute_clips else clip.get("volume_boost", 1.0)
                 asset: Dict = {
                     "type": "video",
                     "src": clip["cloudinary_url"],

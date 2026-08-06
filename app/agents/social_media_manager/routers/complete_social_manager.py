@@ -8090,8 +8090,12 @@ async def fix_fractional_credits(
 
 # ── Submagic Video Production ─────────────────────────────────────────────────
 
-async def _mix_music_into_video(video_url: str, music_url: str) -> Optional[str]:
-    """Download Submagic output + Cloudinary music, mix with ffmpeg, upload result to Cloudinary."""
+async def _mix_music_into_video(video_url: str, music_url: str, mute_original: bool = False) -> Optional[str]:
+    """Download Submagic output + Cloudinary music, mix with ffmpeg, upload result to Cloudinary.
+
+    mute_original=True drops the original audio entirely and uses the music
+    track as the sole audio, instead of mixing it in under the existing voice.
+    """
     import tempfile
     import asyncio as _asyncio
     import os as _os
@@ -8120,15 +8124,30 @@ async def _mix_music_into_video(video_url: str, music_url: str) -> Optional[str]
 
         output_path = f"/tmp/submagic-mixed-{_uuid.uuid4().hex[:8]}.mp4"
 
+        if mute_original:
+            ffmpeg_args = [
+                "ffmpeg", "-y",
+                "-i", video_tmp,
+                "-stream_loop", "-1", "-i", music_tmp,
+                "-map", "0:v", "-map", "1:a",
+                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                "-shortest",
+                output_path,
+            ]
+        else:
+            ffmpeg_args = [
+                "ffmpeg", "-y",
+                "-i", video_tmp,
+                "-stream_loop", "-1", "-i", music_tmp,
+                "-filter_complex", "[0:a]volume=2.0[va];[1:a]volume=0.3[ma];[va][ma]amix=inputs=2:duration=first[a]",
+                "-map", "0:v", "-map", "[a]",
+                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                "-shortest",
+                output_path,
+            ]
+
         proc = await _asyncio.create_subprocess_exec(
-            "ffmpeg", "-y",
-            "-i", video_tmp,
-            "-stream_loop", "-1", "-i", music_tmp,
-            "-filter_complex", "[0:a]volume=2.0[va];[1:a]volume=0.3[ma];[va][ma]amix=inputs=2:duration=first[a]",
-            "-map", "0:v", "-map", "[a]",
-            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-            "-shortest",
-            output_path,
+            *ffmpeg_args,
             stdout=_asyncio.subprocess.DEVNULL,
             stderr=_asyncio.subprocess.PIPE,
         )
@@ -8194,7 +8213,12 @@ def _wrap_for_drawtext(text: str, video_width: int, fontsize: int) -> tuple:
     return "\n".join(lines[:2]), size
 
 
-async def _add_hook_text_overlay(video_url: str, hook_text: str, video_width: Optional[int] = None) -> Optional[str]:
+async def _add_hook_text_overlay(
+    video_url: str,
+    hook_text: str,
+    video_width: Optional[int] = None,
+    color: str = "#ffffff",
+) -> Optional[str]:
     """Download a finished video, burn hook_text into the first 2.5s via FFmpeg drawtext, re-upload to Cloudinary."""
     import tempfile
     import asyncio as _asyncio
@@ -8230,9 +8254,13 @@ async def _add_hook_text_overlay(video_url: str, hook_text: str, video_width: Op
             text_tmp = tf.name
 
         output_path = f"/tmp/hook-overlay-{_uuid.uuid4().hex[:8]}.mp4"
+        hex_color = (color or "#ffffff").lstrip("#")
+        if len(hex_color) != 6 or any(c not in "0123456789abcdefABCDEF" for c in hex_color):
+            hex_color = "ffffff"
+        ffmpeg_color = f"0x{hex_color}"
         drawtext = (
             "drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:"
-            f"textfile={text_tmp}:fontsize={fontsize}:fontcolor=white:line_spacing=6:"
+            f"textfile={text_tmp}:fontsize={fontsize}:fontcolor={ffmpeg_color}:line_spacing=6:"
             "x=(w-text_w)/2:y=100:enable='between(t,0,2.5)':"
             "box=1:boxcolor=black@0.5:boxborderw=12"
         )
@@ -8547,8 +8575,12 @@ async def zapcap_produce(
     enable_music: str = Form("false"),
     enable_hook_text: str = Form("false"),
     custom_hook_text: str = Form(""),
+    hook_text_color: str = Form("#ffffff"),
     caption_style: str = Form("bold"),
     custom_music: Optional[UploadFile] = File(None),
+    music_source: str = Form("upload"),
+    mute_original_audio: str = Form("false"),
+    purpose: str = Form("general"),
     custom_broll_clips: List[UploadFile] = File(default=[]),
     custom_broll_placements: Optional[str] = Form(None),  # JSON: [{"clipIndex":0,"startTime":5.0,"duration":4}]
     custom_broll_estimated_duration: float = Form(60.0),
@@ -8731,12 +8763,19 @@ async def zapcap_produce(
             await refund_video_job(user_id, job_id, billing, reason="refund")
             raise HTTPException(status_code=502, detail=f"ZapCap returned no taskId: {r.text}")
 
-    # Handle optional background music
+    # Handle optional background music — either a user-uploaded MP3, or an
+    # AI-picked track chosen by mapping the video's purpose to a mood.
     music_url: Optional[str] = None
     if enable_music.lower() == "true" and custom_music:
         music_bytes = await custom_music.read()
         music_url = await _upload_audio_to_cloudinary(music_bytes, f"zapcap-{job_id}")
         print(f"[ZapCap] music uploaded → {music_url[:60]}", flush=True)
+    elif enable_music.lower() == "true" and music_source.lower() == "auto":
+        from app.agents.social_media_manager.services.video_production_service import _pick_music_url
+        _PURPOSE_TO_MOOD = {"sell": "upbeat", "teach": "chill", "announce": "cinematic", "general": "acoustic"}
+        mood = _PURPOSE_TO_MOOD.get(purpose.lower(), "acoustic")
+        music_url = _pick_music_url(mood)
+        print(f"[ZapCap] AI-picked music for purpose={purpose} mood={mood} → {(music_url or '')[:60]}", flush=True)
 
     # Persist job
     await db["zapcap_jobs"].insert_one({
@@ -8752,8 +8791,10 @@ async def zapcap_produce(
         "has_custom_broll": bool(custom_broll_clips),
         "caption_style": caption_style,
         "music_url": music_url,
+        "mute_original_audio": mute_original_audio.lower() == "true",
         "hook_text_enabled": enable_hook_text.lower() == "true",
         "custom_hook_text": custom_hook_text.strip() or None,
+        "hook_text_color": hook_text_color or "#ffffff",
         "video_url": video_url,
         "video_width": probed_width or None,
         "video_height": probed_height or None,
@@ -8961,7 +9002,9 @@ async def zapcap_job_status(
 
         if job.get("music_url"):
             print(f"[ZapCapMusic] mixing music into job {job_id}", flush=True)
-            mixed_url = await _mix_music_into_video(output_url, job["music_url"])
+            mixed_url = await _mix_music_into_video(
+                output_url, job["music_url"], mute_original=bool(job.get("mute_original_audio"))
+            )
             if mixed_url:
                 await db["zapcap_jobs"].update_one(
                     {"job_id": job_id},
@@ -9023,7 +9066,9 @@ async def zapcap_job_status(
                     hook_text = await _generate_hook_text(transcript_text)
 
                 if hook_text:
-                    overlaid_url = await _add_hook_text_overlay(output_url, hook_text, job.get("video_width"))
+                    overlaid_url = await _add_hook_text_overlay(
+                        output_url, hook_text, job.get("video_width"), color=job.get("hook_text_color") or "#ffffff"
+                    )
                     if overlaid_url:
                         await db["zapcap_jobs"].update_one(
                             {"job_id": job_id},
