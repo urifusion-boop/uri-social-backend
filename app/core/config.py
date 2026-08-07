@@ -112,7 +112,11 @@ class Settings(BaseSettings):
     # appears anywhere in the codebase — Meta's own META_ADS_PAGE_ID shared-fallback
     # is the exact mistake this guards against repeating).
     GOOGLE_ADS_MCC_CUSTOMER_ID: str = ""
-    GOOGLE_ADS_API_VERSION: str = "v17"
+    # v17 sunset 2025-06-04 (Google Ads API versions live ~1 year) — every request
+    # against it now 404s at Google's edge with a generic HTML error page instead of
+    # a JSON API error, which is what actually broke create-account/link-existing on
+    # staging. Bump this periodically; check developers.google.com/google-ads/api/docs/sunset-dates.
+    GOOGLE_ADS_API_VERSION: str = "v24"
 
     # SQUAD Payment Gateway (PRD Section 6.2: Payment Integration)
     # Production: Always use live mode for real payments
