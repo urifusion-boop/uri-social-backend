@@ -8771,9 +8771,22 @@ async def zapcap_produce(
         music_url = await _upload_audio_to_cloudinary(music_bytes, f"zapcap-{job_id}")
         print(f"[ZapCap] music uploaded → {music_url[:60]}", flush=True)
     elif enable_music.lower() == "true" and music_source.lower() == "auto":
+        import random as _music_random
         from app.agents.social_media_manager.services.video_production_service import _pick_music_url
-        _PURPOSE_TO_MOOD = {"sell": "upbeat", "teach": "chill", "announce": "cinematic", "general": "acoustic"}
-        mood = _PURPOSE_TO_MOOD.get(purpose.lower(), "acoustic")
+        # A single fixed mood per purpose meant every "auto" pick for the same
+        # purpose landed in the same ~3-track pool (or, for "announce", a mood
+        # with only 1 track) — repeated renders sounded like the same track
+        # kept getting picked. Pool a couple of compatible moods per purpose
+        # and pick randomly between them first, so there's a wider spread of
+        # tracks before _pick_music_url's own random choice within the mood.
+        _PURPOSE_TO_MOODS = {
+            "sell": ["upbeat", "electronic"],
+            "teach": ["chill", "acoustic"],
+            "announce": ["cinematic", "electronic"],
+            "general": ["acoustic", "chill"],
+        }
+        mood_pool = _PURPOSE_TO_MOODS.get(purpose.lower(), ["acoustic", "chill"])
+        mood = _music_random.choice(mood_pool)
         music_url = _pick_music_url(mood)
         print(f"[ZapCap] AI-picked music for purpose={purpose} mood={mood} → {(music_url or '')[:60]}", flush=True)
 
