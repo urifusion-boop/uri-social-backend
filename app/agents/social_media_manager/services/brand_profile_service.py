@@ -105,15 +105,13 @@ class BrandProfileService:
         if "secondary_font_prompt" in data:
             doc["secondary_font_prompt"] = data["secondary_font_prompt"]
 
-        # Custom font fields (Typography System)
-        if "custom_font_enabled" in data:
-            doc["custom_font_enabled"] = data["custom_font_enabled"]
-        if "custom_font_files" in data:
-            doc["custom_font_files"] = data["custom_font_files"]
-        if "custom_font_analysis" in data:
-            doc["custom_font_analysis"] = data["custom_font_analysis"]
-        if "custom_font_directive" in data:
-            doc["custom_font_directive"] = data["custom_font_directive"]
+        # Custom font fields (Typography System) — per-slot: primary and secondary
+        # each independently track their own uploaded custom font.
+        for slot in ("primary", "secondary"):
+            for suffix in ("custom_font_enabled", "custom_font_file", "custom_font_analysis", "custom_font_directive"):
+                key = f"{slot}_{suffix}"
+                if key in data:
+                    doc[key] = data[key]
 
         # Canvas Editor feature flag
         if "canvas_editor_enabled" in data:
@@ -412,11 +410,15 @@ class BrandProfileService:
             "primary_font_prompt":  profile.get("primary_font_prompt", ""),
             "secondary_font":       profile.get("secondary_font", ""),
             "secondary_font_prompt": profile.get("secondary_font_prompt", ""),
-            # Custom font fields (Typography System)
-            "custom_font_enabled":  profile.get("custom_font_enabled", False),
-            "custom_font_files":    profile.get("custom_font_files") or [],
-            "custom_font_analysis": profile.get("custom_font_analysis") or {},
-            "custom_font_directive": profile.get("custom_font_directive", ""),
+            # Custom font fields (Typography System) — per-slot, see save-side note above
+            "primary_custom_font_enabled":    profile.get("primary_custom_font_enabled", False),
+            "primary_custom_font_file":       profile.get("primary_custom_font_file"),
+            "primary_custom_font_analysis":   profile.get("primary_custom_font_analysis") or {},
+            "primary_custom_font_directive":  profile.get("primary_custom_font_directive", ""),
+            "secondary_custom_font_enabled":  profile.get("secondary_custom_font_enabled", False),
+            "secondary_custom_font_file":     profile.get("secondary_custom_font_file"),
+            "secondary_custom_font_analysis": profile.get("secondary_custom_font_analysis") or {},
+            "secondary_custom_font_directive": profile.get("secondary_custom_font_directive", ""),
             # Caption Voice System fields
             "voice_profile":        profile.get("voice_profile") or {},
             "voice_sample_analysis": profile.get("voice_sample_analysis") or {},
