@@ -1156,14 +1156,21 @@ async def _run_ai_analysis(clips_ordered: List[Dict], story_type: str) -> Dict:
         f'"zooms":[{{"at":<float>,"duration":<float>,"reason":"<phrase>"}}],'
         f'"transition_style":"cut"|"fade"|"slide"|"zoom",'
         f'"summary":"<one sentence>"}}\n\n'
-        f"RULES FOR CUTS — be aggressive, this should feel tight:\n"
+        f"RULES FOR CUTS — be conservative. When in doubt, leave it in: cutting something the "
+        f"speaker meant to say is worse than leaving in a slightly loose moment.\n"
         f"1. Repeated sentences or phrases: if the same idea or sentence (≥4 key words) appears "
         f"more than once, cut every occurrence AFTER the first. Use the exact [Xs–Ys] timestamps shown.\n"
-        f"2. Meandering or off-topic tangents: sentences that don't advance the main point.\n"
-        f"3. Contradictions or take-backs: 'actually no, what I meant was...' — cut the false start.\n"
+        f"2. Clearly unfinished false starts or self-corrections: 'actually no, what I meant was...' "
+        f"— cut only the abandoned fragment, not the corrected version that follows.\n"
+        f"3. Only cut a tangent if it is CLEARLY unrelated filler (e.g. answering a phone, talking to "
+        f"someone off-camera, a long dead-end aside the speaker themselves drops) — never cut a tangent "
+        f"just because it's one of several points being made; making multiple related points is normal "
+        f"and each one may matter to the viewer.\n"
         f"4. Do NOT cut ranges already listed in ALREADY HANDLED.\n"
         f"5. Do NOT cut anything not in the transcript. at >= 0, end <= {total_duration:.1f}.\n"
-        f"6. Each kept segment between cuts must be ≥ 2s.\n\n"
+        f"6. Each kept segment between cuts must be ≥ 2s.\n"
+        f"7. Cuts from this pass should total well under half the video — if you're proposing more than "
+        f"that, you're being too aggressive; keep only the clearest, most confident cuts.\n\n"
         f"RULES FOR ZOOMS:\n"
         f"- 1–3 moments where the speaker makes their strongest or most emotional point.\n"
         f"- duration 1.0–3.0s. Must fall within a clip that has speech.\n\n"
@@ -1202,20 +1209,49 @@ async def _run_ai_analysis(clips_ordered: List[Dict], story_type: str) -> Dict:
         print(f"[MultiClip/_run_ai_analysis] GPT error: {exc}", flush=True)
 
     # ── Merge and deduplicate ─────────────────────────────────────────────────
+    # Safety cap: timing_cuts are audio/text-grounded (measured silence, exact
+    # filler-word matches, Jaccard-overlap repeats) and stay trustworthy even at
+    # a high total. gpt_cuts and repeat_cuts are subjective judgment calls — an
+    # LLM guessing at "off-topic tangent" is far more likely to be a false
+    # positive that guts real content. If the merged total would remove more
+    # than _MAX_CUT_PCT of the video, drop the least-reliable layer(s) first
+    # (gpt_cuts, then repeat_cuts) rather than silently applying an
+    # over-aggressive cut — this used to only print a warning and cut anyway.
+    _MAX_CUT_PCT = 50.0
+
+    def _cut_pct(cuts: List[Dict]) -> float:
+        merged_ = _merge_cuts(cuts)
+        total_ = sum(c["end"] - c["at"] for c in merged_)
+        return (total_ / total_duration * 100) if total_duration > 0 else 0.0, merged_, total_
+
     all_cuts = timing_cuts + repeat_cuts + gpt_cuts
-    merged = _merge_cuts(all_cuts)
-    total_cut = sum(c["end"] - c["at"] for c in merged)
-    cut_pct = (total_cut / total_duration * 100) if total_duration > 0 else 0.0
+    cut_pct, merged, total_cut = _cut_pct(all_cuts)
+    dropped_layers: List[str] = []
+
+    if cut_pct > _MAX_CUT_PCT and gpt_cuts:
+        dropped_layers.append(f"gpt content cuts ({len(gpt_cuts)})")
+        cut_pct, merged, total_cut = _cut_pct(timing_cuts + repeat_cuts)
+
+    if cut_pct > _MAX_CUT_PCT and repeat_cuts:
+        dropped_layers.append(f"repeat-detection cuts ({len(repeat_cuts)})")
+        cut_pct, merged, total_cut = _cut_pct(timing_cuts)
+
     print(
         f"[MultiClip/analyze] timing={len(timing_cuts)} repeat_pass={len(repeat_cuts)} "
         f"gpt={len(gpt_cuts)} merged={len(merged)} zooms={len(gpt_zooms)} "
         f"total_cut={total_cut:.1f}s/{total_duration:.1f}s ({cut_pct:.0f}%)",
         flush=True,
     )
-    if cut_pct > 50:
+    if dropped_layers:
         print(
-            f"[MultiClip/analyze] ⚠️ removing {cut_pct:.0f}% of total duration — unusually aggressive, "
-            f"check repeat_pass/gpt cuts above for false positives",
+            f"[MultiClip/analyze] ⚠️ capped over-aggressive cut — dropped {', '.join(dropped_layers)} "
+            f"to bring total_cut down to {cut_pct:.0f}% (cap {_MAX_CUT_PCT:.0f}%)",
+            flush=True,
+        )
+    elif cut_pct > _MAX_CUT_PCT:
+        print(
+            f"[MultiClip/analyze] ⚠️ removing {cut_pct:.0f}% of total duration even after dropping "
+            f"gpt/repeat cuts — timing cuts alone (real silence/filler) exceed the cap, leaving as-is",
             flush=True,
         )
     return {"cuts": merged, "zooms": gpt_zooms, "transition_style": transition_style, "summary": summary}
