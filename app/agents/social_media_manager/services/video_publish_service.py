@@ -198,10 +198,16 @@ class VideoPublishService:
     ):
         outstand = OutstandService()
 
+        # TikTok requires media to be fetched from a domain verified in the TikTok
+        # developer portal. Route it through Outstand's own media upload first so
+        # TikTok pulls from Outstand's (already-verified) domain instead.
+        outstand_media_url = await outstand.upload_media_from_url(video_url)
+
         result = await outstand.publish_post(
             outstand_account_ids=[outstand_account_id],
             content=caption,
-            media_urls=[video_url],
+            media_urls=[outstand_media_url],
+            platform_config={"tiktok": {"postMode": "DIRECT_POST", "privacyLevel": "SELF_ONLY"}},
         )
         post_obj = result.get("post") or result.get("data") or {}
         if isinstance(post_obj, list):
