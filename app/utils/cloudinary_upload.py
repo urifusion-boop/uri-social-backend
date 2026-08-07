@@ -33,16 +33,19 @@ async def upload_bytes(
     file_bytes: bytes,
     folder: str = "uri-social",
     resource_type: str = "image",
+    public_id: str | None = None,
 ) -> str:
     """Upload raw bytes to Cloudinary. Returns secure_url."""
     loop = asyncio.get_event_loop()
+    kwargs = {"folder": folder, "resource_type": resource_type}
+    if public_id is not None:
+        kwargs["public_id"] = public_id
     result = await loop.run_in_executor(
         None,
         partial(
             cloudinary.uploader.upload,
             io.BytesIO(file_bytes),
-            folder=folder,
-            resource_type=resource_type,
+            **kwargs,
         ),
     )
     return result["secure_url"]
