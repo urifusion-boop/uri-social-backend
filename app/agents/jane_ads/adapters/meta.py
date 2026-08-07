@@ -42,6 +42,7 @@ import asyncio
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+from urllib.parse import quote
 
 import httpx
 from motor.motor_asyncio import AsyncIOMotorDatabase
@@ -212,8 +213,14 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
             raise ValueError("CampaignPlan.whatsapp_number is required to launch a Click-to-WhatsApp campaign")
         # The real ad destination for every non-followers goal: a chat with the brand's
         # own number. normalize_wa_number (whatsapp.py) already stored it digits-only
-        # and country-coded, which is exactly the form wa.me expects.
-        wa_link = f"https://wa.me/{plan.whatsapp_number}" if plan.whatsapp_number else ""
+        # and country-coded, which is exactly the form wa.me expects. A bare wa.me link
+        # (no ?text=) opens an EMPTY chat with a number the person has never messaged —
+        # live-confirmed: a real campaign got 186 link clicks and zero messages. wa.me's
+        # own `text` param pre-fills the message box (still requires a tap to send, but
+        # removes the "what do I even say" drop-off) — universally supported, no Meta
+        # native WhatsApp linking required.
+        wa_prefill = quote("Hi! I saw your ad and I'm interested — tell me more?")
+        wa_link = f"https://wa.me/{plan.whatsapp_number}?text={wa_prefill}" if plan.whatsapp_number else ""
         platform_plan = meta_plans[0]
 
         total_budget_ngn = min(platform_plan.budget_ngn, auth.funded_amount_ngn)

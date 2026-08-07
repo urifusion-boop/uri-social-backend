@@ -213,8 +213,10 @@ def test_launch_campaign_creates_full_chain_and_stores_record():
     creative_spec = mock_client.post.call_args_list[2].kwargs["json"]["object_story_spec"]
     assert creative_spec["page_id"] == "pg123"
     # The tap goes to a real chat with the brand's own number (it used to be a bare
-    # "https://wa.me/" with no number, which went nowhere).
-    assert creative_spec["link_data"]["link"] == "https://wa.me/2348031234567"
+    # "https://wa.me/" with no number, which went nowhere), pre-filled with an opener
+    # (live-confirmed: an empty chat with an unfamiliar number got 186 clicks and zero
+    # messages — see test_wa_link_prefills_an_opening_message below).
+    assert creative_spec["link_data"]["link"].startswith("https://wa.me/2348031234567?text=")
     assert creative_spec["link_data"]["call_to_action"]["type"] == "WHATSAPP_MESSAGE"
     ad_json = mock_client.post.call_args_list[3].kwargs["json"]
     assert ad_json  # ad creation call still happens after creative
@@ -476,4 +478,26 @@ def test_video_creative_carries_the_wa_link_on_the_cta():
 
     video_data = mock_client.post.call_args_list[-2].kwargs["json"]["object_story_spec"]["video_data"]
     assert video_data["call_to_action"]["type"] == "LEARN_MORE"
-    assert video_data["call_to_action"]["value"]["link"] == "https://wa.me/2348031234567"
+    assert video_data["call_to_action"]["value"]["link"].startswith("https://wa.me/2348031234567?text=")
+
+
+def test_wa_link_prefills_an_opening_message():
+    # Live-confirmed regression: a bare "https://wa.me/<number>" opens an EMPTY chat
+    # with a number the person has never messaged — a real campaign got 186 link
+    # clicks and zero WhatsApp messages. wa.me's own `text` param pre-fills the
+    # message box so there's something to just tap send on.
+    db = FakeDb()
+    adapter = _adapter(db)
+    responses = [
+        {"id": "cmp_1"}, {"id": "adset_1"}, {"id": "creative_1"}, {"id": "ad_1"},
+    ]
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client(responses)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        _run(adapter.launch_campaign(_plan(), _auth()))
+
+    creative_spec = mock_client.post.call_args_list[2].kwargs["json"]["object_story_spec"]
+    link = creative_spec["link_data"]["link"]
+    assert link.startswith("https://wa.me/2348031234567?text=")
+    from urllib.parse import unquote
+    assert unquote(link.split("?text=", 1)[1]).strip()
