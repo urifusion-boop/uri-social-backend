@@ -7985,8 +7985,12 @@ async def fix_fractional_credits(
 
 # ── Submagic Video Production ─────────────────────────────────────────────────
 
-async def _mix_music_into_video(video_url: str, music_url: str) -> Optional[str]:
-    """Download Submagic output + Cloudinary music, mix with ffmpeg, upload result to Cloudinary."""
+async def _mix_music_into_video(video_url: str, music_url: str, mute_original: bool = False) -> Optional[str]:
+    """Download Submagic output + Cloudinary music, mix with ffmpeg, upload result to Cloudinary.
+
+    mute_original=True drops the original audio entirely and uses the music
+    track as the sole audio, instead of mixing it in under the existing voice.
+    """
     import tempfile
     import asyncio as _asyncio
     import os as _os
@@ -8015,15 +8019,30 @@ async def _mix_music_into_video(video_url: str, music_url: str) -> Optional[str]
 
         output_path = f"/tmp/submagic-mixed-{_uuid.uuid4().hex[:8]}.mp4"
 
+        if mute_original:
+            ffmpeg_args = [
+                "ffmpeg", "-y",
+                "-i", video_tmp,
+                "-stream_loop", "-1", "-i", music_tmp,
+                "-map", "0:v", "-map", "1:a",
+                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                "-shortest",
+                output_path,
+            ]
+        else:
+            ffmpeg_args = [
+                "ffmpeg", "-y",
+                "-i", video_tmp,
+                "-stream_loop", "-1", "-i", music_tmp,
+                "-filter_complex", "[0:a]volume=2.0[va];[1:a]volume=0.3[ma];[va][ma]amix=inputs=2:duration=first[a]",
+                "-map", "0:v", "-map", "[a]",
+                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                "-shortest",
+                output_path,
+            ]
+
         proc = await _asyncio.create_subprocess_exec(
-            "ffmpeg", "-y",
-            "-i", video_tmp,
-            "-stream_loop", "-1", "-i", music_tmp,
-            "-filter_complex", "[0:a]volume=2.0[va];[1:a]volume=0.3[ma];[va][ma]amix=inputs=2:duration=first[a]",
-            "-map", "0:v", "-map", "[a]",
-            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-            "-shortest",
-            output_path,
+            *ffmpeg_args,
             stdout=_asyncio.subprocess.DEVNULL,
             stderr=_asyncio.subprocess.PIPE,
         )
@@ -8048,6 +8067,130 @@ async def _mix_music_into_video(video_url: str, music_url: str) -> Optional[str]
 
     except Exception as e:
         print(f"[SubmagicMusic] error: {e}", flush=True)
+        return None
+
+
+def _wrap_for_drawtext(text: str, video_width: int, fontsize: int) -> tuple:
+    """
+    Wrap hook text to at most 2 lines so it never overflows the video's actual
+    width, shrinking fontsize in steps if it still wouldn't fit. drawtext has
+    no auto-wrap of its own — a fixed fontsize with no wrapping (the original
+    bug here) overflows past both edges for anything longer than a couple words,
+    especially on a narrow/vertical video. ~0.65x fontsize per character is a
+    deliberately generous average-width estimate for DejaVu Sans Bold (erring
+    toward wrapping too eagerly rather than risking overflow again) — doesn't
+    need to be exact, box=1 pads around whatever renders.
+    """
+    margin = 120  # total horizontal padding to keep text off the video edges
+    usable_width = max(video_width - margin, 200)
+    words = text.split()
+
+    size = fontsize
+    lines: list = []
+    for _ in range(6):
+        max_chars = max(int(usable_width / (size * 0.65)), 4)
+        lines = []
+        line = ""
+        for word in words:
+            candidate = (line + " " + word).strip()
+            if len(candidate) <= max_chars:
+                line = candidate
+            else:
+                if line:
+                    lines.append(line)
+                line = word
+        if line:
+            lines.append(line)
+        if len(lines) <= 2:
+            break
+        size = int(size * 0.85)
+
+    return "\n".join(lines[:2]), size
+
+
+async def _add_hook_text_overlay(
+    video_url: str,
+    hook_text: str,
+    video_width: Optional[int] = None,
+    color: str = "#ffffff",
+) -> Optional[str]:
+    """Download a finished video, burn hook_text into the first 2.5s via FFmpeg drawtext, re-upload to Cloudinary."""
+    import tempfile
+    import asyncio as _asyncio
+    import os as _os
+    import uuid as _uuid
+    import httpx as _httpx
+    from app.agents.social_media_manager.services.video_production_service import _upload_to_cloudinary
+
+    try:
+        async with _httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
+            video_resp = await client.get(video_url)
+
+        if video_resp.status_code != 200:
+            print(f"[HookOverlay] video download failed {video_resp.status_code}", flush=True)
+            return None
+
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as vf:
+            vf.write(video_resp.content)
+            video_tmp = vf.name
+
+        # video_width (from the job doc) reflects the ORIGINAL upload, probed before
+        # ZapCap touched it — its actual output can differ in resolution. Probe the
+        # real downloaded output file directly so wrapping is never wrong/stale.
+        from app.agents.social_media_manager.services.multi_clip_service import _probe_clip
+        probed = await _probe_clip(video_tmp)
+        actual_width = probed.get("width") or video_width or 1080
+
+        wrapped_text, fontsize = _wrap_for_drawtext(hook_text, actual_width, 52)
+        print(f"[HookOverlay] video_width={actual_width} fontsize={fontsize} text={wrapped_text!r}", flush=True)
+
+        with tempfile.NamedTemporaryFile(suffix=".txt", mode="w", delete=False) as tf:
+            tf.write(wrapped_text)
+            text_tmp = tf.name
+
+        output_path = f"/tmp/hook-overlay-{_uuid.uuid4().hex[:8]}.mp4"
+        hex_color = (color or "#ffffff").lstrip("#")
+        if len(hex_color) != 6 or any(c not in "0123456789abcdefABCDEF" for c in hex_color):
+            hex_color = "ffffff"
+        ffmpeg_color = f"0x{hex_color}"
+        drawtext = (
+            "drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:"
+            f"textfile={text_tmp}:fontsize={fontsize}:fontcolor={ffmpeg_color}:line_spacing=6:"
+            "x=(w-text_w)/2:y=100:enable='between(t,0,2.5)':"
+            "box=1:boxcolor=black@0.5:boxborderw=12"
+        )
+
+        proc = await _asyncio.create_subprocess_exec(
+            "ffmpeg", "-y",
+            "-i", video_tmp,
+            "-vf", drawtext,
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+            "-c:a", "copy",
+            output_path,
+            stdout=_asyncio.subprocess.DEVNULL,
+            stderr=_asyncio.subprocess.PIPE,
+        )
+        _, stderr = await _asyncio.wait_for(proc.communicate(), timeout=300)
+
+        if proc.returncode != 0:
+            print(f"[HookOverlay] ffmpeg failed: {stderr.decode()[-500:]}", flush=True)
+            for p in [video_tmp, text_tmp, output_path]:
+                try: _os.unlink(p)
+                except: pass
+            return None
+
+        with open(output_path, "rb") as f:
+            overlaid_bytes = f.read()
+
+        for p in [video_tmp, text_tmp, output_path]:
+            try: _os.unlink(p)
+            except: pass
+
+        public_id = f"hook-overlay-{_uuid.uuid4().hex[:12]}"
+        return await _upload_to_cloudinary(overlaid_bytes, public_id)
+
+    except Exception as e:
+        print(f"[HookOverlay] error: {e}", flush=True)
         return None
 
 
@@ -8325,8 +8468,14 @@ async def zapcap_produce(
     quality: str = Form("standard"),
     enable_broll: str = Form("false"),
     enable_music: str = Form("false"),
+    enable_hook_text: str = Form("false"),
+    custom_hook_text: str = Form(""),
+    hook_text_color: str = Form("#ffffff"),
     caption_style: str = Form("bold"),
     custom_music: Optional[UploadFile] = File(None),
+    music_source: str = Form("upload"),
+    mute_original_audio: str = Form("false"),
+    purpose: str = Form("general"),
     custom_broll_clips: List[UploadFile] = File(default=[]),
     custom_broll_placements: Optional[str] = Form(None),  # JSON: [{"clipIndex":0,"startTime":5.0,"duration":4}]
     custom_broll_estimated_duration: float = Form(60.0),
@@ -8509,12 +8658,32 @@ async def zapcap_produce(
             await refund_video_job(user_id, job_id, billing, reason="refund")
             raise HTTPException(status_code=502, detail=f"ZapCap returned no taskId: {r.text}")
 
-    # Handle optional background music
+    # Handle optional background music — either a user-uploaded MP3, or an
+    # AI-picked track chosen by mapping the video's purpose to a mood.
     music_url: Optional[str] = None
     if enable_music.lower() == "true" and custom_music:
         music_bytes = await custom_music.read()
         music_url = await _upload_audio_to_cloudinary(music_bytes, f"zapcap-{job_id}")
         print(f"[ZapCap] music uploaded → {music_url[:60]}", flush=True)
+    elif enable_music.lower() == "true" and music_source.lower() == "auto":
+        import random as _music_random
+        from app.agents.social_media_manager.services.video_production_service import _pick_music_url
+        # A single fixed mood per purpose meant every "auto" pick for the same
+        # purpose landed in the same ~3-track pool (or, for "announce", a mood
+        # with only 1 track) — repeated renders sounded like the same track
+        # kept getting picked. Pool a couple of compatible moods per purpose
+        # and pick randomly between them first, so there's a wider spread of
+        # tracks before _pick_music_url's own random choice within the mood.
+        _PURPOSE_TO_MOODS = {
+            "sell": ["upbeat", "electronic"],
+            "teach": ["chill", "acoustic"],
+            "announce": ["cinematic", "electronic"],
+            "general": ["acoustic", "chill"],
+        }
+        mood_pool = _PURPOSE_TO_MOODS.get(purpose.lower(), ["acoustic", "chill"])
+        mood = _music_random.choice(mood_pool)
+        music_url = _pick_music_url(mood)
+        print(f"[ZapCap] AI-picked music for purpose={purpose} mood={mood} → {(music_url or '')[:60]}", flush=True)
 
     # Persist job
     await db["zapcap_jobs"].insert_one({
@@ -8530,6 +8699,10 @@ async def zapcap_produce(
         "has_custom_broll": bool(custom_broll_clips),
         "caption_style": caption_style,
         "music_url": music_url,
+        "mute_original_audio": mute_original_audio.lower() == "true",
+        "hook_text_enabled": enable_hook_text.lower() == "true",
+        "custom_hook_text": custom_hook_text.strip() or None,
+        "hook_text_color": hook_text_color or "#ffffff",
         "video_url": video_url,
         "video_width": probed_width or None,
         "video_height": probed_height or None,
@@ -8737,7 +8910,9 @@ async def zapcap_job_status(
 
         if job.get("music_url"):
             print(f"[ZapCapMusic] mixing music into job {job_id}", flush=True)
-            mixed_url = await _mix_music_into_video(output_url, job["music_url"])
+            mixed_url = await _mix_music_into_video(
+                output_url, job["music_url"], mute_original=bool(job.get("mute_original_audio"))
+            )
             if mixed_url:
                 await db["zapcap_jobs"].update_one(
                     {"job_id": job_id},
@@ -8773,6 +8948,48 @@ async def zapcap_job_status(
                     print(f"[ZapCap] uploaded → {cdn_url[:60]}", flush=True)
             except Exception as _e:
                 print(f"[ZapCap] Cloudinary upload failed: {_e}", flush=True)
+
+        # Hook text: generate from the transcript (only available now that ZapCap has
+        # finished) and burn it into the first 2.5s. Chained after music so it operates
+        # on whichever URL is current at this point. Best-effort — never blocks the render.
+        if job.get("hook_text_enabled"):
+            try:
+                hook_text = job.get("custom_hook_text")
+                if hook_text:
+                    print(f"[HookText] using user-provided text for job {job_id}: '{hook_text}'", flush=True)
+                else:
+                    print(f"[HookText] generating for job {job_id}", flush=True)
+                    stored_words = job.get("transcript_words") or []
+                    if not stored_words:
+                        async with httpx.AsyncClient(timeout=30) as client:
+                            tr = await client.get(
+                                f"{_ZAPCAP_BASE}/videos/{zapcap_video_id}/task/{zapcap_task_id}/transcript",
+                                headers=headers,
+                            )
+                        if tr.status_code == 200:
+                            stored_words = tr.json() if isinstance(tr.json(), list) else []
+                    transcript_text = " ".join(w.get("text", "") for w in stored_words).strip()
+
+                    from app.agents.social_media_manager.services.video_production_service import _generate_hook_text
+                    hook_text = await _generate_hook_text(transcript_text)
+
+                if hook_text:
+                    overlaid_url = await _add_hook_text_overlay(
+                        output_url, hook_text, job.get("video_width"), color=job.get("hook_text_color") or "#ffffff"
+                    )
+                    if overlaid_url:
+                        await db["zapcap_jobs"].update_one(
+                            {"job_id": job_id},
+                            {"$set": {"final_output_url": overlaid_url, "hook_text": hook_text}},
+                        )
+                        output_url = overlaid_url
+                        print(f"[HookText] applied '{hook_text}' → {overlaid_url[:60]}", flush=True)
+                    else:
+                        print(f"[HookText] overlay failed — keeping video without hook text", flush=True)
+                else:
+                    print(f"[HookText] no transcript or generation failed — skipping overlay", flush=True)
+            except Exception as _e:
+                print(f"[HookText] error: {_e}", flush=True)
 
     return UriResponse.get_single_data_response("zapcap_job", {
         "status": status,
