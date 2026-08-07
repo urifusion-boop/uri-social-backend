@@ -697,28 +697,36 @@ class ImageContentService:
             if style_fragment:
                 style_fragment = ImageContentService.inject_brand_variables(style_fragment, bc)
 
-            # Typography System: Prioritize custom font > primary/secondary fonts > legacy single font
-            if bc.get("custom_font_enabled"):
-                font_prompt = bc.get("custom_font_directive", "")
-                print(f"[TYPOGRAPHY] Using custom font directive")
-            elif bc.get("primary_font_prompt") or bc.get("secondary_font_prompt"):
-                # Use primary & secondary font hierarchy
-                primary_prompt = bc.get("primary_font_prompt", "")
-                secondary_prompt = bc.get("secondary_font_prompt", "")
+            # Typography System: primary (headlines) and secondary (body) each
+            # independently use their own uploaded custom font when enabled, falling
+            # back to their own library font prompt otherwise — never one global
+            # custom font applied to both slots.
+            def _slot_prompt(slot: str) -> str:
+                if bc.get(f"{slot}_custom_font_enabled"):
+                    return bc.get(f"{slot}_custom_font_directive", "")
+                return bc.get(f"{slot}_font_prompt", "")
 
-                if primary_prompt and secondary_prompt:
-                    font_prompt = (
-                        f"Typography hierarchy:\n"
-                        f"- Headlines/main text: {primary_prompt}\n"
-                        f"- Body text/supporting copy/captions: {secondary_prompt}"
-                    )
-                    print(f"[TYPOGRAPHY] Using primary ({bc.get('primary_font', '')}) + secondary ({bc.get('secondary_font', '')}) fonts")
-                elif primary_prompt:
-                    font_prompt = f"All text: {primary_prompt}"
-                    print(f"[TYPOGRAPHY] Using primary font only: {bc.get('primary_font', '')}")
-                else:
-                    font_prompt = f"All text: {secondary_prompt}"
-                    print(f"[TYPOGRAPHY] Using secondary font only: {bc.get('secondary_font', '')}")
+            def _slot_label(slot: str) -> str:
+                if bc.get(f"{slot}_custom_font_enabled"):
+                    return f"custom:{(bc.get(f'{slot}_custom_font_file') or {}).get('filename', '?')}"
+                return bc.get(f"{slot}_font", "") or "none"
+
+            primary_prompt = _slot_prompt("primary")
+            secondary_prompt = _slot_prompt("secondary")
+
+            if primary_prompt and secondary_prompt:
+                font_prompt = (
+                    f"Typography hierarchy:\n"
+                    f"- Headlines/main text: {primary_prompt}\n"
+                    f"- Body text/supporting copy/captions: {secondary_prompt}"
+                )
+                print(f"[TYPOGRAPHY] Using primary ({_slot_label('primary')}) + secondary ({_slot_label('secondary')}) fonts")
+            elif primary_prompt:
+                font_prompt = f"All text: {primary_prompt}"
+                print(f"[TYPOGRAPHY] Using primary font only: {_slot_label('primary')}")
+            elif secondary_prompt:
+                font_prompt = f"All text: {secondary_prompt}"
+                print(f"[TYPOGRAPHY] Using secondary font only: {_slot_label('secondary')}")
             else:
                 # Fallback to legacy single font
                 font_prompt = bc.get("font_style_prompt", "")
