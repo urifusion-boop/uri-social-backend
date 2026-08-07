@@ -83,6 +83,21 @@ def _brand_scope(user_id: Optional[str], brand_id: Optional[str]) -> dict:
     return {"$or": [{"user_id": user_id}, {"brand_id": brand_id}]} if brand_id else {"user_id": user_id}
 
 
+def _parse_json_response(resp: httpx.Response, context: str) -> dict:
+    """Google's REST API should always return JSON, but a non-2xx from an upstream
+    auth/gateway failure (bad developer token, MCC not actually linked, wrong
+    customer id shape, etc.) can come back with an empty or non-JSON body — calling
+    .json() directly on that raises an opaque JSONDecodeError that hides the actual
+    HTTP status and body. Surface both here instead, so failures are diagnosable from
+    the server log instead of a bare 'Expecting value: line 1 column 1' traceback."""
+    try:
+        return resp.json()
+    except ValueError:
+        raise GoogleAdsConnectionError(
+            f"{context}: non-JSON response (HTTP {resp.status_code}): {resp.text[:500]!r}"
+        )
+
+
 def _raise_for_error(data: dict, context: str) -> None:
     if "error" in data:
         err = data["error"]
@@ -131,7 +146,7 @@ async def exchange_code_for_tokens(code: str, redirect_uri: str) -> dict:
             "redirect_uri": redirect_uri,
             "grant_type": "authorization_code",
         })
-    data = resp.json()
+    data = _parse_json_response(resp, "Google Ads OAuth code exchange")
     _raise_for_error(data, "Google Ads OAuth code exchange")
     return data
 
@@ -153,7 +168,7 @@ async def refresh_access_token(db, conn_doc: dict) -> dict:
             "client_secret": settings.GOOGLE_ADS_CLIENT_SECRET,
             "grant_type": "refresh_token",
         })
-    data = resp.json()
+    data = _parse_json_response(resp, "Google Ads token refresh")
     if "error" in data:
         raise GoogleAdsConnectionError(f"token refresh failed: {data['error']}")
     expires_at = datetime.now(timezone.utc) + timedelta(seconds=int(data.get("expires_in", 3600)))
@@ -291,7 +306,7 @@ async def request_manager_link(
                 "status": "PENDING",
             }}]},
         )
-    data = resp.json()
+    data = _parse_json_response(resp, "manager-link request")
     if "error" in data:
         message = (data["error"].get("message") or "").lower()
         if "already" in message and ("link" in message or "manager" in message):
@@ -351,7 +366,7 @@ async def create_client_account_under_mcc(
                 "timeZone": "Africa/Lagos",
             }},
         )
-    data = resp.json()
+    data = _parse_json_response(resp, "create client account")
     _raise_for_error(data, "create client account")
     resource_name = data.get("resourceName", "")
     new_customer_id = resource_name.split("/")[-1] if resource_name else ""

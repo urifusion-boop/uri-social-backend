@@ -898,7 +898,7 @@ async def jane_google_ads_link_existing(
     """Path (a): client already has a Google Ads account — send a manager-link
     invitation. On the known 'already linked to another manager' friction, returns
     a specific, actionable message instead of a generic failure."""
-    from .google_ads_connection import AdsConnectionRequired, request_manager_link
+    from .google_ads_connection import AdsConnectionRequired, GoogleAdsConnectionError, request_manager_link
 
     try:
         result = await request_manager_link(
@@ -906,6 +906,8 @@ async def jane_google_ads_link_existing(
         )
     except AdsConnectionRequired as e:
         raise HTTPException(status_code=409, detail=f"google_ads_connection_{e.state.value}")
+    except GoogleAdsConnectionError as e:
+        raise HTTPException(status_code=502, detail=str(e))
 
     if result.get("manager_link_status") == "refused":
         return {
@@ -931,7 +933,7 @@ async def jane_google_ads_create_account(
 ) -> dict:
     """Path (b): client has no Google Ads account — create one fresh under URI's
     MCC (auto-linked, no accept step needed)."""
-    from .google_ads_connection import AdsConnectionRequired, create_client_account_under_mcc
+    from .google_ads_connection import AdsConnectionRequired, GoogleAdsConnectionError, create_client_account_under_mcc
 
     try:
         return await create_client_account_under_mcc(
@@ -939,6 +941,8 @@ async def jane_google_ads_create_account(
         )
     except AdsConnectionRequired as e:
         raise HTTPException(status_code=409, detail=f"google_ads_connection_{e.state.value}")
+    except GoogleAdsConnectionError as e:
+        raise HTTPException(status_code=502, detail=str(e))
 
 
 @router.get("/google/connection/status")
