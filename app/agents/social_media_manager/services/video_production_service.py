@@ -490,6 +490,38 @@ def _wrap_hook_text(text: str, max_chars: int = 20) -> str:
     return "\n".join(lines)
 
 
+async def _generate_hook_text(transcript: str) -> Optional[str]:
+    """
+    Dedicated, lightweight GPT call for a short attention-grabbing hook line
+    describing what a video is about — used for the ZapCap post-render text
+    overlay. Deliberately separate from analyze_content(), which is a heavy
+    8-part prompt requiring SRT/duration/video_type inputs this doesn't need.
+    Fails soft (returns None) so a hook-generation hiccup never blocks the
+    video render itself from completing.
+    """
+    if not transcript or not transcript.strip():
+        return None
+    prompt = (
+        "Here is a video transcript:\n\n"
+        f"{transcript.strip()[:4000]}\n\n"
+        "Write ONE short, punchy hook line (6 words or fewer) that describes what "
+        "this video is about — the kind of line you'd put as a bold title card over "
+        "the first couple seconds to grab a viewer's attention. "
+        "Return ONLY the hook line itself — no quotes, no punctuation at the end, no explanation."
+    )
+    try:
+        client = openai.AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+        response = await client.chat.completions.create(
+            model="gpt-5",
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = (response.choices[0].message.content or "").strip().strip('"').strip()
+        return text or None
+    except Exception as exc:
+        print(f"[HookText] generation failed: {exc}", flush=True)
+        return None
+
+
 def _cld_encode_text(text: str) -> str:
     """URL-encode text for a Cloudinary l_text layer. Commas and slashes must be double-encoded."""
     encoded = urllib.parse.quote(text, safe='')
