@@ -688,14 +688,28 @@ class ImageContentService:
             # independently use their own uploaded custom font when enabled, falling
             # back to their own library font prompt otherwise — never one global
             # custom font applied to both slots.
+            def _selected_custom_font(slot: str) -> Optional[dict]:
+                """This slot's currently-selected font from its own uploaded gallery,
+                or None if the slot is using its library font instead (or the
+                selected url is stale — the font it pointed to was removed)."""
+                selected_url = bc.get(f"{slot}_custom_font_selected_url")
+                if not selected_url:
+                    return None
+                for font in bc.get(f"{slot}_custom_fonts") or []:
+                    if font.get("url") == selected_url:
+                        return font
+                return None
+
             def _slot_prompt(slot: str) -> str:
-                if bc.get(f"{slot}_custom_font_enabled"):
-                    return bc.get(f"{slot}_custom_font_directive", "")
+                custom = _selected_custom_font(slot)
+                if custom:
+                    return custom.get("directive", "")
                 return bc.get(f"{slot}_font_prompt", "")
 
             def _slot_label(slot: str) -> str:
-                if bc.get(f"{slot}_custom_font_enabled"):
-                    return f"custom:{(bc.get(f'{slot}_custom_font_file') or {}).get('filename', '?')}"
+                custom = _selected_custom_font(slot)
+                if custom:
+                    return f"custom:{custom.get('filename', '?')}"
                 return bc.get(f"{slot}_font", "") or "none"
 
             primary_prompt = _slot_prompt("primary")
