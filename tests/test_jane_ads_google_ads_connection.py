@@ -2,10 +2,16 @@
 Unit tests for the Google Ads connection state machine (google_ads_connection.py).
 
 httpx is mocked throughout — these prove the module's own state machine and OAuth
-token handling are correct, not that Google's live API behaves as documented (no
-credentials exist yet to verify that — see the Phase-1 plan). Follows the exact
-convention established by test_jane_ads_meta_adapter.py: no pytest-asyncio, a manual
-_run() helper, a hand-rolled FakeDb, unittest.mock.patch("httpx.AsyncClient").
+token handling are correct, not that Google's live API behaves as documented. Follows
+the exact convention established by test_jane_ads_meta_adapter.py: no pytest-asyncio,
+a manual _run() helper, a hand-rolled FakeDb, unittest.mock.patch("httpx.AsyncClient").
+
+Reflects the corrected connection model, live-confirmed on staging: Google Ads REST
+calls authenticate as URI's own admin identity (a single fixed doc,
+platform="google_ads_admin"), never a brand's own OAuth token — a brand's own
+social_connections doc (platform="google_ads") carries no token fields at all any
+more, only customer_id/manager_link_status/account_name. See the module docstring for
+the live NOT_ADS_USER error this was built to fix.
 """
 import asyncio
 from datetime import datetime, timedelta, timezone
@@ -14,8 +20,9 @@ from unittest.mock import AsyncMock, patch
 from app.agents.jane_ads.google_ads_connection import (
     AdsConnectionRequired,
     ConnectionState,
+    GoogleAdsConnectionError,
     create_client_account_under_mcc,
-    exchange_code_for_tokens,
+    get_admin_valid_access_token,
     get_valid_access_token,
     refresh_access_token,
     request_manager_link,
@@ -89,13 +96,26 @@ class WhatsAppPatched:
 
 
 def _conn_doc(**kw) -> dict:
+    """A brand's own connection doc — no token fields at all (see module docstring):
+    it only tracks which Ads account is theirs, never how to authenticate as them."""
     base = dict(
         id="gads_1", platform="google_ads", user_id="u1", brand_id="b1",
         connection_status="active", customer_id="1234567890",
-        login_customer_id="9999999999", refresh_token="rt_1", access_token="at_1",
-        token_expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        login_customer_id="9999999999",
         manager_link_status="active", account_name="Acme Co",
         connected_at=datetime.now(timezone.utc),
+    )
+    base.update(kw)
+    return base
+
+
+def _admin_conn_doc(**kw) -> dict:
+    """URI's own single admin connection doc — the one that actually carries a
+    token, since it's the identity every real REST call authenticates as."""
+    base = dict(
+        id="gads_admin", platform="google_ads_admin",
+        refresh_token="admin_rt", access_token="admin_at",
+        token_expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
     )
     base.update(kw)
     return base
@@ -114,20 +134,13 @@ def _mock_client(responses):
     return client
 
 
-# ── resolve_connection_state ────────────────────────────────────────────────────
+# ── resolve_connection_state (never touches the network — pure doc-field reads) ──
 
 def test_resolve_connection_state_none_when_no_doc():
     db = FakeDb()
     state, conn = _run(resolve_connection_state(db, "u1", "b1"))
     assert state == ConnectionState.NONE
     assert conn is None
-
-
-def test_resolve_connection_state_oauth_pending():
-    db = FakeDb()
-    db["social_connections"].docs.append(_conn_doc(connection_status="pending_user_match"))
-    state, conn = _run(resolve_connection_state(db, "u1", "b1"))
-    assert state == ConnectionState.OAUTH_PENDING
 
 
 def test_resolve_connection_state_manager_link_pending():
@@ -137,10 +150,10 @@ def test_resolve_connection_state_manager_link_pending():
     assert state == ConnectionState.MANAGER_LINK_PENDING
 
 
-def test_resolve_connection_state_needs_account_selection_right_after_oauth():
-    """A connection with OAuth done but no customer_id chosen yet — manager_link_status
-    is "none" here, NOT "pending", which must NOT be confused with a real invitation
-    already sent to Google (that's a separate state, tested above)."""
+def test_resolve_connection_state_needs_account_selection_right_after_connect():
+    """A connection with no customer_id chosen yet — manager_link_status is "none"
+    here, NOT "pending", which must NOT be confused with a real invitation already
+    sent to Google (that's a separate state, tested above)."""
     db = FakeDb()
     db["social_connections"].docs.append(_conn_doc(manager_link_status="none", customer_id=""))
     state, conn = _run(resolve_connection_state(db, "u1", "b1"))
@@ -164,32 +177,14 @@ def test_resolve_connection_state_manager_link_refused():
     assert state == ConnectionState.MANAGER_LINK_REFUSED
 
 
-def test_resolve_connection_state_expired_on_bad_refresh():
-    db = FakeDb()
+def test_resolve_connection_state_ready_needs_no_admin_connection_at_all():
+    """State resolution is now pure doc-field reads — no live_check, no network call,
+    so it works even with zero admin connection in the db. Whether Google calls would
+    actually succeed is a separate, later concern (get_admin_valid_access_token),
+    checked only when a real REST call is attempted."""
+    db = FakeDb()  # deliberately no admin doc
     db["social_connections"].docs.append(_conn_doc())
-    with patch("httpx.AsyncClient") as MockClient:
-        MockClient.return_value.__aenter__.return_value = _mock_client([{"error": "invalid_grant"}])
-        state, conn = _run(resolve_connection_state(db, "u1", "b1"))
-    assert state == ConnectionState.EXPIRED
-
-
-def test_resolve_connection_state_ready_on_good_refresh():
-    db = FakeDb()
-    db["social_connections"].docs.append(_conn_doc())
-    with patch("httpx.AsyncClient") as MockClient:
-        MockClient.return_value.__aenter__.return_value = _mock_client(
-            [{"access_token": "fresh", "expires_in": 3600}]
-        )
-        state, conn = _run(resolve_connection_state(db, "u1", "b1"))
-    assert state == ConnectionState.READY
-
-
-def test_resolve_connection_state_skips_live_check_when_false():
-    db = FakeDb()
-    db["social_connections"].docs.append(_conn_doc())
-    # No httpx patch at all — if live_check=False actually skips the network call,
-    # this would raise/hang if it tried to hit the real endpoint.
-    state, conn = _run(resolve_connection_state(db, "u1", "b1", live_check=False))
+    state, conn = _run(resolve_connection_state(db, "u1", "b1"))
     assert state == ConnectionState.READY
 
 
@@ -216,6 +211,20 @@ def test_resolve_customer_id_for_launch_raises_for_each_non_ready_state():
             assert e.state == ConnectionState.NONE
 
 
+def test_resolve_customer_id_for_launch_raises_clearly_when_admin_not_connected():
+    """The exact live bug this whole rework fixes: a brand can be fully READY (their
+    own account linked/created) while URI's admin identity was never connected (or
+    its token died) — a distinct, URI-wide ops failure, not a per-brand state."""
+    db = FakeDb()  # brand doc present, but no admin doc at all
+    db["social_connections"].docs.append(_conn_doc())
+    with WhatsAppPatched("2348031234567"):
+        try:
+            _run(resolve_customer_id_for_launch(db, "u1", "b1"))
+            assert False, "expected GoogleAdsConnectionError"
+        except GoogleAdsConnectionError as e:
+            assert "admin" in str(e).lower()
+
+
 def test_resolve_customer_id_for_launch_never_returns_a_settings_fallback():
     """The literal, non-negotiable difference from ads_connection.py's
     resolve_ads_page_for_launch: there is no settings-derived fallback branch here at
@@ -224,10 +233,8 @@ def test_resolve_customer_id_for_launch_never_returns_a_settings_fallback():
     as login_customer_id, never as a substitute customer_id)."""
     db = FakeDb()
     db["social_connections"].docs.append(_conn_doc(customer_id="555555", login_customer_id="9999999999"))
-    with WhatsAppPatched("2348031234567"), patch("httpx.AsyncClient") as MockClient:
-        MockClient.return_value.__aenter__.return_value = _mock_client(
-            [{"access_token": "fresh", "expires_in": 3600}]
-        )
+    db["social_connections"].docs.append(_admin_conn_doc())
+    with WhatsAppPatched("2348031234567"):
         result = _run(resolve_customer_id_for_launch(db, "u1", "b1"))
     assert result["customer_id"] == "555555"
     assert result["customer_id"] != "9999999999"  # never the MCC id
@@ -235,11 +242,13 @@ def test_resolve_customer_id_for_launch_never_returns_a_settings_fallback():
     assert result["whatsapp_number"] == "2348031234567"
 
 
-# ── refresh_access_token / get_valid_access_token ────────────────────────────────
+# ── refresh_access_token / get_valid_access_token (generic over any conn_doc —
+# exercised here via a plain doc; in production these only ever run against the
+# single admin doc, see get_admin_valid_access_token below) ─────────────────────
 
 def test_refresh_access_token_persists_new_token():
     db = FakeDb()
-    db["social_connections"].docs.append(_conn_doc())
+    db["social_connections"].docs.append(_admin_conn_doc())
     with patch("httpx.AsyncClient") as MockClient:
         MockClient.return_value.__aenter__.return_value = _mock_client(
             [{"access_token": "brand_new_token", "expires_in": 3600}]
@@ -252,7 +261,7 @@ def test_refresh_access_token_persists_new_token():
 
 def test_get_valid_access_token_skips_refresh_when_not_expiring_soon():
     db = FakeDb()
-    conn = _conn_doc(access_token="still_good", token_expires_at=datetime.now(timezone.utc) + timedelta(hours=1))
+    conn = _admin_conn_doc(access_token="still_good", token_expires_at=datetime.now(timezone.utc) + timedelta(hours=1))
     # No httpx patch — would raise/hang if a refresh call were actually attempted.
     token = _run(get_valid_access_token(db, conn))
     assert token == "still_good"
@@ -260,7 +269,7 @@ def test_get_valid_access_token_skips_refresh_when_not_expiring_soon():
 
 def test_get_valid_access_token_refreshes_when_close_to_expiry():
     db = FakeDb()
-    conn = _conn_doc(id="gads_2", access_token="stale", token_expires_at=datetime.now(timezone.utc) + timedelta(seconds=10))
+    conn = _admin_conn_doc(access_token="stale", token_expires_at=datetime.now(timezone.utc) + timedelta(seconds=10))
     db["social_connections"].docs.append(conn)
     with patch("httpx.AsyncClient") as MockClient:
         MockClient.return_value.__aenter__.return_value = _mock_client(
@@ -278,9 +287,27 @@ def test_get_valid_access_token_handles_naive_datetime_from_mongo():
     # so this has to be constructed explicitly to catch the regression.
     db = FakeDb()
     naive_expiry = (datetime.now(timezone.utc) + timedelta(hours=1)).replace(tzinfo=None)
-    conn = _conn_doc(access_token="still_good", token_expires_at=naive_expiry)
+    conn = _admin_conn_doc(access_token="still_good", token_expires_at=naive_expiry)
     token = _run(get_valid_access_token(db, conn))
     assert token == "still_good"
+
+
+# ── get_admin_valid_access_token ─────────────────────────────────────────────────
+
+def test_get_admin_valid_access_token_raises_clearly_when_never_connected():
+    db = FakeDb()  # no admin doc at all
+    try:
+        _run(get_admin_valid_access_token(db))
+        assert False, "expected GoogleAdsConnectionError"
+    except GoogleAdsConnectionError as e:
+        assert "admin/connect/initiate" in str(e)
+
+
+def test_get_admin_valid_access_token_returns_stored_token_when_fresh():
+    db = FakeDb()
+    db["social_connections"].docs.append(_admin_conn_doc(access_token="admin_token_1"))
+    token = _run(get_admin_valid_access_token(db))
+    assert token == "admin_token_1"
 
 
 # ── request_manager_link (the "already linked to another manager" friction) ─────
@@ -288,19 +315,22 @@ def test_get_valid_access_token_handles_naive_datetime_from_mongo():
 def test_request_manager_link_success_sets_pending():
     db = FakeDb()
     db["social_connections"].docs.append(_conn_doc(manager_link_status="none", customer_id=""))
+    db["social_connections"].docs.append(_admin_conn_doc())
     with patch("httpx.AsyncClient") as MockClient:
         MockClient.return_value.__aenter__.return_value = _mock_client(
             [{"results": [{"resourceName": "customers/1/customerClientLinks/2"}]}]
         )
         result = _run(request_manager_link(db, "u1", "b1", "5551234567"))
     assert result["manager_link_status"] == "pending"
-    assert db["social_connections"].docs[0]["manager_link_status"] == "pending"
-    assert db["social_connections"].docs[0]["customer_id"] == "5551234567"
+    brand_doc = next(d for d in db["social_connections"].docs if d["platform"] == "google_ads")
+    assert brand_doc["manager_link_status"] == "pending"
+    assert brand_doc["customer_id"] == "5551234567"
 
 
 def test_request_manager_link_refusal_sets_refused_and_next_resolve_reports_it():
     db = FakeDb()
     db["social_connections"].docs.append(_conn_doc(manager_link_status="none", customer_id=""))
+    db["social_connections"].docs.append(_admin_conn_doc())
     with patch("httpx.AsyncClient") as MockClient:
         MockClient.return_value.__aenter__.return_value = _mock_client(
             [{"error": {"message": "This client is already linked to a manager."}}]
@@ -308,10 +338,21 @@ def test_request_manager_link_refusal_sets_refused_and_next_resolve_reports_it()
         result = _run(request_manager_link(db, "u1", "b1", "5551234567"))
     assert result["manager_link_status"] == "refused"
 
-    # A second resolve_connection_state call (no further httpx call needed — refusal
-    # is checked before the live-check branch) correctly reports the refused state.
-    state, conn = _run(resolve_connection_state(db, "u1", "b1", live_check=False))
+    # A second resolve_connection_state call correctly reports the refused state —
+    # no further httpx call involved, since state resolution never touches the
+    # network at all any more.
+    state, conn = _run(resolve_connection_state(db, "u1", "b1"))
     assert state == ConnectionState.MANAGER_LINK_REFUSED
+
+
+def test_request_manager_link_raises_clearly_when_admin_not_connected():
+    db = FakeDb()  # brand doc present, no admin doc
+    db["social_connections"].docs.append(_conn_doc(manager_link_status="none", customer_id=""))
+    try:
+        _run(request_manager_link(db, "u1", "b1", "5551234567"))
+        assert False, "expected GoogleAdsConnectionError"
+    except GoogleAdsConnectionError as e:
+        assert "admin" in str(e).lower()
 
 
 # ── create_client_account_under_mcc ──────────────────────────────────────────────
@@ -319,12 +360,13 @@ def test_request_manager_link_refusal_sets_refused_and_next_resolve_reports_it()
 def test_create_client_account_under_mcc_auto_links():
     db = FakeDb()
     db["social_connections"].docs.append(_conn_doc(manager_link_status="none", customer_id=""))
+    db["social_connections"].docs.append(_admin_conn_doc())
     with patch("httpx.AsyncClient") as MockClient:
         MockClient.return_value.__aenter__.return_value = _mock_client(
             [{"resourceName": "customers/777888999"}]
         )
         result = _run(create_client_account_under_mcc(db, "u1", "b1", "New Brand Ads"))
     assert result["customer_id"] == "777888999"
-    stored = db["social_connections"].docs[0]
-    assert stored["manager_link_status"] == "active"
-    assert stored["created_account_by_uri"] is True
+    brand_doc = next(d for d in db["social_connections"].docs if d["platform"] == "google_ads")
+    assert brand_doc["manager_link_status"] == "active"
+    assert brand_doc["created_account_by_uri"] is True
