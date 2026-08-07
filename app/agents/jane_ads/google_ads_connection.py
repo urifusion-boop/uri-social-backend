@@ -174,6 +174,8 @@ async def get_valid_access_token(db, conn_doc: dict) -> str:
     call — callers never read conn_doc["access_token"] directly."""
     expires_at = conn_doc.get("token_expires_at")
     if isinstance(expires_at, datetime):
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
         remaining = (expires_at - datetime.now(timezone.utc)).total_seconds()
         if remaining > _TOKEN_REFRESH_MARGIN_SECONDS:
             return conn_doc["access_token"]

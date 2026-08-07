@@ -270,6 +270,19 @@ def test_get_valid_access_token_refreshes_when_close_to_expiry():
     assert token == "refreshed"
 
 
+def test_get_valid_access_token_handles_naive_datetime_from_mongo():
+    # Real pymongo/motor reads back naive UTC datetimes even though we write
+    # tz-aware ones (datetime.now(timezone.utc)) — confirmed live on staging,
+    # where this raised TypeError: can't subtract offset-naive and
+    # offset-aware datetimes. FakeDb just stores whatever object it's given,
+    # so this has to be constructed explicitly to catch the regression.
+    db = FakeDb()
+    naive_expiry = (datetime.now(timezone.utc) + timedelta(hours=1)).replace(tzinfo=None)
+    conn = _conn_doc(access_token="still_good", token_expires_at=naive_expiry)
+    token = _run(get_valid_access_token(db, conn))
+    assert token == "still_good"
+
+
 # ── request_manager_link (the "already linked to another manager" friction) ─────
 
 def test_request_manager_link_success_sets_pending():
