@@ -907,6 +907,7 @@ async def jane_google_ads_link_existing(
     except AdsConnectionRequired as e:
         raise HTTPException(status_code=409, detail=f"google_ads_connection_{e.state.value}")
     except GoogleAdsConnectionError as e:
+        print(f"⚠️  Google Ads REST failure: {e}")
         raise HTTPException(status_code=502, detail=str(e))
 
     if result.get("manager_link_status") == "refused":
@@ -942,6 +943,7 @@ async def jane_google_ads_create_account(
     except AdsConnectionRequired as e:
         raise HTTPException(status_code=409, detail=f"google_ads_connection_{e.state.value}")
     except GoogleAdsConnectionError as e:
+        print(f"⚠️  Google Ads REST failure: {e}")
         raise HTTPException(status_code=502, detail=str(e))
 
 
