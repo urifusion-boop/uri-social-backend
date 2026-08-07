@@ -695,9 +695,14 @@ class ImageContentService:
                 selected_url = bc.get(f"{slot}_custom_font_selected_url")
                 if not selected_url:
                     return None
-                for font in bc.get(f"{slot}_custom_fonts") or []:
+                gallery = bc.get(f"{slot}_custom_fonts") or []
+                for font in gallery:
                     if font.get("url") == selected_url:
                         return font
+                print(
+                    f"[TYPOGRAPHY] ⚠️ {slot}_custom_font_selected_url={selected_url!r} set but not found in "
+                    f"{slot}_custom_fonts ({len(gallery)} entries) — falling back to library font for {slot}"
+                )
                 return None
 
             def _slot_prompt(slot: str) -> str:

@@ -143,12 +143,20 @@ class BrandProfileService:
 
         # Custom font fields (Typography System) — per-slot gallery: primary and
         # secondary each independently accumulate uploaded fonts, plus which one (if
-        # any) is currently selected.
+        # any) is currently selected. A slot is EITHER a library font (primary_font/
+        # secondary_font above) OR a selected custom font, never both — the frontend
+        # already clears the other side when either is picked, but enforce it here
+        # too so a stale value from an older save (or a client bug) can never leave
+        # both set at once and get read ambiguously downstream.
         for slot in ("primary", "secondary"):
             for suffix in ("custom_fonts", "custom_font_selected_url"):
                 key = f"{slot}_{suffix}"
                 if key in data:
                     doc[key] = data[key]
+            if data.get(f"{slot}_custom_font_selected_url"):
+                doc[f"{slot}_font"] = ""
+            elif data.get(f"{slot}_font"):
+                doc[f"{slot}_custom_font_selected_url"] = ""
 
         # Canvas Editor feature flag
         if "canvas_editor_enabled" in data:
