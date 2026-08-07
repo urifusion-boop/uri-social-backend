@@ -18,9 +18,23 @@ to repeat. See tests/test_jane_ads_google_no_fallback_account.py for the CI guar
 Extends the EXISTING social_connections collection (platform="google_ads") rather than
 inventing a parallel one — that collection already carries a generic, platform-
 parameterized envelope reused across LinkedIn/X/TikTok/Instagram/Meta-ads connections.
-The OAuth grant itself (initiate/callback/finalize) lives in router.py, as new, purely
-additive endpoints under /jane-ads/google/*; this module is the state machine + token
-handling underneath it.
+The OAuth grant itself (initiate/callback) lives in router.py, as new, purely additive
+endpoints under /jane-ads/google/*; this module is the state machine + token handling
+underneath it.
+
+IMPORTANT, live-confirmed on staging: Google Ads API calls do NOT authenticate as the
+brand. CreateCustomerClient/CustomerClientLinkService require the OAuth identity to
+already be a user on the MANAGER account (the MCC) — a brand's own personal Google
+login has no relationship to URI's MCC and gets a hard "not associated with any Ads
+accounts" error. This is Google's agency model, unlike Meta's per-user/per-page tokens.
+So there is exactly ONE Google Ads OAuth grant in this whole system: URI's own admin
+identity (whoever administers GOOGLE_ADS_MCC_CUSTOMER_ID), connected once via
+/jane-ads/google/admin/connect/initiate and stored as a single fixed doc
+(get_admin_connection/_ADMIN_CONN_ID below). Every real REST call — link-existing,
+create-account, and eventually launch/spend/pause — authenticates as that identity.
+A brand's own social_connections doc carries no token fields at all; it only tracks
+customer_id/manager_link_status/account_name, i.e. which Ads account is theirs, not
+how to authenticate as them (there is no "as them").
 """
 from __future__ import annotations
 
@@ -46,17 +60,20 @@ _TOKEN_REFRESH_MARGIN_SECONDS = 120
 
 
 class ConnectionState(str, Enum):
-    NONE = "none"                                  # no google_ads connection of any kind
-    OAUTH_PENDING = "oauth_pending"                 # OAuth doc stored, not yet finalized to a brand
+    NONE = "none"                                  # brand hasn't clicked Connect yet
     NO_WHATSAPP = "no_whatsapp"                     # connection healthy but no brand WhatsApp number saved
-    NEEDS_ACCOUNT_SELECTION = "needs_account_selection"  # OAuth finalized, but no customer_id chosen yet —
+    NEEDS_ACCOUNT_SELECTION = "needs_account_selection"  # connected, but no customer_id chosen yet —
                                                      # distinct from MANAGER_LINK_PENDING: nothing has been
                                                      # sent to Google to wait on yet, the brand hasn't picked
                                                      # link-existing vs. create-new
     MANAGER_LINK_PENDING = "manager_link_pending"   # link request sent, awaiting client accept
     MANAGER_LINK_REFUSED = "manager_link_refused"   # client account already linked to another manager
-    EXPIRED = "expired"                             # refresh token invalid/revoked
-    READY = "ready"                                 # customer_id + active manager link + refreshable token
+    READY = "ready"                                 # customer_id + active manager link
+
+    # No OAUTH_PENDING/EXPIRED here — those described a per-brand OAuth token's own
+    # lifecycle, which no longer exists (see module docstring: brands don't OAuth into
+    # Google at all anymore). A dead admin token is a URI-wide ops problem, not a
+    # per-brand state — see GoogleAdsConnectionError below instead.
 
 
 class AdsConnectionRequired(Exception):
@@ -110,8 +127,9 @@ def _raise_for_error(data: dict, context: str) -> None:
 
 
 async def get_google_ads_connection(db, user_id: Optional[str], brand_id: Optional[str]) -> Optional[dict]:
-    """The brand's ACTIVE google_ads connection — the one that carries a usable
-    refresh_token. Mirrors ads_connection.get_ads_connection."""
+    """The brand's ACTIVE google_ads connection — note this carries NO token fields
+    (see module docstring); it only tracks which Ads account is theirs. Mirrors
+    ads_connection.get_ads_connection."""
     if db is None or not (user_id or brand_id):
         return None
     return await db[CONNECTIONS].find_one(
@@ -120,10 +138,59 @@ async def get_google_ads_connection(db, user_id: Optional[str], brand_id: Option
     )
 
 
-async def _get_any_connection(db, user_id: Optional[str], brand_id: Optional[str]) -> Optional[dict]:
-    """Same brand scope, WITHOUT the connection_status=active filter — needed to
-    distinguish OAUTH_PENDING (doc exists, not finalized yet) from NONE (nothing at
-    all)."""
+_ADMIN_CONN_ID = "gads_admin"
+
+
+async def get_admin_connection(db) -> Optional[dict]:
+    """URI's own single Google Ads OAuth grant — the identity that actually has admin
+    access to the MCC, and therefore the one every real REST call authenticates as
+    (see module docstring). One fixed doc, not brand-scoped."""
+    if db is None:
+        return None
+    return await db[CONNECTIONS].find_one({"id": _ADMIN_CONN_ID, "platform": "google_ads_admin"})
+
+
+async def save_admin_connection(db, tokens: dict) -> None:
+    """Persists the admin's tokens after the one-time OAuth consent
+    (/jane-ads/google/admin/connect/callback). Reuses the exact doc shape
+    get_valid_access_token/refresh_access_token already expect (id/access_token/
+    refresh_token/token_expires_at), so those two functions work unchanged against
+    this doc — only WHICH doc callers fetch first differs from the old per-brand
+    flow."""
+    now = datetime.now(timezone.utc)
+    update: dict = {
+        "id": _ADMIN_CONN_ID,
+        "platform": "google_ads_admin",
+        "access_token": tokens["access_token"],
+        "token_expires_at": now + timedelta(seconds=int(tokens.get("expires_in", 3600))),
+        "updated_at": now,
+    }
+    if tokens.get("refresh_token"):
+        # Google only returns this on first consent (or prompt=consent, always set on
+        # the admin authorize URL) — never overwrite a previously-stored one with a
+        # blank on a routine refresh.
+        update["refresh_token"] = tokens["refresh_token"]
+    await db[CONNECTIONS].update_one({"id": _ADMIN_CONN_ID}, {"$set": update}, upsert=True)
+
+
+async def get_admin_valid_access_token(db) -> str:
+    """The token every real Google Ads REST call actually authenticates as. Raises
+    GoogleAdsConnectionError with a clear, actionable message if the admin identity
+    has never been connected — a one-time ops action entirely separate from any
+    brand's own connection flow, so this is never a per-brand ConnectionState."""
+    conn = await get_admin_connection(db)
+    if not conn:
+        raise GoogleAdsConnectionError(
+            "Google Ads isn't set up yet — an admin needs to connect the manager "
+            "account via GET /jane-ads/google/admin/connect/initiate first."
+        )
+    return await get_valid_access_token(db, conn)
+
+
+async def get_any_google_ads_connection(db, user_id: Optional[str], brand_id: Optional[str]) -> Optional[dict]:
+    """Same brand scope, WITHOUT the connection_status=active filter. Brand docs are
+    always active from creation now (no OAuth roundtrip to wait on), so this mostly
+    matters for future connection_status values, not a pending state today."""
     if db is None or not (user_id or brand_id):
         return None
     return await db[CONNECTIONS].find_one(
@@ -152,12 +219,10 @@ async def exchange_code_for_tokens(code: str, redirect_uri: str) -> dict:
 
 
 async def refresh_access_token(db, conn_doc: dict) -> dict:
-    """Exchanges the stored refresh_token for a fresh access_token and persists it.
-    This doubles as the live health check in resolve_connection_state — Google has no
-    separate 'verify scopes' endpoint the way Meta's /me/permissions does, so a
-    successful refresh IS the proof the connection still works. Raises
-    GoogleAdsConnectionError on failure (invalid_grant = revoked/expired refresh token
-    is the most common real case); the caller maps that to ConnectionState.EXPIRED."""
+    """Exchanges the stored refresh_token for a fresh access_token and persists it —
+    generic over WHICH doc (the single admin doc today; nothing else carries tokens
+    any more, see module docstring). Raises GoogleAdsConnectionError on failure
+    (invalid_grant = revoked/expired refresh token is the most common real case)."""
     refresh_token = conn_doc.get("refresh_token", "")
     if not refresh_token:
         raise GoogleAdsConnectionError("no refresh_token stored on this connection")
@@ -199,36 +264,30 @@ async def get_valid_access_token(db, conn_doc: dict) -> str:
 
 
 async def resolve_connection_state(
-    db, user_id: Optional[str], brand_id: Optional[str], *, live_check: bool = True,
+    db, user_id: Optional[str], brand_id: Optional[str],
 ) -> tuple[ConnectionState, Optional[dict]]:
-    """The OAuth/manager-link state machine (§2 of the Phase-1 plan). Deliberately does
-    NOT consider the brand's WhatsApp number — that's a separate, orthogonal check
+    """The manager-link state machine (§2 of the Phase-1 plan). Deliberately does NOT
+    consider the brand's WhatsApp number — that's a separate, orthogonal check
     (resolve_customer_id_for_launch checks it independently, same ordering as
-    ads_connection.resolve_ads_page_for_launch: WhatsApp first, then this). Returns
-    (state, connection_doc_or_None)."""
-    conn = await _get_any_connection(db, user_id, brand_id)
+    ads_connection.resolve_ads_page_for_launch: WhatsApp first, then this). No
+    live_check param — a brand doc carries no token to health-check any more (see
+    module docstring); the one thing that CAN go dead is the shared admin token,
+    which every real call already surfaces as a clear GoogleAdsConnectionError on its
+    own, not a per-brand state. Returns (state, connection_doc_or_None)."""
+    conn = await get_any_google_ads_connection(db, user_id, brand_id)
     if not conn:
         return ConnectionState.NONE, None
-
-    if conn.get("connection_status") != "active":
-        return ConnectionState.OAUTH_PENDING, conn
 
     if conn.get("manager_link_status") == "refused":
         return ConnectionState.MANAGER_LINK_REFUSED, conn
     if not conn.get("customer_id"):
-        # OAuth is done, but nothing has been sent to Google to wait on yet — the
-        # brand hasn't chosen link-existing vs. create-new. Checked BEFORE the
-        # "pending" branch below: a doc with manager_link_status="none" and no
-        # customer_id is NOT the same as one where an invitation was actually sent.
+        # Connected, but nothing has been sent to Google to wait on yet — the brand
+        # hasn't chosen link-existing vs. create-new. Checked BEFORE the "pending"
+        # branch below: a doc with manager_link_status="none" and no customer_id is
+        # NOT the same as one where an invitation was actually sent.
         return ConnectionState.NEEDS_ACCOUNT_SELECTION, conn
     if conn.get("manager_link_status") in (None, "", "none", "pending"):
         return ConnectionState.MANAGER_LINK_PENDING, conn
-
-    if live_check:
-        try:
-            await refresh_access_token(db, conn)
-        except GoogleAdsConnectionError:
-            return ConnectionState.EXPIRED, conn
 
     return ConnectionState.READY, conn
 
@@ -255,7 +314,10 @@ async def resolve_customer_id_for_launch(db, user_id: Optional[str], brand_id: O
     if state != ConnectionState.READY:
         raise AdsConnectionRequired(state, (conn or {}).get("account_name", ""))
 
-    access_token = await get_valid_access_token(db, conn)
+    # Authenticates as URI's own admin identity, not the brand's — see module
+    # docstring. GoogleAdsConnectionError here means the admin was never connected or
+    # the refresh token died; a URI-wide ops problem, not something this brand caused.
+    access_token = await get_admin_valid_access_token(db)
     return {
         "customer_id": conn["customer_id"],
         "login_customer_id": conn.get("login_customer_id") or settings.GOOGLE_ADS_MCC_CUSTOMER_ID,
@@ -276,10 +338,9 @@ async def request_manager_link(
     REST shape follows Google Ads API's documented CustomerClientLinkService (POST
     customers/{mccCustomerId}/customerClientLinks:mutate, creating a
     CustomerClientLink with client_customer=resource name of the client account and
-    status=PENDING) — NOT yet live-verified end-to-end (no MCC/developer token/OAuth
-    client exist yet). Re-confirm exact field names against Google's current REST docs
-    at first real use, same "shape not live-verified" caveat adapters/meta.py's header
-    would carry for anything untested against a real Ad Account.
+    status=PENDING). Authenticates as URI's own admin identity (see module docstring)
+    — NOT the brand's, since only an identity that's already a user on the MCC can
+    call this at all.
 
     On Google's specific "already linked to another manager" error (the known §3.6
     friction — a previous agency's link was never removed), stores WHY so
@@ -290,7 +351,7 @@ async def request_manager_link(
         raise AdsConnectionRequired(ConnectionState.NONE)
 
     mcc_id = settings.GOOGLE_ADS_MCC_CUSTOMER_ID
-    access_token = await get_valid_access_token(db, conn)
+    access_token = await get_admin_valid_access_token(db)
     api_base = f"https://googleads.googleapis.com/{_API_VERSION()}"
     headers = {
         "Authorization": f"Bearer {access_token}",
@@ -342,14 +403,15 @@ async def create_client_account_under_mcc(
     way an invitation needs), so this sets manager_link_status="active" immediately.
 
     REST shape follows CustomerService.CreateCustomerClient (POST
-    customers/{mccCustomerId}:createCustomerClient) — same "not yet live-verified"
-    caveat as request_manager_link above."""
+    customers/{mccCustomerId}:createCustomerClient). Authenticates as URI's own admin
+    identity, same reasoning as request_manager_link above — live-confirmed on
+    staging that the brand's own OAuth token gets a hard NOT_ADS_USER error here."""
     conn = await get_google_ads_connection(db, user_id, brand_id)
     if not conn:
         raise AdsConnectionRequired(ConnectionState.NONE)
 
     mcc_id = settings.GOOGLE_ADS_MCC_CUSTOMER_ID
-    access_token = await get_valid_access_token(db, conn)
+    access_token = await get_admin_valid_access_token(db)
     api_base = f"https://googleads.googleapis.com/{_API_VERSION()}"
     headers = {
         "Authorization": f"Bearer {access_token}",
