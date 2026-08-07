@@ -276,17 +276,15 @@ class BrandProfileRequest(BaseModel):
     primary_font_prompt: Optional[str] = None
     secondary_font: Optional[str] = None
     secondary_font_prompt: Optional[str] = None
-    # Custom font upload is per-slot — primary (headlines) and secondary (body) are
-    # independently either a library font (primary_font/secondary_font above) or an
-    # uploaded custom font, never one global font applied to both.
-    primary_custom_font_enabled: Optional[bool] = None
-    primary_custom_font_file: Optional[Dict[str, str]] = None
-    primary_custom_font_analysis: Optional[Dict[str, Any]] = None
-    primary_custom_font_directive: Optional[str] = None
-    secondary_custom_font_enabled: Optional[bool] = None
-    secondary_custom_font_file: Optional[Dict[str, str]] = None
-    secondary_custom_font_analysis: Optional[Dict[str, Any]] = None
-    secondary_custom_font_directive: Optional[str] = None
+    # Custom font upload is per-slot — primary (headlines) and secondary (body) each
+    # keep their OWN gallery of uploaded fonts (new uploads add to it, never discard
+    # a prior one), plus which single font from that gallery (if any) is selected.
+    # An empty *_custom_font_selected_url means this slot is using its library font
+    # (primary_font/secondary_font above) instead.
+    primary_custom_fonts: Optional[List[Dict[str, Any]]] = None  # [{url, filename, analysis, directive}]
+    primary_custom_font_selected_url: Optional[str] = None
+    secondary_custom_fonts: Optional[List[Dict[str, Any]]] = None
+    secondary_custom_font_selected_url: Optional[str] = None
     # Feature flags
     canvas_editor_enabled: Optional[bool] = None
     use_v3_prompts: Optional[bool] = None

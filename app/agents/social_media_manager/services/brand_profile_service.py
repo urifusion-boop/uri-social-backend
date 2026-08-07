@@ -105,10 +105,11 @@ class BrandProfileService:
         if "secondary_font_prompt" in data:
             doc["secondary_font_prompt"] = data["secondary_font_prompt"]
 
-        # Custom font fields (Typography System) — per-slot: primary and secondary
-        # each independently track their own uploaded custom font.
+        # Custom font fields (Typography System) — per-slot gallery: primary and
+        # secondary each independently accumulate uploaded fonts, plus which one (if
+        # any) is currently selected.
         for slot in ("primary", "secondary"):
-            for suffix in ("custom_font_enabled", "custom_font_file", "custom_font_analysis", "custom_font_directive"):
+            for suffix in ("custom_fonts", "custom_font_selected_url"):
                 key = f"{slot}_{suffix}"
                 if key in data:
                     doc[key] = data[key]
@@ -410,15 +411,11 @@ class BrandProfileService:
             "primary_font_prompt":  profile.get("primary_font_prompt", ""),
             "secondary_font":       profile.get("secondary_font", ""),
             "secondary_font_prompt": profile.get("secondary_font_prompt", ""),
-            # Custom font fields (Typography System) — per-slot, see save-side note above
-            "primary_custom_font_enabled":    profile.get("primary_custom_font_enabled", False),
-            "primary_custom_font_file":       profile.get("primary_custom_font_file"),
-            "primary_custom_font_analysis":   profile.get("primary_custom_font_analysis") or {},
-            "primary_custom_font_directive":  profile.get("primary_custom_font_directive", ""),
-            "secondary_custom_font_enabled":  profile.get("secondary_custom_font_enabled", False),
-            "secondary_custom_font_file":     profile.get("secondary_custom_font_file"),
-            "secondary_custom_font_analysis": profile.get("secondary_custom_font_analysis") or {},
-            "secondary_custom_font_directive": profile.get("secondary_custom_font_directive", ""),
+            # Custom font fields (Typography System) — per-slot gallery, see save-side note above
+            "primary_custom_fonts":               profile.get("primary_custom_fonts") or [],
+            "primary_custom_font_selected_url":   profile.get("primary_custom_font_selected_url", ""),
+            "secondary_custom_fonts":              profile.get("secondary_custom_fonts") or [],
+            "secondary_custom_font_selected_url": profile.get("secondary_custom_font_selected_url", ""),
             # Caption Voice System fields
             "voice_profile":        profile.get("voice_profile") or {},
             "voice_sample_analysis": profile.get("voice_sample_analysis") or {},
