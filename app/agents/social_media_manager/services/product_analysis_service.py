@@ -207,35 +207,48 @@ CRITICAL RULES:
         Returns:
             Preservation prompt block (string)
         """
+        # GPT-4o-mini vision sometimes returns the literal string "null" instead of a
+        # real JSON null for an optional field (e.g. liquid_colour/logo_description
+        # when the prompt tells it "or null if not visible") — the same quirk
+        # custom_visual_guide_service.py already guards against. Unfiltered, that
+        # literal text lands straight in this f-string block ("Logo: null", "Liquid
+        # colour: null.") and trips image_content_service's own "prompt contains
+        # 'null'" validation, aborting generation entirely. Live-confirmed: a real
+        # recomposite request failed this way.
+        def _clean(value, default):
+            if value is None or value == "" or (isinstance(value, str) and value.strip().lower() == "null"):
+                return default
+            return value
+
         # Extract fields with safe defaults
-        product_type = product_spec.get("product_type", "product")
-        overall_shape = product_spec.get("overall_shape", "standard shape")
-        ratio = product_spec.get("height_width_ratio", "2:1")
+        product_type = _clean(product_spec.get("product_type"), "product")
+        overall_shape = _clean(product_spec.get("overall_shape"), "standard shape")
+        ratio = _clean(product_spec.get("height_width_ratio"), "2:1")
 
-        cap = product_spec.get("cap_closure", {})
-        cap_type = cap.get("type", "cap")
-        cap_colour = cap.get("colour", "standard")
-        cap_material = cap.get("material", "standard material")
+        cap = product_spec.get("cap_closure", {}) or {}
+        cap_type = _clean(cap.get("type"), "cap")
+        cap_colour = _clean(cap.get("colour"), "standard")
+        cap_material = _clean(cap.get("material"), "standard material")
 
-        body = product_spec.get("body", {})
-        body_material = body.get("material", "standard material")
-        body_colour = body.get("colour", "standard")
-        body_finish = body.get("finish", "standard")
+        body = product_spec.get("body", {}) or {}
+        body_material = _clean(body.get("material"), "standard material")
+        body_colour = _clean(body.get("colour"), "standard")
+        body_finish = _clean(body.get("finish"), "standard")
 
         liquid_visible = product_spec.get("liquid_visible", False)
-        liquid_colour = product_spec.get("liquid_colour")
+        liquid_colour = _clean(product_spec.get("liquid_colour"), None)
 
-        label = product_spec.get("label", {})
+        label = product_spec.get("label", {}) or {}
         label_present = label.get("present", False)
-        label_position = label.get("position", "front")
-        label_bg = label.get("background_colour", "standard")
-        label_text_lines = label.get("text_lines", [])
-        label_text_colour = label.get("text_colour", "standard")
-        label_font = label.get("font_style", "standard")
-        label_logo = label.get("logo_description")
+        label_position = _clean(label.get("position"), "front")
+        label_bg = _clean(label.get("background_colour"), "standard")
+        label_text_lines = [t for t in (label.get("text_lines") or []) if _clean(t, None)]
+        label_text_colour = _clean(label.get("text_colour"), "standard")
+        label_font = _clean(label.get("font_style"), "standard")
+        label_logo = _clean(label.get("logo_description"), None)
 
-        additional = product_spec.get("additional_details", "none")
-        colours_hex = product_spec.get("dominant_colours_hex", [])
+        additional = _clean(product_spec.get("additional_details"), "none")
+        colours_hex = [c for c in (product_spec.get("dominant_colours_hex") or []) if _clean(c, None)]
 
         # Build label text block
         if label_present and label_text_lines:
