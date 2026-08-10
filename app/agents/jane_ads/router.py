@@ -10,6 +10,7 @@ The HTML page is served from the backend so it calls /jane-ads/plan same-origin
 """
 from __future__ import annotations
 
+import re
 from typing import Optional
 
 from fastapi import APIRouter, Body, Depends, File, HTTPException, Request, UploadFile
@@ -1204,6 +1205,42 @@ def _last_known_understood(saved: list[dict]) -> dict:
     return merged
 
 
+_BARE_NUMBER_RE = re.compile(
+    r"^[₦naNGN\s]*([\d,]+(?:\.\d+)?)\s*(k)?[₦\s]*$", re.IGNORECASE,
+)
+
+
+def _extract_trailing_bare_budget(message: str, last_assistant_turn: str) -> Optional[float]:
+    """Live-confirmed real bug: a client answered a budget question with a bare
+    number ("10,000") and the consultant's OWN structured budget_ngn field came
+    back None — even though its own next question's prose explicitly said "your
+    past spending was ₦10,000", proving it understood the number in context but
+    never committed it to the field the rest of the pipeline actually reads. This
+    repeated on every later turn (nothing to backfill from — see
+    _last_known_understood above), forcing the client to type the same number
+    twice before a plan would build.
+
+    Deterministic fallback, independent of the model: `message` is the frontend's
+    accumulated brief (each reply appended as its own ". "-separated segment — see
+    send() in CampaignsPage.tsx), so the LAST segment is always the client's newest
+    raw reply. If that segment is nothing but a bare number (optionally with ₦/
+    commas/a "k" thousands suffix) AND the question that prompted it was actually
+    about budget/spend (never fires on a bare number answering something else,
+    e.g. a phone number or a headcount), treat it as the stated budget."""
+    if "budget" not in last_assistant_turn.lower() and "spend" not in last_assistant_turn.lower():
+        return None
+    segments = [s.strip() for s in message.split(". ") if s.strip()]
+    if not segments:
+        return None
+    m = _BARE_NUMBER_RE.match(segments[-1])
+    if not m:
+        return None
+    value = float(m.group(1).replace(",", ""))
+    if m.group(2):  # "10k" -> 10,000
+        value *= 1000
+    return value if value > 0 else None
+
+
 async def _build_campaign_plan(
     body: MetaLaunchFromMessageBody, brand_ctx: dict, db: AsyncIOMotorDatabase,
 ) -> "_PlanBuildResult | dict":
@@ -1306,6 +1343,18 @@ async def _build_campaign_plan(
                   "desired_conversions", "city", "geo_mode"):
         if not getattr(parsed, field, None) and prior_understood.get(field):
             setattr(parsed, field, prior_understood[field])
+
+    # Live-confirmed separate bug: a client answered a budget question with a bare
+    # number and the model's own budget_ngn field came back None on that SAME turn
+    # (and every turn after — nothing in prior_understood above to backfill from
+    # either, since it was never captured even once). Deterministic fallback, only
+    # trusted when the question actually being answered was about budget/spend.
+    if not parsed.budget_ngn:
+        last_assistant = next((t.get("content", "") for t in reversed(thread_turns)
+                               if t.get("role") == "assistant"), "")
+        bare_budget = _extract_trailing_bare_budget(body.message, last_assistant)
+        if bare_budget:
+            parsed.budget_ngn = bare_budget
 
     # 1.5. Backwards budget (PRD §3.1) — the user described an outcome ("20 customers"),
     # not a Naira amount. Convert using this business's own real cost-per-conversation
