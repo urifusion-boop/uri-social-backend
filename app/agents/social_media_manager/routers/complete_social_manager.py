@@ -1553,6 +1553,26 @@ async def facebook_ads_finalize(
     if not is_personal:
         update_fields["brand_id"] = brand_id
 
+    # A personal brand's ads connection is a single slot, not a growing list — before
+    # this reconnect, personal-brand connections were never tagged with brand_id (see
+    # above), so get_ads_connection's lookup matches EVERY page this user_id ever
+    # connected and just takes whichever has the newest connected_at. Reconnecting a
+    # DIFFERENT page silently lost to an older-but-still-"active" one that happened to
+    # have already been reconnected more recently — live-confirmed: a user connected
+    # "Living the truth" then, days later, reconnected a different page for unrelated
+    # testing, and every ad kept using the unrelated page because it was newer, with no
+    # way to tell from the data which page was actually meant to be in use. Retiring
+    # every other active connection in this same scope on every finalize makes "active"
+    # mean what it says: exactly one connection per (personal user | agency brand).
+    supersede_scope = (
+        {"user_id": user_id} if is_personal else {"brand_id": brand_id}
+    )
+    await db["social_connections"].update_many(
+        {"platform": "facebook_ads", "connection_status": "active",
+         "id": {"$ne": f"fbads_{fb_page_id}"}, **supersede_scope},
+        {"$set": {"connection_status": "superseded", "updated_at": datetime.utcnow().isoformat()}},
+    )
+
     result = await db["social_connections"].update_one(
         {"id": f"fbads_{fb_page_id}"},
         {"$set": update_fields},
