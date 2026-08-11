@@ -8425,7 +8425,22 @@ async def submagic_produce(
             if resp.status_code != 201:
                 print(f"[Submagic] create error {resp.status_code}: {resp.text}", flush=True)
                 await refund_video_job(user_id, job_id, billing, reason="refund")
-                raise HTTPException(status_code=502, detail=f"Submagic error: {resp.text}")
+                # Live-confirmed real case: Submagic's own account ran dry
+                # (402 INSUFFICIENT_CREDITS) and this surfaced as a bare, misleading
+                # 502 "Bad Gateway" — looked like an infra outage, sent debugging in
+                # the wrong direction entirely, when it was really an external
+                # vendor billing issue with a clear message sitting right there in
+                # the response. Pass through Submagic's own status/message for any
+                # 4xx (a real, actionable client-side condition — bad credits, bad
+                # payload) instead of flattening everything into an opaque 502;
+                # keep 502 only for Submagic's own 5xx/unexpected failures, which
+                # genuinely are "the upstream is having a bad day."
+                try:
+                    submagic_message = resp.json().get("message") or resp.text
+                except Exception:
+                    submagic_message = resp.text
+                status = resp.status_code if 400 <= resp.status_code < 500 else 502
+                raise HTTPException(status_code=status, detail=f"Submagic error: {submagic_message}")
             project = resp.json()
     except _httpx.RequestError as exc:
         await refund_video_job(user_id, job_id, billing, reason="refund")
