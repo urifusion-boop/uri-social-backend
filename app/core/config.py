@@ -118,6 +118,17 @@ class Settings(BaseSettings):
     # staging. Bump this periodically; check developers.google.com/google-ads/api/docs/sunset-dates.
     GOOGLE_ADS_API_VERSION: str = "v24"
 
+    # TikTok Marketing API (Jane + Ads, Phase 1 — see app/agents/jane_ads/adapters/tiktok.py)
+    # Unlike Meta/Google, Phase 1 does NOT run ads from the brand's own TikTok presence
+    # (that's Spark Ads, which needs a manual per-video authorization code from the
+    # creator — no OAuth path exists for it). Every brand's video ad is uploaded to and
+    # launched from this one shared URI-owned advertiser account instead — the same
+    # already-established pattern META_ADS_PAGE_ID uses for Meta, just made explicit
+    # here from the start rather than growing into it.
+    TIKTOK_ADS_ADVERTISER_ID: str = ""
+    TIKTOK_ADS_ACCESS_TOKEN: str = ""
+    TIKTOK_ADS_API_VERSION: str = "v1.3"
+
     # SQUAD Payment Gateway (PRD Section 6.2: Payment Integration)
     # Production: Always use live mode for real payments
     SQUAD_MODE: str = "live"  # Options: "sandbox" or "live"
