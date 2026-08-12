@@ -6,7 +6,8 @@ ConsultantBrief, and that the result stays a valid ParsedCampaign so
 to_campaign_request() keeps working unchanged downstream.
 """
 from app.agents.jane_ads.jane_consultant import (
-    ConsultantBrief, _budget_grounded, _coerce, _enforce_hard_requirements, build_history_turns,
+    ConsultantBrief, _budget_grounded, _build_budget_confirmation_note, _coerce,
+    _enforce_hard_requirements, _latest_user_reply, build_history_turns,
 )
 from app.agents.jane_ads.nl import to_campaign_request
 
@@ -230,3 +231,44 @@ def test_enforce_leaves_an_ask_stage_untouched():
     asking = ConsultantBrief(clarify="What's your budget?")
     result = _enforce_hard_requirements(asking, "hey", [], known_budget=None)
     assert result is asking
+
+
+# ── _build_budget_confirmation_note ─────────────────────────────────────────────
+# Live-reported bug, 2026-08-12: the bare-affirmative case below already worked, but
+# a client who instead retyped the remembered figure themselves ("10000, ikeja") got
+# no steering at all — the model treated that restatement as ambiguous (given the
+# `known_line` warning against silently carrying it forward) and re-asked the
+# identical budget question anyway, even though _budget_grounded would have accepted
+# that exact same restatement had the model just said "ready".
+
+def test_no_note_without_a_remembered_budget():
+    assert _build_budget_confirmation_note(None, "10000, ikeja", []) == ""
+
+
+def test_note_fires_on_bare_affirmative_to_janes_own_proposal():
+    history = [{"role": "assistant", "content": "Last time you spent ₦10,000, want the same again?"}]
+    note = _build_budget_confirmation_note(10000, "yes", history)
+    assert "10000" in note.replace(",", "")
+    assert "budget again" in note
+
+
+def test_note_fires_when_client_restates_the_remembered_figure_outright():
+    # The exact live scenario: no "yes", just the number itself, alongside unrelated
+    # new information (the city) in the same reply.
+    note = _build_budget_confirmation_note(10000, "Get me more sales. 10000, ikeja", [])
+    assert "10000" in note.replace(",", "")
+    assert "budget again" in note
+
+
+def test_no_note_when_bare_affirmative_does_not_follow_a_matching_proposal():
+    history = [{"role": "assistant", "content": "What area should I focus on?"}]
+    assert _build_budget_confirmation_note(10000, "yes", history) == ""
+
+
+def test_no_note_when_latest_reply_has_no_matching_number():
+    assert _build_budget_confirmation_note(10000, "Get me more sales. just ikeja", []) == ""
+
+
+def test_latest_user_reply_takes_the_segment_after_the_last_period():
+    assert _latest_user_reply("Get me more sales. 10000, ikeja") == "10000, ikeja"
+    assert _latest_user_reply("") == ""
