@@ -8875,6 +8875,131 @@ async def zapcap_produce(
     )
 
 
+# ── Voiceover (Ask Jane Video — MVP, no semantic shot-alignment yet) ──────────────
+
+@router.post("/video-voiceover/script")
+async def video_voiceover_script(
+    source_url: str = Form(""),
+    purpose: str = Form("general"),
+    user_note: str = Form(""),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+    ctx: dict = Depends(get_active_brand_context),
+):
+    """Suggest a voiceover script grounded in the video's own transcript (if any),
+    the plan's purpose, and brand voice — a suggestion the user can freely ignore
+    (spec §4.4), never a requirement."""
+    from ..services.voiceover_service import generate_voiceover_script
+
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    active_brand_id = ctx["brand_id"]
+    profile_result = await BrandProfileService.get(user_id, db, brand_id=active_brand_id)
+    profile_data = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
+    brand_context = BrandProfileService.to_brand_context(profile_data)
+
+    # Best-effort: if this video already has a transcript on file from an earlier
+    # ZapCap render (source_url points at a completed zapcap_jobs.output_url), use
+    # it to ground the script in what's already being said/shown.
+    transcript_text = ""
+    if source_url:
+        existing = await db["zapcap_jobs"].find_one(
+            {"output_url": source_url}, sort=[("created_at", -1)]
+        )
+        if existing and existing.get("transcript_words"):
+            transcript_text = " ".join(w.get("text", "") for w in existing["transcript_words"]).strip()
+
+    script = await generate_voiceover_script(transcript_text, purpose, brand_context, user_note)
+    return UriResponse.get_single_data_response("voiceover_script", {"script": script or ""})
+
+
+@router.post("/video-voiceover/produce")
+async def video_voiceover_produce(
+    source_url: str = Form(...),
+    voiceover_audio: UploadFile = File(...),
+    keep_original_audio: str = Form("false"),
+    template_id: str = Form("beast"),
+    caption_style: str = Form("bold"),
+    enable_broll: str = Form("false"),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """Clean the recorded voiceover (cut filler/false-starts with crossfades), mix
+    it in as the video's primary audio track, then hand the result to the EXISTING
+    zapcap_produce path as its source_url — ZapCap re-transcribes and captions
+    whatever audio it's given, so caption regeneration (spec §8) needs no new code
+    here at all."""
+    import uuid
+    from ..services.voiceover_service import (
+        clean_voiceover_audio,
+        mix_voiceover_as_primary_audio,
+        upload_voiceover_audio,
+    )
+
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    raw_audio = await voiceover_audio.read()
+    cleaned_audio, cleaned_transcript = await clean_voiceover_audio(raw_audio)
+
+    mixed_url = await mix_voiceover_as_primary_audio(
+        video_url=source_url,
+        voiceover_audio=cleaned_audio,
+        keep_original_audio=keep_original_audio.lower() == "true",
+    )
+    if not mixed_url:
+        raise HTTPException(status_code=502, detail="Could not mix the voiceover into your video — please try again.")
+
+    voice_job_id = uuid.uuid4().hex
+    voiceover_audio_url = await upload_voiceover_audio(cleaned_audio, voice_job_id)
+
+    # Hand off to the existing, already-billed, already-polled ZapCap pipeline —
+    # same call handleRender already makes from the frontend, just with the
+    # voice-mixed video as the source instead of the raw stitched one.
+    result = await zapcap_produce(
+        video=None,
+        source_url=mixed_url,
+        template_id=template_id,
+        language="en",
+        output_mode="composited",
+        quality="standard",
+        enable_broll=enable_broll,
+        enable_music="false",
+        enable_hook_text="false",
+        custom_hook_text="",
+        hook_text_color="#ffffff",
+        caption_style=caption_style,
+        custom_music=None,
+        music_source="upload",
+        mute_original_audio="false",
+        purpose="general",
+        custom_broll_clips=[],
+        custom_broll_placements=None,
+        custom_broll_estimated_duration=60.0,
+        db=db,
+        token=token,
+    )
+    if not isinstance(result, dict):
+        # zapcap_produce returns a plain JSONResponse (not a dict) for its own
+        # error paths (e.g. insufficient credits, undetectable duration) — pass
+        # that straight through rather than treating it as a success payload.
+        return result
+    job_id = (result.get("responseData") or {}).get("job_id")
+    if job_id:
+        await db["zapcap_jobs"].update_one(
+            {"job_id": job_id},
+            {"$set": {
+                "voiceover_audio_url": voiceover_audio_url,
+                "voiceover_transcript": cleaned_transcript,
+                "keep_original_audio": keep_original_audio.lower() == "true",
+            }},
+        )
+    return result
+
+
 @router.get("/zapcap-job/{job_id}")
 async def zapcap_job_status(
     job_id: str,
