@@ -353,23 +353,7 @@ async def consult(message: str, business_name: str = "", category: str = "",
             "EXACTLY that (nothing else) one more time. Otherwise converge now."
         )
 
-    # Pre-resolve the one ambiguity prompting alone couldn't reliably get the model to
-    # commit to (confirmed live: it kept re-asking the identical budget question even
-    # after being told a plain "yes" counts) — if the client's latest reply is a bare
-    # affirmative AND Jane's own last turn explicitly proposed reusing the remembered
-    # budget, tell the model plainly what just happened instead of leaving it to infer.
-    budget_confirmation_note = ""
-    if known_budget and _client_gave_affirmative(message):
-        last_assistant = next((t.get("content", "") for t in reversed(history or [])
-                               if t.get("role") == "assistant"), "")
-        if str(int(known_budget)) in last_assistant.replace(",", ""):
-            budget_confirmation_note = (
-                f"\n\nIMPORTANT: your last message asked the client whether to reuse their "
-                f"remembered budget of ₦{known_budget:,.0f}, and their reply above is a plain "
-                f"affirmative — they ARE confirming ₦{known_budget:,.0f} for THIS campaign. "
-                f"Set budget_ngn to {int(known_budget)} and move on to whatever's next (not "
-                "budget again)."
-            )
+    budget_confirmation_note = _build_budget_confirmation_note(known_budget, message, history or [])
 
     # `message` is the frontend's flattened "brief so far" (every user reply in this
     # conversation, concatenated) — redundant with `history` above when history is
@@ -412,15 +396,58 @@ _AFFIRMATIVE_WORDS = {
 }
 
 
+def _latest_user_reply(message: str) -> str:
+    """The client's newest reply out of `message` (the frontend's flattened, ". "-joined
+    brief-so-far) — everything after the last period. No length cap, unlike
+    `_client_gave_affirmative`'s tail check, since a substantive answer ("10000, ikeja")
+    can run longer than a bare "yes" while still being exactly one fresh reply."""
+    return (message or "").strip().split(".")[-1].strip().lower()
+
+
 def _client_gave_affirmative(message: str) -> bool:
     """True if the client's most recent reply reads like a short yes/no-style
     confirmation ('yes', 'that's fine') rather than a fresh, substantive answer —
     the shape of reply Jane gets when she's just asked 'want to do the same again?'."""
-    tail = (message or "").strip().split(".")[-1].strip().lower()
+    tail = _latest_user_reply(message)
     if not tail or len(tail) > 40:
         return False
     words = {w.strip(",!?'\"") for w in tail.split()}
     return bool(words & _AFFIRMATIVE_WORDS)
+
+
+def _build_budget_confirmation_note(known_budget: Optional[float], message: str,
+                                    history: list[dict]) -> str:
+    """Pre-resolve the one ambiguity prompting alone couldn't reliably get the model to
+    commit to (confirmed live: it kept re-asking the identical budget question even after
+    being told a plain "yes" counts, and separately, confirmed live 2026-08-12, even after
+    the client retyped the exact figure themselves — "10000, ikeja" — since the `known_line`
+    warning against silently carrying the remembered figure forward made the model treat
+    that restatement as ambiguous too). Covers both shapes of a genuine decision: a bare
+    affirmative directly answering Jane's own proposal to reuse the figure, or the client
+    restating the number outright — tell the model plainly what just happened either way,
+    instead of leaving it to infer from a prompt it's already shown it can misread."""
+    if not known_budget:
+        return ""
+    if _client_gave_affirmative(message):
+        last_assistant = next((t.get("content", "") for t in reversed(history)
+                               if t.get("role") == "assistant"), "")
+        if str(int(known_budget)) in last_assistant.replace(",", ""):
+            return (
+                f"\n\nIMPORTANT: your last message asked the client whether to reuse their "
+                f"remembered budget of ₦{known_budget:,.0f}, and their reply above is a plain "
+                f"affirmative — they ARE confirming ₦{known_budget:,.0f} for THIS campaign. "
+                f"Set budget_ngn to {int(known_budget)} and move on to whatever's next (not "
+                "budget again)."
+            )
+    latest_reply = _latest_user_reply(message)
+    if str(int(known_budget)) in latest_reply.replace(",", ""):
+        return (
+            f"\n\nIMPORTANT: the client's latest reply above states ₦{known_budget:,.0f} "
+            "themselves — that is a deliberate answer for THIS campaign, not a silent "
+            f"carryover of the remembered past spend. Set budget_ngn to {int(known_budget)} "
+            "and move on to whatever's next (not budget again)."
+        )
+    return ""
 
 
 def _budget_grounded(amount: Optional[float], known_budget: Optional[float],
