@@ -48,13 +48,6 @@ class ProductAnalysisService:
 
         forensic_prompt = """Describe this product in extreme forensic detail. An image generation AI must reproduce this product EXACTLY. Your description is the specification it will follow.
 
-YOUR LABEL TRANSCRIPTION MUST BE AN EXACT, COMPLETE REPLICA OF WHAT IS PRINTED ON THE
-PRODUCT — EVERY WORD, EVERY LINE, EVERY NUMBER, EVERY SYMBOL, DOWN TO THE LAST PERIOD OR
-DOT. DO NOT LEAVE OUT A SINGLE CHARACTER OF VISIBLE TEXT, EVEN IF IT SEEMS SMALL,
-REPETITIVE, OR UNIMPORTANT. STOPPING EARLY — DESCRIBING ONLY THE BRAND NAME AND OMITTING
-A PRODUCT NAME, TAGLINE, DESCRIPTION, OR MANUFACTURER LINE PRINTED BELOW OR BESIDE IT — IS
-A FAILURE, NOT A SHORTER CORRECT ANSWER.
-
 Return JSON only (no markdown, no code blocks, just raw JSON):
 {
   "product_type": "e.g. perfume bottle, lip gloss tube, water bottle, yogurt container",
@@ -75,11 +68,11 @@ Return JSON only (no markdown, no code blocks, just raw JSON):
   "label": {
     "present": true or false,
     "position": "e.g. centre front, bottom third, wraparound, top section",
-    "background_colour": "e.g. black, white, cream, transparent, gold — if the label has
-      MULTIPLE distinct coloured sections/bands (e.g. a plain upper zone and a separate
-      coloured lower band), describe all of them, e.g. 'white upper band, gold lower band'",
+    "background_colour": "e.g. black, white, cream, transparent, gold",
     "text_lines": [
-      "EVERY line of text visible anywhere on the label, top to bottom, in reading order, INCLUDING punctuation and symbols exactly as printed. There is NO fixed number of lines and NO preferred length — do not stop after 2 or 3 lines just because that is a typical amount. A label with a separate coloured band below the brand name (e.g. a product/variant name, a descriptive tagline, ingredient callouts, a manufacturer credit, a website, a barcode number) is still ONE label — keep transcribing every line from every section, in full, until there is GENUINELY no more text left anywhere on the label. Do not summarise or paraphrase a line — copy it EXACTLY, including trailing periods/dots and ALL-CAPS words exactly as shown."
+      "exact text line 1 as seen on label",
+      "exact text line 2 if present",
+      "exact text line 3 if present"
     ],
     "text_colour": "e.g. gold, white, dark red, black",
     "font_style": "e.g. cursive script, bold sans-serif, serif, handwritten",
@@ -92,23 +85,9 @@ Return JSON only (no markdown, no code blocks, just raw JSON):
 CRITICAL RULES:
 1. ONLY describe what you can actually see in the image
 2. Do NOT invent details or guess
-3. For text on labels: transcribe EXACTLY letter-for-letter, word-for-word, INCLUDING
-   every punctuation mark and dot — your transcription must be an EXACT, COMPLETE
-   REPLICA of what is printed, not a summary or the "important part" of it
-4. If something is unclear or not visible, say "not visible" or "unclear" — but this
-   does NOT excuse skipping text that IS visible just because it is small or secondary
-5. If the label has more than one visually distinct section (e.g. a plain zone with the
-   brand name and a separate coloured band underneath with a product/variant name,
-   tagline, or manufacturer text), transcribe EVERY section IN FULL — stopping after
-   only the brand name when more text is visible below it is a FAILURE, not a shorter
-   correct answer. DO NOT LEAVE EVEN ONE WORD, NUMBER, OR DOT OUT.
-6. If the image shows more than one product, describe only the single product that is
-   most prominent/largest in the frame — but transcribe THAT product's entire label
-   completely, per rule 5, not just the text shared across every product shown
-7. Before finalising your answer, re-check the image once more specifically for any
-   text you have not yet included anywhere in text_lines — a second band of colour,
-   smaller print near the bottom, or text near the cap — and add it if present
-8. Return ONLY the JSON, no explanations, no markdown formatting"""
+3. For text on labels: transcribe EXACTLY letter-for-letter, word-for-word
+4. If something is unclear or not visible, say "not visible" or "unclear"
+5. Return ONLY the JSON, no explanations, no markdown formatting"""
 
         try:
             print(f"🔍 Running forensic product analysis on: {cutout_url[:80]}...")
@@ -124,12 +103,7 @@ CRITICAL RULES:
                 }],
                 model="gpt-4o-mini",
                 temperature=0,  # Deterministic analysis
-                # Was 800 — the exhaustive multi-section label transcription this
-                # prompt now asks for (see CRITICAL RULES 5-6) can genuinely run
-                # longer than a single-band label; a response cut off mid-JSON
-                # fails to parse and falls back to "no label detected" — the
-                # exact failure mode this whole prompt change exists to fix.
-                max_tokens=1200,
+                max_tokens=800,
             )
 
             ai_response = await AIService.chat_completion(ai_request)
@@ -347,10 +321,7 @@ Every letter must match exactly. Do not change, rearrange, or "fix" any text.
 If the label says "Romantic Hari" do NOT write "Romantic Hair"
 If the label says "Cute Girl" do NOT write "Cute Curl"
 If the label says "LUSTROUS LIP GLOSS" reproduce it letter by letter
-If there are typos or unconventional spellings on the original label, KEEP THEM EXACTLY AS THEY ARE.
-EVERY LINE LISTED ABOVE MUST APPEAR ON THE PRODUCT — DO NOT DROP, SHORTEN, OR SUMMARISE
-ANY LINE, EVEN IF IT SEEMS SECONDARY. THE LABEL IN THE GENERATED IMAGE MUST BE AN EXACT
-REPLICA OF THE TEXT SPECIFIED ABOVE, DOWN TO THE LAST DOT OR PERIOD."""
+If there are typos or unconventional spellings on the original label, KEEP THEM EXACTLY AS THEY ARE."""
         else:
             preservation += """
 No label or text is visible on this product.
