@@ -56,6 +56,21 @@ class Settings(BaseSettings):
     INSTAGRAM_APP_ID: str = ""
     INSTAGRAM_APP_SECRET: str = ""
 
+    # WhatsApp Business Platform (Jane on WhatsApp) — Embedded Signup onboarding.
+    # WHATSAPP_SYSTEM_USER_ACCESS_TOKEN is deliberately separate from
+    # META_SYSTEM_TOKEN above (that one is ads-scoped and noted as unreliable for
+    # real ad-account calls); this is the long-lived System User token scoped to
+    # whatsapp_business_management/whatsapp_business_messaging, same value as
+    # jane-whatsapp-reply's WHATSAPP_ACCESS_TOKEN. Meta authorizes WhatsApp Graph
+    # API calls by asset-grant (which WABAs this System User has been given access
+    # to), not by per-client token issuance, so one token here covers every
+    # client's WABA once Embedded Signup shares it to our Business Manager.
+    WHATSAPP_SYSTEM_USER_ACCESS_TOKEN: str = ""
+    # Created once in Meta's App Dashboard (WhatsApp > Configuration > Embedded
+    # Signup), tied to URI's Business ID — this is what makes Embedded Signup
+    # automatically share a client's new WABA as an asset to our Business.
+    META_WA_EMBEDDED_SIGNUP_CONFIG_ID: str = ""
+
     # Outstand
     OUTSTAND_API_KEY: Optional[str] = None
     OUTSTAND_WEBHOOK_SECRET: Optional[str] = None  # For verifying Outstand webhook signatures

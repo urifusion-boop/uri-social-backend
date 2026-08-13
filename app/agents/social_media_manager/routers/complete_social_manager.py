@@ -190,6 +190,16 @@ class FinalizeConnectionRequest(BaseModel):
     session_token: str
     selected_page_ids: List[str] = Field(..., min_items=1)
 
+class WhatsAppEmbeddedSignupCallbackRequest(BaseModel):
+    code: str
+    waba_id: str
+    phone_number_id: str
+    display_phone_number: Optional[str] = None
+
+class WhatsAppEmbeddedSignupFinalizeRequest(BaseModel):
+    phone_number_id: str
+    escalation_email: str
+
 class ApprovalRequest(BaseModel):
     draft_ids: List[str] = Field(..., min_items=1)
     schedule_option: str = "save_draft"  # immediate, schedule, save_draft
@@ -2011,6 +2021,161 @@ async def disconnect_facebook_direct(
         raise HTTPException(status_code=404, detail="Facebook connection not found")
 
     return {"status": True, "responseMessage": "Facebook page disconnected"}
+
+
+# ── WhatsApp Business Platform (Jane on WhatsApp) — Embedded Signup. Unlike the
+# redirect-based connectors above, Embedded Signup is a JS SDK popup that runs
+# inside this already-authenticated settings page and never navigates the browser
+# away to Meta and back — so both endpoints below are authenticated POSTs, not
+# unauthenticated GET redirect targets. No per-client access token is ever stored:
+# Meta authorizes WhatsApp Graph API calls by asset-grant, so the one
+# WHATSAPP_SYSTEM_USER_ACCESS_TOKEN keeps working for every client's WABA once
+# Embedded Signup shares it to our Business Manager.
+
+@router.get("/connect/whatsapp-business/config")
+async def whatsapp_business_config(ctx: dict = Depends(get_active_brand_context)):
+    """What the frontend's Embedded Signup JS SDK popup needs to launch. Values
+    here are not secret (the same app_id is already used client-side for the
+    other OAuth dialogs) — authenticated anyway for consistency with every other
+    endpoint in this file."""
+    if not settings.META_WA_EMBEDDED_SIGNUP_CONFIG_ID:
+        raise HTTPException(status_code=500, detail="META_WA_EMBEDDED_SIGNUP_CONFIG_ID not configured")
+
+    return UriResponse.get_single_data_response("whatsapp_business_config", {
+        "app_id": settings.META_APP_ID,
+        "config_id": settings.META_WA_EMBEDDED_SIGNUP_CONFIG_ID,
+        "graph_api_version": settings.FACEBOOK_API_VERSION,
+    })
+
+
+@router.post("/connect/whatsapp-business/callback")
+async def whatsapp_business_callback(
+    request: WhatsAppEmbeddedSignupCallbackRequest,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    ctx: dict = Depends(get_active_brand_context),
+):
+    """Called by our own frontend immediately after the Embedded Signup popup
+    finishes — `code` comes from the SDK's login response, `waba_id`/
+    `phone_number_id` from the separate postMessage event Meta's SDK fires during
+    the flow. Completes the code exchange, then subscribes our app to the WABA's
+    webhooks (mandatory — a connection must never be marked active if this
+    fails, since it would show connected while receiving zero messages).
+    connection_status stays short of "active" until finalize supplies an
+    escalation_email, which the whole per-tenant escalation path depends on."""
+    from app.models.brand_account import BrandAccount
+    from app.services.whatsapp_embedded_signup_service import (
+        exchange_embedded_signup_code,
+        subscribe_app_to_waba,
+        SubscribedAppsFailed,
+    )
+
+    user_id = ctx["user_id"]
+    brand_id = ctx["brand_id"]
+    is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
+
+    await exchange_embedded_signup_code(request.code)
+
+    try:
+        await subscribe_app_to_waba(request.waba_id)
+        subscribed = True
+        connection_status = "pending_escalation_email"
+    except SubscribedAppsFailed as e:
+        print(f"[WhatsAppEmbeddedSignup] subscribe_app_to_waba failed for waba_id={request.waba_id}: {e}")
+        subscribed = False
+        connection_status = "pending_subscription_retry"
+
+    now = datetime.utcnow().isoformat()
+    conn_doc = {
+        "id": f"whatsapp_business_{request.phone_number_id}",
+        "user_id": user_id,
+        "brand_id": None if is_personal else brand_id,
+        "platform": "whatsapp_business",
+        "connected_via": "whatsapp_embedded_signup",
+        "waba_id": request.waba_id,
+        "phone_number_id": request.phone_number_id,
+        "display_phone_number": request.display_phone_number or "",
+        "subscribed_apps": subscribed,
+        "escalation_email": None,
+        "connection_status": connection_status,
+        "connected_at": now,
+        "updated_at": now,
+    }
+    await db["social_connections"].update_one(
+        {"id": conn_doc["id"]}, {"$set": conn_doc}, upsert=True,
+    )
+
+    return UriResponse.get_single_data_response("whatsapp_business_pending", {
+        "phone_number_id": request.phone_number_id,
+        "subscribed_apps": subscribed,
+    })
+
+
+@router.post("/connect/whatsapp-business/finalize")
+async def whatsapp_business_finalize(
+    request: WhatsAppEmbeddedSignupFinalizeRequest,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    ctx: dict = Depends(get_active_brand_context),
+):
+    """Supplies the one thing callback couldn't know yet — where escalations
+    should land — and flips the connection active. jane-whatsapp-reply's
+    per-tenant escalation path reads escalation_email directly off this doc."""
+    result = await db["social_connections"].update_one(
+        {"id": f"whatsapp_business_{request.phone_number_id}", "user_id": ctx["user_id"]},
+        {"$set": {
+            "escalation_email": request.escalation_email,
+            "connection_status": "active",
+            "updated_at": datetime.utcnow().isoformat(),
+        }},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="WhatsApp connection not found — retry Embedded Signup")
+
+    return UriResponse.get_single_data_response("whatsapp_business_connected", {"phone_number_id": request.phone_number_id})
+
+
+@router.delete("/connections/whatsapp-business/{phone_number_id}")
+async def disconnect_whatsapp_business(
+    phone_number_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    ctx: dict = Depends(get_active_brand_context),
+):
+    """Disconnect a client's WhatsApp number. Best-effort unsubscribe from the
+    WABA's webhooks first (so a removed client stops generating traffic we no
+    longer have a record for), then delete the doc — same is_personal branching
+    as disconnect_facebook_direct above."""
+    from app.models.brand_account import BrandAccount
+    from app.services.whatsapp_embedded_signup_service import unsubscribe_app_from_waba
+
+    user_id = ctx["user_id"]
+    brand_id = ctx["brand_id"]
+    is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
+    personal_bid = BrandAccount.personal_brand_id(user_id)
+
+    doc = await db["social_connections"].find_one({"id": f"whatsapp_business_{phone_number_id}"})
+    if doc and doc.get("waba_id"):
+        try:
+            await unsubscribe_app_from_waba(doc["waba_id"])
+        except Exception as e:
+            print(f"[WhatsAppEmbeddedSignup] unsubscribe_app_from_waba failed for waba_id={doc['waba_id']}: {e}")
+
+    if is_personal:
+        delete_filter = {
+            "id": f"whatsapp_business_{phone_number_id}",
+            "user_id": user_id,
+            "$or": [
+                {"brand_id": {"$exists": False}},
+                {"brand_id": None},
+                {"brand_id": personal_bid},
+            ],
+        }
+    else:
+        delete_filter = {"id": f"whatsapp_business_{phone_number_id}", "brand_id": brand_id}
+
+    result = await db["social_connections"].delete_one(delete_filter)
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="WhatsApp connection not found")
+
+    return {"status": True, "responseMessage": "WhatsApp number disconnected"}
 
 
 # ==============================================================================
