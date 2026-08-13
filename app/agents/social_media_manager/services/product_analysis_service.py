@@ -13,6 +13,29 @@ import asyncio
 from typing import Dict, Any, Optional
 
 
+def _g(d: Dict[str, Any], key: str, default: Any) -> Any:
+    """dict.get(key, default), except an explicit JSON null for `key` also falls
+    back to `default` — dict.get()'s own default only covers a MISSING key, not
+    a key present with value None. The vision model routinely returns explicit
+    null for fields that don't apply (e.g. logo_description when a label has no
+    logo) rather than omitting the key, and every such null used to flow straight
+    into build_preservation_block's f-strings as the literal text "None" —
+    tripping image_content_service.py's "Prompt contains null values" safety
+    check and aborting generation outright. Confirmed live: this is exactly what
+    started happening the moment the forensic analysis call itself was fixed
+    (see AIService.build_ai_model's max_tokens bug) and product_spec started
+    carrying real, model-produced data for the first time instead of always
+    hitting the except-block default."""
+    value = d.get(key, default)
+    if value is None:
+        return default
+    # Vision models routinely write the literal string "null"/"none" instead of
+    # a real JSON null for an inapplicable field — same failure mode, same fix.
+    if isinstance(value, str) and value.strip().lower() in ("null", "none"):
+        return default
+    return value
+
+
 class ProductAnalysisService:
     """
     Forensic product analysis using GPT-4o-mini vision.
@@ -207,35 +230,39 @@ CRITICAL RULES:
         Returns:
             Preservation prompt block (string)
         """
-        # Extract fields with safe defaults
-        product_type = product_spec.get("product_type", "product")
-        overall_shape = product_spec.get("overall_shape", "standard shape")
-        ratio = product_spec.get("height_width_ratio", "2:1")
+        # Extract fields with safe defaults — every lookup goes through _g(),
+        # not a plain .get(), so an explicit JSON null from the vision model
+        # (common for fields that don't apply to this product) falls back to
+        # the same default a missing key would, instead of leaking a literal
+        # "None"/null into the prompt text below.
+        product_type = _g(product_spec, "product_type", "product")
+        overall_shape = _g(product_spec, "overall_shape", "standard shape")
+        ratio = _g(product_spec, "height_width_ratio", "2:1")
 
-        cap = product_spec.get("cap_closure", {})
-        cap_type = cap.get("type", "cap")
-        cap_colour = cap.get("colour", "standard")
-        cap_material = cap.get("material", "standard material")
+        cap = _g(product_spec, "cap_closure", {}) or {}
+        cap_type = _g(cap, "type", "cap")
+        cap_colour = _g(cap, "colour", "standard")
+        cap_material = _g(cap, "material", "standard material")
 
-        body = product_spec.get("body", {})
-        body_material = body.get("material", "standard material")
-        body_colour = body.get("colour", "standard")
-        body_finish = body.get("finish", "standard")
+        body = _g(product_spec, "body", {}) or {}
+        body_material = _g(body, "material", "standard material")
+        body_colour = _g(body, "colour", "standard")
+        body_finish = _g(body, "finish", "standard")
 
-        liquid_visible = product_spec.get("liquid_visible", False)
-        liquid_colour = product_spec.get("liquid_colour")
+        liquid_visible = _g(product_spec, "liquid_visible", False)
+        liquid_colour = _g(product_spec, "liquid_colour", "")
 
-        label = product_spec.get("label", {})
-        label_present = label.get("present", False)
-        label_position = label.get("position", "front")
-        label_bg = label.get("background_colour", "standard")
-        label_text_lines = label.get("text_lines", [])
-        label_text_colour = label.get("text_colour", "standard")
-        label_font = label.get("font_style", "standard")
-        label_logo = label.get("logo_description")
+        label = _g(product_spec, "label", {}) or {}
+        label_present = _g(label, "present", False)
+        label_position = _g(label, "position", "front")
+        label_bg = _g(label, "background_colour", "standard")
+        label_text_lines = _g(label, "text_lines", [])
+        label_text_colour = _g(label, "text_colour", "standard")
+        label_font = _g(label, "font_style", "standard")
+        label_logo = _g(label, "logo_description", "")
 
-        additional = product_spec.get("additional_details", "none")
-        colours_hex = product_spec.get("dominant_colours_hex", [])
+        additional = _g(product_spec, "additional_details", "none")
+        colours_hex = _g(product_spec, "dominant_colours_hex", [])
 
         # Build label text block
         if label_present and label_text_lines:
