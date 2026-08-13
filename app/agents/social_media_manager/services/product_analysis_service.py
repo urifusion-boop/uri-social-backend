@@ -98,23 +98,9 @@ Return JSON only (no markdown, no code blocks, just raw JSON):
   "label": {
     "present": true or false,
     "position": "e.g. centre front, bottom third, wraparound, top section",
-    "background_colour": "the SINGLE overall colour — WHATEVER colour you actually observe
-      in THIS image, not any colour used as an example elsewhere in this prompt — ONLY if
-      the whole label is one uniform colour. If the label has MORE THAN ONE visually
-      distinct coloured zone/band, do NOT collapse them into one word here — set this
-      field to 'multiple zones, see colour_bands' and use colour_bands below instead.
-      Getting this field down to one flat colour when the real label has two or more
-      differently-coloured sections is WRONG.",
-    "colour_bands": [
-      "ONLY fill this in if background_colour above is 'multiple zones, see colour_bands' —
-      otherwise leave this as an empty array. One entry per visually distinct coloured
-      zone on the label, TOP TO BOTTOM, each written as 'COLOUR: text content in that
-      zone', using the ACTUAL colours and text YOU SEE in this specific image — e.g. the
-      shape (not the literal words) is 'colour-you-observed: text in that zone' then
-      'a different colour-you-observed: text in the next zone'. Every zone you can see
-      must have its own entry — do not merge two differently-coloured zones into one
-      entry, and do not skip a zone because it only has one or two words in it."
-    ],
+    "background_colour": "e.g. black, white, cream, transparent, gold — if the label has
+      MULTIPLE distinct coloured sections/bands (e.g. a plain upper zone and a separate
+      coloured lower band), describe all of them, e.g. 'white upper band, gold lower band'",
     "text_lines": [
       "EVERY line of text visible anywhere on the label, top to bottom, in reading order, INCLUDING punctuation and symbols exactly as printed. There is NO fixed number of lines and NO preferred length — do not stop after 2 or 3 lines just because that is a typical amount. A label with a separate coloured band below the brand name (e.g. a product/variant name, a descriptive tagline, ingredient callouts, a manufacturer credit, a website, a barcode number) is still ONE label — keep transcribing every line from every section, in full, until there is GENUINELY no more text left anywhere on the label. Do not summarise or paraphrase a line — copy it EXACTLY, including trailing periods/dots and ALL-CAPS words exactly as shown."
     ],
@@ -138,11 +124,7 @@ CRITICAL RULES:
    brand name and a separate coloured band underneath with a product/variant name,
    tagline, or manufacturer text), transcribe EVERY section IN FULL — stopping after
    only the brand name when more text is visible below it is a FAILURE, not a shorter
-   correct answer. DO NOT LEAVE EVEN ONE WORD, NUMBER, OR DOT OUT. This applies to
-   COLOUR too, not just text — if the zones have different background colours, use
-   colour_bands to record each zone's own colour. Writing "white" for background_colour
-   when part of the label is actually gold/yellow/another colour is WRONG, even if you
-   correctly transcribed all the text — colour and text must both be complete.
+   correct answer. DO NOT LEAVE EVEN ONE WORD, NUMBER, OR DOT OUT.
 6. If the image shows more than one product, describe only the single product that is
    most prominent/largest in the frame — but transcribe THAT product's entire label
    completely, per rule 5, not just the text shared across every product shown
@@ -249,7 +231,6 @@ CRITICAL RULES:
                 "present": False,
                 "position": "unknown",
                 "background_colour": "unknown",
-                "colour_bands": [],
                 "text_lines": [],
                 "text_colour": "unknown",
                 "font_style": "unknown",
@@ -301,7 +282,6 @@ CRITICAL RULES:
         label_present = _g(label, "present", False)
         label_position = _g(label, "position", "front")
         label_bg = _g(label, "background_colour", "standard")
-        label_colour_bands = _g(label, "colour_bands", [])
         label_text_lines = _g(label, "text_lines", [])
         label_text_colour = _g(label, "text_colour", "standard")
         label_font = _g(label, "font_style", "standard")
@@ -364,26 +344,9 @@ LABEL (CRITICAL FOR BRAND RECOGNITION):"""
         if label_present:
             preservation += f"""
 Position on product: {label_position}
+Label background: {label_bg}
 Text colour: {label_text_colour}
 Font style: {label_font}"""
-            if label_colour_bands:
-                # Compound label — render each coloured zone as its own explicit
-                # instruction rather than one flat "Label background: X" line.
-                # A single summarising line was confirmed live to collapse a real
-                # two-tone label ("white top, gold bottom") down to just "white" in
-                # the generated image, even with all the label TEXT reproduced
-                # correctly — colour banding needs the same structural weight as
-                # the text itself, not a description competing for attention
-                # inside one sentence.
-                bands_block = "\n".join(f"  Zone {i+1}: {band}" for i, band in enumerate(label_colour_bands))
-                preservation += f"""
-Label background: MULTIPLE distinct coloured zones, top to bottom — NOT one flat colour:
-{bands_block}
-Each zone above MUST render in ITS OWN stated colour. Do not merge these zones into a
-single background colour, and do not render the whole label in only one of these colours."""
-            else:
-                preservation += f"""
-Label background: {label_bg}"""
             if label_logo:
                 preservation += f"""
 Logo: {label_logo}"""
