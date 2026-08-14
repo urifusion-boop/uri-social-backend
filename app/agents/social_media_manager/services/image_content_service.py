@@ -1299,6 +1299,184 @@ OVERALL:
             return UriResponse.error_response(f"Platform image generation failed: {str(e)}")
 
     @staticmethod
+    async def _generate_platform_image_composited(
+        platform: str,
+        content: str,
+        seed_content: str,
+        brand_context: Optional[Dict[str, Any]] = None,
+        reference_image: Optional[str] = None,
+        image_type: str = "post_image",
+        slide_index: Optional[int] = None,
+        total_slides: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        True product compositing — same signature/response shape as
+        _generate_platform_image, but the product is never redrawn by the AI.
+
+        The background scene (including headline/CTA text) is generated on its
+        own, with no product in the prompt at all; the real product cutout
+        (background genuinely removed now — see app/utils/background_removal.py's
+        data: URI fix) is then pasted onto it via
+        product_compositing_service.composite_product_onto_background, using the
+        exact same PIL alpha-paste technique already proven for logo overlay in
+        _overlay_logo below. The product region is literally the uploaded photo's
+        own pixels — nothing for the model to mis-transcribe or recolour.
+
+        Opt-in only (see use_true_compositing in complete_social_manager.py's
+        _generate_image_bg) — does not change _generate_platform_image's
+        behaviour or any of its callers.
+
+        KNOWN LIMITATION (v1, accepted deliberately): expects reference_image to
+        contain a SINGLE product. remove_background()'s DALL-E-2 fallback has no
+        real segmentation — given a multi-product lineup photo it will most
+        likely return all products still together in one cutout, which then gets
+        squeezed as one unit into the single-product placement box. The target
+        use case is a user photographing their own one product to advertise, not
+        a multi-product lineup shot; no auto-cropping/detection is attempted.
+        """
+        try:
+            from app.utils.background_removal import remove_background
+            from app.agents.social_media_manager.services.product_compositing_service import (
+                compute_product_placement,
+                composite_product_onto_background,
+            )
+            import base64 as _b64c
+            import httpx as _httpx_c
+            import re as _re_c
+
+            if not reference_image:
+                return UriResponse.error_response("True compositing requires a reference_image — nothing to composite.")
+
+            specs = ImageContentService._get_platform_image_specs(platform, image_type=image_type)
+            bc = brand_context or {}
+            brand_name = bc.get("brand_name", "")
+            brand_colors = bc.get("brand_colors") or []
+            color_str = ", ".join(str(c) for c in brand_colors[:4]) if brand_colors else ""
+
+            style_slug = bc.get("style_slug", "")
+            composition_mode = "immersive"
+            if style_slug:
+                from app.agents.social_media_manager.services.style_library import get_style
+                s = get_style(style_slug)
+                if s:
+                    composition_mode = s.get("composition_mode", "immersive")
+
+            logo_url = bc.get("logo_url")
+            logo_position = bc.get("logo_position", "bottom_right") if logo_url else None
+            logo_size = bc.get("logo_size", "small")
+            logo_size_map = {"small": 0.08, "medium": 0.12, "large": 0.16}
+            logo_pct = logo_size_map.get(logo_size, 0.08)
+            reserve_pct = int((logo_pct + 0.02) * 100)
+            logo_space_note = ""
+            if logo_position:
+                position_map = {
+                    "top_center": "top-center", "top_left": "top-left corner", "top_right": "top-right corner",
+                    "bottom_left": "bottom-left corner", "bottom_center": "bottom-center", "bottom_right": "bottom-right corner",
+                }
+                pos_text = position_map.get(logo_position, logo_position)
+                logo_space_note = (
+                    f"\nReserve the {pos_text} ({reserve_pct}% width x {reserve_pct}% height) completely clear of "
+                    f"text/graphics — a brand logo will be overlaid there afterward."
+                )
+
+            # CTA — same round-robin rotation as _generate_platform_image.
+            override_cta = bc.get("override_cta")
+            if override_cta:
+                cta_text = override_cta
+            else:
+                cta_styles_list = bc.get("cta_styles", [])
+                if isinstance(cta_styles_list, list) and cta_styles_list:
+                    idx = bc.get("cta_rotation_index", 0)
+                    if idx >= len(cta_styles_list):
+                        idx = 0
+                    cta_text = cta_styles_list[idx]
+                    if brand_context is not None:
+                        brand_context["cta_rotation_index"] = (idx + 1) % len(cta_styles_list)
+                else:
+                    cta_text = bc.get("default_link", "Learn more")
+
+            zone_desc = (
+                "the right ~55% of the frame" if composition_mode == "editorial" else
+                "the lower-centre area, slightly right of centre"
+            )
+            text_zone_desc = "the left ~45% of the frame" if composition_mode == "editorial" else "the upper/atmospheric area of the frame"
+
+            background_prompt = f"""=== BACKGROUND SCENE ONLY — NO PRODUCT ===
+This is EXCLUSIVELY for the brand "{brand_name}". Do NOT include any other brand
+names, logos, products, or real-world trademarks.
+
+Create a professional social-media background scene for this content:
+{seed_content.strip()}
+
+IMPORTANT: Do NOT draw any bottle, container, jar, tube, or product of any kind.
+Leave {zone_desc} of the frame softly blurred, uncluttered, and free of any
+distinct object — a real product photo will be composited into that exact area
+afterward. Filling that zone with any object will look wrong once the real product
+is placed there.
+
+Use the brand's colours where relevant: {color_str or 'a palette that suits the content'}.
+
+Place the following text in {text_zone_desc}, in the negative space, never overlapping
+the reserved product zone:
+Headline based on: {seed_content.strip()[:80]}
+CTA text (small, clean sans-serif, subtle): "{cta_text}"
+{logo_space_note}
+
+Style: atmospheric, professional social-media graphic, one clear light source,
+rich tonal range, no pure black or pure white."""
+
+            print(f"\n{'━'*60}\n📤 BACKGROUND-ONLY PROMPT → GPT-Image-2 [{platform.upper()}] (true compositing)\n{'━'*60}\n{background_prompt}\n{'━'*60}\n")
+
+            background_response = await ImageContentService._call_dalle_api(
+                prompt=background_prompt,
+                size=f"{specs['width']}x{specs['height']}",
+                reference_image=None,
+                image_model="openai/gpt-image-2",
+            )
+            if not background_response.get("success"):
+                return UriResponse.error_response(f"Background generation failed: {background_response.get('error')}")
+
+            bg_data_url = background_response["url"]
+            bg_m = _re_c.match(r"data:[^;]+;base64,(.+)", bg_data_url, _re_c.DOTALL)
+            if not bg_m:
+                return UriResponse.error_response("Background generation returned an unexpected image format.")
+            background_bytes = _b64c.b64decode(bg_m.group(1))
+
+            cutout_url = await remove_background(reference_image, method="auto")
+            if cutout_url.startswith("data:"):
+                cutout_m = _re_c.match(r"data:[^;]+;base64,(.+)", cutout_url, _re_c.DOTALL)
+                cutout_bytes = _b64c.b64decode(cutout_m.group(1)) if cutout_m else None
+            else:
+                async with _httpx_c.AsyncClient(timeout=20) as _c:
+                    _r = await _c.get(cutout_url)
+                    cutout_bytes = _r.content if _r.status_code == 200 else None
+            if not cutout_bytes:
+                return UriResponse.error_response("Could not load product cutout for compositing.")
+
+            placement = compute_product_placement(specs["width"], specs["height"], composition_mode)
+            composited_png = composite_product_onto_background(background_bytes, cutout_bytes, placement)
+            composited_b64 = _b64c.b64encode(composited_png).decode()
+
+            if logo_url:
+                loop = asyncio.get_running_loop()
+                composited_b64 = await loop.run_in_executor(
+                    None,
+                    lambda: ImageContentService._overlay_logo(composited_b64, logo_url, logo_position, logo_size)
+                )
+
+            return UriResponse.get_single_data_response("platform_image", {
+                "image_url": f"data:image/webp;base64,{composited_b64}",
+                "platform": platform,
+                "specs": specs,
+                "prompt_used": background_prompt,
+                "generated_at": datetime.utcnow().isoformat(),
+                "compositing_mode": "true_compositing",
+            })
+
+        except Exception as e:
+            return UriResponse.error_response(f"Composited platform image generation failed: {str(e)}")
+
+    @staticmethod
     async def _enhance_prompt_for_gpt_image2(
         seed_content: str,
         platform: str,
