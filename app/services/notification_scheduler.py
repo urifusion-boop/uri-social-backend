@@ -96,6 +96,22 @@ def _job_jane_ads_token_health():
     _run_async(_run)
 
 
+def _job_whatsapp_token_refresh():
+    """Jane on WhatsApp — per-client Embedded Signup token refresh, daily. Meta's
+    confirmed "full access" configuration template issues a 60-day-expiry client
+    token (not a permanent System User grant), so this proactively renews any
+    connection's token approaching expiry, and only on genuine refresh failure
+    marks it needing reconnection and notifies the owner once — see
+    whatsapp_embedded_signup_service.run_whatsapp_token_refresh."""
+    async def _run():
+        from app.database import get_db
+        from app.services.whatsapp_embedded_signup_service import run_whatsapp_token_refresh
+        db = get_db()
+        result = await run_whatsapp_token_refresh(db)
+        print(f"🔑 WhatsApp token refresh: {result}")
+    _run_async(_run)
+
+
 def _job_jane_ads_billing():
     """Jane + Ads ad-spend billing — recoups real Meta spend (× markup) from each
     customer's prepaid wallet and pauses any campaign whose wallet can no longer
@@ -195,6 +211,17 @@ def start_notification_scheduler():
         _job_jane_ads_token_health,
         CronTrigger(hour=6, minute=0),
         id="jane_ads_token_health",
+        **_JOB_DEFAULTS,
+    )
+
+    # Jane on WhatsApp per-client token refresh, daily at 07:00 UTC — a 60-day
+    # client token dying silently would mean Jane simply stops responding on that
+    # client's number with no in-band way to tell them, so this runs proactively
+    # rather than waiting for a failed send to reveal it.
+    _scheduler.add_job(
+        _job_whatsapp_token_refresh,
+        CronTrigger(hour=7, minute=0),
+        id="whatsapp_token_refresh",
         **_JOB_DEFAULTS,
     )
 

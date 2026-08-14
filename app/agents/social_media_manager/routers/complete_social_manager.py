@@ -9,7 +9,7 @@ from fastapi.responses import RedirectResponse, StreamingResponse, JSONResponse
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any, AsyncGenerator
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from bson import ObjectId
 
 from app.dependencies import get_db_dependency, get_active_brand_context
@@ -2073,10 +2073,19 @@ async def whatsapp_business_callback(
     brand_id = ctx["brand_id"]
     is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
 
-    await exchange_embedded_signup_code(request.code)
+    exchange_result = await exchange_embedded_signup_code(request.code)
+    access_token = exchange_result.get("access_token")
+    if not access_token:
+        raise HTTPException(status_code=502, detail="Embedded Signup code exchange did not return an access token")
+    # Confirmed live in Meta's App Dashboard: the only "full access" Embedded
+    # Signup configuration template issues a 60-day-expiry client token, not a
+    # permanent grant to our System User — see whatsapp_embedded_signup_service.py's
+    # module docstring. expires_in defaults to 60 days if Meta omits it.
+    expires_in_seconds = int(exchange_result.get("expires_in") or 60 * 24 * 60 * 60)
+    token_expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in_seconds)
 
     try:
-        await subscribe_app_to_waba(request.waba_id)
+        await subscribe_app_to_waba(request.waba_id, access_token)
         subscribed = True
         connection_status = "pending_escalation_email"
     except SubscribedAppsFailed as e:
@@ -2094,6 +2103,8 @@ async def whatsapp_business_callback(
         "waba_id": request.waba_id,
         "phone_number_id": request.phone_number_id,
         "display_phone_number": request.display_phone_number or "",
+        "access_token": access_token,
+        "token_expires_at": token_expires_at,
         "subscribed_apps": subscribed,
         "escalation_email": None,
         "connection_status": connection_status,
@@ -2152,9 +2163,9 @@ async def disconnect_whatsapp_business(
     personal_bid = BrandAccount.personal_brand_id(user_id)
 
     doc = await db["social_connections"].find_one({"id": f"whatsapp_business_{phone_number_id}"})
-    if doc and doc.get("waba_id"):
+    if doc and doc.get("waba_id") and doc.get("access_token"):
         try:
-            await unsubscribe_app_from_waba(doc["waba_id"])
+            await unsubscribe_app_from_waba(doc["waba_id"], doc["access_token"])
         except Exception as e:
             print(f"[WhatsAppEmbeddedSignup] unsubscribe_app_from_waba failed for waba_id={doc['waba_id']}: {e}")
 
