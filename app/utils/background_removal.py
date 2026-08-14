@@ -9,11 +9,35 @@ Supports two methods:
 PRD: URI-Social-Product-Preservation-Pipeline.docx - Step 2
 """
 
+import base64
 import os
 import io
+import re
 import asyncio
 from typing import Optional
 import httpx
+
+
+async def _load_image_bytes(image_url: str) -> bytes:
+    """Load raw image bytes from either a data: URI or a real hosted URL.
+
+    Every method below used to assume image_url was always a fetchable HTTP(S)
+    URL and crashed with "No connection adapters were found for 'data:image/...'"
+    whenever a data: URI was passed in instead (routine for browser-uploaded
+    images, which are frequently base64-encoded client-side rather than hosted
+    first) — confirmed live via the DALL-E-2 fallback path. Mirrors the
+    dual-path handling already used correctly in image_content_service.py's
+    _call_dalle_api for the same reference_image parameter."""
+    if image_url.startswith("data:"):
+        match = re.match(r"data:[^;]+;base64,(.+)", image_url, re.DOTALL)
+        if not match:
+            raise ValueError("Malformed data: URI — expected data:<mime>;base64,<payload>")
+        return base64.b64decode(match.group(1))
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(image_url)
+        resp.raise_for_status()
+        return resp.content
 
 
 async def remove_background_removebg(image_url: str) -> Optional[bytes]:
@@ -37,11 +61,23 @@ async def remove_background_removebg(image_url: str) -> Optional[bytes]:
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                "https://api.remove.bg/v1.0/removebg",
-                data={"image_url": image_url, "size": "auto"},
-                headers={"X-Api-Key": api_key},
-            )
+            if image_url.startswith("data:"):
+                # remove.bg's image_url param expects a fetchable URL — it can't
+                # resolve a data: URI either, so send the raw bytes as a file
+                # upload instead (its documented alternative input mode).
+                image_bytes = await _load_image_bytes(image_url)
+                response = await client.post(
+                    "https://api.remove.bg/v1.0/removebg",
+                    files={"image_file": image_bytes},
+                    data={"size": "auto"},
+                    headers={"X-Api-Key": api_key},
+                )
+            else:
+                response = await client.post(
+                    "https://api.remove.bg/v1.0/removebg",
+                    data={"image_url": image_url, "size": "auto"},
+                    headers={"X-Api-Key": api_key},
+                )
 
             if response.status_code == 200:
                 print(f"✂️ Background removed via remove.bg API")
@@ -73,15 +109,13 @@ async def remove_background_rembg(image_url: str) -> Optional[bytes]:
         try:
             from rembg import remove
             from PIL import Image
-            import requests
         except ImportError:
             print("⚠️ rembg not installed. Install with: pip install rembg[gpu] or pip install rembg")
             return None
 
-        # Download the image
-        response = requests.get(image_url, timeout=10)
-        response.raise_for_status()
-        input_image = Image.open(io.BytesIO(response.content))
+        # Load the image — data: URI or real URL, see _load_image_bytes
+        image_bytes = await _load_image_bytes(image_url)
+        input_image = Image.open(io.BytesIO(image_bytes))
 
         # Remove background (CPU-intensive, run in executor)
         def _remove_bg():
@@ -117,12 +151,12 @@ async def remove_background_dalle(image_url: str) -> Optional[str]:
     """
     try:
         from app.services.AIService import client as openai_client
-        import requests
 
-        # Download the image
-        response = requests.get(image_url, timeout=10)
-        response.raise_for_status()
-        image_bytes = io.BytesIO(response.content)
+        # Load the image — data: URI or real URL, see _load_image_bytes. This is
+        # the exact call that used to crash with "No connection adapters were
+        # found for 'data:image/...'" whenever reference_image was a data: URI
+        # (routine for browser uploads) rather than a hosted URL.
+        image_bytes = io.BytesIO(await _load_image_bytes(image_url))
 
         # Use DALL-E-2 edit mode
         result = await asyncio.get_event_loop().run_in_executor(
