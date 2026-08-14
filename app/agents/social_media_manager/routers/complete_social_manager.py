@@ -151,6 +151,10 @@ class ContentGenerationRequest(BaseModel):
     reference_images: Optional[List[str]] = None  # base64 data URLs uploaded by user for contextual reference (multiple supported)
     slide_image_map: Optional[List[Optional[int]]] = None  # carousel only: per-slide index into reference_images (or null for no image). Defaults to cycling image N -> slide N when omitted.
     post_type: str = "feed"   # feed | carousel | story
+    # Opt-in, develop-only experiment (default False everywhere): paste the real
+    # product cutout onto an AI-generated background instead of asking the AI to
+    # redraw the product — see ImageContentService._generate_platform_image_composited.
+    use_true_compositing: bool = False
     num_slides: int = 3        # carousel only (2–5)
     acknowledged_incomplete_profile: bool = False  # OPTION 1: User acknowledged incomplete profile warning
     override_cta: Optional[str] = None  # One-time CTA for this generation only (not saved to brand playbook)
@@ -639,6 +643,7 @@ async def generate_content(
                             total_slides=total_slides,
                             carousel_id=carousel_id,
                             style_override=request.style_override,
+                            use_true_compositing=request.use_true_compositing,
                         )))
                 else:
                     _bg_image_tasks.append(asyncio.create_task(_generate_image_bg(
@@ -652,6 +657,7 @@ async def generate_content(
                         post_type=post_type,
                         image_model=request.image_model,
                         style_override=request.style_override,
+                        use_true_compositing=request.use_true_compositing,
                     )))
             _BG_IMAGE_TASKS.update(_bg_image_tasks)
             for t in _bg_image_tasks:
@@ -4859,10 +4865,16 @@ async def _generate_image_bg(
     total_slides: Optional[int] = None,
     carousel_id: Optional[str] = None,
     style_override: Optional[List[str]] = None,
+    use_true_compositing: bool = False,
 ):
     """
     Background task: generate an image for an existing draft and save it to DB.
     Runs after the text-only response has already been returned to the frontend.
+
+    use_true_compositing: opt-in only, default False — every existing caller keeps
+    today's behaviour unchanged. When True (and a reference_image is present),
+    routes to ImageContentService._generate_platform_image_composited instead of
+    the standard AI-redraw path — see that method's docstring for why.
     For carousel posts, slide_index indicates which slide this image belongs to,
     and carousel_id ensures all slides share the same visual style.
     For story posts, uses the story (9:16) image spec.
@@ -5222,17 +5234,30 @@ async def _generate_image_bg(
                     reference_image = v2_reference_image
                     print(f"📸 Using V2 reference image (legacy): {reference_image[:80]}...")
 
-            image_result = await ImageContentService._generate_platform_image(
-                platform=platform,
-                content=content,
-                seed_content=seed_content,
-                brand_context=brand_context,
-                reference_image=reference_image,
-                image_type=image_type,
-                image_model=image_model,
-                slide_index=slide_index,
-                total_slides=total_slides,
-            )
+            if use_true_compositing and reference_image:
+                print(f"🧩 True compositing requested — pasting real product cutout instead of AI-redrawing it")
+                image_result = await ImageContentService._generate_platform_image_composited(
+                    platform=platform,
+                    content=content,
+                    seed_content=seed_content,
+                    brand_context=brand_context,
+                    reference_image=reference_image,
+                    image_type=image_type,
+                    slide_index=slide_index,
+                    total_slides=total_slides,
+                )
+            else:
+                image_result = await ImageContentService._generate_platform_image(
+                    platform=platform,
+                    content=content,
+                    seed_content=seed_content,
+                    brand_context=brand_context,
+                    reference_image=reference_image,
+                    image_type=image_type,
+                    image_model=image_model,
+                    slide_index=slide_index,
+                    total_slides=total_slides,
+                )
 
         if not image_result.get("status"):
             print(f"⚠️ BG image gen failed for draft {draft_id}: {image_result.get('responseMessage')}")
