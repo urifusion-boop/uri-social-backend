@@ -7403,6 +7403,42 @@ async def capture_video_frame(
         raise HTTPException(status_code=500, detail="ffmpeg not available on server")
 
 
+@router.get("/video-frame")
+async def capture_video_frame_from_url(
+    video_url: str = Query(...),
+    t: float = Query(default=0.0, ge=0.0),
+    token: dict = Depends(JWTBearer()),
+):
+    """Same extraction as /produce-video-job/{id}/capture-frame, but generic over
+    any video URL rather than an old-pipeline job lookup — used by the brand
+    overlay position picker, which needs a real frame BEFORE a ZapCap render
+    exists yet (plan-time preview uses the stitched source video; post-render
+    adjustment uses the finished output — both are just a URL)."""
+    if not _get_user_id(token):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-ss", str(t),
+                "-i", video_url,
+                "-vframes", "1",
+                "-f", "image2pipe",
+                "-vcodec", "mjpeg",
+                "pipe:1",
+            ],
+            capture_output=True,
+            timeout=30,
+        )
+        if not result.stdout:
+            raise HTTPException(status_code=500, detail="ffmpeg produced no output")
+        return Response(content=result.stdout, media_type="image/jpeg")
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="Frame capture timed out")
+    except FileNotFoundError:
+        raise HTTPException(status_code=500, detail="ffmpeg not available on server")
+
+
 @router.post("/produce-video-job/{job_id}/start-render")
 async def start_produce_video_render(
     job_id: str,
@@ -8349,6 +8385,292 @@ async def _add_hook_text_overlay(
         return None
 
 
+_LOGO_POSITIONS = {
+    "top_left":     "10:10",
+    "top_right":    "W-w-10:10",
+    "bottom_left":  "10:H-h-10",
+    "bottom_right": "W-w-10:H-h-10",
+}
+
+
+def _overlay_timing_clause(timing: str, duration: float) -> str:
+    """Maps a plain timing choice to an ffmpeg drawtext/overlay `enable` clause.
+    'whole' returns '' (no clause — always on), matching how _add_hook_text_overlay
+    only sets `enable` when it actually wants a time window."""
+    if timing == "end":
+        start = max(duration - 4.0, 0.0)
+        return f":enable='between(t,{start:.2f},{duration:.2f})'"
+    if timing == "start":
+        return ":enable='between(t,0,3)'"
+    if timing == "last_few":
+        start = max(duration - 3.0, 0.0)
+        return f":enable='between(t,{start:.2f},{duration:.2f})'"
+    return ""  # 'whole'
+
+
+async def _add_brand_overlay(
+    video_url: str,
+    logo_url: Optional[str],
+    logo_position: str,
+    logo_timing: str,
+    contact_text: Optional[str],
+    contact_position: str,
+    contact_timing: str,
+    brand_name: str = "",
+    brand_color: str = "#CD1B78",
+    video_width: Optional[int] = None,
+) -> Optional[str]:
+    """Download a finished video, burn a logo (or, if none on file, a text
+    wordmark of the brand name) plus an optional short contact line into it, and
+    re-upload. Same download → ffmpeg → reupload shape as _add_hook_text_overlay/
+    _mix_music_into_video — a compositing pass on the already-rendered output,
+    never touching ZapCap. Best-effort throughout: any single piece failing
+    (logo download, background removal, drawtext) falls back to skipping that
+    piece rather than blocking the whole render."""
+    import tempfile
+    import asyncio as _asyncio
+    import os as _os
+    import uuid as _uuid
+    import httpx as _httpx
+    from app.agents.social_media_manager.services.video_production_service import _upload_to_cloudinary
+    from app.agents.social_media_manager.services.multi_clip_service import _probe_clip
+
+    if not logo_url and not contact_text and not brand_name:
+        return None
+
+    video_tmp = logo_tmp = text_tmp = contact_text_tmp = output_path = None
+    try:
+        async with _httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
+            video_resp = await client.get(video_url)
+        if video_resp.status_code != 200:
+            print(f"[BrandOverlay] video download failed {video_resp.status_code}", flush=True)
+            return None
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as vf:
+            vf.write(video_resp.content)
+            video_tmp = vf.name
+
+        probed = await _probe_clip(video_tmp)
+        actual_width = probed.get("width") or video_width or 1080
+        duration = probed.get("duration") or 0.0
+
+        # Resolve the logo — download it, and if it has no transparency and
+        # remove.bg is configured, best-effort clean it up first. Any failure
+        # here just means the plain original logo is used (with its own backing
+        # plate below for contrast), never blocks the render.
+        if logo_url:
+            resolved_logo_url = logo_url
+            try:
+                from PIL import Image
+                import io as _io
+                async with _httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+                    logo_probe_resp = await client.get(logo_url)
+                probe_img = Image.open(_io.BytesIO(logo_probe_resp.content))
+                has_alpha = probe_img.mode in ("RGBA", "LA") or (
+                    probe_img.mode == "P" and "transparency" in probe_img.info
+                )
+                if not has_alpha and _os.environ.get("REMOVEBG_API_KEY"):
+                    from app.utils.background_removal import remove_background
+                    cleaned_url = await remove_background(logo_url, method="removebg")
+                    if cleaned_url:
+                        resolved_logo_url = cleaned_url
+            except Exception as e:
+                print(f"[BrandOverlay] logo transparency check skipped: {e}", flush=True)
+
+            try:
+                async with _httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+                    logo_resp = await client.get(resolved_logo_url)
+                if logo_resp.status_code == 200:
+                    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as lf:
+                        lf.write(logo_resp.content)
+                        logo_tmp = lf.name
+            except Exception as e:
+                print(f"[BrandOverlay] logo download failed: {e}", flush=True)
+
+        ffmpeg_inputs = ["-i", video_tmp]
+        filters: list[str] = []
+        cur = "0:v"
+        input_idx = 1
+
+        if logo_tmp:
+            ffmpeg_inputs += ["-i", logo_tmp]
+            xy = _LOGO_POSITIONS.get(logo_position, _LOGO_POSITIONS["bottom_right"])
+            clause = _overlay_timing_clause(logo_timing, duration)
+            filters.append(f"[{input_idx}:v]scale=120:trunc(ow/a/2)*2,format=rgba[logo]")
+            filters.append(f"[{cur}][logo]overlay={xy}{clause}[v1]")
+            cur = "v1"
+            input_idx += 1
+        elif brand_name:
+            # No logo on file — a plain text wordmark of the business name stands
+            # in for it, same drawtext mechanism as the contact line below.
+            hex_color = (brand_color or "#CD1B78").lstrip("#")
+            if len(hex_color) != 6 or any(c not in "0123456789abcdefABCDEF" for c in hex_color):
+                hex_color = "CD1B78"
+            with tempfile.NamedTemporaryFile(suffix=".txt", mode="w", delete=False) as tf:
+                tf.write(brand_name[:40])
+                text_tmp = tf.name
+            xy = {
+                "top_left": "x=20:y=20", "top_right": "x=w-text_w-20:y=20",
+                "bottom_left": "x=20:y=h-th-20", "bottom_right": "x=w-text_w-20:y=h-th-20",
+            }.get(logo_position, "x=w-text_w-20:y=h-th-20")
+            clause = _overlay_timing_clause(logo_timing, duration)
+            filters.append(
+                f"[{cur}]drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:"
+                f"textfile={text_tmp}:fontsize=32:fontcolor=0x{hex_color}:{xy}{clause}:"
+                "box=1:boxcolor=white@0.6:boxborderw=8[v1]"
+            )
+            cur = "v1"
+
+        if contact_text:
+            with tempfile.NamedTemporaryFile(suffix=".txt", mode="w", delete=False) as ctf:
+                ctf.write(contact_text[:60])
+                contact_text_tmp = ctf.name
+            y = "y=40" if contact_position == "top_center" else "y=h-th-40"
+            clause = _overlay_timing_clause(contact_timing, duration)
+            filters.append(
+                f"[{cur}]drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:"
+                f"textfile={contact_text_tmp}:fontsize=36:fontcolor=white:x=(w-text_w)/2:{y}{clause}:"
+                "box=1:boxcolor=black@0.55:boxborderw=14[vout]"
+            )
+            cur = "vout"
+
+        if not filters:
+            return None  # nothing to actually burn in
+
+        # Relabel the last filter's output to [vout] if it isn't already, so the
+        # -map below is always correct regardless of which branches ran.
+        if cur != "vout":
+            filters[-1] = filters[-1].replace(f"[{cur}]", "[vout]")
+            cur = "vout"
+
+        output_path = f"/tmp/brand-overlay-{_uuid.uuid4().hex[:8]}.mp4"
+        proc = await _asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", *ffmpeg_inputs,
+            "-filter_complex", ";".join(filters),
+            "-map", f"[{cur}]", "-map", "0:a?",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+            "-c:a", "copy",
+            output_path,
+            stdout=_asyncio.subprocess.DEVNULL,
+            stderr=_asyncio.subprocess.PIPE,
+        )
+        _, stderr = await _asyncio.wait_for(proc.communicate(), timeout=300)
+
+        if proc.returncode != 0:
+            print(f"[BrandOverlay] ffmpeg failed: {stderr.decode()[-500:]}", flush=True)
+            return None
+
+        with open(output_path, "rb") as f:
+            overlaid_bytes = f.read()
+
+        public_id = f"brand-overlay-{_uuid.uuid4().hex[:12]}"
+        return await _upload_to_cloudinary(overlaid_bytes, public_id)
+
+    except Exception as e:
+        print(f"[BrandOverlay] error: {e}", flush=True)
+        return None
+    finally:
+        for p in [video_tmp, logo_tmp, text_tmp, contact_text_tmp, output_path]:
+            if p:
+                try: _os.unlink(p)
+                except: pass
+
+
+async def _resolve_brand_overlay_context(
+    user_id: str, db: AsyncIOMotorDatabase, ctx: dict, contact_source: str, custom_contact_text: str
+) -> dict:
+    """Resolve a brand's logo/contact for the overlay from data already on
+    file — shared by zapcap_produce (submit time) and
+    /video-brand-overlay/adjust (post-render adjustment) so the two never
+    drift. Fails soft to an all-empty result; the caller's own try/except
+    (or _add_brand_overlay's own no-op-when-nothing-to-burn guard) handles
+    that gracefully."""
+    result = {"logo_url": None, "contact_text": None, "brand_name": "", "brand_color": "#CD1B78"}
+    try:
+        active_brand_id = ctx["brand_id"]
+        profile_result = await BrandProfileService.get(user_id, db, brand_id=active_brand_id)
+        profile_data = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
+        brand_ctx = BrandProfileService.to_brand_context(profile_data)
+        result["logo_url"] = brand_ctx.get("logo_url") or None
+        result["brand_name"] = brand_ctx.get("brand_name") or ""
+        colors = brand_ctx.get("brand_colors") or []
+        result["brand_color"] = colors[0] if colors else "#CD1B78"
+
+        if contact_source == "custom":
+            result["contact_text"] = custom_contact_text.strip()[:60] or None
+        elif contact_source == "website":
+            result["contact_text"] = brand_ctx.get("default_link") or None
+        elif contact_source in ("whatsapp", "whatsapp_prefixed"):
+            from app.agents.jane_ads.whatsapp import get_brand_whatsapp
+            wa_number = await get_brand_whatsapp(db, active_brand_id)
+            if wa_number:
+                result["contact_text"] = f"Message us: {wa_number}" if contact_source == "whatsapp_prefixed" else wa_number
+    except Exception as e:
+        print(f"[BrandOverlay] context resolution failed, skipping: {e}", flush=True)
+    return result
+
+
+@router.post("/video-brand-overlay/adjust")
+async def video_brand_overlay_adjust(
+    job_id: str = Form(...),
+    logo_position: str = Form("bottom_right"),
+    logo_timing: str = Form("whole"),
+    contact_source: str = Form("none"),
+    custom_contact_text: str = Form(""),
+    contact_position: str = Form("bottom_center"),
+    contact_timing: str = Form("end"),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+    ctx: dict = Depends(get_active_brand_context),
+):
+    """Recompute the brand overlay against the job's stored
+    pre_overlay_output_url — a compositing-only pass, no ZapCap resubmission.
+    This is spec §9's "near-instant adjustment" goal, already true for free:
+    it's the same download->ffmpeg->reupload pattern hook-text/music/voiceover
+    already use, never a full re-render."""
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    job = await db["zapcap_jobs"].find_one({"job_id": job_id, "user_id": user_id})
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    base_url = job.get("pre_overlay_output_url") or job.get("final_output_url") or job.get("output_url")
+    if not base_url:
+        raise HTTPException(status_code=400, detail="This video hasn't finished rendering yet")
+
+    resolved = await _resolve_brand_overlay_context(user_id, db, ctx, contact_source, custom_contact_text)
+
+    overlaid_url = await _add_brand_overlay(
+        base_url,
+        resolved["logo_url"],
+        logo_position,
+        logo_timing,
+        resolved["contact_text"],
+        contact_position,
+        contact_timing,
+        brand_name=resolved["brand_name"],
+        brand_color=resolved["brand_color"],
+        video_width=job.get("video_width"),
+    )
+    if not overlaid_url:
+        raise HTTPException(status_code=502, detail="Could not apply the overlay — please try again.")
+
+    await db["zapcap_jobs"].update_one(
+        {"job_id": job_id},
+        {"$set": {
+            "final_output_url": overlaid_url,
+            "brand_overlay_enabled": True,
+            "logo_position": logo_position,
+            "logo_timing": logo_timing,
+            "brand_overlay_contact_text": resolved["contact_text"],
+            "contact_position": contact_position,
+            "contact_timing": contact_timing,
+        }},
+    )
+    return UriResponse.get_single_data_response("zapcap_job", {"output_url": overlaid_url})
+
+
 @router.post("/submagic-produce")
 async def submagic_produce(
     video: UploadFile = File(...),
@@ -8649,8 +8971,16 @@ async def zapcap_produce(
     custom_broll_clips: List[UploadFile] = File(default=[]),
     custom_broll_placements: Optional[str] = Form(None),  # JSON: [{"clipIndex":0,"startTime":5.0,"duration":4}]
     custom_broll_estimated_duration: float = Form(60.0),
+    enable_brand_overlay: str = Form("false"),
+    logo_position: str = Form("bottom_right"),
+    logo_timing: str = Form("whole"),
+    contact_source: str = Form("none"),  # whatsapp | whatsapp_prefixed | website | custom | none
+    custom_contact_text: str = Form(""),
+    contact_position: str = Form("bottom_center"),
+    contact_timing: str = Form("end"),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
     token: dict = Depends(JWTBearer()),
+    ctx: dict = Depends(get_active_brand_context),
 ):
     import uuid as _uuid
     import httpx
@@ -8855,6 +9185,21 @@ async def zapcap_produce(
         music_url = _pick_music_url(mood)
         print(f"[ZapCap] AI-picked music for purpose={purpose} mood={mood} → {(music_url or '')[:60]}", flush=True)
 
+    # Brand overlay — resolve logo/contact NOW from data already on file (never
+    # asked for fresh). Resolved once at submit time and stored on the job doc
+    # so the completion branch below doesn't need to re-fetch brand context.
+    brand_overlay_logo_url = brand_overlay_contact_text = None
+    brand_overlay_name = ""
+    brand_overlay_color = "#CD1B78"
+    if enable_brand_overlay.lower() == "true":
+        resolved = await _resolve_brand_overlay_context(
+            user_id, db, ctx, contact_source, custom_contact_text
+        )
+        brand_overlay_logo_url = resolved["logo_url"]
+        brand_overlay_contact_text = resolved["contact_text"]
+        brand_overlay_name = resolved["brand_name"]
+        brand_overlay_color = resolved["brand_color"]
+
     # Persist job
     await db["zapcap_jobs"].insert_one({
         "job_id": job_id,
@@ -8873,6 +9218,15 @@ async def zapcap_produce(
         "hook_text_enabled": enable_hook_text.lower() == "true",
         "custom_hook_text": custom_hook_text.strip() or None,
         "hook_text_color": hook_text_color or "#ffffff",
+        "brand_overlay_enabled": enable_brand_overlay.lower() == "true",
+        "brand_overlay_logo_url": brand_overlay_logo_url,
+        "brand_overlay_contact_text": brand_overlay_contact_text,
+        "brand_overlay_name": brand_overlay_name,
+        "brand_overlay_color": brand_overlay_color,
+        "logo_position": logo_position,
+        "logo_timing": logo_timing,
+        "contact_position": contact_position,
+        "contact_timing": contact_timing,
         "video_url": video_url,
         "video_width": probed_width or None,
         "video_height": probed_height or None,
@@ -8950,6 +9304,7 @@ async def video_voiceover_produce(
     enable_broll: str = Form("false"),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
     token: dict = Depends(JWTBearer()),
+    ctx: dict = Depends(get_active_brand_context),
 ):
     """Clean the recorded voiceover (cut filler/false-starts with crossfades), mix
     it in as the video's primary audio track, then hand the result to the EXISTING
@@ -9006,6 +9361,7 @@ async def video_voiceover_produce(
         custom_broll_estimated_duration=60.0,
         db=db,
         token=token,
+        ctx=ctx,
     )
     if not isinstance(result, dict):
         # zapcap_produce returns a plain JSONResponse (not a dict) for its own
@@ -9285,6 +9641,39 @@ async def zapcap_job_status(
                     print(f"[HookText] no transcript or generation failed — skipping overlay", flush=True)
             except Exception as _e:
                 print(f"[HookText] error: {_e}", flush=True)
+
+        # Brand overlay: logo + contact line. Chained last so it composites on
+        # top of whatever music/hook-text already produced. The URL going IN
+        # here is stored as pre_overlay_output_url — a later position/timing
+        # adjustment (POST /video-brand-overlay/adjust) recomposites from this
+        # clean base instead of stacking a second overlay on the first.
+        if job.get("brand_overlay_enabled"):
+            try:
+                await db["zapcap_jobs"].update_one(
+                    {"job_id": job_id}, {"$set": {"pre_overlay_output_url": output_url}}
+                )
+                overlaid_url = await _add_brand_overlay(
+                    output_url,
+                    job.get("brand_overlay_logo_url"),
+                    job.get("logo_position") or "bottom_right",
+                    job.get("logo_timing") or "whole",
+                    job.get("brand_overlay_contact_text"),
+                    job.get("contact_position") or "bottom_center",
+                    job.get("contact_timing") or "end",
+                    brand_name=job.get("brand_overlay_name") or "",
+                    brand_color=job.get("brand_overlay_color") or "#CD1B78",
+                    video_width=job.get("video_width"),
+                )
+                if overlaid_url:
+                    await db["zapcap_jobs"].update_one(
+                        {"job_id": job_id}, {"$set": {"final_output_url": overlaid_url}}
+                    )
+                    output_url = overlaid_url
+                    print(f"[BrandOverlay] applied → {overlaid_url[:60]}", flush=True)
+                else:
+                    print(f"[BrandOverlay] overlay failed or nothing to burn — keeping video as-is", flush=True)
+            except Exception as _e:
+                print(f"[BrandOverlay] error: {_e}", flush=True)
 
     return UriResponse.get_single_data_response("zapcap_job", {
         "status": status,
