@@ -8608,7 +8608,11 @@ async def _resolve_brand_overlay_context(
             # own module docstring intends, just never wired in here.
             wa_number = await get_brand_whatsapp(db, active_brand_id) or await get_connected_whatsapp(db, user_id)
             if wa_number:
-                result["contact_text"] = f"Message us: {wa_number}" if contact_source == "whatsapp_prefixed" else wa_number
+                # Digits-only (normalize_wa_number strips "+") is correct for a
+                # wa.me link, but reads wrong burned into video as visible text —
+                # display form always shows the leading "+".
+                display_number = f"+{wa_number}" if not wa_number.startswith("+") else wa_number
+                result["contact_text"] = f"Message us: {display_number}" if contact_source == "whatsapp_prefixed" else display_number
     except Exception as e:
         print(f"[BrandOverlay] context resolution failed, skipping: {e}", flush=True)
     return result
