@@ -4,19 +4,42 @@ Only accessible by admin email: urisocialingsight@gmail.com
 """
 from fastapi import APIRouter, Depends, HTTPException, Query
 from motor.motor_asyncio import AsyncIOMotorDatabase
+from pydantic import BaseModel, Field
 from typing import List, Optional
 from datetime import datetime
 from app.core.auth_bearer import JWTBearer
+from app.core.config import settings
 from app.database import get_db
+from app.services.CreditService import credit_service
+from app.services.TrialService import trial_service
 
 router = APIRouter(
     prefix="/api/admin",
     tags=["Admin"],
 )
 
-ADMIN_EMAIL = "urisocialingsight@gmail.com"
+def _bootstrap_admin_emails() -> set:
+    return {e.strip().lower() for e in (settings.ADMIN_EMAILS or "").split(",") if e.strip()}
 
-async def verify_admin(jwt_payload: dict = Depends(JWTBearer())) -> dict:
+
+async def _is_admin_email(email: str, db: AsyncIOMotorDatabase) -> bool:
+    """
+    Admin status has two sources: the env-configured ADMIN_EMAILS allowlist
+    (the bootstrap admin(s) — always valid, survives any DB state) and the
+    per-user `is_admin` flag on the users collection (grantable/revocable
+    from the admin UI, see /users/{id}/admin/grant|revoke below). Either
+    grants access.
+    """
+    if email.lower() in _bootstrap_admin_emails():
+        return True
+    user = await db["users"].find_one({"email": email}, {"is_admin": 1})
+    return bool(user and user.get("is_admin"))
+
+
+async def verify_admin(
+    jwt_payload: dict = Depends(JWTBearer()),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+) -> dict:
     """Verify that the user is an admin"""
     if not jwt_payload:
         raise HTTPException(status_code=401, detail="Invalid authentication token")
@@ -28,10 +51,28 @@ async def verify_admin(jwt_payload: dict = Depends(JWTBearer())) -> dict:
     if not user_email:
         raise HTTPException(status_code=401, detail="Invalid token: email not found")
 
-    if user_email != ADMIN_EMAIL:
+    if not await _is_admin_email(user_email, db):
         raise HTTPException(status_code=403, detail="Access denied. Admin only.")
 
     return jwt_payload
+
+
+@router.get("/me")
+async def get_my_admin_status(
+    jwt_payload: dict = Depends(JWTBearer()),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Tells any authenticated user whether THEY are an admin — unlike every
+    other endpoint in this router, deliberately not gated by verify_admin,
+    since its entire purpose is answering that question for the frontend's
+    nav-visibility check.
+    """
+    claims = jwt_payload.get("claims", {})
+    user_email = claims.get("email")
+    if not user_email:
+        raise HTTPException(status_code=401, detail="Invalid token: email not found")
+    return {"is_admin": await _is_admin_email(user_email, db)}
 
 
 @router.get("/users")
@@ -124,6 +165,7 @@ async def get_all_users(
             "trial_end": user.get("trial_end"),
             "credits_balance": credits_balance,
             "phone": user.get("phone"),
+            "is_admin": bool(user.get("is_admin")),
         }
         users.append(user_data)
 
@@ -191,6 +233,7 @@ async def get_recent_users(
             "createdAt": user.get("created_at"),
             "subscription_tier": subscription_tier,
             "trial_end": user.get("trial_end"),
+            "is_admin": bool(user.get("is_admin")),
         }
         users.append(user_data)
 
@@ -284,9 +327,103 @@ async def get_user_details(
         "brand_profiles": brand_profiles,
         "content_count": content_count,
         "workspaces": workspaces,
+        "is_admin": bool(user.get("is_admin")),
     }
 
     return user_data
+
+
+@router.post("/users/{user_id}/admin/grant")
+async def grant_admin(
+    user_id: str,
+    admin_user: dict = Depends(verify_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Grant admin access to a user. Admin-only — an existing admin must do the granting."""
+    from bson import ObjectId
+
+    result = await db["users"].update_one({"_id": ObjectId(user_id)}, {"$set": {"is_admin": True}})
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"user_id": user_id, "is_admin": True}
+
+
+@router.post("/users/{user_id}/admin/revoke")
+async def revoke_admin(
+    user_id: str,
+    admin_user: dict = Depends(verify_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Revoke a user's admin access. Blocks revoking your own access — a
+    DB-granted admin could otherwise lock themselves out with no one else
+    able to undo it (the bootstrap ADMIN_EMAILS allowlist is the only account
+    guaranteed to always regain access, and self-revoke isn't worth risking
+    that gap for).
+    """
+    from bson import ObjectId
+
+    target = await db["users"].find_one({"_id": ObjectId(user_id)}, {"email": 1})
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    acting_email = (admin_user.get("claims", {}) or {}).get("email", "")
+    if target.get("email", "").lower() == acting_email.lower():
+        raise HTTPException(status_code=400, detail="Cannot revoke your own admin access — ask another admin.")
+
+    await db["users"].update_one({"_id": ObjectId(user_id)}, {"$set": {"is_admin": False}})
+    return {"user_id": user_id, "is_admin": False}
+
+
+class CreditAdjustRequest(BaseModel):
+    amount: int = Field(..., description="Signed delta — positive grants, negative claws back")
+    reason: Optional[str] = Field(default=None, description="Admin's free-text note for this adjustment")
+
+
+@router.post("/users/{user_id}/credits/adjust")
+async def adjust_user_credits(
+    user_id: str,
+    body: CreditAdjustRequest,
+    admin_user: dict = Depends(verify_admin),
+):
+    """
+    Adjust a user's bonus credit balance by a signed amount, floored at 0.
+    Replaces raw MongoDB edits with an auditable, logged operation.
+    """
+    wallet = await credit_service.admin_adjust_credits(user_id, body.amount, notes=body.reason)
+    return {
+        "user_id": user_id,
+        "credits_balance": wallet.credits_remaining,
+        "bonus_credits": wallet.bonus_credits,
+        "total_credits": wallet.total_credits,
+    }
+
+
+@router.post("/users/{user_id}/trial/adjust")
+async def adjust_user_trial_credits(
+    user_id: str,
+    body: CreditAdjustRequest,
+    admin_user: dict = Depends(verify_admin),
+):
+    """Adjust a user's remaining trial credits by a signed amount, floored at 0."""
+    try:
+        status = await trial_service.admin_adjust_trial_credits(user_id, body.amount, notes=body.reason)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return status
+
+
+@router.post("/users/{user_id}/trial/expire")
+async def expire_user_trial(
+    user_id: str,
+    admin_user: dict = Depends(verify_admin),
+):
+    """Force-expire a user's trial (credits_remaining=0, trial_used=True)."""
+    try:
+        status = await trial_service.admin_expire_trial(user_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return status
 
 
 @router.get("/stats")

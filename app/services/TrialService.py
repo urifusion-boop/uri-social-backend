@@ -317,6 +317,86 @@ class TrialService:
         trial_doc = await self.trials_collection.find_one({"user_id": user_id})
         return trial_doc is not None
 
+    # ==================== Admin Overrides ====================
+
+    async def admin_adjust_trial_credits(
+        self, user_id: str, amount: int, notes: Optional[str] = None
+    ) -> TrialStatusResponse:
+        """
+        Signed delta to a trial's credits_remaining, floored at 0. Logs a
+        credit_transactions entry with type="admin_adjustment" — the auditable,
+        in-app replacement for editing user_trials by hand in Mongo.
+        """
+        trial_doc = await self.trials_collection.find_one({"user_id": user_id})
+        if not trial_doc:
+            raise ValueError(f"No trial found for user {user_id}")
+
+        now = datetime.utcnow()
+        current = trial_doc["credits_remaining"]
+        new_remaining = max(0, current + amount)
+        applied_amount = new_remaining - current  # what actually changed, after flooring
+
+        updated = await self.trials_collection.find_one_and_update(
+            {"user_id": user_id},
+            {"$set": {"credits_remaining": new_remaining}},
+            return_document=ReturnDocument.AFTER,
+        )
+
+        await self.credit_transactions_collection.insert_one(
+            CreditTransaction(
+                user_id=user_id,
+                type="admin_adjustment",
+                amount=applied_amount,
+                balance_before=current,
+                balance_after=new_remaining,
+                reason="admin_adjustment",
+                notes=notes,
+                created_at=now,
+            ).dict(exclude_none=True)
+        )
+
+        if new_remaining == 0:
+            await self._ensure_wallet_on_trial_expiry(user_id)
+
+        return await self._build_status(updated)
+
+    async def admin_expire_trial(self, user_id: str, notes: Optional[str] = None) -> TrialStatusResponse:
+        """
+        Force-expire a trial: credits_remaining=0, trial_used=True. The exact
+        manual edit that used to require a raw Mongo write, now a named,
+        logged code path.
+        """
+        trial_doc = await self.trials_collection.find_one({"user_id": user_id})
+        if not trial_doc:
+            raise ValueError(f"No trial found for user {user_id}")
+
+        now = datetime.utcnow()
+        current = trial_doc["credits_remaining"]
+
+        updated = await self.trials_collection.find_one_and_update(
+            {"user_id": user_id},
+            {"$set": {"credits_remaining": 0, "trial_used": True}},
+            return_document=ReturnDocument.AFTER,
+        )
+
+        if current != 0:
+            await self.credit_transactions_collection.insert_one(
+                CreditTransaction(
+                    user_id=user_id,
+                    type="admin_adjustment",
+                    amount=-current,
+                    balance_before=current,
+                    balance_after=0,
+                    reason="admin_adjustment",
+                    notes=notes or "Trial force-expired by admin",
+                    created_at=now,
+                ).dict(exclude_none=True)
+            )
+
+        await self._ensure_wallet_on_trial_expiry(user_id)
+
+        return await self._build_status(updated)
+
 
 # Module-level singleton
 trial_service = TrialService()

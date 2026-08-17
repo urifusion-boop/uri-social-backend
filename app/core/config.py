@@ -132,6 +132,13 @@ class Settings(BaseSettings):
     VIDEO_EDIT_CREDITS_PER_MINUTE: int = 4
     # Comma-separated allowlist gating PATCH /video-editing/pricing. Empty = nobody can change it.
     BILLING_ADMIN_EMAILS: str = ""
+    # Comma-separated allowlist gating the /admin/* user-management router (view all
+    # users, adjust credits/trial). Defaults to the same email the frontend's
+    # AdminService.isAdmin() already hardcodes, so this matches today's real
+    # security posture rather than silently locking everyone out until a .env
+    # change ships — extend via env var for additional admins, never widen this
+    # default to something guessable.
+    ADMIN_EMAILS: str = "urisocialingsight@gmail.com"
     # Set to 'reap' | 'opusclip' | 'vizard' after Phase 0 Pidgin test picks a winner
     CLIPPING_API_PROVIDER: str = "reap"
 

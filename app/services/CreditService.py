@@ -204,6 +204,84 @@ class CreditService:
         wallet.credits_remaining = new_remaining
         return wallet
 
+    async def admin_adjust_credits(self, user_id: str, amount: int, notes: Optional[str] = None) -> UserCreditWallet:
+        """
+        Signed delta to bonus_credits, floored at 0 — never negative (an admin
+        correcting an over-grant reduces to zero, not into debt). Logs a real
+        credit_transactions entry with type="admin_adjustment" so this is
+        auditable exactly like every other balance change, unlike a raw DB edit.
+        Distinct from add_bonus_credits (always-positive, reason from a fixed
+        set) — this accepts a signed amount and a free-text admin note.
+        """
+        wallet = await self.get_user_wallet(user_id)
+
+        if not wallet:
+            new_bonus = max(0, amount)
+            new_wallet = UserCreditWallet(
+                user_id=user_id,
+                bonus_credits=new_bonus,
+                subscription_credits=0,
+                frozen_credits=0,
+                total_credits=new_bonus,
+                credits_used=0,
+                credits_remaining=new_bonus,
+                subscription_tier=None,
+                next_renewal=None,
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow()
+            )
+            await self.user_credits_collection.insert_one(new_wallet.dict(exclude_none=True))
+
+            await self.credit_transactions_collection.insert_one(
+                CreditTransaction(
+                    user_id=user_id,
+                    type="admin_adjustment",
+                    amount=new_bonus,  # actual amount applied, may differ from `amount` if floored
+                    balance_before=0,
+                    balance_after=new_bonus,
+                    reason="admin_adjustment",
+                    notes=notes,
+                    created_at=datetime.utcnow()
+                ).dict(exclude_none=True)
+            )
+            return new_wallet
+
+        current_bonus = getattr(wallet, 'bonus_credits', 0)
+        new_bonus = max(0, current_bonus + amount)
+        new_total = new_bonus + getattr(wallet, 'subscription_credits', 0)
+        new_remaining = new_total - wallet.credits_used
+        applied_amount = new_bonus - current_bonus  # what actually changed, after flooring
+
+        await self.user_credits_collection.update_one(
+            {"user_id": user_id},
+            {
+                "$set": {
+                    "bonus_credits": new_bonus,
+                    "total_credits": new_total,
+                    "credits_remaining": new_remaining,
+                    "updated_at": datetime.utcnow()
+                }
+            }
+        )
+
+        await self.credit_transactions_collection.insert_one(
+            CreditTransaction(
+                user_id=user_id,
+                type="admin_adjustment",
+                amount=applied_amount,
+                balance_before=wallet.credits_remaining,
+                balance_after=new_remaining,
+                reason="admin_adjustment",
+                notes=notes,
+                created_at=datetime.utcnow()
+            ).dict(exclude_none=True)
+        )
+
+        wallet.bonus_credits = new_bonus
+        wallet.total_credits = new_total
+        wallet.credits_remaining = new_remaining
+        return wallet
+
     # ==================== PRD 7.2: Deduction Logic ====================
 
     async def check_sufficient_credits(self, user_id: str, required: int = 1) -> bool:
