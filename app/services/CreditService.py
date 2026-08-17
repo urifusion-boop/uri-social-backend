@@ -74,30 +74,49 @@ class CreditService:
         """
         Get user credit balance with low credit warning
         PRD 7.3: Low Credit Warning when credits ≤ 3
+
+        Includes any still-unexpired trial credits in the total — a trial
+        isn't cut short by subscribing, it keeps counting down on its own
+        clock, and the credits it still has should be usable alongside the
+        subscription balance until it naturally runs out (date passes or its
+        own credits hit 0). Confirmed live: a starter subscriber with 20 real
+        credits and 10 unexpired trial credits was shown only "10 credits" —
+        the wallet-only number — instead of the combined 30 they actually had.
         """
         wallet = await self.get_user_wallet(user_id)
 
+        # Trial contribution is independent of whether a wallet/subscription
+        # exists at all — imported here (not at module level) to avoid a
+        # CreditService <-> TrialService import-order dependency at startup.
+        from app.services.TrialService import trial_service
+        trial_status = await trial_service.get_trial_status(user_id)
+        trial_credits_included = trial_status.credits_remaining if trial_status.trial_active else 0
+
         if not wallet:
-            # User never subscribed - return zero balance
+            # No subscription/bonus wallet — balance is whatever unexpired trial credits remain
             return CreditBalanceResponse(
-                total_credits=0,
+                total_credits=trial_credits_included,
                 credits_used=0,
-                credits_remaining=0,
+                credits_remaining=trial_credits_included,
                 subscription_tier=None,
                 next_renewal=None,
-                low_credit_warning=True  # Show warning to subscribe
+                low_credit_warning=trial_credits_included == 0,
+                trial_credits_included=trial_credits_included,
             )
 
+        total_remaining = wallet.credits_remaining + trial_credits_included
+
         # PRD 7.3: Trigger warning when credits ≤ 3
-        low_credit_warning = wallet.credits_remaining <= 3
+        low_credit_warning = total_remaining <= 3
 
         return CreditBalanceResponse(
-            total_credits=wallet.total_credits,
+            total_credits=wallet.total_credits + trial_credits_included,
             credits_used=wallet.credits_used,
-            credits_remaining=wallet.credits_remaining,
+            credits_remaining=total_remaining,
             subscription_tier=wallet.subscription_tier,
             next_renewal=wallet.next_renewal,
-            low_credit_warning=low_credit_warning
+            low_credit_warning=low_credit_warning,
+            trial_credits_included=trial_credits_included
         )
 
     async def create_wallet(
