@@ -203,11 +203,15 @@ class VideoPublishService:
         # TikTok pulls from Outstand's (already-verified) domain instead.
         outstand_media_url = await outstand.upload_media_from_url(video_url)
 
+        # PUBLIC_TO_EVERYONE — the app's Content Posting API audit passed
+        # 2026-08-17, so TikTok now allows a privacy level other than SELF_ONLY.
+        # Before the audit, TikTok's API hard-rejects anything but SELF_ONLY for
+        # an unaudited app; that's what SELF_ONLY here was working around.
         result = await outstand.publish_post(
             outstand_account_ids=[outstand_account_id],
             content=caption,
             media_urls=[outstand_media_url],
-            platform_config={"tiktok": {"postMode": "DIRECT_POST", "privacyLevel": "SELF_ONLY"}},
+            platform_config={"tiktok": {"postMode": "DIRECT_POST", "privacyLevel": "PUBLIC_TO_EVERYONE"}},
         )
         post_obj = result.get("post") or result.get("data") or {}
         if isinstance(post_obj, list):
