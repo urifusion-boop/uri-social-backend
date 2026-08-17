@@ -148,17 +148,28 @@ class TrialService:
                 trial_already_used=False,
             )
 
-        return await self._build_status(trial_doc)
+        wallet = await self.user_credits_collection.find_one({"user_id": user_id})
+        has_paid_subscription = bool(wallet and wallet.get("subscription_tier") not in (None, "free"))
 
-    async def _build_status(self, trial_doc: dict) -> TrialStatusResponse:
+        return await self._build_status(trial_doc, has_paid_subscription=has_paid_subscription)
+
+    async def _build_status(self, trial_doc: dict, has_paid_subscription: bool = False) -> TrialStatusResponse:
         """Build TrialStatusResponse from a trial document."""
         now = datetime.utcnow()
         end_date = trial_doc["trial_end_date"]
         credits_remaining = trial_doc["credits_remaining"]
 
         # PRD 4.2: trial_active = current_time < trial_end_date AND credits_remaining > 0
+        # AND the user isn't already on a paid subscription — otherwise a user
+        # who subscribes while trial credits/days are still technically left
+        # keeps getting shown "Free Trial ends in Xh / Upgrade Now" instead of
+        # their real subscription credits (confirmed live: a starter-tier
+        # subscriber with 20 real credits was shown a trial-ending banner and
+        # had WorkspaceCreditBadge — which only renders when trial is
+        # inactive — hidden entirely). The trial record itself is left
+        # untouched; this only affects what "active" means once paid.
         time_remaining = end_date - now
-        is_active = now < end_date and credits_remaining > 0
+        is_active = now < end_date and credits_remaining > 0 and not has_paid_subscription
 
         total_seconds_remaining = max(0, time_remaining.total_seconds())
         days_remaining = ceil(total_seconds_remaining / 86400) if total_seconds_remaining > 0 else 0
@@ -358,7 +369,9 @@ class TrialService:
         if new_remaining == 0:
             await self._ensure_wallet_on_trial_expiry(user_id)
 
-        return await self._build_status(updated)
+        wallet = await self.user_credits_collection.find_one({"user_id": user_id})
+        has_paid_subscription = bool(wallet and wallet.get("subscription_tier") not in (None, "free"))
+        return await self._build_status(updated, has_paid_subscription=has_paid_subscription)
 
     async def admin_expire_trial(self, user_id: str, notes: Optional[str] = None) -> TrialStatusResponse:
         """
