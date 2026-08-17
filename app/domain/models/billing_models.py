@@ -361,6 +361,10 @@ class CreditBalanceResponse(BaseModel):
     end_date: Optional[datetime] = Field(default=None, description="Subscription end date")
     next_renewal: Optional[datetime] = None
     low_credit_warning: bool = Field(default=False, description="True if credits <= 3 (PRD 7.3)")
+    trial_credits_included: int = Field(
+        default=0,
+        description="Portion of credits_remaining/total_credits coming from an unexpired trial, not the subscription/bonus wallet — the trial keeps running on its own clock independent of subscription status, so this can be nonzero even for a paid subscriber.",
+    )
 
     class Config:
         schema_extra = {
