@@ -18,6 +18,22 @@ router = APIRouter(
     tags=["Admin"],
 )
 
+def _billing_user_id(user: dict) -> str:
+    """
+    The id that keys user_credits/user_trials/workspaces/content_drafts/
+    brand_profiles across this codebase is users.userId (a UUID set at signup —
+    see auth_router.py's three insert_one calls, all of which set it, plus
+    get_user_id() in billing_router.py which pulls this same field straight
+    out of the JWT). It is NOT str(users._id) — the Mongo ObjectId. Every read
+    below used str(_id) instead, which meant every credit/trial number this
+    router ever showed an admin was looking up a different, almost-certainly-
+    empty record. _id remains the right identifier for the /users/{id} route
+    param itself (that lookup is genuinely by _id); this is only for querying
+    the collections that key off userId.
+    """
+    return user.get("userId") or str(user.get("_id"))
+
+
 def _bootstrap_admin_emails() -> set:
     return {e.strip().lower() for e in (settings.ADMIN_EMAILS or "").split(",") if e.strip()}
 
@@ -122,12 +138,13 @@ async def get_all_users(
 
     async for user in cursor:
         user_id = str(user.get("_id"))
+        billing_id = _billing_user_id(user)
 
         # Get credits info from user_credits collection
-        user_credits = await db["user_credits"].find_one({"user_id": user_id})
+        user_credits = await db["user_credits"].find_one({"user_id": billing_id})
 
         # Check if user has trial credits
-        user_trial = await db["user_trials"].find_one({"user_id": user_id})
+        user_trial = await db["user_trials"].find_one({"user_id": billing_id})
 
         # Get subscription tier from user_credits
         if user_credits:
@@ -203,12 +220,13 @@ async def get_recent_users(
 
     async for user in cursor:
         user_id = str(user.get("_id"))
+        billing_id = _billing_user_id(user)
 
         # Get credits info from user_credits collection
-        user_credits = await db["user_credits"].find_one({"user_id": user_id})
+        user_credits = await db["user_credits"].find_one({"user_id": billing_id})
 
         # Check if user has trial credits
-        user_trial = await db["user_trials"].find_one({"user_id": user_id})
+        user_trial = await db["user_trials"].find_one({"user_id": billing_id})
 
         # Get subscription tier
         subscription_tier = user_credits.get("subscription_tier") or "free" if user_credits else "free"
@@ -260,11 +278,13 @@ async def get_user_details(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
+    billing_id = _billing_user_id(user)
+
     # Get credits info from user_credits collection
-    user_credits = await db["user_credits"].find_one({"user_id": user_id})
+    user_credits = await db["user_credits"].find_one({"user_id": billing_id})
 
     # Check if user has trial credits
-    user_trial = await db["user_trials"].find_one({"user_id": user_id})
+    user_trial = await db["user_trials"].find_one({"user_id": billing_id})
 
     # Get subscription tier from user_credits
     if user_credits:
@@ -292,7 +312,7 @@ async def get_user_details(
 
     # Get user's brand profiles
     brand_profiles = []
-    async for profile in db["brand_profiles"].find({"user_id": user_id}):
+    async for profile in db["brand_profiles"].find({"user_id": billing_id}):
         brand_profiles.append({
             "id": str(profile.get("_id")),
             "brand_name": profile.get("brand_name"),
@@ -300,12 +320,16 @@ async def get_user_details(
             "created_at": profile.get("created_at"),
         })
 
-    # Get user's content count
-    content_count = await db["generated_content"].count_documents({"user_id": user_id})
+    # Get user's content count — content_drafts is the real collection name
+    # (generated_content doesn't exist; see carousel_generation_service.py /
+    # approval_workflow_service.py / video_edit_service.py, all of which write
+    # to content_drafts keyed by this same billing_id).
+    content_count = await db["content_drafts"].count_documents({"user_id": billing_id})
 
-    # Get user's workspaces
+    # Get user's workspaces — WorkspaceService.py writes these with a
+    # "user_id" field, not "owner_id".
     workspaces = []
-    async for workspace in db["workspaces"].find({"owner_id": user_id}):
+    async for workspace in db["workspaces"].find({"user_id": billing_id}):
         workspaces.append({
             "id": str(workspace.get("_id")),
             "name": workspace.get("name"),
@@ -380,17 +404,36 @@ class CreditAdjustRequest(BaseModel):
     reason: Optional[str] = Field(default=None, description="Admin's free-text note for this adjustment")
 
 
+async def _resolve_billing_id(user_id: str, db: AsyncIOMotorDatabase) -> str:
+    """
+    The credits/trial/adjust endpoints take the users._id (what the frontend
+    has as user.id from the list/detail views), but user_credits/user_trials
+    are keyed by users.userId — see _billing_user_id's docstring above. Resolve
+    it here so a credit or trial adjustment actually lands on the record the
+    user's own session reads, instead of silently writing a phantom record
+    under the wrong id.
+    """
+    from bson import ObjectId
+
+    user = await db["users"].find_one({"_id": ObjectId(user_id)})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return _billing_user_id(user)
+
+
 @router.post("/users/{user_id}/credits/adjust")
 async def adjust_user_credits(
     user_id: str,
     body: CreditAdjustRequest,
     admin_user: dict = Depends(verify_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """
     Adjust a user's bonus credit balance by a signed amount, floored at 0.
     Replaces raw MongoDB edits with an auditable, logged operation.
     """
-    wallet = await credit_service.admin_adjust_credits(user_id, body.amount, notes=body.reason)
+    billing_id = await _resolve_billing_id(user_id, db)
+    wallet = await credit_service.admin_adjust_credits(billing_id, body.amount, notes=body.reason)
     return {
         "user_id": user_id,
         "credits_balance": wallet.credits_remaining,
@@ -404,10 +447,12 @@ async def adjust_user_trial_credits(
     user_id: str,
     body: CreditAdjustRequest,
     admin_user: dict = Depends(verify_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """Adjust a user's remaining trial credits by a signed amount, floored at 0."""
+    billing_id = await _resolve_billing_id(user_id, db)
     try:
-        status = await trial_service.admin_adjust_trial_credits(user_id, body.amount, notes=body.reason)
+        status = await trial_service.admin_adjust_trial_credits(billing_id, body.amount, notes=body.reason)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     return status
@@ -417,10 +462,12 @@ async def adjust_user_trial_credits(
 async def expire_user_trial(
     user_id: str,
     admin_user: dict = Depends(verify_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """Force-expire a user's trial (credits_remaining=0, trial_used=True)."""
+    billing_id = await _resolve_billing_id(user_id, db)
     try:
-        status = await trial_service.admin_expire_trial(user_id)
+        status = await trial_service.admin_expire_trial(billing_id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     return status
