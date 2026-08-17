@@ -93,13 +93,14 @@ class CreditTransaction(BaseModel):
     Tracks all credit movements
     """
     user_id: str = Field(..., description="User who performed action")
-    type: Literal["allocation", "deduction", "bonus", "refund", "trial"] = Field(..., description="Transaction type")
+    type: Literal["allocation", "deduction", "bonus", "refund", "trial", "admin_adjustment"] = Field(..., description="Transaction type")
     amount: int = Field(..., description="Credit amount (negative for deduction)")
     balance_before: int = Field(..., description="Credit balance before transaction")
     balance_after: int = Field(..., description="Credit balance after transaction")
-    reason: Literal["subscription", "retry", "campaign_generation", "refund", "bonus", "trial", "whatsapp_content_generation", "whatsapp_graphic_generation", "upload_user_content", "video_editing"] = Field(..., description="Why credits changed")
+    reason: Literal["subscription", "retry", "campaign_generation", "refund", "bonus", "trial", "whatsapp_content_generation", "whatsapp_graphic_generation", "upload_user_content", "video_editing", "admin_adjustment"] = Field(..., description="Why credits changed")
     campaign_id: Optional[str] = Field(default=None, description="Reference to content_requests if applicable")
     retry_count: Optional[int] = Field(default=0, description="Retry number if applicable")
+    notes: Optional[str] = Field(default=None, description="Free-text context — e.g. an admin's stated reason for a manual credit/trial adjustment, distinct from the fixed `reason` category")
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
     class Config:
