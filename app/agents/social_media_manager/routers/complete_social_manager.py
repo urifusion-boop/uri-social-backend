@@ -8600,8 +8600,13 @@ async def _resolve_brand_overlay_context(
         elif contact_source == "website":
             result["contact_text"] = brand_ctx.get("default_link") or None
         elif contact_source in ("whatsapp", "whatsapp_prefixed"):
-            from app.agents.jane_ads.whatsapp import get_brand_whatsapp
-            wa_number = await get_brand_whatsapp(db, active_brand_id)
+            from app.agents.jane_ads.whatsapp import get_brand_whatsapp, get_connected_whatsapp
+            # get_brand_whatsapp is the Jane+Ads-specific per-brand setting; most
+            # brands have never touched that settings screen, so fall back to
+            # whatever number the user connected at signup (users.whatsapp_phone)
+            # before giving up — the same fallback chain jane_ads/whatsapp.py's
+            # own module docstring intends, just never wired in here.
+            wa_number = await get_brand_whatsapp(db, active_brand_id) or await get_connected_whatsapp(db, user_id)
             if wa_number:
                 result["contact_text"] = f"Message us: {wa_number}" if contact_source == "whatsapp_prefixed" else wa_number
     except Exception as e:
