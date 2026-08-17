@@ -34,6 +34,26 @@ def _billing_user_id(user: dict) -> str:
     return user.get("userId") or str(user.get("_id"))
 
 
+async def _billing_summary(billing_id: str) -> tuple[int, str]:
+    """
+    Returns (credits_balance, subscription_tier_label) using the SAME
+    canonical CreditService.get_credit_balance/TrialService.get_trial_status
+    this backend uses everywhere else (the user's own dashboard, the billing
+    endpoints). This router used to hand-roll its own copy of this logic —
+    reading user_credits/user_trials directly and adding trial_credits
+    whenever they were nonzero, with no check on whether the trial had
+    actually expired by date. That drifted out of sync with the real
+    balance calculation (which does check trial_end_date), so this admin
+    panel could show a different number than the user's own account ever
+    would. Delegating here instead of maintaining a second copy.
+    """
+    balance = await credit_service.get_credit_balance(billing_id)
+    tier = balance.subscription_tier or "free"
+    if tier == "free" and balance.trial_credits_included > 0:
+        tier = "trial"
+    return balance.credits_remaining, tier
+
+
 def _bootstrap_admin_emails() -> set:
     return {e.strip().lower() for e in (settings.ADMIN_EMAILS or "").split(",") if e.strip()}
 
@@ -140,30 +160,7 @@ async def get_all_users(
         user_id = str(user.get("_id"))
         billing_id = _billing_user_id(user)
 
-        # Get credits info from user_credits collection
-        user_credits = await db["user_credits"].find_one({"user_id": billing_id})
-
-        # Check if user has trial credits
-        user_trial = await db["user_trials"].find_one({"user_id": billing_id})
-
-        # Get subscription tier from user_credits
-        if user_credits:
-            credits_balance = user_credits.get("credits_remaining", 0)
-            subscription_tier = user_credits.get("subscription_tier") or "free"
-        else:
-            credits_balance = 0
-            subscription_tier = "free"
-
-        # Check if user has trial credits remaining
-        trial_credits_remaining = 0
-        if user_trial and user_trial.get("is_trial"):
-            trial_credits_remaining = user_trial.get("credits_remaining", 0)
-            if trial_credits_remaining > 0:
-                # Add trial credits to total balance
-                credits_balance += trial_credits_remaining
-                # Only show as "trial" if they don't have a paid subscription AND have trial credits
-                if subscription_tier in ["free", None]:
-                    subscription_tier = "trial"
+        credits_balance, subscription_tier = await _billing_summary(billing_id)
 
         # Build full name from first_name and last_name
         first_name = user.get("first_name", "")
@@ -222,20 +219,7 @@ async def get_recent_users(
         user_id = str(user.get("_id"))
         billing_id = _billing_user_id(user)
 
-        # Get credits info from user_credits collection
-        user_credits = await db["user_credits"].find_one({"user_id": billing_id})
-
-        # Check if user has trial credits
-        user_trial = await db["user_trials"].find_one({"user_id": billing_id})
-
-        # Get subscription tier
-        subscription_tier = user_credits.get("subscription_tier") or "free" if user_credits else "free"
-
-        # Override to "trial" only if user has TRIAL credits remaining (not just any credits)
-        if user_trial and user_trial.get("is_trial"):
-            trial_credits_remaining = user_trial.get("credits_remaining", 0)
-            if trial_credits_remaining > 0 and subscription_tier in ["free", None]:
-                subscription_tier = "trial"
+        credits_balance, subscription_tier = await _billing_summary(billing_id)
 
         # Build full name
         first_name = user.get("first_name", "")
@@ -251,6 +235,7 @@ async def get_recent_users(
             "createdAt": user.get("created_at"),
             "subscription_tier": subscription_tier,
             "trial_end": user.get("trial_end"),
+            "credits_balance": credits_balance,
             "is_admin": bool(user.get("is_admin")),
         }
         users.append(user_data)
@@ -280,30 +265,7 @@ async def get_user_details(
 
     billing_id = _billing_user_id(user)
 
-    # Get credits info from user_credits collection
-    user_credits = await db["user_credits"].find_one({"user_id": billing_id})
-
-    # Check if user has trial credits
-    user_trial = await db["user_trials"].find_one({"user_id": billing_id})
-
-    # Get subscription tier from user_credits
-    if user_credits:
-        credits_balance = user_credits.get("credits_remaining", 0)
-        subscription_tier = user_credits.get("subscription_tier") or "free"
-    else:
-        credits_balance = 0
-        subscription_tier = "free"
-
-    # Check if user has trial credits remaining
-    trial_credits_remaining = 0
-    if user_trial and user_trial.get("is_trial"):
-        trial_credits_remaining = user_trial.get("credits_remaining", 0)
-        if trial_credits_remaining > 0:
-            # Add trial credits to total balance
-            credits_balance += trial_credits_remaining
-            # Only show as "trial" if they don't have a paid subscription AND have trial credits
-            if subscription_tier in ["free", None]:
-                subscription_tier = "trial"
+    credits_balance, subscription_tier = await _billing_summary(billing_id)
 
     # Build full name
     first_name = user.get("first_name", "")
