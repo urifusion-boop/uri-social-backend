@@ -1,0 +1,56 @@
+name: Build and Push URI Social Backend API to ECR (DEV)
+
+on:
+  push:
+    branches:
+      - aws/dev
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    # id-token: write lets this job request a short-lived GitHub OIDC token.
+    # AWS trusts that token (via the IAM role's trust policy) instead of us
+    # storing a long-lived AWS access key as a GitHub secret.
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python version
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # Exchange the GitHub OIDC token for short-lived AWS credentials by
+      # assuming an IAM role. That role must already exist in AWS with a
+      # trust policy scoped to this repo/branch — see conversation notes.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
+          aws-region: eu-west-1
+
+      # Authenticates Docker against ECR using the credentials from the
+      # previous step, and exposes the registry hostname as an output.
+      - name: Log in to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Build and push Docker image to ECR
+      - name: Build and push Docker image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ vars.IMAGE_TAG }}
+        run: |
+          docker build -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" .
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
