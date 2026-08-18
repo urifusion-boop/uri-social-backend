@@ -348,6 +348,16 @@ async def generate_content(
     print(f"   Include Images: {request.include_images}")
     print(f"{'='*80}\n")
 
+    # Carousels bill 1 credit per slide, not the flat 1-credit-per-generation
+    # rate everything else uses — computed once, up front, so the pre-check
+    # below and the actual deduction later can't drift out of sync with each
+    # other (a UI-facing slide-count picker offers 2-5; the service layer
+    # itself clamps to 2-10, so mirror that wider bound here for whatever the
+    # request actually carries).
+    post_type = request.post_type or "feed"
+    num_slides = max(2, min(5, request.num_slides or 3)) if post_type == "carousel" else 1
+    required_credits = num_slides if post_type == "carousel" else 1
+
     try:
         # ==================== PRD 7.2 & 8: Credit Check ====================
         # Import services (needed later for credit deduction even if check is skipped)
@@ -362,9 +372,38 @@ async def generate_content(
             # Check trial credits first, then paid credits
             is_trial_user = await trial_service.has_active_trial(user_id)
 
+            if is_trial_user and required_credits > 1:
+                # has_active_trial only confirms >0 trial credits — fine for
+                # the flat 1-credit case, but a carousel can need more than
+                # is left in the trial pool. Without this, generation (and
+                # its real OpenAI cost) would proceed and the later
+                # deduct_trial_credit(amount=required_credits) would just
+                # fail its atomic sufficiency guard silently, leaving the
+                # user's trial balance untouched but their content already
+                # generated for free.
+                trial_status = await trial_service.get_trial_status(user_id)
+                if trial_status.credits_remaining < required_credits:
+                    return JSONResponse(
+                        status_code=402,
+                        content={
+                            "status": False,
+                            "responseCode": 402,
+                            "responseMessage": (
+                                f"This {num_slides}-slide carousel needs {required_credits} credits, "
+                                f"but only {trial_status.credits_remaining} trial credits remain. "
+                                "Choose fewer slides or upgrade to continue."
+                            ),
+                            "responseData": {
+                                "credits_remaining": trial_status.credits_remaining,
+                                "credits_required": required_credits,
+                                "upgrade_url": "/pricing"
+                            }
+                        }
+                    )
+
             if not is_trial_user:
                 # Paid user path — check subscription/bonus credits
-                has_credits = await credit_service.check_sufficient_credits(user_id)
+                has_credits = await credit_service.check_sufficient_credits(user_id, required=required_credits)
                 if not has_credits:
                     # PRD 8: "You've run out of credits. Upgrade to continue."
                     return JSONResponse(
@@ -477,8 +516,8 @@ async def generate_content(
             overrides = request.brand_context.dict(exclude_none=True)
             brand_context_dict = {**brand_context_dict, **overrides}
 
-        post_type = request.post_type or "feed"
-        num_slides = max(2, min(5, request.num_slides or 3))
+        # post_type/num_slides/required_credits already computed up front (see above),
+        # before the credit-sufficiency checks, so both stay in sync.
 
         # ── Reference images: normalise to a list, keep old single-image field working ──
         ref_images: List[str] = request.reference_images or (
@@ -553,8 +592,9 @@ async def generate_content(
                     d["post_type"] = post_type
 
         # ==================== PRD 7.2: Credit Deduction ====================
-        # Deduct 1 credit after successful generation (skip for API key users)
-        # PRD 3.1: First campaign generation = 1 credit
+        # Deduct required_credits after successful generation (skip for API key users).
+        # PRD 3.1: 1 credit per campaign generation, except carousels, which
+        # bill 1 credit per slide (required_credits computed up front).
         if result.get("status") and ctx.get("auth_type") != "api_key":
             request_id = result.get("responseData", {}).get("request_id")
             if request_id:
@@ -563,16 +603,18 @@ async def generate_content(
                         user_id=user_id,
                         campaign_id=request_id,
                         reason="campaign_generation",
+                        amount=required_credits,
                     )
-                    print(f"✅ Deducted 1 trial credit from user {user_id} for campaign {request_id}")
+                    print(f"✅ Deducted {required_credits} trial credit(s) from user {user_id} for campaign {request_id}")
                 else:
                     await credit_service.deduct_credit(
                         user_id=user_id,
                         campaign_id=request_id,
                         reason="campaign_generation",
-                        retry_count=0  # Initial generation (not a retry)
+                        retry_count=0,  # Initial generation (not a retry)
+                        amount=required_credits,
                     )
-                    print(f"✅ Deducted 1 credit from user {user_id} for campaign {request_id}")
+                    print(f"✅ Deducted {required_credits} credit(s) from user {user_id} for campaign {request_id}")
 
             # Notification PRD 4.2: Content created notification
             try:
@@ -590,7 +632,7 @@ async def generate_content(
             except Exception as e:
                 print(f"⚠️ Content created notification failed: {e}")
         elif result.get("status") and ctx.get("auth_type") == "api_key":
-            _report_sdk_credit_cost(response, ctx, credits=1)
+            _report_sdk_credit_cost(response, ctx, credits=required_credits)
 
         # If images were requested, mark drafts as has_image=True immediately so the
         # frontend shimmer shows right away, then kick off background generation.
