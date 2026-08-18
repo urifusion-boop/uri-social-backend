@@ -113,16 +113,22 @@ class CarouselGenerationService:
         industry = bc.get("industry", "")
         target_audience = bc.get("target_audience", "")
 
-        # Analyze content to determine optimal slide count
+        # Analyze content to classify it as list/short/story — used below only
+        # to frame the prompt structure (numbered list vs. narrative build),
+        # never to override the caller's requested slide count.
         content_analysis = CarouselGenerationService.analyze_content_type(seed_content)
 
-        # Override num_slides with intelligent detection (unless explicitly forced)
-        # If user explicitly requested a count, respect it. Otherwise use detected optimal.
-        if num_slides == 3:  # Default value, use intelligent detection
-            num_slides = content_analysis["optimal_slides"]
-        else:
-            # User specified custom count, but cap it
-            num_slides = max(2, min(10, num_slides))
+        # Always honor the caller's requested slide count. This used to treat
+        # num_slides == 3 as a sentinel meaning "no preference, auto-detect
+        # optimal_slides instead" — but the only real caller
+        # (complete_social_manager.py, backing the UI's 2/3/4/5 slide-count
+        # picker) always sends an explicit, deliberate value, including 3,
+        # which is indistinguishable from that sentinel. Every genuine
+        # "3 slides" request was silently overridden by an auto-detected
+        # count (commonly 5 or 7 for narrative content) — confirmed live,
+        # reproducible for any user requesting exactly 3 slides on content
+        # long enough to hit the "story" detection path.
+        num_slides = max(2, min(10, num_slides))
 
         print(f"📊 Carousel analysis: type={content_analysis['type']}, optimal_slides={content_analysis['optimal_slides']}, using={num_slides}")
 
