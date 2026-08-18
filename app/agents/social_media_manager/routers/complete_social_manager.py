@@ -1354,6 +1354,142 @@ async def facebook_direct_finalize(
     return UriResponse.get_single_data_response("facebook_connected", {"fb_page_id": fb_page_id})
 
 
+# ── TikTok direct — Content Posting API via FILE_UPLOAD, bypassing Outstand.
+# Same 3-endpoint shape as facebook-direct above (initiate/callback/finalize),
+# additive alongside the existing Outstand-mediated TikTok connection — see
+# tiktok_direct_service.py's module docstring for why this exists now.
+
+@router.get("/connect/tiktok-direct/initiate")
+async def tiktok_direct_initiate(source: Optional[str] = Query("settings")):
+    """Redirect the user's browser to TikTok's OAuth page to connect their
+    TikTok account directly (without Outstand). On completion, TikTok
+    redirects to /connect/tiktok-direct/callback."""
+    import urllib.parse
+
+    client_key = settings.TIKTOK_APP_CLIENT_KEY
+    if not client_key:
+        raise HTTPException(status_code=500, detail="TIKTOK_APP_CLIENT_KEY not configured")
+
+    _base = (settings.PUBLIC_API_URL or settings.URI_GATEWAY_BASE_API_URL).rstrip("/")
+    redirect_uri = f"{_base}/social-media/connect/tiktok-direct/callback"
+
+    params = {
+        "client_key": client_key,
+        "redirect_uri": redirect_uri,
+        "scope": "user.info.basic,video.publish",
+        "response_type": "code",
+        "state": source or "settings",
+    }
+    auth_url = "https://www.tiktok.com/v2/auth/authorize/?" + urllib.parse.urlencode(params)
+    return RedirectResponse(auth_url)
+
+
+@router.get("/connect/tiktok-direct/callback")
+async def tiktok_direct_callback(
+    code: Optional[str] = Query(None),
+    state: Optional[str] = Query(None),
+    error: Optional[str] = Query(None),
+    error_description: Optional[str] = Query(None),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """TikTok OAuth callback for direct connection. Exchanges the auth code
+    for access/refresh tokens, fetches the account's display name/avatar,
+    stores a pending connection, and redirects back to the workspace."""
+    import urllib.parse
+    from datetime import timezone, timedelta
+    from app.agents.social_media_manager.services.tiktok_direct_service import (
+        exchange_code_for_tokens,
+        fetch_user_info,
+    )
+
+    web_app_url = settings.WEB_APP_URL.strip("'\"")
+    base_redirect = f"{web_app_url}/workspace?tab=connections"
+
+    if error:
+        msg = urllib.parse.quote(error_description or error)
+        return RedirectResponse(f"{base_redirect}&connected=false&error={msg}")
+
+    if not code:
+        return RedirectResponse(f"{base_redirect}&connected=false&error=missing_code")
+
+    _base = (settings.PUBLIC_API_URL or settings.URI_GATEWAY_BASE_API_URL).rstrip("/")
+    redirect_uri = f"{_base}/social-media/connect/tiktok-direct/callback"
+
+    try:
+        tokens = await exchange_code_for_tokens(code, redirect_uri)
+        access_token = tokens["access_token"]
+        open_id = tokens.get("open_id", "")
+
+        user_info = await fetch_user_info(access_token)
+        display_name = user_info.get("display_name", "")
+        avatar_url = user_info.get("avatar_url", "")
+
+        now = datetime.now(timezone.utc)
+        expires_at = now + timedelta(seconds=int(tokens.get("expires_in", 86400)))
+        conn_doc = {
+            "id": f"tt_{open_id}",
+            "user_id": None,               # set by finalize
+            "platform": "tiktok",
+            "connected_via": "tiktok_direct_oauth",
+            "open_id": open_id,
+            "access_token": access_token,
+            "refresh_token": tokens.get("refresh_token", ""),
+            "token_expires_at": expires_at.isoformat(),
+            "account_name": display_name,
+            "profile_picture_url": avatar_url,
+            "connection_status": "pending_user_match",
+            "connected_at": now.isoformat(),
+            "updated_at": now.isoformat(),
+        }
+        await db["social_connections"].update_one(
+            {"id": f"tt_{open_id}"},
+            {"$set": conn_doc},
+            upsert=True,
+        )
+        print(f"[TikTokDirectOAuth] ✅ Stored account '{display_name}' (open_id={open_id}) pending user match")
+
+        params_out = (
+            f"connected=tiktok_direct"
+            f"&tt_open_id={urllib.parse.quote(open_id)}"
+            f"&account_name={urllib.parse.quote(display_name)}"
+        )
+        return RedirectResponse(f"{base_redirect}&{params_out}")
+
+    except Exception as e:
+        print(f"[TikTokDirectOAuth] ❌ Error: {e}")
+        return RedirectResponse(
+            f"{base_redirect}&connected=false&error={urllib.parse.quote(str(e))}"
+        )
+
+
+@router.post("/connect/tiktok-direct/finalize")
+async def tiktok_direct_finalize(
+    tt_open_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    ctx: dict = Depends(get_active_brand_context),
+):
+    """Called by the frontend after the TikTok direct OAuth callback to
+    associate the pending connection with the authenticated user and active
+    brand — same shape as facebook_direct_finalize above."""
+    from app.models.brand_account import BrandAccount
+    user_id = ctx["user_id"]
+    brand_id = ctx["brand_id"]
+    is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
+
+    update_fields: dict = {"user_id": user_id, "connection_status": "active", "updated_at": datetime.utcnow().isoformat()}
+    if not is_personal:
+        update_fields["brand_id"] = brand_id
+
+    result = await db["social_connections"].update_one(
+        {"id": f"tt_{tt_open_id}"},
+        {"$set": update_fields},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="TikTok connection not found — try reconnecting")
+
+    return UriResponse.get_single_data_response("tiktok_connected", {"tt_open_id": tt_open_id})
+
+
 # ── Facebook Login for Business — the "hybrid page grant" (Ibukun's engineering
 # work-split item 2.3). Same OAuth shape as facebook-direct above, but requests
 # advertising permissions and — once URI's Business Manager id is configured —
@@ -2017,6 +2153,41 @@ async def disconnect_facebook_direct(
         raise HTTPException(status_code=404, detail="Facebook connection not found")
 
     return {"status": True, "responseMessage": "Facebook page disconnected"}
+
+
+@router.delete("/connections/tiktok-direct")
+async def disconnect_tiktok_direct(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    ctx: dict = Depends(get_active_brand_context),
+):
+    """
+    Disconnect a TikTok account connected via direct OAuth for the active brand.
+    """
+    from app.models.brand_account import BrandAccount
+    user_id = ctx["user_id"]
+    brand_id = ctx["brand_id"]
+    is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
+    personal_bid = BrandAccount.personal_brand_id(user_id)
+
+    if is_personal:
+        delete_filter = {
+            "user_id": user_id,
+            "platform": "tiktok",
+            "connected_via": "tiktok_direct_oauth",
+            "$or": [
+                {"brand_id": {"$exists": False}},
+                {"brand_id": None},
+                {"brand_id": personal_bid},
+            ],
+        }
+    else:
+        delete_filter = {"brand_id": brand_id, "platform": "tiktok", "connected_via": "tiktok_direct_oauth"}
+
+    result = await db["social_connections"].delete_one(delete_filter)
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="TikTok connection not found")
+
+    return {"status": True, "responseMessage": "TikTok account disconnected"}
 
 
 # ==============================================================================
@@ -6040,7 +6211,8 @@ async def publish_video_draft(
     # facebook_reels  → look for "facebook" first; fall back to "instagram" because the
     #                   Instagram OAuth flow stores a Facebook Page access token that can
     #                   also be used to post videos to the Facebook Page.
-    # tiktok          → look for an Outstand-connected "tiktok" account (no direct API).
+    # tiktok          → prefer a direct-OAuth "tiktok" account (FILE_UPLOAD, bypasses
+    #                   Outstand); fall back to an Outstand-connected one.
     if request.platform == "instagram_reels":
         conn = await db["social_connections"].find_one(
             {"user_id": user_id, "platform": "instagram"},
@@ -6052,10 +6224,15 @@ async def publish_video_draft(
             raise HTTPException(status_code=400, detail="Instagram account missing ig_user_id. Please reconnect.")
     elif request.platform == "tiktok":
         conn = await db["social_connections"].find_one(
-            {"user_id": user_id, "platform": "tiktok", "connected_via": "outstand"},
-            {"_id": 0, "outstand_account_id": 1},
+            {"user_id": user_id, "platform": "tiktok", "connected_via": "tiktok_direct_oauth", "connection_status": "active"},
+            {"_id": 0},
         )
-        if not conn or not conn.get("outstand_account_id"):
+        if not conn:
+            conn = await db["social_connections"].find_one(
+                {"user_id": user_id, "platform": "tiktok", "connected_via": "outstand"},
+                {"_id": 0, "outstand_account_id": 1, "connected_via": 1},
+            )
+        if not conn or not (conn.get("outstand_account_id") or conn.get("connected_via") == "tiktok_direct_oauth"):
             raise HTTPException(status_code=400, detail="No connected TikTok account found. Please connect your account first.")
     else:  # facebook_reels
         conn = await db["social_connections"].find_one(

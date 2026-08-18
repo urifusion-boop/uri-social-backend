@@ -954,13 +954,30 @@ class ApprovalWorkflowService:
                 platform = draft["platform"]
                 print(f"🚀 Immediate publish | draft_id={draft_id} platform={platform} user_id={user_id}")
 
-                connections_cursor = db["social_connections"].find({
-                    "user_id": user_id,
-                    "platform": platform,
-                    "connection_status": "active",
-                }).sort("created_at", -1).limit(1)
-                connection = await connections_cursor.to_list(length=1)
-                connection = connection[0] if connection else None
+                connection = None
+                # TikTok: prefer a direct-OAuth connection (FILE_UPLOAD, bypasses
+                # Outstand) over the generic lookup below — that query doesn't
+                # filter by connected_via, so it would otherwise pick whichever
+                # connection happens to be most recently created rather than
+                # reliably preferring direct.
+                if platform == "tiktok":
+                    connection = await db["social_connections"].find_one({
+                        "user_id": user_id,
+                        "platform": "tiktok",
+                        "connected_via": "tiktok_direct_oauth",
+                        "connection_status": "active",
+                    })
+                    if connection:
+                        print(f"🔗 Preferring direct TikTok connection open_id={connection.get('open_id')}")
+
+                if not connection:
+                    connections_cursor = db["social_connections"].find({
+                        "user_id": user_id,
+                        "platform": platform,
+                        "connection_status": "active",
+                    }).sort("created_at", -1).limit(1)
+                    connection = await connections_cursor.to_list(length=1)
+                    connection = connection[0] if connection else None
 
                 # Fall back to Outstand live lookup if local mirror is empty.
                 # Skip Instagram — it always uses direct Graph API, never Outstand.
@@ -1501,6 +1518,27 @@ class ApprovalWorkflowService:
                 else:
                     print(f"⚠️ FB — no Outstand Facebook account found anywhere, falling back to direct FB API")
                     # fall through to legacy Facebook block below
+
+        # ── TikTok direct (FILE_UPLOAD, bypasses Outstand) ───────────────────────
+        if platform == "tiktok" and connection.get("connected_via") == "tiktok_direct_oauth":
+            from app.agents.social_media_manager.services.tiktok_direct_service import (
+                get_valid_tiktok_access_token,
+                publish_tiktok_direct,
+                TikTokDirectAPIError,
+            )
+            video_url = draft.get("video_url") or ""
+            if not video_url:
+                return {"success": False, "error": "TikTok post has no video_url. Re-generate the video before publishing."}
+            if db is None:
+                return {"success": False, "error": "TikTok direct publish requires a database handle."}
+            try:
+                access_token = await get_valid_tiktok_access_token(db, connection)
+                publish_id, status = await publish_tiktok_direct(access_token, video_url, content)
+                print(f"✅ TikTok direct publish: publish_id={publish_id} status={status}")
+                return {"success": True, "post_id": publish_id, "raw_response": {"publish_id": publish_id, "status": status}}
+            except TikTokDirectAPIError as e:
+                print(f"❌ TikTok direct publish failed: {e}")
+                return {"success": False, "error": f"TikTok direct publish failed: {str(e)}"}
 
         # ── Outstand-connected accounts ───────────────────────────────────────
         if connection.get("connected_via") == "outstand":
