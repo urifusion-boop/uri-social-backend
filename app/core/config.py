@@ -129,6 +129,15 @@ class Settings(BaseSettings):
     TIKTOK_ADS_ACCESS_TOKEN: str = ""
     TIKTOK_ADS_API_VERSION: str = "v1.3"
 
+    # TikTok Login Kit + Content Posting API — the "urisocial" app's own
+    # credentials, distinct from TIKTOK_ADS_* above (a separate TikTok product/
+    # app entirely). Powers direct organic posting (FILE_UPLOAD mode — no
+    # domain verification needed, unlike PULL_FROM_URL) as an alternative to
+    # the existing Outstand-mediated TikTok connection. See
+    # app/agents/social_media_manager/services/tiktok_direct_service.py.
+    TIKTOK_APP_CLIENT_KEY: str = ""
+    TIKTOK_APP_CLIENT_SECRET: str = ""
+
     # SQUAD Payment Gateway (PRD Section 6.2: Payment Integration)
     # Production: Always use live mode for real payments
     SQUAD_MODE: str = "live"  # Options: "sandbox" or "live"
