@@ -1654,9 +1654,11 @@ class ApprovalWorkflowService:
                 platform_config = None
                 if platform == "tiktok" and media_urls:
                     media_urls = [await outstand.upload_media_from_url(u) for u in media_urls]
-                    # Default to DIRECT_POST so it goes live instead of sitting as an inbox
-                    # draft; unaudited TikTok apps can only Direct Post as SELF_ONLY.
-                    platform_config = {"tiktok": {"postMode": "DIRECT_POST", "privacyLevel": "SELF_ONLY"}}
+                    # DIRECT_POST so it goes live instead of sitting as an inbox draft.
+                    # PUBLIC_TO_EVERYONE — the app's Content Posting API audit passed
+                    # 2026-08-17; before that, TikTok's API only accepted SELF_ONLY for
+                    # an unaudited app (see the identical fix in video_publish_service.py).
+                    platform_config = {"tiktok": {"postMode": "DIRECT_POST", "privacyLevel": "PUBLIC_TO_EVERYONE"}}
 
                 print(f"📤 Publishing via Outstand | account_id={connection.get('outstand_account_id')} platform={platform} has_image={bool(media_urls)} thread={bool(tweets and len(tweets) > 1)}")
                 result = await outstand.publish_post(
