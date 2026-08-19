@@ -31,6 +31,7 @@ from app.routers.agency_router import router as agency_router
 from app.agents.social_media_manager.routers.sdk_router import router as sdk_router
 from app.agents.social_media_manager.routers.jane_router import router as jane_router
 from app.routers.admin_router import router as admin_router
+from app.routers.jane_escalations_router import router as jane_escalations_router
 
 # Initialize Sentry
 initialize_sentry()
@@ -271,6 +272,7 @@ app.include_router(workspace_member_router)
 
 # Include admin router (admin-only user management)
 app.include_router(admin_router, tags=["Admin"])
+app.include_router(jane_escalations_router)
 
 # Serve generated images directly from backend (avoids third-party CDN like imgBB)
 _BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
