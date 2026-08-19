@@ -142,6 +142,15 @@ class Settings(BaseSettings):
     # Set to 'reap' | 'opusclip' | 'vizard' after Phase 0 Pidgin test picks a winner
     CLIPPING_API_PROVIDER: str = "reap"
 
+    # jane-whatsapp-reply — shared secret this backend presents (as
+    # X-Internal-Service) when proxying support-team requests to jane's own
+    # /internal/* endpoints (see app/services/JaneEscalationClient.py). Must match
+    # jane-whatsapp-reply's own JANE_WA_INTERNAL_SECRET exactly. Empty by default
+    # so an unconfigured deployment fails closed on jane's side, same reasoning as
+    # SDK_GATEWAY_INTERNAL_SECRET above.
+    JANE_WA_INTERNAL_SECRET: str = ""
+    JANE_WA_BASE_URL: str = "https://jane-whatsapp.urisocial.com"
+
     # Bypass flags for local development
     BYPASS_SUBSCRIPTION_CHECK: bool = False
     BYPASS_FEATURE_LIMIT_CHECK: bool = False
