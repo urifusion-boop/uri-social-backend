@@ -72,6 +72,40 @@ async def _is_admin_email(email: str, db: AsyncIOMotorDatabase) -> bool:
     return bool(user and user.get("is_admin"))
 
 
+async def _is_support_email(email: str, db: AsyncIOMotorDatabase) -> bool:
+    """
+    Support access (jane-whatsapp-reply escalation replies) — same DB-driven
+    boolean-flag pattern as _is_admin_email, not a generalized roles list (only
+    two roles exist so far, doesn't justify the extra pattern). Admins always
+    have support access implicitly — no separate grant needed for the bootstrap
+    admin, and any admin can already do everything a support agent can.
+    """
+    if await _is_admin_email(email, db):
+        return True
+    user = await db["users"].find_one({"email": email}, {"is_support": 1})
+    return bool(user and user.get("is_support"))
+
+
+async def verify_support(
+    jwt_payload: dict = Depends(JWTBearer()),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+) -> dict:
+    """Verify the user has support access (admin or is_support) — used by
+    jane_escalations_router.py."""
+    if not jwt_payload:
+        raise HTTPException(status_code=401, detail="Invalid authentication token")
+
+    claims = jwt_payload.get("claims", {})
+    user_email = claims.get("email")
+    if not user_email:
+        raise HTTPException(status_code=401, detail="Invalid token: email not found")
+
+    if not await _is_support_email(user_email, db):
+        raise HTTPException(status_code=403, detail="Access denied. Support access required.")
+
+    return jwt_payload
+
+
 async def verify_admin(
     jwt_payload: dict = Depends(JWTBearer()),
     db: AsyncIOMotorDatabase = Depends(get_db),
@@ -108,7 +142,11 @@ async def get_my_admin_status(
     user_email = claims.get("email")
     if not user_email:
         raise HTTPException(status_code=401, detail="Invalid token: email not found")
-    return {"is_admin": await _is_admin_email(user_email, db)}
+    is_admin = await _is_admin_email(user_email, db)
+    # Admins always have support access implicitly — avoid a second DB read when
+    # we already know the answer.
+    is_support = is_admin or await _is_support_email(user_email, db)
+    return {"is_admin": is_admin, "is_support": is_support}
 
 
 @router.get("/users")
@@ -359,6 +397,39 @@ async def revoke_admin(
 
     await db["users"].update_one({"_id": ObjectId(user_id)}, {"$set": {"is_admin": False}})
     return {"user_id": user_id, "is_admin": False}
+
+
+@router.post("/users/{user_id}/support/grant")
+async def grant_support(
+    user_id: str,
+    admin_user: dict = Depends(verify_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Grant support access (jane-whatsapp-reply escalation replies) to a user.
+    Admin-only — mirrors grant_admin exactly."""
+    from bson import ObjectId
+
+    result = await db["users"].update_one({"_id": ObjectId(user_id)}, {"$set": {"is_support": True}})
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"user_id": user_id, "is_support": True}
+
+
+@router.post("/users/{user_id}/support/revoke")
+async def revoke_support(
+    user_id: str,
+    admin_user: dict = Depends(verify_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Revoke support access. No self-revoke guard here unlike revoke_admin —
+    losing support access isn't a lockout risk, any admin (who always has
+    implicit support access) can re-grant it."""
+    from bson import ObjectId
+
+    result = await db["users"].update_one({"_id": ObjectId(user_id)}, {"$set": {"is_support": False}})
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"user_id": user_id, "is_support": False}
 
 
 class CreditAdjustRequest(BaseModel):
