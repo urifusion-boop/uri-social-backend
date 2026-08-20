@@ -11,11 +11,15 @@ all. This module is additive — the existing Outstand path (video_publish_servi
 / approval_workflow_service.py) stays as the fallback for brands who haven't
 reconnected via the new /connect/tiktok-direct/* flow.
 
-Hand-built against TikTok's public Content Posting API / Login Kit v2 docs — not
-yet verified against a live account (no real connection has been made through this
-flow yet). Same honesty as this session's other new third-party integrations
-(the Google Ads and TikTok Ads adapters): should get a "verified end-to-end"
-header update once real credentials/a real connection exist.
+Hand-built against TikTok's public Content Posting API / Login Kit v2 docs.
+Partially verified against a live account: OAuth connect/token exchange,
+creator_info query, and video/init all confirmed working against real TikTok
+responses. The chunked upload PUT and status-poll loop remain unverified —
+every live test so far has been correctly rejected by TikTok before reaching
+them, either for a Sandbox app posting to a public account
+(unaudited_client_can_only_post_to_private_accounts) or a Production app
+whose redirect_uri hadn't cleared TikTok's review yet. Should get a fully
+"verified end-to-end" note once a publish actually reaches PUBLISH_COMPLETE.
 """
 from __future__ import annotations
 
@@ -153,11 +157,41 @@ def _headers(access_token: str) -> dict:
     return {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json; charset=UTF-8"}
 
 
+async def _fetch_creator_info(access_token: str) -> dict:
+    """TikTok requires this be queried immediately before every publish
+    attempt — the app must never hardcode privacy_level, it must pick one of
+    the values this endpoint returns for the specific creator (accounts
+    belonging to an unaudited/Sandbox app only ever get SELF_ONLY back here;
+    a fully audited Production app gets the full set including
+    PUBLIC_TO_EVERYONE). Skipping this and guessing a value is exactly what
+    trips TikTok's "please review our integration guidelines" catch-all
+    rejection on video/init."""
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.post(
+            f"{_API_BASE}/post/publish/creator_info/query/",
+            headers=_headers(access_token),
+        )
+    data = resp.json()
+    _raise_for_error(data, "creator info query")
+    return data.get("data") or {}
+
+
 async def publish_tiktok_direct(access_token: str, video_url: str, caption: str) -> tuple[str, str]:
     """Downloads the video, uploads it to TikTok via FILE_UPLOAD, and polls
     until the post finishes. Returns (publish_id, status). Raises
     TikTokDirectAPIError on any failure — a publish either succeeds or the
     caller finds out why, never a silent no-op."""
+    creator_info = await _fetch_creator_info(access_token)
+    privacy_options = creator_info.get("privacy_level_options") or []
+    if not privacy_options:
+        raise TikTokDirectAPIError(f"creator_info returned no privacy_level_options: {creator_info}")
+    # Prefer public — this is an organic post, not a private test upload —
+    # but fall back to whatever the account/app combo actually allows
+    # (e.g. Sandbox and not-yet-audited Production apps only get SELF_ONLY,
+    # and unaudited clients of any kind are further restricted to posting
+    # only to accounts whose TikTok profile is itself set to Private).
+    privacy_level = "PUBLIC_TO_EVERYONE" if "PUBLIC_TO_EVERYONE" in privacy_options else privacy_options[0]
+
     async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
         video_resp = await client.get(video_url)
     if video_resp.status_code != 200:
@@ -181,10 +215,10 @@ async def publish_tiktok_direct(access_token: str, video_url: str, caption: str)
             json={
                 "post_info": {
                     "title": caption or "",
-                    "privacy_level": "PUBLIC_TO_EVERYONE",
-                    "disable_duet": False,
-                    "disable_comment": False,
-                    "disable_stitch": False,
+                    "privacy_level": privacy_level,
+                    "disable_duet": bool(creator_info.get("duet_disabled")),
+                    "disable_comment": bool(creator_info.get("comment_disabled")),
+                    "disable_stitch": bool(creator_info.get("stitch_disabled")),
                 },
                 "source_info": {
                     "source": "FILE_UPLOAD",
