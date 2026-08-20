@@ -9545,6 +9545,17 @@ async def video_voiceover_produce(
         custom_broll_clips=[],
         custom_broll_placements=None,
         custom_broll_estimated_duration=60.0,
+        # zapcap_produce's Form(...) defaults only resolve when FastAPI itself
+        # handles the HTTP request — called directly like this, any omitted
+        # param stays the raw Form sentinel object (not a string), so every
+        # param it touches with e.g. .lower() must be passed explicitly.
+        enable_brand_overlay="false",
+        logo_position="bottom_right",
+        logo_timing="whole",
+        contact_source="none",
+        custom_contact_text="",
+        contact_position="bottom_center",
+        contact_timing="end",
         db=db,
         token=token,
         ctx=ctx,
