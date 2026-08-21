@@ -1195,7 +1195,6 @@ async def facebook_direct_initiate(source: Optional[str] = Query("settings")):
         "pages_read_engagement",
         "read_insights",
         "pages_manage_posts",
-        "pages_manage_metadata",
     ]
     params = {
         "client_id": app_id,
@@ -1513,7 +1512,6 @@ async def facebook_ads_initiate(source: Optional[str] = Query("settings")):
     scopes = [
         "pages_show_list",
         "pages_read_engagement",
-        "pages_manage_metadata",
         "business_management",
         "ads_management",
         "pages_manage_ads",
