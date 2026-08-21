@@ -50,6 +50,11 @@ class SocialAccountService:
                     network=network,
                     tenant_id=tenant_id,
                     redirect_uri=callback_url,
+                    # Always force the account picker/consent screen — a browser
+                    # already logged into the network otherwise silently reuses
+                    # that session, which can attach the wrong account with no
+                    # visible warning (surfaced by a real TikTok connect attempt).
+                    force_account_selection=True,
                 )
                 auth_urls[platform.lower()] = url
             except Exception as e:
