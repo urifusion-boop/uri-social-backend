@@ -54,12 +54,21 @@ class OutstandService:
         network: str,
         tenant_id: str,
         redirect_uri: str,
+        force_account_selection: bool = False,
     ) -> str:
+        # force_account_selection maps to each network's own re-auth override
+        # (disable_auto_auth for TikTok, auth_type=reauthenticate for Facebook,
+        # force_reauth for Instagram) — without it, a browser with an existing
+        # session on the network silently reuses whatever account is already
+        # logged in instead of showing the picker/consent screen at all.
+        body: Dict[str, Any] = {"tenant_id": tenant_id, "redirect_uri": redirect_uri}
+        if force_account_selection:
+            body["force_account_selection"] = True
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             resp = await client.post(
                 f"{self.base_url}/v1/social-networks/{network}/auth-url",
                 headers=self.headers,
-                json={"tenant_id": tenant_id, "redirect_uri": redirect_uri},
+                json=body,
             )
             resp.raise_for_status()
             data = resp.json()
