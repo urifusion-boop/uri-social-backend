@@ -813,6 +813,11 @@ class ApprovalWorkflowService:
                                     "connection_status": "active",
                                 }
                                 doc = {
+                                    # Explicit id (mirrors SocialAccountService.finalize_connection) —
+                                    # without it every fallback-synced doc defaults to id: null and
+                                    # the second one ever written collides with the unique index
+                                    # (the recurring "dup key: { id: null }" errors in the logs).
+                                    "id": acc.get("id"),
                                     "user_id": draft_user_id,
                                     "platform": network,
                                     "outstand_account_id": acc.get("id"),
@@ -1002,6 +1007,11 @@ class ApprovalWorkflowService:
                             # Sync to local DB so future lookups work
                             from datetime import datetime as _dt
                             doc = {
+                                # Explicit id (mirrors SocialAccountService.finalize_connection) —
+                                # without it every fallback-synced doc defaults to id: null and
+                                # the second one ever written collides with the unique index
+                                # (the recurring "dup key: { id: null }" errors in the logs).
+                                "id": acc.get("id"),
                                 "user_id": user_id,
                                 "platform": network,
                                 "outstand_account_id": acc.get("id"),
