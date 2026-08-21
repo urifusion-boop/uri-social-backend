@@ -143,6 +143,7 @@ _ALLOWED_ORIGINS = [
     "http://127.0.0.1:3001",
     # Staging
     "https://staging.urisocial.com",
+    "https://uri-staging.urisocial.com"
     "https://app-staging.urisocial.com",
     "https://api-staging.urisocial.com",
     # Production
