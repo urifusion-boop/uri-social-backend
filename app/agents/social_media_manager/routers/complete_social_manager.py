@@ -2053,6 +2053,65 @@ async def finalize_social_connection(
     )
 
 
+@router.post("/connect/finalize-outstand-direct")
+async def finalize_outstand_direct(
+    account_id: str,
+    network: str,
+    username: Optional[str] = None,
+    network_unique_id: Optional[str] = None,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    ctx: dict = Depends(get_active_brand_context),
+):
+    """
+    Finalizes an Outstand connection that used the "direct" callback shape —
+    Outstand returns the connected account_id immediately (TikTok, X) instead
+    of a session token requiring a separate page-selection step, so there was
+    never a finalize call to persist it. Was previously silently unhandled by
+    the frontend, so the connection only ever surfaced via a live Outstand
+    lookup at publish time — the account never showed as "Connected" and the
+    doc that fallback wrote had no `id` field, colliding with the unique
+    index the moment a second such doc landed (the `id: null` duplicate-key
+    errors seen repeatedly in logs). Mirrors finalize_connection's doc shape
+    (explicit `id: account_id`) to avoid that collision.
+    """
+    from app.models.brand_account import BrandAccount
+    user_id = ctx["user_id"]
+    brand_id = ctx["brand_id"]
+    is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
+
+    now = datetime.utcnow()
+    doc = {
+        "id": account_id,
+        "user_id": user_id,
+        "platform": network,
+        "outstand_account_id": account_id,
+        "username": username,
+        "account_name": username,
+        "network_unique_id": network_unique_id,
+        "connection_status": "active",
+        "connected_via": "outstand",
+        "connected_at": now,
+        "updated_at": now,
+    }
+    if not is_personal:
+        doc["brand_id"] = brand_id
+
+    brand_scope = {"user_id": user_id} if is_personal else {"brand_id": brand_id}
+    await db["social_connections"].delete_many({
+        "$or": [
+            {"id": account_id},
+            {**brand_scope, "platform": network},
+        ]
+    })
+    await db["social_connections"].insert_one(doc)
+
+    return UriResponse.get_single_data_response("account_connected", {
+        "outstand_account_id": account_id,
+        "platform": network,
+        "username": username,
+    })
+
+
 @router.get("/connections")
 async def get_user_connections(
     ctx: dict = Depends(get_active_brand_context),
