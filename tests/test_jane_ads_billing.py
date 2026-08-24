@@ -254,3 +254,99 @@ def test_concurrent_sweeps_charge_a_slice_only_once(monkeypatch):
     res = _run(billing.reconcile_ad_spend_charges(db))
     assert res["charged_ngn"] == 0
     assert _run(WalletService(store).get_balance("brnd_1")) == 100_000
+
+
+# ── TikTok sweep — reconcile_ad_spend_charges now sweeps both platforms ────────
+# through the shared _sweep_platform helper. The Meta-only tests above already
+# prove the sweep LOGIC is unchanged (TikTok's settings are unset there, same as
+# today's actual staging state, so its branch is a no-op) — these confirm the
+# credential gate itself and that a configured TikTok sweep charges correctly.
+
+class _FakeMultiDB:
+    """Like _FakeDB but backs BOTH platform collections, for tests exercising the
+    TikTok sweep alongside/instead of Meta's."""
+    def __init__(self, meta_rows=None, tiktok_rows=None):
+        self._meta_coll = _FakeCollection(meta_rows or [])
+        self._tiktok_coll = _FakeCollection(tiktok_rows or [])
+
+    def __getitem__(self, name):
+        if name == billing.COLLECTION:
+            return self._meta_coll
+        if name == billing.TIKTOK_COLLECTION:
+            return self._tiktok_coll
+        raise AssertionError(f"unexpected collection {name}")
+
+
+class _FakeTikTokAdapter(_FakeAdapter):
+    def __call__(self, db, advertiser_id=None, access_token=None):
+        return self
+
+
+def test_tiktok_sweep_is_a_noop_when_unconfigured(monkeypatch):
+    # No TIKTOK_ADS_ADVERTISER_ID/ACCESS_TOKEN set — today's actual staging state.
+    # Confirms the credential gate directly, not just that the Meta-only tests
+    # above happen to still pass with it unset.
+    from app.core.config import settings
+    monkeypatch.setattr(settings, "TIKTOK_ADS_ADVERTISER_ID", "", raising=False)
+    monkeypatch.setattr(settings, "TIKTOK_ADS_ACCESS_TOKEN", "", raising=False)
+    monkeypatch.setattr(settings, "META_AD_ACCOUNT_ID", "", raising=False)
+    monkeypatch.setattr(settings, "META_ADS_ACCESS_TOKEN", "", raising=False)
+    db = _FakeMultiDB(tiktok_rows=[
+        {"campaign_id": "t1", "business_id": "brnd_1", "user_id": "u1", "ad_id": "a1", "spend_billed_ngn": 0.0},
+    ])
+    res = _run(billing.reconcile_ad_spend_charges(db))
+    assert res == {"checked": 0, "charged_ngn": 0.0, "paused": 0}
+
+
+def test_tiktok_sweep_charges_when_configured(monkeypatch):
+    from app.core.config import settings
+    monkeypatch.setattr(settings, "META_AD_ACCOUNT_ID", "", raising=False)
+    monkeypatch.setattr(settings, "META_ADS_ACCESS_TOKEN", "", raising=False)
+    monkeypatch.setattr(settings, "TIKTOK_ADS_ADVERTISER_ID", "adv_test", raising=False)
+    monkeypatch.setattr(settings, "TIKTOK_ADS_ACCESS_TOKEN", "tok_test", raising=False)
+
+    store = InMemoryWalletStore()
+    _run(WalletService(store).top_up("brnd_1", 100_000, reference="seed"))
+    monkeypatch.setattr("app.agents.jane_ads.store.MongoWalletStore", lambda db: store)
+    monkeypatch.setattr("app.services.NotificationService.notification_service", _FakeNotifier())
+
+    adapter = _FakeTikTokAdapter({"t1": _summary(2_000)})
+    monkeypatch.setattr("app.agents.jane_ads.adapters.tiktok.TikTokAdsAdapter", adapter)
+
+    db = _FakeMultiDB(tiktok_rows=[
+        {"campaign_id": "t1", "business_id": "brnd_1", "user_id": "u1", "ad_id": "a1", "spend_billed_ngn": 0.0},
+    ])
+    res = _run(billing.reconcile_ad_spend_charges(db))
+
+    assert res["checked"] == 1 and res["paused"] == 0
+    assert res["charged_ngn"] == round(2_000 * MARKUP, 2)
+    assert _run(WalletService(store).get_balance("brnd_1")) == 100_000 - 2_000 * MARKUP
+    assert db._tiktok_coll.rows[0]["spend_billed_ngn"] == 2_000
+
+
+def test_meta_and_tiktok_sweeps_combine_into_one_summary(monkeypatch):
+    from app.core.config import settings
+    monkeypatch.setattr(settings, "META_AD_ACCOUNT_ID", "act_test", raising=False)
+    monkeypatch.setattr(settings, "META_ADS_ACCESS_TOKEN", "tok_test", raising=False)
+    monkeypatch.setattr(settings, "TIKTOK_ADS_ADVERTISER_ID", "adv_test", raising=False)
+    monkeypatch.setattr(settings, "TIKTOK_ADS_ACCESS_TOKEN", "tok_test", raising=False)
+
+    store = InMemoryWalletStore()
+    _run(WalletService(store).top_up("brnd_1", 100_000, reference="seed"))
+    _run(WalletService(store).top_up("brnd_2", 100_000, reference="seed"))
+    monkeypatch.setattr("app.agents.jane_ads.store.MongoWalletStore", lambda db: store)
+    monkeypatch.setattr("app.services.NotificationService.notification_service", _FakeNotifier())
+
+    meta_adapter = _FakeAdapter({"m1": _summary(2_000)})
+    monkeypatch.setattr("app.agents.jane_ads.adapters.meta.MetaAdPlatformAdapter", meta_adapter)
+    tiktok_adapter = _FakeTikTokAdapter({"t1": _summary(3_000)})
+    monkeypatch.setattr("app.agents.jane_ads.adapters.tiktok.TikTokAdsAdapter", tiktok_adapter)
+
+    db = _FakeMultiDB(
+        meta_rows=[{"campaign_id": "m1", "business_id": "brnd_1", "user_id": "u1", "ad_id": "a1", "spend_billed_ngn": 0.0}],
+        tiktok_rows=[{"campaign_id": "t1", "business_id": "brnd_2", "user_id": "u2", "ad_id": "a2", "spend_billed_ngn": 0.0}],
+    )
+    res = _run(billing.reconcile_ad_spend_charges(db))
+
+    assert res["checked"] == 2
+    assert res["charged_ngn"] == round((2_000 + 3_000) * MARKUP, 2)
