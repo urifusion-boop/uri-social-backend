@@ -11,7 +11,14 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import Optional
 
-from .entities import Strategy, StrategyCategory, Transaction, Wallet, WalletStatus
+from .entities import (
+    Strategy,
+    StrategyCategory,
+    StrategyStatus,
+    Transaction,
+    Wallet,
+    WalletStatus,
+)
 
 
 class WalletStore(ABC):
@@ -147,6 +154,13 @@ class MongoWalletStore(WalletStore):
 
 # ── Ad strategy corpus ────────────────────────────────────────────────────────
 
+# Ingestion stores every row so the Draft -> In review -> Approved workflow has
+# something to work on, but retrieval defaults to Approved only: an unreviewed
+# draft must never shape a live campaign plan. Pass `statuses=None` to search the
+# whole corpus (review tooling, dedupe checks), never for user-facing planning.
+RETRIEVABLE_STATUSES: set[StrategyStatus] = {StrategyStatus.APPROVED}
+
+
 class StrategyStore(ABC):
     """Interface the StrategyCorpusService talks to. Same split as WalletStore:
     InMemory backs unit tests, Mongo is production."""
@@ -163,6 +177,7 @@ class StrategyStore(ABC):
         *,
         category: Optional[StrategyCategory] = None,
         max_budget_floor_ngn: Optional[float] = None,
+        statuses: Optional[set[StrategyStatus]] = RETRIEVABLE_STATUSES,
         limit: int = 50,
     ) -> list[Strategy]: ...
 
@@ -185,9 +200,13 @@ class InMemoryStrategyStore(StrategyStore):
         *,
         category: Optional[StrategyCategory] = None,
         max_budget_floor_ngn: Optional[float] = None,
+        statuses: Optional[set[StrategyStatus]] = RETRIEVABLE_STATUSES,
         limit: int = 50,
     ) -> list[Strategy]:
         out = list(self._items.values())
+        if statuses is not None:
+            # A record with no status has not been through review either.
+            out = [s for s in out if s.status in statuses]
         if category is not None:
             out = [s for s in out if s.category is category]
         if max_budget_floor_ngn is not None:
@@ -219,6 +238,7 @@ class MongoStrategyStore(StrategyStore):
             [("category", 1), ("budget_floor_ngn_per_day", 1)]
         )
         await self._db.jane_ads_strategies.create_index("transfer_verdict")
+        await self._db.jane_ads_strategies.create_index("status")
 
     async def upsert_strategy(self, strategy: Strategy) -> None:
         await self._db.jane_ads_strategies.update_one(
@@ -238,9 +258,12 @@ class MongoStrategyStore(StrategyStore):
         *,
         category: Optional[StrategyCategory] = None,
         max_budget_floor_ngn: Optional[float] = None,
+        statuses: Optional[set[StrategyStatus]] = RETRIEVABLE_STATUSES,
         limit: int = 50,
     ) -> list[Strategy]:
         query: dict = {}
+        if statuses is not None:
+            query["status"] = {"$in": sorted(st.value for st in statuses)}
         if category is not None:
             query["category"] = category.value
         if max_budget_floor_ngn is not None:
