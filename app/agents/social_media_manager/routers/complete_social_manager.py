@@ -3015,11 +3015,28 @@ async def get_content_calendar(
             {"$skip": skip},
             {"$limit": limit},
             {"$addFields": {
+                # image_url is supposed to always be a string or absent, but a
+                # legacy/buggy write can leave it as some other BSON type (an
+                # object, seen live — a caller stored {"url": ..., "is_video": ...}
+                # instead of extracting the string). $substr/$strLenCP throw on
+                # anything but a string, which previously took down this endpoint's
+                # entire response for a user over ONE malformed draft among many.
+                # $cond only evaluates the branch it selects, so gating on $type
+                # here actually skips the unsafe string ops instead of merely
+                # deciding between two branches that both still run.
                 "_img_is_base64": {
-                    "$eq": [{"$substr": [{"$ifNull": ["$image_url", ""]}, 0, 5]}, "data:"]
+                    "$cond": {
+                        "if": {"$eq": [{"$type": "$image_url"}, "string"]},
+                        "then": {"$eq": [{"$substr": ["$image_url", 0, 5]}, "data:"]},
+                        "else": False,
+                    }
                 },
                 "_img_exists": {
-                    "$gt": [{"$strLenCP": {"$ifNull": ["$image_url", ""]}}, 0]
+                    "$cond": {
+                        "if": {"$eq": [{"$type": "$image_url"}, "string"]},
+                        "then": {"$gt": [{"$strLenCP": "$image_url"}, 0]},
+                        "else": False,
+                    }
                 },
                 "_draft_key": {"$ifNull": ["$id", "$draft_id"]},
             }},
