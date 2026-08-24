@@ -326,3 +326,50 @@ class MongoStrategyStore(StrategyStore):
     async def count(self, *, status: Optional[StrategyStatus] = None) -> int:
         q = {} if status is None else {"status": status.value}
         return await self._db.jane_ads_strategies.count_documents(q)
+
+
+# ── Coverage gaps (ENG §5.3) ─────────────────────────────────────────────────
+
+class CoverageGapStore(ABC):
+    """Empty retrievals are data, not errors. Which stage / tier / business-type /
+    conversion-location combinations return nothing IS the seeding roadmap — before
+    outcomes exist it is the most useful signal the system produces. Do not alert
+    on these; do not swallow them."""
+
+    @abstractmethod
+    async def log_gap(self, gap: dict) -> None: ...
+
+    @abstractmethod
+    async def list_gaps(self, limit: int = 100) -> list[dict]: ...
+
+
+class InMemoryCoverageGapStore(CoverageGapStore):
+    def __init__(self) -> None:
+        self.gaps: list[dict] = []
+
+    async def log_gap(self, gap: dict) -> None:
+        self.gaps.append(gap)
+
+    async def list_gaps(self, limit: int = 100) -> list[dict]:
+        return self.gaps[:limit]
+
+
+class MongoCoverageGapStore(CoverageGapStore):
+    """Collection: jane_ads_corpus_coverage_gaps"""
+
+    def __init__(self, db) -> None:
+        self._db = db
+
+    async def ensure_indexes(self) -> None:
+        await self._db.jane_ads_corpus_coverage_gaps.create_index(
+            [("stage", 1), ("budget_tier", 1), ("conversion_location", 1)]
+        )
+        await self._db.jane_ads_corpus_coverage_gaps.create_index("occurred_at")
+
+    async def log_gap(self, gap: dict) -> None:
+        await self._db.jane_ads_corpus_coverage_gaps.insert_one(dict(gap))
+
+    async def list_gaps(self, limit: int = 100) -> list[dict]:
+        return await self._db.jane_ads_corpus_coverage_gaps.find(
+            {}, {"_id": 0}
+        ).sort("occurred_at", -1).to_list(length=limit)
