@@ -12,6 +12,8 @@ from datetime import datetime
 from typing import Optional
 
 from .entities import (
+    ConsumedBy,
+    PooledAccountSafety,
     Strategy,
     StrategyCategory,
     StrategyStatus,
@@ -152,128 +154,175 @@ class MongoWalletStore(WalletStore):
         return [Transaction(**d) for d in docs]
 
 
-# ── Ad strategy corpus ────────────────────────────────────────────────────────
+# ── Ad strategy corpus (ASC-SPEC-01 v2 / ASC-ENG-01 v1) ──────────────────────
 
-# Ingestion stores every row so the Draft -> In review -> Approved workflow has
-# something to work on, but retrieval defaults to Approved only: an unreviewed
-# draft must never shape a live campaign plan. Pass `statuses=None` to search the
-# whole corpus (review tooling, dedupe checks), never for user-facing planning.
-RETRIEVABLE_STATUSES: set[StrategyStatus] = {StrategyStatus.APPROVED}
+class IngestionCannotApprove(Exception):
+    """Spec §1.1: only a human moves draft -> approved, no exceptions, including for
+    records that look obviously correct. ENG §8 fixture 12 requires this be refused
+    at the DATA layer, not merely in a service — so the write path itself raises."""
+
+
+class ImmutableRecordError(Exception):
+    """Spec §3.3: records are immutable once approved. An edit creates a new version;
+    overwriting in place would make an October plan unexplainable in January."""
 
 
 class StrategyStore(ABC):
-    """Interface the StrategyCorpusService talks to. Same split as WalletStore:
-    InMemory backs unit tests, Mongo is production."""
+    """Interface the corpus service talks to. Records are keyed by
+    (strategy_id, version) — never strategy_id alone."""
 
     @abstractmethod
-    async def upsert_strategy(self, strategy: Strategy) -> None: ...
+    async def ingest(self, strategy: Strategy) -> None:
+        """Write a draft/rejected record. MUST raise IngestionCannotApprove if the
+        record arrives already approved."""
 
     @abstractmethod
-    async def get_strategy(self, strategy_id: str) -> Optional[Strategy]: ...
+    async def approve(self, strategy_id: str, version: int, approved_by: str) -> Strategy: ...
 
     @abstractmethod
-    async def find_strategies(
-        self,
-        *,
-        category: Optional[StrategyCategory] = None,
-        max_budget_floor_ngn: Optional[float] = None,
-        statuses: Optional[set[StrategyStatus]] = RETRIEVABLE_STATUSES,
-        limit: int = 50,
-    ) -> list[Strategy]: ...
+    async def get(self, strategy_id: str, version: Optional[int] = None) -> Optional[Strategy]:
+        """`version=None` returns the live (approved) version, else the latest."""
 
     @abstractmethod
-    async def count(self) -> int: ...
+    async def fetch_approved(self) -> list[Strategy]:
+        """Retrieval candidate set. Exclusion and scoring happen above the store —
+        ENG §4 requires exclusion before scoring, so the store does not pre-filter
+        on preconditions."""
+
+    @abstractmethod
+    async def count(self, *, status: Optional[StrategyStatus] = None) -> int: ...
+
+
+def _guard_ingest(strategy: Strategy) -> None:
+    if strategy.status is StrategyStatus.APPROVED:
+        raise IngestionCannotApprove(
+            f"{strategy.strategy_id} arrived as 'approved'; ingestion may only write "
+            "draft/in_review/rejected (spec §1.1)"
+        )
 
 
 class InMemoryStrategyStore(StrategyStore):
     def __init__(self) -> None:
-        self._items: dict[str, Strategy] = {}
+        self._items: dict[tuple[str, int], Strategy] = {}
 
-    async def upsert_strategy(self, strategy: Strategy) -> None:
-        self._items[strategy.strategy_id] = strategy
+    async def ingest(self, strategy: Strategy) -> None:
+        _guard_ingest(strategy)
+        key = (strategy.strategy_id, strategy.version)
+        existing = self._items.get(key)
+        if existing is not None and existing.status is StrategyStatus.APPROVED:
+            raise ImmutableRecordError(
+                f"{strategy.strategy_id} v{strategy.version} is approved; "
+                "create a new version instead of overwriting"
+            )
+        self._items[key] = strategy
 
-    async def get_strategy(self, strategy_id: str) -> Optional[Strategy]:
-        return self._items.get(strategy_id)
+    async def approve(self, strategy_id: str, version: int, approved_by: str) -> Strategy:
+        rec = self._items.get((strategy_id, version))
+        if rec is None:
+            raise KeyError(f"{strategy_id} v{version} not found")
+        live = [
+            s for (sid, _v), s in self._items.items()
+            if sid == strategy_id and s.status is StrategyStatus.APPROVED
+        ]
+        for prev in live:                       # exactly one live version per record
+            prev.status = StrategyStatus.IN_REVIEW
+        rec.status = StrategyStatus.APPROVED
+        rec.ingested_by = approved_by
+        return rec
 
-    async def find_strategies(
-        self,
-        *,
-        category: Optional[StrategyCategory] = None,
-        max_budget_floor_ngn: Optional[float] = None,
-        statuses: Optional[set[StrategyStatus]] = RETRIEVABLE_STATUSES,
-        limit: int = 50,
-    ) -> list[Strategy]:
-        out = list(self._items.values())
-        if statuses is not None:
-            # A record with no status has not been through review either.
-            out = [s for s in out if s.status in statuses]
-        if category is not None:
-            out = [s for s in out if s.category is category]
-        if max_budget_floor_ngn is not None:
-            # A record with no floor is a "does not transfer" rejection — it carries no
-            # budget precondition, so an affordability filter must not surface it.
-            out = [
-                s for s in out
-                if s.budget_floor_ngn_per_day is not None
-                and s.budget_floor_ngn_per_day <= max_budget_floor_ngn
-            ]
-        out.sort(key=lambda s: (-s.evidence_grade.rank, s.strategy_id))
-        return out[:limit]
+    async def get(self, strategy_id: str, version: Optional[int] = None) -> Optional[Strategy]:
+        if version is not None:
+            return self._items.get((strategy_id, version))
+        versions = [s for (sid, _v), s in self._items.items() if sid == strategy_id]
+        if not versions:
+            return None
+        approved = [s for s in versions if s.status is StrategyStatus.APPROVED]
+        return approved[0] if approved else max(versions, key=lambda s: s.version)
 
-    async def count(self) -> int:
-        return len(self._items)
+    async def fetch_approved(self) -> list[Strategy]:
+        return [s for s in self._items.values() if s.status is StrategyStatus.APPROVED]
+
+    async def count(self, *, status: Optional[StrategyStatus] = None) -> int:
+        if status is None:
+            return len(self._items)
+        return sum(1 for s in self._items.values() if s.status is status)
 
 
 class MongoStrategyStore(StrategyStore):
     """Production store. Collection:
-      jane_ads_strategies — one doc per tactic (keyed by strategy_id)
+      jane_ads_strategies — one doc per (strategy_id, version)
     """
 
     def __init__(self, db) -> None:
         self._db = db
 
     async def ensure_indexes(self) -> None:
-        await self._db.jane_ads_strategies.create_index("strategy_id", unique=True)
         await self._db.jane_ads_strategies.create_index(
-            [("category", 1), ("budget_floor_ngn_per_day", 1)]
+            [("strategy_id", 1), ("version", 1)], unique=True
         )
-        await self._db.jane_ads_strategies.create_index("transfer_verdict")
-        await self._db.jane_ads_strategies.create_index("status")
+        # Exactly one live version per record (ENG §3 one_live_version).
+        await self._db.jane_ads_strategies.create_index(
+            "strategy_id", unique=True,
+            partialFilterExpression={"status": StrategyStatus.APPROVED.value},
+            name="one_live_version",
+        )
+        await self._db.jane_ads_strategies.create_index(
+            [("status", 1), ("pooled_account_safe", 1), ("executable_via", 1)]
+        )
+        await self._db.jane_ads_strategies.create_index("consumed_by")
+        await self._db.jane_ads_strategies.create_index("platforms")
+        await self._db.jane_ads_strategies.create_index("conversion_location")
 
-    async def upsert_strategy(self, strategy: Strategy) -> None:
+    async def ingest(self, strategy: Strategy) -> None:
+        _guard_ingest(strategy)
+        existing = await self._db.jane_ads_strategies.find_one(
+            {"strategy_id": strategy.strategy_id, "version": strategy.version},
+            {"_id": 0, "status": 1},
+        )
+        if existing and existing.get("status") == StrategyStatus.APPROVED.value:
+            raise ImmutableRecordError(
+                f"{strategy.strategy_id} v{strategy.version} is approved; "
+                "create a new version instead of overwriting"
+            )
         await self._db.jane_ads_strategies.update_one(
-            {"strategy_id": strategy.strategy_id},
-            {"$set": strategy.model_dump()},
+            {"strategy_id": strategy.strategy_id, "version": strategy.version},
+            {"$set": strategy.model_dump(mode="json")},
             upsert=True,
         )
 
-    async def get_strategy(self, strategy_id: str) -> Optional[Strategy]:
-        doc = await self._db.jane_ads_strategies.find_one(
-            {"strategy_id": strategy_id}, {"_id": 0}
+    async def approve(self, strategy_id: str, version: int, approved_by: str) -> Strategy:
+        await self._db.jane_ads_strategies.update_many(
+            {"strategy_id": strategy_id, "status": StrategyStatus.APPROVED.value},
+            {"$set": {"status": StrategyStatus.IN_REVIEW.value}},
         )
-        return Strategy(**doc) if doc else None
+        await self._db.jane_ads_strategies.update_one(
+            {"strategy_id": strategy_id, "version": version},
+            {"$set": {"status": StrategyStatus.APPROVED.value, "ingested_by": approved_by}},
+        )
+        return await self.get(strategy_id, version)
 
-    async def find_strategies(
-        self,
-        *,
-        category: Optional[StrategyCategory] = None,
-        max_budget_floor_ngn: Optional[float] = None,
-        statuses: Optional[set[StrategyStatus]] = RETRIEVABLE_STATUSES,
-        limit: int = 50,
-    ) -> list[Strategy]:
-        query: dict = {}
-        if statuses is not None:
-            query["status"] = {"$in": sorted(st.value for st in statuses)}
-        if category is not None:
-            query["category"] = category.value
-        if max_budget_floor_ngn is not None:
-            query["budget_floor_ngn_per_day"] = {
-                "$ne": None, "$lte": max_budget_floor_ngn,
-            }
-        docs = await self._db.jane_ads_strategies.find(query, {"_id": 0}).to_list(length=limit)
-        out = [Strategy(**d) for d in docs]
-        out.sort(key=lambda s: (-s.evidence_grade.rank, s.strategy_id))
-        return out
+    async def get(self, strategy_id: str, version: Optional[int] = None) -> Optional[Strategy]:
+        if version is not None:
+            doc = await self._db.jane_ads_strategies.find_one(
+                {"strategy_id": strategy_id, "version": version}, {"_id": 0}
+            )
+            return Strategy(**doc) if doc else None
+        doc = await self._db.jane_ads_strategies.find_one(
+            {"strategy_id": strategy_id, "status": StrategyStatus.APPROVED.value}, {"_id": 0}
+        )
+        if doc:
+            return Strategy(**doc)
+        docs = await self._db.jane_ads_strategies.find(
+            {"strategy_id": strategy_id}, {"_id": 0}
+        ).sort("version", -1).to_list(length=1)
+        return Strategy(**docs[0]) if docs else None
 
-    async def count(self) -> int:
-        return await self._db.jane_ads_strategies.count_documents({})
+    async def fetch_approved(self) -> list[Strategy]:
+        docs = await self._db.jane_ads_strategies.find(
+            {"status": StrategyStatus.APPROVED.value}, {"_id": 0}
+        ).to_list(length=5000)
+        return [Strategy(**d) for d in docs]
+
+    async def count(self, *, status: Optional[StrategyStatus] = None) -> int:
+        q = {} if status is None else {"status": status.value}
+        return await self._db.jane_ads_strategies.count_documents(q)

@@ -146,189 +146,266 @@ class AuthorizationRecord(BaseModel):
     at: datetime = Field(default_factory=_now)
 
 
-# ── Ad strategy corpus (Jane Ads Playbook v1) ────────────────────────────────
-# The cold-start library Jane retrieves from when building a campaign plan. Seeded
-# by hand (URI_Ad_Strategy_Corpus_Seed_v1.xlsx) to set the schema and quality bar
-# that later automated ingestion is measured against.
+# ── Ad strategy corpus (ASC-SPEC-01 v2 / ASC-ENG-01 v1) ──────────────────────
+# The curated corpus Jane retrieves from instead of planning on model priors.
 #
-# Enum values are the literal strings from the workbook's Lists tab — the sheet is
-# the source of truth and exports straight in, so these must match character for
-# character or ingestion silently drops rows.
+# Enum VALUES are the spec's canonical snake_case, not the workbook's display
+# strings. The sheet is a human surface; storage is the contract. `corpus.py`
+# maps one to the other on import, so a label change in the workbook never
+# silently rewrites stored data.
 
 class StrategyCategory(str, Enum):
-    OFFER_POSITIONING = "Offer & Positioning"
-    AUDIENCE_CONSTRUCTION = "Audience Construction"
-    CREATIVE_FORMATS = "Creative Formats & Hooks"
-    COPY_ANGLES = "Copy Angles"
-    BUDGET_PACING = "Budget, Pacing & Timing"
-    MICRO_BUDGET_TESTING = "Micro-Budget Testing"
-    CONVERSION_MECHANICS = "Conversion Mechanics"
-    RETARGETING = "Retargeting & Sequencing"
-    PLATFORM_MECHANICS = "Platform Mechanics"
-    DIAGNOSTICS = "Diagnostics & Troubleshooting"
-
-
-class StrategyPlatform(str, Enum):
-    META = "Meta (FB/IG)"
-    TIKTOK = "TikTok"
-    GOOGLE = "Google"
-    LINKEDIN = "LinkedIn"
-    SNAPCHAT = "Snapchat"
-    WHATSAPP = "WhatsApp"
-    CROSS_PLATFORM = "Cross-platform"
-
-
-class FunnelStage(str, Enum):
-    AWARENESS = "Awareness"
-    CONSIDERATION = "Consideration"
-    CONVERSION = "Conversion"
-    RETENTION = "Retention"
-    FULL_FUNNEL = "Full funnel"
-
-
-class SalesCycle(str, Enum):
-    SAME_DAY = "Same day"
-    ONE_TO_SEVEN_DAYS = "1-7 days"
-    ONE_TO_FOUR_WEEKS = "1-4 weeks"
-    OVER_A_MONTH = "Over a month"
-    NOT_APPLICABLE = "Not applicable"
-
-
-class EvidenceGrade(str, Enum):
-    """Ordered worst-to-best by `rank` below — retrieval prefers A over C when both fit."""
-    A_VERIFIED = "A - Verified case study with numbers"
-    B_PRACTITIONER = "B - Practitioner anecdote"
-    C_GURU = "C - Guru assertion"
-    D_UNSUPPORTED = "D - Unsupported"
-
-    @property
-    def rank(self) -> int:
-        return {"A": 4, "B": 3, "C": 2, "D": 1}[self.value[0]]
-
-
-class MarketOrigin(str, Enum):
-    NIGERIA = "Nigeria"
-    AFRICA_OTHER = "Africa (other)"
-    US = "US"
-    UK_EU = "UK/EU"
-    ASIA = "Asia"
-    GLOBAL_UNSPECIFIED = "Global/Unspecified"
-    LATIN_AMERICA = "Latin America"
-    NIGERIA_DESK_RESEARCH = "Nigeria (desk research)"
-
-
-class TransferVerdict(str, Enum):
-    """Whether a tactic sourced elsewhere survives contact with our market.
-    DOES_NOT_TRANSFER records are kept deliberately — they stop Jane rediscovering
-    a dead tactic later, so they are retrievable, never filtered out at ingestion."""
-    AS_IS = "Applies as-is"
-    WITH_MODIFICATION = "Applies with modification"
-    DOES_NOT_TRANSFER = "Does not transfer"
-
-
-class SourceType(str, Enum):
-    OWN_ACCOUNT_DATA = "Own account data"
-    INTERNAL_TEAM = "Internal team knowledge"
-    REDDIT = "Reddit thread"
-    YOUTUBE = "YouTube video"
-    INSTAGRAM = "Instagram video"
-    BLOG_ARTICLE = "Blog/article"
-    PLATFORM_DOCS = "Platform documentation"
-    CASE_STUDY = "Case study"
-    BOOK_COURSE = "Book/course"
+    OFFER_POSITIONING = "offer_positioning"
+    AUDIENCE_CONSTRUCTION = "audience_construction"
+    CREATIVE_FORMATS = "creative_formats"
+    COPY_ANGLES = "copy_angles"
+    BUDGET_PACING = "budget_pacing"
+    MICRO_BUDGET_TESTING = "micro_budget_testing"
+    CONVERSION_MECHANICS = "conversion_mechanics"
+    RETARGETING = "retargeting_sequencing"
+    PLATFORM_MECHANICS = "platform_mechanics"
+    DIAGNOSTICS = "diagnostics"
 
 
 class StrategyStatus(str, Enum):
-    DRAFT = "Draft"
-    IN_REVIEW = "In review"
-    APPROVED = "Approved"
-    REJECTED = "Rejected"
-    EXAMPLE = "EXAMPLE"           # the four pre-filled EX-* rows; never ingested
+    DRAFT = "draft"
+    IN_REVIEW = "in_review"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+
+
+class EvidenceGrade(str, Enum):
+    A = "A"
+    B = "B"
+    C = "C"
+    D = "D"
+
+    @property
+    def weight(self) -> float:
+        """Spec §8.1. D is excluded upstream and must never be scored."""
+        return {"A": 1.0, "B": 0.8, "C": 0.5, "D": 0.0}[self.value]
+
+
+class MarketOrigin(str, Enum):
+    """`nigeria` means evidence observed in a Nigerian account. `nigeria_desk_research`
+    means reasoning about Nigeria from published sources. Spec §3.3 forbids collapsing
+    them — the distinction is the only honest measure of local knowledge held, and only
+    `nigeria` earns the origin bonus."""
+    NIGERIA = "nigeria"
+    NIGERIA_DESK_RESEARCH = "nigeria_desk_research"
+    AFRICA_OTHER = "africa_other"
+    US = "us"
+    UK_EU = "uk_eu"
+    ASIA = "asia"
+    LATIN_AMERICA = "latin_america"
+    GLOBAL_UNSPECIFIED = "global_unspecified"
+
+
+class TransferVerdict(str, Enum):
+    APPLIES_AS_IS = "applies_as_is"
+    APPLIES_WITH_MODIFICATION = "applies_with_modification"
+    DOES_NOT_TRANSFER = "does_not_transfer"
 
 
 class LocalTestStatus(str, Enum):
-    NOT_YET_TESTED = "Not yet tested"
-    TESTING = "Testing"
-    CONFIRMED_LOCALLY = "Confirmed locally"
-    UNDERPERFORMED_LOCALLY = "Underperformed locally"
-    RETIRED = "Retired"
+    NOT_YET_TESTED = "not_yet_tested"
+    TESTING = "testing"
+    CONFIRMED_LOCALLY = "confirmed_locally"
+    UNDERPERFORMED_LOCALLY = "underperformed_locally"
+    RETIRED = "retired"
+
+
+class ConversionLocation(str, Enum):
+    WEBSITE = "website"
+    APP = "app"
+    MESSAGING = "messaging"
+    LEAD_FORM = "lead_form"
+    CALLS = "calls"
+    ANY = "any"
+
+
+class PooledAccountSafety(str, Enum):
+    """Defaults to UNKNOWN, which blocks retrieval — fail closed (spec §3.2).
+    At cold start most records carry it and nothing retrieves. That is correct
+    behaviour, not a broken system (ENG §10)."""
+    YES = "yes"
+    NO = "no"
+    REQUIRES_ISOLATION = "requires_isolation"
+    UNKNOWN = "unknown"
+
+
+class ConsumedBy(str, Enum):
+    """Flow stage, not topic. `category` is a topical taxonomy; retrieval scopes by stage."""
+    PLAN_GENERATION = "plan_generation"
+    CREATIVE_BRIEF = "creative_brief"
+    CAMPAIGN_STRUCTURE = "campaign_structure"
+    VCE = "vce"
+    DIAGNOSTICS = "diagnostics"
+    REPORTING = "reporting"
+
+
+class ExecutableVia(str, Enum):
+    """Users never open Ads Manager. A ui_only tactic is team knowledge, not an
+    executable strategy — retrievable at the diagnostics stage only (spec §7.1.10)."""
+    API = "api"
+    UI_ONLY = "ui_only"
+    MANUAL = "manual"
+
+
+class Requirement(str, Enum):
+    OUTCOME_CAPTURE = "outcome_capture"
+    WEBSITE_OR_PIXEL = "website_or_pixel"
+    CUSTOMER_LIST = "customer_list"
+    PARALLEL_ADSET_BUDGET = "parallel_adset_budget"
+    CREATIVE_PRODUCTION = "creative_production"
+    VIDEO_ASSET = "video_asset"
+    EXISTING_WINNING_CREATIVE = "existing_winning_creative"
+
+
+class SalesCycle(str, Enum):
+    SAME_DAY = "same_day"
+    ONE_TO_SEVEN_DAYS = "1_7_days"
+    ONE_TO_FOUR_WEEKS = "1_4_weeks"
+    OVER_A_MONTH = "over_a_month"
+    NOT_APPLICABLE = "not_applicable"
+
+
+class StrategyPlatform(str, Enum):
+    META = "meta"
+    TIKTOK = "tiktok"
+    GOOGLE = "google"
+    LINKEDIN = "linkedin"
+    SNAPCHAT = "snapchat"
+    WHATSAPP = "whatsapp"
+    CROSS_PLATFORM = "cross_platform"
+
+
+class LocalEvidence(BaseModel):
+    """Local-evidence state, ORTHOGONAL to approval status. ENG §1 names conflating
+    the two as the most likely modelling error here, so they are separate objects.
+
+    CONFIRMED_LOCALLY promotes the effective evidence grade to A (spec §8.1) — the
+    inversion the whole corpus exists for. That is why promotion needs human
+    confirmation and threshold floors: a bad promotion launders a guru assertion
+    into local evidence.
+    """
+    test_status: LocalTestStatus = LocalTestStatus.NOT_YET_TESTED
+    deployments: int = 0
+    outcomes_recorded: int = 0
+    positive_outcomes: int = 0
+    result_notes: Optional[str] = None
+    last_reviewed: Optional[datetime] = None
+
+    @property
+    def outcome_rate(self) -> Optional[float]:
+        """Of deployments WITH a recorded outcome. Deployments lacking outcomes do not
+        count toward promotion — a record can have 20 deployments and stay unpromotable
+        (ENG §2 MIN_OUTCOMES_RECORDED)."""
+        if not self.outcomes_recorded:
+            return None
+        return self.positive_outcomes / self.outcomes_recorded
 
 
 class Strategy(BaseModel):
-    """One tactic. Never a bundle — a source with six ideas is six Strategy records,
-    because a bundle is unusable at retrieval.
+    """One tactic, at one version. Never a bundle — a source with six ideas is six
+    records, because a bundle is unusable at retrieval.
 
-    The workbook's hard rule is that a row is only a record if every mandatory
-    (pink) field is filled; anything less is a note and must not enter the corpus.
-    That rule is enforced here rather than left to the importer, so no path into
-    Mongo can bypass it.
+    Immutable once approved (spec §3.3): an edit creates version + 1 at status=draft,
+    and prior versions are retained so a plan generated in October is still
+    explainable in January at the version it actually used.
     """
 
-    # ── Mandatory (pink columns A–M). `strategy_id` is assigned, not authored,
-    # which is why the workbook counts twelve authored fields across thirteen columns.
-    strategy_id: str                       # A  ID           (EX-01, SEED-001, …)
-    category: StrategyCategory             # B  Category
-    claim: str                             # C  Claim
-    business_type: str                     # D  Business Type
-    budget_floor_ngn_per_day: Optional[float]  # E  Budget Floor (₦/day) — see validator
-    platform: StrategyPlatform             # F  Platform
-    funnel_stage: FunnelStage              # G  Funnel Stage
-    product_price_band_ngn: str            # H  Product Price Band (₦) — free text ("Any",
-                                           #    "3,000 - 100,000"); not a Lists dropdown
-    sales_cycle: SalesCycle                # I  Sales Cycle
-    mechanism: str                         # J  Mechanism — why it works
-    evidence_grade: EvidenceGrade          # K  Evidence Grade
-    market_origin: MarketOrigin            # L  Market Origin
-    transfer_verdict: TransferVerdict      # M  Transfer Verdict
+    # ── identity
+    strategy_id: str
+    version: int = 1
 
-    # ── Optional (grey columns N–W): provenance and local-validation trail.
-    modification_required: Optional[str] = None      # N
-    source_type: Optional[SourceType] = None         # O
-    source_link: Optional[str] = None                # P
-    source_date: Optional[datetime] = None           # Q
-    seeded_by: Optional[str] = None                  # R
-    date_added: Optional[datetime] = None            # S
-    status: Optional[StrategyStatus] = None          # T
-    local_test_status: Optional[LocalTestStatus] = None   # U
-    local_result_notes: Optional[str] = None         # V
-    last_reviewed: Optional[datetime] = None         # W
+    # ── core
+    status: StrategyStatus = StrategyStatus.DRAFT
+    category: StrategyCategory
+    claim: str
+    mechanism: str
+    evidence_grade: EvidenceGrade
+    market_origin: MarketOrigin
+    transfer_verdict: TransferVerdict
+    modification_required: Optional[str] = None
 
+    # ── preconditions
+    business_types: list[str] = Field(default_factory=list)
+    budget_floor_ngn_daily: Optional[float] = None
+    platforms: list[StrategyPlatform] = Field(default_factory=list)
+    funnel_stages: list[str] = Field(default_factory=list)
+    price_band_min_ngn: Optional[int] = None
+    price_band_max_ngn: Optional[int] = None
+    sales_cycle: SalesCycle = SalesCycle.NOT_APPLICABLE
+
+    # ── v2 additions (spec §3.2). Defaults fail closed, never open.
+    conversion_location: list[ConversionLocation] = Field(default_factory=list)
+    pooled_account_safe: PooledAccountSafety = PooledAccountSafety.UNKNOWN
+    consumed_by: list[ConsumedBy] = Field(default_factory=list)
+    implies_product_change: bool = False
+    executable_via: ExecutableVia = ExecutableVia.API
+    requires_sustained_days: int = 1
+    requires: list[Requirement] = Field(default_factory=list)
+    guardrails: list[str] = Field(default_factory=list)
+    related: list[str] = Field(default_factory=list)
+
+    # ── provenance
+    source_type: Optional[str] = None
+    source_reference: Optional[str] = None
+    source_published_at: Optional[datetime] = None
     ingested_at: datetime = Field(default_factory=_now)
+    ingested_by: str = "import"
 
-    @field_validator("claim", "mechanism", "business_type", "product_price_band_ngn")
+    # ── local evidence
+    local: LocalEvidence = Field(default_factory=LocalEvidence)
+
+    staleness_review_due: Optional[datetime] = None
+    created_at: datetime = Field(default_factory=_now)
+
+    @field_validator("claim", "mechanism")
     @classmethod
     def _no_blank_prose(cls, v: str, info) -> str:
-        """"This just works" is noise — a record with an empty mechanism is a note.
-        Whitespace-only passes a plain `str` type but fails the workbook's rule."""
+        """"This just works" is noise — a record without a mechanism is a note."""
         if not v or not str(v).strip():
             raise ValueError(f"{info.field_name} is mandatory and cannot be blank")
         return str(v).strip()
 
     @model_validator(mode="after")
-    def _budget_floor_required_unless_rejected(self) -> "Strategy":
-        """Budget floors are in naira per day, always — "low budget" is not a
-        precondition, ₦3,000/day is. The one principled exception is a record whose
-        verdict is DOES_NOT_TRANSFER: a rejected claim has no budget at which it
-        works, and the text columns express that as "Not applicable" while a numeric
-        column has no such value. Those records are still kept and retrievable.
+    def _modification_required_when_verdict_says_so(self) -> "Strategy":
+        """Spec §8.2: returning the claim without its modification is a correctness
+        bug — the unmodified version is frequently wrong here and occasionally
+        harmful. Enforced at the record, so it cannot be lost downstream."""
+        if (
+            self.transfer_verdict is TransferVerdict.APPLIES_WITH_MODIFICATION
+            and not (self.modification_required or "").strip()
+        ):
+            raise ValueError(
+                "modification_required is mandatory when transfer_verdict is "
+                "applies_with_modification"
+            )
+        return self
 
-        Zero is a real floor, not a missing one: an organic tactic (WhatsApp Status
-        sequencing, say) costs ₦0/day to run, and Jane needs those retrievable for a
-        user with no paid budget at all."""
+    @model_validator(mode="after")
+    def _budget_floor_required_unless_rejected(self) -> "Strategy":
+        """A rejected claim has no budget at which it works, and the sheet's text
+        columns say "Not applicable" where a numeric column cannot (SEED-003).
+        Zero is a real floor, not a missing one: an organic tactic costs ₦0/day
+        (SEED-044), and Jane needs those for a user with no paid budget at all."""
         if self.transfer_verdict is TransferVerdict.DOES_NOT_TRANSFER:
             return self
-        if self.budget_floor_ngn_per_day is None:
+        if self.budget_floor_ngn_daily is None:
             raise ValueError(
-                "budget_floor_ngn_per_day is mandatory unless transfer_verdict is "
-                f"'{TransferVerdict.DOES_NOT_TRANSFER.value}'"
+                "budget_floor_ngn_daily is mandatory unless transfer_verdict is "
+                "does_not_transfer"
             )
-        if self.budget_floor_ngn_per_day < 0:
-            raise ValueError("budget_floor_ngn_per_day cannot be negative")
+        if self.budget_floor_ngn_daily < 0:
+            raise ValueError("budget_floor_ngn_daily cannot be negative")
         return self
 
     @property
-    def is_ingestible(self) -> bool:
-        """EXAMPLE rows set the standard for human seeders but are not corpus content —
-        the workbook says to delete them before export, so ingestion drops them too
-        rather than trusting that someone remembered."""
-        return self.status is not StrategyStatus.EXAMPLE
+    def effective_grade(self) -> EvidenceGrade:
+        """Spec §8.1 — local confirmation REPLACES the grade rather than modifying it.
+        v1's additive modifier produced a tie, not the claimed inversion."""
+        if self.local.test_status is LocalTestStatus.CONFIRMED_LOCALLY:
+            return EvidenceGrade.A
+        return self.evidence_grade
