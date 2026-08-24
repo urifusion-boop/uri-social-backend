@@ -24,8 +24,10 @@ from typing import Any, Iterable, Optional
 
 from .backfill import derive_consumed_by
 from .entities import (
+    ConversionLocation,
     EvidenceGrade,
     MarketOrigin,
+    PooledAccountSafety,
     SalesCycle,
     Strategy,
     StrategyCategory,
@@ -191,6 +193,15 @@ def row_to_strategy(row: dict[str, Any]) -> Strategy:
         funnel_stages=[f] if (f := _clean(row.get("Funnel Stage"))) else [],
         sales_cycle=_lookup(row.get("Sales Cycle"), SALES_CYCLE_LABELS, "Sales Cycle"),
         consumed_by=derive_consumed_by(category),
+        # Phase 0 columns. Read from the sheet when present; absent stays
+        # fail-closed (empty / unknown) rather than being inferred.
+        conversion_location=(
+            [ConversionLocation(_clean(row.get("Conversion Location")))]
+            if _clean(row.get("Conversion Location")) else []
+        ),
+        pooled_account_safe=PooledAccountSafety(
+            _clean(row.get("Pooled Account Safe")) or PooledAccountSafety.UNKNOWN.value
+        ),
         source_type=_clean(row.get("Source Type")),
         source_reference=_clean(row.get("Source Link")),
         source_published_at=_clean(row.get("Source Date")),
