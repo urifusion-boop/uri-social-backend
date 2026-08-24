@@ -1,56 +1,99 @@
 """
-Jane + Ads — ad strategy corpus ingestion (Jane Ads Playbook v1).
+Jane + Ads — corpus ingestion (ASC-SPEC-01 v2 §4).
 
-Reads the hand-seeded workbook (URI_Ad_Strategy_Corpus_Seed_v1.xlsx, Records tab)
-and turns each row into a `Strategy`. The workbook is the source of truth: its
-column order is load-bearing and its Lists tab supplies every controlled value,
-so this maps by header name rather than position and fails loudly on an unknown
-dropdown value instead of coercing it.
+Reads the Records sheet (header row 3, data from row 4) and maps each row to a
+`Strategy`. The workbook uses human-readable labels; storage uses the spec's
+canonical snake_case. This module owns that translation, so renaming a dropdown
+label never silently rewrites stored data.
 
-The hard rule — a row is only a record if every mandatory field is filled — is
-enforced by the `Strategy` model itself. This module's job is to report which
-rows failed and why, so a seeder can fix the sheet, rather than silently
-importing 55 of 59 rows and leaving nobody the wiser.
+Two rules the spec states plainly and this module enforces:
+
+  · EX-* rows are illustrations, not corpus records — skipped (§4.2). Note EX-04
+    carries "Does not transfer"; it is an example of the verdict, not a record.
+  · Rejected records DO import and are retained for anti-duplication (§17.3);
+    they simply never retrieve.
+
+Ingestion cannot approve. The store raises IngestionCannotApprove if a row
+arrives as approved (§1.1, ENG fixture 12) — a sheet marked Approved by hand does
+not get to bypass human review.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
 from typing import Any, Iterable, Optional
 
-from .entities import Strategy, StrategyStatus
-from .store import StrategyStore
+from .backfill import derive_consumed_by
+from .entities import (
+    EvidenceGrade,
+    MarketOrigin,
+    SalesCycle,
+    Strategy,
+    StrategyCategory,
+    StrategyPlatform,
+    StrategyStatus,
+    TransferVerdict,
+)
+from .store import IngestionCannotApprove, StrategyStore
 
-# Records tab layout. The header lives on row 3 — rows 1–2 are the title banner
-# and the pink/grey legend.
 HEADER_ROW = 3
 
-# Sheet header -> Strategy field. Keys must match the workbook exactly.
-COLUMN_MAP: dict[str, str] = {
-    "ID": "strategy_id",
-    "Category": "category",
-    "Claim": "claim",
-    "Business Type": "business_type",
-    "Budget Floor (₦/day)": "budget_floor_ngn_per_day",
-    "Platform": "platform",
-    "Funnel Stage": "funnel_stage",
-    "Product Price Band (₦)": "product_price_band_ngn",
-    "Sales Cycle": "sales_cycle",
-    "Mechanism — why it works": "mechanism",
-    "Evidence Grade": "evidence_grade",
-    "Market Origin": "market_origin",
-    "Transfer Verdict": "transfer_verdict",
-    "Modification Required": "modification_required",
-    "Source Type": "source_type",
-    "Source Link": "source_link",
-    "Source Date": "source_date",
-    "Seeded By": "seeded_by",
-    "Date Added": "date_added",
-    "Status": "status",
-    "Local Test Status": "local_test_status",
-    "Local Result Notes": "local_result_notes",
-    "Last Reviewed": "last_reviewed",
+# ── Workbook label -> canonical value ────────────────────────────────────────
+CATEGORY_LABELS = {
+    "Offer & Positioning": StrategyCategory.OFFER_POSITIONING,
+    "Audience Construction": StrategyCategory.AUDIENCE_CONSTRUCTION,
+    "Creative Formats & Hooks": StrategyCategory.CREATIVE_FORMATS,
+    "Copy Angles": StrategyCategory.COPY_ANGLES,
+    "Budget, Pacing & Timing": StrategyCategory.BUDGET_PACING,
+    "Micro-Budget Testing": StrategyCategory.MICRO_BUDGET_TESTING,
+    "Conversion Mechanics": StrategyCategory.CONVERSION_MECHANICS,
+    "Retargeting & Sequencing": StrategyCategory.RETARGETING,
+    "Platform Mechanics": StrategyCategory.PLATFORM_MECHANICS,
+    "Diagnostics & Troubleshooting": StrategyCategory.DIAGNOSTICS,
 }
+
+PLATFORM_LABELS = {
+    "Meta (FB/IG)": StrategyPlatform.META,
+    "TikTok": StrategyPlatform.TIKTOK,
+    "Google": StrategyPlatform.GOOGLE,
+    "LinkedIn": StrategyPlatform.LINKEDIN,
+    "Snapchat": StrategyPlatform.SNAPCHAT,
+    "WhatsApp": StrategyPlatform.WHATSAPP,
+    "Cross-platform": StrategyPlatform.CROSS_PLATFORM,
+}
+
+SALES_CYCLE_LABELS = {
+    "Same day": SalesCycle.SAME_DAY,
+    "1-7 days": SalesCycle.ONE_TO_SEVEN_DAYS,
+    "1-4 weeks": SalesCycle.ONE_TO_FOUR_WEEKS,
+    "Over a month": SalesCycle.OVER_A_MONTH,
+    "Not applicable": SalesCycle.NOT_APPLICABLE,
+}
+
+MARKET_ORIGIN_LABELS = {
+    "Nigeria": MarketOrigin.NIGERIA,
+    "Nigeria (desk research)": MarketOrigin.NIGERIA_DESK_RESEARCH,
+    "Africa (other)": MarketOrigin.AFRICA_OTHER,
+    "US": MarketOrigin.US,
+    "UK/EU": MarketOrigin.UK_EU,
+    "Asia": MarketOrigin.ASIA,
+    "Latin America": MarketOrigin.LATIN_AMERICA,
+    "Global/Unspecified": MarketOrigin.GLOBAL_UNSPECIFIED,
+}
+
+VERDICT_LABELS = {
+    "Applies as-is": TransferVerdict.APPLIES_AS_IS,
+    "Applies with modification": TransferVerdict.APPLIES_WITH_MODIFICATION,
+    "Does not transfer": TransferVerdict.DOES_NOT_TRANSFER,
+}
+
+STATUS_LABELS = {
+    "Draft": StrategyStatus.DRAFT,
+    "In review": StrategyStatus.IN_REVIEW,
+    "Approved": StrategyStatus.APPROVED,
+    "Rejected": StrategyStatus.REJECTED,
+}
+
+EXAMPLE_LABEL = "EXAMPLE"
 
 
 @dataclass
@@ -62,8 +105,6 @@ class RowError:
 
 @dataclass
 class ImportReport:
-    """Every row is accounted for: imported + skipped_examples + len(errors)
-    always equals the number of data rows read."""
     imported: int = 0
     skipped_examples: int = 0
     errors: list[RowError] = field(default_factory=list)
@@ -80,7 +121,6 @@ class ImportReport:
 
 
 def _clean(value: Any) -> Any:
-    """Blank-ish spreadsheet cells ("", "  ", "None") all mean absent."""
     if value is None:
         return None
     if isinstance(value, str):
@@ -90,8 +130,6 @@ def _clean(value: Any) -> Any:
 
 
 def _coerce_budget(value: Any) -> Optional[float]:
-    """Budget floors are ₦/day. Accepts the numeric cell openpyxl returns, and the
-    "₦3,000" / "3,000" text a human might type instead."""
     v = _clean(value)
     if v is None:
         return None
@@ -104,22 +142,16 @@ def _coerce_budget(value: Any) -> Optional[float]:
         raise ValueError(f"budget floor {value!r} is not a ₦/day number")
 
 
-def row_to_strategy(row: dict[str, Any]) -> Strategy:
-    """One sheet row -> one Strategy. Raises ValueError/ValidationError if the row
-    is a note rather than a record."""
-    data: dict[str, Any] = {}
-    for header, field_name in COLUMN_MAP.items():
-        raw = row.get(header)
-        if field_name == "budget_floor_ngn_per_day":
-            data[field_name] = _coerce_budget(raw)
-        else:
-            data[field_name] = _clean(raw)
-    return Strategy(**data)
+def _lookup(label: Any, table: dict, field_name: str):
+    v = _clean(label)
+    if v is None:
+        raise ValueError(f"{field_name} is mandatory")
+    if v not in table:
+        raise ValueError(f"{field_name}: {v!r} is not a value the Lists tab defines")
+    return table[v]
 
 
 def _reason(exc: Exception) -> str:
-    """Pydantic puts the useful part on the second line ("Value error, ..."), so the
-    first line alone ("1 validation error for Strategy") tells a seeder nothing."""
     lines = [ln.strip() for ln in str(exc).splitlines() if ln.strip()]
     for ln in lines:
         if ln.startswith("Value error,"):
@@ -130,44 +162,71 @@ def _reason(exc: Exception) -> str:
     return lines[0] if lines else str(exc)
 
 
-async def import_rows(
-    rows: Iterable[dict[str, Any]], store: StrategyStore
-) -> ImportReport:
-    """Import already-parsed rows. Kept separate from the file reader so the same
-    path is exercised by tests without an .xlsx on disk."""
+def row_to_strategy(row: dict[str, Any]) -> Strategy:
+    """One sheet row -> one Strategy at version 1.
+
+    v2 fields other than consumed_by are NOT inferred here — see backfill.py for
+    why guessing them is more dangerous than leaving them at their fail-closed
+    defaults (pooled_account_safe=unknown blocks retrieval until a human reviews).
+    """
+    category = _lookup(row.get("Category"), CATEGORY_LABELS, "Category")
+    grade_label = str(_clean(row.get("Evidence Grade")) or "")
+    if not grade_label or grade_label[0] not in "ABCD":
+        raise ValueError(f"Evidence Grade: {grade_label!r} is not A/B/C/D")
+
+    return Strategy(
+        strategy_id=str(_clean(row.get("ID")) or ""),
+        version=1,
+        status=STATUS_LABELS.get(str(_clean(row.get("Status")) or ""), StrategyStatus.DRAFT),
+        category=category,
+        claim=_clean(row.get("Claim")) or "",
+        mechanism=_clean(row.get("Mechanism — why it works")) or "",
+        evidence_grade=EvidenceGrade(grade_label[0]),
+        market_origin=_lookup(row.get("Market Origin"), MARKET_ORIGIN_LABELS, "Market Origin"),
+        transfer_verdict=_lookup(row.get("Transfer Verdict"), VERDICT_LABELS, "Transfer Verdict"),
+        modification_required=_clean(row.get("Modification Required")),
+        business_types=[b] if (b := _clean(row.get("Business Type"))) else [],
+        budget_floor_ngn_daily=_coerce_budget(row.get("Budget Floor (₦/day)")),
+        platforms=[_lookup(row.get("Platform"), PLATFORM_LABELS, "Platform")],
+        funnel_stages=[f] if (f := _clean(row.get("Funnel Stage"))) else [],
+        sales_cycle=_lookup(row.get("Sales Cycle"), SALES_CYCLE_LABELS, "Sales Cycle"),
+        consumed_by=derive_consumed_by(category),
+        source_type=_clean(row.get("Source Type")),
+        source_reference=_clean(row.get("Source Link")),
+        source_published_at=_clean(row.get("Source Date")),
+        ingested_by=_clean(row.get("Seeded By")) or "import",
+    )
+
+
+async def import_rows(rows: Iterable[dict[str, Any]], store: StrategyStore) -> ImportReport:
     report = ImportReport()
     for offset, row in enumerate(rows):
         sheet_row = HEADER_ROW + 1 + offset
         raw_id = str(_clean(row.get("ID")) or "")
         if not raw_id:
-            continue  # trailing blank rows in a 1000-row sheet
-        try:
-            strategy = row_to_strategy(row)
-        except Exception as exc:                      # noqa: BLE001 — reported, not raised
-            report.errors.append(RowError(sheet_row, raw_id, _reason(exc)))
             continue
-        if not strategy.is_ingestible:
+        if str(_clean(row.get("Status")) or "") == EXAMPLE_LABEL or raw_id.startswith("EX-"):
             report.skipped_examples += 1
             continue
-        await store.upsert_strategy(strategy)
+        try:
+            strategy = row_to_strategy(row)
+            await store.ingest(strategy)
+        except IngestionCannotApprove as exc:
+            report.errors.append(RowError(sheet_row, raw_id, str(exc)))
+            continue
+        except Exception as exc:                  # noqa: BLE001 — reported, not raised
+            report.errors.append(RowError(sheet_row, raw_id, _reason(exc)))
+            continue
         report.imported += 1
     return report
 
 
 def read_records_sheet(path: str, sheet_name: str = "Records") -> list[dict[str, Any]]:
-    """Read the Records tab into header-keyed dicts. openpyxl is an import-time
-    dependency of this function only, so the corpus module stays importable in
-    environments that never run ingestion."""
     import openpyxl
 
     wb = openpyxl.load_workbook(path, data_only=True)
     ws = wb[sheet_name]
     headers = [ws.cell(HEADER_ROW, i).value for i in range(1, ws.max_column + 1)]
-    unknown = [h for h in headers if h and h not in COLUMN_MAP]
-    if unknown:
-        raise ValueError(
-            f"unrecognised column(s) {unknown} — the sheet changed shape; update COLUMN_MAP"
-        )
     rows: list[dict[str, Any]] = []
     for r in range(HEADER_ROW + 1, ws.max_row + 1):
         row = {h: ws.cell(r, i + 1).value for i, h in enumerate(headers) if h}
