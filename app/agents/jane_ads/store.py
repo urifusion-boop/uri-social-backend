@@ -11,7 +11,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import Optional
 
-from .entities import Transaction, Wallet, WalletStatus
+from .entities import Strategy, StrategyCategory, Transaction, Wallet, WalletStatus
 
 
 class WalletStore(ABC):
@@ -143,3 +143,114 @@ class MongoWalletStore(WalletStore):
             query["created_at"] = {"$gte": since}
         docs = await self._db.jane_ads_transactions.find(query, {"_id": 0}).to_list(length=1000)
         return [Transaction(**d) for d in docs]
+
+
+# ── Ad strategy corpus ────────────────────────────────────────────────────────
+
+class StrategyStore(ABC):
+    """Interface the StrategyCorpusService talks to. Same split as WalletStore:
+    InMemory backs unit tests, Mongo is production."""
+
+    @abstractmethod
+    async def upsert_strategy(self, strategy: Strategy) -> None: ...
+
+    @abstractmethod
+    async def get_strategy(self, strategy_id: str) -> Optional[Strategy]: ...
+
+    @abstractmethod
+    async def find_strategies(
+        self,
+        *,
+        category: Optional[StrategyCategory] = None,
+        max_budget_floor_ngn: Optional[float] = None,
+        limit: int = 50,
+    ) -> list[Strategy]: ...
+
+    @abstractmethod
+    async def count(self) -> int: ...
+
+
+class InMemoryStrategyStore(StrategyStore):
+    def __init__(self) -> None:
+        self._items: dict[str, Strategy] = {}
+
+    async def upsert_strategy(self, strategy: Strategy) -> None:
+        self._items[strategy.strategy_id] = strategy
+
+    async def get_strategy(self, strategy_id: str) -> Optional[Strategy]:
+        return self._items.get(strategy_id)
+
+    async def find_strategies(
+        self,
+        *,
+        category: Optional[StrategyCategory] = None,
+        max_budget_floor_ngn: Optional[float] = None,
+        limit: int = 50,
+    ) -> list[Strategy]:
+        out = list(self._items.values())
+        if category is not None:
+            out = [s for s in out if s.category is category]
+        if max_budget_floor_ngn is not None:
+            # A record with no floor is a "does not transfer" rejection — it carries no
+            # budget precondition, so an affordability filter must not surface it.
+            out = [
+                s for s in out
+                if s.budget_floor_ngn_per_day is not None
+                and s.budget_floor_ngn_per_day <= max_budget_floor_ngn
+            ]
+        out.sort(key=lambda s: (-s.evidence_grade.rank, s.strategy_id))
+        return out[:limit]
+
+    async def count(self) -> int:
+        return len(self._items)
+
+
+class MongoStrategyStore(StrategyStore):
+    """Production store. Collection:
+      jane_ads_strategies — one doc per tactic (keyed by strategy_id)
+    """
+
+    def __init__(self, db) -> None:
+        self._db = db
+
+    async def ensure_indexes(self) -> None:
+        await self._db.jane_ads_strategies.create_index("strategy_id", unique=True)
+        await self._db.jane_ads_strategies.create_index(
+            [("category", 1), ("budget_floor_ngn_per_day", 1)]
+        )
+        await self._db.jane_ads_strategies.create_index("transfer_verdict")
+
+    async def upsert_strategy(self, strategy: Strategy) -> None:
+        await self._db.jane_ads_strategies.update_one(
+            {"strategy_id": strategy.strategy_id},
+            {"$set": strategy.model_dump()},
+            upsert=True,
+        )
+
+    async def get_strategy(self, strategy_id: str) -> Optional[Strategy]:
+        doc = await self._db.jane_ads_strategies.find_one(
+            {"strategy_id": strategy_id}, {"_id": 0}
+        )
+        return Strategy(**doc) if doc else None
+
+    async def find_strategies(
+        self,
+        *,
+        category: Optional[StrategyCategory] = None,
+        max_budget_floor_ngn: Optional[float] = None,
+        limit: int = 50,
+    ) -> list[Strategy]:
+        query: dict = {}
+        if category is not None:
+            query["category"] = category.value
+        if max_budget_floor_ngn is not None:
+            query["budget_floor_ngn_per_day"] = {
+                "$ne": None, "$lte": max_budget_floor_ngn,
+            }
+        docs = await self._db.jane_ads_strategies.find(query, {"_id": 0}).to_list(length=limit)
+        out = [Strategy(**d) for d in docs]
+        out.sort(key=lambda s: (-s.evidence_grade.rank, s.strategy_id))
+        return out
+
+    async def count(self) -> int:
+        return await self._db.jane_ads_strategies.count_documents({})
