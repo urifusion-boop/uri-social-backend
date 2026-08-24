@@ -2645,6 +2645,53 @@ Answer with exactly one word: "yes" or "no"."""
         return _b64.b64encode(buf.getvalue()).decode()
 
     @staticmethod
+    async def crop_and_reupload_for_tiktok(image_url: str, user_id: str) -> str:
+        """Center-crop a user-uploaded image to TikTok's Photo Mode spec
+        (1080x1920, 9:16) and re-upload it, returning the new URL. Used only
+        for TikTok drafts in the Upload Content flow — every other platform
+        keeps the user's original upload untouched, matching how AI-generated
+        images already get a platform-specific size (see IMAGE_SPECS) while
+        raw uploads otherwise pass through as-is. TikTok's own client
+        auto-crops/letterboxes anything off-ratio when it actually posts, so
+        this makes what the user approves in the draft preview match what
+        actually goes live, instead of a surprise crop TikTok applies later.
+        Falls back to the original URL on any failure — a bad crop should
+        never block the upload flow."""
+        import base64 as _b64
+        import io
+        import httpx
+        from PIL import Image
+        from app.utils.cloudinary_upload import upload_bytes
+
+        target_w, target_h = 1080, 1920
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.get(image_url)
+            resp.raise_for_status()
+            img = Image.open(io.BytesIO(resp.content)).convert("RGB")
+
+            buf = io.BytesIO()
+            img.save(buf, format="WEBP", quality=97)
+            b64 = _b64.b64encode(buf.getvalue()).decode()
+
+            cropped_b64 = ImageContentService._crop_to_ratio(b64, target_w, target_h)
+            cropped_img = Image.open(io.BytesIO(_b64.b64decode(cropped_b64))).convert("RGB")
+            if cropped_img.size != (target_w, target_h):
+                cropped_img = cropped_img.resize((target_w, target_h), Image.LANCZOS)
+
+            out_buf = io.BytesIO()
+            cropped_img.save(out_buf, format="WEBP", quality=97, method=6)
+
+            url = await upload_bytes(
+                out_buf.getvalue(), folder=f"uri-social/tiktok-crop/{user_id}", resource_type="image",
+            )
+            print(f"✅ Cropped upload to TikTok 9:16 ({target_w}x{target_h}): {url[:100]}...", flush=True)
+            return url
+        except Exception as e:
+            print(f"⚠️ TikTok crop failed for {image_url[:80]}: {e} — using original upload as-is", flush=True)
+            return image_url
+
+    @staticmethod
     async def _call_dalle_api(
         prompt: str,
         size: str = "1024x1024",

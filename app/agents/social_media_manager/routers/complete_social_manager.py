@@ -1076,59 +1076,79 @@ Create engaging social media captions for THIS UPLOADED CONTENT. Base your writi
                 )
 
             if _d_ids:
-                # Attach uploaded images to drafts so they can be published
-                if post_type == "carousel":
-                    # For carousel: one slide per uploaded image, in the exact
-                    # shape both DraftCard (isCarousel = slides.length > 0) and
-                    # publish logic (approval_workflow_service reads draft.slides)
-                    # expect. A prior "carousel_images" field here was never read
-                    # by either, so uploaded carousels silently rendered/published
-                    # as a single post.
-                    #
-                    # KNOWN LIMITATION: slides only carry image_url — there's no
-                    # per-slide video_url in this schema or in DraftCard's carousel
-                    # rendering, so a video uploaded into a carousel still ends up
-                    # here and will fail to render, same as the single-post bug this
-                    # fix addresses did before. Fixing that needs a per-slide video
-                    # field added on the frontend too; out of scope here.
-                    slides = [
-                        {"headline": "", "body": "", "image_url": url, "image_failed": False}
+                # Attach uploaded images to drafts so they can be published.
+                # TikTok gets its own center-cropped-to-9:16 copies of any IMAGE
+                # uploads (see ImageContentService.crop_and_reupload_for_tiktok)
+                # — TikTok's own client auto-crops/letterboxes anything off-ratio
+                # when it actually posts, so this makes the draft preview match
+                # what goes live instead of a surprise crop later. Video uploads
+                # pass through untouched (PIL can't crop a video file). Every
+                # other platform keeps the original upload byte-for-byte.
+                drafts_list = _rd.get("drafts", [])
+                tiktok_media_urls = None
+                if any(d.get("platform") == "tiktok" for d in drafts_list):
+                    from ..services.image_content_service import ImageContentService
+                    tiktok_media_urls = [
+                        url if url in video_urls
+                        else await ImageContentService.crop_and_reupload_for_tiktok(url, user_id)
                         for url in media_urls
                     ]
-                    update_fields = {
-                        "brand_id": active_brand_id,
-                        "content_source": "user_uploaded",
-                        "uploaded_media_urls": media_urls,
-                        "post_type": post_type,
-                        "slides": slides,
-                    }
-                else:
-                    # For single post: use the first uploaded item as the main
-                    # media. DraftCard only renders a <video> element when
-                    # draft.video_url is set (isReel = post_type === 'reel' ||
-                    # !!draft.video_url) — anything else, including a video's own
-                    # URL, gets rendered in an <img> tag and fails to load. Route
-                    # video uploads to video_url so the existing player picks them
-                    # up correctly instead of showing as a broken image.
-                    first_url = media_urls[0] if media_urls else None
-                    is_first_video = first_url in video_urls if first_url else False
-                    update_fields = {
-                        "brand_id": active_brand_id,
-                        "content_source": "user_uploaded",
-                        "uploaded_media_urls": media_urls,
-                        "post_type": post_type,
-                        "image_url": None if is_first_video else first_url,
-                        "video_url": first_url if is_first_video else None,
-                    }
 
-                # Mark drafts as user-uploaded and attach media URLs
-                await db["content_drafts"].update_many(
-                    {"id": {"$in": _d_ids}},
-                    {"$set": update_fields}
-                )
+                for d in drafts_list:
+                    draft_id = d.get("id")
+                    if not draft_id:
+                        continue
+                    urls_for_platform = (
+                        tiktok_media_urls if d.get("platform") == "tiktok" and tiktok_media_urls
+                        else media_urls
+                    )
 
-                # Update in-memory draft objects
-                for d in _rd.get("drafts", []):
+                    if post_type == "carousel":
+                        # One slide per uploaded image, in the exact shape both
+                        # DraftCard (isCarousel = slides.length > 0) and publish
+                        # logic (approval_workflow_service reads draft.slides)
+                        # expect. A prior "carousel_images" field here was never
+                        # read by either, so uploaded carousels silently
+                        # rendered/published as a single post.
+                        #
+                        # KNOWN LIMITATION: slides only carry image_url — there's
+                        # no per-slide video_url in this schema or in DraftCard's
+                        # carousel rendering, so a video uploaded into a carousel
+                        # still ends up here and will fail to render. Fixing that
+                        # needs a per-slide video field added on the frontend too;
+                        # out of scope here.
+                        slides = [
+                            {"headline": "", "body": "", "image_url": url, "image_failed": False}
+                            for url in urls_for_platform
+                        ]
+                        update_fields = {
+                            "brand_id": active_brand_id,
+                            "content_source": "user_uploaded",
+                            "uploaded_media_urls": urls_for_platform,
+                            "post_type": post_type,
+                            "slides": slides,
+                        }
+                    else:
+                        # For single post: use the first uploaded item as the main
+                        # media. DraftCard only renders a <video> element when
+                        # draft.video_url is set (isReel = post_type === 'reel' ||
+                        # !!draft.video_url) — anything else, including a video's
+                        # own URL, gets rendered in an <img> tag and fails to load.
+                        # Route video uploads to video_url so the existing player
+                        # picks them up correctly instead of showing as a broken
+                        # image.
+                        first_url = urls_for_platform[0] if urls_for_platform else None
+                        is_first_video = first_url in video_urls if first_url else False
+                        update_fields = {
+                            "brand_id": active_brand_id,
+                            "content_source": "user_uploaded",
+                            "uploaded_media_urls": urls_for_platform,
+                            "post_type": post_type,
+                            "image_url": None if is_first_video else first_url,
+                            "video_url": first_url if is_first_video else None,
+                        }
+
+                    await db["content_drafts"].update_one({"id": draft_id}, {"$set": update_fields})
                     d.update(update_fields)
 
         # Deduct credits (cheaper than full generation since no image gen)
