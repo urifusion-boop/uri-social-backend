@@ -1963,6 +1963,7 @@ async def outstand_oauth_callback(
     username: Optional[str] = Query(None),
     network_unique_id: Optional[str] = Query(None),
     network: Optional[str] = Query(None),
+    requested_network: Optional[str] = Query(None),
     success: Optional[str] = Query(None),
     error: Optional[str] = Query(None),
     source: Optional[str] = Query(None),
@@ -1974,9 +1975,15 @@ async def outstand_oauth_callback(
     Two possible flows:
     1. Session token flow (Facebook, LinkedIn etc.):
        Outstand sends sessionToken → redirect frontend to pending/finalize.
-    2. Direct flow (X/Twitter OAuth 2.0):
+    2. Direct flow (X/Twitter OAuth 2.0, TikTok):
        Outstand sends account_id + username directly → redirect frontend
-       with account details so it can call POST /x/finalize-direct.
+       with account details so it can call POST /connect/finalize-outstand-direct.
+       Outstand doesn't reliably echo back which network this is (confirmed
+       live for TikTok — no `network` param on the callback at all), so
+       `requested_network` — the network we asked for, round-tripped through
+       our own redirect_uri at initiate time (see initiate_connection_flow) —
+       is the dependable source; `network` (if Outstand ever does send it) wins
+       when present.
 
     source: "onboarding" → redirect to brand-setup, "settings" → redirect to settings/social-accounts
     """
@@ -1990,15 +1997,16 @@ async def outstand_oauth_callback(
         encoded_error = urllib.parse.quote(error)
         return RedirectResponse(f"{base_redirect}?connected=false&error={encoded_error}")
 
-    # Direct flow — X OAuth 2.0 returns account_id immediately
+    # Direct flow — X OAuth 2.0 / TikTok return account_id immediately
     if success == "true" and account_id:
         params = f"account_id={urllib.parse.quote(account_id)}&connected=direct"
         if username:
             params += f"&username={urllib.parse.quote(username)}"
         if network_unique_id:
             params += f"&network_unique_id={urllib.parse.quote(network_unique_id)}"
-        if network:
-            params += f"&network={urllib.parse.quote(network)}"
+        effective_network = network or requested_network
+        if effective_network:
+            params += f"&network={urllib.parse.quote(effective_network)}"
         return RedirectResponse(f"{base_redirect}?{params}")
 
     # Session token flow
