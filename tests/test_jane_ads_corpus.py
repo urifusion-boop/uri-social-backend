@@ -257,3 +257,24 @@ class TestImportAccounting:
         rows = [_row(), _row(ID="EX-02", Status="EXAMPLE"), _row(ID="SEED-997", Claim=None)]
         rep = _run(import_rows(rows, store))
         assert rep.total_seen == len(rows)
+
+
+class TestStaleIndexRegression:
+    """v1 shipped a plain unique index on strategy_id. Left in place it makes a
+    second version of any record unwritable (E11000), silently defeating the
+    versioning model — ensure_indexes must DROP it, not just add the right one."""
+
+    def test_stale_v1_index_names_are_declared_for_removal(self):
+        from app.agents.jane_ads.store import MongoStrategyStore
+        assert "strategy_id_1" in MongoStrategyStore.STALE_V1_INDEXES
+        assert "category_1_budget_floor_ngn_per_day_1" in MongoStrategyStore.STALE_V1_INDEXES
+
+    def test_in_memory_store_allows_two_versions(self):
+        store = InMemoryStrategyStore()
+        _run(import_rows([_row()], store))
+        _run(store.approve("SEED-999", 1, "collins"))
+        v2 = row_to_strategy(_row(Claim="Second version."))
+        v2.version = 2
+        _run(store.ingest(v2))
+        assert _run(store.get("SEED-999", 1)) is not None
+        assert _run(store.get("SEED-999", 2)).claim == "Second version."
