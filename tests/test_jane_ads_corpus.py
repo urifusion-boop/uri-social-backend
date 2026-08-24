@@ -131,11 +131,15 @@ class TestRetrieval:
     def _seeded(self):
         store = InMemoryStrategyStore()
         _run(import_rows([
-            _row(ID="S1", **{"Budget Floor (₦/day)": 1000, "Evidence Grade": "C - Guru assertion"}),
-            _row(ID="S2", **{"Budget Floor (₦/day)": 2000,
-                             "Evidence Grade": "A - Verified case study with numbers"}),
-            _row(ID="S3", **{"Budget Floor (₦/day)": 50000, "Category": "Copy Angles"}),
-            _row(ID="S4", **{"Budget Floor (₦/day)": None, "Transfer Verdict": "Does not transfer"}),
+            _row(ID="S1", Status="Approved",
+                 **{"Budget Floor (₦/day)": 1000, "Evidence Grade": "C - Guru assertion"}),
+            _row(ID="S2", Status="Approved",
+                 **{"Budget Floor (₦/day)": 2000,
+                    "Evidence Grade": "A - Verified case study with numbers"}),
+            _row(ID="S3", Status="Approved",
+                 **{"Budget Floor (₦/day)": 50000, "Category": "Copy Angles"}),
+            _row(ID="S4", Status="Approved",
+                 **{"Budget Floor (₦/day)": None, "Transfer Verdict": "Does not transfer"}),
         ], store))
         return store
 
@@ -160,3 +164,48 @@ class TestRetrieval:
     def test_better_evidence_ranks_first(self):
         got = _run(self._seeded().find_strategies(category=StrategyCategory.CONVERSION_MECHANICS))
         assert got[0].evidence_grade is EvidenceGrade.A_VERIFIED
+
+
+class TestStatusGate:
+    """Draft -> In review -> Approved. Ingestion keeps everything so the review
+    workflow has something to act on; retrieval defaults to Approved only, so an
+    unreviewed draft can never shape a live campaign plan."""
+
+    def _mixed(self):
+        store = InMemoryStrategyStore()
+        _run(import_rows([
+            _row(ID="D1", Status="Draft"),
+            _row(ID="R1", Status="In review"),
+            _row(ID="A1", Status="Approved"),
+            _row(ID="X1", Status="Rejected"),
+        ], store))
+        return store
+
+    def test_drafts_are_ingested(self):
+        """They must be stored — the review workflow needs them."""
+        assert _run(self._mixed().count()) == 4
+        assert _run(self._mixed().get_strategy("D1")) is not None
+
+    def test_retrieval_returns_only_approved(self):
+        got = _run(self._mixed().find_strategies())
+        assert [s.strategy_id for s in got] == ["A1"]
+
+    def test_rejected_records_are_not_retrievable(self):
+        got = _run(self._mixed().find_strategies())
+        assert "X1" not in {s.strategy_id for s in got}
+
+    def test_statuses_none_searches_whole_corpus(self):
+        """Review tooling needs to see everything — never used for user-facing planning."""
+        got = _run(self._mixed().find_strategies(statuses=None))
+        assert len(got) == 4
+
+    def test_explicit_status_set_is_honoured(self):
+        got = _run(self._mixed().find_strategies(statuses={StrategyStatus.DRAFT}))
+        assert [s.strategy_id for s in got] == ["D1"]
+
+    def test_record_without_a_status_is_not_retrievable(self):
+        """No status means it never went through review either."""
+        store = InMemoryStrategyStore()
+        _run(import_rows([_row(ID="N1", Status=None)], store))
+        assert _run(store.count()) == 1
+        assert _run(store.find_strategies()) == []
