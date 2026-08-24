@@ -256,7 +256,18 @@ class MongoStrategyStore(StrategyStore):
     def __init__(self, db) -> None:
         self._db = db
 
+    # v1 shipped a plain unique index on strategy_id and a compound index on a
+    # since-renamed field. The former makes a second version of any record
+    # unwritable — it defeats the whole versioning model — so ensure_indexes must
+    # remove it, not merely add the correct one alongside.
+    STALE_V1_INDEXES = ("strategy_id_1", "category_1_budget_floor_ngn_per_day_1")
+
     async def ensure_indexes(self) -> None:
+        existing = await self._db.jane_ads_strategies.index_information()
+        for name in self.STALE_V1_INDEXES:
+            if name in existing:
+                await self._db.jane_ads_strategies.drop_index(name)
+
         await self._db.jane_ads_strategies.create_index(
             [("strategy_id", 1), ("version", 1)], unique=True
         )
