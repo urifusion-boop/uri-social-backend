@@ -32,7 +32,6 @@ class SocialAccountService:
         outstand = OutstandService()
         # Use PUBLIC_API_URL if set (browser-reachable), otherwise fall back to gateway URL
         _base = (settings.PUBLIC_API_URL or settings.URI_GATEWAY_BASE_API_URL).rstrip("/")
-        callback_url = f"{_base}/social-media/connect/callback/outstand?source={source}"
 
         auth_urls: Dict[str, str] = {}
         unsupported: List[str] = []
@@ -44,6 +43,14 @@ class SocialAccountService:
             if not network:
                 unsupported.append(platform)
                 continue
+
+            # requested_network round-trips through Outstand's own redirect_uri
+            # handling (confirmed live: it preserves query params already on the
+            # redirect_uri and only appends its own on top) — the "direct" callback
+            # shape (TikTok, X) doesn't reliably echo back which network was
+            # connected on its own, so this is the only dependable way the
+            # callback can know without a live Outstand lookup.
+            callback_url = f"{_base}/social-media/connect/callback/outstand?source={source}&requested_network={network}"
 
             try:
                 url = await outstand.get_auth_url(
