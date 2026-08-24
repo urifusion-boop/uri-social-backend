@@ -74,6 +74,16 @@ _NIGERIA_LOCATION_ID = "10000541"
 _OPTIMIZATION_GOAL = "CLICK"
 _BILLING_EVENT = "CPC"
 
+# TikTok's operation_status values, translated to plain language for the campaign-
+# list view — same purpose as meta.py's own _DELIVERY_LABELS. An empty campaign/get/
+# result (the campaign no longer exists on TikTok's side at all) is treated as
+# DELETE by the caller, not represented here.
+_DELIVERY_LABELS = {
+    "ENABLE": "Active",
+    "DISABLE": "Paused",
+    "DELETE": "Deleted",
+}
+
 
 class TikTokAdsAPIError(Exception):
     """A TikTok Marketing API call returned a non-zero `code`, or the adapter is
@@ -411,4 +421,159 @@ class TikTokAdsAdapter(AdPlatformAdapter):
             )
         data = resp.json()
         _raise_for_error(data, "pause ad")
+        return data.get("code") == 0
+
+    # ── Methods below are NOT part of the AdPlatformAdapter ABC — they mirror an
+    # extra contract MetaAdPlatformAdapter (adapters/meta.py) exposes that billing.py
+    # and the campaign-management router endpoints call directly on whichever
+    # adapter they're given. Kept the same shape here so those callers can dispatch
+    # by platform without caring which adapter they're holding. ──────────────────
+
+    async def fetch_campaign_summary(self, campaign_id: str) -> dict:
+        """One combined snapshot for the campaign-list (management) view — mirrors
+        MetaAdPlatformAdapter.fetch_campaign_summary's return shape exactly, since
+        billing.py and the campaign-list endpoint depend on that dict shape
+        directly. Two calls where Meta needs one (status, then a report call) —
+        TikTok's Marketing API has no single combined field-expansion read the way
+        Meta's does. Not yet verified against a live account, same honesty as the
+        rest of this file."""
+        await self._get_campaign_record(campaign_id)  # 404s cleanly if unknown to us
+        now = datetime.now(timezone.utc)
+        async with httpx.AsyncClient(timeout=30) as client:
+            status_resp = await client.get(
+                f"{self._api_base}/campaign/get/",
+                headers=self._headers(),
+                params={
+                    "advertiser_id": self._advertiser_id,
+                    "filtering": json.dumps({"campaign_ids": [campaign_id]}),
+                },
+            )
+            status_data = status_resp.json()
+            _raise_for_error(status_data, "campaign status fetch")
+            status_rows = (status_data.get("data") or {}).get("list") or []
+            # No rows back means TikTok no longer has this campaign at all — same
+            # "Deleted" signal Meta gives via effective_status, just absent here
+            # instead of an explicit value.
+            raw_status = status_rows[0].get("operation_status", "") if status_rows else "DELETE"
+            delivery = _DELIVERY_LABELS.get(raw_status, raw_status.replace("_", " ").title() or "Paused")
+
+            report_resp = await client.get(
+                f"{self._api_base}/report/integrated/get/",
+                headers=self._headers(),
+                params={
+                    "advertiser_id": self._advertiser_id,
+                    "report_type": "BASIC",
+                    "data_level": "AUCTION_CAMPAIGN",
+                    "dimensions": json.dumps(["campaign_id"]),
+                    "metrics": json.dumps(["impressions", "reach", "clicks", "spend"]),
+                    "filtering": json.dumps([{"field_name": "campaign_id", "filter_type": "IN", "filter_value": json.dumps([campaign_id])}]),
+                    "start_date": (now - timedelta(days=30)).strftime("%Y-%m-%d"),
+                    "end_date": now.strftime("%Y-%m-%d"),
+                    "page": 1,
+                    "page_size": 1,
+                },
+            )
+        report_data = report_resp.json()
+        _raise_for_error(report_data, "campaign summary report")
+        report_rows = (report_data.get("data") or {}).get("list") or []
+        metrics = (report_rows[0].get("metrics") if report_rows else None) or {}
+        clicks = int(float(metrics.get("clicks", 0)))
+        # Advertiser account currency, same un-converted-if-unknown caveat
+        # fetch_per_ad_spend's _to_ngn documents — left as-is here since this method
+        # doesn't have a currency field to check against (report/integrated/get/
+        # doesn't return one at this data_level); revisit once a live account
+        # confirms whether the advertiser account is NGN- or USD-denominated.
+        spend_ngn = float(metrics.get("spend", 0))
+        cost_per_click = (spend_ngn / clicks) if clicks else None
+
+        return {
+            "delivery": delivery,
+            "spend_ngn": spend_ngn,
+            "impressions": int(float(metrics.get("impressions", 0))),
+            "reach": int(float(metrics.get("reach", 0))),
+            # A click approximates a conversation here, same documented gap
+            # poll_conversations/fetch_per_ad_spend already carry — no
+            # conversation-start webhook exists yet for TikTok.
+            "conversations": clicks,
+            "cost_per_conversation_ngn": cost_per_click,
+            "ends_at": None,   # not stored on the campaign record today
+        }
+
+    async def set_delivery(self, campaign_id: str, active: bool) -> dict:
+        """Turn a campaign on or off from the caller's own campaign-management
+        view — no TikTok Ads Manager needed. Cascades the SAME operation_status to
+        the campaign, its ad group, and its ad, mirroring
+        MetaAdPlatformAdapter.set_delivery's cascade exactly: TikTok, like Meta,
+        only actually delivers when every level is enabled. Going active is the
+        one genuinely consequential action here — real budget can start being
+        spent from that point on."""
+        record = await self._get_campaign_record(campaign_id)
+        status = "ENABLE" if active else "DISABLE"
+        updated: dict[str, bool] = {}
+        async with httpx.AsyncClient(timeout=30) as client:
+            campaign_resp = await client.post(
+                f"{self._api_base}/campaign/update/status/",
+                headers=self._headers(),
+                json={
+                    "advertiser_id": self._advertiser_id,
+                    "campaign_ids": [campaign_id],
+                    "operation_status": status,
+                },
+            )
+            campaign_data = campaign_resp.json()
+            _raise_for_error(campaign_data, "campaign status update")
+            updated["campaign"] = campaign_data.get("code") == 0
+
+            adgroup_id = record.get("adgroup_id", "")
+            if adgroup_id:
+                adgroup_resp = await client.post(
+                    f"{self._api_base}/adgroup/update/status/",
+                    headers=self._headers(),
+                    json={
+                        "advertiser_id": self._advertiser_id,
+                        "adgroup_ids": [adgroup_id],
+                        "operation_status": status,
+                    },
+                )
+                adgroup_data = adgroup_resp.json()
+                _raise_for_error(adgroup_data, "ad group status update")
+                updated["adgroup"] = adgroup_data.get("code") == 0
+
+            ad_id = record.get("ad_id", "")
+            if ad_id:
+                ad_resp = await client.post(
+                    f"{self._api_base}/ad/status/update/",
+                    headers=self._headers(),
+                    json={
+                        "advertiser_id": self._advertiser_id,
+                        "adgroup_id": adgroup_id,
+                        "ad_ids": [ad_id],
+                        "operation_status": status,
+                    },
+                )
+                ad_data = ad_resp.json()
+                _raise_for_error(ad_data, "ad status update")
+                updated["ad"] = ad_data.get("code") == 0
+
+        return {"status": status, "updated": updated}
+
+    async def delete_campaign(self, campaign_id: str) -> bool:
+        """Permanently delete the campaign on TikTok's side (its ad group and ad
+        go with it — TikTok doesn't require deleting those separately, same as
+        Meta). Same endpoint _rollback_partial_launch already uses for a failed
+        launch, but this one RAISES on failure rather than swallowing it — a
+        caller-requested delete failing silently would leave them thinking a
+        campaign is gone when it isn't."""
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"{self._api_base}/campaign/update/status/",
+                headers=self._headers(),
+                json={
+                    "advertiser_id": self._advertiser_id,
+                    "campaign_ids": [campaign_id],
+                    "operation_status": "DELETE",
+                },
+            )
+        data = resp.json()
+        _raise_for_error(data, "campaign delete")
         return data.get("code") == 0
