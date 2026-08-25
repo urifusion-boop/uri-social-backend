@@ -2058,57 +2058,77 @@ async def instagram_direct_finalize_pending(
     ctx: dict = Depends(get_active_brand_context),
 ):
     """
-    Called once the user picks which Instagram account to connect from the
-    picker. Stores the chosen candidate directly as active (unlike the
+    Called once the user picks which Instagram account(s) to connect from the
+    picker — one or several, mirroring Facebook's own multi-page picker.
+    Stores each chosen candidate directly as active (unlike the
     single-candidate path, this call is already authenticated, so there's no
-    separate pending_user_match step needed) and discards the rest.
+    separate pending_user_match step needed). The pending session is only
+    consumed once, after every requested account is processed, so picking
+    fewer than all the candidates in one call doesn't burn the others.
     """
     from app.models.brand_account import BrandAccount
 
     token = body.get("token")
-    ig_user_id = body.get("ig_user_id")
-    if not token or not ig_user_id:
-        raise HTTPException(status_code=400, detail="token and ig_user_id are required")
+    ig_user_ids = body.get("ig_user_ids")
+    if ig_user_ids is None:
+        single = body.get("ig_user_id")
+        ig_user_ids = [single] if single else []
+    if not token or not ig_user_ids:
+        raise HTTPException(status_code=400, detail="token and ig_user_ids are required")
 
     pending = await db["pending_instagram_connections"].find_one({"token": token})
     if not pending:
         raise HTTPException(status_code=404, detail="This connection session has expired — please reconnect Instagram.")
 
-    chosen = next((c for c in pending.get("candidates", []) if c["ig_user_id"] == ig_user_id), None)
-    if not chosen:
-        raise HTTPException(status_code=400, detail="That account wasn't part of this connection session.")
+    candidates_by_id = {c["ig_user_id"]: c for c in pending.get("candidates", [])}
+    chosen_list = [candidates_by_id[i] for i in ig_user_ids if i in candidates_by_id]
+    if not chosen_list:
+        raise HTTPException(status_code=400, detail="Those accounts weren't part of this connection session.")
 
     user_id = ctx["user_id"]
     brand_id = ctx["brand_id"]
     is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
     now = datetime.utcnow().isoformat()
 
-    conn_doc = {
-        "id": chosen["ig_user_id"],
-        "user_id": user_id,
-        "platform": "instagram",
-        "connected_via": "instagram_direct_oauth",
-        "ig_user_id": chosen["ig_user_id"],
-        "page_id": chosen["page_id"],
-        "page_access_token": chosen["page_access_token"],
-        "username": chosen["username"],
-        "account_name": chosen["username"],
-        "profile_picture_url": chosen.get("profile_picture_url"),
-        "connection_status": "active",
-        "connected_at": now,
-        "updated_at": now,
-    }
-    if not is_personal:
-        conn_doc["brand_id"] = brand_id
+    connected = []
+    for chosen in chosen_list:
+        conn_doc = {
+            "id": chosen["ig_user_id"],
+            "user_id": user_id,
+            "platform": "instagram",
+            "connected_via": "instagram_direct_oauth",
+            "ig_user_id": chosen["ig_user_id"],
+            "page_id": chosen["page_id"],
+            "page_access_token": chosen["page_access_token"],
+            "username": chosen["username"],
+            "account_name": chosen["username"],
+            "profile_picture_url": chosen.get("profile_picture_url"),
+            "connection_status": "active",
+            "connected_at": now,
+            "updated_at": now,
+        }
+        if not is_personal:
+            conn_doc["brand_id"] = brand_id
 
-    await db["social_connections"].update_one(
-        {"id": chosen["ig_user_id"]}, {"$set": conn_doc}, upsert=True,
-    )
-    await db["pending_instagram_connections"].delete_one({"token": token})
+        await db["social_connections"].update_one(
+            {"id": chosen["ig_user_id"]}, {"$set": conn_doc}, upsert=True,
+        )
+        connected.append({"ig_user_id": chosen["ig_user_id"], "username": chosen["username"]})
+
+    # Only the accounts the user picked are consumed — anything left in
+    # candidates that wasn't chosen this call stays available for a follow-up
+    # pick, so connecting one now doesn't burn the rest of the session.
+    remaining = [c for c in pending.get("candidates", []) if c["ig_user_id"] not in {r["ig_user_id"] for r in connected}]
+    if remaining:
+        await db["pending_instagram_connections"].update_one(
+            {"token": token}, {"$set": {"candidates": remaining}}
+        )
+    else:
+        await db["pending_instagram_connections"].delete_one({"token": token})
 
     return UriResponse.get_single_data_response("instagram_connected", {
-        "ig_user_id": chosen["ig_user_id"],
-        "username": chosen["username"],
+        "connected": connected,
+        "total": len(connected),
     })
 
 
