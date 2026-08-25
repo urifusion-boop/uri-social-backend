@@ -278,3 +278,31 @@ class TestStaleIndexRegression:
         _run(store.ingest(v2))
         assert _run(store.get("SEED-999", 1)) is not None
         assert _run(store.get("SEED-999", 2)).claim == "Second version."
+
+
+class TestNairaShorthand:
+    """A plain float() rejects "20k" and returns None, which reads downstream as
+    "no budget stated" — so Jane asks for the budget immediately after being told
+    it. Observed live: "we are using for leads, and budget is 20k"."""
+
+    def test_k_and_m_shorthand(self):
+        from app.agents.jane_ads.nl import parse_ngn
+        assert parse_ngn("20k") == 20_000
+        assert parse_ngn("20K") == 20_000
+        assert parse_ngn("1.5m") == 1_500_000
+
+    def test_naira_signs_and_separators(self):
+        from app.agents.jane_ads.nl import parse_ngn
+        assert parse_ngn("₦20,000") == 20_000
+        assert parse_ngn("N20k") == 20_000
+        assert parse_ngn("20,000") == 20_000
+
+    def test_plain_numbers_unchanged(self):
+        from app.agents.jane_ads.nl import parse_ngn
+        assert parse_ngn(20000) == 20_000
+        assert parse_ngn("20000") == 20_000
+
+    def test_junk_is_none_not_a_guess(self):
+        from app.agents.jane_ads.nl import parse_ngn
+        for v in ("abc", "", None, "twenty thousand"):
+            assert parse_ngn(v) is None

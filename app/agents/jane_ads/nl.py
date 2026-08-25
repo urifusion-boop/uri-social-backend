@@ -13,6 +13,7 @@ itself is live (non-deterministic) and degrades gracefully to "ask for more".
 from __future__ import annotations
 
 import json
+import re
 from typing import Optional
 
 import openai
@@ -155,10 +156,7 @@ async def parse_message(message: str, business_name: str = "", category: str = "
 def _coerce(data: dict, business_name: str, category: str) -> ParsedCampaign:
     """Normalize raw LLM JSON into a validated ParsedCampaign (defensive about types)."""
     def _num(v):
-        try:
-            return float(v) if v not in (None, "", "null") else None
-        except (TypeError, ValueError):
-            return None
+        return parse_ngn(v) if v not in (None, "", "null") else None
 
     def _int(v):
         n = _num(v)
@@ -211,3 +209,37 @@ def to_campaign_request(parsed: ParsedCampaign, business_id: str = "demo") -> Op
         has_existing_demand=parsed.has_existing_demand,
         geo=parsed.city,
     )
+
+
+# ── Naira shorthand ──────────────────────────────────────────────────────────
+_NGN_SHORTHAND = re.compile(
+    r"^\s*(?:₦|ngn|n)?\s*([0-9][0-9,\s]*(?:\.[0-9]+)?)\s*([km])?\s*$", re.I
+)
+
+
+def parse_ngn(value) -> Optional[float]:
+    """Parse a naira amount, including the shorthand clients actually type.
+
+    A plain float() rejects "20k" and returns None, which reads downstream as
+    "no budget stated" — so Jane asks for the budget again immediately after
+    being told it. Observed live: "we are using for leads, and budget is 20k".
+
+    Accepts 20000, "20000", "20,000", "₦20,000", "20k", "20K", "1.5m", "N20k".
+    """
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    m = _NGN_SHORTHAND.match(str(value))
+    if not m:
+        return None
+    digits, suffix = m.group(1), (m.group(2) or "").lower()
+    try:
+        n = float(digits.replace(",", "").replace(" ", ""))
+    except ValueError:
+        return None
+    if suffix == "k":
+        n *= 1_000
+    elif suffix == "m":
+        n *= 1_000_000
+    return n

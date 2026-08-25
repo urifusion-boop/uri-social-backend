@@ -137,13 +137,24 @@ def _corpus_block(corpus: Optional["RetrievalResult"]) -> str:
             line += f" (applies here only with this change: {r.modification_required})"
         lines.append(line)
     return (
-        "Validated tactics from our own strategy corpus, observed at Nigerian SME "
-        "budgets. Use them to sharpen 'why_this_could_work' where one genuinely fits "
-        "a plan you already formed. Do NOT turn a tactic into a plan — a tactic is "
-        "not an audience strategy — and do NOT let them shape 'trade_off', which is "
-        "your own reasoning from the plan's economics:\n"
+        "## HOUSE RULES — these override your defaults\n"
+        "The following are our own validated findings at Nigerian SME budgets. They "
+        "are not background reading: apply them to the plans you produce.\n\n"
         + "\n".join(lines)
         + "\n\n"
+        "How to apply them:\n"
+        "- Where a finding constrains HOW you describe an audience or an offer, follow "
+        "it. If one says to describe audiences by life stage and observable behaviour "
+        "rather than demographic labels, then 'tech enthusiasts' is a failing answer "
+        "and 'finance teams who just moved onto a new accounting system' is a passing "
+        "one.\n"
+        "- In 'why_this_could_work', give the actual reason this buyer spends money, "
+        "drawing on the finding that applies. Do not restate the audience back as its "
+        "own justification.\n"
+        "- Do NOT turn a finding into a plan. A tactic is not an audience strategy — "
+        "five tactics dressed as five plans is a failed answer.\n"
+        "- Do NOT let them touch 'trade_off'. That is your own reasoning from this "
+        "plan's economics — deal size, cycle length, reachability.\n\n"
     )
 
 
