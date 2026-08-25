@@ -1728,6 +1728,7 @@ async def _build_campaign_plan(
             city=parsed.city, service_area=service_area,
             audience_segment=variant_segment, who_its_for=variant_who_its_for,
             geo_pockets=variant_geo_pockets,
+            budget_ngn=float(parsed.budget_ngn or 0),
         )
     elif body.creative_source == "recomposite":
         creative = await creative_from_recomposite(
