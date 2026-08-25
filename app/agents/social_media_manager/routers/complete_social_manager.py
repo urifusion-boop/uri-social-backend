@@ -1743,7 +1743,7 @@ async def instagram_direct_pending(token: str, db: AsyncIOMotorDatabase = Depend
 async def instagram_direct_finalize_pending(
     body: Dict[str, Any],
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """
     Called once the user picks which Instagram account(s) to connect from the
@@ -1953,7 +1953,7 @@ async def disconnect_social_account(
 async def disconnect_all_for_platform(
     platform: str,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    ctx: dict = Depends(get_active_brand_context),
+    ctx: dict = Depends(get_flexible_brand_context),
 ):
     """
     Disconnect every currently-connected account for one platform, for the
