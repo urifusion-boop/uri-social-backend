@@ -245,6 +245,43 @@ async def _retrieve_for_plan_generation(
         return None
 
 
+
+async def _structure_notes(db, budget_ngn: float, duration_days: int = 0) -> list[dict]:
+    """Corpus findings for campaign structure (spec §12), attached to the stored plan
+    as auditable notes — NOT fed into the build.
+
+    §12 is explicit that tier rules take precedence over corpus records: a record
+    proposing a structure the tier forbids should never have passed the filter, and
+    one reaching this point that violates tier rules is a filter defect. The
+    structure decisions themselves (ABO/CBO, ad-set count, pacing) are deterministic
+    arithmetic in decision_engine, so the corpus records here are review material for
+    the operator, not an input the engine should follow.
+    """
+    try:
+        from .entities import ConsumedBy, StrategyPlatform
+        from .retrieval import BudgetContext, BusinessProfile, RetrievalRequest, retrieve
+        from .store import MongoStrategyStore
+        if not budget_ngn or budget_ngn <= 0:
+            return []
+        days = duration_days or C.DEFAULT_CAMPAIGN_DAYS
+        daily = budget_ngn / (1 + C.VAT_RATE) / max(days, 1)
+        req = RetrievalRequest(
+            stage=ConsumedBy.CAMPAIGN_STRUCTURE,
+            platforms=[StrategyPlatform.META],
+            budget=BudgetContext(daily_spend_ngn=daily, budget_tier=_budget_tier(budget_ngn)),
+            profile=BusinessProfile(),
+        )
+        res = retrieve(await MongoStrategyStore(db).fetch_approved(), req)
+        return [
+            {"record_id": r.strategy_id, "version": r.version,
+             "claim": r.claim, "score": res.scores.get(r.strategy_id, 0.0)}
+            for r in res.records
+        ]
+    except Exception as e:                       # noqa: BLE001
+        print(f"[oneshot] structure notes skipped: {e}", flush=True)
+        return []
+
+
 def _budget_tier(budget_ngn: float) -> int:
     """Spec §5.4 — tier gates structure, separately from the daily-spend floor."""
     if budget_ngn < 15_000:
@@ -2118,6 +2155,9 @@ async def meta_plan_from_message(
         "understood": built.understood,
         "budget_estimate": built.budget_estimate,
         "summary": built.summary,
+        # Advisory only — the build is already decided; tier rules take
+        # precedence over corpus records (§12). Stored for operator review.
+        "corpus_structure_notes": await _structure_notes(db, float(built.req.budget_ngn or 0)),
         "thread_id": built.thread_id,
         "variant_group_id": built.variant_group_id,
         "selected_plan_variant": built.selected_plan_variant,
