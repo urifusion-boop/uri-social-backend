@@ -1765,7 +1765,6 @@ async def _build_campaign_plan(
             city=parsed.city, service_area=service_area,
             audience_segment=variant_segment, who_its_for=variant_who_its_for,
             geo_pockets=variant_geo_pockets,
-            budget_ngn=float(parsed.budget_ngn or 0),
         )
     elif body.creative_source == "recomposite":
         creative = await creative_from_recomposite(
@@ -1812,6 +1811,9 @@ async def _build_campaign_plan(
             behaviour=plan.behaviour.value, service_area=service_area,
             audience_segment=variant_segment, who_its_for=variant_who_its_for,
             geo_pockets=variant_geo_pockets,
+            # Drives creative-stage retrieval; without it budget is 0, retrieval
+            # bails early, and the ad ships with corpus_coverage="none".
+            budget_ngn=float(parsed.budget_ngn or 0),
         )
         if creative.image_url:
             # "reason" is a strict Literal on CreditTransaction — "campaign_generation"
