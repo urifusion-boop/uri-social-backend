@@ -2,7 +2,7 @@
 
 import base64
 import re
-from typing import List
+from typing import Any, Dict, List
 from app.utils.cloudinary_upload import upload_bytes
 
 
@@ -12,7 +12,7 @@ class UserMediaStorageService:
     """
 
     @staticmethod
-    async def upload_user_media(base64_data_urls: List[str], user_id: str) -> List[str]:
+    async def upload_user_media(base64_data_urls: List[str], user_id: str) -> List[Dict[str, Any]]:
         """
         Upload multiple user media files (images or videos) to Cloudinary.
 
@@ -21,12 +21,15 @@ class UserMediaStorageService:
             user_id: User ID for organizing uploads in Cloudinary folder
 
         Returns:
-            List of public Cloudinary URLs
+            List of {"url": <public Cloudinary URL>, "is_video": <bool>} — callers need
+            to know which uploads are video, since drafts store them in a different
+            field (video_url) than images (image_url), and video can't be sent through
+            the same PIL-based overlay / vision-analysis steps images go through.
 
         Raises:
             ValueError: If data URL format is invalid or file type unsupported
         """
-        uploaded_urls = []
+        uploaded_media = []
 
         for idx, data_url in enumerate(base64_data_urls):
             # Parse data URL: data:image/png;base64,iVBORw0KGgo...
@@ -69,10 +72,10 @@ class UserMediaStorageService:
                     folder=folder,
                     resource_type=resource_type
                 )
-                uploaded_urls.append(url)
+                uploaded_media.append({"url": url, "is_video": is_video})
                 print(f"✅ Uploaded user media {idx + 1}/{len(base64_data_urls)}: {url[:100]}...")
             except Exception as e:
                 print(f"❌ Failed to upload media at index {idx}: {e}")
                 raise ValueError(f"Failed to upload media at index {idx}: {e}")
 
-        return uploaded_urls
+        return uploaded_media
