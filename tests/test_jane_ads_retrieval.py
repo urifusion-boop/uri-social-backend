@@ -487,3 +487,46 @@ class TestMotorTruthiness:
         src = inspect.getsource(creative.generate_ad_creative)
         assert "if db is not None else None" in src
         assert "has_video=False) if db else" not in src
+
+
+class TestCreativeCorpusReachesShippedCopy:
+    """generate_ad_creative writes copy twice: write_ad_copy, then
+    write_ad_copy_for_image after the image exists — and the second OVERWRITES the
+    first. Passing the corpus only to the first meant it shaped copy that was then
+    discarded, which is why the first live test showed no change in the ad."""
+
+    def test_vision_rewrite_accepts_a_corpus(self):
+        import inspect
+        from app.agents.jane_ads import creative
+        assert "corpus" in inspect.signature(creative.write_ad_copy_for_image).parameters
+
+    def test_vision_rewrite_is_given_the_corpus(self):
+        import inspect
+        from app.agents.jane_ads import creative
+        src = inspect.getsource(creative.generate_ad_creative)
+        assert "corpus=corpus," in src
+
+    def test_both_copy_prompts_carry_the_rules(self):
+        import inspect
+        from app.agents.jane_ads import creative
+        for fn in (creative.write_ad_copy, creative.write_ad_copy_for_image):
+            assert "_corpus_rules(corpus)" in inspect.getsource(fn), fn.__name__
+
+    def test_creative_carries_citations(self):
+        from app.agents.jane_ads.models import AdCreative
+        a = AdCreative()
+        assert a.corpus_coverage == "none"
+        assert a.corpus_citations == []
+
+
+class TestAdImageCta:
+    """Every Jane ad routes to WhatsApp, so the image must not carry the brand's
+    generic website CTA. Live-observed: a click-to-WhatsApp ad whose creative read
+    "Visit our website" while the copy said "message me to order"."""
+
+    def test_image_cta_is_overridden_to_whatsapp(self):
+        import inspect
+        from app.agents.jane_ads import creative
+        src = inspect.getsource(creative.generate_ad_creative)
+        assert '"override_cta": "Message us on WhatsApp"' in src
+        assert "generate_ad_image(content_for_image, image_brand_context" in src

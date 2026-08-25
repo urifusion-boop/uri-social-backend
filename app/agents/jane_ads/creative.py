@@ -692,7 +692,8 @@ async def write_ad_copy_for_image(image_summary: str, business_name: str, catego
                                   brand_context: Optional[dict] = None, city: str = "",
                                   service_area: str = "", audience_segment: str = "",
                                   who_its_for: str = "",
-                                  geo_pockets: Optional[list[str]] = None) -> AdCopy:
+                                  geo_pockets: Optional[list[str]] = None,
+                                  corpus: Optional["RetrievalResult"] = None) -> AdCopy:
     """Write the headline + primary text to MATCH a specific image (its vision description),
     so the caption references what's actually on screen instead of a generic line. Returns
     an AdCopy with only headline + primary_text set.
@@ -733,6 +734,7 @@ async def write_ad_copy_for_image(image_summary: str, business_name: str, catego
         f"The ad's IMAGE shows: {image_summary}.\n"
         f"Context: {description or 'none'}\n"
         f"{_register_rules_block()}\n"
+        f"{_corpus_rules(corpus)}"
         "Write copy that clearly connects to what's in the image above — the headline and "
         "body should feel like they belong with that visual, not generic.\n"
         "Return JSON with:\n"
@@ -900,22 +902,41 @@ async def generate_ad_creative(
     # Image via the SAME content engine normal posts use (better visuals). Seed it with the
     # scene idea; content conveys the theme/message so the graphic is on-topic.
     content_for_image = copy.primary_text or copy.image_prompt or f"{business_name} — {description or category}"
-    image_url = await generate_ad_image(content_for_image, brand_context, seed=copy.image_prompt)
+    # Every Jane ad routes to WhatsApp (AdCreative.cta is fixed), so the image must not
+    # carry the brand's generic website CTA. Live-observed: a click-to-WhatsApp ad whose
+    # creative read "Visit our website" while the copy said "message me to order" — two
+    # different destinations on one ad, and these users often have no website at all.
+    image_brand_context = {**(brand_context or {}), "override_cta": "Message us on WhatsApp"}
+    image_url = await generate_ad_image(content_for_image, image_brand_context, seed=copy.image_prompt)
     # Caption LAST, matched to the actual generated image (vision) so it references the
     # real visual instead of a generic line ("caption doesn't add up"). Falls back to the
     # original copy if the vision pass fails.
     if image_url:
         summary = await describe_ad_image(image_url)
         if summary:
+            # Same corpus as write_ad_copy above: this call OVERWRITES headline and
+            # primary_text, so without it the corpus shapes copy that is then discarded
+            # — which is exactly why the first live test showed no change in the ad.
             matched = await write_ad_copy_for_image(
                 summary, business_name, category, goal, description, brand_context, city,
                 service_area, audience_segment, who_its_for, geo_pockets=geo_pockets,
+                corpus=corpus,
             )
             if matched.headline:
                 copy.headline = matched.headline
             if matched.primary_text:
                 copy.primary_text = matched.primary_text
-    return assemble_creative(copy, image_url, source=CreativeSource.GENERATE, service_area=service_area)
+    ad = assemble_creative(copy, image_url, source=CreativeSource.GENERATE, service_area=service_area)
+    if corpus is not None:
+        from .models import StrategyCitation
+        ad.corpus_coverage = corpus.coverage
+        ad.corpus_citations = [
+            StrategyCitation(record_id=r.strategy_id, version=r.version,
+                             stage="creative_brief",
+                             score=corpus.scores.get(r.strategy_id, 0.0))
+            for r in corpus.records
+        ]
+    return ad
 
 
 async def creative_from_upload(

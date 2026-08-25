@@ -299,6 +299,11 @@ class AdCreative(BaseModel):
     DRAFT and RECOMPOSITE can carry either — `is_video` says which."""
     image_url: str = ""             # final creative media URL, hosted on Cloudinary
     is_video: bool = False           # True when image_url is actually a video
+    # Which corpus records shaped this copy, pinned at version. Without this there is
+    # no way to tell from the outside whether the corpus reached the creative stage or
+    # was silently ignored — the position the first live test left us in.
+    corpus_coverage: str = "none"                     # none | partial | full
+    corpus_citations: list[StrategyCitation] = Field(default_factory=list)
     headline: str = ""
     primary_text: str = ""
     cta: str = "Send WhatsApp Message"
