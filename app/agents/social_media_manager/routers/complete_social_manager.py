@@ -1903,73 +1903,89 @@ async def instagram_direct_callback(
                 err_msg = "No Facebook Pages found. Link your Instagram Business Account to a Facebook Page first."
                 return RedirectResponse(f"{base_redirect}?connected=false&error={urllib.parse.quote(err_msg)}")
 
-            # Step 4: find Instagram Business Account linked to one of the pages
-            ig_user_id = None
-            username = None
-            profile_picture_url = None
-            page_token = None
-
+            # Step 4: find every Instagram Business Account linked to any of the
+            # user's Facebook Pages — not just the first one. A user managing
+            # several Pages, each with its own linked Instagram account, gets to
+            # choose which one to connect instead of silently getting whichever
+            # Page happened to come first in Meta's response.
+            candidates = []
             for page in pages:
                 pid = page["id"]
                 ptok = page.get("access_token", long_token)
                 ig_resp = await client.get(
                     f"https://graph.facebook.com/v20.0/{pid}",
-                    params={"fields": "instagram_business_account", "access_token": ptok},
+                    params={"fields": "instagram_business_account,name", "access_token": ptok},
                 )
                 ig_data = ig_resp.json()
                 ig_account = ig_data.get("instagram_business_account")
-                if ig_account:
-                    ig_user_id = str(ig_account["id"])
-                    # Store the user's long-lived token instead of page token
-                    # The long_token has instagram_content_publish permission
-                    page_token = long_token
-                    # Step 5: fetch Instagram profile
-                    profile_resp = await client.get(
-                        f"https://graph.facebook.com/v20.0/{ig_user_id}",
-                        params={"fields": "id,username,name,profile_picture_url", "access_token": long_token},
-                    )
-                    profile = profile_resp.json()
-                    print(f"[IGDirectOAuth] ig profile: {profile}")
-                    username = profile.get("username", ig_user_id)
-                    profile_picture_url = profile.get("profile_picture_url")
-                    break
+                if not ig_account:
+                    continue
+                ig_user_id = str(ig_account["id"])
+                # Step 5: fetch Instagram profile for this candidate
+                profile_resp = await client.get(
+                    f"https://graph.facebook.com/v20.0/{ig_user_id}",
+                    params={"fields": "id,username,name,profile_picture_url", "access_token": long_token},
+                )
+                profile = profile_resp.json()
+                print(f"[IGDirectOAuth] ig profile for page {pid}: {profile}")
+                candidates.append({
+                    "ig_user_id": ig_user_id,
+                    "page_id": pid,
+                    "page_name": ig_data.get("name") or page.get("name"),
+                    "username": profile.get("username", ig_user_id),
+                    "profile_picture_url": profile.get("profile_picture_url"),
+                    # Store the user's long-lived token instead of the page token —
+                    # it carries instagram_content_publish permission.
+                    "page_access_token": long_token,
+                })
 
-            if not ig_user_id:
+            if not candidates:
                 err_msg = "No Instagram Business Account found linked to your Facebook Pages."
                 return RedirectResponse(f"{base_redirect}?connected=false&error={urllib.parse.quote(err_msg)}")
 
-        # Step 6: store in social_connections
-        # Use id (the unique indexed field) as the upsert key so reconnecting
-        # never hits a duplicate-key error regardless of how the old record was stored.
         now = datetime.now(timezone.utc).isoformat()
-        conn_doc = {
-            "id": ig_user_id,
-            "user_id": None,  # matched when user calls /connections after redirect
-            "platform": "instagram",
-            "connected_via": "instagram_direct_oauth",
-            "ig_user_id": ig_user_id,
-            "page_id": pid,  # Facebook Page ID linked to this Instagram account
-            "page_access_token": page_token,
-            "username": username,
-            "account_name": username,
-            "profile_picture_url": profile_picture_url,
-            "connection_status": "pending_user_match",
-            "connected_at": now,
-            "updated_at": now,
-        }
-        await db["social_connections"].update_one(
-            {"id": ig_user_id},
-            {"$set": conn_doc},
-            upsert=True,
-        )
-        print(f"[IGDirectOAuth] ✅ Stored @{username} (ig_user_id={ig_user_id}) pending user match")
 
-        params_out = (
-            f"connected=instagram_direct"
-            f"&ig_user_id={urllib.parse.quote(ig_user_id)}"
-            f"&username={urllib.parse.quote(username)}"
-        )
-        # base_redirect already has ?tab=connections so append with &
+        # Exactly one candidate — nothing to choose between, connect it directly
+        # exactly as before (unchanged behaviour for the common case).
+        if len(candidates) == 1:
+            c = candidates[0]
+            conn_doc = {
+                "id": c["ig_user_id"],
+                "user_id": None,  # matched when user calls /connections after redirect
+                "platform": "instagram",
+                "connected_via": "instagram_direct_oauth",
+                "ig_user_id": c["ig_user_id"],
+                "page_id": c["page_id"],
+                "page_access_token": c["page_access_token"],
+                "username": c["username"],
+                "account_name": c["username"],
+                "profile_picture_url": c["profile_picture_url"],
+                "connection_status": "pending_user_match",
+                "connected_at": now,
+                "updated_at": now,
+            }
+            await db["social_connections"].update_one(
+                {"id": c["ig_user_id"]}, {"$set": conn_doc}, upsert=True,
+            )
+            print(f"[IGDirectOAuth] ✅ Stored @{c['username']} (ig_user_id={c['ig_user_id']}) pending user match")
+            params_out = (
+                f"connected=instagram_direct"
+                f"&ig_user_id={urllib.parse.quote(c['ig_user_id'])}"
+                f"&username={urllib.parse.quote(c['username'])}"
+            )
+            return RedirectResponse(f"{base_redirect}&{params_out}")
+
+        # Multiple candidates — stash them and let the user pick, same idea as
+        # the Outstand picker but self-contained (no Outstand involved here).
+        import secrets
+        token = secrets.token_urlsafe(24)
+        await db["pending_instagram_connections"].insert_one({
+            "token": token,
+            "candidates": candidates,
+            "created_at": datetime.utcnow(),
+        })
+        print(f"[IGDirectOAuth] {len(candidates)} Instagram candidates — awaiting user pick (token={token})")
+        params_out = f"connected=instagram_pending&token={urllib.parse.quote(token)}"
         return RedirectResponse(f"{base_redirect}&{params_out}")
 
     except Exception as e:
@@ -2006,6 +2022,94 @@ async def instagram_direct_finalize(
         raise HTTPException(status_code=404, detail="Instagram connection not found — try reconnecting")
 
     return UriResponse.get_single_data_response("instagram_connected", {"ig_user_id": ig_user_id})
+
+
+@router.get("/connect/instagram-direct/pending/{token}")
+async def instagram_direct_pending(token: str, db: AsyncIOMotorDatabase = Depends(get_db_dependency)):
+    """
+    Returns the Instagram account candidates awaiting a user pick, stashed by
+    the callback when more than one Facebook Page had a linked Instagram
+    Business Account. No JWT required — reachable right after the OAuth
+    redirect, same as the Outstand pending-connection endpoint.
+    """
+    pending = await db["pending_instagram_connections"].find_one({"token": token})
+    if not pending:
+        return UriResponse.error_response(
+            "This connection session has expired — please reconnect Instagram.", code=404
+        )
+    return UriResponse.get_single_data_response("pending_instagram_connection", {
+        "token": token,
+        "candidates": [
+            {
+                "ig_user_id": c["ig_user_id"],
+                "page_name": c.get("page_name"),
+                "username": c.get("username"),
+                "profile_picture_url": c.get("profile_picture_url"),
+            }
+            for c in pending.get("candidates", [])
+        ],
+    })
+
+
+@router.post("/connect/instagram-direct/finalize-pending")
+async def instagram_direct_finalize_pending(
+    body: Dict[str, Any],
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    ctx: dict = Depends(get_active_brand_context),
+):
+    """
+    Called once the user picks which Instagram account to connect from the
+    picker. Stores the chosen candidate directly as active (unlike the
+    single-candidate path, this call is already authenticated, so there's no
+    separate pending_user_match step needed) and discards the rest.
+    """
+    from app.models.brand_account import BrandAccount
+
+    token = body.get("token")
+    ig_user_id = body.get("ig_user_id")
+    if not token or not ig_user_id:
+        raise HTTPException(status_code=400, detail="token and ig_user_id are required")
+
+    pending = await db["pending_instagram_connections"].find_one({"token": token})
+    if not pending:
+        raise HTTPException(status_code=404, detail="This connection session has expired — please reconnect Instagram.")
+
+    chosen = next((c for c in pending.get("candidates", []) if c["ig_user_id"] == ig_user_id), None)
+    if not chosen:
+        raise HTTPException(status_code=400, detail="That account wasn't part of this connection session.")
+
+    user_id = ctx["user_id"]
+    brand_id = ctx["brand_id"]
+    is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
+    now = datetime.utcnow().isoformat()
+
+    conn_doc = {
+        "id": chosen["ig_user_id"],
+        "user_id": user_id,
+        "platform": "instagram",
+        "connected_via": "instagram_direct_oauth",
+        "ig_user_id": chosen["ig_user_id"],
+        "page_id": chosen["page_id"],
+        "page_access_token": chosen["page_access_token"],
+        "username": chosen["username"],
+        "account_name": chosen["username"],
+        "profile_picture_url": chosen.get("profile_picture_url"),
+        "connection_status": "active",
+        "connected_at": now,
+        "updated_at": now,
+    }
+    if not is_personal:
+        conn_doc["brand_id"] = brand_id
+
+    await db["social_connections"].update_one(
+        {"id": chosen["ig_user_id"]}, {"$set": conn_doc}, upsert=True,
+    )
+    await db["pending_instagram_connections"].delete_one({"token": token})
+
+    return UriResponse.get_single_data_response("instagram_connected", {
+        "ig_user_id": chosen["ig_user_id"],
+        "username": chosen["username"],
+    })
 
 
 @router.get("/connect/callback/outstand")
@@ -2200,6 +2304,25 @@ async def disconnect_social_account(
         db=db,
         user_id=ctx["user_id"],
         outstand_account_id=outstand_account_id,
+        brand_id=ctx["brand_id"],
+    )
+
+
+@router.delete("/connections/platform/{platform}")
+async def disconnect_all_for_platform(
+    platform: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    ctx: dict = Depends(get_active_brand_context),
+):
+    """
+    Disconnect every currently-connected account for one platform, for the
+    active brand — the "Disconnect All" action when multiple pages/accounts
+    are connected to the same platform.
+    """
+    return await SocialAccountService.disconnect_all_for_platform(
+        db=db,
+        user_id=ctx["user_id"],
+        platform=platform,
         brand_id=ctx["brand_id"],
     )
 
