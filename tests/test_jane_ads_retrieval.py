@@ -530,3 +530,30 @@ class TestAdImageCta:
         src = inspect.getsource(creative.generate_ad_creative)
         assert '"override_cta": "Message us on WhatsApp"' in src
         assert "generate_ad_image(content_for_image, image_brand_context" in src
+
+
+class TestCreativeCallSites:
+    """A kwarg landed on the wrong function after a merge: budget_ngn went to
+    creative_from_upload, which has no such parameter (a latent TypeError on the
+    "Upload my own" path), while generate_ad_creative — the one that actually reads
+    the corpus — got none, so every generated ad shipped corpus_coverage="none".
+    Verified live: the 13:31 build had coverage none and zero citations."""
+
+    def test_only_generate_accepts_budget(self):
+        import inspect
+        from app.agents.jane_ads import creative as c
+        assert "budget_ngn" in inspect.signature(c.generate_ad_creative).parameters
+        for fn in (c.creative_from_upload, c.creative_from_recomposite):
+            assert "budget_ngn" not in inspect.signature(fn).parameters, fn.__name__
+
+    def test_router_passes_budget_only_where_supported(self):
+        src = open("app/agents/jane_ads/router.py").read()
+        import re
+        for m in re.finditer(r"(creative_from_upload|creative_from_recomposite)\((.*?)\n        \)",
+                             src, re.S):
+            assert "budget_ngn=" not in m.group(2), f"{m.group(1)} would TypeError"
+
+    def test_generate_call_site_supplies_budget(self):
+        src = open("app/agents/jane_ads/router.py").read()
+        i = src.index("creative = await generate_ad_creative(")
+        assert "budget_ngn=float(parsed.budget_ngn or 0)" in src[i:i+900]
