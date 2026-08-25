@@ -21,6 +21,7 @@ plan_defence.py).
 from __future__ import annotations
 
 import json
+import re
 from typing import Optional
 
 import openai
@@ -113,6 +114,30 @@ def _variant_fields_block() -> str:
         "jobs\" / \"fewer enquiries, much bigger jobs\"), never fabricated precision."
     )
 
+
+
+
+# A plan card must say what the buyer is DOING, not name a category and assert a
+# need. The field instruction already forbids the label form, and the corpus block
+# repeats it (SEED-023: describe by life stage and observable behaviour, not
+# demographic label) — the model still produced "businesses needing efficient tech
+# solutions" and "start-ups in need of scalable tech infrastructures" on two
+# consecutive live runs. Restating it a third time was not going to work, so the
+# constraint moved out of the prompt and into a check with one corrective retry.
+_LABEL_SHAPE = re.compile(
+    r"\b(?:needing|in need of|seeking|looking for|wanting|requiring|interested in)\b"
+    r"|\b(?:solutions?|services?|products?|infrastructures?|offerings?)\s*$",
+    re.I,
+)
+
+
+def label_shaped(who_its_for: str) -> bool:
+    """True when who_its_for reads as a category plus a need rather than a situation.
+
+    Passes: "people fitting out a new place", "individuals setting up home offices".
+    Fails:  "businesses needing efficient tech solutions".
+    """
+    return bool(_LABEL_SHAPE.search((who_its_for or "").strip()))
 
 
 def _corpus_block(corpus: Optional["RetrievalResult"]) -> str:
@@ -219,6 +244,40 @@ async def generate_plan_variants(
             timeout=35,
         )
         data = json.loads(resp.choices[0].message.content or "{}")
+
+        # One corrective retry, naming the offenders. The instruction exists twice
+        # in the prompt already; what it lacked was a consequence.
+        offenders = [
+            str(v.get("who_its_for", ""))
+            for v in (data.get("variants") or [])
+            if label_shaped(str(v.get("who_its_for", "")))
+        ]
+        if offenders:
+            print(f"[PlanVariants] label-shaped who_its_for, retrying: {offenders}", flush=True)
+            retry = await client.chat.completions.create(
+                model="gpt-4o",
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": resp.choices[0].message.content or ""},
+                    {"role": "user", "content": (
+                        "These who_its_for values name a category and assert a need, "
+                        f"instead of describing what the buyer is doing: {offenders}.\n"
+                        "Rewrite EVERY variant's who_its_for as the situation the buyer "
+                        "is in — something observable that is happening to them right "
+                        "now. 'businesses needing efficient tech solutions' is a "
+                        "failure; 'finance teams who just moved onto a new accounting "
+                        "system' is correct. Never use needing / in need of / seeking / "
+                        "looking for, and never end on solutions, services or "
+                        "infrastructure.\n"
+                        "Keep everything else identical. Return the same JSON shape."
+                    )},
+                ],
+                timeout=35,
+            )
+            retried = json.loads(retry.choices[0].message.content or "{}")
+            if retried.get("variants"):
+                data = retried
     except Exception as e:
         print(f"[PlanVariants] generation error: {e}", flush=True)
         raise PlanVariantsUnavailableError(str(e)) from e
