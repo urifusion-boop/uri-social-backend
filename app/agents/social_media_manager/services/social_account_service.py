@@ -168,6 +168,20 @@ class SocialAccountService:
 
             now = datetime.utcnow()
             stored = []
+            brand_scope = {"user_id": user_id} if is_personal else {"brand_id": brand_id}
+
+            # Wipe existing connections for every network being (re)connected in
+            # this batch — ONCE, before the loop. Doing this per-account inside
+            # the loop (the previous approach) meant finalizing page B deleted
+            # page A's own record from earlier in the very same loop, via the
+            # platform-wide clause — so selecting multiple pages of the same
+            # platform in the picker could never leave more than one connected
+            # locally, no matter how many were actually selected. Outstand's own
+            # side was never affected by this — only our local mirror was.
+            networks_in_batch = {acc.get("network") for acc in accounts if acc.get("network")}
+            for network in networks_in_batch:
+                await db["social_connections"].delete_many({**brand_scope, "platform": network})
+
             for acc in accounts:
                 outstand_account_id = acc.get("id")
                 network = acc.get("network")
@@ -190,15 +204,19 @@ class SocialAccountService:
                 if not is_personal:
                     doc["brand_id"] = brand_id
 
-                # Scope the delete to this brand so we don't wipe another brand's connection
-                brand_scope = {"user_id": user_id} if is_personal else {"brand_id": brand_id}
-                await db["social_connections"].delete_many({
-                    "$or": [
-                        {"id": outstand_account_id},
-                        {**brand_scope, "platform": network},
-                    ]
-                })
+                # Exact-id cleanup only, for idempotent re-finalize of the same
+                # account within this batch — the platform-wide wipe already
+                # happened once, above.
+                await db["social_connections"].delete_one({"id": outstand_account_id})
                 await db["social_connections"].insert_one(doc)
+
+                # A fresh, intentional (re)connect un-hides this account if the
+                # customer had previously disconnected it — otherwise it would
+                # stay filtered out of their own newly-reconnected list forever.
+                await db["disconnected_accounts"].delete_many({
+                    **brand_scope, "outstand_account_id": outstand_account_id,
+                })
+
                 stored.append({
                     "outstand_account_id": outstand_account_id,
                     "platform": network,
@@ -265,11 +283,26 @@ class SocialAccountService:
 
         by_platform: Dict[str, list] = {}
 
+        # Accounts the customer explicitly disconnected — filtered out below
+        # regardless of what Outstand's live list or the local mirror still
+        # say, since Outstand's own side-delete can silently fail or lag
+        # behind indefinitely. See disconnect_account for where this is
+        # written; a fresh reconnect through finalize_connection clears it.
+        tombstone_scope = {"user_id": user_id} if is_personal else {"brand_id": brand_id}
+        disconnected_ids = {
+            doc["outstand_account_id"]
+            async for doc in db["disconnected_accounts"].find(
+                tombstone_scope, {"outstand_account_id": 1}
+            )
+        }
+
         # 1. Outstand-managed accounts — failures must not prevent direct connections
         try:
             outstand = OutstandService()
             result = await outstand.list_accounts(tenant_id=tenant)
             for acc in result.get("data", []):
+                if acc.get("id") in disconnected_ids:
+                    continue
                 platform = acc.get("network", "unknown")
                 by_platform.setdefault(platform, []).append({
                     "outstand_account_id": acc.get("id"),
@@ -299,6 +332,8 @@ class SocialAccountService:
                 platform = doc.get("platform", "unknown")
                 doc_outstand_id = doc.get("outstand_account_id") or doc.get("id")
                 if doc_outstand_id and doc_outstand_id in outstand_ids_seen:
+                    continue
+                if doc_outstand_id and doc_outstand_id in disconnected_ids:
                     continue
                 by_platform.setdefault(platform, []).append({
                     "platform": platform,
@@ -340,7 +375,17 @@ class SocialAccountService:
         """
         Permanently disconnect a social account scoped to the active brand.
         outstand_account_id is the ID returned by Outstand (e.g. '9dyJS').
+
+        Always ends by recording this id in `disconnected_accounts`,
+        regardless of whether the local mirror or the Outstand-side delete
+        actually succeeded. get_user_connections filters every read against
+        that record, so the account stops appearing to this customer
+        immediately and permanently — even if Outstand's own delete keeps
+        silently failing behind the scenes. That's deliberate: making
+        disconnect visibly work for the customer must not depend on a
+        third party's cooperation.
         """
+        import asyncio
         from app.models.brand_account import BrandAccount
         is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
         personal_bid = BrandAccount.personal_brand_id(user_id)
@@ -376,29 +421,120 @@ class SocialAccountService:
                 flush=True,
             )
 
-        # Best-effort Outstand delete — log failures but always return success to the user.
+        # Best-effort Outstand delete, with a couple of retries — a transient
+        # timeout/500 on Outstand's side is common and often just needs a
+        # second attempt. Every failure mode (404/500/timeout/auth) still
+        # collapses to a generic exception here; the tombstone write below is
+        # what actually makes the disconnect stick regardless of how this
+        # resolves.
         outstand_ok = False
-        try:
-            await outstand.delete_account(outstand_account_id)
-            outstand_ok = True
-        except Exception as e:
+        last_error: Optional[Exception] = None
+        for attempt in range(3):
+            try:
+                await outstand.delete_account(outstand_account_id)
+                outstand_ok = True
+                break
+            except Exception as e:
+                last_error = e
+                if attempt < 2:
+                    await asyncio.sleep(1.5 * (attempt + 1))
+        if not outstand_ok:
             print(
-                f"[Disconnect] Outstand delete failed for {outstand_account_id}: {e}",
+                f"[Disconnect] Outstand delete failed for {outstand_account_id} "
+                f"after 3 attempts: {last_error}",
                 flush=True,
             )
 
-        # If neither local DB nor Outstand had the account, it's genuinely missing.
-        if del_result.deleted_count == 0 and not outstand_ok:
-            return UriResponse.error_response(
-                "Account not found — it may have already been disconnected.", code=404
-            )
+        # Tombstone regardless of the outcome above — see docstring.
+        now = datetime.utcnow()
+        tombstone_scope = {"user_id": user_id} if is_personal else {"brand_id": brand_id}
+        await db["disconnected_accounts"].update_one(
+            {**tombstone_scope, "outstand_account_id": outstand_account_id},
+            {"$set": {
+                **tombstone_scope,
+                "outstand_account_id": outstand_account_id,
+                "platform": local.get("platform") if local else None,
+                "disconnected_at": now,
+                "outstand_delete_confirmed": outstand_ok,
+            }},
+            upsert=True,
+        )
 
         return UriResponse.get_single_data_response("disconnection", {
             "outstand_account_id": outstand_account_id,
             "platform": local.get("platform") if local else None,
             "username": local.get("username") if local else None,
             "status": "disconnected",
-            "disconnected_at": datetime.utcnow().isoformat(),
+            "disconnected_at": now.isoformat(),
+        })
+
+    # -------------------------------------------------------------------------
+    # 5b. Disconnect all accounts for one platform — "Disconnect All"
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    async def disconnect_all_for_platform(
+        db: AsyncIOMotorDatabase,
+        user_id: str,
+        platform: str,
+        brand_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Disconnect every currently-visible account for one platform, scoped to
+        the active brand — Outstand-managed AND direct-OAuth accounts alike.
+        Reuses get_user_connections to find exactly what the customer would
+        see connected right now.
+
+        Outstand-managed accounts (have outstand_account_id) go through the
+        same disconnect_account path individually (retries + tombstone), same
+        as clicking Disconnect on that one row. Direct-OAuth accounts
+        (facebook_direct/instagram_direct/tiktok_direct — never touched
+        Outstand, so there's nothing on a third party to retry or tombstone
+        against) are just removed from the local mirror directly; a plain
+        delete is already permanent for these since nothing external can make
+        them reappear.
+        """
+        from app.models.brand_account import BrandAccount
+        is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
+        personal_bid = BrandAccount.personal_brand_id(user_id)
+        if is_personal:
+            brand_scope = {
+                "user_id": user_id,
+                "$or": [
+                    {"brand_id": {"$exists": False}},
+                    {"brand_id": None},
+                    {"brand_id": personal_bid},
+                ],
+            }
+        else:
+            brand_scope = {"brand_id": brand_id}
+
+        current = await SocialAccountService.get_user_connections(db, user_id, brand_id)
+        accounts = (current.get("responseData") or {}).get("connections", {}).get(platform, [])
+
+        results = []
+        for acc in accounts:
+            acc_id = acc.get("outstand_account_id")
+            if acc_id:
+                result = await SocialAccountService.disconnect_account(db, user_id, acc_id, brand_id)
+                results.append({"outstand_account_id": acc_id, "status": result.get("status")})
+                continue
+
+            # Direct-OAuth account — no outstand_account_id, so nothing to
+            # retry/tombstone against a third party. Match the same way each
+            # direct flow's own disconnect endpoint does: Instagram by
+            # ig_user_id, everything else (one connection per platform) by
+            # platform + brand scope alone.
+            direct_filter: Dict[str, Any] = {**brand_scope, "platform": platform}
+            if platform == "instagram" and acc.get("ig_user_id"):
+                direct_filter["ig_user_id"] = acc["ig_user_id"]
+            await db["social_connections"].delete_one(direct_filter)
+            results.append({"connected_via": acc.get("connected_via"), "status": "disconnected"})
+
+        return UriResponse.get_single_data_response("disconnect_all", {
+            "platform": platform,
+            "disconnected_count": len(results),
+            "results": results,
         })
 
     # -------------------------------------------------------------------------
