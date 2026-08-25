@@ -1562,7 +1562,7 @@ async def instagram_direct_callback(
             print(f"[IGDirectOAuth] short-lived token response: {token_data}")
             if "error" in token_data:
                 err = token_data["error"].get("message", "token exchange failed")
-                return RedirectResponse(f"{base_redirect}?connected=false&error={urllib.parse.quote(err)}")
+                return RedirectResponse(f"{base_redirect}&connected=false&error={urllib.parse.quote(err)}")
             short_token = token_data.get("access_token")
 
             # Step 2: exchange short-lived → long-lived user token (60 days)
@@ -1589,7 +1589,7 @@ async def instagram_direct_callback(
             pages = pages_data.get("data", [])
             if not pages:
                 err_msg = "No Facebook Pages found. Link your Instagram Business Account to a Facebook Page first."
-                return RedirectResponse(f"{base_redirect}?connected=false&error={urllib.parse.quote(err_msg)}")
+                return RedirectResponse(f"{base_redirect}&connected=false&error={urllib.parse.quote(err_msg)}")
 
             # Step 4: find every Instagram Business Account linked to any of the
             # user's Facebook Pages — not just the first one. A user managing
@@ -1629,7 +1629,7 @@ async def instagram_direct_callback(
 
             if not candidates:
                 err_msg = "No Instagram Business Account found linked to your Facebook Pages."
-                return RedirectResponse(f"{base_redirect}?connected=false&error={urllib.parse.quote(err_msg)}")
+                return RedirectResponse(f"{base_redirect}&connected=false&error={urllib.parse.quote(err_msg)}")
 
         now = datetime.now(timezone.utc).isoformat()
 
