@@ -189,6 +189,14 @@ class SocialAccountService:
                     "id": outstand_account_id,
                     "user_id": user_id,
                     "platform": network,
+                    # Outstand-managed docs have no real Facebook/TikTok page id of
+                    # their own, but the collection's unique index is
+                    # (user_id, platform, brand_id, page_id) — leaving this unset
+                    # means every page in a multi-page batch indexes as page_id:
+                    # null, so the 2nd+ insert collides as a duplicate of the 1st
+                    # and the whole finalize fails. outstand_account_id is already
+                    # unique per page, so reusing it here satisfies the index.
+                    "page_id": outstand_account_id,
                     "outstand_account_id": outstand_account_id,
                     "username": acc.get("username"),
                     "account_name": acc.get("nickname") or acc.get("username"),
