@@ -886,11 +886,14 @@ async def generate_ad_creative(
     reference nudge on generation. Never raises — falls back to copy-only if image
     generation fails."""
     brand_context = await get_brand_context(user_id, db, brand_id) if user_id else {}
-    # TEMPORARILY DISABLED while isolating a 500 on /jane-ads/meta/plan-from-message.
-    # Every path here verified clean locally against the live DB (retrieval, prompt
-    # build, AdCopy return), so this is bisection rather than a known fault. Restore
-    # by removing the `False and` once the build path is confirmed green.
-    corpus = await retrieve_creative_corpus(db, budget_ngn or 0, has_video=False) if (False and db) else None
+    # `db is not None`, never `if db`: Motor's Database raises NotImplementedError on
+    # truth-value testing, and in a conditional expression that fires while evaluating
+    # the argument — outside retrieve_creative_corpus's own try/except — so it surfaced
+    # as an unhandled 500 on the build endpoint.
+    corpus = (
+        await retrieve_creative_corpus(db, budget_ngn or 0, has_video=False)
+        if db is not None else None
+    )
     copy = await write_ad_copy(business_name, category, goal, description, brand_context,
                                city, behaviour, service_area, audience_segment, who_its_for,
                                geo_pockets=geo_pockets, corpus=corpus)
