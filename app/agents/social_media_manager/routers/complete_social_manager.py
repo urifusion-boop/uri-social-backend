@@ -755,8 +755,10 @@ async def upload_user_content(
         from ..services.user_media_storage_service import UserMediaStorageService
 
         print(f"📤 Uploading {len(uploaded_media)} user media files...")
-        media_urls = await UserMediaStorageService.upload_user_media(uploaded_media, user_id)
-        print(f"✅ All media uploaded successfully: {len(media_urls)} URLs")
+        uploaded_items = await UserMediaStorageService.upload_user_media(uploaded_media, user_id)
+        media_urls = [item["url"] for item in uploaded_items]
+        video_urls = {item["url"] for item in uploaded_items if item["is_video"]}
+        print(f"✅ All media uploaded successfully: {len(media_urls)} URLs ({len(video_urls)} video)")
 
         # Load brand profile (needed for logo/CTA overlays)
         profile_result = await BrandProfileService.get(user_id, db, brand_id=active_brand_id)
@@ -774,6 +776,12 @@ async def upload_user_content(
 
             processed_media_urls = []
             for media_url in media_urls:
+                if media_url in video_urls:
+                    # Logo/CTA overlay here is PIL-based (single still frame) — no
+                    # video support, and downloading a video just to skip it wastes
+                    # the request. Pass the upload through untouched.
+                    processed_media_urls.append(media_url)
+                    continue
                 try:
                     # Download the uploaded image
                     resp = requests.get(media_url, timeout=10)
@@ -986,6 +994,16 @@ Choose the position that will cause the LEAST visual disruption."""
         # Build comprehensive analysis of all uploaded media
         vision_analyses = []
         for idx, media_url in enumerate(media_urls):
+            if media_url in video_urls:
+                # The vision model takes still images via image_url — pointing it at
+                # a video file fails every time (and did, silently, before this: the
+                # request went out, errored, and was swallowed by the except below).
+                # No frame-extraction step exists yet, so skip straight to relying on
+                # context_text for this item instead of burning an API call on a
+                # guaranteed failure.
+                vision_analyses.append(f"[Media {idx + 1}]: (video upload — visual analysis not available; caption based on provided context)")
+                print(f"⏭️  Skipping vision analysis for video {idx + 1}/{len(media_urls)}")
+                continue
             print(f"🔍 Analyzing media {idx + 1}/{len(media_urls)}...")
             try:
                 vision_prompt = f"""Analyze this uploaded image/video for social media content generation.
@@ -1058,43 +1076,79 @@ Create engaging social media captions for THIS UPLOADED CONTENT. Base your writi
                 )
 
             if _d_ids:
-                # Attach uploaded images to drafts so they can be published
-                if post_type == "carousel":
-                    # For carousel: one slide per uploaded image, in the exact
-                    # shape both DraftCard (isCarousel = slides.length > 0) and
-                    # publish logic (approval_workflow_service reads draft.slides)
-                    # expect. A prior "carousel_images" field here was never read
-                    # by either, so uploaded carousels silently rendered/published
-                    # as a single post.
-                    slides = [
-                        {"headline": "", "body": "", "image_url": url, "image_failed": False}
+                # Attach uploaded images to drafts so they can be published.
+                # TikTok gets its own center-cropped-to-9:16 copies of any IMAGE
+                # uploads (see ImageContentService.crop_and_reupload_for_tiktok)
+                # — TikTok's own client auto-crops/letterboxes anything off-ratio
+                # when it actually posts, so this makes the draft preview match
+                # what goes live instead of a surprise crop later. Video uploads
+                # pass through untouched (PIL can't crop a video file). Every
+                # other platform keeps the original upload byte-for-byte.
+                drafts_list = _rd.get("drafts", [])
+                tiktok_media_urls = None
+                if any(d.get("platform") == "tiktok" for d in drafts_list):
+                    from ..services.image_content_service import ImageContentService
+                    tiktok_media_urls = [
+                        url if url in video_urls
+                        else await ImageContentService.crop_and_reupload_for_tiktok(url, user_id)
                         for url in media_urls
                     ]
-                    update_fields = {
-                        "brand_id": active_brand_id,
-                        "content_source": "user_uploaded",
-                        "uploaded_media_urls": media_urls,
-                        "post_type": post_type,
-                        "slides": slides,
-                    }
-                else:
-                    # For single post: use first uploaded image as main image
-                    update_fields = {
-                        "brand_id": active_brand_id,
-                        "content_source": "user_uploaded",
-                        "uploaded_media_urls": media_urls,
-                        "post_type": post_type,
-                        "image_url": media_urls[0] if media_urls else None,
-                    }
 
-                # Mark drafts as user-uploaded and attach media URLs
-                await db["content_drafts"].update_many(
-                    {"id": {"$in": _d_ids}},
-                    {"$set": update_fields}
-                )
+                for d in drafts_list:
+                    draft_id = d.get("id")
+                    if not draft_id:
+                        continue
+                    urls_for_platform = (
+                        tiktok_media_urls if d.get("platform") == "tiktok" and tiktok_media_urls
+                        else media_urls
+                    )
 
-                # Update in-memory draft objects
-                for d in _rd.get("drafts", []):
+                    if post_type == "carousel":
+                        # One slide per uploaded image, in the exact shape both
+                        # DraftCard (isCarousel = slides.length > 0) and publish
+                        # logic (approval_workflow_service reads draft.slides)
+                        # expect. A prior "carousel_images" field here was never
+                        # read by either, so uploaded carousels silently
+                        # rendered/published as a single post.
+                        #
+                        # KNOWN LIMITATION: slides only carry image_url — there's
+                        # no per-slide video_url in this schema or in DraftCard's
+                        # carousel rendering, so a video uploaded into a carousel
+                        # still ends up here and will fail to render. Fixing that
+                        # needs a per-slide video field added on the frontend too;
+                        # out of scope here.
+                        slides = [
+                            {"headline": "", "body": "", "image_url": url, "image_failed": False}
+                            for url in urls_for_platform
+                        ]
+                        update_fields = {
+                            "brand_id": active_brand_id,
+                            "content_source": "user_uploaded",
+                            "uploaded_media_urls": urls_for_platform,
+                            "post_type": post_type,
+                            "slides": slides,
+                        }
+                    else:
+                        # For single post: use the first uploaded item as the main
+                        # media. DraftCard only renders a <video> element when
+                        # draft.video_url is set (isReel = post_type === 'reel' ||
+                        # !!draft.video_url) — anything else, including a video's
+                        # own URL, gets rendered in an <img> tag and fails to load.
+                        # Route video uploads to video_url so the existing player
+                        # picks them up correctly instead of showing as a broken
+                        # image.
+                        first_url = urls_for_platform[0] if urls_for_platform else None
+                        is_first_video = first_url in video_urls if first_url else False
+                        update_fields = {
+                            "brand_id": active_brand_id,
+                            "content_source": "user_uploaded",
+                            "uploaded_media_urls": urls_for_platform,
+                            "post_type": post_type,
+                            "image_url": None if is_first_video else first_url,
+                            "video_url": first_url if is_first_video else None,
+                        }
+
+                    await db["content_drafts"].update_one({"id": draft_id}, {"$set": update_fields})
                     d.update(update_fields)
 
         # Deduct credits (cheaper than full generation since no image gen)
@@ -3451,11 +3505,28 @@ async def get_content_calendar(
             {"$skip": skip},
             {"$limit": limit},
             {"$addFields": {
+                # image_url is supposed to always be a string or absent, but a
+                # legacy/buggy write can leave it as some other BSON type (an
+                # object, seen live — a caller stored {"url": ..., "is_video": ...}
+                # instead of extracting the string). $substr/$strLenCP throw on
+                # anything but a string, which previously took down this endpoint's
+                # entire response for a user over ONE malformed draft among many.
+                # $cond only evaluates the branch it selects, so gating on $type
+                # here actually skips the unsafe string ops instead of merely
+                # deciding between two branches that both still run.
                 "_img_is_base64": {
-                    "$eq": [{"$substr": [{"$ifNull": ["$image_url", ""]}, 0, 5]}, "data:"]
+                    "$cond": {
+                        "if": {"$eq": [{"$type": "$image_url"}, "string"]},
+                        "then": {"$eq": [{"$substr": ["$image_url", 0, 5]}, "data:"]},
+                        "else": False,
+                    }
                 },
                 "_img_exists": {
-                    "$gt": [{"$strLenCP": {"$ifNull": ["$image_url", ""]}}, 0]
+                    "$cond": {
+                        "if": {"$eq": [{"$type": "$image_url"}, "string"]},
+                        "then": {"$gt": [{"$strLenCP": "$image_url"}, 0]},
+                        "else": False,
+                    }
                 },
                 "_draft_key": {"$ifNull": ["$id", "$draft_id"]},
             }},
