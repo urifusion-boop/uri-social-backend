@@ -389,3 +389,35 @@ class TestWhoItsForShape:
         from app.agents.jane_ads.plan_variants import label_shaped
         assert not label_shaped("")
         assert not label_shaped(None)
+
+
+class TestCreativeBriefStage:
+    """Spec §10 — corpus shapes angle/format/register; Zone A holds without exception."""
+
+    def _rules(self):
+        from app.agents.jane_ads.creative import _corpus_rules
+        return _corpus_rules(RetrievalResult([rec("S1")], "partial", [], {"S1": 0.8}))
+
+    def test_rules_are_directive_not_advisory(self):
+        assert "override your defaults" in self._rules()
+
+    def test_zone_a_prohibition_is_stated(self):
+        r = self._rules()
+        assert "DELIVERY CONTEXT" in r
+        assert "Never introduce a location" in r
+
+    def test_percentage_prohibition_is_stated(self):
+        """§16.1 — no performance figure a record carries may reach copy."""
+        assert "percentage" in self._rules()
+
+    def test_empty_corpus_adds_nothing(self):
+        from app.agents.jane_ads.creative import _corpus_rules
+        assert _corpus_rules(None) == ""
+        assert _corpus_rules(RetrievalResult([], "none", [], {})) == ""
+
+    def test_directive_carries_stage_specific_forbid(self):
+        from app.agents.jane_ads.retrieval import corpus_directive
+        d = corpus_directive(RetrievalResult([rec("S1")], "partial", [], {"S1": 0.8}),
+                             applies_to="the angle", forbid="the trade-off")
+        assert "They apply to: the angle" in d
+        assert "They must NOT influence: the trade-off" in d

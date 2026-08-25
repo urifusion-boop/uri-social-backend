@@ -291,3 +291,35 @@ def top_exclusions(excluded: list[Excluded], n: int = 10) -> list[tuple[str, int
     for e in excluded:
         counts[str(e)] = counts.get(str(e), 0) + 1
     return sorted(counts.items(), key=lambda kv: -kv[1])[:n]
+
+
+def corpus_directive(result: Optional[RetrievalResult], *, applies_to: str,
+                     forbid: str = "") -> str:
+    """Render retrieved records as binding house rules for a prompt.
+
+    Worded as rules that override the model's defaults, not as background reading:
+    the plan-generation stage proved that an advisory framing gets ignored even
+    when the same constraint already appears elsewhere in the prompt.
+
+    `applies_to` names what the records may shape at this stage; `forbid` names what
+    they must not touch, which differs per stage — at creative_brief the hard line is
+    Zone A (spec §10: a record must never introduce a targeting parameter into
+    creative instruction), at plan_generation it is trade_off (§9.3).
+    """
+    if not result or not result.records:
+        return ""
+    lines = []
+    for r in result.records:
+        line = f"- {r.claim.rstrip('.')}. Why: {r.mechanism}"
+        if r.modification_required:
+            line += f" (applies here only with this change: {r.modification_required})"
+        lines.append(line)
+    out = (
+        "## HOUSE RULES — these override your defaults\n"
+        "Our own validated findings at Nigerian SME budgets. Apply them, do not "
+        "merely consider them.\n\n" + "\n".join(lines) + "\n\n"
+        f"They apply to: {applies_to}\n"
+    )
+    if forbid:
+        out += f"They must NOT influence: {forbid}\n"
+    return out + "\n"

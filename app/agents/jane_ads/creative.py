@@ -316,11 +316,70 @@ async def _call_ad_copy_model(prompt: str) -> Optional[dict]:
         return None
 
 
+
+
+async def retrieve_creative_corpus(db, budget_ngn: float, duration_days: int = 0,
+                                   has_video: bool = False):
+    """Corpus scoped to the creative stage. Best-effort: a corpus outage must not
+    stop an ad being written (§9.1 — it informs, it does not generate)."""
+    try:
+        from . import constants as C
+        from .entities import ConsumedBy, StrategyPlatform
+        from .retrieval import (
+            BudgetContext, BusinessProfile, RetrievalRequest, gap_record, retrieve,
+        )
+        from .store import MongoCoverageGapStore, MongoStrategyStore
+        if not budget_ngn or budget_ngn <= 0:
+            return None
+        days = duration_days or C.DEFAULT_CAMPAIGN_DAYS
+        daily = budget_ngn / (1 + C.VAT_RATE) / max(days, 1)
+        tier = 1 if budget_ngn < 15_000 else 2 if budget_ngn < 50_000 else 3 if budget_ngn < 250_000 else 4
+        req = RetrievalRequest(
+            stage=ConsumedBy.CREATIVE_BRIEF,
+            platforms=[StrategyPlatform.META],
+            budget=BudgetContext(daily_spend_ngn=daily, budget_tier=tier),
+            profile=BusinessProfile(has_video_asset=has_video),
+        )
+        res = retrieve(await MongoStrategyStore(db).fetch_approved(), req)
+        if not res.records:
+            await MongoCoverageGapStore(db).log_gap(gap_record(req))
+        return res
+    except Exception as e:                       # noqa: BLE001
+        print(f"[creative] corpus retrieval skipped: {e}", flush=True)
+        return None
+
+
+def _corpus_rules(corpus) -> str:
+    """Corpus findings for the creative stage (spec §10).
+
+    Zone A is the hard line and it holds without exception: a retrieved record may
+    shape the ANGLE, FORMAT and REGISTER of the ad, and must never introduce a
+    targeting parameter into creative instruction. A tactic phrased around geography
+    does not license geography in copy — service_area stays the only location field
+    that may appear. §16.1 also applies: no performance figure a record carries may
+    reach generated copy.
+    """
+    from .retrieval import corpus_directive
+    return corpus_directive(
+        corpus,
+        applies_to=(
+            "the ANGLE, FORMAT and REGISTER of the MESSAGE section only — which "
+            "proof to lead with, which objection to answer, how polished to sound"
+        ),
+        forbid=(
+            "anything in DELIVERY CONTEXT. Never introduce a location, audience "
+            "label, or interest term into the copy because a finding mentions one, "
+            "and never quote a percentage or performance multiple from a finding"
+        ),
+    )
+
+
 async def write_ad_copy(business_name: str, category: str, goal: str = "messages",
                         description: str = "", brand_context: Optional[dict] = None,
                         city: str = "", behaviour: str = "", service_area: str = "",
                         audience_segment: str = "", who_its_for: str = "",
-                        geo_pockets: Optional[list[str]] = None) -> AdCopy:
+                        geo_pockets: Optional[list[str]] = None,
+                        corpus: Optional["RetrievalResult"] = None) -> AdCopy:
     """Write a short headline, primary text, and an image prompt (used only for the
     GENERATE source). Voice-matched to the brand playbook when a profile exists, and
     visually grounded in the real city/area the campaign targets. Also does the
@@ -376,6 +435,7 @@ async def write_ad_copy(business_name: str, category: str, goal: str = "messages
         f"Context: {description or 'none'}\n"
         f"How customers find this business: {behaviour or 'unknown'}.\n"
         f"{_register_rules_block()}\n"
+        f"{_corpus_rules(corpus)}"
         "Return JSON with:\n"
         "- headline: punchy, <= 5 words, no ALL CAPS, no emoji spam, from MESSAGE only\n"
         "- primary_text: 1–2 sentences in the brand voice above if given, following "
@@ -810,6 +870,7 @@ async def generate_ad_creative(
     user_id: str = "", db=None, brand_id: Optional[str] = None, city: str = "",
     behaviour: str = "", service_area: str = "", audience_segment: str = "",
     who_its_for: str = "", geo_pockets: Optional[list[str]] = None,
+    budget_ngn: float = 0.0,
 ) -> AdCreative:
     """SOURCE 1 (default) — Jane writes the copy and generates the image herself,
     using the brand playbook's colours/voice/region/industry, grounded in `city` (the
@@ -825,9 +886,10 @@ async def generate_ad_creative(
     reference nudge on generation. Never raises — falls back to copy-only if image
     generation fails."""
     brand_context = await get_brand_context(user_id, db, brand_id) if user_id else {}
+    corpus = await retrieve_creative_corpus(db, budget_ngn or 0, has_video=False) if db else None
     copy = await write_ad_copy(business_name, category, goal, description, brand_context,
                                city, behaviour, service_area, audience_segment, who_its_for,
-                               geo_pockets=geo_pockets)
+                               geo_pockets=geo_pockets, corpus=corpus)
     # Image via the SAME content engine normal posts use (better visuals). Seed it with the
     # scene idea; content conveys the theme/message so the graphic is on-topic.
     content_for_image = copy.primary_text or copy.image_prompt or f"{business_name} — {description or category}"
