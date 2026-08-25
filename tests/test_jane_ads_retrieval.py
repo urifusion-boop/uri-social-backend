@@ -362,3 +362,30 @@ class TestSustainedCapacity:
 
     def test_no_wallet_is_unknown_not_zero(self):
         assert _run(self._svc().sustained_daily_ngn("nobody")) == (None, False)
+
+
+class TestWhoItsForShape:
+    """The field instruction forbids the label form and the corpus block repeats it
+    (SEED-023). The model produced it anyway on two consecutive live runs, so the
+    constraint is enforced here rather than asked for a third time."""
+
+    def test_category_plus_need_is_rejected(self):
+        from app.agents.jane_ads.plan_variants import label_shaped
+        for bad in ("businesses needing efficient tech solutions",
+                    "start-ups in need of scalable tech infrastructures",
+                    "tech enthusiasts seeking cutting-edge software solutions",
+                    "companies looking for reliable services"):
+            assert label_shaped(bad), bad
+
+    def test_situations_pass(self):
+        from app.agents.jane_ads.plan_variants import label_shaped
+        for good in ("people fitting out a new place",
+                     "individuals setting up home offices",
+                     "finance teams who just moved onto a new accounting system",
+                     "restaurants that just opened a second branch"):
+            assert not label_shaped(good), good
+
+    def test_empty_is_not_flagged(self):
+        from app.agents.jane_ads.plan_variants import label_shaped
+        assert not label_shaped("")
+        assert not label_shaped(None)
