@@ -2155,9 +2155,6 @@ async def meta_plan_from_message(
         "understood": built.understood,
         "budget_estimate": built.budget_estimate,
         "summary": built.summary,
-        # Advisory only — the build is already decided; tier rules take
-        # precedence over corpus records (§12). Stored for operator review.
-        "corpus_structure_notes": await _structure_notes(db, float(built.req.budget_ngn or 0)),
         "thread_id": built.thread_id,
         "variant_group_id": built.variant_group_id,
         "selected_plan_variant": built.selected_plan_variant,
