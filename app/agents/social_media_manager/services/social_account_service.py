@@ -343,6 +343,7 @@ class SocialAccountService:
                 if doc_outstand_id and doc_outstand_id in disconnected_ids:
                     continue
                 by_platform.setdefault(platform, []).append({
+                    "id": doc.get("id"),
                     "platform": platform,
                     "connected_via": doc.get("connected_via"),
                     "outstand_account_id": doc.get("outstand_account_id"),
