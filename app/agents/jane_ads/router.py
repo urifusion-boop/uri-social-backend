@@ -180,7 +180,9 @@ async def _plan_and_simulate(
 
 
 
-async def _retrieve_for_plan_generation(db, parsed) -> Optional["RetrievalResult"]:
+async def _retrieve_for_plan_generation(
+    db, parsed, business_id: Optional[str] = None
+) -> Optional["RetrievalResult"]:
     """ASC-SPEC-01 v2 §9.2 — retrieval fires AFTER platform selection, so it is scoped
     to the platforms this build will actually use; retrieving earlier returns records
     for platforms that will never run.
@@ -204,14 +206,35 @@ async def _retrieve_for_plan_generation(db, parsed) -> Optional["RetrievalResult
         duration = int(getattr(parsed, "duration_days", 0) or C.DEFAULT_CAMPAIGN_DAYS)
         daily = budget_ngn / (1 + C.VAT_RATE) / max(duration, 1)
 
+        # Sustained capacity is a SEPARATE question from what this campaign can
+        # spend (§5.2). Unknown fails closed: every record needing more than one
+        # day of continuous spend is excluded rather than optimistically allowed.
+        sustained_ngn, sustained_known = None, False
+        if business_id:
+            from .store import MongoWalletStore
+            from .wallet import WalletService
+            sustained_ngn, sustained_known = await WalletService(
+                MongoWalletStore(db)
+            ).sustained_daily_ngn(business_id)
+
         req = RetrievalRequest(
             stage=ConsumedBy.PLAN_GENERATION,
+            # Jane Ads runs on the pooled Meta account; TikTok/Google adapters exist
+            # but no live ads path reaches them yet. Sourced here rather than assumed
+            # downstream so the day a second platform ships, this is the one edit.
             platforms=[StrategyPlatform.META],
             budget=BudgetContext(
                 daily_spend_ngn=daily,
                 budget_tier=_budget_tier(budget_ngn),
+                sustained_daily_ngn=sustained_ngn,
+                sustained_known=sustained_known,
             ),
-            profile=BusinessProfile(),
+            profile=BusinessProfile(
+                has_video_asset=bool(getattr(parsed, "has_video", False)),
+                # outcome capture is ENG step 9, unbuilt — records requiring it
+                # correctly stay excluded until it exists.
+                records_outcomes=False,
+            ),
         )
         result = retrieve(await MongoStrategyStore(db).fetch_approved(), req)
         if not result.records:
@@ -1546,7 +1569,7 @@ async def _build_campaign_plan(
     if selected_variant is None:
         try:
             from .plan_variants import generate_plan_variants, PlanVariantsUnavailableError
-            corpus = await _retrieve_for_plan_generation(db, parsed)
+            corpus = await _retrieve_for_plan_generation(db, parsed, business_id)
             variant_set = await generate_plan_variants(
                 parsed, business_name=req.business_name, description=req.description,
                 corpus=corpus,
