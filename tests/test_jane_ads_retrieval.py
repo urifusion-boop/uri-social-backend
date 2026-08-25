@@ -421,3 +421,43 @@ class TestCreativeBriefStage:
                              applies_to="the angle", forbid="the trade-off")
         assert "They apply to: the angle" in d
         assert "They must NOT influence: the trade-off" in d
+
+
+class TestDiagnosticsStage:
+    """Fires on underperformance, not at build time. The only stage where ui_only
+    records are legitimately allowed through (§7.1.10) — the operator can act on
+    team knowledge Jane cannot execute."""
+
+    def test_ui_only_reaches_diagnostics(self):
+        r = rec(executable_via=ExecutableVia.UI_ONLY, consumed_by=[ConsumedBy.DIAGNOSTICS])
+        got = retrieve([r], request(stage=ConsumedBy.DIAGNOSTICS), now=NOW)
+        assert len(got.records) == 1
+
+    def test_ui_only_still_blocked_at_build_stages(self):
+        r = rec(executable_via=ExecutableVia.UI_ONLY, consumed_by=[ConsumedBy.PLAN_GENERATION])
+        assert only_reason([r], request()) is ExclusionReason.NOT_API_EXECUTABLE
+
+    def test_limit_one_returns_the_best_scoring(self):
+        hi = rec("HI", market_origin=MarketOrigin.NIGERIA, consumed_by=[ConsumedBy.DIAGNOSTICS])
+        lo = rec("LO", evidence_grade=EvidenceGrade.C, consumed_by=[ConsumedBy.DIAGNOSTICS])
+        got = retrieve([lo, hi], request(stage=ConsumedBy.DIAGNOSTICS), now=NOW, limit=1)
+        assert [x.strategy_id for x in got.records] == ["HI"]
+
+
+class TestCampaignStructureStage:
+    """§12 — tier rules take precedence over corpus records, so these are stored as
+    review material rather than fed into the deterministic build."""
+
+    def test_tier_gate_excludes_parallel_adset_records_below_tier_3(self):
+        r = rec(requires=[Requirement.PARALLEL_ADSET_BUDGET],
+                consumed_by=[ConsumedBy.CAMPAIGN_STRUCTURE])
+        req = request(stage=ConsumedBy.CAMPAIGN_STRUCTURE,
+                      budget=BudgetContext(daily_spend_ngn=3720, budget_tier=2))
+        assert only_reason([r], req) is ExclusionReason.INFRASTRUCTURE_MISSING
+
+    def test_same_record_passes_at_tier_3(self):
+        r = rec(requires=[Requirement.PARALLEL_ADSET_BUDGET],
+                consumed_by=[ConsumedBy.CAMPAIGN_STRUCTURE])
+        req = request(stage=ConsumedBy.CAMPAIGN_STRUCTURE,
+                      budget=BudgetContext(daily_spend_ngn=12000, budget_tier=3))
+        assert len(retrieve([r], req, now=NOW).records) == 1
