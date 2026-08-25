@@ -461,3 +461,29 @@ class TestCampaignStructureStage:
         req = request(stage=ConsumedBy.CAMPAIGN_STRUCTURE,
                       budget=BudgetContext(daily_spend_ngn=12000, budget_tier=3))
         assert len(retrieve([r], req, now=NOW).records) == 1
+
+
+class TestMotorTruthiness:
+    """Motor's Database raises NotImplementedError on bool(), and in a conditional
+    expression that fires while evaluating the argument — outside the callee's own
+    try/except. `if db` shipped a 500 on the build endpoint that every local test
+    missed, because the tests called the helper directly and never went through the
+    guard. Compare with None."""
+
+    def test_bool_on_a_motor_database_raises(self):
+        class FakeMotorDB:
+            def __bool__(self):
+                raise NotImplementedError(
+                    "Database objects do not implement truth value testing or bool()."
+                )
+        db = FakeMotorDB()
+        with pytest.raises(NotImplementedError):
+            bool(db)
+        assert (db is not None) is True
+
+    def test_creative_guard_uses_is_not_none(self):
+        import inspect
+        from app.agents.jane_ads import creative
+        src = inspect.getsource(creative.generate_ad_creative)
+        assert "if db is not None else None" in src
+        assert "has_video=False) if db else" not in src
