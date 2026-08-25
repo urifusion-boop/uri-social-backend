@@ -335,3 +335,30 @@ class TestPlanGenerationIntegration:
         that makes the system look like it works while doing nothing."""
         from app.agents.jane_ads.models import PlanVariantSet
         assert PlanVariantSet(variants=[]).corpus_coverage == "none"
+
+
+class TestSustainedCapacity:
+    """Spec §5.2 — what they can KEEP spending, distinct from what this campaign can."""
+
+    def _svc(self):
+        from app.agents.jane_ads.store import InMemoryWalletStore
+        from app.agents.jane_ads.wallet import WalletService
+        return WalletService(InMemoryWalletStore())
+
+    def test_single_topup_is_not_trusted(self):
+        """Below the minimum event count the rate is not stable, so it fails closed
+        and every multi-day tactic is excluded."""
+        svc = self._svc()
+        _run(svc.top_up("b1", 50_000, reference="r1"))
+        assert _run(svc.sustained_daily_ngn("b1")) == (None, False)
+
+    def test_two_topups_give_a_trusted_rate(self):
+        svc = self._svc()
+        _run(svc.top_up("b1", 45_000, reference="r1"))
+        _run(svc.top_up("b1", 45_000, reference="r2"))
+        rate, known = _run(svc.sustained_daily_ngn("b1"))
+        assert known is True
+        assert rate == 1000.0          # 90,000 over the 90-day window
+
+    def test_no_wallet_is_unknown_not_zero(self):
+        assert _run(self._svc().sustained_daily_ngn("nobody")) == (None, False)
