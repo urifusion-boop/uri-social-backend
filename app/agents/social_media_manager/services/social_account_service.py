@@ -6,6 +6,16 @@ from app.domain.responses.uri_response import UriResponse
 from app.core.config import settings
 from .outstand_service import OutstandService, PLATFORM_TO_NETWORK, SUPPORTED_PLATFORMS
 
+# force_account_selection maps to a real per-network re-auth override on
+# Outstand's side (disable_auto_auth for TikTok, auth_type=reauthenticate for
+# Facebook, force_reauth for Instagram) — for Facebook specifically that means
+# Meta's own password-reentry checkpoint on every single connect, even for an
+# already-logged-in browser. It was turned on for every network to fix one
+# confirmed incident (TikTok silently attaching the wrong already-logged-in
+# account with no picker shown) but the added friction elsewhere was never
+# needed to fix that bug, so it's scoped to just the network it fixed.
+NETWORKS_REQUIRING_ACCOUNT_SELECTION = {"tiktok"}
+
 
 class SocialAccountService:
 
@@ -57,11 +67,7 @@ class SocialAccountService:
                     network=network,
                     tenant_id=tenant_id,
                     redirect_uri=callback_url,
-                    # Always force the account picker/consent screen — a browser
-                    # already logged into the network otherwise silently reuses
-                    # that session, which can attach the wrong account with no
-                    # visible warning (surfaced by a real TikTok connect attempt).
-                    force_account_selection=True,
+                    force_account_selection=network in NETWORKS_REQUIRING_ACCOUNT_SELECTION,
                 )
                 auth_urls[platform.lower()] = url
             except Exception as e:
@@ -190,6 +196,14 @@ class SocialAccountService:
                     "id": outstand_account_id,
                     "user_id": user_id,
                     "platform": network,
+                    # Outstand-managed docs have no real Facebook/TikTok page id of
+                    # their own, but the collection's unique index is
+                    # (user_id, platform, brand_id, page_id) — leaving this unset
+                    # means every page in a multi-page batch indexes as page_id:
+                    # null, so the 2nd+ insert collides as a duplicate of the 1st
+                    # and the whole finalize fails. outstand_account_id is already
+                    # unique per page, so reusing it here satisfies the index.
+                    "page_id": outstand_account_id,
                     "outstand_account_id": outstand_account_id,
                     "username": acc.get("username"),
                     "account_name": acc.get("nickname") or acc.get("username"),
