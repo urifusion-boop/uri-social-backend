@@ -164,8 +164,13 @@ def exclusion_reason(rec: Strategy, req: RetrievalRequest) -> Optional[Excluded]
     if req.stage not in rec.consumed_by:
         return Excluded(sid, ExclusionReason.STAGE_MISMATCH)
 
-    if not set(rec.platforms) & set(req.platforms):
-        return Excluded(sid, ExclusionReason.PLATFORM_MISMATCH)
+    # CROSS_PLATFORM is a wildcard, not a seventh platform: a tactic that applies
+    # everywhere must not be excluded from a Meta-only request. Treating it as a
+    # literal value silently dropped 20 of 55 records — the same failure class as a
+    # precondition that excludes the accounts it was written for.
+    if StrategyPlatform.CROSS_PLATFORM not in rec.platforms:
+        if not set(rec.platforms) & set(req.platforms):
+            return Excluded(sid, ExclusionReason.PLATFORM_MISMATCH)
 
     if rec.conversion_location and ConversionLocation.ANY not in rec.conversion_location:
         if req.profile.conversion_location not in rec.conversion_location:

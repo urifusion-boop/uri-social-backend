@@ -242,10 +242,23 @@ class PlanVariant(BaseModel):
     budget_shared_ngn: Optional[float] = None  # what it would cost split with one other
 
 
+class StrategyCitation(BaseModel):
+    """A corpus record that shaped a plan, pinned at the VERSION used. Citing the id
+    alone makes a plan unexplainable within one edit cycle (ASC-ENG-01 §3)."""
+    record_id: str
+    version: int
+    stage: str
+    score: float
+
+
 class PlanVariantSet(BaseModel):
     """The full ranked set Jane presents, plus the computed (never generated)
     selection rule for this budget (spec §6.1)."""
     variants: list[PlanVariant]
+    # ASC-SPEC-01 v2 §8.4 — 'none' must be visible, never silent: if retrieval
+    # returned nothing Jane fell back to model priors and the plan should say so.
+    corpus_coverage: str = "none"          # none | partial | full
+    corpus_citations: list[StrategyCitation] = Field(default_factory=list)
     recommendation_reason: str = ""    # argued, not asserted (spec §3) — why the
                                         # recommended variant beats the others
     max_selectable: int = 1

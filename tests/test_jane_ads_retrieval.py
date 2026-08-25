@@ -27,6 +27,7 @@ from app.agents.jane_ads.entities import (
 )
 from app.agents.jane_ads.retrieval import (
     BudgetContext,
+    RetrievalResult,
     BusinessProfile,
     ExclusionReason,
     RetrievalRequest,
@@ -159,6 +160,13 @@ class TestExclusions:
         assert only_reason([rec(consumed_by=[ConsumedBy.CREATIVE_BRIEF])], request()) \
             is ExclusionReason.STAGE_MISMATCH
 
+    def test_cross_platform_matches_any_request(self):
+        """A tactic that applies everywhere must not be excluded from a Meta-only
+        request. Treating cross_platform as a literal value dropped 20 of 55."""
+        r = rec(platforms=[StrategyPlatform.CROSS_PLATFORM])
+        assert len(retrieve([r], request(platforms=[StrategyPlatform.META]), now=NOW).records) == 1
+        assert len(retrieve([r], request(platforms=[StrategyPlatform.TIKTOK]), now=NOW).records) == 1
+
     def test_platform_mismatch(self):
         assert only_reason([rec(platforms=[StrategyPlatform.TIKTOK])], request()) \
             is ExclusionReason.PLATFORM_MISMATCH
@@ -277,3 +285,53 @@ class TestFixture13PlatformRequired:
         with pytest.raises(ValueError, match="platforms is required"):
             RetrievalRequest(stage=ConsumedBy.PLAN_GENERATION, platforms=[],
                              budget=BudgetContext(daily_spend_ngn=3322, budget_tier=2))
+
+
+class TestPlanGenerationIntegration:
+    """ASC-SPEC-01 v2 §9 — the corpus informs plans, it does not generate them."""
+
+    def test_corpus_block_is_empty_without_records(self):
+        """No corpus, no prompt injection — Jane plans exactly as before."""
+        from app.agents.jane_ads.plan_variants import _corpus_block
+        assert _corpus_block(None) == ""
+        assert _corpus_block(RetrievalResult([], "none", [], {})) == ""
+
+    def test_corpus_block_carries_claim_and_mechanism(self):
+        from app.agents.jane_ads.plan_variants import _corpus_block
+        block = _corpus_block(RetrievalResult([rec("S1")], "partial", [], {"S1": 0.8}))
+        assert "A claim" in block and "A mechanism" in block
+
+    def test_modification_travels_with_the_claim(self):
+        """§8.2 — returning the claim without its modification is a correctness bug."""
+        from app.agents.jane_ads.plan_variants import _corpus_block
+        r = rec("S1", transfer_verdict=TransferVerdict.APPLIES_WITH_MODIFICATION,
+                modification_required="Halve the budget floor.")
+        assert "Halve the budget floor." in _corpus_block(
+            RetrievalResult([r], "partial", [], {"S1": 0.68}))
+
+    def test_block_forbids_tactics_becoming_plans_and_owning_the_tradeoff(self):
+        """§9.1 five tactics presented as five strategies is the wrong output;
+        §9.3 the trade-off is Jane's own reasoning, never a corpus field."""
+        from app.agents.jane_ads.plan_variants import _corpus_block
+        block = _corpus_block(RetrievalResult([rec("S1")], "partial", [], {"S1": 0.8}))
+        assert "not an audience strategy" in block
+        assert "trade_off" in block
+
+    def test_citations_pin_the_version(self):
+        """§9.5 / ENG §3 — citing the id alone makes a plan unexplainable
+        within one edit cycle."""
+        from app.agents.jane_ads.models import StrategyCitation
+        c = StrategyCitation(record_id="SEED-013", version=3,
+                             stage="plan_generation", score=0.8)
+        assert (c.record_id, c.version) == ("SEED-013", 3)
+
+    def test_budget_tier_boundaries(self):
+        from app.agents.jane_ads.router import _budget_tier
+        assert [_budget_tier(b) for b in (14_999, 15_000, 49_999, 50_000,
+                                          249_999, 250_000)] == [1, 2, 2, 3, 3, 4]
+
+    def test_empty_coverage_is_visible_not_silent(self):
+        """§8.4 / ENG §10 — silent fallback to model priors is the failure mode
+        that makes the system look like it works while doing nothing."""
+        from app.agents.jane_ads.models import PlanVariantSet
+        assert PlanVariantSet(variants=[]).corpus_coverage == "none"

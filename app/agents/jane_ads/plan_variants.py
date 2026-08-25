@@ -29,7 +29,8 @@ from app.core.config import settings
 
 from . import constants as C
 from .jane_consultant import ConsultantBrief
-from .models import PlanVariant, PlanVariantSet
+from .models import PlanVariant, PlanVariantSet, StrategyCitation
+from .retrieval import RetrievalResult
 
 
 class PlanVariantsUnavailableError(Exception):
@@ -113,8 +114,44 @@ def _variant_fields_block() -> str:
     )
 
 
+
+def _corpus_block(corpus: Optional["RetrievalResult"]) -> str:
+    """ASC-SPEC-01 v2 §9.1 — the corpus INFORMS plans, it does not generate them.
+    Five tactics presented as five strategies is the wrong output; the plan-variants
+    contract needs genuinely distinct audience strategies. So retrieved records enter
+    as evidence Jane may draw on for `why_this_could_work`, never as the plans
+    themselves.
+
+    §9.3: the trade-off is Jane's own reasoning from the plan's economics and is
+    explicitly NOT a corpus field, so nothing here may supply it.
+
+    §8.2: a record that applies only with modification must carry that modification
+    with it — the unmodified version is frequently wrong for this market.
+    """
+    if not corpus or not corpus.records:
+        return ""
+    lines = []
+    for r in corpus.records:
+        line = f"- {r.claim.rstrip('.')}. Why: {r.mechanism}"
+        if r.modification_required:
+            line += f" (applies here only with this change: {r.modification_required})"
+        lines.append(line)
+    return (
+        "Validated tactics from our own strategy corpus, observed at Nigerian SME "
+        "budgets. Use them to sharpen 'why_this_could_work' where one genuinely fits "
+        "a plan you already formed. Do NOT turn a tactic into a plan — a tactic is "
+        "not an audience strategy — and do NOT let them shape 'trade_off', which is "
+        "your own reasoning from the plan's economics:\n"
+        + "\n".join(lines)
+        + "\n\n"
+    )
+
+
 async def generate_plan_variants(
-    parsed: ConsultantBrief, business_name: str = "", description: str = "",
+    parsed: ConsultantBrief,
+    business_name: str = "",
+    description: str = "",
+    corpus: Optional["RetrievalResult"] = None,
 ) -> PlanVariantSet:
     """The one LLM call that turns an already-extracted strategy (jane_consultant's
     ConsultantBrief — goal, budget, geo strategy, intermediary/creative-fit notes)
@@ -159,6 +196,7 @@ async def generate_plan_variants(
         "30-50' is not two plans. 'Developers buying multiple units vs homeowners "
         "fitting out one' is.\n\n"
         f"{_variant_fields_block()}\n"
+        f"{_corpus_block(corpus)}"
         "Return ONLY the JSON."
     )
     try:
@@ -215,4 +253,12 @@ async def generate_plan_variants(
         recommendation_reason=str(data.get("recommendation_reason", "")).strip(),
         max_selectable=max_selectable,
         selection_rule_reason=selection_rule_reason,
+        corpus_coverage=(corpus.coverage if corpus else "none"),
+        corpus_citations=[
+            StrategyCitation(
+                record_id=r.strategy_id, version=r.version,
+                stage="plan_generation", score=corpus.scores.get(r.strategy_id, 0.0),
+            )
+            for r in (corpus.records if corpus else [])
+        ],
     )

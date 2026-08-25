@@ -179,6 +179,60 @@ async def _plan_and_simulate(
     }
 
 
+
+async def _retrieve_for_plan_generation(db, parsed) -> Optional["RetrievalResult"]:
+    """ASC-SPEC-01 v2 §9.2 — retrieval fires AFTER platform selection, so it is scoped
+    to the platforms this build will actually use; retrieving earlier returns records
+    for platforms that will never run.
+
+    Best-effort by design: the corpus informs plans, it does not generate them (§9.1),
+    so a corpus outage must degrade to today's model-prior behaviour rather than block
+    a client mid-conversation. An empty result is NOT swallowed — it is logged as a
+    coverage gap, because which stage/tier/platform combinations return nothing is the
+    seeding roadmap (§8.4).
+    """
+    try:
+        from .entities import ConsumedBy, StrategyPlatform
+        from .retrieval import (
+            BudgetContext, BusinessProfile, RetrievalRequest, gap_record, retrieve,
+        )
+        from .store import MongoCoverageGapStore, MongoStrategyStore
+
+        budget_ngn = float(getattr(parsed, "budget_ngn", 0) or 0)
+        if budget_ngn <= 0:
+            return None
+        duration = int(getattr(parsed, "duration_days", 0) or C.DEFAULT_CAMPAIGN_DAYS)
+        daily = budget_ngn / (1 + C.VAT_RATE) / max(duration, 1)
+
+        req = RetrievalRequest(
+            stage=ConsumedBy.PLAN_GENERATION,
+            platforms=[StrategyPlatform.META],
+            budget=BudgetContext(
+                daily_spend_ngn=daily,
+                budget_tier=_budget_tier(budget_ngn),
+            ),
+            profile=BusinessProfile(),
+        )
+        result = retrieve(await MongoStrategyStore(db).fetch_approved(), req)
+        if not result.records:
+            await MongoCoverageGapStore(db).log_gap(gap_record(req))
+        return result
+    except Exception as e:                       # noqa: BLE001 — never block a build
+        print(f"[oneshot] corpus retrieval skipped: {e}", flush=True)
+        return None
+
+
+def _budget_tier(budget_ngn: float) -> int:
+    """Spec §5.4 — tier gates structure, separately from the daily-spend floor."""
+    if budget_ngn < 15_000:
+        return 1
+    if budget_ngn < 50_000:
+        return 2
+    if budget_ngn < 250_000:
+        return 3
+    return 4
+
+
 @router.post("/plan")
 async def plan(
     body: PlanRequestBody,
@@ -1492,8 +1546,10 @@ async def _build_campaign_plan(
     if selected_variant is None:
         try:
             from .plan_variants import generate_plan_variants, PlanVariantsUnavailableError
+            corpus = await _retrieve_for_plan_generation(db, parsed)
             variant_set = await generate_plan_variants(
                 parsed, business_name=req.business_name, description=req.description,
+                corpus=corpus,
             )
         except Exception as e:
             variant_set = None
