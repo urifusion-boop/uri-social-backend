@@ -829,8 +829,10 @@ async def upload_user_content(
         from ..services.user_media_storage_service import UserMediaStorageService
 
         print(f"📤 Uploading {len(uploaded_media)} user media files...")
-        media_urls = await UserMediaStorageService.upload_user_media(uploaded_media, user_id)
-        print(f"✅ All media uploaded successfully: {len(media_urls)} URLs")
+        uploaded_items = await UserMediaStorageService.upload_user_media(uploaded_media, user_id)
+        media_urls = [item["url"] for item in uploaded_items]
+        video_urls = {item["url"] for item in uploaded_items if item["is_video"]}
+        print(f"✅ All media uploaded successfully: {len(media_urls)} URLs ({len(video_urls)} video)")
 
         # Load brand profile (needed for logo/CTA overlays)
         profile_result = await BrandProfileService.get(user_id, db, brand_id=active_brand_id)
@@ -847,6 +849,12 @@ async def upload_user_content(
 
             processed_media_urls = []
             for media_url in media_urls:
+                if media_url in video_urls:
+                    # Logo/CTA overlay here is PIL-based (single still frame) — no
+                    # video support, and downloading a video just to skip it wastes
+                    # the request. Pass the upload through untouched.
+                    processed_media_urls.append(media_url)
+                    continue
                 try:
                     # Download the uploaded image
                     resp = requests.get(media_url, timeout=10)
@@ -1089,6 +1097,16 @@ Choose the position that will cause the LEAST visual disruption."""
         # Build comprehensive analysis of all uploaded media
         vision_analyses = []
         for idx, media_url in enumerate(media_urls):
+            if media_url in video_urls:
+                # The vision model takes still images via image_url — pointing it at
+                # a video file fails every time (and did, silently, before this: the
+                # request went out, errored, and was swallowed by the except below).
+                # No frame-extraction step exists yet, so skip straight to relying on
+                # context_text for this item instead of burning an API call on a
+                # guaranteed failure.
+                vision_analyses.append(f"[Media {idx + 1}]: (video upload — visual analysis not available; caption based on provided context)")
+                print(f"⏭️  Skipping vision analysis for video {idx + 1}/{len(media_urls)}")
+                continue
             print(f"🔍 Analyzing media {idx + 1}/{len(media_urls)}...")
             try:
                 vision_prompt = f"""Analyze this uploaded image/video for social media content generation.
@@ -1163,7 +1181,8 @@ Create engaging social media captions for THIS UPLOADED CONTENT. Base your writi
             if _d_ids:
                 # Attach uploaded images to drafts so they can be published
                 if post_type == "carousel":
-                    # For carousel: create slides from uploaded images
+                    # Carousel handling is untouched here — this fix is scoped to
+                    # the single-post video bug only.
                     carousel_images = [{"image_url": url} for url in media_urls]
                     update_fields = {
                         "brand_id": active_brand_id,
@@ -1173,13 +1192,22 @@ Create engaging social media captions for THIS UPLOADED CONTENT. Base your writi
                         "carousel_images": carousel_images,
                     }
                 else:
-                    # For single post: use first uploaded image as main image
+                    # For single post: use the first uploaded item as the main
+                    # media. DraftCard only renders a <video> element when
+                    # draft.video_url is set (isReel = post_type === 'reel' ||
+                    # !!draft.video_url) — anything else, including a video's own
+                    # URL, gets rendered in an <img> tag and fails to load. Route
+                    # video uploads to video_url so the existing player picks them
+                    # up correctly instead of showing as a broken image.
+                    first_url = media_urls[0] if media_urls else None
+                    is_first_video = first_url in video_urls if first_url else False
                     update_fields = {
                         "brand_id": active_brand_id,
                         "content_source": "user_uploaded",
                         "uploaded_media_urls": media_urls,
                         "post_type": post_type,
-                        "image_url": media_urls[0] if media_urls else None,
+                        "image_url": None if is_first_video else first_url,
+                        "video_url": first_url if is_first_video else None,
                     }
 
                 # Mark drafts as user-uploaded and attach media URLs
