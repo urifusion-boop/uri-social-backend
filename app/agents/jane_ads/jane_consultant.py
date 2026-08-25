@@ -24,6 +24,7 @@ from pydantic import Field
 
 from app.core.config import settings
 
+from .nl import parse_ngn
 from .models import Goal, OfferType, PurchaseBehaviour
 from .nl import NlUnavailableError, ParsedCampaign
 
@@ -505,10 +506,9 @@ def _coerce(data: dict, business_name: str, category: str) -> ConsultantBrief:
     """Normalize raw LLM JSON into a validated ConsultantBrief (defensive about types
     and stage, mirroring nl.py's own _coerce discipline)."""
     def _num(v):
-        try:
-            return float(v) if v not in (None, "", "null") else None
-        except (TypeError, ValueError):
-            return None
+        # Shared with nl.py — clients type "20k", and float() turning that into
+        # None makes Jane re-ask for a budget she was just given.
+        return parse_ngn(v) if v not in (None, "", "null") else None
 
     def _int(v):
         n = _num(v)
