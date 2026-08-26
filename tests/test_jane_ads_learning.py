@@ -211,9 +211,13 @@ class TestStatedBudgetOverridesRemembered:
         note = _build_budget_confirmation_note(10000.0, "same 10000", [])
         assert "10,000" in note and "REPLACES" not in note
 
-    def test_no_remembered_budget_means_no_note(self):
+    def test_no_remembered_budget_still_accepts_a_stated_one(self):
+        """Superseded: this used to assert no note on a fresh thread, which is what
+        let Jane re-ask a budget the client had just typed. See
+        TestFreshThreadStatedBudget."""
         from app.agents.jane_ads.jane_consultant import _build_budget_confirmation_note
-        assert _build_budget_confirmation_note(None, "budget 20000", []) == ""
+        note = _build_budget_confirmation_note(None, "budget 20000", [])
+        assert "20,000" in note and "do not ask them to confirm" in note
 
 
 class TestOfferingReadsMappedKeys:
@@ -246,3 +250,33 @@ class TestOfferingReadsMappedKeys:
         for k in ("business_description", "key_products_services",
                   "ideal_customer_profile", "tagline"):
             assert k in block, k
+
+
+class TestFreshThreadStatedBudget:
+    """_build_budget_confirmation_note bailed on `if not known_budget`, so on a fresh
+    thread a plainly stated figure got no note at all and the model decided for itself
+    whether to accept it. That is a coin flip: the identical message converged in one
+    turn over the API and took two in the UI, where Jane asked "can you confirm this
+    budget is still accurate" about a number the client had just typed."""
+
+    def test_stated_budget_on_a_fresh_thread_gets_a_note(self):
+        from app.agents.jane_ads.jane_consultant import _build_budget_confirmation_note
+        note = _build_budget_confirmation_note(None, "Budget 20000 for this campaign", [])
+        assert "20,000" in note
+        assert "do not ask them to confirm" in note
+        assert "not budget again" in note
+
+    def test_no_budget_stated_still_yields_nothing(self):
+        """Jane must stay free to ask when the client genuinely has not said."""
+        from app.agents.jane_ads.jane_consultant import _build_budget_confirmation_note
+        assert _build_budget_confirmation_note(None, "hey", []) == ""
+        assert _build_budget_confirmation_note(None, "I want more sales", []) == ""
+
+    def test_ambiguous_amounts_on_a_fresh_thread_still_ask(self):
+        from app.agents.jane_ads.jane_consultant import _build_budget_confirmation_note
+        assert _build_budget_confirmation_note(None, "20k for ads and 5k for design", []) == ""
+
+    def test_remembered_branches_are_unchanged(self):
+        from app.agents.jane_ads.jane_consultant import _build_budget_confirmation_note
+        assert "REPLACES" in _build_budget_confirmation_note(10000.0, "budget 20000", [])
+        assert "10,000" in _build_budget_confirmation_note(10000.0, "same 10000", [])
