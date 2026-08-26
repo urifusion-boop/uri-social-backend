@@ -468,8 +468,25 @@ def _build_budget_confirmation_note(known_budget: Optional[float], message: str,
     affirmative directly answering Jane's own proposal to reuse the figure, or the client
     restating the number outright — tell the model plainly what just happened either way,
     instead of leaving it to infer from a prompt it's already shown it can misread."""
+    latest = _latest_user_reply(message)
+    stated_now = stated_budget_ngn(latest)
+
+    # No remembered budget at all — a fresh thread. The function used to bail here,
+    # so a plainly stated figure got no note and the model was left to decide for
+    # itself whether to accept it. It is a coin flip: the identical message converged
+    # in one turn over the API and took two in the UI, asking "can you confirm this
+    # budget is still accurate" about a number the client had just typed. Say it
+    # plainly instead of leaving it to chance.
     if not known_budget:
+        if stated_now:
+            return (
+                f"\n\nIMPORTANT: the client's latest reply above states ₦{stated_now:,.0f} as "
+                f"THIS campaign's budget. It is stated, not implied — do not ask them to "
+                f"confirm it. Set budget_ngn to {int(stated_now)} and move on to whatever's "
+                "next (not budget again)."
+            )
         return ""
+
     if _client_gave_affirmative(message):
         last_assistant = next((t.get("content", "") for t in reversed(history)
                                if t.get("role") == "assistant"), "")
@@ -481,14 +498,14 @@ def _build_budget_confirmation_note(known_budget: Optional[float], message: str,
                 f"Set budget_ngn to {int(known_budget)} and move on to whatever's next (not "
                 "budget again)."
             )
-    latest_reply = _latest_user_reply(message)
+    latest_reply = latest
 
     # The client named a DIFFERENT figure to the remembered one. This was the gap:
     # the two branches below only fire when the reply repeats the remembered amount,
     # so stating a new budget matched nothing, the known_line kept advertising the old
     # spend, and Jane re-asked — offering the past figure back. Live-confirmed on
     # 2026-08-26: remembered ₦10,000, client said "budget 20000", Jane asked again.
-    stated = stated_budget_ngn(latest_reply)
+    stated = stated_now
     if stated and stated != known_budget:
         return (
             f"\n\nIMPORTANT: the client's latest reply above states ₦{stated:,.0f} for THIS "
