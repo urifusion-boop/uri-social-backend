@@ -313,7 +313,8 @@ def build_history_turns(saved: list[dict]) -> list[dict]:
 
 async def consult(message: str, business_name: str = "", category: str = "",
                   known_budget: Optional[float] = None,
-                  history: Optional[list[dict]] = None) -> ConsultantBrief:
+                  history: Optional[list[dict]] = None,
+                  offering: str = "") -> ConsultantBrief:
     """One consultant turn. `history` — the real prior turns of THIS conversation
     (see build_history_turns) — is what lets the consultant actually track state
     across turns instead of re-deriving confusion from a jumbled flat string each
@@ -332,6 +333,11 @@ async def consult(message: str, business_name: str = "", category: str = "",
         known_bits.append(f"business name: {business_name}")
     if category:
         known_bits.append(f"category: {category}")
+    if offering:
+        # What they actually sell, from the brand profile. Without it the consultant
+        # has only a name and an industry label, and plans come out generic — a
+        # category is not an offer, and the offer is what an audience responds to.
+        known_bits.append(f"what they sell: {offering}")
     if known_budget:
         known_bits.append(f"last campaign they spent ₦{known_budget:,.0f} (a PAST campaign — "
                           "do not treat this as THIS campaign's budget; you may offer it as a "
