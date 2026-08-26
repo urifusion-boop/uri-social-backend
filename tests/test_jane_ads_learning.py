@@ -116,3 +116,53 @@ class TestPromotionRequiresAHuman:
         v = assess(rec(deployments=1))
         with pytest.raises(ValueError, match="nothing to apply"):
             _run(apply_verdict(None, None, v, confirmed_by="collins"))
+
+
+class TestBrandIdentityPrecedence:
+    """A stale identity in conversation history outranked the brand profile, so a
+    Social Media & Marketing Technology brand was planned for as "Living the Truth /
+    Faith-based" — and every downstream plan, audience and ad served the wrong
+    business. The profile is authoritative for WHO the business is."""
+
+    def test_profile_beats_stale_history(self):
+        src = open("app/agents/jane_ads/router.py").read()
+        i = src.index("known_business_name = (")
+        block = src[i:i + 420]
+        assert 'brand_profile.get("brand_name", "")' in block
+        assert block.index('brand_profile.get("brand_name"') < block.index("remembered_business_name")
+        assert block.index('brand_profile.get("industry"') < block.index("remembered_category")
+
+    def test_explicit_request_value_still_wins(self):
+        """An identity stated on the request is the most specific signal of all."""
+        src = open("app/agents/jane_ads/router.py").read()
+        i = src.index("known_business_name = (")
+        block = src[i:i + 420]
+        assert block.index("body.business_name") < block.index('brand_profile.get("brand_name"')
+
+    def test_history_is_still_the_last_resort(self):
+        """It should fill the gap when a profile has no value, not be removed."""
+        src = open("app/agents/jane_ads/router.py").read()
+        i = src.index("known_business_name = (")
+        assert "remembered_business_name(history)" in src[i:i + 420]
+
+
+class TestOfferingReachesTheConsultant:
+    """The profile holds product_description and key_products_services and neither
+    reached Jane, so she reasoned from a name and an industry label. A category is
+    not an offer, and the offer is what an audience responds to."""
+
+    def test_consult_accepts_an_offering(self):
+        import inspect
+        from app.agents.jane_ads.jane_consultant import consult
+        assert "offering" in inspect.signature(consult).parameters
+
+    def test_router_builds_it_from_the_profile(self):
+        src = open("app/agents/jane_ads/router.py").read()
+        assert "known_offering" in src
+        assert "product_description" in src and "key_products_services" in src
+        assert "offering=known_offering" in src
+
+    def test_offering_is_surfaced_in_the_prompt(self):
+        import inspect
+        from app.agents.jane_ads import jane_consultant
+        assert "what they sell:" in inspect.getsource(jane_consultant.consult)
