@@ -242,10 +242,23 @@ class PlanVariant(BaseModel):
     budget_shared_ngn: Optional[float] = None  # what it would cost split with one other
 
 
+class StrategyCitation(BaseModel):
+    """A corpus record that shaped a plan, pinned at the VERSION used. Citing the id
+    alone makes a plan unexplainable within one edit cycle (ASC-ENG-01 §3)."""
+    record_id: str
+    version: int
+    stage: str
+    score: float
+
+
 class PlanVariantSet(BaseModel):
     """The full ranked set Jane presents, plus the computed (never generated)
     selection rule for this budget (spec §6.1)."""
     variants: list[PlanVariant]
+    # ASC-SPEC-01 v2 §8.4 — 'none' must be visible, never silent: if retrieval
+    # returned nothing Jane fell back to model priors and the plan should say so.
+    corpus_coverage: str = "none"          # none | partial | full
+    corpus_citations: list[StrategyCitation] = Field(default_factory=list)
     recommendation_reason: str = ""    # argued, not asserted (spec §3) — why the
                                         # recommended variant beats the others
     max_selectable: int = 1
@@ -286,6 +299,11 @@ class AdCreative(BaseModel):
     DRAFT and RECOMPOSITE can carry either — `is_video` says which."""
     image_url: str = ""             # final creative media URL, hosted on Cloudinary
     is_video: bool = False           # True when image_url is actually a video
+    # Which corpus records shaped this copy, pinned at version. Without this there is
+    # no way to tell from the outside whether the corpus reached the creative stage or
+    # was silently ignored — the position the first live test left us in.
+    corpus_coverage: str = "none"                     # none | partial | full
+    corpus_citations: list[StrategyCitation] = Field(default_factory=list)
     headline: str = ""
     primary_text: str = ""
     cta: str = "Send WhatsApp Message"

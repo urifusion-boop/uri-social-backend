@@ -201,6 +201,25 @@ TONE: Think Aliko Dangote sharing business wisdom, or Tony Elumelu discussing en
 Do NOT include hashtags in the main content - they will be added separately.
 
 Write as if you're sharing hard-won business wisdom with fellow African entrepreneurs.
+        """,
+
+        "tiktok": """
+You are writing a TikTok caption for a Nigerian business account's photo/graphic post. The caption supports the image — it doesn't replace it.
+
+CONTENT TO TRANSFORM: {seed_content}
+
+REQUIREMENTS:
+- Very short — 1-3 lines max, TikTok truncates after ~1 line
+- Ultra-casual, meme-friendly, Gen Z language patterns
+- One punchy hook or POV-style line, not a paragraph
+- No corporate/marketing tone — read like a real person's caption, not an ad
+- Nigerian business context where it genuinely fits (Lagos, SMEs, Naira) — never forced
+
+TONE: Think a Nigerian founder posting on their own TikTok, not a brand account performing enthusiasm.
+
+Do NOT include hashtags in the main content - they will be added separately.
+
+Write one caption. No alternatives, no meta-commentary.
         """
     }
     
@@ -1012,6 +1031,15 @@ Create social media content about THIS SPECIFIC PRODUCT based on the image analy
                 "hashtag_limit": 5,
                 "audience": "Nigerian/African CEOs, entrepreneurs, professionals",
                 "context": "Lagos business scene, African market insights"
+            },
+            "tiktok": {
+                "max_length": 150,
+                "optimal_length": 60,
+                "tone": "Ultra-casual, meme-friendly, Gen Z Nigerian founder",
+                "format": "1-3 lines, caption supports the image, doesn't replace it",
+                "hashtag_limit": 5,
+                "audience": "Young Nigerian entrepreneurs, creatives, Gen Z",
+                "context": "Relatable business moments, behind-the-scenes"
             },
         }
 

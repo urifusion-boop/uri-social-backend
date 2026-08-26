@@ -66,6 +66,14 @@ def _raise_http_for_meta_error(e: "MetaAPIError") -> None:
     raise HTTPException(status_code=502, detail=str(e))
 
 
+def _raise_http_for_tiktok_error(e: "TikTokAdsAPIError") -> None:
+    """Mirrors _raise_http_for_meta_error's shape. No live-verified rate-limit
+    signal exists yet for TikTok's Marketing API the way Meta's is_rate_limited
+    flag does — every failure surfaces as a plain 502 until a real account shows
+    which `code` values deserve the same special-cased treatment."""
+    raise HTTPException(status_code=502, detail=str(e))
+
+
 class PlanRequestBody(BaseModel):
     business_name: str = "My Business"
     category: str = ""
@@ -169,6 +177,120 @@ async def _plan_and_simulate(
             "cap_respected": spent <= plan_obj.per_business_cap_ngn,
         },
     }
+
+
+
+async def _retrieve_for_plan_generation(
+    db, parsed, business_id: Optional[str] = None
+) -> Optional["RetrievalResult"]:
+    """ASC-SPEC-01 v2 §9.2 — retrieval fires AFTER platform selection, so it is scoped
+    to the platforms this build will actually use; retrieving earlier returns records
+    for platforms that will never run.
+
+    Best-effort by design: the corpus informs plans, it does not generate them (§9.1),
+    so a corpus outage must degrade to today's model-prior behaviour rather than block
+    a client mid-conversation. An empty result is NOT swallowed — it is logged as a
+    coverage gap, because which stage/tier/platform combinations return nothing is the
+    seeding roadmap (§8.4).
+    """
+    try:
+        from .entities import ConsumedBy, StrategyPlatform
+        from .retrieval import (
+            BudgetContext, BusinessProfile, RetrievalRequest, gap_record, retrieve,
+        )
+        from .store import MongoCoverageGapStore, MongoStrategyStore
+
+        budget_ngn = float(getattr(parsed, "budget_ngn", 0) or 0)
+        if budget_ngn <= 0:
+            return None
+        duration = int(getattr(parsed, "duration_days", 0) or C.DEFAULT_CAMPAIGN_DAYS)
+        daily = budget_ngn / (1 + C.VAT_RATE) / max(duration, 1)
+
+        # Sustained capacity is a SEPARATE question from what this campaign can
+        # spend (§5.2). Unknown fails closed: every record needing more than one
+        # day of continuous spend is excluded rather than optimistically allowed.
+        sustained_ngn, sustained_known = None, False
+        if business_id:
+            from .store import MongoWalletStore
+            from .wallet import WalletService
+            sustained_ngn, sustained_known = await WalletService(
+                MongoWalletStore(db)
+            ).sustained_daily_ngn(business_id)
+
+        req = RetrievalRequest(
+            stage=ConsumedBy.PLAN_GENERATION,
+            # Jane Ads runs on the pooled Meta account; TikTok/Google adapters exist
+            # but no live ads path reaches them yet. Sourced here rather than assumed
+            # downstream so the day a second platform ships, this is the one edit.
+            platforms=[StrategyPlatform.META],
+            budget=BudgetContext(
+                daily_spend_ngn=daily,
+                budget_tier=_budget_tier(budget_ngn),
+                sustained_daily_ngn=sustained_ngn,
+                sustained_known=sustained_known,
+            ),
+            profile=BusinessProfile(
+                has_video_asset=bool(getattr(parsed, "has_video", False)),
+                # outcome capture is ENG step 9, unbuilt — records requiring it
+                # correctly stay excluded until it exists.
+                records_outcomes=False,
+            ),
+        )
+        result = retrieve(await MongoStrategyStore(db).fetch_approved(), req)
+        if not result.records:
+            await MongoCoverageGapStore(db).log_gap(gap_record(req))
+        return result
+    except Exception as e:                       # noqa: BLE001 — never block a build
+        print(f"[oneshot] corpus retrieval skipped: {e}", flush=True)
+        return None
+
+
+
+async def _structure_notes(db, budget_ngn: float, duration_days: int = 0) -> list[dict]:
+    """Corpus findings for campaign structure (spec §12), attached to the stored plan
+    as auditable notes — NOT fed into the build.
+
+    §12 is explicit that tier rules take precedence over corpus records: a record
+    proposing a structure the tier forbids should never have passed the filter, and
+    one reaching this point that violates tier rules is a filter defect. The
+    structure decisions themselves (ABO/CBO, ad-set count, pacing) are deterministic
+    arithmetic in decision_engine, so the corpus records here are review material for
+    the operator, not an input the engine should follow.
+    """
+    try:
+        from .entities import ConsumedBy, StrategyPlatform
+        from .retrieval import BudgetContext, BusinessProfile, RetrievalRequest, retrieve
+        from .store import MongoStrategyStore
+        if not budget_ngn or budget_ngn <= 0:
+            return []
+        days = duration_days or C.DEFAULT_CAMPAIGN_DAYS
+        daily = budget_ngn / (1 + C.VAT_RATE) / max(days, 1)
+        req = RetrievalRequest(
+            stage=ConsumedBy.CAMPAIGN_STRUCTURE,
+            platforms=[StrategyPlatform.META],
+            budget=BudgetContext(daily_spend_ngn=daily, budget_tier=_budget_tier(budget_ngn)),
+            profile=BusinessProfile(),
+        )
+        res = retrieve(await MongoStrategyStore(db).fetch_approved(), req)
+        return [
+            {"record_id": r.strategy_id, "version": r.version,
+             "claim": r.claim, "score": res.scores.get(r.strategy_id, 0.0)}
+            for r in res.records
+        ]
+    except Exception as e:                       # noqa: BLE001
+        print(f"[oneshot] structure notes skipped: {e}", flush=True)
+        return []
+
+
+def _budget_tier(budget_ngn: float) -> int:
+    """Spec §5.4 — tier gates structure, separately from the daily-spend floor."""
+    if budget_ngn < 15_000:
+        return 1
+    if budget_ngn < 50_000:
+        return 2
+    if budget_ngn < 250_000:
+        return 3
+    return 4
 
 
 @router.post("/plan")
@@ -1131,6 +1253,78 @@ async def meta_test_launch(
     }
 
 
+class TikTokTestLaunchBody(BaseModel):
+    business_name: str = "Test Business"
+    budget_ngn: float = Field(50_000, gt=0)   # PRD: only route ₦50,000+ wallets to TikTok
+    days: int = Field(7, gt=0)
+    video_url: str    # TikTok is video-only — a hosted .mp4 TikTok can fetch by URL
+    headline: str = "Chat With Us"
+    primary_text: str = "Chat with us on WhatsApp!"
+    whatsapp_number: str   # TikTok routes to wa.me/<this> — no shared-page fallback exists
+
+
+@router.post("/tiktok/test-launch")
+async def tiktok_test_launch(
+    body: TikTokTestLaunchBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    _token: dict = Depends(JWTBearer()),
+) -> dict:
+    """Launches a REAL TikTok campaign (created DISABLE — TikTok's paused
+    equivalent, zero spend until a human activates it in TikTok Ads Manager)
+    against the configured advertiser account. Mirrors /meta/test-launch's shape —
+    lets anyone exercise the live TikTok adapter directly once real
+    TIKTOK_ADS_ADVERTISER_ID/TIKTOK_ADS_ACCESS_TOKEN exist, the same way that
+    endpoint was used to first prove the Meta adapter against a real account.
+    This is the intended next verification step once Ibukun has real TikTok
+    Marketing API credentials — the adapter itself is unit-tested but has never
+    run against a live account."""
+    import uuid
+    from app.core.config import settings
+    from .adapters.tiktok import TikTokAdsAdapter, TikTokAdsAPIError
+    from .models import (
+        ABTestScope, AdCreative, CampaignPlan, CampaignObjective, Goal, PlatformPlan,
+        PurchaseBehaviour, SpendAuthorization,
+    )
+
+    if not (settings.TIKTOK_ADS_ADVERTISER_ID and settings.TIKTOK_ADS_ACCESS_TOKEN):
+        raise HTTPException(
+            status_code=400,
+            detail="TikTok ads not configured — need TIKTOK_ADS_ADVERTISER_ID and TIKTOK_ADS_ACCESS_TOKEN",
+        )
+
+    business_id = f"demo_tiktok_test_{uuid.uuid4().hex[:8]}"
+    plan = CampaignPlan(
+        business_id=business_id,
+        goal=Goal.MESSAGES,
+        behaviour=PurchaseBehaviour.DISCOVER,
+        platforms=[PlatformPlan(
+            platform=Platform.TIKTOK, budget_ngn=body.budget_ngn, days=body.days,
+            variants=1, test_scope=ABTestScope.NONE, objective=CampaignObjective.CONVERSATIONS,
+        )],
+        per_business_cap_ngn=body.budget_ngn,
+        account_cap_ngn=body.budget_ngn,
+        whatsapp_number=body.whatsapp_number,
+        creative=AdCreative(image_url=body.video_url, is_video=True, headline=body.headline, primary_text=body.primary_text),
+        explanation=f"Real TikTok ads test launch for {body.business_name}",
+    )
+    auth = SpendAuthorization(business_id=business_id, funded_amount_ngn=body.budget_ngn, account_cap_ngn=body.budget_ngn)
+
+    adapter = TikTokAdsAdapter(db, advertiser_id=settings.TIKTOK_ADS_ADVERTISER_ID, access_token=settings.TIKTOK_ADS_ACCESS_TOKEN)
+    try:
+        result = await adapter.launch_campaign(plan, auth)
+    except TikTokAdsAPIError as e:
+        _raise_http_for_tiktok_error(e)
+    except (ValueError, NotImplementedError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {
+        "campaign_id": result.campaign_id,
+        "ad_ids": result.ad_ids,
+        "note": "Created DISABLE (paused) — zero spend. Review and activate it yourself in TikTok Ads Manager if you want it live.",
+        "ads_manager_url": f"https://ads.tiktok.com/i18n/perf/campaign?aadvid={settings.TIKTOK_ADS_ADVERTISER_ID}",
+    }
+
+
 class MetaLaunchFromMessageBody(BaseModel):
     message: str                          # plain-English ask, e.g. "get me lunch customers in Surulere, ₦15k"
     business_name: str = ""
@@ -1412,8 +1606,10 @@ async def _build_campaign_plan(
     if selected_variant is None:
         try:
             from .plan_variants import generate_plan_variants, PlanVariantsUnavailableError
+            corpus = await _retrieve_for_plan_generation(db, parsed, business_id)
             variant_set = await generate_plan_variants(
                 parsed, business_name=req.business_name, description=req.description,
+                corpus=corpus,
             )
         except Exception as e:
             variant_set = None
@@ -1470,16 +1666,26 @@ async def _build_campaign_plan(
         price_per_conversation = WalletService.price_conversation(trailing_cost)
     plan.estimated_conversations = max(1, round(req.budget_ngn / price_per_conversation))
 
-    # For now, always launch on Meta — it's the only platform with a live adapter
-    # (Google/TikTok are still pending, #7/#8). If Jane's decision landed elsewhere,
-    # force the plan onto Meta so the demo always produces a real ad. Jane's original
-    # recommendation is still surfaced in the response for transparency.
+    # TikTok has a live adapter now, but only actually usable once real Marketing
+    # API credentials exist (staging/prod both start with these empty — a TikTok
+    # for Business + Marketing API app approval is a real, external, days-to-weeks
+    # process, not something flipped on by a deploy). Route to TikTok only when
+    # Jane herself picked it AND credentials are configured; otherwise force Meta
+    # exactly as before. Google is still pending — no live adapter wired into this
+    # launch path yet. Jane's original recommendation is always surfaced in the
+    # response for transparency, regardless of what actually launches.
     jane_platforms = [p.platform.value for p in plan.platforms]
-    forced_to_meta = not any(p.platform == Platform.META for p in plan.platforms)
-    if forced_to_meta:
-        plan = apply_platform_override(plan, [Platform.META])
+    tiktok_ready = bool(settings.TIKTOK_ADS_ADVERTISER_ID and settings.TIKTOK_ADS_ACCESS_TOKEN)
+    jane_picked_tiktok = any(p.platform == Platform.TIKTOK for p in plan.platforms)
+    if jane_picked_tiktok and tiktok_ready:
+        plan.platforms = [p for p in plan.platforms if p.platform == Platform.TIKTOK]
+        forced_to_meta = False
     else:
-        plan.platforms = [p for p in plan.platforms if p.platform == Platform.META]
+        forced_to_meta = not any(p.platform == Platform.META for p in plan.platforms)
+        if forced_to_meta:
+            plan = apply_platform_override(plan, [Platform.META])
+        else:
+            plan.platforms = [p for p in plan.platforms if p.platform == Platform.META]
 
     # 3. Geo refinement — prefer the consultant's own §7 judgment (which of own-radius/
     # watering-hole/mixed/non-local, and which named pockets), validated by real
@@ -1605,6 +1811,9 @@ async def _build_campaign_plan(
             behaviour=plan.behaviour.value, service_area=service_area,
             audience_segment=variant_segment, who_its_for=variant_who_its_for,
             geo_pockets=variant_geo_pockets,
+            # Drives creative-stage retrieval; without it budget is 0, retrieval
+            # bails early, and the ad ships with corpus_coverage="none".
+            budget_ngn=float(parsed.budget_ngn or 0),
         )
         if creative.image_url:
             # "reason" is a strict Literal on CreditTransaction — "campaign_generation"
@@ -1703,21 +1912,26 @@ async def _build_campaign_plan(
         from .adapters.meta import MetaAdPlatformAdapter
 
         estimate = None
-        try:
-            est_adapter = MetaAdPlatformAdapter(db, access_token=settings.META_ADS_ACCESS_TOKEN)
-            # Reach the REAL audience: build the targeting from the plan's geo pins (radius
-            # around each validated coordinate) so the estimate isn't all of Nigeria.
-            custom_locations = [
-                {"latitude": pin.lat, "longitude": pin.lng,
-                 "radius": pin.radius_km, "distance_unit": "kilometer"}
-                for pin in (plan.geo.pins if plan.geo else [])
-                if pin.lat is not None and pin.lng is not None
-            ]
-            targeting = ({"geo_locations": {"custom_locations": custom_locations}}
-                         if custom_locations else {"geo_locations": {"countries": ["NG"]}})
-            estimate = await est_adapter.get_delivery_estimate(targeting)
-        except Exception as e:
-            print(f"[oneshot] delivery estimate skipped: {e}", flush=True)
+        # get_delivery_estimate is a Meta-only capability (Meta's own Delivery
+        # Estimate API) — TikTokAdsAdapter has no equivalent, so only attempt this
+        # for a Meta-bound plan rather than failing every TikTok launch through
+        # the except below for no reason.
+        if plan.platforms and plan.platforms[0].platform == Platform.META:
+            try:
+                est_adapter = MetaAdPlatformAdapter(db, access_token=settings.META_ADS_ACCESS_TOKEN)
+                # Reach the REAL audience: build the targeting from the plan's geo pins (radius
+                # around each validated coordinate) so the estimate isn't all of Nigeria.
+                custom_locations = [
+                    {"latitude": pin.lat, "longitude": pin.lng,
+                     "radius": pin.radius_km, "distance_unit": "kilometer"}
+                    for pin in (plan.geo.pins if plan.geo else [])
+                    if pin.lat is not None and pin.lng is not None
+                ]
+                targeting = ({"geo_locations": {"custom_locations": custom_locations}}
+                             if custom_locations else {"geo_locations": {"countries": ["NG"]}})
+                estimate = await est_adapter.get_delivery_estimate(targeting)
+            except Exception as e:
+                print(f"[oneshot] delivery estimate skipped: {e}", flush=True)
         summary = build_campaign_summary(plan, req, price_per_result_ngn=price_per_conversation,
                                          delivery_estimate=estimate)
         summary_dump = summary.model_dump(mode="json")
@@ -1797,11 +2011,14 @@ def _plan_response_dict(built: _PlanBuildResult) -> dict:
 
 
 async def _do_launch(built: _PlanBuildResult, body_message: str, body_business_name: str, brand_ctx: dict, db: AsyncIOMotorDatabase) -> dict:
-    """The actual Meta launch + campaign-record enrichment — shared by the one-shot
-    endpoint and /meta/plan/{id}/launch, both of which have already done their own
-    wallet-gate check by the time they call this."""
+    """The actual platform launch + campaign-record enrichment — shared by the
+    one-shot endpoint and /meta/plan/{id}/launch, both of which have already done
+    their own wallet-gate check by the time they call this. Dispatches by
+    plan.platforms[0].platform — Meta unless Jane picked TikTok AND TikTok
+    credentials are configured (see the forcing logic in _build_campaign_plan)."""
     from app.core.config import settings
     from .adapters.meta import MetaAdPlatformAdapter, MetaAPIError
+    from .adapters.tiktok import TikTokAdsAdapter, TikTokAdsAPIError
     from .wallet import WalletService
     from .store import MongoWalletStore
 
@@ -1809,17 +2026,26 @@ async def _do_launch(built: _PlanBuildResult, body_message: str, body_business_n
     wallet = WalletService(MongoWalletStore(db))
     auth = await wallet.authorization_for(business_id, total_funded_wallets_ngn=req.budget_ngn)
 
-    adapter = MetaAdPlatformAdapter(db, access_token=settings.META_ADS_ACCESS_TOKEN)
+    launch_platform = plan.platforms[0].platform if plan.platforms else Platform.META
+    is_tiktok = launch_platform == Platform.TIKTOK
+
+    if is_tiktok:
+        adapter = TikTokAdsAdapter(db, advertiser_id=settings.TIKTOK_ADS_ADVERTISER_ID, access_token=settings.TIKTOK_ADS_ACCESS_TOKEN)
+    else:
+        adapter = MetaAdPlatformAdapter(db, access_token=settings.META_ADS_ACCESS_TOKEN)
     try:
         launch = await adapter.launch_campaign(plan, auth)
+    except TikTokAdsAPIError as e:
+        _raise_http_for_tiktok_error(e)
     except MetaAPIError as e:
         _raise_http_for_meta_error(e)
     except (ValueError, NotImplementedError) as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    campaign_collection = "jane_ads_tiktok_campaigns" if is_tiktok else "jane_ads_meta_campaigns"
     # Enrich the stored campaign record with display fields so the campaign-list
     # view can render name/creative/budget without re-deriving them.
-    await db["jane_ads_meta_campaigns"].update_one(
+    await db[campaign_collection].update_one(
         {"campaign_id": launch.campaign_id},
         {"$set": {
             "brand_id": brand_ctx.get("brand_id"),
@@ -1841,6 +2067,17 @@ async def _do_launch(built: _PlanBuildResult, body_message: str, body_business_n
         }},
     )
 
+    launch_note = (
+        "Created DISABLE (paused) — zero spend. Review and activate in TikTok Ads Manager to go live."
+        if is_tiktok else
+        "Created PAUSED — zero spend. Review and activate in Ads Manager to go live."
+    )
+    ads_manager_url = (
+        f"https://ads.tiktok.com/i18n/perf/campaign?aadvid={settings.TIKTOK_ADS_ADVERTISER_ID}"
+        if is_tiktok else
+        f"https://adsmanager.facebook.com/adsmanager/manage/campaigns"
+        f"?act={settings.META_AD_ACCOUNT_ID}&selected_campaign_ids={launch.campaign_id}"
+    )
     return {
         "stage": "launched",
         "understood": built.understood,
@@ -1851,12 +2088,9 @@ async def _do_launch(built: _PlanBuildResult, body_message: str, body_business_n
             "campaign_id": launch.campaign_id,
             "ad_ids": launch.ad_ids,
             "page_id": plan.page_id,
-            "status": "PAUSED",
-            "note": "Created PAUSED — zero spend. Review and activate in Ads Manager to go live.",
-            "ads_manager_url": (
-                f"https://adsmanager.facebook.com/adsmanager/manage/campaigns"
-                f"?act={settings.META_AD_ACCOUNT_ID}&selected_campaign_ids={launch.campaign_id}"
-            ),
+            "status": "DISABLE" if is_tiktok else "PAUSED",
+            "note": launch_note,
+            "ads_manager_url": ads_manager_url,
         },
     }
 
@@ -2195,30 +2429,44 @@ async def meta_campaigns(
     brand_ctx: dict = Depends(get_active_brand_context),
     with_metrics: bool = True,
 ) -> dict:
-    """List the active brand's campaigns for the management view. Each row carries
-    its display fields (name, creative, budget) plus — when with_metrics — live
-    reach/conversation/spend numbers pulled from the platform. Metrics failures per
-    campaign are swallowed so one bad campaign never blanks the whole list."""
+    """List the active brand's campaigns for the management view — Meta and TikTok
+    together (the route stays named /meta/campaigns for backwards compatibility;
+    the frontend already calls it and matches the PRD's own "Jane decides the
+    platform silently" philosophy — the caller never had to pick one). Each row
+    carries its display fields (name, creative, budget) plus — when with_metrics —
+    live reach/conversation/spend numbers pulled from the platform. Metrics
+    failures per campaign are swallowed so one bad campaign never blanks the whole
+    list."""
     from app.core.config import settings
     from .adapters.meta import MetaAdPlatformAdapter
+    from .adapters.tiktok import TikTokAdsAdapter
 
     brand_id = brand_ctx.get("brand_id")
     if not brand_id:
         return {"campaigns": []}
 
-    records = await (db["jane_ads_meta_campaigns"]
+    meta_records = await (db["jane_ads_meta_campaigns"]
+                     .find({"brand_id": brand_id}, {"_id": 0})
+                     .sort("created_at", -1).to_list(length=200))
+    tiktok_records = await (db["jane_ads_tiktok_campaigns"]
                      .find({"brand_id": brand_id}, {"_id": 0})
                      .sort("created_at", -1).to_list(length=200))
 
-    adapter = None
+    meta_adapter = None
     if with_metrics and settings.META_ADS_ACCESS_TOKEN and settings.META_AD_ACCOUNT_ID:
-        adapter = MetaAdPlatformAdapter(db, access_token=settings.META_ADS_ACCESS_TOKEN)
+        meta_adapter = MetaAdPlatformAdapter(db, access_token=settings.META_ADS_ACCESS_TOKEN)
+    tiktok_adapter = None
+    if with_metrics and settings.TIKTOK_ADS_ACCESS_TOKEN and settings.TIKTOK_ADS_ADVERTISER_ID:
+        tiktok_adapter = TikTokAdsAdapter(db, advertiser_id=settings.TIKTOK_ADS_ADVERTISER_ID, access_token=settings.TIKTOK_ADS_ACCESS_TOKEN)
 
     out = []
-    for r in records:
+    for is_tiktok, r in [(False, r) for r in meta_records] + [(True, r) for r in tiktok_records]:
+        collection = "jane_ads_tiktok_campaigns" if is_tiktok else "jane_ads_meta_campaigns"
+        adapter = tiktok_adapter if is_tiktok else meta_adapter
         created = r.get("created_at")
         row = {
             "campaign_id": r.get("campaign_id"),
+            "platform": "tiktok" if is_tiktok else "meta",
             "name": r.get("display_name") or "Campaign",
             "headline": r.get("headline", ""),
             "primary_text": r.get("primary_text", ""),
@@ -2229,9 +2477,11 @@ async def meta_campaigns(
             # Where leads for this campaign land, so the user can find their conversations.
             # Empty on legacy campaigns (pre-wa.me routing) — the UI flags those.
             "whatsapp_number": r.get("whatsapp_number") or "",
-            "status": "paused",   # everything is created PAUSED for now
+            "status": "paused",   # everything is created PAUSED (Meta) / DISABLE (TikTok) for now
             "created_at": created.isoformat() if hasattr(created, "isoformat") else created,
             "ads_manager_url": (
+                f"https://ads.tiktok.com/i18n/perf/campaign?aadvid={settings.TIKTOK_ADS_ADVERTISER_ID}"
+                if is_tiktok else
                 f"https://adsmanager.facebook.com/adsmanager/manage/campaigns"
                 f"?act={settings.META_AD_ACCOUNT_ID}&selected_campaign_ids={r.get('campaign_id')}"
             ),
@@ -2241,12 +2491,12 @@ async def meta_campaigns(
             try:
                 summary = await adapter.fetch_campaign_summary(r["campaign_id"])
                 # A campaign can be deleted by means we never see (directly in Ads
-                # Manager, or a manual cleanup) — once Meta itself reports it as
-                # gone, drop our own record too instead of showing a stale "Deleted"
-                # ghost card forever. This is the ONLY status we self-heal on;
-                # everything else (paused/active/in review/etc.) still renders.
+                # Manager, or a manual cleanup) — once the platform itself reports
+                # it as gone, drop our own record too instead of showing a stale
+                # "Deleted" ghost card forever. This is the ONLY status we self-heal
+                # on; everything else (paused/active/in review/etc.) still renders.
                 if summary["delivery"] == "Deleted":
-                    await db["jane_ads_meta_campaigns"].delete_one({"campaign_id": r["campaign_id"]})
+                    await db[collection].delete_one({"campaign_id": r["campaign_id"]})
                     continue
                 row["status"] = summary["delivery"].lower()
                 row["metrics"] = {
@@ -2265,6 +2515,7 @@ async def meta_campaigns(
                 print(f"[campaigns] metrics failed for {r.get('campaign_id')}: {e}", flush=True)
         out.append(row)
 
+    out.sort(key=lambda row: row.get("created_at") or "", reverse=True)
     return {"campaigns": out}
 
 
@@ -2282,14 +2533,32 @@ async def set_meta_campaign_status(
     """Turn a campaign on or off from the caller's own campaign-management view —
     no Ads Manager needed. Scoped to the caller's active brand so a campaign_id
     can't be toggled by anyone outside the brand that owns it. Going active is the
-    one genuinely consequential action here — real budget can start being spent."""
+    one genuinely consequential action here — real budget can start being spent.
+    Looks the campaign up across both platform collections — the route stays
+    /meta/campaigns/... for backwards compatibility, but a campaign_id could now
+    belong to either."""
     from app.core.config import settings
     from .adapters.meta import MetaAdPlatformAdapter, MetaAPIError
+    from .adapters.tiktok import TikTokAdsAdapter, TikTokAdsAPIError
 
     brand_id = brand_ctx.get("brand_id")
     record = await db["jane_ads_meta_campaigns"].find_one({"campaign_id": campaign_id})
+    is_tiktok = False
+    if not record:
+        record = await db["jane_ads_tiktok_campaigns"].find_one({"campaign_id": campaign_id})
+        is_tiktok = True
     if not record or record.get("brand_id") != brand_id:
         raise HTTPException(status_code=404, detail="Campaign not found")
+
+    if is_tiktok:
+        if not (settings.TIKTOK_ADS_ADVERTISER_ID and settings.TIKTOK_ADS_ACCESS_TOKEN):
+            raise HTTPException(status_code=400, detail="TikTok ads not configured")
+        adapter = TikTokAdsAdapter(db, advertiser_id=settings.TIKTOK_ADS_ADVERTISER_ID, access_token=settings.TIKTOK_ADS_ACCESS_TOKEN)
+        try:
+            return await adapter.set_delivery(campaign_id, body.active)
+        except TikTokAdsAPIError as e:
+            _raise_http_for_tiktok_error(e)
+
     if not (settings.META_AD_ACCOUNT_ID and settings.META_ADS_ACCESS_TOKEN):
         raise HTTPException(status_code=400, detail="Meta ads not configured")
 
@@ -2321,14 +2590,33 @@ async def delete_meta_campaign(
 ) -> dict:
     """Permanently delete a campaign — from the caller's own campaign-management view,
     scoped to their active brand so a campaign_id can't be deleted by anyone outside
-    the brand that owns it. Removes it from OUR list too, not just Meta's side."""
+    the brand that owns it. Removes it from OUR list too, not just the platform's side.
+    Looks the campaign up across both platform collections, same as the status
+    endpoint above."""
     from app.core.config import settings
     from .adapters.meta import MetaAdPlatformAdapter, MetaAPIError
+    from .adapters.tiktok import TikTokAdsAdapter, TikTokAdsAPIError
 
     brand_id = brand_ctx.get("brand_id")
     record = await db["jane_ads_meta_campaigns"].find_one({"campaign_id": campaign_id})
+    is_tiktok = False
+    if not record:
+        record = await db["jane_ads_tiktok_campaigns"].find_one({"campaign_id": campaign_id})
+        is_tiktok = True
     if not record or record.get("brand_id") != brand_id:
         raise HTTPException(status_code=404, detail="Campaign not found")
+
+    if is_tiktok:
+        if not (settings.TIKTOK_ADS_ADVERTISER_ID and settings.TIKTOK_ADS_ACCESS_TOKEN):
+            raise HTTPException(status_code=400, detail="TikTok ads not configured")
+        adapter = TikTokAdsAdapter(db, advertiser_id=settings.TIKTOK_ADS_ADVERTISER_ID, access_token=settings.TIKTOK_ADS_ACCESS_TOKEN)
+        try:
+            await adapter.delete_campaign(campaign_id)
+        except TikTokAdsAPIError as e:
+            _raise_http_for_tiktok_error(e)
+        await db["jane_ads_tiktok_campaigns"].delete_one({"campaign_id": campaign_id})
+        return {"deleted": True}
+
     if not (settings.META_AD_ACCOUNT_ID and settings.META_ADS_ACCESS_TOKEN):
         raise HTTPException(status_code=400, detail="Meta ads not configured")
 

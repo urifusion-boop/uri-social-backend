@@ -208,6 +208,27 @@ class WalletService:
         await self._store.add_transaction(txn)
         return txn
 
+    async def sustained_daily_ngn(
+        self, business_id: str, now: Optional[datetime] = None
+    ) -> tuple[Optional[float], bool]:
+        """Spec §5.2 — what they can KEEP spending, as distinct from what this campaign
+        can spend. Returns (naira_per_day, known).
+
+        Ninety days, not thirty: top-ups arrive staggered and small, and thirty days is
+        too few events for the rate to be stable. Below MIN events the number is not
+        trusted and every record needing more than a single day of spend is excluded —
+        fail closed, because a client who can afford ₦3,000/day once but tops up
+        ₦20,000 a month cannot run a tactic that needs three weeks of continuous spend.
+        """
+        now = now or _now()
+        since = now - timedelta(days=C.SUSTAINED_WINDOW_DAYS)
+        txns = await self._store.list_transactions(business_id, since=since)
+        topups = [t for t in txns if t.type == TransactionType.TOPUP]
+        if len(topups) < C.SUSTAINED_MIN_TOPUP_EVENTS:
+            return None, False
+        total = sum(t.amount_ngn for t in topups)
+        return round(total / C.SUSTAINED_WINDOW_DAYS, 2), True
+
     async def can_afford(self, business_id: str, price_ngn: float) -> bool:
         return (await self.get_balance(business_id)) >= price_ngn
 

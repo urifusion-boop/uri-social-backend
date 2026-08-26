@@ -813,6 +813,11 @@ class ApprovalWorkflowService:
                                     "connection_status": "active",
                                 }
                                 doc = {
+                                    # Explicit id (mirrors SocialAccountService.finalize_connection) —
+                                    # without it every fallback-synced doc defaults to id: null and
+                                    # the second one ever written collides with the unique index
+                                    # (the recurring "dup key: { id: null }" errors in the logs).
+                                    "id": acc.get("id"),
                                     "user_id": draft_user_id,
                                     "platform": network,
                                     "outstand_account_id": acc.get("id"),
@@ -954,13 +959,30 @@ class ApprovalWorkflowService:
                 platform = draft["platform"]
                 print(f"🚀 Immediate publish | draft_id={draft_id} platform={platform} user_id={user_id}")
 
-                connections_cursor = db["social_connections"].find({
-                    "user_id": user_id,
-                    "platform": platform,
-                    "connection_status": "active",
-                }).sort("created_at", -1).limit(1)
-                connection = await connections_cursor.to_list(length=1)
-                connection = connection[0] if connection else None
+                connection = None
+                # TikTok: prefer a direct-OAuth connection (FILE_UPLOAD, bypasses
+                # Outstand) over the generic lookup below — that query doesn't
+                # filter by connected_via, so it would otherwise pick whichever
+                # connection happens to be most recently created rather than
+                # reliably preferring direct.
+                if platform == "tiktok":
+                    connection = await db["social_connections"].find_one({
+                        "user_id": user_id,
+                        "platform": "tiktok",
+                        "connected_via": "tiktok_direct_oauth",
+                        "connection_status": "active",
+                    })
+                    if connection:
+                        print(f"🔗 Preferring direct TikTok connection open_id={connection.get('open_id')}")
+
+                if not connection:
+                    connections_cursor = db["social_connections"].find({
+                        "user_id": user_id,
+                        "platform": platform,
+                        "connection_status": "active",
+                    }).sort("created_at", -1).limit(1)
+                    connection = await connections_cursor.to_list(length=1)
+                    connection = connection[0] if connection else None
 
                 # Fall back to Outstand live lookup if local mirror is empty.
                 # Skip Instagram — it always uses direct Graph API, never Outstand.
@@ -985,6 +1007,11 @@ class ApprovalWorkflowService:
                             # Sync to local DB so future lookups work
                             from datetime import datetime as _dt
                             doc = {
+                                # Explicit id (mirrors SocialAccountService.finalize_connection) —
+                                # without it every fallback-synced doc defaults to id: null and
+                                # the second one ever written collides with the unique index
+                                # (the recurring "dup key: { id: null }" errors in the logs).
+                                "id": acc.get("id"),
                                 "user_id": user_id,
                                 "platform": network,
                                 "outstand_account_id": acc.get("id"),
@@ -1502,6 +1529,27 @@ class ApprovalWorkflowService:
                     print(f"⚠️ FB — no Outstand Facebook account found anywhere, falling back to direct FB API")
                     # fall through to legacy Facebook block below
 
+        # ── TikTok direct (FILE_UPLOAD, bypasses Outstand) ───────────────────────
+        if platform == "tiktok" and connection.get("connected_via") == "tiktok_direct_oauth":
+            from app.agents.social_media_manager.services.tiktok_direct_service import (
+                get_valid_tiktok_access_token,
+                publish_tiktok_direct,
+                TikTokDirectAPIError,
+            )
+            video_url = draft.get("video_url") or ""
+            if not video_url:
+                return {"success": False, "error": "TikTok post has no video_url. Re-generate the video before publishing."}
+            if db is None:
+                return {"success": False, "error": "TikTok direct publish requires a database handle."}
+            try:
+                access_token = await get_valid_tiktok_access_token(db, connection)
+                publish_id, status = await publish_tiktok_direct(access_token, video_url, content)
+                print(f"✅ TikTok direct publish: publish_id={publish_id} status={status}")
+                return {"success": True, "post_id": publish_id, "raw_response": {"publish_id": publish_id, "status": status}}
+            except TikTokDirectAPIError as e:
+                print(f"❌ TikTok direct publish failed: {e}")
+                return {"success": False, "error": f"TikTok direct publish failed: {str(e)}"}
+
         # ── Outstand-connected accounts ───────────────────────────────────────
         if connection.get("connected_via") == "outstand":
             try:
@@ -1654,9 +1702,11 @@ class ApprovalWorkflowService:
                 platform_config = None
                 if platform == "tiktok" and media_urls:
                     media_urls = [await outstand.upload_media_from_url(u) for u in media_urls]
-                    # Default to DIRECT_POST so it goes live instead of sitting as an inbox
-                    # draft; unaudited TikTok apps can only Direct Post as SELF_ONLY.
-                    platform_config = {"tiktok": {"postMode": "DIRECT_POST", "privacyLevel": "SELF_ONLY"}}
+                    # DIRECT_POST so it goes live instead of sitting as an inbox draft.
+                    # PUBLIC_TO_EVERYONE — the app's Content Posting API audit passed
+                    # 2026-08-17; before that, TikTok's API only accepted SELF_ONLY for
+                    # an unaudited app (see the identical fix in video_publish_service.py).
+                    platform_config = {"tiktok": {"postMode": "DIRECT_POST", "privacyLevel": "PUBLIC_TO_EVERYONE"}}
 
                 print(f"📤 Publishing via Outstand | account_id={connection.get('outstand_account_id')} platform={platform} has_image={bool(media_urls)} thread={bool(tweets and len(tweets) > 1)}")
                 result = await outstand.publish_post(

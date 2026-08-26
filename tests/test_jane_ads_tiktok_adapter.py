@@ -301,3 +301,164 @@ def test_pause_ad_sends_disable_status():
     assert sent["operation_status"] == "DISABLE"
     assert sent["ad_ids"] == ["333"]
     assert sent["adgroup_id"] == "222"
+
+
+# ── fetch_campaign_summary / set_delivery / delete_campaign ─────────────────────
+# Not part of AdPlatformAdapter's ABC — billing.py and the campaign-management
+# router endpoints call these directly, mirroring the extra contract
+# MetaAdPlatformAdapter exposes (see adapters/meta.py's own tests for the Meta
+# equivalents of every case below).
+
+def test_fetch_campaign_summary_active_campaign():
+    db = FakeDb()
+    db["jane_ads_tiktok_campaigns"].docs["111"] = {"business_id": "b1", "ad_id": "333"}
+    adapter = _adapter(db)
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client([
+            {"code": 0, "message": "OK", "data": {"list": [{"operation_status": "ENABLE"}]}},
+            {"code": 0, "message": "OK", "data": {"list": [{"metrics": {
+                "impressions": "1000", "reach": "800", "clicks": "20", "spend": "5000",
+            }}]}},
+        ])
+        MockClient.return_value.__aenter__.return_value = mock_client
+        summary = _run(adapter.fetch_campaign_summary("111"))
+    assert summary["delivery"] == "Active"
+    assert summary["spend_ngn"] == 5000.0
+    assert summary["impressions"] == 1000
+    assert summary["reach"] == 800
+    assert summary["conversations"] == 20
+    assert summary["cost_per_conversation_ngn"] == 250.0
+
+
+def test_fetch_campaign_summary_paused_campaign():
+    db = FakeDb()
+    db["jane_ads_tiktok_campaigns"].docs["111"] = {"business_id": "b1", "ad_id": "333"}
+    adapter = _adapter(db)
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client([
+            {"code": 0, "message": "OK", "data": {"list": [{"operation_status": "DISABLE"}]}},
+            {"code": 0, "message": "OK", "data": {"list": []}},
+        ])
+        MockClient.return_value.__aenter__.return_value = mock_client
+        summary = _run(adapter.fetch_campaign_summary("111"))
+    assert summary["delivery"] == "Paused"
+    assert summary["spend_ngn"] == 0.0
+    assert summary["conversations"] == 0
+    assert summary["cost_per_conversation_ngn"] is None
+
+
+def test_fetch_campaign_summary_no_status_rows_means_deleted():
+    # TikTok no longer knows about this campaign at all — same "gone" signal
+    # Meta gives via effective_status, just absent here instead of an explicit
+    # value. billing.py and the campaign list both self-heal on "Deleted".
+    db = FakeDb()
+    db["jane_ads_tiktok_campaigns"].docs["111"] = {"business_id": "b1", "ad_id": "333"}
+    adapter = _adapter(db)
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client([
+            {"code": 0, "message": "OK", "data": {"list": []}},
+            {"code": 0, "message": "OK", "data": {"list": []}},
+        ])
+        MockClient.return_value.__aenter__.return_value = mock_client
+        summary = _run(adapter.fetch_campaign_summary("111"))
+    assert summary["delivery"] == "Deleted"
+
+
+def test_fetch_campaign_summary_unknown_campaign_raises():
+    adapter = _adapter(FakeDb())
+    with pytest.raises(TikTokAdsAPIError):
+        _run(adapter.fetch_campaign_summary("does-not-exist"))
+
+
+def test_set_delivery_enable_cascades_to_campaign_adgroup_and_ad():
+    db = FakeDb()
+    db["jane_ads_tiktok_campaigns"].docs["111"] = {"business_id": "b1", "ad_id": "333", "adgroup_id": "222"}
+    adapter = _adapter(db)
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client([
+            {"code": 0, "message": "OK"},
+            {"code": 0, "message": "OK"},
+            {"code": 0, "message": "OK"},
+        ])
+        MockClient.return_value.__aenter__.return_value = mock_client
+        result = _run(adapter.set_delivery("111", active=True))
+
+    assert result["status"] == "ENABLE"
+    assert result["updated"] == {"campaign": True, "adgroup": True, "ad": True}
+    assert mock_client.post.call_count == 3
+
+    campaign_json = mock_client.post.call_args_list[0].kwargs["json"]
+    assert campaign_json["campaign_ids"] == ["111"]
+    assert campaign_json["operation_status"] == "ENABLE"
+
+    adgroup_json = mock_client.post.call_args_list[1].kwargs["json"]
+    assert adgroup_json["adgroup_ids"] == ["222"]
+    assert adgroup_json["operation_status"] == "ENABLE"
+
+    ad_json = mock_client.post.call_args_list[2].kwargs["json"]
+    assert ad_json["ad_ids"] == ["333"]
+    assert ad_json["adgroup_id"] == "222"
+    assert ad_json["operation_status"] == "ENABLE"
+
+
+def test_set_delivery_disable_sends_disable_to_every_level():
+    db = FakeDb()
+    db["jane_ads_tiktok_campaigns"].docs["111"] = {"business_id": "b1", "ad_id": "333", "adgroup_id": "222"}
+    adapter = _adapter(db)
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client([
+            {"code": 0, "message": "OK"},
+            {"code": 0, "message": "OK"},
+            {"code": 0, "message": "OK"},
+        ])
+        MockClient.return_value.__aenter__.return_value = mock_client
+        result = _run(adapter.set_delivery("111", active=False))
+    assert result["status"] == "DISABLE"
+    for call in mock_client.post.call_args_list:
+        assert call.kwargs["json"]["operation_status"] == "DISABLE"
+
+
+def test_set_delivery_skips_adgroup_and_ad_when_ids_missing():
+    # A record saved before adgroup_id/ad_id were populated (shouldn't happen in
+    # practice, but the cascade must not crash on a missing id).
+    db = FakeDb()
+    db["jane_ads_tiktok_campaigns"].docs["111"] = {"business_id": "b1"}
+    adapter = _adapter(db)
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client([{"code": 0, "message": "OK"}])
+        MockClient.return_value.__aenter__.return_value = mock_client
+        result = _run(adapter.set_delivery("111", active=True))
+    assert result["updated"] == {"campaign": True}
+    assert mock_client.post.call_count == 1
+
+
+def test_set_delivery_raises_on_campaign_level_error():
+    db = FakeDb()
+    db["jane_ads_tiktok_campaigns"].docs["111"] = {"business_id": "b1", "ad_id": "333", "adgroup_id": "222"}
+    adapter = _adapter(db)
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client([{"code": 40003, "message": "campaign not found"}])
+        MockClient.return_value.__aenter__.return_value = mock_client
+        with pytest.raises(TikTokAdsAPIError, match="campaign not found"):
+            _run(adapter.set_delivery("111", active=True))
+
+
+def test_delete_campaign_sends_delete_status():
+    adapter = _adapter()
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client([{"code": 0, "message": "OK"}])
+        MockClient.return_value.__aenter__.return_value = mock_client
+        ok = _run(adapter.delete_campaign("111"))
+    assert ok is True
+    sent = mock_client.post.call_args.kwargs["json"]
+    assert sent["campaign_ids"] == ["111"]
+    assert sent["operation_status"] == "DELETE"
+
+
+def test_delete_campaign_raises_on_error():
+    adapter = _adapter()
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client([{"code": 40004, "message": "already deleted"}])
+        MockClient.return_value.__aenter__.return_value = mock_client
+        with pytest.raises(TikTokAdsAPIError, match="already deleted"):
+            _run(adapter.delete_campaign("111"))

@@ -106,6 +106,20 @@ async def startup_event():
     except Exception as e:
         print(f"⚠️  Warning: Failed to migrate brand_profiles index: {e}")
 
+    # TTL-expire abandoned Instagram-picker sessions (the customer started
+    # connecting Instagram, saw the multi-account picker, then never finished)
+    # so pending_instagram_connections doesn't grow unbounded — mirrors the
+    # 15-minute window the picker UI itself is expected to be used within.
+    try:
+        from app.database import get_db
+        db = get_db()
+        await db["pending_instagram_connections"].create_index(
+            "created_at", expireAfterSeconds=900, name="created_at_ttl"
+        )
+        print("✅ pending_instagram_connections TTL index ensured")
+    except Exception as e:
+        print(f"⚠️  Warning: Failed to create pending_instagram_connections TTL index: {e}")
+
     # Start notification scheduler (PRD 8: Scheduled Jobs)
     try:
         from app.services.notification_scheduler import start_notification_scheduler
