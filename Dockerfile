@@ -36,6 +36,9 @@ RUN pip install uvicorn
 COPY --from=build /usr/local/lib/python3.13 /usr/local/lib/python3.13
 COPY --from=build /app /app
 
+RUN curl -fsSL -o /app/global-bundle.pem \
+    https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
+
 EXPOSE 80
 EXPOSE 443
 
