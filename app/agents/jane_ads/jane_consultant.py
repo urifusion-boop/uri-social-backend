@@ -17,6 +17,7 @@ new strategic fields (geo_mode/geo_areas) when the consultant has populated them
 from __future__ import annotations
 
 import json
+import re
 from typing import Optional
 
 import openai
@@ -422,6 +423,40 @@ def _client_gave_affirmative(message: str) -> bool:
     return bool(words & _AFFIRMATIVE_WORDS)
 
 
+# Money the client names for THIS campaign. Requires a naira marker (₦/N/NGN), a
+# k/m suffix, or a bare figure of at least 4 digits — so "100 customers" and "7 days"
+# are not mistaken for a budget, while "20k", "₦20,000" and "20000" are.
+_NUM = r"\d[\d,]*(?:\.\d+)?"
+_STATED_AMOUNT = re.compile(
+    rf"(?:₦|\bngn\b|\bn(?=\d))\s*({_NUM})\s*([km])?"   # ₦20,000 / N20k / NGN 50000
+    rf"|\b({_NUM})\s*([km])\b"                            # 20k / 5k / 1.5m
+    r"|\b(\d{4,})\b",                                     # bare 20000
+    re.I,
+)
+
+
+def stated_budget_ngn(reply: str) -> Optional[float]:
+    """The budget the client just named, if they named exactly one.
+
+    Two or more distinct figures in one reply is genuinely ambiguous ("20k for ads,
+    5k for design"), so this returns None and lets Jane ask rather than guessing
+    which one was meant.
+    """
+    from .nl import parse_ngn
+
+    found: list[float] = []
+    for m in _STATED_AMOUNT.finditer(reply or ""):
+        digits = m.group(1) or m.group(3) or m.group(5)
+        suffix = m.group(2) or m.group(4) or ""
+        if not digits:
+            continue
+        v = parse_ngn(f"{digits}{suffix}")
+        if v and v >= 1000:
+            found.append(v)
+    uniq = sorted(set(found))
+    return uniq[0] if len(uniq) == 1 else None
+
+
 def _build_budget_confirmation_note(known_budget: Optional[float], message: str,
                                     history: list[dict]) -> str:
     """Pre-resolve the one ambiguity prompting alone couldn't reliably get the model to
@@ -447,6 +482,21 @@ def _build_budget_confirmation_note(known_budget: Optional[float], message: str,
                 "budget again)."
             )
     latest_reply = _latest_user_reply(message)
+
+    # The client named a DIFFERENT figure to the remembered one. This was the gap:
+    # the two branches below only fire when the reply repeats the remembered amount,
+    # so stating a new budget matched nothing, the known_line kept advertising the old
+    # spend, and Jane re-asked — offering the past figure back. Live-confirmed on
+    # 2026-08-26: remembered ₦10,000, client said "budget 20000", Jane asked again.
+    stated = stated_budget_ngn(latest_reply)
+    if stated and stated != known_budget:
+        return (
+            f"\n\nIMPORTANT: the client's latest reply above states ₦{stated:,.0f} for THIS "
+            f"campaign. That REPLACES the remembered ₦{known_budget:,.0f} — do not offer the "
+            f"old figure back. Set budget_ngn to {int(stated)} and move on to whatever's next "
+            "(not budget again)."
+        )
+
     if str(int(known_budget)) in latest_reply.replace(",", ""):
         return (
             f"\n\nIMPORTANT: the client's latest reply above states ₦{known_budget:,.0f} "
