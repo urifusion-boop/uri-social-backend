@@ -1514,10 +1514,22 @@ async def _build_campaign_plan(
     # What the business actually SELLS. The profile holds this and none of it reached
     # the consultant, so Jane reasoned from a name and an industry string alone —
     # which is most of why plans read generic rather than brand-specific.
+    # to_brand_context() renames product_description -> business_description, so
+    # reading the raw profile key returned nothing and the single most useful
+    # sentence the brand has never reached Jane. ideal_customer_profile and tagline
+    # are the other two that describe the business rather than style it.
+    def _bit(v) -> str:
+        if isinstance(v, (list, tuple)):
+            return ", ".join(str(x).strip() for x in v if str(x).strip())
+        return str(v or "").strip()
+
     known_offering = " · ".join(
-        str(brand_profile.get(k)).strip()
-        for k in ("product_description", "key_products_services")
-        if str(brand_profile.get(k) or "").strip()
+        b for b in (
+            _bit(brand_profile.get("business_description")),
+            _bit(brand_profile.get("key_products_services")),
+            _bit(brand_profile.get("ideal_customer_profile")),
+            _bit(brand_profile.get("tagline")),
+        ) if b
     )
     known_budget = remembered_budget_ngn(history)
 

@@ -214,3 +214,35 @@ class TestStatedBudgetOverridesRemembered:
     def test_no_remembered_budget_means_no_note(self):
         from app.agents.jane_ads.jane_consultant import _build_budget_confirmation_note
         assert _build_budget_confirmation_note(None, "budget 20000", []) == ""
+
+
+class TestOfferingReadsMappedKeys:
+    """to_brand_context() renames product_description -> business_description, so
+    reading the raw profile key returned nothing and the brand's single most useful
+    sentence never reached Jane. Live-observed: Uri Social, an AI social media
+    content platform, got plans for "Finance teams adjusting to a recently
+    implemented accounting system" — generic B2B SaaS, because a list of service
+    names and an industry label was all she had."""
+
+    def test_router_reads_the_context_key_not_the_raw_profile_key(self):
+        src = open("app/agents/jane_ads/router.py").read()
+        i = src.index("known_offering = ")
+        block = src[i - 700:i + 400]
+        assert 'brand_profile.get("business_description")' in block
+        assert 'brand_profile.get("product_description")' not in block
+
+    def test_lists_are_flattened_not_repr(self):
+        """key_products_services is a list; str() on it yields "['a', 'b']", which is
+        Python syntax leaking into a prompt."""
+        src = open("app/agents/jane_ads/router.py").read()
+        i = src.index("def _bit(")
+        assert "isinstance(v, (list, tuple))" in src[i:i + 300]
+        assert '", ".join' in src[i:i + 300]
+
+    def test_all_four_descriptive_fields_are_used(self):
+        src = open("app/agents/jane_ads/router.py").read()
+        i = src.index("known_offering = ")
+        block = src[i:i + 500]
+        for k in ("business_description", "key_products_services",
+                  "ideal_customer_profile", "tagline"):
+            assert k in block, k
