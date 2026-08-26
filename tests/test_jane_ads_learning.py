@@ -166,3 +166,51 @@ class TestOfferingReachesTheConsultant:
         import inspect
         from app.agents.jane_ads import jane_consultant
         assert "what they sell:" in inspect.getsource(jane_consultant.consult)
+
+
+class TestStatedBudgetOverridesRemembered:
+    """The long-running "you say the amount and it keeps asking" bug.
+
+    _build_budget_confirmation_note only fired when the client said "yes" or repeated
+    the REMEMBERED figure. Stating a DIFFERENT amount matched neither, so nothing told
+    the model what had happened, the known_line kept advertising the old spend, and
+    Jane re-asked — offering the past figure back. Live-confirmed 2026-08-26:
+    remembered ₦10,000, client said "budget 20000", Jane asked again and proposed
+    ₦10,000.
+    """
+
+    def test_a_new_amount_is_detected(self):
+        from app.agents.jane_ads.jane_consultant import stated_budget_ngn
+        for reply, want in (("budget 20000", 20000), ("20k", 20000),
+                            ("₦20,000", 20000), ("N50,000 please", 50000),
+                            ("1.5m", 1_500_000)):
+            assert stated_budget_ngn(reply) == want, reply
+
+    def test_non_budget_numbers_are_ignored(self):
+        """A customer count or a duration is not a budget."""
+        from app.agents.jane_ads.jane_consultant import stated_budget_ngn
+        for reply in ("I want 100 customers", "run it for 7 days", "yes", ""):
+            assert stated_budget_ngn(reply) is None, reply
+
+    def test_two_figures_stay_ambiguous(self):
+        """"20k for ads and 5k for design" has no single answer — ask, do not guess."""
+        from app.agents.jane_ads.jane_consultant import stated_budget_ngn
+        assert stated_budget_ngn("20k for ads and 5k for design") is None
+        assert stated_budget_ngn("make it 20000 not 10000") is None
+
+    def test_note_tells_the_model_the_new_figure_replaces_the_old(self):
+        from app.agents.jane_ads.jane_consultant import _build_budget_confirmation_note
+        note = _build_budget_confirmation_note(10000.0, "budget 20000", [])
+        assert "20,000" in note
+        assert "REPLACES" in note
+        assert "not budget again" in note
+
+    def test_restating_the_remembered_figure_still_confirms_it(self):
+        """The existing behaviour must survive: repeating ₦10,000 confirms ₦10,000."""
+        from app.agents.jane_ads.jane_consultant import _build_budget_confirmation_note
+        note = _build_budget_confirmation_note(10000.0, "same 10000", [])
+        assert "10,000" in note and "REPLACES" not in note
+
+    def test_no_remembered_budget_means_no_note(self):
+        from app.agents.jane_ads.jane_consultant import _build_budget_confirmation_note
+        assert _build_budget_confirmation_note(None, "budget 20000", []) == ""
