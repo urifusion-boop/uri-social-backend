@@ -51,6 +51,11 @@ class BrandProfileService:
             "tagline": "",
             "product_description": "",
             "key_products_services": [],
+            # Business Details (Content Calendar Automation inputs)
+            "price_range": "",
+            "unique_selling_proposition": "",
+            "business_stage": "",  # "" | new | growing | established | market_leader
+            "business_priorities": [],
             "logo_url": None,
             "logo_position": "bottom_right",
             "logo_size": "small",
@@ -63,6 +68,18 @@ class BrandProfileService:
             "same_tone_everywhere": True,
             "target_audience": "",
             "ideal_customer_profile": "",
+            # Target Customer Detail (additive to target_audience/ideal_customer_profile
+            # above, not a replacement — see to_brand_context() for why these need
+            # their own distinct keys rather than reusing "target_audience")
+            "customer_gender": "",
+            "customer_location": "",
+            "customer_occupation": "",
+            "customer_income_level": "",
+            "customer_interests": [],
+            "customer_pain_points": [],
+            "customer_needs": [],
+            "customer_objections": [],
+            "why_customers_choose_us": "",
             "content_pillars": [],
             "preferred_formats": [],
             "guardrails": {},
@@ -121,6 +138,32 @@ class BrandProfileService:
             }
         elif existing is None:
             doc["voice_profile"] = dict(vp_defaults)
+
+        # Business Pulse — time-sensitive "what's happening right now" fields
+        # (current promotions/campaigns/news/milestones/new products), saved as a
+        # unit from their own dedicated panel/endpoint rather than the main wizard.
+        # Deliberately absent from PLAYBOOK_FIELDS below: one brand's active
+        # promotion is meaningless noise for a sibling agency brand, unlike the
+        # evergreen fields above which legitimately backfill.
+        bp_defaults = {
+            "current_period_goal": "",
+            "current_promotions": [],
+            "current_campaigns": [],
+            "business_news_announcements": [],
+            "recent_milestones": [],
+            "new_products_services": [],
+        }
+        if "business_pulse" in data:
+            incoming_bp = data.get("business_pulse") or {}
+            existing_bp = (existing or {}).get("business_pulse") or {}
+            doc["business_pulse"] = {
+                key: incoming_bp[key] if key in incoming_bp else existing_bp.get(key, default)
+                for key, default in bp_defaults.items()
+            }
+            doc["business_pulse_updated_at"] = now
+        elif existing is None:
+            doc["business_pulse"] = dict(bp_defaults)
+            doc["business_pulse_updated_at"] = None
 
         if "style_selections" in data:
             doc["style_selections"] = data["style_selections"]
@@ -241,6 +284,14 @@ class BrandProfileService:
                 "audience_interests", "content_tones", "cta_styles", "default_link",
                 "tagline", "region", "font_preference", "logo_url", "logo_position", "logo_size",
                 "target_audience", "ideal_customer_profile",
+                # Business Details — evergreen brand facts, same reasoning as tagline/region above
+                "price_range", "unique_selling_proposition", "business_stage", "business_priorities",
+                # Target Customer Detail — evergreen persona, same reasoning as ideal_customer_profile
+                "customer_gender", "customer_location", "customer_occupation", "customer_income_level",
+                "customer_interests", "customer_pain_points", "customer_needs", "customer_objections",
+                "why_customers_choose_us",
+                # Deliberately NOT business_pulse — one brand's active promotion is
+                # noise for a sibling agency brand, unlike the evergreen facts above.
             ]
             if profile is None and personal_profile:
                 # No agency profile at all — use personal profile as base
@@ -306,6 +357,11 @@ class BrandProfileService:
             "tagline":              profile.get("tagline", ""),
             "business_description": profile.get("product_description", ""),
             "key_products_services": [p for p in (profile.get("key_products_services") or []) if p],
+            # Business Details
+            "price_range":          profile.get("price_range", ""),
+            "unique_selling_proposition": profile.get("unique_selling_proposition", ""),
+            "business_stage":       profile.get("business_stage", ""),
+            "business_priorities":  profile.get("business_priorities") or [],
             "logo_url":             profile.get("logo_url"),
             "logo_position":        profile.get("logo_position", "bottom_right"),
             "logo_size":            profile.get("logo_size", "small"),
@@ -317,6 +373,18 @@ class BrandProfileService:
             "same_tone_everywhere": profile.get("same_tone_everywhere", True),
             "target_audience":      target_audience,
             "ideal_customer_profile": profile.get("ideal_customer_profile", ""),
+            # Target Customer Detail — own distinct keys, additive to target_audience/
+            # ideal_customer_profile above (target_audience itself is a synthesized
+            # string, not a passthrough of the raw stored field — these are not).
+            "customer_gender":       profile.get("customer_gender", ""),
+            "customer_location":     profile.get("customer_location", ""),
+            "customer_occupation":   profile.get("customer_occupation", ""),
+            "customer_income_level": profile.get("customer_income_level", ""),
+            "customer_interests":    profile.get("customer_interests") or [],
+            "customer_pain_points":  profile.get("customer_pain_points") or [],
+            "customer_needs":        profile.get("customer_needs") or [],
+            "customer_objections":   profile.get("customer_objections") or [],
+            "why_customers_choose_us": profile.get("why_customers_choose_us", ""),
             "audience_age_range":   profile.get("audience_age_range", ""),
             "primary_goal":         profile.get("primary_goal", ""),
             "target_platforms":     profile.get("target_platforms") or [],
@@ -349,4 +417,9 @@ class BrandProfileService:
             # Caption Voice System fields
             "voice_profile":        profile.get("voice_profile") or {},
             "voice_sample_analysis": profile.get("voice_sample_analysis") or {},
+            # Business Pulse — raw passthrough only, no freshness math here (this is
+            # a pure profile→context transform; freshness is computed by whichever
+            # caller actually cares about recency, e.g. the calendar service).
+            "business_pulse":            profile.get("business_pulse") or {},
+            "business_pulse_updated_at": profile.get("business_pulse_updated_at"),
         }
