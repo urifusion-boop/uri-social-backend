@@ -21,6 +21,7 @@ plan_defence.py).
 from __future__ import annotations
 
 import json
+import re
 from typing import Optional
 
 import openai
@@ -29,7 +30,8 @@ from app.core.config import settings
 
 from . import constants as C
 from .jane_consultant import ConsultantBrief
-from .models import PlanVariant, PlanVariantSet
+from .models import PlanVariant, PlanVariantSet, StrategyCitation
+from .retrieval import RetrievalResult
 
 
 class PlanVariantsUnavailableError(Exception):
@@ -113,8 +115,79 @@ def _variant_fields_block() -> str:
     )
 
 
+
+
+# A plan card must say what the buyer is DOING, not name a category and assert a
+# need. The field instruction already forbids the label form, and the corpus block
+# repeats it (SEED-023: describe by life stage and observable behaviour, not
+# demographic label) — the model still produced "businesses needing efficient tech
+# solutions" and "start-ups in need of scalable tech infrastructures" on two
+# consecutive live runs. Restating it a third time was not going to work, so the
+# constraint moved out of the prompt and into a check with one corrective retry.
+_LABEL_SHAPE = re.compile(
+    r"\b(?:needing|in need of|seeking|looking for|wanting|requiring|interested in)\b"
+    r"|\b(?:solutions?|services?|products?|infrastructures?|offerings?)\s*$",
+    re.I,
+)
+
+
+def label_shaped(who_its_for: str) -> bool:
+    """True when who_its_for reads as a category plus a need rather than a situation.
+
+    Passes: "people fitting out a new place", "individuals setting up home offices".
+    Fails:  "businesses needing efficient tech solutions".
+    """
+    return bool(_LABEL_SHAPE.search((who_its_for or "").strip()))
+
+
+def _corpus_block(corpus: Optional["RetrievalResult"]) -> str:
+    """ASC-SPEC-01 v2 §9.1 — the corpus INFORMS plans, it does not generate them.
+    Five tactics presented as five strategies is the wrong output; the plan-variants
+    contract needs genuinely distinct audience strategies. So retrieved records enter
+    as evidence Jane may draw on for `why_this_could_work`, never as the plans
+    themselves.
+
+    §9.3: the trade-off is Jane's own reasoning from the plan's economics and is
+    explicitly NOT a corpus field, so nothing here may supply it.
+
+    §8.2: a record that applies only with modification must carry that modification
+    with it — the unmodified version is frequently wrong for this market.
+    """
+    if not corpus or not corpus.records:
+        return ""
+    lines = []
+    for r in corpus.records:
+        line = f"- {r.claim.rstrip('.')}. Why: {r.mechanism}"
+        if r.modification_required:
+            line += f" (applies here only with this change: {r.modification_required})"
+        lines.append(line)
+    return (
+        "## HOUSE RULES — these override your defaults\n"
+        "The following are our own validated findings at Nigerian SME budgets. They "
+        "are not background reading: apply them to the plans you produce.\n\n"
+        + "\n".join(lines)
+        + "\n\n"
+        "How to apply them:\n"
+        "- Where a finding constrains HOW you describe an audience or an offer, follow "
+        "it. If one says to describe audiences by life stage and observable behaviour "
+        "rather than demographic labels, then 'tech enthusiasts' is a failing answer "
+        "and 'finance teams who just moved onto a new accounting system' is a passing "
+        "one.\n"
+        "- In 'why_this_could_work', give the actual reason this buyer spends money, "
+        "drawing on the finding that applies. Do not restate the audience back as its "
+        "own justification.\n"
+        "- Do NOT turn a finding into a plan. A tactic is not an audience strategy — "
+        "five tactics dressed as five plans is a failed answer.\n"
+        "- Do NOT let them touch 'trade_off'. That is your own reasoning from this "
+        "plan's economics — deal size, cycle length, reachability.\n\n"
+    )
+
+
 async def generate_plan_variants(
-    parsed: ConsultantBrief, business_name: str = "", description: str = "",
+    parsed: ConsultantBrief,
+    business_name: str = "",
+    description: str = "",
+    corpus: Optional["RetrievalResult"] = None,
 ) -> PlanVariantSet:
     """The one LLM call that turns an already-extracted strategy (jane_consultant's
     ConsultantBrief — goal, budget, geo strategy, intermediary/creative-fit notes)
@@ -159,6 +232,7 @@ async def generate_plan_variants(
         "30-50' is not two plans. 'Developers buying multiple units vs homeowners "
         "fitting out one' is.\n\n"
         f"{_variant_fields_block()}\n"
+        f"{_corpus_block(corpus)}"
         "Return ONLY the JSON."
     )
     try:
@@ -170,6 +244,40 @@ async def generate_plan_variants(
             timeout=35,
         )
         data = json.loads(resp.choices[0].message.content or "{}")
+
+        # One corrective retry, naming the offenders. The instruction exists twice
+        # in the prompt already; what it lacked was a consequence.
+        offenders = [
+            str(v.get("who_its_for", ""))
+            for v in (data.get("variants") or [])
+            if label_shaped(str(v.get("who_its_for", "")))
+        ]
+        if offenders:
+            print(f"[PlanVariants] label-shaped who_its_for, retrying: {offenders}", flush=True)
+            retry = await client.chat.completions.create(
+                model="gpt-4o",
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": resp.choices[0].message.content or ""},
+                    {"role": "user", "content": (
+                        "These who_its_for values name a category and assert a need, "
+                        f"instead of describing what the buyer is doing: {offenders}.\n"
+                        "Rewrite EVERY variant's who_its_for as the situation the buyer "
+                        "is in — something observable that is happening to them right "
+                        "now. 'businesses needing efficient tech solutions' is a "
+                        "failure; 'finance teams who just moved onto a new accounting "
+                        "system' is correct. Never use needing / in need of / seeking / "
+                        "looking for, and never end on solutions, services or "
+                        "infrastructure.\n"
+                        "Keep everything else identical. Return the same JSON shape."
+                    )},
+                ],
+                timeout=35,
+            )
+            retried = json.loads(retry.choices[0].message.content or "{}")
+            if retried.get("variants"):
+                data = retried
     except Exception as e:
         print(f"[PlanVariants] generation error: {e}", flush=True)
         raise PlanVariantsUnavailableError(str(e)) from e
@@ -215,4 +323,12 @@ async def generate_plan_variants(
         recommendation_reason=str(data.get("recommendation_reason", "")).strip(),
         max_selectable=max_selectable,
         selection_rule_reason=selection_rule_reason,
+        corpus_coverage=(corpus.coverage if corpus else "none"),
+        corpus_citations=[
+            StrategyCitation(
+                record_id=r.strategy_id, version=r.version,
+                stage="plan_generation", score=corpus.scores.get(r.strategy_id, 0.0),
+            )
+            for r in (corpus.records if corpus else [])
+        ],
     )

@@ -70,7 +70,7 @@ class VideoPublishService:
                 )
             elif platform == "tiktok":
                 post_id, post_url = await VideoPublishService._publish_tiktok(
-                    conn["outstand_account_id"], video_url, caption
+                    conn, video_url, caption, db
                 )
             else:
                 raise ValueError(f"Unsupported platform: {platform}")
@@ -188,14 +188,26 @@ class VideoPublishService:
             post_url = f"https://www.facebook.com/video/{video_id}"
             return video_id, post_url
 
-    # ── TikTok (via Outstand — no direct TikTok API) ───────────────────────────
+    # ── TikTok (direct FILE_UPLOAD when connected that way, else via Outstand) ──
 
     @staticmethod
     async def _publish_tiktok(
-        outstand_account_id: str,
+        conn: Dict[str, Any],
         video_url: str,
         caption: str,
+        db,
     ):
+        if conn.get("connected_via") == "tiktok_direct_oauth":
+            from app.agents.social_media_manager.services.tiktok_direct_service import (
+                get_valid_tiktok_access_token,
+                publish_tiktok_direct,
+            )
+            access_token = await get_valid_tiktok_access_token(db, conn)
+            publish_id, status = await publish_tiktok_direct(access_token, video_url, caption)
+            print(f"✅ TikTok direct publish: publish_id={publish_id} status={status}")
+            return publish_id, None
+
+        outstand_account_id = conn["outstand_account_id"]
         outstand = OutstandService()
 
         # TikTok requires media to be fetched from a domain verified in the TikTok

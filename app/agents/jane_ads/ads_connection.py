@@ -28,10 +28,15 @@ CONNECTIONS = "social_connections"
 # Every "facebook_ads" connection was granted this same fixed set, so a connection's mere
 # existence implies the request was made for all of them — live-verified via
 # GET /me/permissions, not just assumed, since Meta's dialog can grant a subset.
+#
+# Keep this in lockstep with that initiate route: it is an issubset() gate, so a scope
+# listed here but no longer requested marks every connection EXPIRED and pauses live
+# campaigns. pages_manage_metadata was dropped from both (App Review rejected it as
+# unused — nothing calls subscribed_apps); connections predating that still carry the
+# grant, which is harmless because this set only has to be a subset of what was granted.
 REQUIRED_ADS_SCOPES = {
     "pages_show_list",
     "pages_read_engagement",
-    "pages_manage_metadata",
     "business_management",
     "pages_manage_ads",
     "ads_management",

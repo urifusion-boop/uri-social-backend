@@ -755,8 +755,10 @@ async def upload_user_content(
         from ..services.user_media_storage_service import UserMediaStorageService
 
         print(f"📤 Uploading {len(uploaded_media)} user media files...")
-        media_urls = await UserMediaStorageService.upload_user_media(uploaded_media, user_id)
-        print(f"✅ All media uploaded successfully: {len(media_urls)} URLs")
+        uploaded_items = await UserMediaStorageService.upload_user_media(uploaded_media, user_id)
+        media_urls = [item["url"] for item in uploaded_items]
+        video_urls = {item["url"] for item in uploaded_items if item["is_video"]}
+        print(f"✅ All media uploaded successfully: {len(media_urls)} URLs ({len(video_urls)} video)")
 
         # Load brand profile (needed for logo/CTA overlays)
         profile_result = await BrandProfileService.get(user_id, db, brand_id=active_brand_id)
@@ -774,6 +776,12 @@ async def upload_user_content(
 
             processed_media_urls = []
             for media_url in media_urls:
+                if media_url in video_urls:
+                    # Logo/CTA overlay here is PIL-based (single still frame) — no
+                    # video support, and downloading a video just to skip it wastes
+                    # the request. Pass the upload through untouched.
+                    processed_media_urls.append(media_url)
+                    continue
                 try:
                     # Download the uploaded image
                     resp = requests.get(media_url, timeout=10)
@@ -986,6 +994,16 @@ Choose the position that will cause the LEAST visual disruption."""
         # Build comprehensive analysis of all uploaded media
         vision_analyses = []
         for idx, media_url in enumerate(media_urls):
+            if media_url in video_urls:
+                # The vision model takes still images via image_url — pointing it at
+                # a video file fails every time (and did, silently, before this: the
+                # request went out, errored, and was swallowed by the except below).
+                # No frame-extraction step exists yet, so skip straight to relying on
+                # context_text for this item instead of burning an API call on a
+                # guaranteed failure.
+                vision_analyses.append(f"[Media {idx + 1}]: (video upload — visual analysis not available; caption based on provided context)")
+                print(f"⏭️  Skipping vision analysis for video {idx + 1}/{len(media_urls)}")
+                continue
             print(f"🔍 Analyzing media {idx + 1}/{len(media_urls)}...")
             try:
                 vision_prompt = f"""Analyze this uploaded image/video for social media content generation.
@@ -1058,43 +1076,79 @@ Create engaging social media captions for THIS UPLOADED CONTENT. Base your writi
                 )
 
             if _d_ids:
-                # Attach uploaded images to drafts so they can be published
-                if post_type == "carousel":
-                    # For carousel: one slide per uploaded image, in the exact
-                    # shape both DraftCard (isCarousel = slides.length > 0) and
-                    # publish logic (approval_workflow_service reads draft.slides)
-                    # expect. A prior "carousel_images" field here was never read
-                    # by either, so uploaded carousels silently rendered/published
-                    # as a single post.
-                    slides = [
-                        {"headline": "", "body": "", "image_url": url, "image_failed": False}
+                # Attach uploaded images to drafts so they can be published.
+                # TikTok gets its own center-cropped-to-9:16 copies of any IMAGE
+                # uploads (see ImageContentService.crop_and_reupload_for_tiktok)
+                # — TikTok's own client auto-crops/letterboxes anything off-ratio
+                # when it actually posts, so this makes the draft preview match
+                # what goes live instead of a surprise crop later. Video uploads
+                # pass through untouched (PIL can't crop a video file). Every
+                # other platform keeps the original upload byte-for-byte.
+                drafts_list = _rd.get("drafts", [])
+                tiktok_media_urls = None
+                if any(d.get("platform") == "tiktok" for d in drafts_list):
+                    from ..services.image_content_service import ImageContentService
+                    tiktok_media_urls = [
+                        url if url in video_urls
+                        else await ImageContentService.crop_and_reupload_for_tiktok(url, user_id)
                         for url in media_urls
                     ]
-                    update_fields = {
-                        "brand_id": active_brand_id,
-                        "content_source": "user_uploaded",
-                        "uploaded_media_urls": media_urls,
-                        "post_type": post_type,
-                        "slides": slides,
-                    }
-                else:
-                    # For single post: use first uploaded image as main image
-                    update_fields = {
-                        "brand_id": active_brand_id,
-                        "content_source": "user_uploaded",
-                        "uploaded_media_urls": media_urls,
-                        "post_type": post_type,
-                        "image_url": media_urls[0] if media_urls else None,
-                    }
 
-                # Mark drafts as user-uploaded and attach media URLs
-                await db["content_drafts"].update_many(
-                    {"id": {"$in": _d_ids}},
-                    {"$set": update_fields}
-                )
+                for d in drafts_list:
+                    draft_id = d.get("id")
+                    if not draft_id:
+                        continue
+                    urls_for_platform = (
+                        tiktok_media_urls if d.get("platform") == "tiktok" and tiktok_media_urls
+                        else media_urls
+                    )
 
-                # Update in-memory draft objects
-                for d in _rd.get("drafts", []):
+                    if post_type == "carousel":
+                        # One slide per uploaded image, in the exact shape both
+                        # DraftCard (isCarousel = slides.length > 0) and publish
+                        # logic (approval_workflow_service reads draft.slides)
+                        # expect. A prior "carousel_images" field here was never
+                        # read by either, so uploaded carousels silently
+                        # rendered/published as a single post.
+                        #
+                        # KNOWN LIMITATION: slides only carry image_url — there's
+                        # no per-slide video_url in this schema or in DraftCard's
+                        # carousel rendering, so a video uploaded into a carousel
+                        # still ends up here and will fail to render. Fixing that
+                        # needs a per-slide video field added on the frontend too;
+                        # out of scope here.
+                        slides = [
+                            {"headline": "", "body": "", "image_url": url, "image_failed": False}
+                            for url in urls_for_platform
+                        ]
+                        update_fields = {
+                            "brand_id": active_brand_id,
+                            "content_source": "user_uploaded",
+                            "uploaded_media_urls": urls_for_platform,
+                            "post_type": post_type,
+                            "slides": slides,
+                        }
+                    else:
+                        # For single post: use the first uploaded item as the main
+                        # media. DraftCard only renders a <video> element when
+                        # draft.video_url is set (isReel = post_type === 'reel' ||
+                        # !!draft.video_url) — anything else, including a video's
+                        # own URL, gets rendered in an <img> tag and fails to load.
+                        # Route video uploads to video_url so the existing player
+                        # picks them up correctly instead of showing as a broken
+                        # image.
+                        first_url = urls_for_platform[0] if urls_for_platform else None
+                        is_first_video = first_url in video_urls if first_url else False
+                        update_fields = {
+                            "brand_id": active_brand_id,
+                            "content_source": "user_uploaded",
+                            "uploaded_media_urls": urls_for_platform,
+                            "post_type": post_type,
+                            "image_url": None if is_first_video else first_url,
+                            "video_url": first_url if is_first_video else None,
+                        }
+
+                    await db["content_drafts"].update_one({"id": draft_id}, {"$set": update_fields})
                     d.update(update_fields)
 
         # Deduct credits (cheaper than full generation since no image gen)
@@ -1195,7 +1249,6 @@ async def facebook_direct_initiate(source: Optional[str] = Query("settings")):
         "pages_read_engagement",
         "read_insights",
         "pages_manage_posts",
-        "pages_manage_metadata",
     ]
     params = {
         "client_id": app_id,
@@ -1354,6 +1407,142 @@ async def facebook_direct_finalize(
     return UriResponse.get_single_data_response("facebook_connected", {"fb_page_id": fb_page_id})
 
 
+# ── TikTok direct — Content Posting API via FILE_UPLOAD, bypassing Outstand.
+# Same 3-endpoint shape as facebook-direct above (initiate/callback/finalize),
+# additive alongside the existing Outstand-mediated TikTok connection — see
+# tiktok_direct_service.py's module docstring for why this exists now.
+
+@router.get("/connect/tiktok-direct/initiate")
+async def tiktok_direct_initiate(source: Optional[str] = Query("settings")):
+    """Redirect the user's browser to TikTok's OAuth page to connect their
+    TikTok account directly (without Outstand). On completion, TikTok
+    redirects to /connect/tiktok-direct/callback."""
+    import urllib.parse
+
+    client_key = settings.TIKTOK_APP_CLIENT_KEY
+    if not client_key:
+        raise HTTPException(status_code=500, detail="TIKTOK_APP_CLIENT_KEY not configured")
+
+    _base = (settings.PUBLIC_API_URL or settings.URI_GATEWAY_BASE_API_URL).rstrip("/")
+    redirect_uri = f"{_base}/social-media/connect/tiktok-direct/callback"
+
+    params = {
+        "client_key": client_key,
+        "redirect_uri": redirect_uri,
+        "scope": "user.info.basic,video.publish",
+        "response_type": "code",
+        "state": source or "settings",
+    }
+    auth_url = "https://www.tiktok.com/v2/auth/authorize/?" + urllib.parse.urlencode(params)
+    return RedirectResponse(auth_url)
+
+
+@router.get("/connect/tiktok-direct/callback")
+async def tiktok_direct_callback(
+    code: Optional[str] = Query(None),
+    state: Optional[str] = Query(None),
+    error: Optional[str] = Query(None),
+    error_description: Optional[str] = Query(None),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """TikTok OAuth callback for direct connection. Exchanges the auth code
+    for access/refresh tokens, fetches the account's display name/avatar,
+    stores a pending connection, and redirects back to the workspace."""
+    import urllib.parse
+    from datetime import timezone, timedelta
+    from app.agents.social_media_manager.services.tiktok_direct_service import (
+        exchange_code_for_tokens,
+        fetch_user_info,
+    )
+
+    web_app_url = settings.WEB_APP_URL.strip("'\"")
+    base_redirect = f"{web_app_url}/workspace?tab=connections"
+
+    if error:
+        msg = urllib.parse.quote(error_description or error)
+        return RedirectResponse(f"{base_redirect}&connected=false&error={msg}")
+
+    if not code:
+        return RedirectResponse(f"{base_redirect}&connected=false&error=missing_code")
+
+    _base = (settings.PUBLIC_API_URL or settings.URI_GATEWAY_BASE_API_URL).rstrip("/")
+    redirect_uri = f"{_base}/social-media/connect/tiktok-direct/callback"
+
+    try:
+        tokens = await exchange_code_for_tokens(code, redirect_uri)
+        access_token = tokens["access_token"]
+        open_id = tokens.get("open_id", "")
+
+        user_info = await fetch_user_info(access_token)
+        display_name = user_info.get("display_name", "")
+        avatar_url = user_info.get("avatar_url", "")
+
+        now = datetime.now(timezone.utc)
+        expires_at = now + timedelta(seconds=int(tokens.get("expires_in", 86400)))
+        conn_doc = {
+            "id": f"tt_{open_id}",
+            "user_id": None,               # set by finalize
+            "platform": "tiktok",
+            "connected_via": "tiktok_direct_oauth",
+            "open_id": open_id,
+            "access_token": access_token,
+            "refresh_token": tokens.get("refresh_token", ""),
+            "token_expires_at": expires_at.isoformat(),
+            "account_name": display_name,
+            "profile_picture_url": avatar_url,
+            "connection_status": "pending_user_match",
+            "connected_at": now.isoformat(),
+            "updated_at": now.isoformat(),
+        }
+        await db["social_connections"].update_one(
+            {"id": f"tt_{open_id}"},
+            {"$set": conn_doc},
+            upsert=True,
+        )
+        print(f"[TikTokDirectOAuth] ✅ Stored account '{display_name}' (open_id={open_id}) pending user match")
+
+        params_out = (
+            f"connected=tiktok_direct"
+            f"&tt_open_id={urllib.parse.quote(open_id)}"
+            f"&account_name={urllib.parse.quote(display_name)}"
+        )
+        return RedirectResponse(f"{base_redirect}&{params_out}")
+
+    except Exception as e:
+        print(f"[TikTokDirectOAuth] ❌ Error: {e}")
+        return RedirectResponse(
+            f"{base_redirect}&connected=false&error={urllib.parse.quote(str(e))}"
+        )
+
+
+@router.post("/connect/tiktok-direct/finalize")
+async def tiktok_direct_finalize(
+    tt_open_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    ctx: dict = Depends(get_active_brand_context),
+):
+    """Called by the frontend after the TikTok direct OAuth callback to
+    associate the pending connection with the authenticated user and active
+    brand — same shape as facebook_direct_finalize above."""
+    from app.models.brand_account import BrandAccount
+    user_id = ctx["user_id"]
+    brand_id = ctx["brand_id"]
+    is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
+
+    update_fields: dict = {"user_id": user_id, "connection_status": "active", "updated_at": datetime.utcnow().isoformat()}
+    if not is_personal:
+        update_fields["brand_id"] = brand_id
+
+    result = await db["social_connections"].update_one(
+        {"id": f"tt_{tt_open_id}"},
+        {"$set": update_fields},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="TikTok connection not found — try reconnecting")
+
+    return UriResponse.get_single_data_response("tiktok_connected", {"tt_open_id": tt_open_id})
+
+
 # ── Facebook Login for Business — the "hybrid page grant" (Ibukun's engineering
 # work-split item 2.3). Same OAuth shape as facebook-direct above, but requests
 # advertising permissions and — once URI's Business Manager id is configured —
@@ -1377,7 +1566,6 @@ async def facebook_ads_initiate(source: Optional[str] = Query("settings")):
     scopes = [
         "pages_show_list",
         "pages_read_engagement",
-        "pages_manage_metadata",
         "business_management",
         "ads_management",
         "pages_manage_ads",
@@ -1686,7 +1874,7 @@ async def instagram_direct_callback(
             print(f"[IGDirectOAuth] short-lived token response: {token_data}")
             if "error" in token_data:
                 err = token_data["error"].get("message", "token exchange failed")
-                return RedirectResponse(f"{base_redirect}?connected=false&error={urllib.parse.quote(err)}")
+                return RedirectResponse(f"{base_redirect}&connected=false&error={urllib.parse.quote(err)}")
             short_token = token_data.get("access_token")
 
             # Step 2: exchange short-lived → long-lived user token (60 days)
@@ -1713,75 +1901,91 @@ async def instagram_direct_callback(
             pages = pages_data.get("data", [])
             if not pages:
                 err_msg = "No Facebook Pages found. Link your Instagram Business Account to a Facebook Page first."
-                return RedirectResponse(f"{base_redirect}?connected=false&error={urllib.parse.quote(err_msg)}")
+                return RedirectResponse(f"{base_redirect}&connected=false&error={urllib.parse.quote(err_msg)}")
 
-            # Step 4: find Instagram Business Account linked to one of the pages
-            ig_user_id = None
-            username = None
-            profile_picture_url = None
-            page_token = None
-
+            # Step 4: find every Instagram Business Account linked to any of the
+            # user's Facebook Pages — not just the first one. A user managing
+            # several Pages, each with its own linked Instagram account, gets to
+            # choose which one to connect instead of silently getting whichever
+            # Page happened to come first in Meta's response.
+            candidates = []
             for page in pages:
                 pid = page["id"]
                 ptok = page.get("access_token", long_token)
                 ig_resp = await client.get(
                     f"https://graph.facebook.com/v20.0/{pid}",
-                    params={"fields": "instagram_business_account", "access_token": ptok},
+                    params={"fields": "instagram_business_account,name", "access_token": ptok},
                 )
                 ig_data = ig_resp.json()
                 ig_account = ig_data.get("instagram_business_account")
-                if ig_account:
-                    ig_user_id = str(ig_account["id"])
-                    # Store the user's long-lived token instead of page token
-                    # The long_token has instagram_content_publish permission
-                    page_token = long_token
-                    # Step 5: fetch Instagram profile
-                    profile_resp = await client.get(
-                        f"https://graph.facebook.com/v20.0/{ig_user_id}",
-                        params={"fields": "id,username,name,profile_picture_url", "access_token": long_token},
-                    )
-                    profile = profile_resp.json()
-                    print(f"[IGDirectOAuth] ig profile: {profile}")
-                    username = profile.get("username", ig_user_id)
-                    profile_picture_url = profile.get("profile_picture_url")
-                    break
+                if not ig_account:
+                    continue
+                ig_user_id = str(ig_account["id"])
+                # Step 5: fetch Instagram profile for this candidate
+                profile_resp = await client.get(
+                    f"https://graph.facebook.com/v20.0/{ig_user_id}",
+                    params={"fields": "id,username,name,profile_picture_url", "access_token": long_token},
+                )
+                profile = profile_resp.json()
+                print(f"[IGDirectOAuth] ig profile for page {pid}: {profile}")
+                candidates.append({
+                    "ig_user_id": ig_user_id,
+                    "page_id": pid,
+                    "page_name": ig_data.get("name") or page.get("name"),
+                    "username": profile.get("username", ig_user_id),
+                    "profile_picture_url": profile.get("profile_picture_url"),
+                    # Store the user's long-lived token instead of the page token —
+                    # it carries instagram_content_publish permission.
+                    "page_access_token": long_token,
+                })
 
-            if not ig_user_id:
+            if not candidates:
                 err_msg = "No Instagram Business Account found linked to your Facebook Pages."
-                return RedirectResponse(f"{base_redirect}?connected=false&error={urllib.parse.quote(err_msg)}")
+                return RedirectResponse(f"{base_redirect}&connected=false&error={urllib.parse.quote(err_msg)}")
 
-        # Step 6: store in social_connections
-        # Use id (the unique indexed field) as the upsert key so reconnecting
-        # never hits a duplicate-key error regardless of how the old record was stored.
         now = datetime.now(timezone.utc).isoformat()
-        conn_doc = {
-            "id": ig_user_id,
-            "user_id": None,  # matched when user calls /connections after redirect
-            "platform": "instagram",
-            "connected_via": "instagram_direct_oauth",
-            "ig_user_id": ig_user_id,
-            "page_id": pid,  # Facebook Page ID linked to this Instagram account
-            "page_access_token": page_token,
-            "username": username,
-            "account_name": username,
-            "profile_picture_url": profile_picture_url,
-            "connection_status": "pending_user_match",
-            "connected_at": now,
-            "updated_at": now,
-        }
-        await db["social_connections"].update_one(
-            {"id": ig_user_id},
-            {"$set": conn_doc},
-            upsert=True,
-        )
-        print(f"[IGDirectOAuth] ✅ Stored @{username} (ig_user_id={ig_user_id}) pending user match")
 
-        params_out = (
-            f"connected=instagram_direct"
-            f"&ig_user_id={urllib.parse.quote(ig_user_id)}"
-            f"&username={urllib.parse.quote(username)}"
-        )
-        # base_redirect already has ?tab=connections so append with &
+        # Exactly one candidate — nothing to choose between, connect it directly
+        # exactly as before (unchanged behaviour for the common case).
+        if len(candidates) == 1:
+            c = candidates[0]
+            conn_doc = {
+                "id": c["ig_user_id"],
+                "user_id": None,  # matched when user calls /connections after redirect
+                "platform": "instagram",
+                "connected_via": "instagram_direct_oauth",
+                "ig_user_id": c["ig_user_id"],
+                "page_id": c["page_id"],
+                "page_access_token": c["page_access_token"],
+                "username": c["username"],
+                "account_name": c["username"],
+                "profile_picture_url": c["profile_picture_url"],
+                "connection_status": "pending_user_match",
+                "connected_at": now,
+                "updated_at": now,
+            }
+            await db["social_connections"].update_one(
+                {"id": c["ig_user_id"]}, {"$set": conn_doc}, upsert=True,
+            )
+            print(f"[IGDirectOAuth] ✅ Stored @{c['username']} (ig_user_id={c['ig_user_id']}) pending user match")
+            params_out = (
+                f"connected=instagram_direct"
+                f"&ig_user_id={urllib.parse.quote(c['ig_user_id'])}"
+                f"&username={urllib.parse.quote(c['username'])}"
+            )
+            return RedirectResponse(f"{base_redirect}&{params_out}")
+
+        # Multiple candidates — stash them and let the user pick, same idea as
+        # the Outstand picker but self-contained (no Outstand involved here).
+        import secrets
+        token = secrets.token_urlsafe(24)
+        await db["pending_instagram_connections"].insert_one({
+            "token": token,
+            "candidates": candidates,
+            "created_at": datetime.utcnow(),
+        })
+        print(f"[IGDirectOAuth] {len(candidates)} Instagram candidates — awaiting user pick (token={token})")
+        params_out = f"connected=instagram_pending&token={urllib.parse.quote(token)}"
         return RedirectResponse(f"{base_redirect}&{params_out}")
 
     except Exception as e:
@@ -1820,6 +2024,114 @@ async def instagram_direct_finalize(
     return UriResponse.get_single_data_response("instagram_connected", {"ig_user_id": ig_user_id})
 
 
+@router.get("/connect/instagram-direct/pending/{token}")
+async def instagram_direct_pending(token: str, db: AsyncIOMotorDatabase = Depends(get_db_dependency)):
+    """
+    Returns the Instagram account candidates awaiting a user pick, stashed by
+    the callback when more than one Facebook Page had a linked Instagram
+    Business Account. No JWT required — reachable right after the OAuth
+    redirect, same as the Outstand pending-connection endpoint.
+    """
+    pending = await db["pending_instagram_connections"].find_one({"token": token})
+    if not pending:
+        return UriResponse.error_response(
+            "This connection session has expired — please reconnect Instagram.", code=404
+        )
+    return UriResponse.get_single_data_response("pending_instagram_connection", {
+        "token": token,
+        "candidates": [
+            {
+                "ig_user_id": c["ig_user_id"],
+                "page_name": c.get("page_name"),
+                "username": c.get("username"),
+                "profile_picture_url": c.get("profile_picture_url"),
+            }
+            for c in pending.get("candidates", [])
+        ],
+    })
+
+
+@router.post("/connect/instagram-direct/finalize-pending")
+async def instagram_direct_finalize_pending(
+    body: Dict[str, Any],
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    ctx: dict = Depends(get_active_brand_context),
+):
+    """
+    Called once the user picks which Instagram account(s) to connect from the
+    picker — one or several, mirroring Facebook's own multi-page picker.
+    Stores each chosen candidate directly as active (unlike the
+    single-candidate path, this call is already authenticated, so there's no
+    separate pending_user_match step needed). The pending session is only
+    consumed once, after every requested account is processed, so picking
+    fewer than all the candidates in one call doesn't burn the others.
+    """
+    from app.models.brand_account import BrandAccount
+
+    token = body.get("token")
+    ig_user_ids = body.get("ig_user_ids")
+    if ig_user_ids is None:
+        single = body.get("ig_user_id")
+        ig_user_ids = [single] if single else []
+    if not token or not ig_user_ids:
+        raise HTTPException(status_code=400, detail="token and ig_user_ids are required")
+
+    pending = await db["pending_instagram_connections"].find_one({"token": token})
+    if not pending:
+        raise HTTPException(status_code=404, detail="This connection session has expired — please reconnect Instagram.")
+
+    candidates_by_id = {c["ig_user_id"]: c for c in pending.get("candidates", [])}
+    chosen_list = [candidates_by_id[i] for i in ig_user_ids if i in candidates_by_id]
+    if not chosen_list:
+        raise HTTPException(status_code=400, detail="Those accounts weren't part of this connection session.")
+
+    user_id = ctx["user_id"]
+    brand_id = ctx["brand_id"]
+    is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
+    now = datetime.utcnow().isoformat()
+
+    connected = []
+    for chosen in chosen_list:
+        conn_doc = {
+            "id": chosen["ig_user_id"],
+            "user_id": user_id,
+            "platform": "instagram",
+            "connected_via": "instagram_direct_oauth",
+            "ig_user_id": chosen["ig_user_id"],
+            "page_id": chosen["page_id"],
+            "page_access_token": chosen["page_access_token"],
+            "username": chosen["username"],
+            "account_name": chosen["username"],
+            "profile_picture_url": chosen.get("profile_picture_url"),
+            "connection_status": "active",
+            "connected_at": now,
+            "updated_at": now,
+        }
+        if not is_personal:
+            conn_doc["brand_id"] = brand_id
+
+        await db["social_connections"].update_one(
+            {"id": chosen["ig_user_id"]}, {"$set": conn_doc}, upsert=True,
+        )
+        connected.append({"ig_user_id": chosen["ig_user_id"], "username": chosen["username"]})
+
+    # Only the accounts the user picked are consumed — anything left in
+    # candidates that wasn't chosen this call stays available for a follow-up
+    # pick, so connecting one now doesn't burn the rest of the session.
+    remaining = [c for c in pending.get("candidates", []) if c["ig_user_id"] not in {r["ig_user_id"] for r in connected}]
+    if remaining:
+        await db["pending_instagram_connections"].update_one(
+            {"token": token}, {"$set": {"candidates": remaining}}
+        )
+    else:
+        await db["pending_instagram_connections"].delete_one({"token": token})
+
+    return UriResponse.get_single_data_response("instagram_connected", {
+        "connected": connected,
+        "total": len(connected),
+    })
+
+
 @router.get("/connect/callback/outstand")
 async def outstand_oauth_callback(
     sessionToken: Optional[str] = Query(None),
@@ -1829,6 +2141,7 @@ async def outstand_oauth_callback(
     username: Optional[str] = Query(None),
     network_unique_id: Optional[str] = Query(None),
     network: Optional[str] = Query(None),
+    requested_network: Optional[str] = Query(None),
     success: Optional[str] = Query(None),
     error: Optional[str] = Query(None),
     source: Optional[str] = Query(None),
@@ -1840,9 +2153,15 @@ async def outstand_oauth_callback(
     Two possible flows:
     1. Session token flow (Facebook, LinkedIn etc.):
        Outstand sends sessionToken → redirect frontend to pending/finalize.
-    2. Direct flow (X/Twitter OAuth 2.0):
+    2. Direct flow (X/Twitter OAuth 2.0, TikTok):
        Outstand sends account_id + username directly → redirect frontend
-       with account details so it can call POST /x/finalize-direct.
+       with account details so it can call POST /connect/finalize-outstand-direct.
+       Outstand doesn't reliably echo back which network this is (confirmed
+       live for TikTok — no `network` param on the callback at all), so
+       `requested_network` — the network we asked for, round-tripped through
+       our own redirect_uri at initiate time (see initiate_connection_flow) —
+       is the dependable source; `network` (if Outstand ever does send it) wins
+       when present.
 
     source: "onboarding" → redirect to brand-setup, "settings" → redirect to settings/social-accounts
     """
@@ -1856,15 +2175,16 @@ async def outstand_oauth_callback(
         encoded_error = urllib.parse.quote(error)
         return RedirectResponse(f"{base_redirect}?connected=false&error={encoded_error}")
 
-    # Direct flow — X OAuth 2.0 returns account_id immediately
+    # Direct flow — X OAuth 2.0 / TikTok return account_id immediately
     if success == "true" and account_id:
         params = f"account_id={urllib.parse.quote(account_id)}&connected=direct"
         if username:
             params += f"&username={urllib.parse.quote(username)}"
         if network_unique_id:
             params += f"&network_unique_id={urllib.parse.quote(network_unique_id)}"
-        if network:
-            params += f"&network={urllib.parse.quote(network)}"
+        effective_network = network or requested_network
+        if effective_network:
+            params += f"&network={urllib.parse.quote(effective_network)}"
         return RedirectResponse(f"{base_redirect}?{params}")
 
     # Session token flow
@@ -1919,6 +2239,65 @@ async def finalize_social_connection(
     )
 
 
+@router.post("/connect/finalize-outstand-direct")
+async def finalize_outstand_direct(
+    account_id: str,
+    network: str,
+    username: Optional[str] = None,
+    network_unique_id: Optional[str] = None,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    ctx: dict = Depends(get_active_brand_context),
+):
+    """
+    Finalizes an Outstand connection that used the "direct" callback shape —
+    Outstand returns the connected account_id immediately (TikTok, X) instead
+    of a session token requiring a separate page-selection step, so there was
+    never a finalize call to persist it. Was previously silently unhandled by
+    the frontend, so the connection only ever surfaced via a live Outstand
+    lookup at publish time — the account never showed as "Connected" and the
+    doc that fallback wrote had no `id` field, colliding with the unique
+    index the moment a second such doc landed (the `id: null` duplicate-key
+    errors seen repeatedly in logs). Mirrors finalize_connection's doc shape
+    (explicit `id: account_id`) to avoid that collision.
+    """
+    from app.models.brand_account import BrandAccount
+    user_id = ctx["user_id"]
+    brand_id = ctx["brand_id"]
+    is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
+
+    now = datetime.utcnow()
+    doc = {
+        "id": account_id,
+        "user_id": user_id,
+        "platform": network,
+        "outstand_account_id": account_id,
+        "username": username,
+        "account_name": username,
+        "network_unique_id": network_unique_id,
+        "connection_status": "active",
+        "connected_via": "outstand",
+        "connected_at": now,
+        "updated_at": now,
+    }
+    if not is_personal:
+        doc["brand_id"] = brand_id
+
+    brand_scope = {"user_id": user_id} if is_personal else {"brand_id": brand_id}
+    await db["social_connections"].delete_many({
+        "$or": [
+            {"id": account_id},
+            {**brand_scope, "platform": network},
+        ]
+    })
+    await db["social_connections"].insert_one(doc)
+
+    return UriResponse.get_single_data_response("account_connected", {
+        "outstand_account_id": account_id,
+        "platform": network,
+        "username": username,
+    })
+
+
 @router.get("/connections")
 async def get_user_connections(
     ctx: dict = Depends(get_active_brand_context),
@@ -1945,6 +2324,25 @@ async def disconnect_social_account(
         db=db,
         user_id=ctx["user_id"],
         outstand_account_id=outstand_account_id,
+        brand_id=ctx["brand_id"],
+    )
+
+
+@router.delete("/connections/platform/{platform}")
+async def disconnect_all_for_platform(
+    platform: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    ctx: dict = Depends(get_active_brand_context),
+):
+    """
+    Disconnect every currently-connected account for one platform, for the
+    active brand — the "Disconnect All" action when multiple pages/accounts
+    are connected to the same platform.
+    """
+    return await SocialAccountService.disconnect_all_for_platform(
+        db=db,
+        user_id=ctx["user_id"],
+        platform=platform,
         brand_id=ctx["brand_id"],
     )
 
@@ -2017,6 +2415,41 @@ async def disconnect_facebook_direct(
         raise HTTPException(status_code=404, detail="Facebook connection not found")
 
     return {"status": True, "responseMessage": "Facebook page disconnected"}
+
+
+@router.delete("/connections/tiktok-direct")
+async def disconnect_tiktok_direct(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    ctx: dict = Depends(get_active_brand_context),
+):
+    """
+    Disconnect a TikTok account connected via direct OAuth for the active brand.
+    """
+    from app.models.brand_account import BrandAccount
+    user_id = ctx["user_id"]
+    brand_id = ctx["brand_id"]
+    is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
+    personal_bid = BrandAccount.personal_brand_id(user_id)
+
+    if is_personal:
+        delete_filter = {
+            "user_id": user_id,
+            "platform": "tiktok",
+            "connected_via": "tiktok_direct_oauth",
+            "$or": [
+                {"brand_id": {"$exists": False}},
+                {"brand_id": None},
+                {"brand_id": personal_bid},
+            ],
+        }
+    else:
+        delete_filter = {"brand_id": brand_id, "platform": "tiktok", "connected_via": "tiktok_direct_oauth"}
+
+    result = await db["social_connections"].delete_one(delete_filter)
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="TikTok connection not found")
+
+    return {"status": True, "responseMessage": "TikTok account disconnected"}
 
 
 # ==============================================================================
@@ -3215,11 +3648,28 @@ async def get_content_calendar(
             {"$skip": skip},
             {"$limit": limit},
             {"$addFields": {
+                # image_url is supposed to always be a string or absent, but a
+                # legacy/buggy write can leave it as some other BSON type (an
+                # object, seen live — a caller stored {"url": ..., "is_video": ...}
+                # instead of extracting the string). $substr/$strLenCP throw on
+                # anything but a string, which previously took down this endpoint's
+                # entire response for a user over ONE malformed draft among many.
+                # $cond only evaluates the branch it selects, so gating on $type
+                # here actually skips the unsafe string ops instead of merely
+                # deciding between two branches that both still run.
                 "_img_is_base64": {
-                    "$eq": [{"$substr": [{"$ifNull": ["$image_url", ""]}, 0, 5]}, "data:"]
+                    "$cond": {
+                        "if": {"$eq": [{"$type": "$image_url"}, "string"]},
+                        "then": {"$eq": [{"$substr": ["$image_url", 0, 5]}, "data:"]},
+                        "else": False,
+                    }
                 },
                 "_img_exists": {
-                    "$gt": [{"$strLenCP": {"$ifNull": ["$image_url", ""]}}, 0]
+                    "$cond": {
+                        "if": {"$eq": [{"$type": "$image_url"}, "string"]},
+                        "then": {"$gt": [{"$strLenCP": "$image_url"}, 0]},
+                        "else": False,
+                    }
                 },
                 "_draft_key": {"$ifNull": ["$id", "$draft_id"]},
             }},
@@ -6040,7 +6490,8 @@ async def publish_video_draft(
     # facebook_reels  → look for "facebook" first; fall back to "instagram" because the
     #                   Instagram OAuth flow stores a Facebook Page access token that can
     #                   also be used to post videos to the Facebook Page.
-    # tiktok          → look for an Outstand-connected "tiktok" account (no direct API).
+    # tiktok          → prefer a direct-OAuth "tiktok" account (FILE_UPLOAD, bypasses
+    #                   Outstand); fall back to an Outstand-connected one.
     if request.platform == "instagram_reels":
         conn = await db["social_connections"].find_one(
             {"user_id": user_id, "platform": "instagram"},
@@ -6052,10 +6503,15 @@ async def publish_video_draft(
             raise HTTPException(status_code=400, detail="Instagram account missing ig_user_id. Please reconnect.")
     elif request.platform == "tiktok":
         conn = await db["social_connections"].find_one(
-            {"user_id": user_id, "platform": "tiktok", "connected_via": "outstand"},
-            {"_id": 0, "outstand_account_id": 1},
+            {"user_id": user_id, "platform": "tiktok", "connected_via": "tiktok_direct_oauth", "connection_status": "active"},
+            {"_id": 0},
         )
-        if not conn or not conn.get("outstand_account_id"):
+        if not conn:
+            conn = await db["social_connections"].find_one(
+                {"user_id": user_id, "platform": "tiktok", "connected_via": "outstand"},
+                {"_id": 0, "outstand_account_id": 1, "connected_via": 1},
+            )
+        if not conn or not (conn.get("outstand_account_id") or conn.get("connected_via") == "tiktok_direct_oauth"):
             raise HTTPException(status_code=400, detail="No connected TikTok account found. Please connect your account first.")
     else:  # facebook_reels
         conn = await db["social_connections"].find_one(
@@ -9368,6 +9824,17 @@ async def video_voiceover_produce(
         custom_broll_clips=[],
         custom_broll_placements=None,
         custom_broll_estimated_duration=60.0,
+        # zapcap_produce's Form(...) defaults only resolve when FastAPI itself
+        # handles the HTTP request — called directly like this, any omitted
+        # param stays the raw Form sentinel object (not a string), so every
+        # param it touches with e.g. .lower() must be passed explicitly.
+        enable_brand_overlay="false",
+        logo_position="bottom_right",
+        logo_timing="whole",
+        contact_source="none",
+        custom_contact_text="",
+        contact_position="bottom_center",
+        contact_timing="end",
         db=db,
         token=token,
         ctx=ctx,

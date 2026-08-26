@@ -56,6 +56,48 @@ async def _notify(notification_service, *, user_id: str, notification_type: str,
     )
 
 
+
+async def diagnostic_hint(db, spend_ngn: float, duration_days: int = 0) -> str:
+    """One concrete next step for an underperforming campaign, from the corpus
+    (stage=diagnostics).
+
+    The stock message ("try a different photo or widen the area") is a guess that
+    ignores the most common real causes — reading cost per result without reference
+    to how much spend the ad actually got, or blaming creative before ruling out
+    seasonality. A retrieved record names the actual check to run.
+
+    This is the one stage where ui_only records are legitimately allowed through
+    (spec §7.1.10): the ₦30k operator can act on team knowledge Jane cannot execute.
+    Best-effort — no hint is strictly better than a broken notification.
+    """
+    try:
+        from . import constants as C
+        from .entities import ConsumedBy, StrategyPlatform
+        from .retrieval import (
+            BudgetContext, BusinessProfile, RetrievalRequest, gap_record, retrieve,
+        )
+        from .store import MongoCoverageGapStore, MongoStrategyStore
+        if not spend_ngn or spend_ngn <= 0:
+            return ""
+        days = duration_days or C.DEFAULT_CAMPAIGN_DAYS
+        daily = spend_ngn / max(days, 1)
+        tier = 1 if spend_ngn < 15_000 else 2 if spend_ngn < 50_000 else 3 if spend_ngn < 250_000 else 4
+        req = RetrievalRequest(
+            stage=ConsumedBy.DIAGNOSTICS,
+            platforms=[StrategyPlatform.META],
+            budget=BudgetContext(daily_spend_ngn=daily, budget_tier=tier),
+            profile=BusinessProfile(),
+        )
+        res = retrieve(await MongoStrategyStore(db).fetch_approved(), req, limit=1)
+        if not res.records:
+            await MongoCoverageGapStore(db).log_gap(gap_record(req))
+            return ""
+        return res.records[0].claim.rstrip(".")
+    except Exception as e:                       # noqa: BLE001
+        print(f"[monitoring] diagnostic corpus skipped: {e}", flush=True)
+        return ""
+
+
 async def check_active_campaigns(db) -> dict:
     """One pass over every campaign we've launched: flag underperformers, detect
     newly-ended campaigns, notify the owning user for both, and self-heal any
@@ -122,7 +164,11 @@ async def check_active_campaigns(db) -> dict:
                 subject=f"{name} could use a tweak",
                 message=(
                     f"Quick update — {name} has spent ₦{summary['spend_ngn']:,.0f} so far with no "
-                    "conversations yet. Might be worth trying a different photo or widening the area."
+                    "conversations yet. " + (
+                        f"Worth checking first: {hint.lower()}."
+                        if (hint := await diagnostic_hint(db, summary.get("spend_ngn") or 0))
+                        else "Might be worth trying a different photo or widening the area."
+                    )
                 ),
                 campaign_id=campaign_id,
             )

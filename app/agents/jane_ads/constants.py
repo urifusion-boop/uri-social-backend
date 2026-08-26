@@ -76,3 +76,10 @@ AB_FULL_TEST_NGN: float = 20_000.0
 PLAN_VARIANT_TIER_2_NGN: float = 15_000.0    # below this: one plan only
 PLAN_VARIANT_TIER_3_NGN: float = 50_000.0    # at/above: two or three selectable
 PLAN_VARIANT_TIER_4_NGN: float = 250_000.0   # at/above: multiple, with proper structure
+
+# ── Sustained capacity (ASC-SPEC-01 v2 §5.2, ASC-ENG-01 §2) ──────────────────
+# Ninety days rather than thirty: top-ups arrive staggered and small, and thirty
+# days is too few events for the rate to be stable. Below the minimum event count
+# the number is not trusted and multi-day tactics are excluded — fail closed.
+SUSTAINED_WINDOW_DAYS: int = 90
+SUSTAINED_MIN_TOPUP_EVENTS: int = 2
