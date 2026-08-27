@@ -55,6 +55,32 @@ def _cal_scope(user_id: str, brand_id: Optional[str]) -> Dict[str, Any]:
         ],
     }
 
+# Shared by _generate_ideas() and regenerate_day() — a single source of truth for
+# what each explicit business_stage value means for tone, so the two prompt-builders
+# can never drift apart on this.
+_STAGE_GUIDANCE = {
+    "new": "a brand-new business — lean into trust-building, founder story, and credibility-establishing content",
+    "growing": "a growing business with early traction — balance trust-building with momentum/social-proof content",
+    "established": "an established business with a steady base — lean into authority, depth, and loyalty content",
+    "market_leader": "a market-leading business — lean into authority, scale, and category-defining content",
+}
+
+
+def _business_pulse_freshness_str(updated_at: Optional[datetime]) -> Optional[str]:
+    """
+    Render a human-readable freshness note for Business Pulse data (current
+    promotions/campaigns/news/milestones), so the model can gauge how much
+    weight to give it. Called from both _generate_ideas() and regenerate_day()
+    so the "how stale is stale" threshold only lives in one place.
+    """
+    if not updated_at:
+        return None
+    age_days = (datetime.utcnow() - updated_at).days
+    if age_days <= 21:
+        return f"as of {age_days} day{'s' if age_days != 1 else ''} ago"
+    return f"as of {age_days} days ago — likely stale, treat with caution"
+
+
 CONTENT_TYPES = ["educational", "relatable", "promotional", "behind_the_scenes", "engagement"]
 
 # Four default mix variants — different type distributions so the shown
@@ -400,6 +426,24 @@ async def _generate_ideas(
     region = brand.get("region", "")
     primary_goal = brand.get("primary_goal", "")
     audience_age = brand.get("audience_age_range", "")
+    # Business Details
+    business_stage = brand.get("business_stage", "")
+    usp = brand.get("unique_selling_proposition", "")
+    price_range = brand.get("price_range", "")
+    business_priorities = brand.get("business_priorities") or []
+    # Target Customer Detail
+    customer_gender = brand.get("customer_gender", "")
+    customer_location = brand.get("customer_location", "")
+    customer_occupation = brand.get("customer_occupation", "")
+    customer_income_level = brand.get("customer_income_level", "")
+    customer_interests = brand.get("customer_interests") or []
+    customer_pain_points = brand.get("customer_pain_points") or []
+    customer_needs = brand.get("customer_needs") or []
+    customer_objections = brand.get("customer_objections") or []
+    why_customers_choose_us = brand.get("why_customers_choose_us", "")
+    # Business Pulse
+    business_pulse = brand.get("business_pulse") or {}
+    business_pulse_updated_at = brand.get("business_pulse_updated_at")
     key_dates = brand.get("key_dates", "")
     guardrails = brand.get("guardrails") or {}
     avoid = guardrails.get("avoid_topics") or guardrails.get("avoid") or []
@@ -510,16 +554,22 @@ async def _generate_ideas(
         )
 
     # ── Business stage awareness (req 5) ────────────────────────────────────────
-    # No dedicated "stage of growth" field exists on the brand profile today —
-    # rather than block this on a new onboarding field, ask the model to infer
-    # it from what's already there (description, goal, products, cadence).
-    stage_block = (
-        "Business stage: infer this brand's apparent stage of growth from the details "
-        "above (e.g. a brand-new solo operation vs. an established team with a full "
-        "product line and steady posting cadence) and let it inform tone and ideas where "
-        "relevant — e.g. an early-stage brand benefits more from trust-building/story "
-        "content, an established one can lean harder into authority/scale content."
-    )
+    # Prefer the owner's own explicit business_stage field when set — deterministic
+    # and reliable, vs. asking the model to infer it. Keep the inference fallback
+    # for profiles that haven't filled this in yet, so they don't regress.
+    if business_stage:
+        stage_block = (
+            f"Business stage (explicitly set by the owner): {business_stage} — "
+            f"{_STAGE_GUIDANCE.get(business_stage, '')}"
+        )
+    else:
+        stage_block = (
+            "Business stage: infer this brand's apparent stage of growth from the details "
+            "above (e.g. a brand-new solo operation vs. an established team with a full "
+            "product line and steady posting cadence) and let it inform tone and ideas where "
+            "relevant — e.g. an early-stage brand benefits more from trust-building/story "
+            "content, an established one can lean harder into authority/scale content."
+        )
 
     # ── User-saved key dates (req 4) ────────────────────────────────────────────
     # These are dates the business owner explicitly saved in their Brand Playbook
@@ -606,6 +656,56 @@ async def _generate_ideas(
                 + "\n".join(f"  - {l}" for l in perf_lines)
             )
 
+    # ── Business Pulse block — "what's happening right now" ─────────────────────
+    bp_freshness = _business_pulse_freshness_str(business_pulse_updated_at)
+    bp_lines = []
+    if business_pulse.get("current_period_goal"):
+        bp_lines.append(f"This period's specific goal (distinct from the long-term primary goal): {business_pulse['current_period_goal']}")
+    if business_pulse.get("current_promotions"):
+        bp_lines.append(f"Active promotions/offers: {', '.join(business_pulse['current_promotions'][:5])}")
+    if business_pulse.get("current_campaigns"):
+        bp_lines.append(f"Active campaigns: {', '.join(business_pulse['current_campaigns'][:5])}")
+    if business_pulse.get("new_products_services"):
+        bp_lines.append(f"Newly launched products/services (recent additions worth spotlighting, not the full catalog): {', '.join(business_pulse['new_products_services'][:5])}")
+    if business_pulse.get("recent_milestones"):
+        bp_lines.append(f"Recent milestones worth celebrating: {', '.join(business_pulse['recent_milestones'][:5])}")
+    if business_pulse.get("business_news_announcements"):
+        bp_lines.append(f"News/announcements: {', '.join(business_pulse['business_news_announcements'][:5])}")
+    business_pulse_block = ""
+    if bp_lines:
+        freshness_note = f" (saved {bp_freshness})" if bp_freshness else ""
+        business_pulse_block = (
+            f"=== CURRENT BUSINESS PULSE{freshness_note} — what's happening RIGHT NOW, weight this heavily for at least 1-2 of the 7 days ===\n"
+            + "\n".join(f"  - {l}" for l in bp_lines)
+            + "\n==============================================================="
+        )
+
+    # ── Target Customer persona block ────────────────────────────────────────────
+    persona_bits = []
+    if customer_occupation:
+        persona_bits.append(f"occupation: {customer_occupation}")
+    if customer_gender:
+        persona_bits.append(f"gender: {customer_gender}")
+    if customer_location:
+        persona_bits.append(f"location: {customer_location}")
+    if customer_income_level:
+        persona_bits.append(f"income: {customer_income_level}")
+    persona_line = ", ".join(persona_bits)
+    persona_block = ""
+    if persona_line or customer_interests or customer_pain_points or customer_needs or customer_objections or why_customers_choose_us:
+        _persona_lines = [f"Customer persona: {persona_line}"] if persona_line else []
+        if customer_interests:
+            _persona_lines.append(f"  Interests: {', '.join(customer_interests[:5])}")
+        if customer_pain_points:
+            _persona_lines.append(f"  Pain points to speak to: {', '.join(customer_pain_points[:5])}")
+        if customer_needs:
+            _persona_lines.append(f"  Needs: {', '.join(customer_needs[:5])}")
+        if customer_objections:
+            _persona_lines.append(f"  Common objections to address: {', '.join(customer_objections[:5])}")
+        if why_customers_choose_us:
+            _persona_lines.append(f"  Why they choose this brand: {why_customers_choose_us}")
+        persona_block = "\n".join(_persona_lines)
+
     brand_block = f"Brand: {brand_name}"
     if tagline:
         brand_block += f' — "{tagline}"'
@@ -643,6 +743,12 @@ async def _generate_ideas(
         extras.append(f"Posting cadence: {posting_cadence}")
     if avoid_str:
         extras.append(f"Topics/themes to avoid: {avoid_str}")
+    if usp:
+        extras.append(f"Unique selling proposition: {usp}")
+    if price_range:
+        extras.append(f"Price positioning: {price_range}")
+    if business_priorities:
+        extras.append(f"Current business priorities: {', '.join(business_priorities)}")
     extras_block = "\n".join(extras)
 
     # When we have engagement data, assign one proven topic to each day explicitly.
@@ -686,6 +792,7 @@ specific about THIS business, not a generic instance of its content_type.
 {brand_block}
 
 {audience_block}
+{persona_block}
 
 {voice_block}
 
@@ -695,6 +802,7 @@ specific about THIS business, not a generic instance of its content_type.
 {user_date_block}
 
 {performance_block}
+{business_pulse_block}
 {content_focus_line}
 Platforms: {platforms_str}
 Week starting: {week_start}
@@ -1104,6 +1212,24 @@ async def generate_plan(
             "key_dates_structured":brand.get("key_dates_structured") or [],
             "posting_cadence":     brand.get("posting_cadence"),
             "website":             brand.get("website"),
+            # Business Details
+            "unique_selling_proposition": brand.get("unique_selling_proposition"),
+            "price_range":         brand.get("price_range"),
+            "business_stage":      brand.get("business_stage"),
+            "business_priorities": brand.get("business_priorities") or [],
+            # Target Customer Detail
+            "customer_gender":       brand.get("customer_gender"),
+            "customer_location":     brand.get("customer_location"),
+            "customer_occupation":   brand.get("customer_occupation"),
+            "customer_income_level": brand.get("customer_income_level"),
+            "customer_interests":    brand.get("customer_interests") or [],
+            "customer_pain_points":  brand.get("customer_pain_points") or [],
+            "customer_needs":        brand.get("customer_needs") or [],
+            "customer_objections":   brand.get("customer_objections") or [],
+            "why_customers_choose_us": brand.get("why_customers_choose_us"),
+            # Business Pulse
+            "business_pulse":            brand.get("business_pulse") or {},
+            "business_pulse_updated_at": brand.get("business_pulse_updated_at"),
         },
     }
     await db[COLLECTION].insert_one({**doc, "_id": plan_id})
@@ -1172,6 +1298,24 @@ async def regenerate_day(
     guardrails = brand.get("guardrails") or {}
     avoid = guardrails.get("avoid_topics") or guardrails.get("avoid") or []
     avoid_str = ", ".join(avoid) if avoid else ""
+    # Business Details
+    business_stage = brand.get("business_stage", "")
+    usp = brand.get("unique_selling_proposition", "")
+    price_range = brand.get("price_range", "")
+    business_priorities = brand.get("business_priorities") or []
+    # Target Customer Detail
+    customer_gender = brand.get("customer_gender", "")
+    customer_location = brand.get("customer_location", "")
+    customer_occupation = brand.get("customer_occupation", "")
+    customer_income_level = brand.get("customer_income_level", "")
+    customer_interests = brand.get("customer_interests") or []
+    customer_pain_points = brand.get("customer_pain_points") or []
+    customer_needs = brand.get("customer_needs") or []
+    customer_objections = brand.get("customer_objections") or []
+    why_customers_choose_us = brand.get("why_customers_choose_us", "")
+    # Business Pulse
+    business_pulse = brand.get("business_pulse") or {}
+    business_pulse_updated_at = brand.get("business_pulse_updated_at")
 
     # Avoid all existing day titles in this plan
     existing_titles = [d.get("title", "") for d in plan["days"] if d.get("title") and d["day_index"] != day_index]
@@ -1202,12 +1346,76 @@ async def regenerate_day(
             f"confident actually exists; leave holiday_reference null otherwise."
         )
 
-    stage_block = (
-        "Business stage: infer this brand's apparent stage of growth from the details "
-        "above and let it inform tone where relevant (e.g. an early-stage brand benefits "
-        "more from trust-building/story content, an established one can lean harder into "
-        "authority/scale content)."
-    )
+    if business_stage:
+        stage_block = (
+            f"Business stage (explicitly set by the owner): {business_stage} — "
+            f"{_STAGE_GUIDANCE.get(business_stage, '')}"
+        )
+    else:
+        stage_block = (
+            "Business stage: infer this brand's apparent stage of growth from the details "
+            "above and let it inform tone where relevant (e.g. an early-stage brand benefits "
+            "more from trust-building/story content, an established one can lean harder into "
+            "authority/scale content)."
+        )
+
+    extras_line = ""
+    _extras_bits = []
+    if usp:
+        _extras_bits.append(f"Unique selling proposition: {usp}")
+    if price_range:
+        _extras_bits.append(f"Price positioning: {price_range}")
+    if business_priorities:
+        _extras_bits.append(f"Current business priorities: {', '.join(business_priorities)}")
+    if _extras_bits:
+        extras_line = "\n".join(_extras_bits)
+
+    persona_bits = []
+    if customer_occupation:
+        persona_bits.append(f"occupation: {customer_occupation}")
+    if customer_gender:
+        persona_bits.append(f"gender: {customer_gender}")
+    if customer_location:
+        persona_bits.append(f"location: {customer_location}")
+    if customer_income_level:
+        persona_bits.append(f"income: {customer_income_level}")
+    persona_line = ", ".join(persona_bits)
+    persona_block = ""
+    if persona_line or customer_interests or customer_pain_points or customer_needs or customer_objections or why_customers_choose_us:
+        _persona_lines = [f"Customer persona: {persona_line}"] if persona_line else []
+        if customer_interests:
+            _persona_lines.append(f"  Interests: {', '.join(customer_interests[:5])}")
+        if customer_pain_points:
+            _persona_lines.append(f"  Pain points to speak to: {', '.join(customer_pain_points[:5])}")
+        if customer_needs:
+            _persona_lines.append(f"  Needs: {', '.join(customer_needs[:5])}")
+        if customer_objections:
+            _persona_lines.append(f"  Common objections to address: {', '.join(customer_objections[:5])}")
+        if why_customers_choose_us:
+            _persona_lines.append(f"  Why they choose this brand: {why_customers_choose_us}")
+        persona_block = "\n".join(_persona_lines)
+
+    bp_freshness = _business_pulse_freshness_str(business_pulse_updated_at)
+    bp_lines = []
+    if business_pulse.get("current_period_goal"):
+        bp_lines.append(f"This period's specific goal: {business_pulse['current_period_goal']}")
+    if business_pulse.get("current_promotions"):
+        bp_lines.append(f"Active promotions/offers: {', '.join(business_pulse['current_promotions'][:5])}")
+    if business_pulse.get("current_campaigns"):
+        bp_lines.append(f"Active campaigns: {', '.join(business_pulse['current_campaigns'][:5])}")
+    if business_pulse.get("new_products_services"):
+        bp_lines.append(f"Newly launched products/services: {', '.join(business_pulse['new_products_services'][:5])}")
+    if business_pulse.get("recent_milestones"):
+        bp_lines.append(f"Recent milestones: {', '.join(business_pulse['recent_milestones'][:5])}")
+    if business_pulse.get("business_news_announcements"):
+        bp_lines.append(f"News/announcements: {', '.join(business_pulse['business_news_announcements'][:5])}")
+    business_pulse_block = ""
+    if bp_lines:
+        freshness_note = f" (saved {bp_freshness})" if bp_freshness else ""
+        business_pulse_block = (
+            f"=== CURRENT BUSINESS PULSE{freshness_note} — what's happening RIGHT NOW ===\n"
+            + "\n".join(f"  - {l}" for l in bp_lines)
+        )
 
     # Same deterministic check as _generate_ideas — if the business owner saved a
     # date that lands on THIS exact day, it's non-negotiable, not left to AI recall.
@@ -1230,12 +1438,15 @@ async def regenerate_day(
 {brand_line}
 Brand voice: {voice}{f' | Example: "{voice_sample[:150]}"' if voice_sample else ''}
 Target audience: {audience}{f' | {region} market' if region else ''}
+{persona_block}
 {f'Content pillars: {pillars_str}' if pillars_str else ''}
 Platforms: {platforms_str}
 {country_block}
 {stage_block}
+{extras_line}
 {user_date_block}
 {avoid_block}
+{business_pulse_block}
 
 Generate ONE new, COMPLETE {CONTENT_TYPE_LABELS[content_type]} content brief for {day_name}
 — a full, ready-to-publish idea, not just a title.

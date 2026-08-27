@@ -124,6 +124,22 @@ class Ad(BaseModel):
     conversations: int = 0
 
 
+
+class ConversationOutcome(str, Enum):
+    """Did this conversation become a customer? The blocking dependency for the whole
+    learning loop (spec §14.4): without it, both Jane and the platform optimise on
+    cost per lead, which systematically selects for cheap enquiries that never buy."""
+    QUALIFIED = "qualified"
+    WON = "won"
+    LOST = "lost"
+
+
+class OutcomeSetBy(str, Enum):
+    OPERATOR = "operator"
+    USER = "user"
+    JANE_INFERRED = "jane_inferred"   # never counted as confirmed for re-weighting
+
+
 class Conversation(BaseModel):
     conversation_id: str
     business_id: str
@@ -133,6 +149,23 @@ class Conversation(BaseModel):
     charged_ngn: float
     actual_platform_cost_ngn: Optional[float] = None
     at: datetime = Field(default_factory=_now)
+
+    # Outcome capture (spec §14) — a field on the object that already exists, not a
+    # new surface. The attribution chain campaign -> conversation was already here.
+    outcome: Optional[ConversationOutcome] = None
+    outcome_value_ngn: Optional[float] = None
+    outcome_set_by: Optional[OutcomeSetBy] = None
+    outcome_set_at: Optional[datetime] = None
+
+    @property
+    def outcome_is_confirmed(self) -> bool:
+        """Jane may pre-fill from context (a customer asking for account details,
+        confirming an order), but an inferred outcome is never treated as confirmed
+        for corpus re-weighting (§14.3) — it is a labour saver, not evidence."""
+        return (
+            self.outcome is not None
+            and self.outcome_set_by is not OutcomeSetBy.JANE_INFERRED
+        )
 
 
 class AuthorizationRecord(BaseModel):

@@ -1500,10 +1500,37 @@ async def _build_campaign_plan(
     # the brand profile on the account.
     brand_profile = (await get_brand_context(brand_ctx.get("user_id", ""), db, brand_ctx.get("brand_id"))
                      if brand_ctx.get("user_id") else {})
-    known_business_name = (body.business_name or remembered_business_name(history)
-                           or brand_profile.get("brand_name", ""))
-    known_category = (body.category or remembered_category(history)
-                      or brand_profile.get("industry", ""))
+    # WHO the business is comes from the brand profile before conversation history.
+    # History carried a stale identity from an older thread and outranked the profile,
+    # so a Social Media & Marketing Technology brand was planned for as "Living the
+    # Truth / Faith-based" — and every downstream plan, audience and ad served that
+    # wrong business. History still fills the gap when a profile has no value, and an
+    # explicit value on the request still wins over both.
+    known_business_name = (body.business_name or brand_profile.get("brand_name", "")
+                           or remembered_business_name(history))
+    known_category = (body.category or brand_profile.get("industry", "")
+                      or remembered_category(history))
+
+    # What the business actually SELLS. The profile holds this and none of it reached
+    # the consultant, so Jane reasoned from a name and an industry string alone —
+    # which is most of why plans read generic rather than brand-specific.
+    # to_brand_context() renames product_description -> business_description, so
+    # reading the raw profile key returned nothing and the single most useful
+    # sentence the brand has never reached Jane. ideal_customer_profile and tagline
+    # are the other two that describe the business rather than style it.
+    def _bit(v) -> str:
+        if isinstance(v, (list, tuple)):
+            return ", ".join(str(x).strip() for x in v if str(x).strip())
+        return str(v or "").strip()
+
+    known_offering = " · ".join(
+        b for b in (
+            _bit(brand_profile.get("business_description")),
+            _bit(brand_profile.get("key_products_services")),
+            _bit(brand_profile.get("ideal_customer_profile")),
+            _bit(brand_profile.get("tagline")),
+        ) if b
+    )
     known_budget = remembered_budget_ngn(history)
 
     # 1. Jane (the strategic consultant, jane-strategy-extraction v1.1.0) reads the
@@ -1521,7 +1548,8 @@ async def _build_campaign_plan(
     # instead of falling through to a follow-up question — otherwise every answer
     # re-triggers the same question (an infinite loop).
     try:
-        parsed = await consult(body.message, known_business_name, known_category, known_budget, thread_turns)
+        parsed = await consult(body.message, known_business_name, known_category,
+                               known_budget, thread_turns, offering=known_offering)
     except NlUnavailableError:
         raise HTTPException(status_code=503, detail=_AI_DIFFICULTIES)
 

@@ -274,6 +274,19 @@ Write one caption. No alternatives, no meta-commentary.
                 f'You may reference it naturally in a CTA if it fits the content.'
             )
 
+        if brand_context.get("unique_selling_proposition"):
+            parts.append(
+                f'- What makes this brand different: {brand_context["unique_selling_proposition"]}. '
+                f'Let this differentiation show through naturally, especially in hooks or CTAs.'
+            )
+
+        if brand_context.get("price_range"):
+            parts.append(
+                f'- Price positioning: {brand_context["price_range"]}. '
+                f'Match the tone and vocabulary to this price tier (e.g. don\'t use budget '
+                f'language for a premium brand, or exclusive/luxury language for a budget one).'
+            )
+
         # ── Voice & tone ──────────────────────────────────────────────────────
         # Use platform-specific tone if available and same_tone_everywhere is False
         platform_tones = brand_context.get("platform_tones") or {}
@@ -304,6 +317,35 @@ Write one caption. No alternatives, no meta-commentary.
             parts.append(
                 f'- Ideal Customer Profile: {brand_context["ideal_customer_profile"]}. '
                 f'Tailor all content specifically to resonate with this exact persona — their interests, pain points, and aspirations.'
+            )
+
+        # Target Customer Detail — a short combined line in aggregate (occupation/
+        # location/income), plus pain points and "why they choose us" separately,
+        # since those two are directly actionable for a single post's hook/angle.
+        cust_bits = []
+        if brand_context.get("customer_occupation"):
+            cust_bits.append(brand_context["customer_occupation"])
+        if brand_context.get("customer_location"):
+            cust_bits.append(f'in {brand_context["customer_location"]}')
+        if brand_context.get("customer_income_level"):
+            cust_bits.append(f'{brand_context["customer_income_level"]} income')
+        if cust_bits:
+            parts.append(
+                f'- Customer profile: {", ".join(cust_bits)}. '
+                f'Reflect this in the references and examples you use.'
+            )
+
+        pain_points = brand_context.get("customer_pain_points")
+        if isinstance(pain_points, list) and pain_points:
+            parts.append(
+                f'- Customer pain points: {", ".join(pain_points[:4])}. '
+                f'Speak to at least one of these where relevant.'
+            )
+
+        if brand_context.get("why_customers_choose_us"):
+            parts.append(
+                f'- Why customers choose this brand: {brand_context["why_customers_choose_us"]}. '
+                f'Let this reasoning surface naturally, especially in CTAs.'
             )
 
         if brand_context.get("audience_age_range"):

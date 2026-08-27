@@ -17,6 +17,7 @@ new strategic fields (geo_mode/geo_areas) when the consultant has populated them
 from __future__ import annotations
 
 import json
+import re
 from typing import Optional
 
 import openai
@@ -313,7 +314,8 @@ def build_history_turns(saved: list[dict]) -> list[dict]:
 
 async def consult(message: str, business_name: str = "", category: str = "",
                   known_budget: Optional[float] = None,
-                  history: Optional[list[dict]] = None) -> ConsultantBrief:
+                  history: Optional[list[dict]] = None,
+                  offering: str = "") -> ConsultantBrief:
     """One consultant turn. `history` — the real prior turns of THIS conversation
     (see build_history_turns) — is what lets the consultant actually track state
     across turns instead of re-deriving confusion from a jumbled flat string each
@@ -332,6 +334,11 @@ async def consult(message: str, business_name: str = "", category: str = "",
         known_bits.append(f"business name: {business_name}")
     if category:
         known_bits.append(f"category: {category}")
+    if offering:
+        # What they actually sell, from the brand profile. Without it the consultant
+        # has only a name and an industry label, and plans come out generic — a
+        # category is not an offer, and the offer is what an audience responds to.
+        known_bits.append(f"what they sell: {offering}")
     if known_budget:
         known_bits.append(f"last campaign they spent ₦{known_budget:,.0f} (a PAST campaign — "
                           "do not treat this as THIS campaign's budget; you may offer it as a "
@@ -416,6 +423,40 @@ def _client_gave_affirmative(message: str) -> bool:
     return bool(words & _AFFIRMATIVE_WORDS)
 
 
+# Money the client names for THIS campaign. Requires a naira marker (₦/N/NGN), a
+# k/m suffix, or a bare figure of at least 4 digits — so "100 customers" and "7 days"
+# are not mistaken for a budget, while "20k", "₦20,000" and "20000" are.
+_NUM = r"\d[\d,]*(?:\.\d+)?"
+_STATED_AMOUNT = re.compile(
+    rf"(?:₦|\bngn\b|\bn(?=\d))\s*({_NUM})\s*([km])?"   # ₦20,000 / N20k / NGN 50000
+    rf"|\b({_NUM})\s*([km])\b"                            # 20k / 5k / 1.5m
+    r"|\b(\d{4,})\b",                                     # bare 20000
+    re.I,
+)
+
+
+def stated_budget_ngn(reply: str) -> Optional[float]:
+    """The budget the client just named, if they named exactly one.
+
+    Two or more distinct figures in one reply is genuinely ambiguous ("20k for ads,
+    5k for design"), so this returns None and lets Jane ask rather than guessing
+    which one was meant.
+    """
+    from .nl import parse_ngn
+
+    found: list[float] = []
+    for m in _STATED_AMOUNT.finditer(reply or ""):
+        digits = m.group(1) or m.group(3) or m.group(5)
+        suffix = m.group(2) or m.group(4) or ""
+        if not digits:
+            continue
+        v = parse_ngn(f"{digits}{suffix}")
+        if v and v >= 1000:
+            found.append(v)
+    uniq = sorted(set(found))
+    return uniq[0] if len(uniq) == 1 else None
+
+
 def _build_budget_confirmation_note(known_budget: Optional[float], message: str,
                                     history: list[dict]) -> str:
     """Pre-resolve the one ambiguity prompting alone couldn't reliably get the model to
@@ -427,8 +468,25 @@ def _build_budget_confirmation_note(known_budget: Optional[float], message: str,
     affirmative directly answering Jane's own proposal to reuse the figure, or the client
     restating the number outright — tell the model plainly what just happened either way,
     instead of leaving it to infer from a prompt it's already shown it can misread."""
+    latest = _latest_user_reply(message)
+    stated_now = stated_budget_ngn(latest)
+
+    # No remembered budget at all — a fresh thread. The function used to bail here,
+    # so a plainly stated figure got no note and the model was left to decide for
+    # itself whether to accept it. It is a coin flip: the identical message converged
+    # in one turn over the API and took two in the UI, asking "can you confirm this
+    # budget is still accurate" about a number the client had just typed. Say it
+    # plainly instead of leaving it to chance.
     if not known_budget:
+        if stated_now:
+            return (
+                f"\n\nIMPORTANT: the client's latest reply above states ₦{stated_now:,.0f} as "
+                f"THIS campaign's budget. It is stated, not implied — do not ask them to "
+                f"confirm it. Set budget_ngn to {int(stated_now)} and move on to whatever's "
+                "next (not budget again)."
+            )
         return ""
+
     if _client_gave_affirmative(message):
         last_assistant = next((t.get("content", "") for t in reversed(history)
                                if t.get("role") == "assistant"), "")
@@ -440,7 +498,22 @@ def _build_budget_confirmation_note(known_budget: Optional[float], message: str,
                 f"Set budget_ngn to {int(known_budget)} and move on to whatever's next (not "
                 "budget again)."
             )
-    latest_reply = _latest_user_reply(message)
+    latest_reply = latest
+
+    # The client named a DIFFERENT figure to the remembered one. This was the gap:
+    # the two branches below only fire when the reply repeats the remembered amount,
+    # so stating a new budget matched nothing, the known_line kept advertising the old
+    # spend, and Jane re-asked — offering the past figure back. Live-confirmed on
+    # 2026-08-26: remembered ₦10,000, client said "budget 20000", Jane asked again.
+    stated = stated_now
+    if stated and stated != known_budget:
+        return (
+            f"\n\nIMPORTANT: the client's latest reply above states ₦{stated:,.0f} for THIS "
+            f"campaign. That REPLACES the remembered ₦{known_budget:,.0f} — do not offer the "
+            f"old figure back. Set budget_ngn to {int(stated)} and move on to whatever's next "
+            "(not budget again)."
+        )
+
     if str(int(known_budget)) in latest_reply.replace(",", ""):
         return (
             f"\n\nIMPORTANT: the client's latest reply above states ₦{known_budget:,.0f} "

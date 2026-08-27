@@ -45,11 +45,51 @@ async def run(path: str, dry_run: bool) -> int:
     return 1 if report.errors else 0
 
 
+
+async def watch(path: str, dry_run: bool, interval: float) -> int:
+    """Re-import on every save, so seeding in the workbook lands in the corpus without
+    anyone remembering to run the importer.
+
+    Safe to leave running: the import upserts on (strategy_id, version), so a
+    re-import is idempotent — it updates drafts in place and never duplicates. It
+    also cannot approve anything (the store refuses), so a sheet edit can add and
+    revise records but never push one live on its own.
+    """
+    import os
+
+    print(f"Watching {path} — re-imports on change, Ctrl-C to stop.")
+    last = None
+    while True:
+        try:
+            stamp = os.path.getmtime(path)
+        except OSError as e:
+            print(f"  cannot stat {path}: {e}", flush=True)
+            await asyncio.sleep(interval)
+            continue
+        if stamp != last:
+            if last is not None:
+                print(f"\n[{_clock()}] change detected", flush=True)
+            await run(path, dry_run)
+            last = stamp
+        await asyncio.sleep(interval)
+
+
+def _clock() -> str:
+    from datetime import datetime
+    return datetime.now().strftime("%H:%M:%S")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Ingest the ad strategy corpus workbook.")
     ap.add_argument("path", help="Path to URI_Ad_Strategy_Corpus_Seed_v1.xlsx")
     ap.add_argument("--dry-run", action="store_true", help="Validate without writing")
+    ap.add_argument("--watch", action="store_true",
+                    help="Re-import whenever the workbook changes on disk")
+    ap.add_argument("--interval", type=float, default=5.0,
+                    help="Seconds between change checks when --watch is set")
     args = ap.parse_args()
+    if args.watch:
+        sys.exit(asyncio.run(watch(args.path, args.dry_run, args.interval)))
     sys.exit(asyncio.run(run(args.path, args.dry_run)))
 
 
