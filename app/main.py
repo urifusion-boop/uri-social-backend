@@ -245,13 +245,14 @@ app.include_router(canvas_editor_router, prefix="/social-media", tags=["Canvas E
 app.include_router(jane_router, prefix="/social-media", tags=["Jane's First Message"])
 
 # Include Agency Accounts (agency layer wrapping Jane) — agency_router already
-# declares its own prefix="/agency" internally; mounting it again with prefix=
-# "/social-media" here double-prefixed every agency endpoint to
-# /social-media/agency/... (live-confirmed: POST /agency 404s on staging, where
-# this bug is deployed — the frontend calls plain /agency, matching the
-# router's own declared prefix). Broken since the Agency Accounts feature was
-# first added (3be9874b, 2026-06-11).
-app.include_router(agency_router, tags=["Agency"])
+# declares its own prefix="/agency" internally, but the frontend's Agency route
+# constants live in the /social-media-prefixed route file (socialMediaAgentRoutes.ts,
+# via RouteHelper.createRoutes(URI_INSIGHTS_PATH, ...)), so the frontend has always
+# actually called /social-media/agency/... A prior fix (05ab69e) removed this prefix
+# believing the frontend called plain /agency — it never did, so that "fix" broke
+# what had been working and mismatched. Restoring the /social-media prefix here so
+# backend and frontend agree again.
+app.include_router(agency_router, prefix="/social-media", tags=["Agency"])
 
 # Include Jane + Ads (decision-engine demo UI at /jane-ads/demo)
 from app.agents.jane_ads.router import router as jane_ads_router
