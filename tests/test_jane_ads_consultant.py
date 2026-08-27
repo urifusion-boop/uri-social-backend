@@ -241,8 +241,15 @@ def test_enforce_leaves_an_ask_stage_untouched():
 # identical budget question anyway, even though _budget_grounded would have accepted
 # that exact same restatement had the model just said "ready".
 
-def test_no_note_without_a_remembered_budget():
-    assert _build_budget_confirmation_note(None, "10000, ikeja", []) == ""
+def test_stated_budget_is_accepted_without_a_remembered_one():
+    """Superseded 2026-08-26. This asserted no note on a fresh thread, which is what
+    let Jane re-ask a budget the client had just typed — live-observed: "Budget 20000
+    for this campaign" answered with "can you confirm if this budget is still
+    accurate". A stated figure is now told to the model plainly whether or not a
+    remembered one exists; silence is reserved for when nothing was stated."""
+    note = _build_budget_confirmation_note(None, "10000, ikeja", [])
+    assert "10,000" in note and "do not ask them to confirm" in note
+    assert _build_budget_confirmation_note(None, "ikeja", []) == ""
 
 
 def test_note_fires_on_bare_affirmative_to_janes_own_proposal():
