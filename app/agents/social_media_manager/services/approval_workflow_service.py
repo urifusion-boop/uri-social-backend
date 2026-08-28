@@ -1303,6 +1303,16 @@ class ApprovalWorkflowService:
                 return {"success": False, "error": "Instagram direct connection is missing credentials. Please reconnect Facebook."}
 
             post_type = draft.get("post_type", "feed")
+            # A draft can carry a video without post_type having been explicitly
+            # set to "reel" — e.g. uploaded content defaults to "feed" even when
+            # a video was uploaded. The frontend already treats any draft with a
+            # video_url as a Reel (DraftCard's isReel: post_type === 'reel' ||
+            # !!draft.video_url); mirror that here so publishing doesn't fall
+            # through to the image-only feed path and demand an image for
+            # content that's actually a video. Carousel/story are untouched — a
+            # video can't be a carousel slide or classic story image here.
+            if post_type not in ("carousel", "story") and draft.get("video_url"):
+                post_type = "reel"
 
             if post_type == "carousel":
                 slides = draft.get("slides", [])
