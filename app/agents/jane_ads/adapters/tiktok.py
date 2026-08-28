@@ -113,7 +113,7 @@ class TikTokAdsAdapter(AdPlatformAdapter):
         self._db = db
         self._advertiser_id = advertiser_id
         self._access_token = access_token
-        self._api_base = f"https://business-api.tiktok.com/open_api/{settings.TIKTOK_ADS_API_VERSION}"
+        self._api_base = f"{settings.TIKTOK_ADS_API_BASE}/open_api/{settings.TIKTOK_ADS_API_VERSION}"
         if not self._advertiser_id:
             raise TikTokAdsAPIError("advertiser_id is required")
         if not self._access_token:

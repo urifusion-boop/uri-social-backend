@@ -128,6 +128,14 @@ class Settings(BaseSettings):
     TIKTOK_ADS_ADVERTISER_ID: str = ""
     TIKTOK_ADS_ACCESS_TOKEN: str = ""
     TIKTOK_ADS_API_VERSION: str = "v1.3"
+    # Confirmed live (2026-08-26) against a Sandbox Ad Account: sandbox tokens
+    # 401/permission-error against the production host below and only work
+    # against sandbox-ads.tiktok.com — a real host split TikTok doesn't
+    # document clearly. Override to "https://sandbox-ads.tiktok.com" in
+    # .env.staging while testing against a Sandbox Ad Account; leave unset
+    # (production default) once TIKTOK_ADS_ADVERTISER_ID is a real, funded
+    # account.
+    TIKTOK_ADS_API_BASE: str = "https://business-api.tiktok.com"
 
     # TikTok Login Kit + Content Posting API — the "urisocial" app's own
     # credentials, distinct from TIKTOK_ADS_* above (a separate TikTok product/
