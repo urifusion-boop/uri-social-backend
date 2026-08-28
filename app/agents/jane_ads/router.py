@@ -13,7 +13,9 @@ from __future__ import annotations
 import re
 from typing import Optional
 
-from fastapi import APIRouter, Body, Depends, File, HTTPException, Request, UploadFile
+from fastapi import (
+    APIRouter, Body, Depends, File, HTTPException, Query, Request, UploadFile,
+)
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from pydantic import BaseModel, Field
@@ -3220,3 +3222,186 @@ async function pickDraft(){
 }
 </script>
 </body></html>"""
+
+
+# ── Corpus upload (standalone admin page) ────────────────────────────────────
+# A page of its own rather than a screen inside the app: the people who maintain
+# the strategy workbook are not the people using Jane, and the seeding workflow is
+# "export the sheet, drop it here" — nothing else in the product.
+
+@router.post("/corpus/upload")
+async def corpus_upload(
+    file: UploadFile = File(...),
+    dry_run: bool = Query(False, description="Validate without writing"),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+) -> dict:
+    """Ingest an uploaded strategy workbook.
+
+    Idempotent: the import upserts on (strategy_id, version), so re-uploading the
+    same sheet updates in place and never duplicates. It also cannot approve —
+    IngestionCannotApprove fires on any row marked Approved — so a sheet edit can
+    add and revise records but never push one live on its own.
+    """
+    import os
+    import tempfile
+
+    from .corpus import import_rows, read_records_sheet
+    from .store import InMemoryStrategyStore, MongoStrategyStore
+
+    _require_ads_admin(token)
+
+    name = (file.filename or "").lower()
+    if not name.endswith((".xlsx", ".xlsm")):
+        raise HTTPException(status_code=400, detail="Upload the .xlsx workbook itself.")
+
+    payload = await file.read()
+    if not payload:
+        raise HTTPException(status_code=400, detail="That file is empty.")
+
+    tmp_path = ""
+    try:
+        fd, tmp_path = tempfile.mkstemp(suffix=".xlsx")
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(payload)
+        try:
+            rows = read_records_sheet(tmp_path)
+        except Exception as e:                       # noqa: BLE001 — a bad sheet is a 400
+            raise HTTPException(status_code=400, detail=f"Could not read that workbook: {e}")
+
+        store = MongoStrategyStore(db)
+        if not dry_run:
+            await store.ensure_indexes()
+        report = await import_rows(rows, store if not dry_run else InMemoryStrategyStore())
+        return {
+            "status": True,
+            "responseMessage": report.summary(),
+            "responseData": {
+                "dry_run": dry_run,
+                "rows_read": report.total_seen,
+                "imported": report.imported,
+                "skipped_examples": report.skipped_examples,
+                "rejected": [
+                    {"row": e.row, "strategy_id": e.strategy_id, "reason": e.reason}
+                    for e in report.errors
+                ],
+                "corpus_size": (await store.count()) if not dry_run else None,
+            },
+        }
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+@router.get("/corpus/upload", response_class=HTMLResponse, include_in_schema=False)
+async def corpus_upload_page() -> str:
+    """The page itself. Self-contained — no build step, no bundle, nothing to deploy
+    beyond this file. Auth is the caller's own token, pasted once and kept in
+    localStorage, because this sits outside the app's session."""
+    return _CORPUS_UPLOAD_HTML
+
+
+_CORPUS_UPLOAD_HTML = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ad Strategy Corpus — Upload</title>
+<style>
+  :root { --ink:#1a0a12; --pink:#C2185B; --line:#e6e2df; --muted:#7a7a7a; --bg:#faf8f7; }
+  * { box-sizing:border-box }
+  body { margin:0; padding:32px 20px; background:var(--bg); color:var(--ink);
+         font:15px/1.6 Urbanist,-apple-system,Segoe UI,Roboto,sans-serif }
+  main { max-width:640px; margin:0 auto }
+  h1 { font-size:22px; font-weight:800; margin:0 0 4px }
+  p.sub { color:var(--muted); margin:0 0 28px }
+  .card { background:#fff; border:1px solid var(--line); border-radius:14px; padding:22px; margin-bottom:16px }
+  label { display:block; font-weight:700; font-size:13px; margin-bottom:6px }
+  input[type=password], input[type=file] { width:100%; padding:10px 12px; border:1px solid var(--line);
+         border-radius:9px; font:inherit; background:#fff }
+  .row { margin-bottom:16px }
+  .check { display:flex; align-items:center; gap:8px; font-size:14px; color:var(--muted) }
+  button { width:100%; padding:12px; border:none; border-radius:10px; background:var(--pink);
+           color:#fff; font:inherit; font-weight:700; cursor:pointer }
+  button:disabled { background:#d9c3cd; cursor:default }
+  .out { display:none; margin-top:16px; padding:16px; border-radius:10px; font-size:14px }
+  .ok { background:#eaf7ee; border:1px solid #bfe3c9 }
+  .bad { background:#fdecea; border:1px solid #f5c4bf }
+  .stat { display:flex; gap:22px; margin:10px 0 4px; flex-wrap:wrap }
+  .stat b { display:block; font-size:19px }
+  .stat span { color:var(--muted); font-size:12px }
+  table { width:100%; border-collapse:collapse; margin-top:10px; font-size:13px }
+  td, th { text-align:left; padding:5px 6px; border-bottom:1px solid var(--line); vertical-align:top }
+  .note { color:var(--muted); font-size:12.5px; line-height:1.6 }
+</style></head><body><main>
+  <h1>Ad Strategy Corpus</h1>
+  <p class="sub">Upload the workbook. Records are added and updated; nothing goes live on its own.</p>
+
+  <div class="card">
+    <div class="row">
+      <label for="tok">Access token</label>
+      <input id="tok" type="password" placeholder="Paste your token" autocomplete="off">
+    </div>
+    <div class="row">
+      <label for="f">Workbook (.xlsx)</label>
+      <input id="f" type="file" accept=".xlsx,.xlsm">
+    </div>
+    <div class="row check">
+      <input id="dry" type="checkbox" checked>
+      <label for="dry" style="margin:0;font-weight:400">Dry run — check it first, write nothing</label>
+    </div>
+    <button id="go">Upload</button>
+    <div id="out" class="out"></div>
+  </div>
+
+  <p class="note">
+    Re-uploading the same sheet is safe — records match on ID and version, so they update
+    in place rather than duplicating. Rows marked <b>Approved</b> in the sheet are refused:
+    approval is a separate human step, and an upload can never push a record live.
+    <b>EXAMPLE</b> rows are skipped. Any row missing a mandatory field is rejected and
+    listed below with its row number, so it can be fixed in the sheet.
+  </p>
+
+<script>
+const $ = id => document.getElementById(id);
+$("tok").value = localStorage.getItem("corpus_token") || "";
+
+$("go").onclick = async () => {
+  const tok = $("tok").value.trim(), file = $("f").files[0], out = $("out");
+  out.style.display = "block";
+  if (!tok || !file) { out.className = "out bad"; out.textContent = "Token and file are both needed."; return; }
+  localStorage.setItem("corpus_token", tok);
+
+  $("go").disabled = true; $("go").textContent = "Working\u2026";
+  out.className = "out"; out.textContent = "Reading the workbook\u2026";
+  try {
+    const fd = new FormData(); fd.append("file", file);
+    const r = await fetch("/jane-ads/corpus/upload?dry_run=" + $("dry").checked,
+                          { method:"POST", headers:{ Authorization:"Bearer " + tok }, body: fd });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      out.className = "out bad";
+      out.textContent = j.detail || ("Upload failed (" + r.status + ")");
+      return;
+    }
+    const d = j.responseData || {};
+    out.className = "out ok";
+    out.innerHTML =
+      "<b>" + (d.dry_run ? "Dry run \u2014 nothing written" : "Imported") + "</b>" +
+      '<div class="stat">' +
+        "<div><b>" + d.rows_read + "</b><span>rows read</span></div>" +
+        "<div><b>" + d.imported + "</b><span>imported</span></div>" +
+        "<div><b>" + d.skipped_examples + "</b><span>examples skipped</span></div>" +
+        "<div><b>" + (d.rejected || []).length + "</b><span>rejected</span></div>" +
+        (d.corpus_size != null ? "<div><b>" + d.corpus_size + "</b><span>in corpus</span></div>" : "") +
+      "</div>" +
+      ((d.rejected || []).length
+        ? "<table><tr><th>Row</th><th>ID</th><th>Why it was rejected</th></tr>" +
+          d.rejected.map(e => "<tr><td>" + e.row + "</td><td>" + e.strategy_id +
+                              "</td><td>" + e.reason + "</td></tr>").join("") + "</table>"
+        : "");
+  } catch (e) {
+    out.className = "out bad"; out.textContent = "Could not reach the server: " + e.message;
+  } finally {
+    $("go").disabled = false; $("go").textContent = "Upload";
+  }
+};
+</script></main></body></html>"""

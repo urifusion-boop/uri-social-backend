@@ -306,3 +306,53 @@ class TestNairaShorthand:
         from app.agents.jane_ads.nl import parse_ngn
         for v in ("abc", "", None, "twenty thousand"):
             assert parse_ngn(v) is None
+
+
+class TestCorpusUploadEndpoint:
+    """Standalone admin page for seeding — the people who maintain the workbook are
+    not the people using Jane, so it lives on its own route rather than inside the
+    app. Writes to production corpus data, so it is gated on the same admin
+    allowlist as the billing report."""
+
+    def _routes(self):
+        from app.agents.jane_ads.router import router
+        return {getattr(r, "path", "") for r in router.routes}
+
+    def test_both_routes_exist(self):
+        assert "/jane-ads/corpus/upload" in self._routes()
+
+    def test_upload_requires_an_admin(self):
+        import inspect
+        from app.agents.jane_ads.router import corpus_upload
+        src = inspect.getsource(corpus_upload)
+        assert "_require_ads_admin(token)" in src
+
+    def test_only_workbooks_are_accepted(self):
+        import inspect
+        from app.agents.jane_ads.router import corpus_upload
+        src = inspect.getsource(corpus_upload)
+        assert '(".xlsx", ".xlsm")' in src
+
+    def test_dry_run_never_touches_the_real_store(self):
+        import inspect
+        from app.agents.jane_ads.router import corpus_upload
+        src = inspect.getsource(corpus_upload)
+        assert "InMemoryStrategyStore()" in src
+        assert "if not dry_run:" in src
+
+    def test_temp_file_is_always_cleaned_up(self):
+        import inspect
+        from app.agents.jane_ads.router import corpus_upload
+        src = inspect.getsource(corpus_upload)
+        assert "finally:" in src and "os.unlink(tmp_path)" in src
+
+    def test_page_is_self_contained(self):
+        """No bundle, no build step — it has to survive a backend-only deploy."""
+        from app.agents.jane_ads.router import _CORPUS_UPLOAD_HTML as h
+        assert "<script>" in h and "<style>" in h
+        assert "src=" not in h and "cdn" not in h.lower()
+
+    def test_page_posts_to_the_upload_endpoint(self):
+        from app.agents.jane_ads.router import _CORPUS_UPLOAD_HTML as h
+        assert "/jane-ads/corpus/upload?dry_run=" in h
+        assert "Bearer " in h
