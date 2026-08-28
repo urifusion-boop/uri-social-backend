@@ -3246,10 +3246,21 @@ async def corpus_upload(
     import os
     import tempfile
 
+    from app.core.config import settings
+
     from .corpus import import_rows, read_records_sheet
     from .store import InMemoryStrategyStore, MongoStrategyStore
 
-    _require_ads_admin(token)
+    # Same allowlist as the billing report, but its wording ("not authorized for the
+    # billing report") makes no sense here — say what actually happened.
+    if not (settings.JANE_ADS_ADMIN_EMAILS or "").strip():
+        raise HTTPException(status_code=503, detail="Corpus upload is not configured.")
+    if not _is_ads_admin(token):
+        raise HTTPException(
+            status_code=403,
+            detail="That account can't upload the corpus. Ask for it to be added to the "
+                   "corpus admin list.",
+        )
 
     name = (file.filename or "").lower()
     if not name.endswith((".xlsx", ".xlsm")):
@@ -3333,12 +3344,18 @@ _CORPUS_UPLOAD_HTML = """<!doctype html>
   .note { color:var(--muted); font-size:12.5px; line-height:1.6 }
 </style></head><body><main>
   <h1>Ad Strategy Corpus</h1>
-  <p class="sub">Upload the workbook. Records are added and updated; nothing goes live on its own.</p>
+  <p class="sub">Sign in, choose the workbook, upload. Records are added and updated;
+     nothing goes live on its own.</p>
 
   <div class="card">
     <div class="row">
-      <label for="tok">Access token</label>
-      <input id="tok" type="password" placeholder="Paste your token" autocomplete="off">
+      <label for="em">Email</label>
+      <input id="em" type="email" placeholder="you@urisocial.com" autocomplete="username">
+    </div>
+    <div class="row">
+      <label for="pw">Password</label>
+      <input id="pw" type="password" placeholder="Your URI Social password"
+             autocomplete="current-password">
     </div>
     <div class="row">
       <label for="f">Workbook (.xlsx)</label>
@@ -3362,17 +3379,34 @@ _CORPUS_UPLOAD_HTML = """<!doctype html>
 
 <script>
 const $ = id => document.getElementById(id);
-$("tok").value = localStorage.getItem("corpus_token") || "";
+// Email is remembered so it need only be typed once. The password never is.
+$("em").value = localStorage.getItem("corpus_email") || "";
+
+async function signIn(email, password) {
+  const r = await fetch("/auth/login", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password }),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.detail || "That email and password did not work.");
+  const rd = j.responseData || {};
+  const tok = (rd.tokens || {}).accessToken || rd.accessToken;
+  if (!tok) throw new Error("Signed in, but no access token came back.");
+  return tok;
+}
 
 $("go").onclick = async () => {
-  const tok = $("tok").value.trim(), file = $("f").files[0], out = $("out");
+  const email = $("em").value.trim(), pw = $("pw").value, file = $("f").files[0], out = $("out");
   out.style.display = "block";
-  if (!tok || !file) { out.className = "out bad"; out.textContent = "Token and file are both needed."; return; }
-  localStorage.setItem("corpus_token", tok);
+  if (!email || !pw) { out.className = "out bad"; out.textContent = "Email and password are both needed."; return; }
+  if (!file) { out.className = "out bad"; out.textContent = "Choose the workbook file first."; return; }
+  localStorage.setItem("corpus_email", email);
 
   $("go").disabled = true; $("go").textContent = "Working\u2026";
-  out.className = "out"; out.textContent = "Reading the workbook\u2026";
+  out.className = "out"; out.textContent = "Signing in\u2026";
   try {
+    const tok = await signIn(email, pw);
+    out.textContent = "Reading the workbook\u2026";
     const fd = new FormData(); fd.append("file", file);
     const r = await fetch("/jane-ads/corpus/upload?dry_run=" + $("dry").checked,
                           { method:"POST", headers:{ Authorization:"Bearer " + tok }, body: fd });

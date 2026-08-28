@@ -322,10 +322,14 @@ class TestCorpusUploadEndpoint:
         assert "/jane-ads/corpus/upload" in self._routes()
 
     def test_upload_requires_an_admin(self):
+        """Same allowlist as the billing report, inlined so the refusal can be worded
+        for this page rather than saying "not authorized for the billing report"."""
         import inspect
         from app.agents.jane_ads.router import corpus_upload
         src = inspect.getsource(corpus_upload)
-        assert "_require_ads_admin(token)" in src
+        assert "_is_ads_admin(token)" in src
+        assert "JANE_ADS_ADMIN_EMAILS" in src
+        assert "status_code=403" in src
 
     def test_only_workbooks_are_accepted(self):
         import inspect
@@ -356,3 +360,29 @@ class TestCorpusUploadEndpoint:
         from app.agents.jane_ads.router import _CORPUS_UPLOAD_HTML as h
         assert "/jane-ads/corpus/upload?dry_run=" in h
         assert "Bearer " in h
+
+    def test_page_signs_in_with_email_and_password(self):
+        """Non-technical users maintain the workbook — asking them to dig an access
+        token out of devtools was never going to work."""
+        from app.agents.jane_ads.router import _CORPUS_UPLOAD_HTML as h
+        assert 'id="em"' in h and 'id="pw"' in h
+        assert '"/auth/login"' in h
+        assert 'type="password"' in h
+
+    def test_password_is_never_stored(self):
+        """Email is remembered for convenience; the password must not be."""
+        from app.agents.jane_ads.router import _CORPUS_UPLOAD_HTML as h
+        assert "corpus_email" in h
+        assert "corpus_password" not in h
+        assert 'localStorage.setItem("corpus_email"' in h
+
+    def test_permission_error_reads_sensibly_here(self):
+        """The shared gate says "not authorized for the billing report", which is
+        nonsense on an upload page."""
+        import inspect
+        from app.agents.jane_ads.router import corpus_upload
+        src = inspect.getsource(corpus_upload)
+        assert "can't upload the corpus" in src
+        assert "Corpus upload is not configured." in src
+        # the shared helper's wording must not be what the user sees
+        assert "Not authorized for the billing report" not in src
