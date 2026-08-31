@@ -34,6 +34,15 @@ class Settings(BaseSettings):
     # the ads page-connect flow still runs and stores the page token; only the
     # final "grant URI's Business Manager ADVERTISE access" step is skipped.
     META_BUSINESS_MANAGER_ID: str = ""
+    # The BM system user that actually creates the ads. Sharing a client's Page with
+    # the business is NOT enough — a system user does not inherit Page access from
+    # the business, so each Page must also be assigned to this user or ad-creative
+    # creation fails with "Missing Page permission ... Advertiser role or higher".
+    # Must be the APP-SCOPED id (what GET /me returns using the system user's own
+    # token), not the business-scoped id shown in Business Settings > Users > System
+    # users — /{page}/assigned_users rejects the latter with "(#100) Param user does
+    # not accept global user IDs. Pass an app-scoped ID instead."
+    META_ADS_SYSTEM_USER_ID: str = ""
     # Numeric id only, no "act_" prefix (the Marketing API adds that itself).
     META_AD_ACCOUNT_ID: str = ""
     # Working credential for real ad-account calls. A long-lived USER access token
