@@ -194,6 +194,14 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                         "advertiser_id": self._advertiser_id,
                         "campaign_id": campaign_id,
                         "adgroup_name": f"JaneAds-{plan.business_id}-adgroup",
+                        # Required by TikTok for every ad group — confirmed live
+                        # (2026-08-31): omitting it fails with "Invalid value for
+                        # promotion_type" rather than defaulting to anything. The
+                        # destination is an external URL (wa.me), matching the
+                        # campaign's own TRAFFIC objective_type above, so this is
+                        # "WEBSITE" — not TikTok's native in-app messaging type,
+                        # since we're not using their Click-to-Message integration.
+                        "promotion_type": "WEBSITE",
                         "placement_type": "PLACEMENT_TYPE_NORMAL",
                         "placements": ["PLACEMENT_TIKTOK"],
                         "location_ids": [_NIGERIA_LOCATION_ID],
@@ -275,7 +283,17 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                         "operation_status": "DELETE",
                     },
                 )
-                data = resp.json()
+                # A non-JSON/empty body (seen live: httpx's .json() raising
+                # "Expecting value: line 1 column 1") means something failed
+                # before TikTok's own JSON envelope ever got written — surface
+                # the raw status/text instead of a cryptic decode error, since
+                # this path is diagnostic-only and never re-raises anyway.
+                try:
+                    data = resp.json()
+                except ValueError:
+                    print(f"[TikTokAdsAdapter] ORPHANED campaign {campaign_id} — "
+                          f"rollback got a non-JSON response: HTTP {resp.status_code} {resp.text[:300]!r}", flush=True)
+                    return
                 if data.get("code") not in (0, None):
                     print(f"[TikTokAdsAdapter] ORPHANED campaign {campaign_id} — "
                           f"rollback rejected: {data.get('message')}", flush=True)
