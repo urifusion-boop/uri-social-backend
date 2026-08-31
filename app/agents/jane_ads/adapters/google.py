@@ -17,8 +17,9 @@ volume exists yet to train automated bidding), no Display network, no Performanc
 Every campaign is created PAUSED, never ACTIVE — same hard product rule as Meta; a
 human reviews and activates in Google Ads UI.
 
-Destination is always a wa.me link (reusing whatsapp.py, already platform-agnostic —
-confirmed no Meta imports). Call extensions and Lead form extensions are explicitly
+Destination is whatever the brand chose (destination.py: their WhatsApp chat, their
+website, or their Instagram DMs) — all three resolve to one plain link, which is all
+a Search ad's finalUrls needs. Call extensions and Lead form extensions are explicitly
 out of scope for this phase — lead forms in particular carry real personal-data
 handling obligations (deliver immediately to WhatsApp, never retain) that are a
 meaningfully separate scope, not a default to build casually.
@@ -35,6 +36,7 @@ import openai
 
 from app.core.config import settings
 from .base import AdPlatformAdapter
+from ..destination import link_for_plan
 from ..models import (
     CampaignPlan,
     ConversationDelivered,
@@ -256,8 +258,12 @@ class GoogleAdsAdapter(AdPlatformAdapter):
         google_plans = [p for p in plan.platforms if p.platform == Platform.GOOGLE]
         if not google_plans:
             raise ValueError("GoogleAdsAdapter only handles Platform.GOOGLE plans")
-        if not plan.whatsapp_number:
-            raise ValueError("CampaignPlan.whatsapp_number is required — Google Search ads route to wa.me")
+        dest_link = link_for_plan(plan).link
+        if not dest_link:
+            raise ValueError(
+                f"CampaignPlan has no usable destination link for destination_type="
+                f"'{plan.destination_type}' — a Search ad needs a final URL"
+            )
         # Deliberately NO check on plan.page_id (Meta-only concept) and NO check on
         # plan.creative — CreativeKind.NONE means a Search campaign needs no image;
         # Meta hard-requires plan.creative.image_url, Google does not (see the
@@ -286,8 +292,6 @@ class GoogleAdsAdapter(AdPlatformAdapter):
         clicks_per_day = estimate_clicks_per_day(daily_budget_ngn, estimated_cpc_ngn)
         if clicks_per_day < _MIN_USEFUL_CLICKS_PER_DAY:
             raise LowClicksWarning(daily_budget_ngn, estimated_cpc_ngn, clicks_per_day)
-
-        wa_link = f"https://wa.me/{plan.whatsapp_number}"
 
         campaign_resource_name = ""
         budget_resource_name = ""
@@ -401,7 +405,7 @@ class GoogleAdsAdapter(AdPlatformAdapter):
                         "adGroup": ad_group_resource_name,
                         "status": "PAUSED",
                         "ad": {
-                            "finalUrls": [wa_link],
+                            "finalUrls": [dest_link],
                             "responsiveSearchAd": {
                                 "headlines": [{"text": h[:30]} for h in headlines],
                                 "descriptions": [{"text": d[:90]} for d in descriptions],

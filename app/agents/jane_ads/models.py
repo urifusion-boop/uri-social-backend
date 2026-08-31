@@ -181,7 +181,20 @@ class CampaignPlan(BaseModel):
     whatsapp_number: str = ""               # the brand's own WhatsApp number (digits, country-
                                              # coded) leads route to — the ad links to
                                              # wa.me/<this>, so chats reach the brand directly
-                                             # instead of the shared Page's inbox
+                                             # instead of the shared Page's inbox. Only
+                                             # meaningful when destination_type == "whatsapp".
+    destination_type: str = "whatsapp"      # where the tap goes: whatsapp | website |
+                                             # instagram_dm (destination.DestinationType).
+                                             # Defaults to whatsapp so every plan built
+                                             # before this field existed behaves as before.
+    destination_link: str = ""              # the ACTUAL resolved https link the adapters put
+                                             # on the ad (wa.me/…, the site, ig.me/m/…, or
+                                             # whatever URL the user pasted), frozen at
+                                             # plan-build time like whatsapp_number
+    destination_cta: str = ""               # which button the user picked, as a key into
+                                             # destination.CTA_CHOICES ("shop_now", "book_now",
+                                             # …). Ignored for a WhatsApp destination, which
+                                             # uses Meta's own native button.
     creative: Optional["AdCreative"] = None # the actual ad (image/video + copy) from creative.py —
                                              # Meta rejects link-ad creation with no real media
                                              # attached, so the real adapter needs this, not just
