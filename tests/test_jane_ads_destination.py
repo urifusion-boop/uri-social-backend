@@ -98,9 +98,21 @@ def test_unknown_type_falls_back_to_whatsapp():
     assert coerce_type("WEBSITE") is DestinationType.WEBSITE
 
 
-def test_each_destination_has_its_own_default_button_and_image_wording():
-    assert len({cta_label(d) for d in DestinationType}) == len(DestinationType)
+def test_each_destination_has_its_own_image_wording():
+    # The IMAGE wording is ours to write, so it stays distinct per destination.
     assert len({image_cta(d) for d in DestinationType}) == len(DestinationType)
+
+
+def test_button_labels_are_only_ever_what_meta_renders():
+    # Superseded 2026-08-31: this used to require a DISTINCT label per destination,
+    # which is what let the WhatsApp label drift. Meta renders one of a fixed set of
+    # buttons, and two destinations can legitimately land on the same one — the label
+    # must match the ad, not be unique. Live-confirmed on ad 52561318289410: the
+    # preview said "Send WhatsApp Message", the ad said "Contact Us".
+    pairs = set(CTA_CHOICES.values())
+    for d in DestinationType:
+        meta_type = meta_cta(d, "https://x.com", False)["type"]
+        assert (cta_label(d), meta_type) in pairs
 
 
 # ── Meta's call_to_action ─────────────────────────────────────────────────────
@@ -127,8 +139,12 @@ def test_whatsapp_video_ad_carries_the_wa_link_on_the_cta():
 @pytest.mark.parametrize("dest", [DestinationType.WEBSITE, DestinationType.INSTAGRAM_DM])
 @pytest.mark.parametrize("is_video", [False, True])
 def test_non_whatsapp_destinations_are_plain_link_ctas(dest, is_video):
+    # INSTAGRAM_DM defaults to CONTACT_US, not LEARN_MORE: its old default key
+    # "send_message" was labelled "Send Message" but mapped to LEARN_MORE, so the ad's
+    # button read "Learn More". Meta has no generic send-message CTA on a link ad.
+    expected = "CONTACT_US" if dest is DestinationType.INSTAGRAM_DM else "LEARN_MORE"
     assert meta_cta(dest, "https://x.com", is_video) == {
-        "type": "LEARN_MORE", "value": {"link": "https://x.com"}
+        "type": expected, "value": {"link": "https://x.com"}
     }
 
 
@@ -189,10 +205,14 @@ def test_chosen_button_drives_both_the_label_and_metas_cta_type():
     assert meta_cta(DestinationType.CUSTOM, "https://x.com", False, "shop_now")["type"] == "SHOP_NOW"
 
 
-def test_whatsapp_label_stays_ours_while_the_button_honours_the_choice():
-    # The label the client sees in our UI is still WhatsApp-specific...
-    assert cta_label(DestinationType.WHATSAPP, "shop_now") == "Send WhatsApp Message"
-    # ...but Meta now gets a real, link-carrying CTA rather than its native WhatsApp
+def test_whatsapp_label_tracks_the_button_the_ad_will_actually_show():
+    # Was: the label stayed "Send WhatsApp Message" whatever the choice. That was a
+    # leftover from Meta's native WhatsApp button and became a lie once the ad started
+    # shipping a plain link CTA — the preview promised one button, the ad showed
+    # another. Now the label is read off the same row as the Meta type.
+    assert cta_label(DestinationType.WHATSAPP, "shop_now") == "Shop Now"
+    assert cta_label(DestinationType.WHATSAPP) == "Contact Us"
+    # Meta gets a real, link-carrying CTA rather than its native WhatsApp
     # button, which would not deliver without the Page being linked.
     assert meta_cta(DestinationType.WHATSAPP, "https://wa.me/234", False, "shop_now") == {
         "type": "SHOP_NOW", "value": {"link": "https://wa.me/234"}
@@ -201,7 +221,10 @@ def test_whatsapp_label_stays_ours_while_the_button_honours_the_choice():
 
 def test_unknown_button_falls_back_per_destination_never_to_something_meta_rejects():
     assert coerce_cta("make_it_pop", DestinationType.CUSTOM) == "learn_more"
-    assert coerce_cta("", DestinationType.INSTAGRAM_DM) == "send_message"
+    assert coerce_cta("", DestinationType.INSTAGRAM_DM) == "contact_us"
+    # A destination stored before "send_message" was removed coerces to the default
+    # rather than raising or reaching a key that no longer exists.
+    assert coerce_cta("send_message", DestinationType.INSTAGRAM_DM) == "contact_us"
     assert coerce_cta("SHOP_NOW", DestinationType.WEBSITE) == "shop_now"
 
 
@@ -232,12 +255,12 @@ def test_picker_offers_exactly_the_destination_types_that_exist():
     assert {o["value"] for o in DESTINATION_OPTIONS} == {d.value for d in DestinationType}
 
 
-def test_only_whatsapp_hides_the_button_picker():
-    # Meta renders its own WhatsApp button, so offering a choice there would be a lie.
+def test_every_destination_offers_the_button_picker():
+    # Was: WhatsApp hid the picker, because Meta rendered its own native button there.
+    # It ships a plain link ad now, so its button is as chooseable as any other's and
+    # hiding the picker would just make it unchangeable.
     from app.agents.jane_ads.destination import DESTINATION_OPTIONS
-    takes_cta = {o["value"]: o["takes_cta"] for o in DESTINATION_OPTIONS}
-    assert takes_cta[DestinationType.WHATSAPP.value] is False
-    assert all(v for k, v in takes_cta.items() if k != DestinationType.WHATSAPP.value)
+    assert all(o["takes_cta"] for o in DESTINATION_OPTIONS)
 
 
 def test_options_carry_the_copy_a_picker_needs():

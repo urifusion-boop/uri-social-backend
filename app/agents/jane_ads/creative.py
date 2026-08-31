@@ -48,8 +48,6 @@ from .destination import (DEFAULT_DESTINATION, coerce_type, copy_action,
                           copy_action_examples, cta_label, image_cta)
 from .models import AdCopy, AdCreative, CreativeSource, GeoMode, GeoPlan, ShootScript, ShootShot
 
-WHATSAPP_CTA = "Send WhatsApp Message"   # the default destination's button; see
-                                          # destination.py for website/Instagram DM
 
 # Ads are always vertical (CTWA/Stories placements) regardless of which ad platform
 # the campaign ultimately runs on — "instagram"+"story" is the engine's 9:16 spec.
