@@ -227,7 +227,7 @@ def test_launch_campaign_happy_path_full_call_sequence():
 
     ad_json = mock_client.post.call_args_list[5].kwargs["json"]["operations"][0]["create"]
     assert ad_json["status"] == "PAUSED"
-    assert ad_json["ad"]["finalUrls"] == ["https://wa.me/2348031234567"]
+    assert ad_json["ad"]["finalUrls"] == ['https://wa.me/2348031234567?text=Hi%21%20I%20saw%20your%20ad%20and%20I%27m%20interested%20%E2%80%94%20tell%20me%20more%3F']
 
     record = _run(db["jane_ads_google_campaigns"].find_one({"campaign_id": "111"}))
     assert record["ad_id"] == "555"

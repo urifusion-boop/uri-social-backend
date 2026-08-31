@@ -28,8 +28,9 @@ paused-equivalent) — the same hard product rule as Meta and Google: nothing th
 adapter creates is ever live until a human reviews and enables it in TikTok Ads
 Manager.
 
-Destination is always a wa.me link (reusing whatsapp.py via plan.whatsapp_number,
-resolved by the caller before this adapter is constructed) — TikTok's native
+Destination is whatever the brand chose (destination.py: their WhatsApp chat, their
+website, or their Instagram DMs), resolved by the caller before this adapter is
+constructed and carried on plan.destination_link — TikTok's native
 click-to-message/Click-to-WhatsApp availability in Nigeria is an explicitly open
 question in the Master PRD (Part E3); this adapter does not depend on it.
 
@@ -50,6 +51,7 @@ import httpx
 
 from app.core.config import settings
 from .base import AdPlatformAdapter
+from ..destination import link_for_plan
 from ..models import (
     CampaignPlan,
     ConversationDelivered,
@@ -128,8 +130,12 @@ class TikTokAdsAdapter(AdPlatformAdapter):
         tiktok_plans = [p for p in plan.platforms if p.platform == Platform.TIKTOK]
         if not tiktok_plans:
             raise ValueError("TikTokAdsAdapter only handles Platform.TIKTOK plans")
-        if not plan.whatsapp_number:
-            raise ValueError("CampaignPlan.whatsapp_number is required — TikTok ads route to wa.me")
+        dest_link = link_for_plan(plan).link
+        if not dest_link:
+            raise ValueError(
+                f"CampaignPlan has no usable destination link for destination_type="
+                f"'{plan.destination_type}' — a TikTok ad needs a landing page URL"
+            )
         if not plan.creative or not plan.creative.image_url or not plan.creative.is_video:
             # decision_engine.py's video-only gate (PRD C1) means a TikTok plan should
             # never reach here without real video creative — asserted explicitly
@@ -143,7 +149,6 @@ class TikTokAdsAdapter(AdPlatformAdapter):
 
         now = datetime.now(timezone.utc)
         end = now + timedelta(days=days)
-        wa_link = f"https://wa.me/{plan.whatsapp_number}"
 
         campaign_id = ""
         adgroup_id = ""
@@ -211,8 +216,8 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                 _raise_for_error(adgroup_data, "ad group creation")
                 adgroup_id = str(adgroup_data["data"]["adgroup_id"])
 
-                # 4. The ad itself — video creative + copy + the wa.me landing page,
-                # paused.
+                # 4. The ad itself — video creative + copy + the brand's destination
+                # as the landing page, paused.
                 ad_resp = await client.post(
                     f"{self._api_base}/ad/create/",
                     headers=self._headers(),
@@ -223,7 +228,7 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                             "ad_name": f"JaneAds-{plan.business_id}-ad",
                             "ad_text": (plan.creative.primary_text or plan.creative.headline or "")[:100],
                             "video_id": video_id,
-                            "landing_page_url": wa_link,
+                            "landing_page_url": dest_link,
                             "call_to_action": "CONTACT_US",
                         }],
                         "operation_status": "DISABLE",

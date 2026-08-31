@@ -42,13 +42,13 @@ import asyncio
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
-from urllib.parse import quote
 
 import httpx
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from app.core.config import settings
 from .base import AdPlatformAdapter
+from ..destination import link_for_plan
 from ..models import (
     CampaignPlan,
     ConversationDelivered,
@@ -203,24 +203,25 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
             # attached ("Please specify the media to run with this ad"), so this
             # can't fall back to a text-only placeholder.
             raise ValueError("CampaignPlan.creative.image_url is required to launch a real Meta campaign")
-        # A followers/engagement campaign never routes anywhere via WhatsApp — every
-        # other goal does. Without the brand's number there's nowhere for a
-        # Click-to-WhatsApp ad to route to. Blocked here too (the router's
-        # ads_connection gate checks first) so a missing number can never silently
-        # ship a dead-end ad.
+        # A followers/engagement campaign routes nowhere off-platform — every other
+        # goal sends the tap to the brand's chosen destination, so without a usable
+        # one there's nothing for the ad to open. Blocked here too (the router's
+        # ads_connection gate checks first) so a missing destination can never
+        # silently ship a dead-end ad.
         is_followers_goal = plan.goal == Goal.FOLLOWERS
-        if not is_followers_goal and not plan.whatsapp_number:
-            raise ValueError("CampaignPlan.whatsapp_number is required to launch a Click-to-WhatsApp campaign")
-        # The real ad destination for every non-followers goal: a chat with the brand's
-        # own number. normalize_wa_number (whatsapp.py) already stored it digits-only
-        # and country-coded, which is exactly the form wa.me expects. A bare wa.me link
-        # (no ?text=) opens an EMPTY chat with a number the person has never messaged —
-        # live-confirmed: a real campaign got 186 link clicks and zero messages. wa.me's
-        # own `text` param pre-fills the message box (still requires a tap to send, but
-        # removes the "what do I even say" drop-off) — universally supported, no Meta
-        # native WhatsApp linking required.
-        wa_prefill = quote("Hi! I saw your ad and I'm interested — tell me more?")
-        wa_link = f"https://wa.me/{plan.whatsapp_number}?text={wa_prefill}" if plan.whatsapp_number else ""
+        destination = link_for_plan(plan)
+        dest_link = destination.link
+        if not is_followers_goal and not dest_link:
+            raise ValueError(
+                f"CampaignPlan has no usable destination link for destination_type="
+                f"'{destination.type.value}' — the ad would link nowhere"
+            )
+        # The real ad destination for every non-followers goal, resolved above by
+        # destination.link_for_plan: the brand's own WhatsApp chat (wa.me/<number>,
+        # pre-filled — a bare wa.me link opens an EMPTY chat with a stranger's number,
+        # live-confirmed at 186 link clicks and zero messages), their website, or their
+        # Instagram DMs (ig.me/m/<handle>). All three are plain link ads, so none of
+        # them needs Meta's native per-brand messaging linking.
         platform_plan = meta_plans[0]
 
         total_budget_ngn = min(platform_plan.budget_ngn, auth.funded_amount_ngn)
@@ -333,23 +334,15 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                     cta = {"type": "LIKE_PAGE", "value": {"page": plan.page_id}}
                 else:
                     message = plan.creative.primary_text or plan.creative.headline or "Chat with us on WhatsApp!"
-                    # The tap opens a WhatsApp chat with the brand's OWN number through a
-                    # plain wa.me link (see the ad set above for why this is a link ad and
-                    # not Meta's native Click-to-WhatsApp). For photo ads the destination
-                    # is link_data.link itself, so the CTA carries no value at all.
-                    # video_data has no link field of its own (confirmed against Meta's
-                    # AdCreativeVideoData reference — no such field exists), so the
-                    # destination has to ride on the CTA's value.link instead. Live-
-                    # confirmed WHATSAPP_MESSAGE rejects that: "Please remove the 'link'
-                    # parameter from the value of the WhatsApp message Call to Action"
-                    # (code=105, subcode=1815630) — that CTA type only supports a link via
-                    # its own native promoted_object routing, which this system doesn't use.
-                    # LEARN_MORE is a plain link-carrying CTA Meta accepts on video_data;
-                    # the button reads "Learn More" instead of "Send WhatsApp Message" for
-                    # video ads specifically, but the tap still opens the same wa.me chat.
-                    cta = {"type": "WHATSAPP_MESSAGE"}
-                    if plan.creative.is_video and wa_link:
-                        cta = {"type": "LEARN_MORE", "value": {"link": wa_link}}
+                    # The tap opens the brand's chosen destination through a plain link
+                    # (see the ad set above for why this is a link ad and not Meta's
+                    # native Click-to-WhatsApp). For photo ads the destination is
+                    # link_data.link itself; video_data has no link field of its own
+                    # (confirmed against Meta's AdCreativeVideoData reference), so there
+                    # the destination has to ride on the CTA's value.link — which
+                    # WHATSAPP_MESSAGE refuses to carry. destination.meta_cta owns that
+                    # whole choice.
+                    cta = destination.meta_call_to_action(plan.creative.is_video)
                 if plan.creative.is_video:
                     object_story_spec = {
                         "page_id": plan.page_id,
@@ -370,7 +363,7 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                             # there. For every other goal this is the REAL destination:
                             # wa.me/<the brand's number>. It used to be a bare
                             # "https://wa.me/" with no number, which went nowhere.
-                            "link": f"https://www.facebook.com/{plan.page_id}" if is_followers_goal else wa_link,
+                            "link": f"https://www.facebook.com/{plan.page_id}" if is_followers_goal else dest_link,
                             "picture": plan.creative.image_url,
                             "call_to_action": cta,
                         },
