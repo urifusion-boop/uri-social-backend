@@ -278,16 +278,21 @@ def test_destination_is_asked_before_the_creative_is_built():
 # "message on WhatsApp". Same broken promise as a mismatched image, one layer down.
 
 def test_copy_action_follows_destination():
-    from app.agents.jane_ads.destination import copy_action, copy_action_example
+    from app.agents.jane_ads.destination import copy_action, copy_action_examples
 
     assert copy_action(DestinationType.WHATSAPP) == "message on WhatsApp"
-    assert "website" in copy_action(DestinationType.WEBSITE)
+    assert copy_action(DestinationType.WEBSITE) == "go to the website"
     assert "DM" in copy_action(DestinationType.INSTAGRAM_DM)
     # CUSTOM can't name the place — it's whatever URL the brand pasted — so it
     # points at the button, which is the one thing that is always true.
     assert copy_action(DestinationType.CUSTOM) == "tap the button"
 
-    assert "WhatsApp" not in copy_action_example(DestinationType.WEBSITE)
+    # Two examples, not one: with a single example the model pasted it verbatim
+    # (a football academy closed on "Tap to shop"). They must differ, or the pair
+    # is no better than one.
+    web_examples = copy_action_examples(DestinationType.WEBSITE)
+    assert len(web_examples) == 2 and web_examples[0] != web_examples[1]
+    assert not any("WhatsApp" in e for e in web_examples)
 
 
 def test_register_block_example_matches_destination():
@@ -301,4 +306,10 @@ def test_register_block_example_matches_destination():
     # website ad. The REGISTER line itself ("texting a customer on WhatsApp")
     # stays either way — that's about tone of voice, not where the tap goes.
     assert "Message me to order" not in web
-    assert "Tap to shop" in web
+    assert "Tap to see prices" in web
+    # The block must name the destination's action AND demand a closing ask —
+    # softening the examples to "your own words" without keeping the ask
+    # mandatory made website ads end with no ask at all (1 of 4 samples had one).
+    assert "go to the website" in web
+    assert "Never end without one." in web
+    assert "your own words" in web

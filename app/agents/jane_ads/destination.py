@@ -86,15 +86,34 @@ _IMAGE_CTAS = {
     DestinationType.CUSTOM: "Tap to find out more",
 }
 
-# The ask the ad COPY closes on, and the example of a good one. Same contract as
+# The ask the ad COPY closes on, and examples of good ones. Same contract as
 # _IMAGE_CTAS, one layer down: a written "message me to order" on an ad whose button
 # opens a website is the same broken promise as an image that says the wrong thing.
-# Phrased as an instruction to the copywriter, not as copy to paste.
+#
+# TWO examples per destination, deliberately: with one, the model copies it verbatim
+# — live-observed, a football academy closed on "Tap to shop" because that was the
+# single website example. A pair reads as a register to imitate rather than a line to
+# paste, and the two differ in verb and object so neither is the obvious template.
+#
+# The ACTION is kept to a short verb phrase for the same reason. "tap the button to
+# open the website" read as a finished sentence, and all four sampled website ads
+# ended with it word for word; "go to the website" cannot be pasted as an ask, so
+# the model has to write one.
+#
+# The examples stop at the verb and carry no purpose ("Send us a message", not "Send
+# us a message to book") for the same reason once more: with a purpose attached, the
+# model kept it — a leather-bag shop closed on "to book", a service verb. Ending them
+# early leaves the reason for the copywriter, who is the one that knows whether this
+# business is booked or ordered from.
 _COPY_ACTIONS = {
-    DestinationType.WHATSAPP: ("message on WhatsApp", "Message me to order"),
-    DestinationType.WEBSITE: ("tap the button to open the website", "Tap to shop"),
-    DestinationType.INSTAGRAM_DM: ("send a DM on Instagram", "DM me to order"),
-    DestinationType.CUSTOM: ("tap the button", "Tap to get started"),
+    DestinationType.WHATSAPP: (
+        "message on WhatsApp", ("Message me to order", "Send us a message")),
+    DestinationType.WEBSITE: (
+        "go to the website", ("Tap to see prices", "Visit the site")),
+    DestinationType.INSTAGRAM_DM: (
+        "send a DM on Instagram", ("DM me to order", "Send us a DM")),
+    DestinationType.CUSTOM: (
+        "tap the button", ("Tap to get started", "Tap the button")),
 }
 
 _IG_USERNAME_RE = re.compile(r"^[A-Za-z0-9._]{1,30}$")
@@ -255,8 +274,9 @@ def copy_action(destination_type: DestinationType) -> str:
     return _COPY_ACTIONS.get(destination_type, _COPY_ACTIONS[DEFAULT_DESTINATION])[0]
 
 
-def copy_action_example(destination_type: DestinationType) -> str:
-    """A model closing ask for this destination, for the register block's example."""
+def copy_action_examples(destination_type: DestinationType) -> tuple[str, str]:
+    """Two model closing asks for this destination, for the register block. Two, not
+    one, so the model imitates the register instead of pasting the example."""
     return _COPY_ACTIONS.get(destination_type, _COPY_ACTIONS[DEFAULT_DESTINATION])[1]
 
 

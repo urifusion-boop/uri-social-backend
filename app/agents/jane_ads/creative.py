@@ -45,7 +45,7 @@ import openai
 from app.core.config import settings
 
 from .destination import (DEFAULT_DESTINATION, coerce_type, copy_action,
-                          copy_action_example, cta_label, image_cta)
+                          copy_action_examples, cta_label, image_cta)
 from .models import AdCopy, AdCreative, CreativeSource, GeoMode, GeoPlan, ShootScript, ShootShot
 
 WHATSAPP_CTA = "Send WhatsApp Message"   # the default destination's button; see
@@ -206,10 +206,11 @@ def _register_rules_block(destination_type: str = DEFAULT_DESTINATION.value) -> 
     retrieval-driven delivery, since specificity is what tells the platform who
     the ad is for.
 
-    The closing-ask EXAMPLE follows the brand's ad destination: "Message me to order"
+    The closing-ask EXAMPLES follow the brand's ad destination: "Message me to order"
     is only right when the tap opens WhatsApp, and an example is what the model
     actually imitates — leaving it fixed put a WhatsApp ask on website ads whose
     button said "Shop Now"."""
+    _ex = copy_action_examples(coerce_type(destination_type))
     return (
         "REGISTER — write like a real Nigerian business owner texting a customer on "
         "WhatsApp, not a brand:\n"
@@ -218,8 +219,13 @@ def _register_rules_block(destination_type: str = DEFAULT_DESTINATION.value) -> 
         "- If a specific price or starting price is mentioned in the context below, "
         "state it plainly (e.g. \"₦12,000\", never \"12k\"). If no price was given, do "
         "NOT invent one.\n"
-        f"- End with a direct ask — \"{copy_action_example(coerce_type(destination_type))}\", "
-        "not \"reach out today\" or \"get in touch to learn more\".\n"
+        f"- REQUIRED: the last sentence is a direct ask telling the reader to "
+        f"{copy_action(coerce_type(destination_type))}. Never end without one.\n"
+        f"  Write it in your own words for this business, in this register: "
+        f"\"{_ex[0]}\", \"{_ex[1]}\". Not \"reach out today\" or \"get in touch "
+        "to learn more\".\n"
+        "  Match the verb to what this business actually sells — you order or buy a "
+        "product, you book or join a service. \"Book\" on a shop reads wrong.\n"
         "- Never use: " + ", ".join(f'"{w}"' for w in _FORBIDDEN_COPY_WORDS) + ".\n"
         "- No manufactured urgency for an evergreen offer. No emoji spam (one is fine, "
         "three fire emoji reads as a flyer)."
