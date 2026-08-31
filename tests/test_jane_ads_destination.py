@@ -270,3 +270,35 @@ def test_destination_is_asked_before_the_creative_is_built():
     from app.agents.jane_ads import router
     src = inspect.getsource(router._build_campaign_plan)
     assert src.index('"stage": "choose_destination"') < src.index('"stage": "choose_creative_source"')
+
+
+# ── The written copy follows the destination too ─────────────────────────────
+# The button and the generated image already did; the copy PROMPT did not, so a
+# website ad whose button read "Shop Now" was still being told to close on
+# "message on WhatsApp". Same broken promise as a mismatched image, one layer down.
+
+def test_copy_action_follows_destination():
+    from app.agents.jane_ads.destination import copy_action, copy_action_example
+
+    assert copy_action(DestinationType.WHATSAPP) == "message on WhatsApp"
+    assert "website" in copy_action(DestinationType.WEBSITE)
+    assert "DM" in copy_action(DestinationType.INSTAGRAM_DM)
+    # CUSTOM can't name the place — it's whatever URL the brand pasted — so it
+    # points at the button, which is the one thing that is always true.
+    assert copy_action(DestinationType.CUSTOM) == "tap the button"
+
+    assert "WhatsApp" not in copy_action_example(DestinationType.WEBSITE)
+
+
+def test_register_block_example_matches_destination():
+    from app.agents.jane_ads.creative import _register_rules_block
+
+    wa = _register_rules_block(DestinationType.WHATSAPP.value)
+    web = _register_rules_block(DestinationType.WEBSITE.value)
+
+    assert "Message me to order" in wa
+    # The example is what the model imitates, so it must not say WhatsApp on a
+    # website ad. The REGISTER line itself ("texting a customer on WhatsApp")
+    # stays either way — that's about tone of voice, not where the tap goes.
+    assert "Message me to order" not in web
+    assert "Tap to shop" in web

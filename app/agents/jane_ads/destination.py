@@ -86,6 +86,17 @@ _IMAGE_CTAS = {
     DestinationType.CUSTOM: "Tap to find out more",
 }
 
+# The ask the ad COPY closes on, and the example of a good one. Same contract as
+# _IMAGE_CTAS, one layer down: a written "message me to order" on an ad whose button
+# opens a website is the same broken promise as an image that says the wrong thing.
+# Phrased as an instruction to the copywriter, not as copy to paste.
+_COPY_ACTIONS = {
+    DestinationType.WHATSAPP: ("message on WhatsApp", "Message me to order"),
+    DestinationType.WEBSITE: ("tap the button to open the website", "Tap to shop"),
+    DestinationType.INSTAGRAM_DM: ("send a DM on Instagram", "DM me to order"),
+    DestinationType.CUSTOM: ("tap the button", "Tap to get started"),
+}
+
 _IG_USERNAME_RE = re.compile(r"^[A-Za-z0-9._]{1,30}$")
 
 # The picker Jane shows in the conversation ("where should people who tap end up?").
@@ -237,6 +248,16 @@ def cta_label(destination_type: DestinationType, cta_choice: str = "") -> str:
 def image_cta(destination_type: DestinationType) -> str:
     """What the generated image is allowed to say, so it matches the real button."""
     return _IMAGE_CTAS.get(destination_type, _IMAGE_CTAS[DEFAULT_DESTINATION])
+
+
+def copy_action(destination_type: DestinationType) -> str:
+    """The action the written copy tells the reader to take."""
+    return _COPY_ACTIONS.get(destination_type, _COPY_ACTIONS[DEFAULT_DESTINATION])[0]
+
+
+def copy_action_example(destination_type: DestinationType) -> str:
+    """A model closing ask for this destination, for the register block's example."""
+    return _COPY_ACTIONS.get(destination_type, _COPY_ACTIONS[DEFAULT_DESTINATION])[1]
 
 
 def meta_cta(destination_type: DestinationType, link: str, is_video: bool,

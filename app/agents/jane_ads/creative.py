@@ -24,8 +24,9 @@ into the image — the headline/primary_text/CTA are separate fields the ad plat
 lays over it. So GENERATE reuses the brand DATA (the playbook) via a direct,
 controlled image call instead of the organic-content TEMPLATE pipeline.
 
-Whatever the source, Jane always writes fresh ad copy and auto-attaches the WhatsApp
-CTA — the customer never sets that (every ad routes to WhatsApp).
+Whatever the source, Jane always writes fresh ad copy and attaches the CTA for the
+brand's chosen ad destination (destination.py) — the customer picks where the tap
+lands, not the button wording.
 
 Copy-writing + image generation are live (LLM); `assemble_creative`, `_as_ad_content`,
 and the draft-summary mapping are pure and unit-tested.
@@ -43,7 +44,8 @@ import openai
 
 from app.core.config import settings
 
-from .destination import DEFAULT_DESTINATION, coerce_type, cta_label, image_cta
+from .destination import (DEFAULT_DESTINATION, coerce_type, copy_action,
+                          copy_action_example, cta_label, image_cta)
 from .models import AdCopy, AdCreative, CreativeSource, GeoMode, GeoPlan, ShootScript, ShootShot
 
 WHATSAPP_CTA = "Send WhatsApp Message"   # the default destination's button; see
@@ -198,11 +200,16 @@ _FORBIDDEN_COPY_WORDS = (
 )
 
 
-def _register_rules_block() -> str:
+def _register_rules_block(destination_type: str = DEFAULT_DESTINATION.value) -> str:
     """Nigerian commerce register (creative brief spec §5) — specific and
     transactional beats fluent and abstract, and it's also what performs under
     retrieval-driven delivery, since specificity is what tells the platform who
-    the ad is for."""
+    the ad is for.
+
+    The closing-ask EXAMPLE follows the brand's ad destination: "Message me to order"
+    is only right when the tap opens WhatsApp, and an example is what the model
+    actually imitates — leaving it fixed put a WhatsApp ask on website ads whose
+    button said "Shop Now"."""
     return (
         "REGISTER — write like a real Nigerian business owner texting a customer on "
         "WhatsApp, not a brand:\n"
@@ -211,8 +218,8 @@ def _register_rules_block() -> str:
         "- If a specific price or starting price is mentioned in the context below, "
         "state it plainly (e.g. \"₦12,000\", never \"12k\"). If no price was given, do "
         "NOT invent one.\n"
-        "- End with a direct ask — \"Message me to order\", not \"reach out today\" or "
-        "\"get in touch to learn more\".\n"
+        f"- End with a direct ask — \"{copy_action_example(coerce_type(destination_type))}\", "
+        "not \"reach out today\" or \"get in touch to learn more\".\n"
         "- Never use: " + ", ".join(f'"{w}"' for w in _FORBIDDEN_COPY_WORDS) + ".\n"
         "- No manufactured urgency for an evergreen offer. No emoji spam (one is fine, "
         "three fire emoji reads as a flyer)."
@@ -381,7 +388,8 @@ async def write_ad_copy(business_name: str, category: str, goal: str = "messages
                         city: str = "", behaviour: str = "", service_area: str = "",
                         audience_segment: str = "", who_its_for: str = "",
                         geo_pockets: Optional[list[str]] = None,
-                        corpus: Optional["RetrievalResult"] = None) -> AdCopy:
+                        corpus: Optional["RetrievalResult"] = None,
+                        destination_type: str = DEFAULT_DESTINATION.value) -> AdCopy:
     """Write a short headline, primary text, and an image prompt (used only for the
     GENERATE source). Voice-matched to the brand playbook when a profile exists, and
     visually grounded in the real city/area the campaign targets. Also does the
@@ -427,7 +435,7 @@ async def write_ad_copy(business_name: str, category: str, goal: str = "messages
            "\"if you run a small business...\") — never the audience label above\n")
         + (f"- service_area (mention this, not the delivery-context location above): "
            f"{service_area}\n" if service_area else "")
-        + "- the_action: message on WhatsApp\n"
+        + f"- the_action: {copy_action(coerce_type(destination_type))}\n"
     )
     prompt = (
         f"Write a Meta/Instagram ad for '{business_name or bc.get('brand_name') or 'a business'}' "
@@ -436,7 +444,7 @@ async def write_ad_copy(business_name: str, category: str, goal: str = "messages
         f"{location_bit}\n"
         f"Context: {description or 'none'}\n"
         f"How customers find this business: {behaviour or 'unknown'}.\n"
-        f"{_register_rules_block()}\n"
+        f"{_register_rules_block(destination_type)}\n"
         f"{_corpus_rules(corpus)}"
         "Return JSON with:\n"
         "- headline: punchy, <= 5 words, no ALL CAPS, no emoji spam, from MESSAGE only\n"
@@ -695,7 +703,8 @@ async def write_ad_copy_for_image(image_summary: str, business_name: str, catego
                                   service_area: str = "", audience_segment: str = "",
                                   who_its_for: str = "",
                                   geo_pockets: Optional[list[str]] = None,
-                                  corpus: Optional["RetrievalResult"] = None) -> AdCopy:
+                                  corpus: Optional["RetrievalResult"] = None,
+                                  destination_type: str = DEFAULT_DESTINATION.value) -> AdCopy:
     """Write the headline + primary text to MATCH a specific image (its vision description),
     so the caption references what's actually on screen instead of a generic line. Returns
     an AdCopy with only headline + primary_text set.
@@ -726,7 +735,7 @@ async def write_ad_copy_for_image(image_summary: str, business_name: str, catego
            "the audience label above\n")
         + (f"- service_area (mention this, not the delivery-context location above): "
            f"{service_area}\n" if service_area else "")
-        + "- the_action: message on WhatsApp\n"
+        + f"- the_action: {copy_action(coerce_type(destination_type))}\n"
     )
     prompt = (
         f"Write the copy for a Meta/Instagram ad for "
@@ -735,7 +744,7 @@ async def write_ad_copy_for_image(image_summary: str, business_name: str, catego
         f"{zone_a}{zone_b}"
         f"The ad's IMAGE shows: {image_summary}.\n"
         f"Context: {description or 'none'}\n"
-        f"{_register_rules_block()}\n"
+        f"{_register_rules_block(destination_type)}\n"
         f"{_corpus_rules(corpus)}"
         "Write copy that clearly connects to what's in the image above — the headline and "
         "body should feel like they belong with that visual, not generic.\n"
@@ -904,7 +913,8 @@ async def generate_ad_creative(
     )
     copy = await write_ad_copy(business_name, category, goal, description, brand_context,
                                city, behaviour, service_area, audience_segment, who_its_for,
-                               geo_pockets=geo_pockets, corpus=corpus)
+                               geo_pockets=geo_pockets, corpus=corpus,
+                               destination_type=destination_type)
     # Image via the SAME content engine normal posts use (better visuals). Seed it with the
     # scene idea; content conveys the theme/message so the graphic is on-topic.
     content_for_image = copy.primary_text or copy.image_prompt or f"{business_name} — {description or category}"
@@ -927,7 +937,7 @@ async def generate_ad_creative(
             matched = await write_ad_copy_for_image(
                 summary, business_name, category, goal, description, brand_context, city,
                 service_area, audience_segment, who_its_for, geo_pockets=geo_pockets,
-                corpus=corpus,
+                corpus=corpus, destination_type=destination_type,
             )
             if matched.headline:
                 copy.headline = matched.headline
@@ -969,11 +979,13 @@ async def creative_from_upload(
         copy = await write_ad_copy_for_image(
             summary, business_name, category, goal, description, brand_context, city,
             service_area, audience_segment, who_its_for, geo_pockets=geo_pockets,
+            destination_type=destination_type,
         )
     else:
         copy = await write_ad_copy(business_name, category, goal, description, brand_context, city,
                                    service_area=service_area, audience_segment=audience_segment,
-                                   who_its_for=who_its_for, geo_pockets=geo_pockets)
+                                   who_its_for=who_its_for, geo_pockets=geo_pockets,
+                                   destination_type=destination_type)
     return assemble_creative(copy, image_url, source=CreativeSource.UPLOAD, is_video=is_video,
                              service_area=service_area, destination_type=destination_type,
                              destination_cta=destination_cta)
@@ -997,6 +1009,7 @@ async def creative_from_draft(
     copy = await write_ad_copy_for_image(
         summary, business_name, category, goal, draft["content"], brand_context, city,
         service_area, audience_segment, who_its_for, geo_pockets=geo_pockets,
+        destination_type=destination_type,
     )
     return assemble_creative(copy, draft["image_url"], source=CreativeSource.DRAFT,
                              service_area=service_area, destination_type=destination_type,
@@ -1029,11 +1042,13 @@ async def creative_from_recomposite(
         copy = await write_ad_copy_for_image(
             summary, business_name, category, goal, description, brand_context, city,
             service_area, audience_segment, who_its_for, geo_pockets=geo_pockets,
+            destination_type=destination_type,
         )
     else:
         copy = await write_ad_copy(business_name, category, goal, description, brand_context, city,
                                    audience_segment=audience_segment, who_its_for=who_its_for,
-                                   service_area=service_area, geo_pockets=geo_pockets)
+                                   service_area=service_area, geo_pockets=geo_pockets,
+                                   destination_type=destination_type)
     return assemble_creative(copy, final_image, source=CreativeSource.RECOMPOSITE,
                              service_area=service_area, destination_type=destination_type,
                              destination_cta=destination_cta)
