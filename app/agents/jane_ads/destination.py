@@ -56,8 +56,12 @@ CTA_CHOICES: dict[str, tuple[str, str]] = {
     "sign_up": ("Sign Up", "SIGN_UP"),
     "get_offer": ("Get Offer", "GET_OFFER"),
     "contact_us": ("Contact Us", "CONTACT_US"),
-    "send_message": ("Send Message", "LEARN_MORE"),
 }
+# Every label above is what Meta ACTUALLY renders for that type. A "send_message"
+# key used to sit here mapped to LEARN_MORE — so a user who picked "Send Message"
+# got an ad whose button said "Learn More". Meta has no generic send-message CTA for
+# a link ad, so the honest option is CONTACT_US, and the key is gone rather than
+# relabelled: a stored "send_message" now coerces to that destination's default.
 
 # Used when the user hasn't picked a button. WHATSAPP needs an entry here now that it
 # no longer uses Meta's native WHATSAPP_MESSAGE button (see meta_cta) — without one it
@@ -66,16 +70,15 @@ CTA_CHOICES: dict[str, tuple[str, str]] = {
 _DEFAULT_CTA_CHOICE = {
     DestinationType.WHATSAPP: "contact_us",
     DestinationType.WEBSITE: "learn_more",
-    DestinationType.INSTAGRAM_DM: "send_message",
+    DestinationType.INSTAGRAM_DM: "contact_us",
     DestinationType.CUSTOM: "learn_more",
 }
 
-_CTA_LABELS = {
-    DestinationType.WHATSAPP: "Send WhatsApp Message",
-    DestinationType.WEBSITE: "Visit Website",
-    DestinationType.INSTAGRAM_DM: "Message on Instagram",
-    DestinationType.CUSTOM: "Learn More",
-}
+# There is deliberately no separate label table any more. One existed, and it drifted
+# from what Meta renders the moment WHATSAPP_MESSAGE was dropped: the preview promised
+# "Send WhatsApp Message" while the launched ad showed "Contact Us" — live-confirmed on
+# ad 52561318289410. CTA_CHOICES is now the single source, so a label can only be wrong
+# if the Meta type beside it is wrong too.
 
 # What the CREATIVE IMAGE is allowed to say. The image must never contradict the
 # button (live-observed: a click-to-WhatsApp ad whose image read "Visit our website").
@@ -130,7 +133,9 @@ DESTINATION_OPTIONS: list[dict] = [
         "field": "whatsapp_number",
         "input_label": "Your WhatsApp number",
         "placeholder": "0803 123 4567",
-        "takes_cta": False,      # Meta renders its own WhatsApp button
+        # Was False while WhatsApp used Meta's native WHATSAPP_MESSAGE button. It's a
+        # plain link ad now, so its button is chooseable like any other destination's.
+        "takes_cta": True,
     },
     {
         "value": DestinationType.WEBSITE.value,
@@ -254,14 +259,10 @@ def build_link(
 
 
 def cta_label(destination_type: DestinationType, cta_choice: str = "") -> str:
-    """The button wording shown on the ad (and in previews/plans). WhatsApp keeps its
-    own native button; every other destination uses the wording the user picked, or
-    that destination's sensible default."""
-    if destination_type == DestinationType.WHATSAPP:
-        return _CTA_LABELS[DestinationType.WHATSAPP]
-    if cta_choice:
-        return CTA_CHOICES[coerce_cta(cta_choice, destination_type)][0]
-    return _CTA_LABELS.get(destination_type, _CTA_LABELS[DEFAULT_DESTINATION])
+    """The button wording shown on the ad (and in previews/plans) — read from the same
+    row that supplies the Meta type, so a preview can never promise a button the ad
+    won't show."""
+    return CTA_CHOICES[coerce_cta(cta_choice, destination_type)][0]
 
 
 def image_cta(destination_type: DestinationType) -> str:
