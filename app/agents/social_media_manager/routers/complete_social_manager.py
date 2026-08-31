@@ -1631,7 +1631,12 @@ async def facebook_ads_callback(
     import urllib.parse
     import httpx
     from datetime import timezone
-    from app.services.MetaAdsService import BusinessManagerNotConfigured, share_page_with_business_manager
+    from app.services.MetaAdsService import (
+        BusinessManagerNotConfigured,
+        SystemUserNotConfigured,
+        assign_page_to_system_user,
+        share_page_with_business_manager,
+    )
 
     web_app_url = settings.WEB_APP_URL.strip("'\"")
     base_redirect = f"{web_app_url}/workspace?tab=connections"
@@ -1700,6 +1705,27 @@ async def facebook_ads_callback(
                 await share_page_with_business_manager(page_id, page_token)
                 business_manager_shared = True
                 print(f"[FBAdsOAuth] ✅ Granted URI Business Manager ADVERTISE access to page {page_id}")
+
+                # Sharing with the business is not enough on its own: a system user
+                # does NOT inherit Page access from the business it belongs to, so
+                # ad-creative creation fails with "Missing Page permission ...
+                # Advertiser role or higher" even though the business holds
+                # PROFILE_PLUS_ADVERTISE. Live-confirmed 2026-08-31. Without this the
+                # only alternative is an admin assigning every client Page by hand.
+                try:
+                    await assign_page_to_system_user(page_id, page_token)
+                    print(f"[FBAdsOAuth] ✅ Assigned ads system user to page {page_id}")
+                except SystemUserNotConfigured:
+                    business_manager_error = (
+                        "META_ADS_SYSTEM_USER_ID not set — ads cannot run from this Page yet."
+                    )
+                    print(f"[FBAdsOAuth] ⚠️ system user not configured — page {page_id} not assignable")
+                except Exception as e:
+                    # The share succeeded; only the assignment failed. Record it rather
+                    # than reporting the connection as fully shared, because a launch
+                    # from this Page will fail until it is resolved.
+                    business_manager_error = f"system-user assignment: {e}"
+                    print(f"[FBAdsOAuth] ⚠️ system-user assignment failed for {page_id}: {e}")
             except BusinessManagerNotConfigured:
                 print(f"[FBAdsOAuth] ⚠️ META_BUSINESS_MANAGER_ID not set — page {page_id} token stored, BM share deferred")
             except Exception as e:

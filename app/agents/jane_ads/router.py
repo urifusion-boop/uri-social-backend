@@ -401,8 +401,16 @@ async def creative_for_brand(
     """Generate/assemble an ad creative for the caller's real brand — pulls the brand
     playbook (colours, voice, fonts) so ads look like the brand, not a template."""
     from .creative import creative_from_draft, creative_from_recomposite, creative_from_upload, generate_ad_creative
+    from .destination import get_brand_destination
+
     user_id = brand_ctx["user_id"]
     brand_id = brand_ctx.get("brand_id")
+    # The preview's button (and, for GENERATE, the CTA baked into the image) has to be
+    # the brand's real ad destination — otherwise the preview promises WhatsApp and the
+    # launched ad opens their website.
+    _destination = await get_brand_destination(db, brand_id)
+    destination_type = _destination["destination_type"]
+    destination_cta = _destination["destination_cta"]
 
     if body.source == "upload":
         if not body.reference_image_url:
@@ -411,6 +419,7 @@ async def creative_for_brand(
             body.business_name, body.category, body.reference_image_url, body.goal,
             body.description, user_id=user_id, db=db, brand_id=brand_id,
             is_video=body.is_video, city=body.city,
+            destination_type=destination_type, destination_cta=destination_cta,
         )
     elif body.source == "recomposite":
         if not body.reference_image_url:
@@ -418,6 +427,7 @@ async def creative_for_brand(
         ad = await creative_from_recomposite(
             body.business_name, body.category, body.reference_image_url, body.goal,
             body.description, user_id=user_id, db=db, brand_id=brand_id, city=body.city,
+            destination_type=destination_type, destination_cta=destination_cta,
         )
     elif body.source == "draft":
         if not body.draft_id:
@@ -425,6 +435,7 @@ async def creative_for_brand(
         ad = await creative_from_draft(
             body.business_name, body.category, body.draft_id, user_id, db,
             goal=body.goal, brand_id=brand_id, city=body.city,
+            destination_type=destination_type, destination_cta=destination_cta,
         )
         if ad is None:
             raise HTTPException(status_code=404, detail="Draft not found or has no image")
@@ -432,6 +443,7 @@ async def creative_for_brand(
         ad = await generate_ad_creative(
             body.business_name, body.category, body.goal, body.description,
             user_id=user_id, db=db, brand_id=brand_id, city=body.city,
+            destination_type=destination_type, destination_cta=destination_cta,
         )
     return ad.model_dump()
 
@@ -754,6 +766,105 @@ async def jane_set_whatsapp(
         raise HTTPException(status_code=400, detail="That WhatsApp number doesn't look right — please type it in full, e.g. 0803 123 4567.")
     await set_brand_whatsapp(db, brand_id, number)
     return {"whatsapp_number": number}
+
+
+# ── Brand ad destination (WhatsApp / website / Instagram DM) ─────────────────
+# WhatsApp is the default and what most brands want, but it was the ONLY option:
+# a brand that sells on its site, or whose inbox is Instagram, had no way to point
+# an ad anywhere else. All three are plain link ads under the hood (destination.py),
+# so nothing about the ad mechanism changes — only where the tap lands.
+
+class DestinationBody(BaseModel):
+    destination_type: str              # whatsapp | website | instagram_dm | custom
+    website_url: str = ""              # required for destination_type=website
+    instagram_username: str = ""       # required for destination_type=instagram_dm
+    custom_url: str = ""               # required for destination_type=custom — the exact
+                                       # link the user wants, pasted as-is (a Paystack
+                                       # checkout, a Google Form, a Linktree, anything)
+    destination_cta: str = ""          # which button the ad shows, a key from CTA_CHOICES;
+                                       # ignored for whatsapp (Meta's native button)
+
+
+@router.get("/destination")
+async def jane_get_destination(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Where the active brand's ads send people, plus the resolved link so the UI can
+    show the exact destination rather than re-deriving it."""
+    from .destination import CTA_CHOICES, build_link, coerce_type, cta_label, get_brand_destination
+
+    saved = await get_brand_destination(db, brand_ctx.get("brand_id"))
+    dest = coerce_type(saved["destination_type"])
+    return {
+        **saved,
+        "link": build_link(
+            dest,
+            whatsapp_number=saved["whatsapp_number"],
+            website_url=saved["website_url"],
+            instagram_username=saved["instagram_username"],
+            custom_url=saved["custom_url"],
+        ),
+        "cta": cta_label(dest, saved["destination_cta"]),
+        # So the picker can render the real options instead of hard-coding a list that
+        # drifts from what Meta actually accepts.
+        "cta_choices": [{"value": k, "label": v[0]} for k, v in CTA_CHOICES.items()],
+    }
+
+
+@router.put("/destination")
+async def jane_set_destination(
+    body: DestinationBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Point the brand's ads wherever they want: their WhatsApp, their website, their
+    Instagram DMs, or — with destination_type=custom — the exact link they paste, with
+    the button wording of their choice. Switching TO whatsapp just selects the number
+    saved via PUT /whatsapp; the number keeps its own endpoint because the ads
+    connection gate reads it too."""
+    from .destination import (
+        CTA_CHOICES, DestinationType, build_link, coerce_type, cta_label,
+        get_brand_destination, set_brand_destination,
+    )
+
+    brand_id = brand_ctx.get("brand_id")
+    if not brand_id:
+        raise HTTPException(status_code=400, detail="No active brand to save a destination for.")
+    dest = coerce_type(body.destination_type)
+    if dest.value != (body.destination_type or "").strip().lower():
+        raise HTTPException(
+            status_code=400,
+            detail="destination_type must be one of: "
+                   + ", ".join(d.value for d in DestinationType),
+        )
+    if dest == DestinationType.WHATSAPP:
+        saved = await get_brand_destination(db, brand_id)
+        if not saved["whatsapp_number"]:
+            raise HTTPException(
+                status_code=400,
+                detail="Save a WhatsApp number first (PUT /jane-ads/whatsapp) — ads can't route to a number you haven't given.",
+            )
+    try:
+        saved = await set_brand_destination(
+            db, brand_id, dest,
+            website_url=body.website_url, instagram_username=body.instagram_username,
+            custom_url=body.custom_url, destination_cta=body.destination_cta,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {
+        **saved,
+        "link": build_link(
+            dest,
+            whatsapp_number=saved["whatsapp_number"],
+            website_url=saved["website_url"],
+            instagram_username=saved["instagram_username"],
+            custom_url=saved["custom_url"],
+        ),
+        "cta": cta_label(dest, saved["destination_cta"]),
+        "cta_choices": [{"value": k, "label": v[0]} for k, v in CTA_CHOICES.items()],
+    }
 
 
 # ── Per-brand Meta ads connection (Per-Brand Page Connection plan) ───────────
@@ -1353,6 +1464,16 @@ class MetaLaunchFromMessageBody(BaseModel):
                                           # that specific audience rather than the one
                                           # Jane would've picked silently. None → present
                                           # the ranked options instead of proceeding.
+    # Ad destination (the choose_destination stage) — where a tap on this ad lands.
+    # "" uses the brand's saved default (a returning brand is never re-asked);
+    # "ask" makes Jane present the picker instead of building; a concrete type uses
+    # THAT for this campaign and saves it as the brand's new default.
+    destination_type: str = ""            # "" | ask | whatsapp | website | instagram_dm | custom
+    destination_value: str = ""           # the one answer, read per type: the number, the
+                                          # domain, the handle, or the pasted URL. Blank keeps
+                                          # whatever the brand already has for that type.
+    destination_cta: str = ""             # which button the ad shows (CTA_CHOICES key);
+                                          # ignored for whatsapp, which has Meta's native one
     variant_group_id: str = ""           # ties multiple builds together when the client
                                           # picked more than one variant (one call per
                                           # selected variant, spec §7 "one creative per
@@ -1607,10 +1728,27 @@ async def _build_campaign_plan(
         return {"early_return": {"stage": "need_more", "understood": parsed.model_dump(), "question": clarify}}
 
     # 1.6. Now that the goal is actually known: a followers/engagement campaign never
-    # routes through WhatsApp, so step 0 above deliberately let ADS_NO_WHATSAPP through.
-    # Every other goal DOES need it — re-check strictly now, catching it here instead of
-    # at launch.
-    if req.goal != Goal.FOLLOWERS and not ads_conn["whatsapp_number"]:
+    # routes off-platform, so step 0 above deliberately let ADS_NO_WHATSAPP through.
+    # Every other goal DOES need a destination — but only a WhatsApp one needs the
+    # linked NUMBER; a brand routing to their website or Instagram DMs may legitimately
+    # have no number at all. Re-check strictly now, catching it here instead of at launch.
+    from .destination import DestinationType, build_link, coerce_type, get_brand_destination
+    brand_destination = await get_brand_destination(db, brand_ctx.get("brand_id"))
+    # A destination named on THIS request wins over the brand's saved default;
+    # "ask" means the user hasn't chosen yet (the choose_destination stage below),
+    # so nothing about the old default should gate them here.
+    requested_destination = (body.destination_type or "").strip().lower()
+    destination_type = (
+        coerce_type(brand_destination["destination_type"])
+        if requested_destination in ("", "ask")
+        else coerce_type(requested_destination)
+    )
+    needs_whatsapp_number = (
+        req.goal != Goal.FOLLOWERS
+        and requested_destination != "ask"
+        and destination_type == DestinationType.WHATSAPP
+    )
+    if needs_whatsapp_number and not ads_conn["whatsapp_number"]:
         try:
             ads_conn = await resolve_ads_page_for_launch(db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"))
         except AdsConnectionRequired as e:
@@ -1672,10 +1810,22 @@ async def _build_campaign_plan(
     if consultant_notes:
         plan.explanation = f"{consultant_notes} {plan.explanation}"
 
-    # 2.5. WhatsApp destination — resolved from the per-brand ads connection (step 0
-    # above already guarantees READY, which requires a linked number). This is a real
-    # Click-to-WhatsApp destination now, not a wa.me link — see the adapter.
+    # 2.5. Where this campaign's taps land, frozen into the plan alongside the page:
+    # the brand's WhatsApp chat (the default — number from the per-brand ads connection,
+    # which step 1.6 guarantees is present for this goal), their website, or their
+    # Instagram DMs. All three become one plain link (destination.py); the adapters
+    # only ever see that link.
     wa_number = ads_conn["whatsapp_number"]
+    destination_link = build_link(
+        destination_type,
+        whatsapp_number=wa_number or brand_destination["whatsapp_number"],
+        website_url=brand_destination["website_url"],
+        instagram_username=brand_destination["instagram_username"],
+        custom_url=brand_destination["custom_url"],
+    )
+    destination_cta = brand_destination["destination_cta"]
+    # NOT gated here: if there's no usable destination yet, Jane asks for one in the
+    # conversation at step 3.9 (choose_destination) rather than dead-ending the build.
 
     if budget_estimate:
         plan.explanation = (
@@ -1760,6 +1910,88 @@ async def _build_campaign_plan(
     user_id = brand_ctx.get("user_id", "")
     brand_id = brand_ctx.get("brand_id")
 
+    # 3.9. Destination step — where a tap on this ad actually lands. Asked HERE, just
+    # before the creative is built, because the answer changes the ad itself: the button
+    # ("Send WhatsApp Message" vs "Shop Now") and the CTA baked into the generated image
+    # both come from it, so choosing afterwards would mean regenerating. Same tappable
+    # early-return shape as choose_creative_source directly below.
+    #
+    # Asked when the caller passes destination_type="ask", or when the brand has no
+    # usable destination at all — never when they already have one and didn't ask to
+    # change it, so a returning brand isn't re-interrogated every campaign.
+    if req.goal != Goal.FOLLOWERS:
+        from .destination import (
+            DESTINATION_OPTIONS, VALUE_FIELD_FOR_TYPE, cta_choice_list, set_brand_destination,
+        )
+
+        def _destination_prompt(error: str = "") -> dict:
+            return {"early_return": {
+                "stage": "choose_destination",
+                "understood": parsed.model_dump(),
+                "question": "Where should people who tap your ad end up?",
+                # Pre-fill: what this brand already has on file, per option, so nobody
+                # retypes their own number to change only the button.
+                "destination_options": [
+                    {**opt, "current": brand_destination.get(opt["field"], "")}
+                    for opt in DESTINATION_OPTIONS
+                ],
+                "cta_choices": cta_choice_list(),
+                "selected": {
+                    "destination_type": destination_type.value,
+                    "destination_cta": brand_destination["destination_cta"],
+                },
+                # Set when an answer came back unusable (a handle that isn't one, a
+                # link that isn't a link) — the picker reopens with the reason.
+                "error": error,
+                # Jane's geography/audience call, same as choose_creative_source below:
+                # confirmed back to the client before they commit, never silently decided.
+                "explanation": plan.explanation,
+            }}
+
+        if requested_destination and requested_destination != "ask":
+            # A real answer — save it as the brand's destination (so the next campaign
+            # doesn't ask again) and use it for this build.
+            value = (body.destination_value or "").strip()
+            field = VALUE_FIELD_FOR_TYPE[destination_type.value]
+            if destination_type == DestinationType.WHATSAPP and value:
+                # The number lives in TWO places by existing design: the ads connection
+                # (which the launch gate reads) and the brand settings (which the
+                # destination reads). Both setters already exist as their own endpoints.
+                from .ads_connection import AdsConnectionRequired, set_whatsapp_number
+                from .whatsapp import set_brand_whatsapp
+                try:
+                    number = await set_whatsapp_number(db, user_id, brand_id, value)
+                    await set_brand_whatsapp(db, brand_id, number)
+                except ValueError as e:
+                    return _destination_prompt(str(e))
+                except AdsConnectionRequired as e:
+                    return {"early_return": {
+                        "stage": f"meta_connection_{e.state.value}",
+                        "understood": parsed.model_dump(), "page_name": e.page_name,
+                    }}
+            try:
+                brand_destination = await set_brand_destination(
+                    db, brand_id, destination_type,
+                    destination_cta=body.destination_cta,
+                    **({field: value} if value and field != "whatsapp_number" else {}),
+                )
+            except ValueError as e:
+                return _destination_prompt(str(e))
+            destination_link = build_link(
+                destination_type,
+                whatsapp_number=brand_destination["whatsapp_number"] or wa_number,
+                website_url=brand_destination["website_url"],
+                instagram_username=brand_destination["instagram_username"],
+                custom_url=brand_destination["custom_url"],
+            )
+            destination_cta = brand_destination["destination_cta"]
+
+        if requested_destination == "ask" or not destination_link:
+            return _destination_prompt(
+                "" if requested_destination == "ask"
+                else "Your ads don't have a destination yet — pick one and this campaign is ready to build."
+            )
+
     # Image-selection step (PRD §2): don't silently generate once budget is set — ask the
     # user how to source the image (upload their own / pick a past post / let Jane generate).
     # Only when the caller hasn't already chosen ("ask"); a concrete source skips through.
@@ -1794,7 +2026,8 @@ async def _build_campaign_plan(
             user_id=user_id, db=db, brand_id=brand_id, is_video=body.is_video,
             city=parsed.city, service_area=service_area,
             audience_segment=variant_segment, who_its_for=variant_who_its_for,
-            geo_pockets=variant_geo_pockets,
+            geo_pockets=variant_geo_pockets, destination_type=destination_type.value,
+            destination_cta=destination_cta,
         )
     elif body.creative_source == "recomposite":
         creative = await creative_from_recomposite(
@@ -1802,7 +2035,8 @@ async def _build_campaign_plan(
             user_id=user_id, db=db, brand_id=brand_id,
             city=parsed.city, service_area=service_area,
             audience_segment=variant_segment, who_its_for=variant_who_its_for,
-            geo_pockets=variant_geo_pockets,
+            geo_pockets=variant_geo_pockets, destination_type=destination_type.value,
+            destination_cta=destination_cta,
         )
     elif body.creative_source == "draft":
         creative = await creative_from_draft(
@@ -1810,7 +2044,8 @@ async def _build_campaign_plan(
             goal=req.goal.value, brand_id=brand_id,
             city=parsed.city, service_area=service_area,
             audience_segment=variant_segment, who_its_for=variant_who_its_for,
-            geo_pockets=variant_geo_pockets,
+            geo_pockets=variant_geo_pockets, destination_type=destination_type.value,
+            destination_cta=destination_cta,
         )
         if creative is None:
             raise HTTPException(status_code=404, detail="Draft not found or has no image")
@@ -1823,7 +2058,8 @@ async def _build_campaign_plan(
             user_id=user_id, db=db, brand_id=brand_id, is_video=False,
             city=parsed.city, service_area=service_area,
             audience_segment=variant_segment, who_its_for=variant_who_its_for,
-            geo_pockets=variant_geo_pockets,
+            geo_pockets=variant_geo_pockets, destination_type=destination_type.value,
+            destination_cta=destination_cta,
         )
     else:
         # AI generation is the one creative path that costs a content credit — an
@@ -1840,7 +2076,8 @@ async def _build_campaign_plan(
             user_id=user_id, db=db, brand_id=brand_id, city=parsed.city,
             behaviour=plan.behaviour.value, service_area=service_area,
             audience_segment=variant_segment, who_its_for=variant_who_its_for,
-            geo_pockets=variant_geo_pockets,
+            geo_pockets=variant_geo_pockets, destination_type=destination_type.value,
+            destination_cta=destination_cta,
             # Drives creative-stage retrieval; without it budget is 0, retrieval
             # bails early, and the ad ships with corpus_coverage="none".
             budget_ngn=float(parsed.budget_ngn or 0),
@@ -1913,6 +2150,9 @@ async def _build_campaign_plan(
 
     plan.page_id = page_id
     plan.whatsapp_number = wa_number
+    plan.destination_type = destination_type.value
+    plan.destination_link = destination_link
+    plan.destination_cta = destination_cta
     plan.creative = creative
     if creative.video_recommendation:
         # Path C (PRD §4.1): gpt-image-1 can't shoot the recommended video itself, so
@@ -2028,8 +2268,11 @@ def _plan_response_dict(built: _PlanBuildResult) -> dict:
         "shoot_script": plan.shoot_script.model_dump(mode="json") if plan.shoot_script else None,
         "budget_estimate": built.budget_estimate,
         # So the review can show where leads land (and let the user catch a wrong
-        # auto-adopted number before launch).
+        # auto-adopted number/site/handle before launch).
         "whatsapp_number": plan.whatsapp_number,
+        "destination_type": plan.destination_type,
+        "destination_link": plan.destination_link,
+        "destination_cta": plan.destination_cta,
         # Tier C — the structured, explained summary (each choice + its why + estimates).
         "summary": built.summary,
         # Multi-Plan Audience Variants — which audience this specific build used, and
@@ -2090,10 +2333,14 @@ async def _do_launch(built: _PlanBuildResult, body_message: str, body_business_n
             "city": req.geo,
             "message": body_message,
             "thread_id": built.thread_id,
-            # Where this campaign's leads route (wa.me/<this>) — so "My Campaigns" can show
-            # the user exactly where to find their conversations. Absent on legacy campaigns
-            # that predate wa.me routing (they went to the shared Page's inbox).
+            # Where this campaign's taps land — so "My Campaigns" can show the user
+            # exactly where to find their conversations. whatsapp_number is absent on
+            # legacy campaigns that predate wa.me routing (they went to the shared
+            # Page's inbox); destination_* is absent on any campaign that predates
+            # non-WhatsApp destinations, which were all WhatsApp by definition.
             "whatsapp_number": plan.whatsapp_number,
+            "destination_type": plan.destination_type,
+            "destination_link": plan.destination_link,
         }},
     )
 
@@ -2283,20 +2530,44 @@ async def meta_launch_plan(
     plan = CampaignPlan.model_validate(doc["plan"])
     req = CampaignRequest.model_validate(doc["req"])
 
-    # Re-resolve the ads connection at commit time rather than trusting the page_id/
-    # whatsapp_number frozen into the plan when it was first built — real time has
-    # passed, and this is exactly the moment a client who just fixed a rejected
-    # WhatsApp number (Meta: "not linked to your account") needs the retry to
-    # actually pick up their correction, not silently resend the stale one.
+    # Re-resolve the ads connection AND the destination at commit time rather than
+    # trusting the page_id/number/link frozen into the plan when it was first built —
+    # real time has passed, and this is exactly the moment a client who just fixed a
+    # rejected WhatsApp number (Meta: "not linked to your account"), a typo'd website
+    # or the wrong Instagram handle needs the retry to actually pick up their
+    # correction, not silently resend the stale one.
     from .ads_connection import AdsConnectionRequired, resolve_ads_page_for_launch
+    from .destination import DestinationType, build_link, coerce_type, get_brand_destination
+
+    brand_destination = await get_brand_destination(db, brand_id)
+    destination_type = coerce_type(brand_destination["destination_type"])
+    # Only a WhatsApp destination needs the linked number; a website/Instagram-DM
+    # brand may have none at all, and must not be blocked on one.
+    require_whatsapp = (
+        plan.goal != Goal.FOLLOWERS and destination_type == DestinationType.WHATSAPP
+    )
     try:
         ads_conn = await resolve_ads_page_for_launch(
-            db, brand_ctx.get("user_id"), brand_id, require_whatsapp=plan.goal != Goal.FOLLOWERS,
+            db, brand_ctx.get("user_id"), brand_id, require_whatsapp=require_whatsapp,
         )
     except AdsConnectionRequired as e:
         raise HTTPException(status_code=409, detail=f"meta_connection_{e.state.value}")
     plan.page_id = ads_conn["page_id"]
     plan.whatsapp_number = ads_conn["whatsapp_number"]
+    plan.destination_type = destination_type.value
+    plan.destination_link = build_link(
+        destination_type,
+        whatsapp_number=ads_conn["whatsapp_number"] or brand_destination["whatsapp_number"],
+        website_url=brand_destination["website_url"],
+        instagram_username=brand_destination["instagram_username"],
+        custom_url=brand_destination["custom_url"],
+    )
+    plan.destination_cta = brand_destination["destination_cta"]
+    if plan.goal != Goal.FOLLOWERS and not plan.destination_link:
+        raise HTTPException(
+            status_code=400,
+            detail="This ad has nowhere to send people — set your ad destination (WhatsApp number, website, or Instagram handle) and try again.",
+        )
 
     # Policy re-check at commit — cheap and deterministic, and real time has passed
     # since the plan was built, so this is a genuine safety re-validation, not just
@@ -2507,6 +2778,10 @@ async def meta_campaigns(
             # Where leads for this campaign land, so the user can find their conversations.
             # Empty on legacy campaigns (pre-wa.me routing) — the UI flags those.
             "whatsapp_number": r.get("whatsapp_number") or "",
+            # Where this campaign actually pointed. Campaigns from before non-WhatsApp
+            # destinations existed carry neither field and were all WhatsApp.
+            "destination_type": r.get("destination_type") or "whatsapp",
+            "destination_link": r.get("destination_link") or "",
             "status": "paused",   # everything is created PAUSED (Meta) / DISABLE (TikTok) for now
             "created_at": created.isoformat() if hasattr(created, "isoformat") else created,
             "ads_manager_url": (

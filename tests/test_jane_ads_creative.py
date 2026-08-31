@@ -10,7 +10,6 @@ import asyncio
 from unittest.mock import AsyncMock, patch
 
 from app.agents.jane_ads.creative import (
-    WHATSAPP_CTA,
     _as_ad_content,
     _check_leakage,
     _draft_to_summary,
@@ -46,9 +45,13 @@ def test_assemble_with_image_defaults_to_generate_source():
     assert c.is_video is False
 
 
-def test_cta_is_always_whatsapp():
+def test_default_cta_is_the_button_meta_will_actually_render():
+    # Was test_cta_is_always_whatsapp, asserting "Send WhatsApp Message". That label
+    # came from Meta's native WhatsApp button, which the ad no longer uses — the ad
+    # ships a plain link CTA, and Meta renders "Contact Us". Live-confirmed on ad
+    # 52561318289410, where the preview and the ad disagreed.
     c = assemble_creative(AdCopy(headline="x"), "https://cdn/a.png")
-    assert c.cta == WHATSAPP_CTA == "Send WhatsApp Message"
+    assert c.cta == "Contact Us"
 
 
 def test_copy_only_fallback_when_no_image():
@@ -56,7 +59,7 @@ def test_copy_only_fallback_when_no_image():
     c = assemble_creative(copy, None)
     assert c.image_url == ""
     assert c.generated is False          # flagged as copy-only
-    assert c.cta == WHATSAPP_CTA         # CTA still attached
+    assert c.cta == "Contact Us"         # CTA still attached
     assert c.headline == "Still Works"
 
 
