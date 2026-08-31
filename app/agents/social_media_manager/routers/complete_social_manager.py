@@ -8846,6 +8846,55 @@ def _wrap_for_drawtext(text: str, video_width: int, fontsize: int) -> tuple:
     return "\n".join(lines[:2]), size
 
 
+async def _image_to_video_clip(
+    image_bytes: bytes,
+    duration_seconds: float,
+    width: int = 1080,
+    height: int = 1920,
+) -> Optional[bytes]:
+    """Turn a still image into a silent MP4 that holds the image for
+    duration_seconds — lets a photo drop into a b-roll slot the same way a
+    video clip does (ZapCap's customBrolls API takes clip URLs with a
+    startTime/endTime window; a raw image has no timeline of its own)."""
+    import tempfile
+    import asyncio as _asyncio
+    import os as _os
+    import uuid as _uuid
+
+    duration_seconds = max(0.5, min(duration_seconds, 30.0))
+
+    with tempfile.NamedTemporaryFile(suffix=".img", delete=False) as imf:
+        imf.write(image_bytes)
+        image_tmp = imf.name
+
+    output_path = f"/tmp/img-broll-{_uuid.uuid4().hex[:8]}.mp4"
+    try:
+        proc = await _asyncio.create_subprocess_exec(
+            "ffmpeg", "-y",
+            "-loop", "1", "-i", image_tmp,
+            "-t", str(duration_seconds),
+            "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+                   f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,format=yuv420p",
+            "-r", "30",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+            output_path,
+            stdout=_asyncio.subprocess.DEVNULL,
+            stderr=_asyncio.subprocess.PIPE,
+        )
+        _, stderr = await _asyncio.wait_for(proc.communicate(), timeout=60)
+
+        if proc.returncode != 0:
+            print(f"[ImageToVideo] ffmpeg failed: {stderr.decode()[-500:]}", flush=True)
+            return None
+
+        with open(output_path, "rb") as f:
+            return f.read()
+    finally:
+        for p in [image_tmp, output_path]:
+            try: _os.unlink(p)
+            except: pass
+
+
 async def _add_hook_text_overlay(
     video_url: str,
     hook_text: str,
@@ -9515,6 +9564,7 @@ async def zapcap_produce(
     output_mode: str = Form("composited"),
     quality: str = Form("standard"),
     enable_broll: str = Form("false"),
+    captions_enabled: str = Form("true"),
     enable_music: str = Form("false"),
     enable_hook_text: str = Form("false"),
     custom_hook_text: str = Form(""),
@@ -9591,128 +9641,147 @@ async def zapcap_produce(
 
     headers = await _zapcap_headers()
 
-    # Upload video URL to ZapCap → get videoId.
-    # ZapCap fetches and validates the video from the URL before responding,
-    # so large files can take well over 60s — use a 5-minute timeout here.
-    async with httpx.AsyncClient(timeout=300) as client:
-        r = await client.post(
-            f"{_ZAPCAP_BASE}/videos/url",
-            json={"url": video_url},
-            headers=headers,
-        )
-        if r.status_code not in (200, 201):
-            await refund_video_job(user_id, job_id, billing, reason="refund")
-            raise HTTPException(status_code=502, detail=f"ZapCap upload failed: {r.text}")
-        zapcap_video_id = r.json().get("videoId") or r.json().get("id")
-        if not zapcap_video_id:
-            await refund_video_job(user_id, job_id, billing, reason="refund")
-            raise HTTPException(status_code=502, detail=f"ZapCap returned no videoId: {r.text}")
+    # Captions are ZapCap's core function — confirmed live against their own
+    # API validation that there is no way to suppress them (fontColor rejects
+    # an alpha channel, styleOptions.top is hard-capped at 80 to keep captions
+    # on-frame). So "captions off" means skipping ZapCap's render entirely —
+    # zapcap_job_status recognizes render_type="no_captions" and runs the SAME
+    # music/hook-text/brand-overlay chain a normal job gets after ZapCap
+    # completes, just starting from the raw uploaded video instead of ZapCap's
+    # captioned output. Cost: auto b-roll (ZapCap's transcription-driven
+    # placement) isn't available for these — it needs a transcript that only
+    # exists because ZapCap ran. Manual b-roll (upload + placement, in the
+    # post-render cleanup step) still works regardless.
+    captions_wanted = captions_enabled.lower() != "false"
+    zapcap_video_id: Optional[str] = None
+    zapcap_task_id: Optional[str] = None
 
-    # Build task payload with correct ZapCap field structure
-    export_settings: dict = {}
-    if output_mode == "transparent":
-        export_settings["outputMode"] = "transparent"
-        # ZapCap requires exportSettings.width/height whenever outputMode is
-        # "transparent" (confirmed against the live API: without them it
-        # 400s with "width and height are required when outputMode is
-        # transparent", which the client only ever saw as an opaque 502).
-        if probed_width and probed_height:
-            export_settings["width"] = probed_width
-            export_settings["height"] = probed_height
-        else:
-            # Never send a transparent task ZapCap will just reject — fail
-            # loudly here with a clear reason instead of a second opaque 502.
-            await refund_video_job(user_id, job_id, billing, reason="refund")
-            raise HTTPException(
-                status_code=422,
-                detail="Could not read this video's dimensions, which are required for transparent output. Try a different file."
+    if captions_wanted:
+        # Upload video URL to ZapCap → get videoId.
+        # ZapCap fetches and validates the video from the URL before responding,
+        # so large files can take well over 60s — use a 5-minute timeout here.
+        async with httpx.AsyncClient(timeout=300) as client:
+            r = await client.post(
+                f"{_ZAPCAP_BASE}/videos/url",
+                json={"url": video_url},
+                headers=headers,
             )
-    elif output_mode == "greenScreen":
-        export_settings["greenScreen"] = True
-    if quality != "standard":
-        export_settings["quality"] = quality
+            if r.status_code not in (200, 201):
+                await refund_video_job(user_id, job_id, billing, reason="refund")
+                raise HTTPException(status_code=502, detail=f"ZapCap upload failed: {r.text}")
+            zapcap_video_id = r.json().get("videoId") or r.json().get("id")
+            if not zapcap_video_id:
+                await refund_video_job(user_id, job_id, billing, reason="refund")
+                raise HTTPException(status_code=502, detail=f"ZapCap returned no videoId: {r.text}")
 
-    _CAPTION_RENDER_OPTIONS: dict = {
-        "bold": {
-            "styleOptions": {"fontUppercase": True, "fontWeight": 800, "stroke": "m", "fontShadow": "s"},
-            "subsOptions": {"animation": False, "emphasizeKeywords": True, "displayWords": 3},
-            "highlightOptions": {"randomColourOne": "#FFE600", "randomColourTwo": "#FF4136"},
-        },
-        "minimal": {
-            "styleOptions": {"fontUppercase": False, "fontWeight": 400, "stroke": "none", "fontShadow": "none"},
-            "subsOptions": {"animation": False, "emphasizeKeywords": False, "displayWords": 6},
-        },
-        "animated": {
-            "styleOptions": {"fontUppercase": False, "fontWeight": 700, "stroke": "s"},
-            "subsOptions": {"animation": True, "emphasizeKeywords": True, "displayWords": 4},
-            "highlightOptions": {"randomColourOne": "#FF6B9D", "randomColourTwo": "#A855F7", "randomColourThree": "#06B6D4"},
-        },
-    }
+        # Build task payload with correct ZapCap field structure
+        export_settings: dict = {}
+        if output_mode == "transparent":
+            export_settings["outputMode"] = "transparent"
+            # ZapCap requires exportSettings.width/height whenever outputMode is
+            # "transparent" (confirmed against the live API: without them it
+            # 400s with "width and height are required when outputMode is
+            # transparent", which the client only ever saw as an opaque 502).
+            if probed_width and probed_height:
+                export_settings["width"] = probed_width
+                export_settings["height"] = probed_height
+            else:
+                # Never send a transparent task ZapCap will just reject — fail
+                # loudly here with a clear reason instead of a second opaque 502.
+                await refund_video_job(user_id, job_id, billing, reason="refund")
+                raise HTTPException(
+                    status_code=422,
+                    detail="Could not read this video's dimensions, which are required for transparent output. Try a different file."
+                )
+        elif output_mode == "greenScreen":
+            export_settings["greenScreen"] = True
+        if quality != "standard":
+            export_settings["quality"] = quality
 
-    task_payload: dict = {
-        "templateId": template_id,
-        "language": language,
-        "autoApprove": True,
-    }
-    if export_settings:
-        task_payload["exportSettings"] = export_settings
-    if caption_style in _CAPTION_RENDER_OPTIONS:
-        task_payload["renderOptions"] = _CAPTION_RENDER_OPTIONS[caption_style]
+        _CAPTION_RENDER_OPTIONS: dict = {
+            "bold": {
+                "styleOptions": {"fontUppercase": True, "fontWeight": 800, "stroke": "m", "fontShadow": "s"},
+                "subsOptions": {"animation": False, "emphasizeKeywords": True, "displayWords": 3},
+                "highlightOptions": {"randomColourOne": "#FFE600", "randomColourTwo": "#FF4136"},
+            },
+            "minimal": {
+                "styleOptions": {"fontUppercase": False, "fontWeight": 400, "stroke": "none", "fontShadow": "none"},
+                "subsOptions": {"animation": False, "emphasizeKeywords": False, "displayWords": 6},
+            },
+            "animated": {
+                "styleOptions": {"fontUppercase": False, "fontWeight": 700, "stroke": "s"},
+                "subsOptions": {"animation": True, "emphasizeKeywords": True, "displayWords": 4},
+                "highlightOptions": {"randomColourOne": "#FF6B9D", "randomColourTwo": "#A855F7", "randomColourThree": "#06B6D4"},
+            },
+        }
 
-    # Custom b-roll: upload clips to Cloudinary and spread them evenly across estimated duration.
-    # customBrolls is mutually exclusive with brollPercent — don't set both.
-    if custom_broll_clips:
-        clip_urls = []
-        for i, clip in enumerate(custom_broll_clips):
-            clip_bytes = await clip.read()
-            url = await _upload_to_cloudinary(clip_bytes, f"broll-preprod-{job_id}-{i}")
-            clip_urls.append(url)
-            print(f"[ZapCap/customBroll] uploaded clip {i} → {url[:60]}", flush=True)
+        task_payload: dict = {
+            "templateId": template_id,
+            "language": language,
+            "autoApprove": True,
+        }
+        if export_settings:
+            task_payload["exportSettings"] = export_settings
+        if caption_style in _CAPTION_RENDER_OPTIONS:
+            task_payload["renderOptions"] = _CAPTION_RENDER_OPTIONS[caption_style]
 
-        import json as _json_broll
-        if custom_broll_placements:
-            raw = _json_broll.loads(custom_broll_placements)
-            custom_brolls = [
-                {
-                    "startTime": round(float(p["startTime"]), 2),
-                    "endTime": round(float(p["startTime"]) + float(p["duration"]), 2),
-                    "url": clip_urls[int(p["clipIndex"])],
-                }
-                for p in raw
-                if int(p["clipIndex"]) < len(clip_urls)
-            ]
-            print(f"[ZapCap/customBroll] {len(custom_brolls)} clips from explicit placements", flush=True)
-        else:
-            clip_duration = 4.0
-            n = len(clip_urls)
-            spread = custom_broll_estimated_duration / (n + 1)
-            custom_brolls = [
-                {"startTime": round(spread * (i + 1), 2), "endTime": round(spread * (i + 1) + clip_duration, 2), "url": clip_urls[i]}
-                for i in range(n)
-            ]
-            custom_brolls = [c for c in custom_brolls if c["startTime"] < custom_broll_estimated_duration]
-            for c in custom_brolls:
-                c["endTime"] = min(c["endTime"], custom_broll_estimated_duration)
-            print(f"[ZapCap/customBroll] {len(custom_brolls)} clips auto-spread over ~{custom_broll_estimated_duration}s", flush=True)
-        custom_brolls.sort(key=lambda c: c["startTime"])
-        task_payload["transcribeSettings"] = {"broll": {"customBrolls": custom_brolls}}
-    elif enable_broll.lower() == "true":
-        task_payload["transcribeSettings"] = {"broll": {"brollPercent": 50}}
+        # Custom b-roll: upload clips to Cloudinary and spread them evenly across estimated duration.
+        # customBrolls is mutually exclusive with brollPercent — don't set both.
+        if custom_broll_clips:
+            clip_urls = []
+            for i, clip in enumerate(custom_broll_clips):
+                clip_bytes = await clip.read()
+                url = await _upload_to_cloudinary(clip_bytes, f"broll-preprod-{job_id}-{i}")
+                clip_urls.append(url)
+                print(f"[ZapCap/customBroll] uploaded clip {i} → {url[:60]}", flush=True)
 
-    # Submit task → get taskId
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(
-            f"{_ZAPCAP_BASE}/videos/{zapcap_video_id}/task",
-            json=task_payload,
-            headers=headers,
-        )
-        if r.status_code not in (200, 201):
-            await refund_video_job(user_id, job_id, billing, reason="refund")
-            raise HTTPException(status_code=502, detail=f"ZapCap task failed: {r.text}")
-        zapcap_task_id = r.json().get("taskId") or r.json().get("id")
-        if not zapcap_task_id:
-            await refund_video_job(user_id, job_id, billing, reason="refund")
-            raise HTTPException(status_code=502, detail=f"ZapCap returned no taskId: {r.text}")
+            import json as _json_broll
+            if custom_broll_placements:
+                raw = _json_broll.loads(custom_broll_placements)
+                custom_brolls = [
+                    {
+                        "startTime": round(float(p["startTime"]), 2),
+                        "endTime": round(float(p["startTime"]) + float(p["duration"]), 2),
+                        "url": clip_urls[int(p["clipIndex"])],
+                    }
+                    for p in raw
+                    if int(p["clipIndex"]) < len(clip_urls)
+                ]
+                print(f"[ZapCap/customBroll] {len(custom_brolls)} clips from explicit placements", flush=True)
+            else:
+                clip_duration = 4.0
+                n = len(clip_urls)
+                spread = custom_broll_estimated_duration / (n + 1)
+                custom_brolls = [
+                    {"startTime": round(spread * (i + 1), 2), "endTime": round(spread * (i + 1) + clip_duration, 2), "url": clip_urls[i]}
+                    for i in range(n)
+                ]
+                custom_brolls = [c for c in custom_brolls if c["startTime"] < custom_broll_estimated_duration]
+                for c in custom_brolls:
+                    c["endTime"] = min(c["endTime"], custom_broll_estimated_duration)
+                print(f"[ZapCap/customBroll] {len(custom_brolls)} clips auto-spread over ~{custom_broll_estimated_duration}s", flush=True)
+            custom_brolls.sort(key=lambda c: c["startTime"])
+            task_payload["transcribeSettings"] = {"broll": {"customBrolls": custom_brolls}}
+        elif enable_broll.lower() == "true":
+            task_payload["transcribeSettings"] = {"broll": {"brollPercent": 50}}
+
+        # Submit task → get taskId
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post(
+                f"{_ZAPCAP_BASE}/videos/{zapcap_video_id}/task",
+                json=task_payload,
+                headers=headers,
+            )
+            if r.status_code not in (200, 201):
+                await refund_video_job(user_id, job_id, billing, reason="refund")
+                raise HTTPException(status_code=502, detail=f"ZapCap task failed: {r.text}")
+            zapcap_task_id = r.json().get("taskId") or r.json().get("id")
+            if not zapcap_task_id:
+                await refund_video_job(user_id, job_id, billing, reason="refund")
+                raise HTTPException(status_code=502, detail=f"ZapCap returned no taskId: {r.text}")
+    else:
+        if enable_broll.lower() == "true" or custom_broll_clips:
+            print(f"[ZapCap] captions_enabled=false — skipping auto/custom b-roll for job {job_id} (needs ZapCap's transcription, which didn't run)", flush=True)
 
     # Handle optional background music — either a user-uploaded MP3, or an
     # AI-picked track chosen by mapping the video's purpose to a mood.
@@ -9760,6 +9829,8 @@ async def zapcap_produce(
     await db["zapcap_jobs"].insert_one({
         "job_id": job_id,
         "user_id": user_id,
+        "render_type": "no_captions" if not captions_wanted else None,
+        "captions_enabled": captions_wanted,
         "zapcap_video_id": zapcap_video_id,
         "zapcap_task_id": zapcap_task_id,
         "template_id": template_id,
@@ -10030,6 +10101,82 @@ async def zapcap_job_status(
             "status": mapped,
             "output_url": ss_url or None,
             "failure_reason": "Shotstack render failed" if mapped == "failed" else None,
+        })
+
+    # ── No-captions jobs: no ZapCap task ever ran (captions can't be turned
+    # off on ZapCap's side — confirmed live, see zapcap_produce). Run the same
+    # music/hook-text/brand-overlay chain a normal job gets post-ZapCap, just
+    # starting from the raw uploaded video. Everything here is our own
+    # ffmpeg-based compositing, so it finishes synchronously on this one poll
+    # instead of needing further status checks.
+    if job.get("render_type") == "no_captions":
+        output_url = job["video_url"]
+
+        if job.get("music_url"):
+            print(f"[NoCaptions] mixing music into job {job_id}", flush=True)
+            mixed_url = await _mix_music_into_video(
+                output_url, job["music_url"], mute_original=bool(job.get("mute_original_audio"))
+            )
+            if mixed_url:
+                output_url = mixed_url
+                print(f"[NoCaptions] music mixed → {mixed_url[:60]}", flush=True)
+            else:
+                print(f"[NoCaptions] music mix failed — keeping video without music", flush=True)
+
+        # Hook text: only from user-provided text — there's no ZapCap
+        # transcript to auto-generate one from (that requires ZapCap's own
+        # transcription, which never ran for a no-captions job).
+        if job.get("hook_text_enabled") and job.get("custom_hook_text"):
+            try:
+                hook_text = job["custom_hook_text"]
+                print(f"[NoCaptions/HookText] using user-provided text for job {job_id}: '{hook_text}'", flush=True)
+                overlaid_url = await _add_hook_text_overlay(
+                    output_url, hook_text, job.get("video_width"), color=job.get("hook_text_color") or "#ffffff"
+                )
+                if overlaid_url:
+                    output_url = overlaid_url
+                    await db["zapcap_jobs"].update_one({"job_id": job_id}, {"$set": {"hook_text": hook_text}})
+                    print(f"[NoCaptions/HookText] applied → {overlaid_url[:60]}", flush=True)
+                else:
+                    print(f"[NoCaptions/HookText] overlay failed — keeping video without hook text", flush=True)
+            except Exception as _e:
+                print(f"[NoCaptions/HookText] error: {_e}", flush=True)
+        elif job.get("hook_text_enabled"):
+            print(f"[NoCaptions/HookText] enabled but no custom_hook_text — skipping (no transcript available to auto-generate from)", flush=True)
+
+        if job.get("brand_overlay_enabled"):
+            try:
+                await db["zapcap_jobs"].update_one({"job_id": job_id}, {"$set": {"pre_overlay_output_url": output_url}})
+                overlaid_url = await _add_brand_overlay(
+                    output_url,
+                    job.get("brand_overlay_logo_url"),
+                    job.get("logo_position") or "bottom_right",
+                    job.get("logo_timing") or "whole",
+                    job.get("brand_overlay_contact_text"),
+                    job.get("contact_position") or "bottom_center",
+                    job.get("contact_timing") or "end",
+                    brand_name=job.get("brand_overlay_name") or "",
+                    brand_color=job.get("brand_overlay_color") or "#CD1B78",
+                    video_width=job.get("video_width"),
+                )
+                if overlaid_url:
+                    output_url = overlaid_url
+                    print(f"[NoCaptions/BrandOverlay] applied → {overlaid_url[:60]}", flush=True)
+                else:
+                    print(f"[NoCaptions/BrandOverlay] overlay failed or nothing to burn — keeping video as-is", flush=True)
+            except Exception as _e:
+                print(f"[NoCaptions/BrandOverlay] error: {_e}", flush=True)
+
+        final_url = output_url
+        await db["zapcap_jobs"].update_one(
+            {"job_id": job_id},
+            {"$set": {"status": "completed", "output_url": final_url, "final_output_url": final_url}},
+        )
+        print(f"[NoCaptions] job {job_id} complete → {final_url[:60]}", flush=True)
+        return UriResponse.get_single_data_response("zapcap_job", {
+            "status": "completed",
+            "output_url": final_url,
+            "failure_reason": None,
         })
 
     headers = await _zapcap_headers()
@@ -10324,6 +10471,14 @@ async def zapcap_job_rerender(
     job = await db["zapcap_jobs"].find_one({"job_id": job_id})
     if not job:
         raise HTTPException(status_code=404, detail="ZapCap job not found")
+    if job.get("render_type") == "no_captions":
+        # This job never ran through ZapCap (captions were off, so we skipped
+        # it entirely) — there's no ZapCap task to rerender word edits or
+        # b-roll against. B-roll placement needs ZapCap's transcription.
+        raise HTTPException(
+            status_code=422,
+            detail="This render has captions off, so there's no transcript to edit or b-roll to auto-place. Turn captions on and re-render to use word edits or auto b-roll."
+        )
 
     headers = await _zapcap_headers()
     zapcap_video_id = job["zapcap_video_id"]
@@ -10450,6 +10605,7 @@ async def zapcap_job_custom_broll(
     """
     import uuid as _uuid3
     import json as _json
+    import re
     import httpx as _httpx_cb
     from datetime import datetime, timezone
     from app.agents.social_media_manager.services.video_production_service import (
@@ -10476,18 +10632,33 @@ async def zapcap_job_custom_broll(
     if not placement_list:
         raise HTTPException(status_code=400, detail="No placements provided")
 
-    # Upload each clip to Cloudinary so ZapCap can fetch them via public URL
-    clip_urls: list[str] = []
+    # Videos upload straight to Cloudinary as before. Images have no timeline
+    # of their own — a b-roll slot needs something to actually play for its
+    # startTime→endTime window — so those are converted to a silent held-image
+    # video per placement (deferred until the placement loop below, since the
+    # duration comes from the placement, not the file).
+    _IMAGE_TYPES = {"image/jpeg", "image/jpg", "image/png", "image/webp"}
+    clip_urls: list[Optional[str]] = []
+    clip_bytes_list: list[bytes] = []
+    clip_is_image: list[bool] = []
     for i, clip_file in enumerate(clips):
         clip_bytes = await clip_file.read()
-        clip_url = await _upload_broll_clip(clip_bytes, f"broll-custom-{job_id}-{i}")
-        clip_urls.append(clip_url)
+        is_image = (clip_file.content_type in _IMAGE_TYPES) or bool(
+            re.search(r"\.(jpe?g|png|webp)$", clip_file.filename or "", re.IGNORECASE)
+        )
+        clip_bytes_list.append(clip_bytes)
+        clip_is_image.append(is_image)
+        if is_image:
+            clip_urls.append(None)  # resolved per-placement below
+        else:
+            clip_urls.append(await _upload_broll_clip(clip_bytes, f"broll-custom-{job_id}-{i}"))
 
     if not clip_urls:
         raise HTTPException(status_code=400, detail="No clips provided")
 
     # Map placements to ZapCap CustomBrollDto format
     # ZapCap constraint: overlapping brolls are not allowed; sort by startTime
+    _image_video_cache: dict[tuple[int, float], Optional[str]] = {}
     custom_brolls = []
     for p in sorted(placement_list, key=lambda x: float(x.get("start_time", 0))):
         idx = int(p.get("clip_index", 0))
@@ -10495,10 +10666,26 @@ async def zapcap_job_custom_broll(
             continue
         start = float(p.get("start_time", 0))
         end = float(p.get("end_time", start + 5.0))
+
+        if clip_is_image[idx]:
+            cache_key = (idx, round(end - start, 2))
+            if cache_key not in _image_video_cache:
+                converted_bytes = await _image_to_video_clip(clip_bytes_list[idx], end - start)
+                _image_video_cache[cache_key] = (
+                    await _upload_broll_clip(converted_bytes, f"broll-custom-{job_id}-{idx}-img")
+                    if converted_bytes else None
+                )
+            url = _image_video_cache[cache_key]
+            if not url:
+                print(f"[ZapCap/customBroll] image→video conversion failed for clip {idx} — skipping placement", flush=True)
+                continue
+        else:
+            url = clip_urls[idx]
+
         custom_brolls.append({
             "startTime": start,
             "endTime": end,
-            "url": clip_urls[idx],
+            "url": url,
         })
 
     if not custom_brolls:
