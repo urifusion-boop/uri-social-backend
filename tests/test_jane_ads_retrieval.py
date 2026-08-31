@@ -520,16 +520,21 @@ class TestCreativeCorpusReachesShippedCopy:
 
 
 class TestAdImageCta:
-    """Every Jane ad routes to WhatsApp, so the image must not carry the brand's
-    generic website CTA. Live-observed: a click-to-WhatsApp ad whose creative read
-    "Visit our website" while the copy said "message me to order"."""
+    """The image's CTA must match where the ad actually sends people, never the
+    brand playbook's generic one. Live-observed: a click-to-WhatsApp ad whose
+    creative read "Visit our website" while the copy said "message me to order"."""
 
-    def test_image_cta_is_overridden_to_whatsapp(self):
+    def test_image_cta_follows_the_ad_destination(self):
         import inspect
         from app.agents.jane_ads import creative
+        from app.agents.jane_ads.destination import DestinationType, image_cta
         src = inspect.getsource(creative.generate_ad_creative)
-        assert '"override_cta": "Message us on WhatsApp"' in src
+        assert '"override_cta": image_cta(coerce_type(destination_type))' in src
         assert "generate_ad_image(content_for_image, image_brand_context" in src
+        # And each destination gets its own honest wording.
+        assert image_cta(DestinationType.WHATSAPP) == "Message us on WhatsApp"
+        assert image_cta(DestinationType.WEBSITE) == "Visit our website"
+        assert image_cta(DestinationType.INSTAGRAM_DM) == "DM us on Instagram"
 
 
 class TestCreativeCallSites:

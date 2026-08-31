@@ -217,7 +217,10 @@ def test_launch_campaign_creates_full_chain_and_stores_record():
     # (live-confirmed: an empty chat with an unfamiliar number got 186 clicks and zero
     # messages — see test_wa_link_prefills_an_opening_message below).
     assert creative_spec["link_data"]["link"].startswith("https://wa.me/2348031234567?text=")
-    assert creative_spec["link_data"]["call_to_action"]["type"] == "WHATSAPP_MESSAGE"
+    # CONTACT_US, not Meta's native WHATSAPP_MESSAGE: the native button needs the Page
+    # to have a WhatsApp number connected and is blocked at review without it
+    # (#2446880). The wa.me link on the CTA is the destination either way.
+    assert creative_spec["link_data"]["call_to_action"]["type"] == "CONTACT_US"
     ad_json = mock_client.post.call_args_list[3].kwargs["json"]
     assert ad_json  # ad creation call still happens after creative
 
@@ -477,7 +480,7 @@ def test_video_creative_carries_the_wa_link_on_the_cta():
         _run(adapter.launch_campaign(plan, _auth()))
 
     video_data = mock_client.post.call_args_list[-2].kwargs["json"]["object_story_spec"]["video_data"]
-    assert video_data["call_to_action"]["type"] == "LEARN_MORE"
+    assert video_data["call_to_action"]["type"] == "CONTACT_US"
     assert video_data["call_to_action"]["value"]["link"].startswith("https://wa.me/2348031234567?text=")
 
 

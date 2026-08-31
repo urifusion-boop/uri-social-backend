@@ -143,7 +143,7 @@ def test_launch_campaign_happy_path_full_call_sequence():
     assert ad_json["operation_status"] == "DISABLE"
     creative = ad_json["creatives"][0]
     assert creative["video_id"] == "vid_999"
-    assert creative["landing_page_url"] == "https://wa.me/2348031234567"
+    assert creative["landing_page_url"] == 'https://wa.me/2348031234567?text=Hi%21%20I%20saw%20your%20ad%20and%20I%27m%20interested%20%E2%80%94%20tell%20me%20more%3F'
 
     record = _run(db["jane_ads_tiktok_campaigns"].find_one({"campaign_id": "111"}))
     assert record["ad_id"] == "333"

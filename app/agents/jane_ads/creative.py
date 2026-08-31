@@ -43,9 +43,11 @@ import openai
 
 from app.core.config import settings
 
+from .destination import DEFAULT_DESTINATION, coerce_type, cta_label, image_cta
 from .models import AdCopy, AdCreative, CreativeSource, GeoMode, GeoPlan, ShootScript, ShootShot
 
-WHATSAPP_CTA = "Send WhatsApp Message"
+WHATSAPP_CTA = "Send WhatsApp Message"   # the default destination's button; see
+                                          # destination.py for website/Instagram DM
 
 # Ads are always vertical (CTWA/Stories placements) regardless of which ad platform
 # the campaign ultimately runs on — "instagram"+"story" is the engine's 9:16 spec.
@@ -831,9 +833,12 @@ def _looks_like_video(url: str) -> bool:
 def assemble_creative(copy: AdCopy, image_url: Optional[str],
                       source: CreativeSource = CreativeSource.GENERATE,
                       is_video: Optional[bool] = None,
-                      service_area: str = "") -> AdCreative:
-    """Combine copy + media into a submittable creative. The WhatsApp CTA is always
-    attached; `generated` is False when there's no media (copy-only fallback).
+                      service_area: str = "",
+                      destination_type: str = DEFAULT_DESTINATION.value,
+                      destination_cta: str = "") -> AdCreative:
+    """Combine copy + media into a submittable creative. The CTA matches the brand's
+    ad destination (`destination_type` — WhatsApp unless they chose their website or
+    Instagram DMs), so the button never promises somewhere the tap doesn't go; `generated` is False when there's no media (copy-only fallback).
     `is_video` should be passed explicitly when the caller already knows the media
     type (e.g. from the upload's content-type); otherwise it's guessed from the URL.
     The video recommendation applies to ANY source whose media isn't already a video
@@ -852,7 +857,7 @@ def assemble_creative(copy: AdCopy, image_url: Optional[str],
         is_video=resolved_is_video,
         headline=copy.headline,
         primary_text=copy.primary_text,
-        cta=WHATSAPP_CTA,
+        cta=cta_label(coerce_type(destination_type), destination_cta),
         source=source,
         generated=bool(url),
         video_recommendation=copy.video_recommendation_reason if (
@@ -872,7 +877,8 @@ async def generate_ad_creative(
     user_id: str = "", db=None, brand_id: Optional[str] = None, city: str = "",
     behaviour: str = "", service_area: str = "", audience_segment: str = "",
     who_its_for: str = "", geo_pockets: Optional[list[str]] = None,
-    budget_ngn: float = 0.0,
+    budget_ngn: float = 0.0, destination_type: str = DEFAULT_DESTINATION.value,
+    destination_cta: str = "",
 ) -> AdCreative:
     """SOURCE 1 (default) — Jane writes the copy and generates the image herself,
     using the brand playbook's colours/voice/region/industry, grounded in `city` (the
@@ -902,11 +908,12 @@ async def generate_ad_creative(
     # Image via the SAME content engine normal posts use (better visuals). Seed it with the
     # scene idea; content conveys the theme/message so the graphic is on-topic.
     content_for_image = copy.primary_text or copy.image_prompt or f"{business_name} — {description or category}"
-    # Every Jane ad routes to WhatsApp (AdCreative.cta is fixed), so the image must not
-    # carry the brand's generic website CTA. Live-observed: a click-to-WhatsApp ad whose
-    # creative read "Visit our website" while the copy said "message me to order" — two
-    # different destinations on one ad, and these users often have no website at all.
-    image_brand_context = {**(brand_context or {}), "override_cta": "Message us on WhatsApp"}
+    # The image must say the same thing the button does. Live-observed: a click-to-
+    # WhatsApp ad whose creative read "Visit our website" while the copy said "message
+    # me to order" — two different destinations on one ad. So the image's CTA comes
+    # from the brand's real ad destination, not the brand playbook's generic one.
+    image_brand_context = {**(brand_context or {}),
+                           "override_cta": image_cta(coerce_type(destination_type))}
     image_url = await generate_ad_image(content_for_image, image_brand_context, seed=copy.image_prompt)
     # Caption LAST, matched to the actual generated image (vision) so it references the
     # real visual instead of a generic line ("caption doesn't add up"). Falls back to the
@@ -926,7 +933,8 @@ async def generate_ad_creative(
                 copy.headline = matched.headline
             if matched.primary_text:
                 copy.primary_text = matched.primary_text
-    ad = assemble_creative(copy, image_url, source=CreativeSource.GENERATE, service_area=service_area)
+    ad = assemble_creative(copy, image_url, source=CreativeSource.GENERATE, service_area=service_area,
+                           destination_type=destination_type, destination_cta=destination_cta)
     if corpus is not None:
         from .models import StrategyCitation
         ad.corpus_coverage = corpus.coverage
@@ -944,6 +952,7 @@ async def creative_from_upload(
     description: str = "", user_id: str = "", db=None, brand_id: Optional[str] = None,
     is_video: Optional[bool] = None, city: str = "", service_area: str = "",
     audience_segment: str = "", who_its_for: str = "", geo_pockets: Optional[list[str]] = None,
+    destination_type: str = DEFAULT_DESTINATION.value, destination_cta: str = "",
 ) -> AdCreative:
     """SOURCE 2 — the user's own uploaded photo OR video (uploaded via
     /jane-ads/creative/upload, or the existing /upload-user-content flow) becomes
@@ -966,13 +975,15 @@ async def creative_from_upload(
                                    service_area=service_area, audience_segment=audience_segment,
                                    who_its_for=who_its_for, geo_pockets=geo_pockets)
     return assemble_creative(copy, image_url, source=CreativeSource.UPLOAD, is_video=is_video,
-                             service_area=service_area)
+                             service_area=service_area, destination_type=destination_type,
+                             destination_cta=destination_cta)
 
 
 async def creative_from_draft(
     business_name: str, category: str, draft_id: str, user_id: str, db,
     goal: str = "messages", brand_id: Optional[str] = None, city: str = "", service_area: str = "",
     audience_segment: str = "", who_its_for: str = "", geo_pockets: Optional[list[str]] = None,
+    destination_type: str = DEFAULT_DESTINATION.value, destination_cta: str = "",
 ) -> Optional[AdCreative]:
     """SOURCE 3 — reuse a content draft the user already generated and liked.
     Returns None if the draft can't be found (caller should 404)."""
@@ -987,14 +998,17 @@ async def creative_from_draft(
         summary, business_name, category, goal, draft["content"], brand_context, city,
         service_area, audience_segment, who_its_for, geo_pockets=geo_pockets,
     )
-    return assemble_creative(copy, draft["image_url"], source=CreativeSource.DRAFT, service_area=service_area)
+    return assemble_creative(copy, draft["image_url"], source=CreativeSource.DRAFT,
+                             service_area=service_area, destination_type=destination_type,
+                             destination_cta=destination_cta)
 
 
 async def creative_from_recomposite(
     business_name: str, category: str, reference_image_url: str, goal: str = "messages",
     description: str = "", user_id: str = "", db=None, brand_id: Optional[str] = None,
     city: str = "", service_area: str = "", audience_segment: str = "", who_its_for: str = "",
-    geo_pockets: Optional[list[str]] = None,
+    geo_pockets: Optional[list[str]] = None, destination_type: str = DEFAULT_DESTINATION.value,
+    destination_cta: str = "",
 ) -> AdCreative:
     """SOURCE 4 — the user's own real product photo, recomposited: background
     cleaned/replaced, the product itself preserved exactly (creative brief spec §7,
@@ -1020,4 +1034,6 @@ async def creative_from_recomposite(
         copy = await write_ad_copy(business_name, category, goal, description, brand_context, city,
                                    audience_segment=audience_segment, who_its_for=who_its_for,
                                    service_area=service_area, geo_pockets=geo_pockets)
-    return assemble_creative(copy, final_image, source=CreativeSource.RECOMPOSITE, service_area=service_area)
+    return assemble_creative(copy, final_image, source=CreativeSource.RECOMPOSITE,
+                             service_area=service_area, destination_type=destination_type,
+                             destination_cta=destination_cta)
