@@ -416,6 +416,18 @@ class AutoContentService:
         include_images = settings_doc.get("include_images", False)
         settings_brand_context = settings_doc.get("brand_context") or {}
 
+        # TikTok direct-OAuth connections can only publish video, and Auto never
+        # generates video (image or text only) — so a TikTok draft would be
+        # created here only to fail at publish time. Outstand-connected TikTok
+        # already has a proven photo-publish path (approval_workflow_service.py),
+        # so only include TikTok when that's how it's connected.
+        if "tiktok" in platforms:
+            tiktok_conn = await db["social_connections"].find_one(
+                {"user_id": user_id, "platform": "tiktok", "connection_status": "active"}
+            )
+            if not tiktok_conn or tiktok_conn.get("connected_via") != "outstand":
+                platforms = [p for p in platforms if p != "tiktok"]
+
         # Load the rich brand profile from onboarding (source of truth)
         profile_result = await BrandProfileService.get(user_id, db)
         profile_data = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}

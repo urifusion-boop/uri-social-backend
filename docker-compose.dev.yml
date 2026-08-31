@@ -4,6 +4,9 @@ services:
   uri-agent.api:
     image: uriteam/urisvc:uriagentdev
     container_name: uri-agent.api
+    build:
+      context: .
+      dockerfile: Dockerfile
     command:
       [
         'uvicorn',

@@ -64,17 +64,33 @@ from .. import constants as C
 
 COLLECTION = "jane_ads_tiktok_campaigns"
 
-# TikTok's documented geo-target id for Nigeria (region-code lookup) — like Google's
-# geoTargetConstants/2566, this is a value to confirm against a live
-# /open_api/v1.3/tool/region/ call once real credentials exist; not guessable purely
-# from public docs with certainty, flagged here rather than silently trusted.
-_NIGERIA_LOCATION_ID = "10000541"
+# TikTok's location_ids are GeoNames ids (confirmed: TikTok's own docs give
+# 6252001 as their United States example, which is exactly GeoNames' id for
+# the US — https://www.geonames.org/6252001). Nigeria's GeoNames id is
+# 2328926 (https://www.geonames.org/2328926/nigeria.html). The old value
+# here (10000541) was an unverified guess that failed live against a real
+# advertiser account ("At least 1 location ID is invalid") — TikTok's own
+# /tool/region/ lookup isn't available on a Sandbox Ad Account (404s there),
+# so this is confirmed by the GeoNames pattern match rather than a live
+# region-list call; re-verify once a real (non-sandbox) launch is possible.
+_NIGERIA_LOCATION_ID = "2328926"
 
 # TikTok's ad-group-level optimization/billing pair for a click-driving campaign —
 # mirrors the "Maximise Clicks"-equivalent choice google.py made for the same reason
 # (no conversion volume exists yet to train a smarter bidding strategy).
 _OPTIMIZATION_GOAL = "CLICK"
 _BILLING_EVENT = "CPC"
+
+# Every TikTok ad creative must declare who it's posted "as" (their Identity
+# feature — like a Facebook Page for a Meta ad). Confirmed live (2026-08-31):
+# omitting it fails ad/create with "creatives.identity_id is required". We
+# don't have per-brand TikTok accounts (same shared-account architecture as
+# everywhere else in this adapter), so one shared CUSTOMIZED_USER identity is
+# created once and reused — see _get_or_create_identity. TikTok requires the
+# avatar to be a 1:1 square image.
+_IDENTITY_COLLECTION = "jane_ads_tiktok_identity"
+_IDENTITY_DISPLAY_NAME = "URI Social"
+_IDENTITY_LOGO_URL = "https://staging.urisocial.com/images/uri-logo-1024.png"
 
 # TikTok's operation_status values, translated to plain language for the campaign-
 # list view — same purpose as meta.py's own _DELIVERY_LABELS. An empty campaign/get/
@@ -115,7 +131,7 @@ class TikTokAdsAdapter(AdPlatformAdapter):
         self._db = db
         self._advertiser_id = advertiser_id
         self._access_token = access_token
-        self._api_base = f"https://business-api.tiktok.com/open_api/{settings.TIKTOK_ADS_API_VERSION}"
+        self._api_base = f"{settings.TIKTOK_ADS_API_BASE}/open_api/{settings.TIKTOK_ADS_API_VERSION}"
         if not self._advertiser_id:
             raise TikTokAdsAPIError("advertiser_id is required")
         if not self._access_token:
@@ -125,6 +141,54 @@ class TikTokAdsAdapter(AdPlatformAdapter):
         # TikTok's Marketing API uses a bare "Access-Token" header — NOT
         # "Authorization: Bearer", a real difference from both Meta and Google.
         return {"Access-Token": self._access_token, "Content-Type": "application/json"}
+
+    async def _get_or_create_identity(self, client: httpx.AsyncClient) -> str:
+        """Returns the shared CUSTOMIZED_USER identity_id every ad creative
+        needs, creating it once (uploads the URI logo, creates the identity)
+        and caching it in Mongo — never recreated after the first successful
+        call, on this advertiser account or any other that reuses this DB."""
+        cached = await self._db[_IDENTITY_COLLECTION].find_one({"advertiser_id": self._advertiser_id})
+        if cached and cached.get("identity_id"):
+            return cached["identity_id"]
+
+        image_resp = await client.post(
+            f"{self._api_base}/file/image/ad/upload/",
+            headers=self._headers(),
+            json={
+                "advertiser_id": self._advertiser_id,
+                "upload_type": "UPLOAD_BY_URL",
+                "image_url": _IDENTITY_LOGO_URL,
+                "file_name": "uri-social-identity-logo.png",
+            },
+        )
+        image_data = image_resp.json()
+        _raise_for_error(image_data, "identity logo upload")
+        inner = image_data.get("data") or {}
+        image_id = inner[0]["image_id"] if isinstance(inner, list) else inner.get("image_id")
+        if not image_id:
+            raise TikTokAdsAPIError(f"image upload returned no image_id: {image_data}")
+
+        identity_resp = await client.post(
+            f"{self._api_base}/identity/create/",
+            headers=self._headers(),
+            json={
+                "advertiser_id": self._advertiser_id,
+                "display_name": _IDENTITY_DISPLAY_NAME,
+                "image_uri": image_id,
+            },
+        )
+        identity_data = identity_resp.json()
+        _raise_for_error(identity_data, "identity creation")
+        identity_id = (identity_data.get("data") or {}).get("identity_id")
+        if not identity_id:
+            raise TikTokAdsAPIError(f"identity creation returned no identity_id: {identity_data}")
+
+        await self._db[_IDENTITY_COLLECTION].update_one(
+            {"advertiser_id": self._advertiser_id},
+            {"$set": {"identity_id": identity_id, "image_id": image_id, "created_at": datetime.now(timezone.utc)}},
+            upsert=True,
+        )
+        return identity_id
 
     async def launch_campaign(self, plan: CampaignPlan, auth: SpendAuthorization) -> LaunchResult:
         tiktok_plans = [p for p in plan.platforms if p.platform == Platform.TIKTOK]
@@ -199,6 +263,14 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                         "advertiser_id": self._advertiser_id,
                         "campaign_id": campaign_id,
                         "adgroup_name": f"JaneAds-{plan.business_id}-adgroup",
+                        # Required by TikTok for every ad group — confirmed live
+                        # (2026-08-31): omitting it fails with "Invalid value for
+                        # promotion_type" rather than defaulting to anything. The
+                        # destination is an external URL (wa.me), matching the
+                        # campaign's own TRAFFIC objective_type above, so this is
+                        # "WEBSITE" — not TikTok's native in-app messaging type,
+                        # since we're not using their Click-to-Message integration.
+                        "promotion_type": "WEBSITE",
                         "placement_type": "PLACEMENT_TYPE_NORMAL",
                         "placements": ["PLACEMENT_TIKTOK"],
                         "location_ids": [_NIGERIA_LOCATION_ID],
@@ -209,6 +281,22 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                         "schedule_end_time": end.strftime("%Y-%m-%d %H:%M:%S"),
                         "optimization_goal": _OPTIMIZATION_GOAL,
                         "billing_event": _BILLING_EVENT,
+                        # Confirmed live (2026-08-31): omitting bid_type fails with
+                        # "Bid needs to be greater than $0.00" — TikTok defaults to
+                        # requiring an explicit bid_price rather than automatic
+                        # bidding unless told otherwise. NO_BID lets TikTok pick the
+                        # bid automatically to spend the budget efficiently, matching
+                        # Meta/Google's own automatic-bidding choice elsewhere in
+                        # Jane + Ads — no per-click bid management for the user.
+                        "bid_type": "BID_TYPE_NO_BID",
+                        # Confirmed live (2026-08-31): whatever pacing TikTok defaults
+                        # to here reads as "accelerated," which it flatly rejects
+                        # paired with BID_TYPE_NO_BID for this objective ("Accelerated
+                        # delivery under No-Bid strategy is not supported"). SMOOTH
+                        # (standard pacing, spend spread across the whole schedule)
+                        # is also just the right choice for an unattended, no-manual-
+                        # tuning campaign regardless of the error.
+                        "pacing": "PACING_MODE_SMOOTH",
                         "operation_status": "DISABLE",
                     },
                 )
@@ -217,7 +305,10 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                 adgroup_id = str(adgroup_data["data"]["adgroup_id"])
 
                 # 4. The ad itself — video creative + copy + the brand's destination
-                # as the landing page, paused.
+                # as the landing page, paused. Every creative must declare an identity
+                # (who it's posted "as") — the one shared URI Social identity,
+                # created once.
+                identity_id = await self._get_or_create_identity(client)
                 ad_resp = await client.post(
                     f"{self._api_base}/ad/create/",
                     headers=self._headers(),
@@ -228,6 +319,8 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                             "ad_name": f"JaneAds-{plan.business_id}-ad",
                             "ad_text": (plan.creative.primary_text or plan.creative.headline or "")[:100],
                             "video_id": video_id,
+                            "identity_id": identity_id,
+                            "identity_type": "CUSTOMIZED_USER",
                             "landing_page_url": dest_link,
                             "call_to_action": "CONTACT_US",
                         }],
@@ -280,7 +373,17 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                         "operation_status": "DELETE",
                     },
                 )
-                data = resp.json()
+                # A non-JSON/empty body (seen live: httpx's .json() raising
+                # "Expecting value: line 1 column 1") means something failed
+                # before TikTok's own JSON envelope ever got written — surface
+                # the raw status/text instead of a cryptic decode error, since
+                # this path is diagnostic-only and never re-raises anyway.
+                try:
+                    data = resp.json()
+                except ValueError:
+                    print(f"[TikTokAdsAdapter] ORPHANED campaign {campaign_id} — "
+                          f"rollback got a non-JSON response: HTTP {resp.status_code} {resp.text[:300]!r}", flush=True)
+                    return
                 if data.get("code") not in (0, None):
                     print(f"[TikTokAdsAdapter] ORPHANED campaign {campaign_id} — "
                           f"rollback rejected: {data.get('message')}", flush=True)
