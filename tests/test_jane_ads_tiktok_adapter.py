@@ -47,11 +47,28 @@ class FakeCollection:
         self.docs[cid] = existing
 
 
+class FakeIdentityCollection:
+    """A single cached doc, looked up by advertiser_id — mirrors the shape
+    _get_or_create_identity actually uses (jane_ads_tiktok_identity)."""
+
+    def __init__(self):
+        self.doc: dict | None = None
+
+    async def find_one(self, query):
+        return dict(self.doc) if self.doc else None
+
+    async def update_one(self, query, update, upsert=False):
+        self.doc = {**(self.doc or {}), **query, **update.get("$set", {})}
+
+
 class FakeDb:
     def __init__(self):
         self._coll = FakeCollection()
+        self._identity_coll = FakeIdentityCollection()
 
     def __getitem__(self, name):
+        if name == "jane_ads_tiktok_identity":
+            return self._identity_coll
         return self._coll
 
 
@@ -92,11 +109,13 @@ def _adapter(db=None) -> TikTokAdsAdapter:
     return TikTokAdsAdapter(db or FakeDb(), advertiser_id="adv123", access_token="tok")
 
 
-# campaign, video upload, ad group, ad — 4 calls total.
+# campaign, video upload, ad group, identity logo upload, identity create, ad — 6 calls total.
 _HAPPY_RESPONSES = [
     {"code": 0, "message": "OK", "data": {"campaign_id": "111"}},
     {"code": 0, "message": "OK", "data": [{"video_id": "vid_999"}]},
     {"code": 0, "message": "OK", "data": {"adgroup_id": "222"}},
+    {"code": 0, "message": "OK", "data": {"image_id": "img_888"}},
+    {"code": 0, "message": "OK", "data": {"identity_id": "identity_777"}},
     {"code": 0, "message": "OK", "data": {"ad_ids": ["333"]}},
 ]
 
@@ -124,7 +143,7 @@ def test_launch_campaign_happy_path_full_call_sequence():
     assert result.campaign_id == "111"
     assert result.ad_ids == {"b1": "333"}
     assert result.platforms == [Platform.TIKTOK]
-    assert mock_client.post.call_count == 4
+    assert mock_client.post.call_count == 6
 
     campaign_json = mock_client.post.call_args_list[0].kwargs["json"]
     assert campaign_json["operation_status"] == "DISABLE"
@@ -138,12 +157,38 @@ def test_launch_campaign_happy_path_full_call_sequence():
     assert adgroup_json["operation_status"] == "DISABLE"
     assert adgroup_json["budget"] == 70_000
     assert adgroup_json["campaign_id"] == "111"
+    assert adgroup_json["bid_type"] == "BID_TYPE_NO_BID"
+    assert adgroup_json["pacing"] == "PACING_MODE_SMOOTH"
 
-    ad_json = mock_client.post.call_args_list[3].kwargs["json"]
+    image_json = mock_client.post.call_args_list[3].kwargs["json"]
+    assert image_json["upload_type"] == "UPLOAD_BY_URL"
+    assert "image_url" in image_json
+
+    identity_json = mock_client.post.call_args_list[4].kwargs["json"]
+    assert identity_json["display_name"]
+    assert identity_json["image_uri"] == "img_888"
+
+    ad_json = mock_client.post.call_args_list[5].kwargs["json"]
     assert ad_json["operation_status"] == "DISABLE"
     creative = ad_json["creatives"][0]
     assert creative["video_id"] == "vid_999"
     assert creative["landing_page_url"] == "https://wa.me/2348031234567"
+    assert creative["identity_id"] == "identity_777"
+    assert creative["identity_type"] == "CUSTOMIZED_USER"
+
+    # A second launch must reuse the cached identity — no repeat upload/create calls.
+    mock_client2 = _mock_client([
+        {"code": 0, "message": "OK", "data": {"campaign_id": "444"}},
+        {"code": 0, "message": "OK", "data": [{"video_id": "vid_000"}]},
+        {"code": 0, "message": "OK", "data": {"adgroup_id": "555"}},
+        {"code": 0, "message": "OK", "data": {"ad_ids": ["666"]}},
+    ])
+    with patch("httpx.AsyncClient") as MockClient2:
+        MockClient2.return_value.__aenter__.return_value = mock_client2
+        _run(adapter.launch_campaign(_plan(business_id="b2"), _auth()))
+    assert mock_client2.post.call_count == 4
+    ad_json_2 = mock_client2.post.call_args_list[3].kwargs["json"]
+    assert ad_json_2["creatives"][0]["identity_id"] == "identity_777"
 
     record = _run(db["jane_ads_tiktok_campaigns"].find_one({"campaign_id": "111"}))
     assert record["ad_id"] == "333"
