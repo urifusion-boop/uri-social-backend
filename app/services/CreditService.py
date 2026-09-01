@@ -261,72 +261,81 @@ class CreditService:
             return True
 
         # Deduct from subscription first (use before expiry), then bonus
-        # (never expires). Guarded by $expr in the filter and computed via an
-        # update pipeline so the check-and-decrement is a single atomic
-        # operation — two concurrent requests can no longer both read the
-        # same balance and both succeed (the old read -> compute -> $set
-        # pattern allowed exactly that).
-        # Legacy documents may predate these fields entirely (the old code
-        # read them via getattr(wallet, field, 0)) — $ifNull keeps the
-        # pipeline equivalent to that default for any doc missing a field.
-        sub_credits = {"$ifNull": ["$subscription_credits", 0]}
-        bonus_credits = {"$ifNull": ["$bonus_credits", 0]}
-        credits_used = {"$ifNull": ["$credits_used", 0]}
+        # (never expires). This used to be a single atomic update-pipeline
+        # operation (array-form find_one_and_update) — correct, but DocumentDB
+        # only supports update pipelines on 5.0+, and both our dev and prod
+        # clusters are older: every deduction failed with "Failed to parse
+        # update: field must be of BSON type object" (DocumentDB rejecting the
+        # pipeline array). Replaced with a compare-and-swap retry loop using
+        # plain update operators, which every DocumentDB version supports:
+        # read the balance, compute the new one, then write it back with a
+        # filter matching the exact values just read. A concurrent deduction
+        # that changes the balance in between makes the write match zero
+        # documents, so we retry with a fresh read instead of both requests
+        # silently double-spending off the same stale balance.
+        max_attempts = 8
+        updated = None
+        for _attempt in range(max_attempts):
+            wallet = await self.user_credits_collection.find_one(
+                {"user_id": user_id},
+                {"subscription_credits": 1, "bonus_credits": 1, "credits_used": 1},
+            )
+            if not wallet:
+                return False
 
-        updated = await self.user_credits_collection.find_one_and_update(
-            {
+            sub_before = wallet.get("subscription_credits") or 0
+            bonus_before = wallet.get("bonus_credits") or 0
+            credits_used_before = wallet.get("credits_used") or 0
+
+            if sub_before + bonus_before < amount:
+                return False
+
+            deduct_from_subscription = min(sub_before, amount)
+            deduct_from_bonus = amount - deduct_from_subscription
+            sub_after = sub_before - deduct_from_subscription
+            bonus_after = bonus_before - deduct_from_bonus
+            credits_remaining_after = sub_after + bonus_after
+
+            # Match the exact balance just read — for a legacy document where
+            # the field is missing entirely (not just zero), $in: [None, ...]
+            # matches both "missing" and "explicitly null" the way Mongo
+            # query semantics already treat those as equivalent, so a legacy
+            # doc that's still unmigrated by the time we write doesn't spin
+            # forever failing to match its own read.
+            match_filter = {
                 "user_id": user_id,
-                "$expr": {
-                    "$gte": [
-                        {"$add": [sub_credits, bonus_credits]},
-                        amount,
-                    ]
-                },
-            },
-            [
+                "subscription_credits": (
+                    sub_before if wallet.get("subscription_credits") is not None
+                    else {"$in": [None, sub_before]}
+                ),
+                "bonus_credits": (
+                    bonus_before if wallet.get("bonus_credits") is not None
+                    else {"$in": [None, bonus_before]}
+                ),
+            }
+
+            updated = await self.user_credits_collection.find_one_and_update(
+                match_filter,
                 {
                     "$set": {
-                        "_deduct_from_subscription": {
-                            "$min": [sub_credits, amount]
-                        }
-                    }
-                },
-                {
-                    "$set": {
-                        "subscription_credits": {
-                            "$subtract": [
-                                sub_credits,
-                                "$_deduct_from_subscription",
-                            ]
-                        },
-                        "bonus_credits": {
-                            "$subtract": [
-                                bonus_credits,
-                                {"$subtract": [amount, "$_deduct_from_subscription"]},
-                            ]
-                        },
-                        "credits_used": {"$add": [credits_used, amount]},
-                    }
-                },
-                {
-                    "$set": {
-                        "total_credits": {
-                            "$add": ["$subscription_credits", "$bonus_credits"]
-                        },
-                        "credits_remaining": {
-                            "$add": ["$subscription_credits", "$bonus_credits"]
-                        },
+                        "subscription_credits": sub_after,
+                        "bonus_credits": bonus_after,
+                        "credits_used": credits_used_before + amount,
+                        "total_credits": credits_remaining_after,
+                        "credits_remaining": credits_remaining_after,
                         "updated_at": datetime.utcnow(),
                     }
                 },
-                {"$unset": "_deduct_from_subscription"},
-            ],
-            return_document=ReturnDocument.AFTER,
-        )
+                return_document=ReturnDocument.AFTER,
+            )
+            if updated:
+                break
 
         if not updated:
-            # Either the wallet vanished between the two reads, or the
-            # balance guard failed — both mean "insufficient credits" now.
+            # Either the wallet vanished, the balance guard failed (both mean
+            # "insufficient credits" now), or we lost every CAS race under
+            # contention after max_attempts retries — safer to fail the
+            # deduction than guess at a stale balance.
             return False
 
         balance_after = updated["credits_remaining"]
