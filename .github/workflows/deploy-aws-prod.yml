@@ -87,10 +87,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Deliberately a DIFFERENT role from the build job's. AWS_GITHUB_ACTIONS_ROLE_ARN_PROD
+      # lives in the ECR registry account (893361711560) and can only push images —
+      # ECS/CodeDeploy live in a separate account (062677866324), and IAM identity
+      # policies can't grant cross-account access to those services (no resource-based
+      # policy support). This role must be created directly in 062677866324 with its
+      # own GitHub OIDC trust policy — see conversation notes for the exact trust +
+      # permission policy JSON.
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN_PROD }}
+          role-to-assume: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN_PROD_DEPLOY }}
           aws-region: eu-west-1
 
       # Pull the CURRENT task definition as the base to modify — never hand
