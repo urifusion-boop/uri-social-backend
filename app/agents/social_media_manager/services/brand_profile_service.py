@@ -165,6 +165,21 @@ class BrandProfileService:
             doc["business_pulse"] = dict(bp_defaults)
             doc["business_pulse_updated_at"] = None
 
+        # Onboarding save-and-resume: the wizard fires a partial save on every
+        # step transition (see brand-setup/page.tsx), sending only that step's
+        # own fields plus these three. onboarding_current_step is the step's
+        # NAME (e.g. "targetCustomerDetail"), not a numeric index — indexes
+        # break silently if a step is later added/removed/reordered, whereas
+        # an unrecognized name just falls back to step 0 on the frontend.
+        # onboarding_started_at is set once, on the first partial save, and
+        # never overwritten after — every subsequent save only touches
+        # onboarding_current_step/onboarding_last_saved_at.
+        if "onboarding_current_step" in data:
+            doc["onboarding_current_step"] = data["onboarding_current_step"]
+            doc["onboarding_last_saved_at"] = now
+            if not (existing or {}).get("onboarding_started_at"):
+                doc["onboarding_started_at"] = now
+
         if "style_selections" in data:
             doc["style_selections"] = data["style_selections"]
         if "style_prompt_fragments" in data:
