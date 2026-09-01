@@ -318,6 +318,9 @@ class BrandProfileRequest(BaseModel):
     region: Optional[str] = None
     # Meta
     onboarding_completed: Optional[bool] = False
+    # Onboarding save-and-resume — the step's NAME (e.g. "targetCustomerDetail"),
+    # not a numeric index; see BrandProfileService.save() for why.
+    onboarding_current_step: Optional[str] = None
     # Visual style
     style_selections: Optional[List[str]] = None
     style_prompt_fragments: Optional[List[str]] = None
