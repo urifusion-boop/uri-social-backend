@@ -120,6 +120,34 @@ async def delete_thread(db, brand_id: str, thread_id: str) -> bool:
     return result.deleted_count > 0
 
 
+async def mark_destination_answered(db, brand_id: str, thread_id: str) -> None:
+    """Record that this campaign thread's destination question has been answered.
+
+    The question is asked once per CAMPAIGN, not once per request. Every later call in
+    the same build (picking an image, tweaking the budget) re-runs the whole planner
+    but carries no destination field, so without this flag the planner asked again on
+    every one of them and the conversation looped between "where should people end up?"
+    and the image step. Live-reported.
+    """
+    if not (brand_id and thread_id):
+        return
+    await db[THREADS_COLLECTION].update_one(
+        {"brand_id": brand_id, "thread_id": thread_id},
+        {"$set": {"destination_answered": True}},
+    )
+
+
+async def destination_already_answered(db, brand_id: str, thread_id: str) -> bool:
+    """Whether this thread has already settled its destination. False for a thread-less
+    (one-shot) call, which has no conversation to remember it in — so those still ask."""
+    if not (brand_id and thread_id):
+        return False
+    doc = await db[THREADS_COLLECTION].find_one(
+        {"brand_id": brand_id, "thread_id": thread_id}, {"_id": 0, "destination_answered": 1}
+    )
+    return bool((doc or {}).get("destination_answered"))
+
+
 async def thread_history(db, brand_id: str, thread_id: str) -> list[dict]:
     """The messages tagged to one thread, oldest first."""
     if not (brand_id and thread_id) or db is None:
