@@ -1928,7 +1928,19 @@ async def _build_campaign_plan(
     # silently reusing last time's answer ships an ad pointing somewhere they didn't
     # choose. The saved value is still the pre-filled default and `selected` marks it,
     # so a returning brand confirms in one tap rather than retyping anything.
-    if req.goal != Goal.FOLLOWERS:
+    from .threads import destination_already_answered, mark_destination_answered
+    # Once per CAMPAIGN, not once per request: every later call in this build re-runs
+    # the planner without a destination field, and asking on each of them looped the
+    # conversation between this question and the image step.
+    # An explicit destination_type on the request always wins over the flag: "ask"
+    # means the client deliberately reopened the picker (a change-destination action),
+    # and a concrete type is an answer to save — neither should be swallowed because
+    # the question was settled earlier in this thread.
+    destination_settled = (
+        not (body.destination_type or "").strip()
+        and await destination_already_answered(db, brand_ctx.get("brand_id"), body.thread_id)
+    )
+    if req.goal != Goal.FOLLOWERS and not destination_settled:
         from .destination import (
             DESTINATION_OPTIONS, VALUE_FIELD_FOR_TYPE, cta_choice_list, set_brand_destination,
         )
@@ -1994,6 +2006,8 @@ async def _build_campaign_plan(
                 custom_url=brand_destination["custom_url"],
             )
             destination_cta = brand_destination["destination_cta"]
+            # Settled for the rest of this campaign.
+            await mark_destination_answered(db, brand_ctx.get("brand_id"), body.thread_id)
 
         # Answered on THIS request → proceed. Anything else (blank, or an explicit
         # "ask") → put the question, whatever the brand has stored.
