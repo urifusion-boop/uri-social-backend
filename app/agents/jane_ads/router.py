@@ -1743,10 +1743,18 @@ async def _build_campaign_plan(
         if requested_destination in ("", "ask")
         else coerce_type(requested_destination)
     )
+    # `chosen` matters here: WhatsApp is also the DEFAULT for a brand that has never
+    # picked a destination, and gating on the default sent those brands to the
+    # "link your WhatsApp number" wall instead of the choose_destination question —
+    # live-observed, a brand with no destination at all never got asked for a link.
+    # Only a brand that actually answered "WhatsApp" needs a number; anyone else
+    # falls through to step 3.9 below and gets asked where their ad should send
+    # people, and only then for whatever that answer needs.
     needs_whatsapp_number = (
         req.goal != Goal.FOLLOWERS
         and requested_destination != "ask"
         and destination_type == DestinationType.WHATSAPP
+        and (brand_destination["chosen"] or bool(brand_destination["whatsapp_number"]))
     )
     if needs_whatsapp_number and not ads_conn["whatsapp_number"]:
         try:
