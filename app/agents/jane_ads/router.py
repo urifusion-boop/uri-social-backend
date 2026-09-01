@@ -1238,6 +1238,56 @@ async def admin_access(token: dict = Depends(JWTBearer())) -> dict:
     return {"allowed": _is_ads_admin(token)}
 
 
+class AdminWalletCreditBody(BaseModel):
+    brand_id: str                          # whose wallet to credit
+    amount_ngn: float = Field(gt=0)        # WalletService still enforces the ₦5,000 floor
+    note: str = ""                         # why — recorded alongside the credit
+
+
+@router.post("/admin/wallet/credit")
+async def admin_wallet_credit(
+    body: AdminWalletCreditBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+) -> dict:
+    """Credit a brand's ad wallet without a payment — testing, refunds, comped balance.
+    Admin-only (JANE_ADS_ADMIN_EMAILS), the same gate as the billing report.
+
+    Every other credit path goes through Squad and only moves the balance once the
+    payment confirms. That is right for customers and leaves no way to fund a wallet
+    for QA, so the reflex is to edit the balance directly in Mongo — which sets a
+    number with no transaction behind it. The wallet then disagrees with its own
+    history, and the billing report (which sums transactions) under-counts silently.
+
+    This goes through WalletService.top_up like any other credit, so balance,
+    total_topped_up and a transaction row move together. The reference records WHO
+    comped it, so a manual credit is never mistaken for a real payment in the ledger.
+    """
+    _require_ads_admin(token)
+
+    import uuid as _uuid
+
+    actor = ((token.get("claims", {}) or {}).get("email") or "unknown").lower()
+    reference = f"manual:{actor}:{_uuid.uuid4().hex[:12]}"
+    wallet = WalletService(MongoWalletStore(db))
+    try:
+        await wallet.top_up(body.brand_id, body.amount_ngn, reference=reference)
+    except MinimumTopUpError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    print(f"[admin] {actor} credited {body.brand_id} "
+          f"NGN{body.amount_ngn:,.0f} — {body.note or 'no note'}", flush=True)
+    return {
+        "status": "credited",
+        "brand_id": body.brand_id,
+        "amount_ngn": body.amount_ngn,
+        "balance_ngn": await wallet.get_balance(body.brand_id),
+        "reference": reference,
+        "credited_by": actor,
+        "note": body.note,
+    }
+
+
 @router.get("/admin/billing-summary")
 async def admin_billing_summary(
     from_date: Optional[str] = None,
