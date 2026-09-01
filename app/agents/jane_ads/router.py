@@ -1743,18 +1743,15 @@ async def _build_campaign_plan(
         if requested_destination in ("", "ask")
         else coerce_type(requested_destination)
     )
-    # `chosen` matters here: WhatsApp is also the DEFAULT for a brand that has never
-    # picked a destination, and gating on the default sent those brands to the
-    # "link your WhatsApp number" wall instead of the choose_destination question —
-    # live-observed, a brand with no destination at all never got asked for a link.
-    # Only a brand that actually answered "WhatsApp" needs a number; anyone else
-    # falls through to step 3.9 below and gets asked where their ad should send
-    # people, and only then for whatever that answer needs.
+    # Only ONCE this campaign's destination has actually been answered — and answered
+    # WhatsApp — is a WhatsApp number required. Gating any earlier put the "link your
+    # WhatsApp number" wall in front of the question that decides whether a number is
+    # wanted at all, so a brand selling on their website was pushed at WhatsApp and
+    # never asked for their link.
     needs_whatsapp_number = (
         req.goal != Goal.FOLLOWERS
-        and requested_destination != "ask"
+        and requested_destination not in ("", "ask")
         and destination_type == DestinationType.WHATSAPP
-        and (brand_destination["chosen"] or bool(brand_destination["whatsapp_number"]))
     )
     if needs_whatsapp_number and not ads_conn["whatsapp_number"]:
         try:
@@ -1924,9 +1921,13 @@ async def _build_campaign_plan(
     # both come from it, so choosing afterwards would mean regenerating. Same tappable
     # early-return shape as choose_creative_source directly below.
     #
-    # Asked when the caller passes destination_type="ask", or when the brand has no
-    # usable destination at all — never when they already have one and didn't ask to
-    # change it, so a returning brand isn't re-interrogated every campaign.
+    # Asked on EVERY campaign, before the ad is built. It was previously skipped for a
+    # brand that already had a destination on file, on the reasoning that re-asking is
+    # nagging — but the destination is a per-campaign decision, not a brand setting:
+    # the same business runs one ad to WhatsApp and the next to a product page, and
+    # silently reusing last time's answer ships an ad pointing somewhere they didn't
+    # choose. The saved value is still the pre-filled default and `selected` marks it,
+    # so a returning brand confirms in one tap rather than retyping anything.
     if req.goal != Goal.FOLLOWERS:
         from .destination import (
             DESTINATION_OPTIONS, VALUE_FIELD_FOR_TYPE, cta_choice_list, set_brand_destination,
@@ -1994,10 +1995,12 @@ async def _build_campaign_plan(
             )
             destination_cta = brand_destination["destination_cta"]
 
-        if requested_destination == "ask" or not destination_link:
+        # Answered on THIS request → proceed. Anything else (blank, or an explicit
+        # "ask") → put the question, whatever the brand has stored.
+        if requested_destination in ("", "ask") or not destination_link:
             return _destination_prompt(
-                "" if requested_destination == "ask"
-                else "Your ads don't have a destination yet — pick one and this campaign is ready to build."
+                "Your ads don't have a destination yet — pick one and this campaign is "
+                "ready to build." if requested_destination not in ("", "ask") else ""
             )
 
     # Image-selection step (PRD §2): don't silently generate once budget is set — ask the
