@@ -175,6 +175,15 @@ class ContentGenerationRequest(BaseModel):
     brand_context: Optional[BrandContextRequest] = None
     reference_image: Optional[str] = None  # DEPRECATED: use reference_images. Kept for backward compatibility.
     reference_images: Optional[List[str]] = None  # base64 data URLs uploaded by user for contextual reference (multiple supported)
+    # Parallel to reference_images (same length, same order). Each entry: optional
+    # "label" (what this image IS — "product", "background", "logo" — fed into the
+    # multi-reference prompt when combining) and optional "remove_background" (per-
+    # image override; unset means the mode-based default: strip for a single image,
+    # keep as-is for multiple — see ImageContentService._generate_platform_image).
+    # Whether images get COMBINED into one output vs. only the first one used is not
+    # a separate flag — it's inferred from how many images the frontend actually
+    # sends: the user ticks which uploads to include, and the count IS the mode.
+    reference_image_meta: Optional[List[Dict[str, Any]]] = None
     slide_image_map: Optional[List[Optional[int]]] = None  # carousel only: per-slide index into reference_images (or null for no image). Defaults to cycling image N -> slide N when omitted.
     post_type: str = "feed"   # feed | carousel | story
     # Opt-in, develop-only experiment (default False everywhere): paste the real
@@ -493,11 +502,13 @@ async def generate_content(
         )
         print(f"🖼️📥 [REF-IMG TRACE] resolved ref_images_count={len(ref_images)}")
 
-        def _slide_reference_image(slide_index: int) -> Optional[str]:
-            """Which single reference image (if any) a given carousel slide should use.
+        def _slide_reference_index(slide_index: int) -> Optional[int]:
+            """Which index into ref_images (if any) a given carousel slide should use.
             Explicit slide_image_map wins; otherwise images cycle 1:1 across slides
             (image 1 -> slide 1, image 2 -> slide 2, wrapping if there are fewer images
-            than slides)."""
+            than slides). Carousels stay one-image-per-slide — combining multiple
+            references into a single slide isn't part of this feature; that's what
+            slide_image_map already gives explicit per-slide control for."""
             if not ref_images:
                 print(f"🖼️📥 [REF-IMG TRACE] slide {slide_index}: no ref_images available -> None")
                 return None
@@ -508,12 +519,25 @@ async def generate_content(
                     return None
                 if 0 <= img_idx < len(ref_images):
                     print(f"🖼️📥 [REF-IMG TRACE] slide {slide_index}: slide_image_map -> image #{img_idx}")
-                    return ref_images[img_idx]
+                    return img_idx
                 print(f"🖼️📥 [REF-IMG TRACE] slide {slide_index}: slide_image_map index {img_idx} out of range -> None")
                 return None
             picked = slide_index % len(ref_images)
             print(f"🖼️📥 [REF-IMG TRACE] slide {slide_index}: auto-cycle -> image #{picked}")
-            return ref_images[picked]
+            return picked
+
+        def _slide_reference_image(slide_index: int) -> Optional[str]:
+            idx = _slide_reference_index(slide_index)
+            return ref_images[idx] if idx is not None else None
+
+        def _slide_reference_meta(slide_index: int) -> Optional[List[Dict[str, Any]]]:
+            """The single-item meta list matching _slide_reference_image's pick, so a
+            slide's image still respects its own remove_background preference."""
+            idx = _slide_reference_index(slide_index)
+            meta = request.reference_image_meta or []
+            if idx is None or idx >= len(meta):
+                return None
+            return [meta[idx]]
 
         if post_type == "carousel":
             from ..services.carousel_generation_service import CarouselGenerationService
@@ -656,6 +680,7 @@ async def generate_content(
                             brand_context=brand_context_dict,
                             db=db,
                             reference_image=_slide_reference_image(slide_index),
+                            reference_image_meta=_slide_reference_meta(slide_index),
                             post_type=post_type,
                             slide_index=slide_index,
                             image_model=request.image_model,
@@ -673,6 +698,8 @@ async def generate_content(
                         brand_context=brand_context_dict,
                         db=db,
                         reference_image=ref_images[0] if ref_images else None,
+                        reference_images=ref_images,
+                        reference_image_meta=request.reference_image_meta,
                         post_type=post_type,
                         image_model=request.image_model,
                         style_override=request.style_override,
@@ -5532,6 +5559,8 @@ async def _generate_image_bg(
     brand_context: Dict[str, Any],
     db: AsyncIOMotorDatabase,
     reference_image: Optional[str] = None,
+    reference_images: Optional[List[str]] = None,
+    reference_image_meta: Optional[List[Dict[str, Any]]] = None,
     post_type: str = "feed",
     slide_index: Optional[int] = None,
     image_model: Optional[str] = None,
@@ -5547,7 +5576,12 @@ async def _generate_image_bg(
     use_true_compositing: opt-in only, default False — every existing caller keeps
     today's behaviour unchanged. When True (and a reference_image is present),
     routes to ImageContentService._generate_platform_image_composited instead of
-    the standard AI-redraw path — see that method's docstring for why.
+    the standard AI-redraw path — see that method's docstring for why. (Not
+    combinable with reference_images having more than one entry — true
+    compositing is single-product only; see its own docstring.)
+    reference_images/reference_image_meta: see ImageContentService.
+    _generate_platform_image's docstring — more than one entry switches to the
+    multi-reference combine path there.
     For carousel posts, slide_index indicates which slide this image belongs to,
     and carousel_id ensures all slides share the same visual style.
     For story posts, uses the story (9:16) image spec.
@@ -5926,6 +5960,8 @@ async def _generate_image_bg(
                     seed_content=seed_content,
                     brand_context=brand_context,
                     reference_image=reference_image,
+                    reference_images=reference_images,
+                    reference_image_meta=reference_image_meta,
                     image_type=image_type,
                     image_model=image_model,
                     slide_index=slide_index,
