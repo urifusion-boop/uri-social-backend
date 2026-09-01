@@ -11,6 +11,28 @@ from .image_content_service import ImageContentService
 from .brand_profile_service import BrandProfileService
 
 
+def _auto_scope(user_id: str, brand_id: Optional[str]) -> Dict[str, Any]:
+    """Brand-aware Mongo filter — same pattern as content_calendar_service.py's
+    _cal_scope and complete_social_manager.py's _brand_scope. Without this,
+    every Auto-generate query fell back to a bare {"user_id": user_id} filter,
+    which for an agency account managing multiple client brands under one
+    login returns whichever brand's docs Mongo finds first — confirmed live as
+    the cause of one client's content (and brand profile) leaking into
+    another's Auto-generate output."""
+    from app.models.brand_account import BrandAccount
+    personal_bid = BrandAccount.personal_brand_id(user_id)
+    if brand_id and brand_id != personal_bid:
+        return {"brand_id": brand_id}
+    return {
+        "user_id": user_id,
+        "$or": [
+            {"brand_id": {"$exists": False}},
+            {"brand_id": None},
+            {"brand_id": personal_bid},
+        ],
+    }
+
+
 class AutoContentService:
     DEFAULT_PLATFORMS = ["facebook", "instagram"]
     FALLBACK_SEED = (
@@ -22,12 +44,16 @@ class AutoContentService:
     # -------------------------------------------------------------------------
 
     @staticmethod
-    async def get_or_create_settings(user_id: str, db: AsyncIOMotorDatabase) -> dict:
-        doc = await db["auto_content_settings"].find_one({"user_id": user_id})
+    async def get_or_create_settings(
+        user_id: str, db: AsyncIOMotorDatabase, brand_id: Optional[str] = None
+    ) -> dict:
+        doc = await db["auto_content_settings"].find_one(_auto_scope(user_id, brand_id))
         if not doc:
+            from app.models.brand_account import BrandAccount
             now = datetime.utcnow()
             doc = {
                 "user_id": user_id,
+                "brand_id": brand_id or BrandAccount.personal_brand_id(user_id),
                 "enabled": False,
                 "platforms": AutoContentService.DEFAULT_PLATFORMS,
                 "frequency": "daily",
@@ -46,7 +72,7 @@ class AutoContentService:
 
         # Append connected analytics context summary
         ctx_docs = await db["account_analytics_context"].find(
-            {"user_id": user_id}
+            _auto_scope(user_id, brand_id)
         ).sort("saved_at", -1).limit(10).to_list(length=10)
 
         connected_platforms = list({d["platform"] for d in ctx_docs if d.get("platform")})
@@ -68,14 +94,17 @@ class AutoContentService:
 
     @staticmethod
     async def update_settings(
-        user_id: str, payload: dict, db: AsyncIOMotorDatabase
+        user_id: str, payload: dict, db: AsyncIOMotorDatabase, brand_id: Optional[str] = None
     ) -> dict:
+        from app.models.brand_account import BrandAccount
         now = datetime.utcnow()
         frequency = payload.get("frequency", "daily")
         delta = timedelta(days=1) if frequency == "daily" else timedelta(weeks=1)
         next_run_at = now + delta
+        resolved_brand_id = brand_id or BrandAccount.personal_brand_id(user_id)
 
         update_fields = {
+            "brand_id": resolved_brand_id,
             "enabled": payload.get("enabled", False),
             "platforms": payload.get("platforms", AutoContentService.DEFAULT_PLATFORMS),
             "frequency": frequency,
@@ -85,13 +114,14 @@ class AutoContentService:
             "updated_at": now,
         }
 
+        scope = _auto_scope(user_id, brand_id)
         await db["auto_content_settings"].update_one(
-            {"user_id": user_id},
+            scope,
             {"$set": update_fields, "$setOnInsert": {"user_id": user_id, "created_at": now, "last_run_at": None, "last_run_draft_count": 0}},
             upsert=True,
         )
 
-        doc = await db["auto_content_settings"].find_one({"user_id": user_id})
+        doc = await db["auto_content_settings"].find_one(scope)
         if doc and "_id" in doc:
             del doc["_id"]
         return doc or {}
@@ -108,14 +138,17 @@ class AutoContentService:
         social_user_id: Optional[str],
         insights: dict,
         db: AsyncIOMotorDatabase,
+        brand_id: Optional[str] = None,
     ) -> None:
         """
         Persist the AiMediaReportDto from account tracking to a durable collection.
         Called each time the frontend fetches a fresh AI media report for an account.
         """
+        from app.models.brand_account import BrandAccount
         now = datetime.utcnow()
         doc = {
             "user_id": user_id,
+            "brand_id": brand_id or BrandAccount.personal_brand_id(user_id),
             "influencer_id": influencer_id,
             "platform": platform.lower(),
             "social_user_id": social_user_id,
@@ -132,7 +165,7 @@ class AutoContentService:
             "saved_at": now,
         }
         await db["account_analytics_context"].replace_one(
-            {"user_id": user_id, "influencer_id": influencer_id, "platform": platform.lower()},
+            {**_auto_scope(user_id, brand_id), "influencer_id": influencer_id, "platform": platform.lower()},
             doc,
             upsert=True,
         )
@@ -143,7 +176,7 @@ class AutoContentService:
 
     @staticmethod
     async def gather_account_tracking_insights(
-        user_id: str, db: AsyncIOMotorDatabase
+        user_id: str, db: AsyncIOMotorDatabase, brand_id: Optional[str] = None
     ) -> dict:
         """
         Pull context from three sources, ordered by richness:
@@ -151,14 +184,16 @@ class AutoContentService:
         2. influencers collection     — resolve tracked social_user_ids
         3. embeddings                 — top-performing raw posts (ACCOUNT_TRACKING_EMBEDDING)
         """
+        scope = _auto_scope(user_id, brand_id)
+
         # ── 1. Rich analytics context (from Analyse button) ──────────────────
         analytics_docs = await db["account_analytics_context"].find(
-            {"user_id": user_id}
+            scope
         ).sort("saved_at", -1).limit(5).to_list(length=5)
 
         # ── 2. Tracked account social_user_ids (influencers collection) ───────
         influencer_docs = await db["influencers"].find(
-            {"user_id": user_id}
+            scope
         ).to_list(length=50)
 
         tracked_social_ids = [
@@ -169,7 +204,7 @@ class AutoContentService:
 
         # Also include social_connections (own posting accounts)
         connections = await db["social_connections"].find(
-            {"user_id": user_id}
+            scope
         ).to_list(length=20)
         for conn in connections:
             sid = conn.get("social_user_id") or conn.get("page_id")
@@ -401,7 +436,7 @@ class AutoContentService:
     # -------------------------------------------------------------------------
 
     @staticmethod
-    async def generate_for_user(user_id: str, db: AsyncIOMotorDatabase) -> dict:
+    async def generate_for_user(user_id: str, db: AsyncIOMotorDatabase, brand_id: Optional[str] = None) -> dict:
         """
         Full pipeline:
         1. Load settings
@@ -410,8 +445,15 @@ class AutoContentService:
         4. Generate platform drafts (tagging auto_generated=True)
         5. Update settings with run stats
         Returns {"drafts_created": N, "platforms": [...], "seed_used": str}
+
+        brand_id scopes every step to one specific brand — an agency user
+        manages multiple client brands under one login, and every lookup here
+        (settings, brand profile, analytics insights) must stay isolated to
+        the brand this run is actually for. Confirmed live: omitting this
+        caused one client's brand profile/content to leak into another's
+        Auto-generate output.
         """
-        settings_doc = await AutoContentService.get_or_create_settings(user_id, db)
+        settings_doc = await AutoContentService.get_or_create_settings(user_id, db, brand_id)
         platforms = settings_doc.get("platforms", AutoContentService.DEFAULT_PLATFORMS)
         include_images = settings_doc.get("include_images", False)
         settings_brand_context = settings_doc.get("brand_context") or {}
@@ -423,18 +465,18 @@ class AutoContentService:
         # so only include TikTok when that's how it's connected.
         if "tiktok" in platforms:
             tiktok_conn = await db["social_connections"].find_one(
-                {"user_id": user_id, "platform": "tiktok", "connection_status": "active"}
+                {**_auto_scope(user_id, brand_id), "platform": "tiktok", "connection_status": "active"}
             )
             if not tiktok_conn or tiktok_conn.get("connected_via") != "outstand":
                 platforms = [p for p in platforms if p != "tiktok"]
 
         # Load the rich brand profile from onboarding (source of truth)
-        profile_result = await BrandProfileService.get(user_id, db)
+        profile_result = await BrandProfileService.get(user_id, db, brand_id=brand_id)
         profile_data = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
         profile_brand_context = BrandProfileService.to_brand_context(profile_data) if profile_data else {}
 
         # Gather analytics insights
-        insights = await AutoContentService.gather_account_tracking_insights(user_id, db)
+        insights = await AutoContentService.gather_account_tracking_insights(user_id, db, brand_id)
 
         # Synthesise seed — prefer brand profile industry if available
         seed = await AutoContentService.synthesize_content_brief(insights, platforms)
@@ -499,7 +541,7 @@ class AutoContentService:
         frequency = settings_doc.get("frequency", "daily")
         delta = timedelta(days=1) if frequency == "daily" else timedelta(weeks=1)
         await db["auto_content_settings"].update_one(
-            {"user_id": user_id},
+            _auto_scope(user_id, brand_id),
             {
                 "$set": {
                     "last_run_at": now,
@@ -523,28 +565,31 @@ class AutoContentService:
     @staticmethod
     async def run_scheduled_auto_generation(db: AsyncIOMotorDatabase):
         """
-        Cron job: iterate all users with enabled=True and next_run_at <= now.
+        Cron job: iterate all (user, brand) settings docs with enabled=True and
+        next_run_at <= now. One agency user can have several due docs — one per
+        client brand — each must run through its own isolated brand_id.
         """
         now = datetime.utcnow()
         print(f"[{now}] Starting auto_content_generation job...")
 
         try:
-            due_users = await db["auto_content_settings"].find(
+            due_docs = await db["auto_content_settings"].find(
                 {"enabled": True, "next_run_at": {"$lte": now}}
             ).to_list(length=None)
 
-            print(f"[AutoContentService] {len(due_users)} user(s) due for auto generation")
+            print(f"[AutoContentService] {len(due_docs)} settings doc(s) due for auto generation")
 
-            for doc in due_users:
+            for doc in due_docs:
                 user_id = doc["user_id"]
+                brand_id = doc.get("brand_id")
                 try:
-                    result = await AutoContentService.generate_for_user(user_id, db)
+                    result = await AutoContentService.generate_for_user(user_id, db, brand_id)
                     print(
-                        f"  ✓ user={user_id} drafts={result['drafts_created']} "
+                        f"  ✓ user={user_id} brand={brand_id} drafts={result['drafts_created']} "
                         f"platforms={result['platforms']}"
                     )
                 except Exception as user_err:
-                    print(f"  ✗ user={user_id} error={user_err}")
+                    print(f"  ✗ user={user_id} brand={brand_id} error={user_err}")
 
         except Exception as exc:
             print(f"[{datetime.utcnow()}] ERROR in auto_content_generation job: {exc}")
