@@ -1,4 +1,4 @@
-name: Build and Push URI Social Backend API to ECR (DEV)
+name: Build and Deploy URI Social Backend API to ECS (DEV)
 
 on:
   push:
@@ -6,9 +6,17 @@ on:
       - aws/dev
   workflow_dispatch:
 
+# Mirrors deploy-aws-prod.yml's structure: this used to be build+push only,
+# with every actual deployment done by hand (see conversation notes — the
+# same gap prod had until its deploy job was added). Now registers a fresh
+# task definition revision and creates a real CodeDeploy deployment after
+# every push, same as prod.
 jobs:
   build:
     runs-on: ubuntu-latest
+
+    outputs:
+      image: ${{ steps.build-image.outputs.image }}
 
     # id-token: write lets this job request a short-lived GitHub OIDC token.
     # AWS trusts that token (via the IAM role's trust policy) instead of us
@@ -45,13 +53,80 @@ jobs:
         id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
 
-      # Build and push Docker image to ECR
+      # Build and push the Docker image to ECR. Tagged with BOTH the mutable
+      # environment tag (kept for anyone/anything still pulling it by name)
+      # AND the immutable commit SHA — the SHA tag is what the deploy job
+      # below actually puts into the task definition, so "what's running"
+      # is always traceable to an exact commit.
       - name: Build and push Docker image
+        id: build-image
         env:
           ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
           ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY_DEV }}
           IMAGE_TAG: ${{ vars.IMAGE_TAG_DEV }}
+          SHA_TAG: ${{ github.sha }}
         run: |
-          docker build -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" .
+          docker build -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" -t "$ECR_REGISTRY/$ECR_REPOSITORY:$SHA_TAG" .
           docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
-# testing
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$SHA_TAG"
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$SHA_TAG" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Deliberately a DIFFERENT role from the build job's. AWS_GITHUB_ACTIONS_ROLE_ARN_DEV
+      # lives in the shared ECR registry account (893361711560) and can only push images —
+      # ECS/CodeDeploy live in the dev account (209855136988), and IAM identity
+      # policies can't grant cross-account access to those services (no resource-based
+      # policy support). This role must be created directly in 209855136988 with its
+      # own GitHub OIDC trust policy — see conversation notes for the exact trust +
+      # permission policy JSON.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN_DEV_DEPLOY }}
+          aws-region: eu-west-1
+
+      # Pull the CURRENT task definition as the base to modify — never hand
+      # write this file, it drifts from whatever's actually registered
+      # (env vars, secrets, CPU/memory, roles) and register-task-definition
+      # would silently reset anything this workflow doesn't know about.
+      - name: Download current task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition social-backend-service-dev-ecs-task \
+            --query taskDefinition > task-definition.json
+
+      # Swap in the new SHA-tagged image, register a new task definition
+      # revision, then create a CodeDeploy blue/green deployment for it.
+      # deployment-group and application names come from the CodeDeploy
+      # setup already in place (uri-social-backend-service-codedeploy_app /
+      # uri-social-backend-service-dev-dg); ContainerName in appspec-dev.yaml
+      # must match the container name in loadBalancerInfo on that deployment
+      # group (social-backend-service-dev-v1).
+      - name: Render new image into task definition
+        id: render-task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: social-backend-service-dev-v1
+          image: ${{ needs.build.outputs.image }}
+
+      - name: Deploy to ECS via CodeDeploy
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render-task-def.outputs.task-definition }}
+          service: social-backend-service-ecs-service-dev
+          cluster: uri-ecs-cluster-dev
+          codedeploy-appspec: .github/codedeploy/appspec-dev.yaml
+          codedeploy-application: uri-social-backend-service-codedeploy_app
+          codedeploy-deployment-group: uri-social-backend-service-dev-dg
+          wait-for-service-stability: true
