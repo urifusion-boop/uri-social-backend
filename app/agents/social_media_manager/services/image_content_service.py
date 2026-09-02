@@ -663,6 +663,8 @@ class ImageContentService:
         seed_content: str,
         brand_context: Optional[Dict[str, Any]] = None,
         reference_image: Optional[str] = None,
+        reference_images: Optional[List[str]] = None,
+        reference_image_meta: Optional[List[Dict[str, Any]]] = None,
         feedback: Optional[str] = None,
         image_type: str = "post_image",
         image_model: Optional[str] = None,
@@ -673,11 +675,48 @@ class ImageContentService:
         Generate an AI image optimized for a specific platform.
         image_type: "post_image" (default), "story" (9:16), or any key in IMAGE_SPECS[platform].
         For carousel slides: slide_index and total_slides provide context for slide numbering.
+
+        reference_images (plural) supersedes reference_image (singular, kept for the many
+        other callers of this function that only ever pass one) when both are given.
+        len(ref_imgs) <= 1 behaves EXACTLY as before this parameter existed — same product-
+        preservation pipeline, same forced background removal by default. len(ref_imgs) > 1
+        switches to the multi-reference "combine" path below: no forensic single-product
+        analysis (that pipeline assumes one product, not several unrelated images), a
+        dedicated prompt block that tells the model what role each image plays, and — unlike
+        the single-image path — background removal defaults to OFF per image, since the
+        common combine case is "blend a product shot with a background/scene photo," and
+        forcibly cutting the scene photo down to a cutout would defeat the point. Either way,
+        reference_image_meta (parallel array, same length as the resolved image list) lets
+        the caller override the per-image default and attach an optional role label
+        ("product", "background", "logo", ...) that feeds directly into the prompt.
         """
         try:
             # ALWAYS use GPT-Image-2 generation mode for final graphics (PRD Section 8)
             # Background removal uses edit mode, but final generation uses generation mode
             image_model = "openai/gpt-image-2"
+
+            ref_imgs: List[str] = [
+                i for i in (reference_images if reference_images else ([reference_image] if reference_image else []))
+                if i
+            ]
+            ref_meta: List[Dict[str, Any]] = list(reference_image_meta or [])
+            is_multi_reference = len(ref_imgs) > 1
+
+            def _ref_meta_for(i: int) -> Dict[str, Any]:
+                return ref_meta[i] if i < len(ref_meta) else {}
+
+            def _should_remove_bg(i: int) -> bool:
+                m = _ref_meta_for(i)
+                if "remove_background" in m:
+                    return bool(m["remove_background"])
+                # Default: strip for the classic single-product case (unchanged
+                # behaviour), don't strip per-image in combine mode (see docstring).
+                return not is_multi_reference
+
+            # Everything below this point was written against a single `reference_image`
+            # string — keep it working unchanged for the len(ref_imgs) <= 1 case (the
+            # multi-reference branch, further down, bypasses this variable entirely).
+            reference_image = ref_imgs[0] if ref_imgs else None
 
             specs = ImageContentService._get_platform_image_specs(platform, image_type=image_type)
 
@@ -1100,16 +1139,21 @@ Follow these rules precisely for every image. No exceptions.
             product_preservation_block = ""
             cutout_url = reference_image  # Default to original if background removal fails
 
-            if reference_image:
+            if reference_image and not is_multi_reference:
                 try:
                     print(f"\n{'='*60}")
                     print(f"🔬 PRODUCT PRESERVATION PIPELINE ACTIVATED")
                     print(f"{'='*60}")
 
-                    # Step 1: Background removal (get clean product cutout)
-                    from app.utils.background_removal import remove_background
-                    cutout_url = await remove_background(reference_image, method="auto")
-                    print(f"✂️  Background removed: {cutout_url[:80]}...")
+                    # Step 1: Background removal (get clean product cutout) — only
+                    # when this image's own toggle says to (defaults True here,
+                    # preserving the original always-on behaviour for this path).
+                    if _should_remove_bg(0):
+                        from app.utils.background_removal import remove_background
+                        cutout_url = await remove_background(reference_image, method="auto")
+                        print(f"✂️  Background removed: {cutout_url[:80]}...")
+                    else:
+                        print("✂️  Background removal skipped (per-image toggle off)")
 
                     # Step 2: Forensic product analysis (the key innovation)
                     from app.agents.social_media_manager.services.product_analysis_service import ProductAnalysisService
@@ -1128,7 +1172,9 @@ Follow these rules precisely for every image. No exceptions.
 
             # Add composition block based on style's composition_mode (Immersive Composition System PRD)
             # When a reference image is provided, choose composition style based on the visual style
-            if reference_image:
+            # (combine mode gets its own multi-reference block further down instead —
+            # this one is written for "redraw the scene around one exact product").
+            if reference_image and not is_multi_reference:
                 # Get industry and dynamic details for immersive mode
                 industry = bc.get("industry", "general_other")
                 dynamic_motion = ImageContentService._get_dynamic_motion_detail(industry)
@@ -1259,24 +1305,84 @@ OVERALL:
                 print(f"⚠️  Minimum recommended: 400 chars")
 
             print(f"Prompt Length: {len(image_prompt)} chars")
-            print(f"\n{'━'*60}\n"
-                f"📤 FINAL PROMPT → GPT-Image-2 [{platform.upper()}] "
-                f"({'with style' if style_fragment else 'no style'}"
-                f"{' + font' if font_prompt else ''})\n"
-                f"{'━'*60}\n"
-                f"{image_prompt}\n"
-                f"{'━'*60}\n"
-            )
+            if not is_multi_reference:
+                # Combine mode prepends the multi-reference block further down and
+                # prints its own final version there — printing here too would just
+                # show the same prompt twice, once before that block exists.
+                print(f"\n{'━'*60}\n"
+                    f"📤 FINAL PROMPT → GPT-Image-2 [{platform.upper()}] "
+                    f"({'with style' if style_fragment else 'no style'}"
+                    f"{' + font' if font_prompt else ''})\n"
+                    f"{'━'*60}\n"
+                    f"{image_prompt}\n"
+                    f"{'━'*60}\n"
+                )
 
-            # Use cutout_url (background-removed) if preservation pipeline ran, otherwise original
-            final_reference_image = cutout_url if (reference_image and cutout_url != reference_image) else reference_image
+            if is_multi_reference:
+                # ========== MULTI-REFERENCE COMBINE PATH ==========
+                # No forensic single-product analysis here — that pipeline's whole
+                # premise (exact colour/shape/label preservation of ONE product) doesn't
+                # apply when the images are different things being blended together.
+                # Instead: process each image independently (per-image background
+                # removal per _should_remove_bg), and tell the model in plain language
+                # what role each one plays — gpt-image-1's edit endpoint accepts
+                # multiple images natively but has no way to infer that on its own.
+                from app.utils.background_removal import remove_background
 
-            image_response = await ImageContentService._call_dalle_api(
-                prompt=image_prompt,
-                size=f"{specs['width']}x{specs['height']}",
-                reference_image=final_reference_image,
-                image_model=image_model,
-            )
+                processed_imgs: List[str] = []
+                role_lines: List[str] = []
+                for i, img_url in enumerate(ref_imgs):
+                    meta = _ref_meta_for(i)
+                    label = (meta.get("label") or "").strip()
+                    if _should_remove_bg(i):
+                        try:
+                            processed = await remove_background(img_url, method="auto")
+                        except Exception as e:
+                            print(f"⚠️ Background removal failed for reference image {i} ({label or 'unlabeled'}): {e}")
+                            processed = img_url
+                    else:
+                        processed = img_url
+                    processed_imgs.append(processed)
+                    role_desc = label if label else f"reference image {i + 1}"
+                    bg_note = "background removed, use only the isolated subject" if _should_remove_bg(i) else "use exactly as provided, including its background/setting"
+                    role_lines.append(f"  {i + 1}. {role_desc} — {bg_note}")
+
+                multi_reference_block = (
+                    "=== MULTIPLE REFERENCE IMAGES — COMBINE THEM ===\n"
+                    f"You have been given {len(ref_imgs)} reference images, in this order:\n"
+                    + "\n".join(role_lines) + "\n"
+                    "Combine them into ONE cohesive social media graphic. Every labelled subject "
+                    "(product, person, logo, etc.) must appear EXACTLY as it looks in its own "
+                    "reference image — same shape, colours, proportions, and detail. Do not "
+                    "invent, omit, or merge subjects together. Where a reference is a background/"
+                    "setting, use its environment, lighting, and mood as the scene the other "
+                    "subjects are placed into."
+                )
+                image_prompt = multi_reference_block + "\n\n" + image_prompt
+
+                print(f"\n{'━'*60}\n"
+                    f"📤 FINAL PROMPT → GPT-Image-2 [{platform.upper()}] (combining {len(ref_imgs)} reference images)\n"
+                    f"{'━'*60}\n"
+                    f"{image_prompt}\n"
+                    f"{'━'*60}\n"
+                )
+
+                image_response = await ImageContentService._call_dalle_api(
+                    prompt=image_prompt,
+                    size=f"{specs['width']}x{specs['height']}",
+                    reference_images=processed_imgs,
+                    image_model=image_model,
+                )
+            else:
+                # Use cutout_url (background-removed) if preservation pipeline ran, otherwise original
+                final_reference_image = cutout_url if (reference_image and cutout_url != reference_image) else reference_image
+
+                image_response = await ImageContentService._call_dalle_api(
+                    prompt=image_prompt,
+                    size=f"{specs['width']}x{specs['height']}",
+                    reference_image=final_reference_image,
+                    image_model=image_model,
+                )
 
             if image_response.get('success'):
                 # Composite brand logo onto generated image for all models.
@@ -2692,10 +2798,32 @@ Answer with exactly one word: "yes" or "no"."""
             return image_url
 
     @staticmethod
+    def _resize_contain_pad(img: Any, tw: int, th: int) -> Any:
+        """
+        Resize preserving aspect ratio (fit within tw×th, never stretch/squash),
+        then pad the leftover space with fully transparent pixels to reach the
+        exact target canvas. Replaces a plain img.resize((tw, th)), which forces
+        the image to exactly tw×th regardless of its original proportions —
+        visibly stretching or squashing anything whose aspect ratio doesn't
+        already match the target bucket. Padding (not cropping) so nothing the
+        user uploaded is ever cut off either.
+        """
+        from PIL import Image as _PILImage
+
+        img = img.convert("RGBA")
+        scale = min(tw / img.width, th / img.height)
+        new_w, new_h = max(1, round(img.width * scale)), max(1, round(img.height * scale))
+        resized = img.resize((new_w, new_h), _PILImage.LANCZOS)
+        canvas = _PILImage.new("RGBA", (tw, th), (0, 0, 0, 0))
+        canvas.paste(resized, ((tw - new_w) // 2, (th - new_h) // 2), resized)
+        return canvas
+
+    @staticmethod
     async def _call_dalle_api(
         prompt: str,
         size: str = "1024x1024",
         reference_image: Optional[str] = None,
+        reference_images: Optional[List[str]] = None,
         image_model: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
@@ -2705,7 +2833,12 @@ Answer with exactly one word: "yes" or "no"."""
         When reference_image (base64 data URL or public URL) is provided, uses
         gpt-image-1's edit endpoint so the reference appears exactly as-is and
         only brand/design overlays are added — bypassing Imagen which would
-        reimagine the scene from scratch.
+        reimagine the scene from scratch. reference_images (plural) does the
+        same but passes MULTIPLE images to that same edit endpoint in one call —
+        gpt-image-1's edit endpoint natively accepts a list (up to 16), and the
+        model uses all of them together for a single output; this was already
+        supported by the API, just never exercised since every caller here used
+        to pass exactly one image.
         """
         import base64 as _b64
         import io
@@ -2719,33 +2852,21 @@ Answer with exactly one word: "yes" or "no"."""
             except (ValueError, AttributeError):
                 target_w, target_h = 1024, 1024
 
-            # ── Image-edit path (reference image provided) ─────────────────────
+            # ── Image-edit path (reference image(s) provided) ──────────────────
             # Skip Imagen (text-to-image only) and use gpt-image-1 edit endpoint,
-            # which takes the reference as a base and applies the prompt as overlays.
-            # GPT-Image-2 handles its own reference image path below.
-            if reference_image and (image_model or "") not in ("openai/gpt-image-2", "fal-ai/openai/gpt-image-2"):
+            # which takes the reference(s) as a base and applies the prompt as
+            # overlays/instructions. GPT-Image-2 handles its own reference image
+            # path below. reference_images (plural) takes priority when both are
+            # given, but a single reference_image resolves to a 1-item list here
+            # too, so everything downstream is written against one list either way.
+            all_refs: List[str] = [r for r in (reference_images or ([reference_image] if reference_image else [])) if r]
+            if all_refs and (image_model or "") not in ("openai/gpt-image-2", "fal-ai/openai/gpt-image-2"):
                 try:
                     from app.services.AIService import client as _ai_client
                     from PIL import Image as _PILImage
 
-                    # Decode reference image to raw PNG bytes (gpt-image-1 edit requires PNG)
-                    if reference_image.startswith("data:"):
-                        import re as _re_ref
-                        _m = _re_ref.match(r"data:[^;]+;base64,(.+)", reference_image, _re_ref.DOTALL)
-                        raw_bytes = _b64.b64decode(_m.group(1)) if _m else None
-                    else:
-                        import httpx as _httpx
-                        async with _httpx.AsyncClient(timeout=20) as _c:
-                            r = await _c.get(reference_image)
-                            raw_bytes = r.content if r.status_code == 200 else None
-
-                    if not raw_bytes:
-                        raise ValueError("Could not load reference image bytes")
-
-                    # Convert to RGBA PNG (required by the edit endpoint)
-                    img = _PILImage.open(io.BytesIO(raw_bytes)).convert("RGBA")
-
-                    # Resize to match requested output dimensions
+                    # Same target canvas bucket for every image in the set, so a
+                    # multi-image edit call gets consistently-sized inputs.
                     if target_w > target_h:
                         edit_size = "1536x1024"
                     elif target_h > target_w:
@@ -2753,11 +2874,38 @@ Answer with exactly one word: "yes" or "no"."""
                     else:
                         edit_size = "1024x1024"
                     tw, th = map(int, edit_size.split("x"))
-                    img = img.resize((tw, th), _PILImage.LANCZOS)
 
-                    png_buf = io.BytesIO()
-                    img.save(png_buf, format="PNG")
-                    png_buf.seek(0)
+                    image_tuples = []
+                    for idx, ref in enumerate(all_refs):
+                        if ref.startswith("data:"):
+                            import re as _re_ref
+                            _m = _re_ref.match(r"data:[^;]+;base64,(.+)", ref, _re_ref.DOTALL)
+                            raw_bytes = _b64.b64decode(_m.group(1)) if _m else b""
+                        else:
+                            import httpx as _httpx
+                            async with _httpx.AsyncClient(timeout=20) as _c:
+                                r = await _c.get(ref)
+                                raw_bytes = r.content if r.status_code == 200 else b""
+
+                        if not raw_bytes:
+                            raise ValueError(f"Could not load reference image bytes (index {idx})")
+
+                        # Fit-within + transparent-pad instead of a plain resize —
+                        # preserves the original's proportions and full content
+                        # instead of stretching/squashing it to the target bucket.
+                        img = _PILImage.open(io.BytesIO(raw_bytes))
+                        img = ImageContentService._resize_contain_pad(img, tw, th)
+
+                        buf = io.BytesIO()
+                        img.save(buf, format="PNG")
+                        buf.seek(0)
+                        image_tuples.append((f"reference_{idx}.png", buf, "image/png"))
+
+                    # images.edit's `image` param accepts either a single file tuple
+                    # or a list — pass the bare tuple for the single-image case
+                    # (matches the original call shape exactly) and the list for
+                    # multi-reference combine mode.
+                    edit_image_arg = image_tuples[0] if len(image_tuples) == 1 else image_tuples
 
                     loop = asyncio.get_running_loop()
                     response = await asyncio.wait_for(
@@ -2765,7 +2913,7 @@ Answer with exactly one word: "yes" or "no"."""
                             None,
                             lambda: _ai_client.images.edit(
                                 model="gpt-image-1",
-                                image=("reference.png", png_buf, "image/png"),
+                                image=edit_image_arg,
                                 prompt=prompt,
                                 n=1,
                                 size=edit_size,
