@@ -1,3 +1,4 @@
+import asyncio
 import os
 
 from fastapi import FastAPI
@@ -20,6 +21,7 @@ from app.agents.social_media_manager.routers.custom_visual_guides_v2 import rout
 from app.agents.social_media_manager.routers.canvas_editor import router as canvas_editor_router
 from app.agents.social_media_manager.routers.jane_router import router as jane_router
 from app.agents.visual_engine_v2.routers.visual_engine_v2_router import router as visual_engine_v2_router
+from app.agents.content_calendar_v2.routers.content_calendar_v2_router import router as content_calendar_v2_router
 from app.routers.auth_router import router as auth_router
 from app.routers.billing_router import router as billing_router
 from app.routers.notification_router import router as notification_router
@@ -127,6 +129,15 @@ async def startup_event():
         print("✅ Notification scheduler started")
     except Exception as e:
         print(f"⚠️  Warning: Failed to start notification scheduler: {e}")
+
+    # DocumentDB credential refresher — no-op unless DOCDB_SECRET_ARN is set
+    # (only where the cluster has AWS-managed password rotation). See
+    # app/services/docdb_credential_refresher.py for why this exists.
+    try:
+        from app.services.docdb_credential_refresher import start_background_refresher
+        asyncio.ensure_future(start_background_refresher())
+    except Exception as e:
+        print(f"⚠️  Warning: Failed to start DocumentDB credential refresher: {e}")
 
 # CORS
 # Use explicit origins only (no allow_origin_regex) — Starlette's elif chain
@@ -237,6 +248,10 @@ app.include_router(custom_guides_v2_router)  # V2 - Advanced style transfer
 
 # Include Visual Engine V2 (4-layer compositing system)
 app.include_router(visual_engine_v2_router, prefix="/social-media/visual-engine", tags=["Visual Engine V2"])
+
+# Include Content Calendar V2 (30-day content intelligence engine, staging-only —
+# see /Users/macintoshhd/.claude/plans/enchanted-wiggling-treehouse.md)
+app.include_router(content_calendar_v2_router, prefix="/social-media/content-calendar-v2", tags=["Content Calendar V2"])
 
 # Include Canvas Editor (layered document editing)
 app.include_router(canvas_editor_router, prefix="/social-media", tags=["Canvas Editor"])
