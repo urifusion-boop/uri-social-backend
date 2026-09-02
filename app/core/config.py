@@ -8,6 +8,13 @@ class Settings(BaseSettings):
     MONGODB_USER: str = ""
     MONGODB_PASSWORD: str = ""
     MONGODB_HOST: str = ""
+    # ARN of the DocumentDB-managed master-password secret (set only where the
+    # cluster has AWS-managed rotation enabled, e.g. prod). When set, a
+    # background task polls this secret and rebuilds the Mongo connection the
+    # moment the password changes — the whole point being that a rotation event
+    # is a non-event for anyone using the app, instead of an outage discovered
+    # only once someone can't log in. See app/services/docdb_credential_refresher.py.
+    DOCDB_SECRET_ARN: str = ""
     OPENAI_API_KEY: str
     AUTHJWT_SECRET_KEY: str
 
