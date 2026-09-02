@@ -1,3 +1,4 @@
+import asyncio
 import os
 
 from fastapi import FastAPI
@@ -128,6 +129,15 @@ async def startup_event():
         print("✅ Notification scheduler started")
     except Exception as e:
         print(f"⚠️  Warning: Failed to start notification scheduler: {e}")
+
+    # DocumentDB credential refresher — no-op unless DOCDB_SECRET_ARN is set
+    # (only where the cluster has AWS-managed password rotation). See
+    # app/services/docdb_credential_refresher.py for why this exists.
+    try:
+        from app.services.docdb_credential_refresher import start_background_refresher
+        asyncio.ensure_future(start_background_refresher())
+    except Exception as e:
+        print(f"⚠️  Warning: Failed to start DocumentDB credential refresher: {e}")
 
 # CORS
 # Use explicit origins only (no allow_origin_regex) — Starlette's elif chain
