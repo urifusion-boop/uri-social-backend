@@ -270,6 +270,37 @@ def image_cta(destination_type: DestinationType) -> str:
     return _IMAGE_CTAS.get(destination_type, _IMAGE_CTAS[DEFAULT_DESTINATION])
 
 
+# What Meta is told to optimise for, per destination. Every ad is a link ad, so this
+# is always link clicks — but naming the actual place is what makes the plan card
+# readable, and hard-coding WhatsApp here put "WhatsApp link clicks / most likely to
+# message you" on a website campaign. Live-reported.
+_OPTIMIZATION = {
+    DestinationType.WHATSAPP: ("WhatsApp link clicks",
+        "Meta optimises delivery toward people most likely to tap through and message you."),
+    DestinationType.WEBSITE: ("Website link clicks",
+        "Meta optimises delivery toward people most likely to tap through to your site."),
+    DestinationType.INSTAGRAM_DM: ("Instagram DM clicks",
+        "Meta optimises delivery toward people most likely to tap through and DM you."),
+    DestinationType.CUSTOM: ("Link clicks",
+        "Meta optimises delivery toward people most likely to tap through to your link."),
+}
+
+
+def optimization_for(destination_type: DestinationType) -> tuple[str, str]:
+    """The plan card's OPTIMIZATION row — its value and its reason."""
+    return _OPTIMIZATION.get(destination_type, _OPTIMIZATION[DEFAULT_DESTINATION])
+
+
+def clicks_label(destination_type: DestinationType) -> str:
+    """Label for the estimated-clicks figure, e.g. "Est. website clicks"."""
+    return {
+        DestinationType.WHATSAPP: "Est. WhatsApp clicks",
+        DestinationType.WEBSITE: "Est. website clicks",
+        DestinationType.INSTAGRAM_DM: "Est. Instagram DM clicks",
+        DestinationType.CUSTOM: "Est. link clicks",
+    }.get(destination_type, "Est. link clicks")
+
+
 def copy_action(destination_type: DestinationType) -> str:
     """The action the written copy tells the reader to take."""
     return _COPY_ACTIONS.get(destination_type, _COPY_ACTIONS[DEFAULT_DESTINATION])[0]
@@ -312,7 +343,13 @@ async def get_brand_destination(db, brand_id: Optional[str]) -> dict:
     """The brand's saved destination — every field, so a brand that switches type
     keeps the values it already gave for the others. Defaults to WhatsApp: every
     existing brand predates this setting and already has a number stored, so they
-    keep working untouched."""
+    keep working untouched.
+
+    `chosen` says whether that type is a real ANSWER or just this default. Callers
+    must not treat the two the same: a brand who has never been asked was being
+    pushed down the WhatsApp path — and straight into "link your WhatsApp number" —
+    instead of being asked where their ad should send people at all.
+    """
     doc = {}
     if brand_id and db is not None:
         doc = await db[SETTINGS_COLLECTION].find_one(
@@ -323,6 +360,7 @@ async def get_brand_destination(db, brand_id: Optional[str]) -> dict:
     dest = coerce_type(doc.get("destination_type", ""))
     return {
         "destination_type": dest.value,
+        "chosen": bool(doc.get("destination_type")),
         "whatsapp_number": doc.get("whatsapp_number", "") or "",
         "website_url": doc.get("website_url", "") or "",
         "instagram_username": doc.get("instagram_username", "") or "",
