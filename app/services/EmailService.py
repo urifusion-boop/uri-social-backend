@@ -33,6 +33,32 @@ def _get_jinja_env() -> Environment:
     return _jinja_env
 
 
+def _make_smtp_client() -> "aiosmtplib.SMTP":
+    """
+    A fresh SMTP client for one send attempt (both send_email and send_raw_email
+    create a new connection per attempt rather than reusing one, to avoid stale
+    connections across retries).
+
+    use_tls (implicit TLS from the first byte, correct for port 465) was
+    previously hardcoded True regardless of the actual configured port —  but
+    SMTP_PORT has no explicit value set in either environment, so it silently
+    defaulted to 587 (config.py) instead, which is the STARTTLS port: it
+    expects a plaintext EHLO first and only upgrades to TLS after an explicit
+    STARTTLS command. Sending a TLS ClientHello where the server expects
+    plaintext SMTP is exactly what produces "Unexpected EOF received" —
+    confirmed live, every verification email failed on both dev and prod.
+    Derive the correct mode from the actual port instead of assuming one.
+    """
+    implicit_tls = settings.SMTP_PORT == 465
+    return aiosmtplib.SMTP(
+        hostname=settings.SMTP_HOST,
+        port=settings.SMTP_PORT,
+        use_tls=implicit_tls,
+        start_tls=not implicit_tls,
+        timeout=30,
+    )
+
+
 class EmailService:
     """
     Async SMTP email delivery service.
@@ -84,14 +110,9 @@ class EmailService:
         last_error = None
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                # Create a new connection for each attempt to avoid stale connections
-                # Port 465 uses direct SSL/TLS connection (no STARTTLS needed)
-                smtp = aiosmtplib.SMTP(
-                    hostname=settings.SMTP_HOST,
-                    port=settings.SMTP_PORT,
-                    use_tls=True,  # Direct SSL/TLS for port 465
-                    timeout=30,
-                )
+                # A fresh connection per attempt (avoids stale connections across
+                # retries) — see _make_smtp_client's docstring for the TLS/port fix.
+                smtp = _make_smtp_client()
 
                 await smtp.connect()
                 await smtp.login(settings.SMTP_USERNAME, settings.SMTP_PASSWORD)
@@ -133,14 +154,9 @@ class EmailService:
         last_error = None
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                # Create a new connection for each attempt to avoid stale connections
-                # Port 465 uses direct SSL/TLS connection (no STARTTLS needed)
-                smtp = aiosmtplib.SMTP(
-                    hostname=settings.SMTP_HOST,
-                    port=settings.SMTP_PORT,
-                    use_tls=True,  # Direct SSL/TLS for port 465
-                    timeout=30,
-                )
+                # A fresh connection per attempt (avoids stale connections across
+                # retries) — see _make_smtp_client's docstring for the TLS/port fix.
+                smtp = _make_smtp_client()
 
                 await smtp.connect()
                 await smtp.login(settings.SMTP_USERNAME, settings.SMTP_PASSWORD)
