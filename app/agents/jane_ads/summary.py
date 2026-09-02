@@ -49,6 +49,9 @@ class CampaignEstimates(BaseModel):
     estimated_clicks: Optional[int] = None
     estimated_leads: Optional[int] = None
     cost_per_result_ngn: Optional[float] = None
+    # What to call estimated_clicks on the card. The client used to hard-code
+    # "Est. WhatsApp clicks", which was wrong for every other destination.
+    clicks_label: str = "Est. link clicks"
     note: str = "These are estimates based on your budget and audience — not guarantees."
 
 
@@ -144,11 +147,13 @@ def build_campaign_summary(
                 f"minimum daily budget so the ad actually delivers, without stretching too thin."),
     )
 
-    # Optimization — what Meta is told to get you.
-    optimization = ReasonedValue(
-        value="WhatsApp link clicks",
-        reason="Meta optimizes delivery toward people most likely to tap through and message you.",
-    )
+    # Optimization — what Meta is told to get you, named after where the tap actually
+    # lands. Was hard-coded to WhatsApp, which read "WhatsApp link clicks / most likely
+    # to message you" on a campaign pointing at a website.
+    from .destination import clicks_label, coerce_type, optimization_for
+    _dest = coerce_type(getattr(plan, "destination_type", "") or "")
+    _opt_value, _opt_reason = optimization_for(_dest)
+    optimization = ReasonedValue(value=_opt_value, reason=_opt_reason)
 
     # Estimates. Audience size = Meta's addressable pool for the targeting (real data,
     # honestly labeled as "could reach", not "will reach"). Clicks/leads are BUDGET-driven:
@@ -164,6 +169,8 @@ def build_campaign_summary(
         estimates.estimated_clicks = max(leads, round(leads / ASSUMED_LEAD_RATE))
         estimates.cost_per_result_ngn = round(
             price_per_result_ngn if price_per_result_ngn else total_budget / leads, 2)
+
+    estimates.clicks_label = clicks_label(_dest)
 
     return CampaignSummary(
         objective=objective, audience=audience, platforms=platforms,

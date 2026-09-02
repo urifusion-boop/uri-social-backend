@@ -2964,36 +2964,49 @@ Answer with exactly one word: "yes" or "no"."""
                     else:
                         _gpt2_size = "1024x1024"
 
-                    if reference_image:
-                        # Decode reference image to PNG bytes for the edit endpoint
-                        if reference_image.startswith("data:"):
-                            import re as _re_ref2
-                            _m2 = _re_ref2.match(r"data:[^;]+;base64,(.+)", reference_image, _re_ref2.DOTALL)
-                            _ref_bytes = _b64.b64decode(_m2.group(1)) if _m2 else None
-                        else:
-                            import httpx as _httpx2
-                            async with _httpx2.AsyncClient(timeout=20) as _c2:
-                                _r2 = await _c2.get(reference_image)
-                                _ref_bytes = _r2.content if _r2.status_code == 200 else None
-
-                        if not _ref_bytes:
-                            raise ValueError("Could not load reference image bytes for GPT-Image-2 edit")
-
-                        _ref_img = _PILImage.open(_io.BytesIO(_ref_bytes)).convert("RGBA")
+                    if all_refs:
+                        # image_model is force-set to "openai/gpt-image-2" by every
+                        # caller of _generate_platform_image (PRD Section 8), which
+                        # means the "Image-edit path" block above — despite being
+                        # written first — can never actually run: its own guard
+                        # condition explicitly excludes this exact image_model value.
+                        # THIS is the branch every reference-image generation (single
+                        # or multi) actually goes through. Mirrors the same
+                        # multi-image + letterbox handling as that other branch so
+                        # both stay correct even though only one is reachable.
                         _tw2, _th2 = map(int, _gpt2_size.split("x"))
-                        _ref_img = _ref_img.resize((_tw2, _th2), _PILImage.LANCZOS)
-                        _ref_png_buf = _io.BytesIO()
-                        _ref_img.save(_ref_png_buf, format="PNG")
-                        _ref_png_buf.seek(0)
+                        _gpt2_image_tuples = []
+                        for _idx2, _ref2 in enumerate(all_refs):
+                            if _ref2.startswith("data:"):
+                                import re as _re_ref2
+                                _m2 = _re_ref2.match(r"data:[^;]+;base64,(.+)", _ref2, _re_ref2.DOTALL)
+                                _ref_bytes = _b64.b64decode(_m2.group(1)) if _m2 else None
+                            else:
+                                import httpx as _httpx2
+                                async with _httpx2.AsyncClient(timeout=20) as _c2:
+                                    _r2 = await _c2.get(_ref2)
+                                    _ref_bytes = _r2.content if _r2.status_code == 200 else None
 
-                        print(f"🎨 GPT-Image-2 edit with reference ({_gpt2_size})…")
+                            if not _ref_bytes:
+                                raise ValueError(f"Could not load reference image bytes for GPT-Image-2 edit (index {_idx2})")
+
+                            _ref_img = _PILImage.open(_io.BytesIO(_ref_bytes))
+                            _ref_img = ImageContentService._resize_contain_pad(_ref_img, _tw2, _th2)
+                            _ref_png_buf = _io.BytesIO()
+                            _ref_img.save(_ref_png_buf, format="PNG")
+                            _ref_png_buf.seek(0)
+                            _gpt2_image_tuples.append((f"reference_{_idx2}.png", _ref_png_buf, "image/png"))
+
+                        _gpt2_edit_image_arg = _gpt2_image_tuples[0] if len(_gpt2_image_tuples) == 1 else _gpt2_image_tuples
+
+                        print(f"🎨 GPT-Image-2 edit with {len(_gpt2_image_tuples)} reference image(s) ({_gpt2_size})…")
                         loop = asyncio.get_running_loop()
                         _gpt2_resp = await asyncio.wait_for(
                             loop.run_in_executor(
                                 None,
                                 lambda: _oai_client.images.edit(
                                     model="gpt-image-2",
-                                    image=("reference.png", _ref_png_buf, "image/png"),
+                                    image=_gpt2_edit_image_arg,
                                     prompt=prompt,
                                     n=1,
                                     size=_gpt2_size,

@@ -336,3 +336,58 @@ def test_register_block_example_matches_destination():
     assert "go to the website" in web
     assert "Never end without one." in web
     assert "your own words" in web
+
+
+# ── A brand that never chose is not a brand that chose WhatsApp ───────────────
+# Live-observed on staging: a brand with no destination at all was never asked for
+# a link. get_brand_destination defaults destination_type to "whatsapp", and the
+# step-1.6 gate read that default as an answer, so the brand was sent to the
+# "link your WhatsApp number" wall instead of the choose_destination question.
+
+def _fake_db(doc):
+    class _Coll:
+        async def find_one(self, *a, **k):
+            return doc
+    class _DB:
+        def __getitem__(self, name):
+            return _Coll()
+    return _DB()
+
+
+@pytest.mark.asyncio
+async def test_unset_destination_is_marked_unchosen():
+    from app.agents.jane_ads.destination import get_brand_destination
+
+    d = await get_brand_destination(_fake_db(None), "brand_1")
+    # The default is still WhatsApp, so nothing downstream changes shape...
+    assert d["destination_type"] == "whatsapp"
+    # ...but callers can tell it apart from a brand that actually said WhatsApp.
+    assert d["chosen"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_real_choice_is_marked_chosen():
+    from app.agents.jane_ads.destination import get_brand_destination
+
+    d = await get_brand_destination(
+        _fake_db({"destination_type": "whatsapp", "whatsapp_number": "2348000000000"}),
+        "brand_1",
+    )
+    assert (d["destination_type"], d["chosen"]) == ("whatsapp", True)
+
+    web = await get_brand_destination(
+        _fake_db({"destination_type": "website", "website_url": "https://x.com"}), "brand_1")
+    assert (web["destination_type"], web["chosen"]) == ("website", True)
+
+
+@pytest.mark.asyncio
+async def test_legacy_brand_with_only_a_number_still_reads_as_whatsapp():
+    # A brand from before this setting existed has a number but no destination_type.
+    # It must keep working untouched: chosen is False, but the number is what the
+    # step-1.6 gate falls back to, so nothing starts re-asking these brands.
+    from app.agents.jane_ads.destination import get_brand_destination
+
+    d = await get_brand_destination(_fake_db({"whatsapp_number": "2348000000000"}), "brand_1")
+    assert d["chosen"] is False
+    assert d["whatsapp_number"] == "2348000000000"
+    assert d["destination_type"] == "whatsapp"
