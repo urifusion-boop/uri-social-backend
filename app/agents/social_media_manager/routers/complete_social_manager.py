@@ -1346,7 +1346,7 @@ async def facebook_direct_callback(
     from datetime import timezone
 
     web_app_url = settings.WEB_APP_URL.strip("'\"")
-    base_redirect = f"{web_app_url}/workspace?tab=connections"
+    base_redirect = f"{web_app_url}/workspace/?tab=connections"
 
     if error:
         msg = urllib.parse.quote(error_reason or error)
@@ -1532,7 +1532,7 @@ async def instagram_direct_callback(
     # Always redirect to the workspace connections tab — that is where
     # the finalizeInstagramDirect handler lives. /settings/social-accounts
     # does not exist as a route so the finalize call would never fire there.
-    base_redirect = f"{web_app_url}/workspace?tab=connections"
+    base_redirect = f"{web_app_url}/workspace/?tab=connections"
 
     if error:
         msg = urllib.parse.quote(error_reason or error)
@@ -1850,7 +1850,7 @@ async def outstand_oauth_callback(
 
     web_app_url = settings.WEB_APP_URL.strip("'\"")
     is_settings = source == "settings"
-    base_redirect = f"{web_app_url}/settings/social-accounts" if is_settings else f"{web_app_url}/social-media/brand-setup"
+    base_redirect = f"{web_app_url}/settings/social-accounts/" if is_settings else f"{web_app_url}/social-media/brand-setup/"
 
     if error:
         encoded_error = urllib.parse.quote(error)
