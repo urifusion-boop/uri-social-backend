@@ -122,18 +122,18 @@ async def x_oauth_callback(
 
     if denied or not oauth_token or not oauth_verifier:
         return RedirectResponse(
-            f"{web_app_url}/social-media/brand-setup?connected=false&platform=x&error=access_denied"
+            f"{web_app_url}/social-media/brand-setup/?connected=false&platform=x&error=access_denied"
         )
 
     pending = await db["x_oauth_pending"].find_one({"oauth_token": oauth_token})
     if not pending:
         return RedirectResponse(
-            f"{web_app_url}/social-media/brand-setup?connected=false&platform=x&error=session_expired"
+            f"{web_app_url}/social-media/brand-setup/?connected=false&platform=x&error=session_expired"
         )
     if pending.get("expires_at") and datetime.utcnow() > pending["expires_at"]:
         await db["x_oauth_pending"].delete_one({"oauth_token": oauth_token})
         return RedirectResponse(
-            f"{web_app_url}/social-media/brand-setup?connected=false&platform=x&error=session_expired"
+            f"{web_app_url}/social-media/brand-setup/?connected=false&platform=x&error=session_expired"
         )
 
     user_id = pending["user_id"]
@@ -145,7 +145,7 @@ async def x_oauth_callback(
         result = await svc.get_access_token(oauth_token, oauth_token_secret, oauth_verifier)
     except Exception as e:
         return RedirectResponse(
-            f"{web_app_url}/social-media/brand-setup"
+            f"{web_app_url}/social-media/brand-setup/"
             f"?connected=false&platform=x&error={urllib.parse.quote(str(e))}"
         )
     finally:
@@ -182,7 +182,7 @@ async def x_oauth_callback(
     )
 
     return RedirectResponse(
-        f"{web_app_url}/social-media/brand-setup"
+        f"{web_app_url}/social-media/brand-setup/"
         f"?connected=true&platform=x&username={urllib.parse.quote(screen_name)}"
     )
 
