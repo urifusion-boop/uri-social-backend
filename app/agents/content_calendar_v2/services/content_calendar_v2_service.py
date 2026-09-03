@@ -26,6 +26,7 @@ edit_history $push pattern), approval, performance sync.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import random
 import secrets
@@ -531,8 +532,16 @@ async def generate_plan_v2(
         existing = await get_active_plan(user_id, db, brand_id=brand_id)
         if existing:
             return existing
-    else:
-        await db[COLLECTION].update_many({**scope, "status": "active"}, {"$set": {"status": "archived"}})
+    # NOTE: the old "archive the active plan, then generate" ordering was a real
+    # data-loss bug — confirmed live: generation can take several minutes (5
+    # chunks x up to 2 LLM calls + ad-copy + diversity check), which regularly
+    # outlives whatever proxy/gateway fronts this endpoint. If the request gets
+    # cancelled after the archive but before the new plan exists, the user is
+    # left with zero active plans and no way back to the one that just got
+    # archived. Archiving now happens right before the insert below, once the
+    # new plan is fully built — shrinking the unsafe window from "the entire
+    # generation" down to two adjacent Mongo calls, so a mid-generation
+    # disconnect just leaves the old plan intact instead of destroying it.
 
     industry = brand.get("industry", "")
     region = brand.get("region", "")
@@ -605,14 +614,24 @@ async def generate_plan_v2(
     for slot in carousel_slots:
         formats[slot] = "carousel"
 
-    # ── Generate in chunks ───────────────────────────────────────────────────
-    all_items: List[Dict[str, Any]] = []
-    running_titles = list(previous_titles)
-    running_key_points = list(previous_key_points)
-    for chunk_start_idx in range(0, PLAN_DAYS, CHUNK_SIZE):
+    # ── Generate in chunks, concurrently ─────────────────────────────────────
+    # Every chunk's inputs (formats/hooks/content-types/dates) are already
+    # fully precomputed above, so chunks don't need to run one-after-another —
+    # confirmed live: sequential generation took 5+ minutes for 5 chunks,
+    # regularly outliving whatever proxy/gateway fronts this endpoint and
+    # dropping the client mid-request. Running them concurrently instead cuts
+    # wall-clock time roughly 5x. Trade-off: each chunk only sees the
+    # anti-repetition context from PRIOR plan runs (previous_titles/
+    # previous_key_points, fetched from Mongo before this loop), not from
+    # sibling chunks generated in the same run — acceptable since the
+    # post-generation diversity check below still runs across the full,
+    # combined 30-item set regardless of how the chunks were produced.
+    chunk_starts = list(range(0, PLAN_DAYS, CHUNK_SIZE))
+
+    async def _run_chunk(chunk_start_idx: int) -> List[Dict[str, Any]]:
         chunk_len = min(CHUNK_SIZE, PLAN_DAYS - chunk_start_idx)
         try:
-            chunk_items = await _generate_chunk_items(
+            return await _generate_chunk_items(
                 brand=brand,
                 chunk_content_types=content_type_mix[chunk_start_idx:chunk_start_idx + chunk_len],
                 chunk_formats=formats[chunk_start_idx:chunk_start_idx + chunk_len],
@@ -620,19 +639,18 @@ async def generate_plan_v2(
                 chunk_dates=all_dates[chunk_start_idx:chunk_start_idx + chunk_len],
                 day_offset=chunk_start_idx,
                 platforms=platforms,
-                previous_titles=running_titles,
-                previous_key_points=running_key_points,
+                previous_titles=previous_titles,
+                previous_key_points=previous_key_points,
                 trend_keywords=trend_keywords or [],
                 performance=performance,
                 force=force,
             )
         except Exception as exc:
             print(f"[CalendarV2] chunk at offset {chunk_start_idx} failed: {exc}", flush=True)
-            chunk_items = []
-        all_items += chunk_items
-        running_titles += [it.get("title", "") for it in chunk_items if it.get("title")]
-        for it in chunk_items:
-            running_key_points += [str(p) for p in (it.get("key_points") or []) if p]
+            return []
+
+    chunk_results = await asyncio.gather(*[_run_chunk(idx) for idx in chunk_starts])
+    all_items: List[Dict[str, Any]] = [item for chunk_items in chunk_results for item in chunk_items]
 
     if not all_items:
         raise RuntimeError("Content Calendar V2 generation failed for every chunk — no items produced.")
@@ -766,6 +784,8 @@ async def generate_plan_v2(
         "created_at": now.isoformat(),
         "updated_at": now.isoformat(),
     }
+    if force:
+        await db[COLLECTION].update_many({**scope, "status": "active"}, {"$set": {"status": "archived"}})
     await db[COLLECTION].insert_one({**doc, "_id": plan_id})
     return doc
 
