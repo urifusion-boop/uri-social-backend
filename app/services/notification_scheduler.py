@@ -11,11 +11,16 @@ Runs daily batch jobs:
 - WhatsApp daily content push (08:00 UTC / 09:00 WAT)
 - Jane + Ads mid-flight monitoring (every 4 hours) — campaign roadmap Tier 4
 - Jane + Ads ad-spend billing (hourly) — recoup Meta spend × markup from prepaid wallets
+- Publish scheduled content (every 5 minutes)
 
-Note: publish_scheduled_content is intentionally NOT in this scheduler.
-It is triggered every 5 minutes by the GitHub Actions workflow
-(.github/workflows/publish-scheduled-posts.yml) via POST /social-media/publish-scheduled.
-Running it here AND in GH Actions would create duplicate publish attempts.
+Note on publish_scheduled_content: an earlier version of this file ran it
+via a separate GitHub Actions workflow instead (publish-scheduled-posts.yml)
+and deliberately left it out of this scheduler to avoid double-firing. That
+workflow is currently disabled (.yml.txt, not .yml — GitHub only runs the
+literal extension) on both dev and prod, so this in-process job is what
+actually publishes scheduled posts. If that workflow is ever re-enabled,
+this job must come back out first, or every post fires from both places
+again.
 """
 import asyncio
 from datetime import datetime
@@ -157,6 +162,19 @@ def _job_jane_ads_billing():
     _run_async("jane_ads_billing", _run)
 
 
+def _job_publish_scheduled_content():
+    async def _run():
+        from app.database import get_db
+        from app.agents.social_media_manager.services.approval_workflow_service import ApprovalWorkflowService
+        db = get_db()
+        result = await ApprovalWorkflowService.publish_scheduled_content(db=db)
+        published = result.get("published_count", 0)
+        errors = result.get("errors", [])
+        if published > 0 or errors:
+            print(f"📅 Scheduled publish: {published} published, {len(errors)} errors — {errors}")
+    _run_async("publish_scheduled_content", _run)
+
+
 def start_notification_scheduler():
     """Start the APScheduler with all notification batch jobs."""
     global _scheduler, _main_loop
@@ -246,8 +264,18 @@ def start_notification_scheduler():
         **_JOB_DEFAULTS,
     )
 
+    # Publish scheduled content every 5 minutes — see the module docstring:
+    # the GH Actions workflow that used to own this is currently disabled,
+    # so this in-process job is what actually publishes scheduled posts.
+    _scheduler.add_job(
+        _job_publish_scheduled_content,
+        CronTrigger(minute="*/5"),
+        id="publish_scheduled_content",
+        **_JOB_DEFAULTS,
+    )
+
     _scheduler.start()
-    print("📅 Notification scheduler started with 8 jobs")
+    print("📅 Notification scheduler started with 9 jobs")
 
 
 def stop_notification_scheduler():
