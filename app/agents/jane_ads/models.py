@@ -296,13 +296,19 @@ class AdCopy(BaseModel):
 
 
 class CreativeSource(str, Enum):
-    """Mirrors PRD Part D2, extended by the creative brief spec's four asset paths."""
+    """Mirrors PRD Part D2, extended by the creative brief spec's four asset paths,
+    plus a fifth added for the static ad format library (VSG-01 v3 §1.2)."""
     GENERATE = "generate"        # Jane generates it via the brand playbook engine (default)
     UPLOAD = "upload"            # the user's own uploaded photo/video, used as-is
     DRAFT = "draft"              # an existing content draft the user already liked
     RECOMPOSITE = "recomposite"  # the user's own real product photo, background cleaned/
                                  # replaced — the product itself is never regenerated
                                  # (product truthfulness rule, creative brief spec §7.1)
+    DRAWN = "drawn"              # entirely composited in Layer 4, no photography at all —
+                                 # receipts, comparison tables, chat-thread mockups. Never
+                                 # a stand-in for a real product photo; only for formats
+                                 # that were never going to show one (VSG-01 v3 §1.2, §2.5,
+                                 # §2.4, §2.6).
 
 
 class AdCreative(BaseModel):
