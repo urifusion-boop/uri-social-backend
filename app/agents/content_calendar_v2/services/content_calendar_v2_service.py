@@ -572,11 +572,18 @@ async def generate_plan_v2(
     carousel_slots = _assign_carousel_slots(content_type_mix, holiday_flags)
 
     # ── Format + hook-style rotation, per chunk ─────────────────────────────
+    # Carousel placement is decided EXCLUSIVELY by _assign_carousel_slots above
+    # (PRD §9 — exactly 3, no more) — POST_FORMATS' own "Carousel (3-5 slides)"
+    # entry must never enter this rotation pool, or a day outside carousel_slots
+    # could draw it independently and end up stored as format="carousel" with
+    # no slide instruction ever reaching the prompt (confirmed live: this
+    # produced 5 extra zero-slide "carousel" items before this exclusion).
+    _NON_CAROUSEL_FORMATS = [f for f in POST_FORMATS if POST_FORMAT_TO_KEY.get(f) != "carousel"]
     formats: List[str] = []
     hooks: List[str] = []
     for chunk_start_idx in range(0, PLAN_DAYS, CHUNK_SIZE):
         chunk_len = min(CHUNK_SIZE, PLAN_DAYS - chunk_start_idx)
-        shuffled_formats = (POST_FORMATS * ((chunk_len // len(POST_FORMATS)) + 1))[:chunk_len]
+        shuffled_formats = (_NON_CAROUSEL_FORMATS * ((chunk_len // len(_NON_CAROUSEL_FORMATS)) + 1))[:chunk_len]
         shuffled_hooks = (HOOK_STYLES * ((chunk_len // len(HOOK_STYLES)) + 1))[:chunk_len]
         random.shuffle(shuffled_formats)
         random.shuffle(shuffled_hooks)
@@ -620,7 +627,19 @@ async def generate_plan_v2(
     # ── Diversity check (rule-based + one LLM self-check pass) ──────────────
     rule_issues = _rule_based_diversity_issues(all_items)
     llm_flagged = await _llm_diversity_check(all_items)
+    print(f"[CalendarV2] diversity check: rule_issues={len(rule_issues)} llm_flagged={len(llm_flagged)}", flush=True)
+    # Confirmed live: the self-check call can occasionally misread the task
+    # and return most/all indices instead of just the genuine duplicates —
+    # a single bad LLM response shouldn't be able to flag a large fraction of
+    # the plan as non-diverse. Treat an implausible result as unreliable and
+    # drop it (the rule-based half — real, deterministic duplicate detection
+    # — still applies either way, so a bad LLM call degrades to "rules only"
+    # rather than corrupting the whole plan's diversity_check field).
+    if len(llm_flagged) > max(6, len(all_items) // 4):
+        print(f"[CalendarV2] LLM diversity check flagged {len(llm_flagged)}/{len(all_items)} — implausible, discarding", flush=True)
+        llm_flagged = []
     flagged_set = set(rule_issues.keys()) | set(llm_flagged)
+    print(f"[CalendarV2] diversity check: final flagged_set size={len(flagged_set)}", flush=True)
 
     # ── Ad opportunity scoring ────────────────────────────────────────────────
     items_out: List[Dict[str, Any]] = []
