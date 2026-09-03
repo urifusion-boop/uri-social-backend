@@ -179,11 +179,15 @@ _ALLOWED_ORIGINS = [
     "http://localhost:8080",
     "http://127.0.0.1:3000",
     "http://127.0.0.1:3001",
-    # Staging
-    "https://staging.urisocial.com",
-    "https://uri-staging.urisocial.com"
-    "https://app-staging.urisocial.com",
-    "https://api-staging.urisocial.com",
+    # Staging — staging.urisocial.com/app-staging.urisocial.com/api-staging.urisocial.com
+    # never actually existed as real DNS records; uri-staging (frontend) and
+    # api-social-dev (backend) are the real CNAMEs, confirmed directly against
+    # the DNS provider's own record list. (Also fixes a real bug in the
+    # previous version here: a missing comma after uri-staging.urisocial.com
+    # silently concatenated it with the next string literal into one
+    # nonsensical origin that could never match a real request.)
+    "https://uri-staging.urisocial.com",
+    "https://api-social-dev.urisocial.com",
     # Production
     "https://urisocial.com",
     "https://www.urisocial.com",
@@ -191,6 +195,7 @@ _ALLOWED_ORIGINS = [
     "https://api.urisocial.com",
     # SDK Gateway
     "https://sdk-gateway.urisocial.com",
+    "https://sdk-gateway-dev.urisocial.com",
 ]
 app.add_middleware(
     CORSMiddleware,

@@ -90,10 +90,12 @@ def configure_cors_for_environment(app, environment: str = "production"):
         ALLOW_ALL_ORIGINS = True
 
     elif environment == "staging":
-        # Add staging domains
+        # uri-staging (frontend) / api-social-dev (backend) — the real CNAMEs,
+        # confirmed against the DNS provider's own record list. The previous
+        # values here never existed as real DNS records.
         CORS_ORIGINS.extend([
-            "https://staging.urisocial.com",
-            "https://staging-app.urisocial.com",
+            "https://uri-staging.urisocial.com",
+            "https://api-social-dev.urisocial.com",
         ])
 
     # Apply CORS configuration
