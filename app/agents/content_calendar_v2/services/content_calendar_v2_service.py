@@ -561,10 +561,23 @@ async def generate_plan_v2(
     industry_best_practices = IndustryTrendService.get_industry_best_practices(industry)
 
     # ── Content-type mix, per-week-chunk (preserves v1's non-fixed-percentage property) ──
+    # NOTE: v1's _pick_mix_from_performance ignores week_number entirely whenever
+    # real performance data exists (its personalised branch derives the mix purely
+    # from avg_engagement_by_topic/primary_goal, both constant across a single
+    # generation run) — harmless in v1, which only ever calls it once per 7-day
+    # plan, but confirmed live here: calling it 5x for one 30-day plan returned
+    # the IDENTICAL mix every week, tiling one 7-day template across the month
+    # and driving heavy false-positive-looking (but real) diversity-check flags.
+    # Not a bug to fix in v1's shared function — vary it in V2's own layer instead,
+    # keeping the same performance-derived type distribution but a different
+    # day-to-day arrangement per week so weeks 2+ aren't a carbon copy of week 1.
     content_type_mix: List[str] = []
     for chunk_idx, chunk_start_idx in enumerate(range(0, PLAN_DAYS, 7)):
         week_number = (period_start.isocalendar()[1] + chunk_idx) if not force else secrets.randbelow(52)
         week_mix = _pick_mix_from_performance(performance, industry, brand, week_number=week_number)
+        if chunk_idx > 0:
+            week_mix = list(week_mix)
+            random.Random(f"{week_number}:{chunk_idx}").shuffle(week_mix)
         content_type_mix += week_mix
     content_type_mix = content_type_mix[:PLAN_DAYS]
 
