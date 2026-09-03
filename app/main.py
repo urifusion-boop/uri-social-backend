@@ -122,6 +122,20 @@ async def startup_event():
     except Exception as e:
         print(f"⚠️  Warning: Failed to create pending_instagram_connections TTL index: {e}")
 
+    # TTL-expire scheduled-job run claims (app/services/notification_scheduler.py's
+    # _try_claim_job_run) — only needed to survive the few-second window across
+    # the container's 4 uvicorn workers checking in for the same minute-bucketed
+    # job, so a generous 1-day expiry is just cleanup, not functional.
+    try:
+        from app.database import get_db
+        db = get_db()
+        await db["scheduled_job_locks"].create_index(
+            "claimed_at", expireAfterSeconds=86400, name="claimed_at_ttl"
+        )
+        print("✅ scheduled_job_locks TTL index ensured")
+    except Exception as e:
+        print(f"⚠️  Warning: Failed to create scheduled_job_locks TTL index: {e}")
+
     # Start notification scheduler (PRD 8: Scheduled Jobs)
     try:
         from app.services.notification_scheduler import start_notification_scheduler

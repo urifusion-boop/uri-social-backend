@@ -18,6 +18,7 @@ It is triggered every 5 minutes by the GitHub Actions workflow
 Running it here AND in GH Actions would create duplicate publish attempts.
 """
 import asyncio
+from datetime import datetime
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
@@ -25,13 +26,60 @@ _scheduler: BackgroundScheduler = None
 _main_loop: asyncio.AbstractEventLoop = None
 
 
-def _run_async(coro_func):
+async def _try_claim_job_run(job_id: str) -> bool:
+    """
+    Makes a scheduled job's actual work run exactly once per scheduled fire
+    time, no matter how many independent schedulers are ticking at once.
+
+    The container runs `uvicorn --workers 4` (see Dockerfile) — four separate
+    OS processes, each importing app.main fresh and each calling
+    start_notification_scheduler() in its own startup_event(). That's four
+    independent APScheduler instances with the identical cron schedule, so
+    every job here has always fired 4 times at the same instant (briefly
+    more, during a blue/green deploy's old+new task overlap) — this is what
+    caused the daily content-idea email to arrive multiple times at once,
+    and just as seriously means jane_ads_billing (hourly wallet charges) has
+    been quadruple-charging customer wallets on every run, silently, since
+    nothing about that job's output looks wrong from a single log line.
+
+    Uses the fire-time-bucketed job id as a Mongo document's _id — the
+    collection's unique _id index makes the first insert_one an atomic
+    "claim"; every other concurrent caller gets a DuplicateKeyError and
+    backs off instead of doing the job's work a second (or fourth) time.
+    """
+    from app.database import get_db
+    from pymongo.errors import DuplicateKeyError
+
+    db = get_db()
+    # Minute-precision bucket matches this scheduler's coarsest cron
+    # granularity (CronTrigger(minute=...)) — one claim per job per minute.
+    lock_id = f"{job_id}:{datetime.utcnow().strftime('%Y-%m-%dT%H:%M')}"
+    try:
+        await db["scheduled_job_locks"].insert_one({
+            "_id": lock_id,
+            "job_id": job_id,
+            "claimed_at": datetime.utcnow(),
+        })
+        return True
+    except DuplicateKeyError:
+        return False
+
+
+def _run_async(job_id: str, coro_func):
     """Helper to run an async coroutine from a sync APScheduler job.
     Schedules the coroutine on the main event loop so Motor cursors
-    (bound to that loop) work correctly.
+    (bound to that loop) work correctly. Wraps coro_func with the
+    claim check above so only one of the several concurrently-running
+    schedulers actually executes it per scheduled fire time.
     """
+    async def _guarded():
+        if not await _try_claim_job_run(job_id):
+            print(f"⏭️  {job_id}: already claimed by another worker for this run, skipping")
+            return
+        await coro_func()
+
     if _main_loop is not None and _main_loop.is_running():
-        future = asyncio.run_coroutine_threadsafe(coro_func(), _main_loop)
+        future = asyncio.run_coroutine_threadsafe(_guarded(), _main_loop)
         try:
             future.result(timeout=300)
         except Exception as e:
@@ -42,23 +90,23 @@ def _run_async(coro_func):
 
 def _job_daily_suggestions():
     from app.services.NotificationService import notification_service
-    _run_async(notification_service.run_daily_suggestions)
+    _run_async("daily_suggestions", notification_service.run_daily_suggestions)
 
 
 def _job_inactivity_check():
     from app.services.NotificationService import notification_service
-    _run_async(notification_service.run_inactivity_check)
+    _run_async("inactivity_check", notification_service.run_inactivity_check)
 
 
 def _job_trial_check():
     from app.services.NotificationService import notification_service
-    _run_async(notification_service.run_trial_check)
+    _run_async("trial_check", notification_service.run_trial_check)
 
 
 def _job_subscription_expiry():
     """Check and expire subscriptions past their end_date"""
     from app.services.SubscriptionService import subscription_service
-    _run_async(subscription_service.expire_subscriptions)
+    _run_async("subscription_expiry", subscription_service.expire_subscriptions)
 
 
 def _job_whatsapp_daily_push():
@@ -68,7 +116,7 @@ def _job_whatsapp_daily_push():
         db = get_db()
         result = await WhatsAppFlowService.send_daily_push(db)
         print(f"📱 WhatsApp daily push complete: {result}")
-    _run_async(_run)
+    _run_async("whatsapp_daily_push", _run)
 
 
 def _job_jane_ads_monitoring():
@@ -80,7 +128,7 @@ def _job_jane_ads_monitoring():
         db = get_db()
         result = await check_active_campaigns(db)
         print(f"📊 Jane Ads monitoring: {result}")
-    _run_async(_run)
+    _run_async("jane_ads_monitoring", _run)
 
 
 def _job_jane_ads_token_health():
@@ -93,7 +141,7 @@ def _job_jane_ads_token_health():
         db = get_db()
         result = await run_token_health_check(db)
         print(f"🔑 Jane Ads token health: {result}")
-    _run_async(_run)
+    _run_async("jane_ads_token_health", _run)
 
 
 def _job_jane_ads_billing():
@@ -106,7 +154,7 @@ def _job_jane_ads_billing():
         db = get_db()
         result = await reconcile_ad_spend_charges(db)
         print(f"💳 Jane Ads billing: {result}")
-    _run_async(_run)
+    _run_async("jane_ads_billing", _run)
 
 
 def start_notification_scheduler():
