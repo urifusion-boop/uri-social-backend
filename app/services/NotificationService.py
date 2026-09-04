@@ -179,6 +179,48 @@ class NotificationService:
         await self.notifications_collection.insert_one(doc)
         return notification_id
 
+    # ==================== Atomic Per-Day Claim ====================
+
+    async def _try_claim_daily_notification(
+        self, user_id: str, notification_type: NotificationType
+    ) -> bool:
+        """
+        Atomically claims "notification_type has been sent to user_id today" via
+        a unique-_id insert, instead of _should_send_notification's check-then-
+        write pattern. That pattern is genuinely race-prone under DocumentDB's
+        default secondaryPreferred reads: a write to the primary is not
+        guaranteed visible to a secondary read moments later, so if the same
+        user_id is iterated more than once within one run — a duplicate user
+        record, or ordinary replica lag between two fast consecutive iterations
+        — each pass can see "nothing sent yet" and send again. Live-confirmed:
+        a single, correctly-single-claimed scheduler run (see
+        notification_scheduler.py's _try_claim_job_run) still sent one
+        recipient 4 different daily-suggestion emails.
+
+        Only correct for "at most once per calendar day" notification types —
+        daily_suggestion is exactly that. Types with multi-day reminder windows
+        (trial_ending/trial_expired's "every N days, max M times") don't reduce
+        to a single per-day claim and still use _should_send_notification.
+
+        Returns True if this call just claimed today's send (go ahead and
+        send); False if today's slot is already claimed (skip — someone else,
+        possibly an earlier iteration for a duplicate user record, already
+        sent it)."""
+        from pymongo.errors import DuplicateKeyError
+
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        claim_id = f"{user_id}:{notification_type}:{today}"
+        try:
+            await self.db["notification_daily_claims"].insert_one({
+                "_id": claim_id,
+                "user_id": user_id,
+                "notification_type": notification_type,
+                "claimed_at": datetime.utcnow(),
+            })
+            return True
+        except DuplicateKeyError:
+            return False
+
     # ==================== Duplicate Prevention ====================
 
     async def _was_recently_sent(
@@ -832,17 +874,11 @@ class NotificationService:
             if not user_id:
                 continue
 
-            # Check if we already sent a suggestion today (1 day interval)
-            should_send = await self._should_send_notification(
-                user_id=user_id,
-                notification_type="daily_suggestion",
-                reminder_config={
-                    "reminder_days": 1,  # Daily reminders
-                    "max_reminders": 365  # Essentially unlimited for daily suggestions
-                }
-            )
-
-            if not should_send:
+            # Atomic per-day claim (see _try_claim_daily_notification) — not
+            # _should_send_notification's check-then-write, which is what let
+            # a duplicated user_id in this same cursor send more than once.
+            claimed = await self._try_claim_daily_notification(user_id, "daily_suggestion")
+            if not claimed:
                 skipped += 1
                 continue
 
