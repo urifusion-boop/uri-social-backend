@@ -1813,6 +1813,72 @@ async def _build_campaign_plan(
                 "page_name": e.page_name,
             }}
 
+    # 1.65. Save a destination answer THE MOMENT it arrives on the request — before
+    # anything else in this call (the variant picker just below is a live model call
+    # that may return a fresh early-return of its own) gets a chance to return first
+    # and throw it away. It used to be saved only once we reached the choose_destination
+    # gate near the end of this function, which is AFTER the variant picker: a call
+    # that both answered the destination AND happened to trip the variant picker (no
+    # selected_plan_variant yet) returned choose_plan_variant without ever saving the
+    # answer. The next call reopened choose_destination, pre-filled from whatever the
+    # brand had on file before — the just-typed answer was gone. Live-reported: an
+    # answer of "uricreative.com" vanished and the next turn re-asked with a stale,
+    # unrelated "sporteinstein.com" left over from an earlier campaign.
+    if req.goal != Goal.FOLLOWERS and requested_destination not in ("", "ask"):
+        from .destination import (
+            DESTINATION_OPTIONS, VALUE_FIELD_FOR_TYPE, cta_choice_list, set_brand_destination,
+        )
+
+        def _early_destination_error(error: str) -> dict:
+            # No `plan` yet at this point in the build — this only ever fires on a
+            # malformed answer (a link that isn't one, a handle that isn't one), so
+            # there is no targeting explanation to echo back yet either.
+            return {"early_return": {
+                "stage": "choose_destination",
+                "understood": parsed.model_dump(),
+                "question": "Where should people who tap your ad end up?",
+                "destination_options": [
+                    {**opt, "current": brand_destination.get(opt["field"], "")}
+                    for opt in DESTINATION_OPTIONS
+                ],
+                "cta_choices": cta_choice_list(),
+                "selected": {
+                    "destination_type": destination_type.value,
+                    "destination_cta": brand_destination["destination_cta"],
+                },
+                "error": error,
+                "explanation": "",
+            }}
+
+        value = (body.destination_value or "").strip()
+        field = VALUE_FIELD_FOR_TYPE[destination_type.value]
+        if destination_type == DestinationType.WHATSAPP and value:
+            # The number lives in TWO places by existing design: the ads connection
+            # (which the launch gate reads) and the brand settings (which the
+            # destination reads). Both setters already exist as their own endpoints.
+            from .ads_connection import set_whatsapp_number
+            from .whatsapp import set_brand_whatsapp
+            try:
+                number = await set_whatsapp_number(db, brand_ctx.get("user_id", ""), brand_ctx.get("brand_id"), value)
+                await set_brand_whatsapp(db, brand_ctx.get("brand_id"), number)
+            except ValueError as e:
+                return _early_destination_error(str(e))
+            except AdsConnectionRequired as e:
+                return {"early_return": {
+                    "stage": f"meta_connection_{e.state.value}",
+                    "understood": parsed.model_dump(), "page_name": e.page_name,
+                }}
+        try:
+            brand_destination = await set_brand_destination(
+                db, brand_ctx.get("brand_id"), destination_type,
+                destination_cta=body.destination_cta,
+                **({field: value} if value and field != "whatsapp_number" else {}),
+            )
+        except ValueError as e:
+            return _early_destination_error(str(e))
+        from .threads import mark_destination_answered
+        await mark_destination_answered(db, brand_ctx.get("brand_id"), body.thread_id)
+
     # 1.7. Multi-Plan Audience Variants (spec v1.0.0) — most businesses have more than
     # one viable audience, and the client knows their customers better than Jane's
     # reasoning does. Present up to five ranked, genuinely-distinct strategies with an
@@ -1978,22 +2044,21 @@ async def _build_campaign_plan(
     # silently reusing last time's answer ships an ad pointing somewhere they didn't
     # choose. The saved value is still the pre-filled default and `selected` marks it,
     # so a returning brand confirms in one tap rather than retyping anything.
-    from .threads import destination_already_answered, mark_destination_answered
+    from .threads import destination_already_answered
     # Once per CAMPAIGN, not once per request: every later call in this build re-runs
     # the planner without a destination field, and asking on each of them looped the
     # conversation between this question and the image step.
     # An explicit destination_type on the request always wins over the flag: "ask"
     # means the client deliberately reopened the picker (a change-destination action),
-    # and a concrete type is an answer to save — neither should be swallowed because
-    # the question was settled earlier in this thread.
+    # and a concrete type was already saved above at step 1.65, before the variant
+    # picker got a chance to return first — `brand_destination`/`destination_link`
+    # here already reflect it.
     destination_settled = (
         not (body.destination_type or "").strip()
         and await destination_already_answered(db, brand_ctx.get("brand_id"), body.thread_id)
     )
     if req.goal != Goal.FOLLOWERS and not destination_settled:
-        from .destination import (
-            DESTINATION_OPTIONS, VALUE_FIELD_FOR_TYPE, cta_choice_list, set_brand_destination,
-        )
+        from .destination import DESTINATION_OPTIONS, cta_choice_list
 
         def _destination_prompt(error: str = "") -> dict:
             return {"early_return": {
@@ -2019,48 +2084,9 @@ async def _build_campaign_plan(
                 "explanation": plan.explanation,
             }}
 
-        if requested_destination and requested_destination != "ask":
-            # A real answer — save it as the brand's destination (so the next campaign
-            # doesn't ask again) and use it for this build.
-            value = (body.destination_value or "").strip()
-            field = VALUE_FIELD_FOR_TYPE[destination_type.value]
-            if destination_type == DestinationType.WHATSAPP and value:
-                # The number lives in TWO places by existing design: the ads connection
-                # (which the launch gate reads) and the brand settings (which the
-                # destination reads). Both setters already exist as their own endpoints.
-                from .ads_connection import AdsConnectionRequired, set_whatsapp_number
-                from .whatsapp import set_brand_whatsapp
-                try:
-                    number = await set_whatsapp_number(db, user_id, brand_id, value)
-                    await set_brand_whatsapp(db, brand_id, number)
-                except ValueError as e:
-                    return _destination_prompt(str(e))
-                except AdsConnectionRequired as e:
-                    return {"early_return": {
-                        "stage": f"meta_connection_{e.state.value}",
-                        "understood": parsed.model_dump(), "page_name": e.page_name,
-                    }}
-            try:
-                brand_destination = await set_brand_destination(
-                    db, brand_id, destination_type,
-                    destination_cta=body.destination_cta,
-                    **({field: value} if value and field != "whatsapp_number" else {}),
-                )
-            except ValueError as e:
-                return _destination_prompt(str(e))
-            destination_link = build_link(
-                destination_type,
-                whatsapp_number=brand_destination["whatsapp_number"] or wa_number,
-                website_url=brand_destination["website_url"],
-                instagram_username=brand_destination["instagram_username"],
-                custom_url=brand_destination["custom_url"],
-            )
-            destination_cta = brand_destination["destination_cta"]
-            # Settled for the rest of this campaign.
-            await mark_destination_answered(db, brand_ctx.get("brand_id"), body.thread_id)
-
-        # Answered on THIS request → proceed. Anything else (blank, or an explicit
-        # "ask") → put the question, whatever the brand has stored.
+        # Answered on THIS request (saved already at step 1.65) → proceed. Anything
+        # else (blank, or an explicit "ask") → put the question, whatever the brand
+        # has stored.
         if requested_destination in ("", "ask") or not destination_link:
             return _destination_prompt(
                 "Your ads don't have a destination yet — pick one and this campaign is "
