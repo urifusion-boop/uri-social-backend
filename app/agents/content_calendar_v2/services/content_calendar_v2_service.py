@@ -235,14 +235,26 @@ Return ONLY valid JSON: {{"headline": "...", "primary_text": "...", "short_copy"
 
 def _rule_based_diversity_issues(items: List[Dict[str, Any]]) -> Dict[int, str]:
     """Deterministic half of the diversity check: duplicate/near-duplicate
-    hook openings, and repeated content_type+format on adjacent days."""
+    TITLE openings, and repeated content_type+format on adjacent days.
+
+    NOTE: this compares titles, not hooks — confirmed live: comparing hooks
+    flagged 29/30 items on a real 30-day run. HOOK_STYLES itself hands the
+    model literal canned phrases per style (e.g. "How-to opener — begin with
+    'Here's how…' or 'The exact steps we use to…'"), and with only 7 styles
+    rotating across 30 days each style recurs ~4x — the model reusing that
+    style's own suggested opening phrase each time is expected, by-design
+    behavior, not genuine repetition. Titles are the field the model is
+    actually instructed to keep unique ("no two titles share an opening
+    word", in the generation prompt below) and aren't handed a template
+    phrase to reuse, so they're the real diversity signal here.
+    """
     issues: Dict[int, str] = {}
     seen_openings: Dict[str, int] = {}
     for i, item in enumerate(items):
-        hook = str(item.get("hook") or "").strip().lower()
-        opening = " ".join(hook.split()[:5])
+        title = str(item.get("title") or "").strip().lower()
+        opening = " ".join(title.split()[:5])
         if opening and opening in seen_openings:
-            issues[i] = f"hook opens the same way as day {seen_openings[opening]}"
+            issues[i] = f"title opens the same way as day {seen_openings[opening]}"
         elif opening:
             seen_openings[opening] = i
         if i > 0:
