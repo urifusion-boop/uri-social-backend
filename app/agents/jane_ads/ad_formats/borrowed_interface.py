@@ -41,8 +41,7 @@ screen viewed outdoors after data-saver compression.
 """
 from typing import Dict, List, Optional, Tuple
 
-from PIL import Image, ImageDraw, ImageFont
-
+from ._text_metrics import wrap_text as _wrap_text
 from .tokens import AdFormatDef, PLACEHOLDER_TOKENS
 from app.agents.social_media_manager.services.document_renderer_service import DocumentRendererService
 
@@ -64,61 +63,6 @@ class TooManyTurns(ValueError):
     as a borrowed interface and starts reading as a transcript — raised
     before layout rather than silently overflowing the canvas."""
     pass
-
-
-_DUMMY_DRAW = ImageDraw.Draw(Image.new("RGB", (1, 1)))
-
-
-def _load_measuring_font(font_size: int, font_weight: int) -> ImageFont.ImageFont:
-    """Mirrors DocumentRendererService._load_font's exact path/fallback so a
-    bubble is sized against the same font that will actually draw the text
-    at render time — measuring against the wrong font is worse than not
-    measuring at all."""
-    try:
-        path = (
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-            if font_weight >= 700
-            else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
-        )
-        return ImageFont.truetype(path, font_size)
-    except Exception:
-        return ImageFont.load_default()
-
-
-def _text_width(text: str, font_size: int, font_weight: int = 400) -> int:
-    return int(_DUMMY_DRAW.textlength(text, font=_load_measuring_font(font_size, font_weight)))
-
-
-def _wrap_text(text: str, max_width: int, font_size: int, font_weight: int = 400, measure=None) -> List[str]:
-    """Greedy word-wrap against a measured width. A fixed-width bubble with
-    unwrapped text silently overflows past its own edge (and off the canvas)
-    the moment a message is longer than a couple of words — found by
-    actually rendering a realistic message, not assumed safe from a short
-    test string.
-
-    `measure` defaults to the real font-file measurement (`_text_width`) but
-    can be overridden — needed because the real measurement depends on a
-    font file being present at DocumentRendererService's hardcoded path,
-    which isn't true on every machine that runs this module's tests (Pillow
-    silently falls back to a fixed-size bitmap font there, ignoring
-    font_size entirely). Production always uses the real default; injection
-    exists only so the wrap *algorithm* can be tested independently of
-    which fonts happen to be installed."""
-    measure = measure or (lambda s: _text_width(s, font_size, font_weight))
-    words = text.split()
-    if not words:
-        return [text]
-    lines = []
-    current = words[0]
-    for word in words[1:]:
-        candidate = f"{current} {word}"
-        if measure(candidate) <= max_width:
-            current = candidate
-        else:
-            lines.append(current)
-            current = word
-    lines.append(current)
-    return lines
 
 
 def _tint(hex_color: str, toward: str, amount: float) -> str:
