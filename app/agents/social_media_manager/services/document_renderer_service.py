@@ -68,6 +68,9 @@ class DocumentRendererService:
                 elif layer_type == "brand_asset":
                     await DocumentRendererService._render_asset(canvas, layer)
 
+                elif layer_type == "shape":
+                    await DocumentRendererService._render_shape(canvas, layer)
+
             except Exception as e:
                 print(f"⚠️ Error rendering layer {layer.get('id')}: {e}")
                 # Continue rendering other layers even if one fails
@@ -199,6 +202,86 @@ class DocumentRendererService:
 
         # Paste onto canvas
         canvas.paste(asset_image, (x, y), asset_image if asset_image.mode == 'RGBA' else None)
+
+    @staticmethod
+    async def _render_shape(canvas: Image.Image, layer: Dict[str, Any]):
+        """
+        Render a plain/rounded rectangle or a (optionally dashed) line — the
+        one primitive this renderer was missing, needed for VSG-01's L4-only
+        formats: Receipt's leader lines and rule-above-total, Us vs Them's
+        field blocks and row rules, Borrowed Interface's message bubbles.
+        No image download, no external dependency — pure Pillow drawing, same
+        as _render_text below.
+
+        rect / rounded_rect: {x, y, width, height, corner_radius (rounded_rect
+        only), fill_color, border_color, border_width}. fill_color and/or
+        border_color may be omitted (an outline-only or fill-only shape).
+
+        line: {x1, y1, x2, y2, color, stroke_width, dashed, dash_length,
+        gap_length}. Deliberately a distinct coordinate scheme from rect
+        (endpoints, not x/y/width/height) — a leader line runs between two
+        specific points, not a box.
+        """
+        shape = layer.get("shape", "rect")
+        draw = ImageDraw.Draw(canvas)
+
+        if shape in ("rect", "rounded_rect"):
+            x, y = layer.get("x", 0), layer.get("y", 0)
+            width, height = layer.get("width", 0), layer.get("height", 0)
+            if width <= 0 or height <= 0:
+                return
+            box = [x, y, x + width, y + height]
+            fill = DocumentRendererService._hex_to_rgba(layer["fill_color"]) if layer.get("fill_color") else None
+            outline = DocumentRendererService._hex_to_rgba(layer["border_color"]) if layer.get("border_color") else None
+            border_width = layer.get("border_width", 2)
+            if fill is None and outline is None:
+                return  # nothing would actually render — matches _render_text's early-return-on-empty-content
+            if shape == "rounded_rect":
+                radius = layer.get("corner_radius", 8)
+                draw.rounded_rectangle(box, radius=radius, fill=fill, outline=outline, width=border_width)
+            else:
+                draw.rectangle(box, fill=fill, outline=outline, width=border_width)
+
+        elif shape == "line":
+            x1, y1 = layer.get("x1", 0), layer.get("y1", 0)
+            x2, y2 = layer.get("x2", 0), layer.get("y2", 0)
+            color = DocumentRendererService._hex_to_rgba(layer.get("color", "#000000"))
+            stroke_width = layer.get("stroke_width", 2)
+            if not layer.get("dashed"):
+                draw.line([(x1, y1), (x2, y2)], fill=color, width=stroke_width)
+                return
+            # Dashed: walk the segment in dash+gap steps. Only horizontal and
+            # vertical lines are supported dashed (every use case here —
+            # Receipt's leaders, rule dividers — is axis-aligned); a diagonal
+            # dashed line falls back to solid rather than silently drawing
+            # nothing.
+            dash_length = layer.get("dash_length", 6)
+            gap_length = layer.get("gap_length", 4)
+            step = dash_length + gap_length
+            if y1 == y2:
+                total = abs(x2 - x1)
+                direction = 1 if x2 >= x1 else -1
+                pos = 0
+                while pos < total:
+                    seg_end = min(pos + dash_length, total)
+                    draw.line(
+                        [(x1 + direction * pos, y1), (x1 + direction * seg_end, y1)],
+                        fill=color, width=stroke_width,
+                    )
+                    pos += step
+            elif x1 == x2:
+                total = abs(y2 - y1)
+                direction = 1 if y2 >= y1 else -1
+                pos = 0
+                while pos < total:
+                    seg_end = min(pos + dash_length, total)
+                    draw.line(
+                        [(x1, y1 + direction * pos), (x1, y1 + direction * seg_end)],
+                        fill=color, width=stroke_width,
+                    )
+                    pos += step
+            else:
+                draw.line([(x1, y1), (x2, y2)], fill=color, width=stroke_width)
 
     @staticmethod
     async def _fetch_image(url: str) -> Optional[Image.Image]:
