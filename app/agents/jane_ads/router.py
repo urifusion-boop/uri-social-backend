@@ -2124,6 +2124,23 @@ async def _build_campaign_plan(
     except Exception as e:
         print(f"[oneshot] geo skipped: {e}", flush=True)
 
+    # 3.5. Demographic/interest targeting — Jane's audience call (the selected
+    # variant's audience_segment, or the brand's own generic target_audience when no
+    # variant was selected), translated into what Meta's ad set actually accepts.
+    # Live-reported: the real launched ad set always shipped broad (all ages, all
+    # genders, no interests) regardless of this reasoning — it was computed and shown
+    # in the plan card, never applied. Best-effort, same as geo above: unresolvable
+    # text or an unreachable AI/Graph API just leaves this axis broad.
+    audience_text = ((selected_variant.audience_segment if selected_variant else "")
+                     or brand_profile.get("target_audience", ""))
+    try:
+        from .audience_targeting import resolve_audience_targeting
+        plan.audience_targeting = await resolve_audience_targeting(
+            audience_text, settings.META_ADS_ACCESS_TOKEN,
+        )
+    except Exception as e:
+        print(f"[oneshot] audience targeting skipped: {e}", flush=True)
+
     # service_area (creative brief spec) — the one place a location legitimately
     # belongs in customer-facing COPY, distinct from plan.geo/parsed.city which
     # ground targeting and image generation but must never leak into copy.
@@ -2394,12 +2411,12 @@ async def _build_campaign_plan(
         if plan.platforms and plan.platforms[0].platform == Platform.META:
             try:
                 est_adapter = MetaAdPlatformAdapter(db, access_token=settings.META_ADS_ACCESS_TOKEN)
-                # Reach the REAL audience: build the targeting from the plan's geo pins (radius
-                # around each validated coordinate) so the estimate isn't all of Nigeria — the
-                # SAME conversion the real launch uses (geo.meta_targeting_from_geo), so the
-                # estimate shown here can never promise a tighter audience than what launches.
+                # Reach the REAL audience: geo pins + Jane's resolved demographic/interest
+                # read, the SAME conversion+merge the real launch uses (adapters/meta.py),
+                # so the estimate shown here can never promise a tighter audience than
+                # what actually launches.
                 from .geo import meta_targeting_from_geo
-                targeting = meta_targeting_from_geo(plan.geo)
+                targeting = {**meta_targeting_from_geo(plan.geo), **plan.audience_targeting}
                 estimate = await est_adapter.get_delivery_estimate(targeting)
             except Exception as e:
                 print(f"[oneshot] delivery estimate skipped: {e}", flush=True)
