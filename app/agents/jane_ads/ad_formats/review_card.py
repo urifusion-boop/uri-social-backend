@@ -41,6 +41,7 @@ Hard checks (§2.1):
 import re
 from typing import Dict, Optional, Tuple
 
+from ._content_guards import mentions_health_or_appearance_outcome
 from ._text_metrics import wrap_text
 from .tokens import AdFormatDef, PLACEHOLDER_TOKENS
 from app.agents.social_media_manager.services.document_renderer_service import DocumentRendererService
@@ -79,16 +80,10 @@ _TIME_PHRASE = re.compile(
     r"\d+)\s*(?:day|days|week|weeks|month|months)\b",
     re.IGNORECASE,
 )
-_OUTCOME_WORD = re.compile(
-    r"\b(?:skin|complexion|wrinkle|wrinkles|acne|glow|glowing|fair(?:er|ness)?|"
-    r"weight|kg|kilos?|fat|slim(?:mer|ming)?|cellulite|stretch\s*marks?|hair\s*"
-    r"growth|bleach(?:ed|ing)?)\b",
-    re.IGNORECASE,
-)
 
 
 def _makes_a_timed_outcome_claim(quote: str) -> bool:
-    return bool(_TIME_PHRASE.search(quote)) and bool(_OUTCOME_WORD.search(quote))
+    return bool(_TIME_PHRASE.search(quote)) and mentions_health_or_appearance_outcome(quote)
 
 
 def build_document(
