@@ -186,13 +186,27 @@ async def _write_calendar_ad_copy(
     brand_name = brand.get("brand_name") or "the brand"
     usp = brand.get("unique_selling_proposition") or ""
     cta_preference = (brand.get("cta_styles") or [""])[0]
+    # Confirmed live: without this, the model has no active-promo data to work
+    # with at all, so it correctly (per its own anti-fabrication instruction
+    # below) falls back to generic "exclusive promotions today" instead of
+    # naming the real offer — this isn't a compliance failure, it's a data gap.
+    business_pulse = brand.get("business_pulse") or {}
+    promo_lines = [v for v in [
+        ("Active promotion: " + "; ".join(business_pulse.get("current_promotions") or [])) if business_pulse.get("current_promotions") else "",
+        ("Active campaign: " + "; ".join(business_pulse.get("current_campaigns") or [])) if business_pulse.get("current_campaigns") else "",
+    ] if v]
+    promo_block = ("\n" + "\n".join(promo_lines)) if promo_lines else ""
 
     prompt = f"""Adapt this organic social post idea into paid-ad copy for {brand_name}.
 
 Organic idea: "{item.get('title', '')}"
 Hook: "{item.get('hook', '')}"
 Key points: {', '.join(str(p) for p in (item.get('key_points') or [])[:4])}
-{f'USP: {usp}' if usp else ''}
+{f'USP: {usp}' if usp else ''}{promo_block}
+
+If an active promotion/campaign above is genuinely relevant to this specific
+idea, name its real terms — do not paraphrase it into something vague like
+"exclusive promotions today". If none is relevant here, don't force one in.
 
 Required angle: {angle.replace('_', ' ')} — the ad copy MUST lead with this angle,
 not just restate the organic hook.
@@ -443,9 +457,13 @@ required, no field may be a placeholder:
   for this post (subject, style, mood) — usable directly as an image-gen prompt
 - creative_direction: {{"visual_style": "...", "mood": "...", "color_note": "...", "composition_note": "..."}}
 - reasoning: 1-2 sentences on WHY this specific idea, for THIS day — reference
-  a real signal above (a proven topic, a trend keyword, the business stage, or
-  a gap in recent content) — this is shown to the user as "why this post?", so
-  it must name something concrete, never generic filler like "this will engage your audience"
+  a real signal above (a proven performance topic, a trend keyword, the
+  business stage, a current promotion/campaign/milestone from Business Pulse,
+  or a gap in recent content) — this is shown to the user as "why this post?",
+  so it must name something concrete. Explaining why the HOOK STYLE or FORMAT
+  works in general (e.g. "using a question engages the audience", "a
+  side-by-side visual showcases results") is NOT a real signal, even though it
+  sounds specific — that's true of every post in that format, not this one
 - primary_kpi: one of reach|engagement|leads|sales|awareness — whichever this
   specific item is actually optimized for
 
