@@ -165,9 +165,16 @@ class DocumentRendererService:
         # Load font
         font = DocumentRendererService._load_font(font_family, font_size, font_weight)
 
-        # Draw text
+        # Draw text. `text_align` maps straight onto Pillow's own anchor
+        # strings (e.g. "ra" = right-ascender) — added for right-aligned
+        # numbers (Receipt's prices need to line up at a fixed right edge,
+        # which means anchoring at x rather than measuring text width
+        # ourselves in every format builder that needs it). Left/top-anchored
+        # ("la", Pillow's own default) is unchanged for every existing caller
+        # that doesn't pass this.
         rgba_color = DocumentRendererService._hex_to_rgba(color)
-        draw.text((x, y), content, font=font, fill=rgba_color)
+        anchor = layer.get("text_align")
+        draw.text((x, y), content, font=font, fill=rgba_color, anchor=anchor)
 
     @staticmethod
     async def _render_asset(canvas: Image.Image, layer: Dict[str, Any]):
