@@ -150,6 +150,19 @@ async def startup_event():
     except Exception as e:
         print(f"⚠️  Warning: Failed to create scheduled_job_locks TTL index: {e}")
 
+    # TTL-expire daily-notification claims (NotificationService._try_claim_
+    # daily_notification) — only needed to survive same-day duplicate-send
+    # races, so a 2-day expiry is comfortably past its useful life.
+    try:
+        from app.database import get_db
+        db = get_db()
+        await db["notification_daily_claims"].create_index(
+            "claimed_at", expireAfterSeconds=172800, name="claimed_at_ttl"
+        )
+        print("✅ notification_daily_claims TTL index ensured")
+    except Exception as e:
+        print(f"⚠️  Warning: Failed to create notification_daily_claims TTL index: {e}")
+
     # Start notification scheduler (PRD 8: Scheduled Jobs)
     try:
         from app.services.notification_scheduler import start_notification_scheduler
