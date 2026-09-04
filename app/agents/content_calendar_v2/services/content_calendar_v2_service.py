@@ -259,8 +259,15 @@ def _rule_based_diversity_issues(items: List[Dict[str, Any]]) -> Dict[int, str]:
             seen_openings[opening] = i
         if i > 0:
             prev = items[i - 1]
+            # NOTE: these items carry "assigned_format" at this stage (set in
+            # _generate_chunk_items), not "format" — items_out builds the final
+            # "format" key later. Confirmed live: comparing the wrong/missing
+            # keys here made both sides always None, so this condition was
+            # unconditionally True for every i>0 — the actual dominant cause of
+            # 29/30 items getting flagged (title-opening collisions were real
+            # but a much smaller contributor).
             if (item.get("content_type") == prev.get("content_type")
-                    and item.get("format") == prev.get("format")):
+                    and item.get("assigned_format") == prev.get("assigned_format")):
                 issues[i] = issues.get(i, "") + "; repeats prior day's content_type+format pair"
     return issues
 
@@ -513,6 +520,13 @@ must be impossible to copy-paste to a different brand.
 
     for i, idea in enumerate(items):
         idea["assigned_format"] = "carousel" if chunk_formats[i] == "carousel" else POST_FORMAT_TO_KEY.get(chunk_formats[i], "image")
+        # The LLM's raw JSON response never includes a content_type field (it
+        # wasn't asked for one — the real content_type/format for each day is
+        # assigned deterministically before generation, see chunk_content_types/
+        # chunk_formats above). Stamping it here so _rule_based_diversity_issues
+        # (which runs against these raw items, before items_out is built) can
+        # actually compare real values instead of two missing dict keys.
+        idea["content_type"] = chunk_content_types[i]
     return items
 
 
