@@ -287,7 +287,10 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                     "daily_budget": daily_budget_minor,
                     "billing_event": "IMPRESSIONS",
                     "bid_strategy": "LOWEST_COST_WITHOUT_CAP",
-                    "targeting": meta_targeting_from_geo(plan.geo),
+                    # Geo (pins/country) plus Jane's resolved demographic/interest read
+                    # (age_min/age_max/genders/flexible_spec, {} when nothing resolved) —
+                    # disjoint keys, so merging never overwrites either side.
+                    "targeting": {**meta_targeting_from_geo(plan.geo), **plan.audience_targeting},
                     "status": "PAUSED",
                     "start_time": start_time.isoformat(),
                     "end_time": end_time.isoformat(),
