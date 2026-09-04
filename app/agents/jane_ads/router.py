@@ -2395,15 +2395,11 @@ async def _build_campaign_plan(
             try:
                 est_adapter = MetaAdPlatformAdapter(db, access_token=settings.META_ADS_ACCESS_TOKEN)
                 # Reach the REAL audience: build the targeting from the plan's geo pins (radius
-                # around each validated coordinate) so the estimate isn't all of Nigeria.
-                custom_locations = [
-                    {"latitude": pin.lat, "longitude": pin.lng,
-                     "radius": pin.radius_km, "distance_unit": "kilometer"}
-                    for pin in (plan.geo.pins if plan.geo else [])
-                    if pin.lat is not None and pin.lng is not None
-                ]
-                targeting = ({"geo_locations": {"custom_locations": custom_locations}}
-                             if custom_locations else {"geo_locations": {"countries": ["NG"]}})
+                # around each validated coordinate) so the estimate isn't all of Nigeria — the
+                # SAME conversion the real launch uses (geo.meta_targeting_from_geo), so the
+                # estimate shown here can never promise a tighter audience than what launches.
+                from .geo import meta_targeting_from_geo
+                targeting = meta_targeting_from_geo(plan.geo)
                 estimate = await est_adapter.get_delivery_estimate(targeting)
             except Exception as e:
                 print(f"[oneshot] delivery estimate skipped: {e}", flush=True)

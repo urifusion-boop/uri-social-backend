@@ -287,6 +287,23 @@ async def archive_guide_v2(
         )
         print(f"[V2] Removed guide {guide_id} from user {user_id}'s selected_custom_guides_v2")
 
+        # 2b. Also remove it from every platform's own override, if any (VSG
+        # plan). $pull can't target every key of an arbitrary-keyed dict in
+        # one operator, so this is a read-modify-write instead of a second
+        # $pull — a deleted guide must not keep silently applying to a
+        # platform just because that lookup lives in a different field.
+        _profile_doc = await db["brand_profiles"].find_one(
+            {"user_id": user_id}, {"selected_custom_guides_v2_by_platform": 1}
+        )
+        _by_platform = (_profile_doc or {}).get("selected_custom_guides_v2_by_platform") or {}
+        if any(guide_id in (ids or []) for ids in _by_platform.values()):
+            _cleaned = {k: [g for g in (v or []) if g != guide_id] for k, v in _by_platform.items()}
+            await db["brand_profiles"].update_one(
+                {"user_id": user_id},
+                {"$set": {"selected_custom_guides_v2_by_platform": _cleaned}}
+            )
+            print(f"[V2] Also removed guide {guide_id} from per-platform overrides: {list(_by_platform.keys())}")
+
         return UriResponse.create_response(
             entity_name="Custom Visual Guide V2",
             data={"archived": True},
