@@ -13,6 +13,7 @@ from __future__ import annotations
 import re
 from typing import Optional
 
+import httpx
 from fastapi import (
     APIRouter, Body, Depends, File, HTTPException, Query, Request, UploadFile,
 )
@@ -1066,6 +1067,109 @@ async def jane_google_ads_admin_connect_callback(
 
     await save_admin_connection(db, tokens)
     return HTMLResponse("<p>Google Ads admin account connected. You can close this tab.</p>")
+
+
+# ── TikTok Ads — one-time admin advertiser authorization ────────────────────
+# Same shape as the Google Ads admin-connect pair above: ops-only, not brand-scoped,
+# not linked from the app UI. Confirmed (2026-09) TikTok's Sandbox environment is
+# being deprecated entirely — this is what replaces it: a REAL TikTok Ads advertiser
+# authorizes the app once via TikTok's own portal consent screen, which hands back a
+# real, production access_token + advertiser_id pair. Deliberately does NOT persist
+# to Mongo or touch any of the 8 existing TikTokAdsAdapter call sites in this file/
+# billing.py — those already read settings.TIKTOK_ADS_ADVERTISER_ID/
+# TIKTOK_ADS_ACCESS_TOKEN directly (see adapters/tiktok.py's own docstring: "Phase 1
+# callers pass settings.* directly, since there is exactly one shared URI identity
+# today"), so the callback below just displays the exchanged credentials for a human
+# to paste into .env.staging — same manual-config pattern already documented on
+# TIKTOK_ADS_API_BASE. Refactoring those call sites to read a live Mongo connection
+# instead is a bigger, separate change if/when this needs to stop being static config.
+
+_TIKTOK_ADS_TOKEN_ENDPOINT = "https://business-api.tiktok.com/open_api/v1.3/oauth2/access_token/"
+
+
+@router.get("/tiktok-ads/admin/connect/initiate")
+async def jane_tiktok_ads_admin_connect_initiate():
+    """One-time, ops-only: redirects to TikTok's own advertiser-authorization consent
+    page so a real TikTok Ads advertiser can grant this app production Marketing API
+    access. Visit this URL directly, logged into the TikTok Ads Manager account that
+    should authorize the app — not the deprecated Sandbox Ad Account."""
+    import urllib.parse
+    from app.core.config import settings
+
+    app_id = settings.TIKTOK_ADS_APP_ID
+    if not app_id:
+        raise HTTPException(status_code=500, detail="TIKTOK_ADS_APP_ID not configured")
+
+    _base = (settings.PUBLIC_API_URL or settings.URI_GATEWAY_BASE_API_URL).rstrip("/")
+    redirect_uri = f"{_base}/jane-ads/tiktok-ads/admin/connect/callback"
+    params = {"app_id": app_id, "state": "uri_admin_connect", "redirect_uri": redirect_uri}
+    auth_url = "https://business-api.tiktok.com/portal/auth?" + urllib.parse.urlencode(params)
+    return RedirectResponse(auth_url)
+
+
+@router.get("/tiktok-ads/admin/connect/callback")
+async def jane_tiktok_ads_admin_connect_callback(
+    auth_code: Optional[str] = None,
+    code: Optional[str] = None,  # some TikTok flows/docs use "code" instead of "auth_code"
+    error: Optional[str] = None,
+    state: Optional[str] = None,
+):
+    """Exchanges the auth code for a real access_token + advertiser_id(s). Plain HTML
+    response, not a redirect back into the app — there's nowhere in the UI to land,
+    same as Google's admin callback above. Does NOT persist anything (see module note
+    above) — displays the exchanged credentials for a human to paste into
+    .env.staging as TIKTOK_ADS_ACCESS_TOKEN/TIKTOK_ADS_ADVERTISER_ID."""
+    from app.core.config import settings
+
+    if error:
+        return HTMLResponse(f"<p>TikTok Ads admin connect failed: {error}</p>", status_code=400)
+    grant_code = auth_code or code
+    if not grant_code:
+        return HTMLResponse("<p>TikTok Ads admin connect failed: missing auth_code.</p>", status_code=400)
+    if not (settings.TIKTOK_ADS_APP_ID and settings.TIKTOK_ADS_APP_SECRET):
+        return HTMLResponse(
+            "<p>TikTok Ads admin connect failed: TIKTOK_ADS_APP_ID/TIKTOK_ADS_APP_SECRET not configured.</p>",
+            status_code=500,
+        )
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.post(_TIKTOK_ADS_TOKEN_ENDPOINT, json={
+            "app_id": settings.TIKTOK_ADS_APP_ID,
+            "secret": settings.TIKTOK_ADS_APP_SECRET,
+            "auth_code": grant_code,
+        })
+    try:
+        data = resp.json()
+    except ValueError:
+        return HTMLResponse(
+            f"<p>TikTok Ads admin connect failed: non-JSON response (HTTP {resp.status_code}): "
+            f"{resp.text[:500]!r}</p>", status_code=502,
+        )
+
+    if data.get("code") not in (0, None):
+        return HTMLResponse(
+            f"<p>TikTok Ads admin connect failed: {data.get('message', 'unknown error')} "
+            f"(code {data.get('code')})</p>", status_code=502,
+        )
+
+    token_data = data.get("data") or {}
+    access_token = token_data.get("access_token", "")
+    advertiser_ids = token_data.get("advertiser_ids") or []
+    scope = token_data.get("scope") or []
+
+    advertiser_rows = "".join(f"<li><code>{aid}</code></li>" for aid in advertiser_ids) or "<li>(none returned)</li>"
+    return HTMLResponse(f"""
+        <p><b>TikTok Ads connected.</b> Paste these into .env.staging (replacing the
+        old sandbox values), then redeploy:</p>
+        <pre>TIKTOK_ADS_ACCESS_TOKEN={access_token}
+TIKTOK_ADS_ADVERTISER_ID={advertiser_ids[0] if advertiser_ids else '(pick one below)'}</pre>
+        <p>Authorized advertiser_id(s) — pick the one to actually run ads through if more than one:</p>
+        <ul>{advertiser_rows}</ul>
+        <p>Granted scope: {', '.join(str(s) for s in scope) or '(none returned)'}</p>
+        <p>Also unset/remove TIKTOK_ADS_API_BASE's sandbox override so it falls back
+        to the production default — sandbox is deprecated.</p>
+        <p>You can close this tab.</p>
+    """)
 
 
 @router.post("/google/connect")
