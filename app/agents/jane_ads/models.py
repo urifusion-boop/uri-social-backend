@@ -207,6 +207,14 @@ class CampaignPlan(BaseModel):
                                              # goal/behaviour), and GoogleAdsAdapter's keyword
                                              # translation needs it. Populated by the router at
                                              # plan-build time; None for every non-Google plan.
+    audience_targeting: dict = Field(default_factory=dict)  # Meta-shaped demographic/
+                                             # interest targeting (age_min/age_max/genders/
+                                             # flexible_spec) resolved from the selected
+                                             # variant's audience_segment (or the brand's own
+                                             # target_audience) via audience_targeting.py.
+                                             # {} — broad on this axis — when nothing resolved;
+                                             # merged with geo.meta_targeting_from_geo() at
+                                             # launch, never replaces it.
 
 
 class SpendAuthorization(BaseModel):
