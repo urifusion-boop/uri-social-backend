@@ -53,9 +53,13 @@ class PaymentService:
 
         print(f"🔐 SQUAD Payment Gateway initialized (default: {self.default_mode.upper()})")
 
-        # User-facing callback URL (where users return after payment)
+        # User-facing callback URL (where users return after payment).
+        # Trailing slash matters: the frontend is a static export where every
+        # route is its own folder (/workspace/index.html) — a request without
+        # the slash 404s outright instead of loading the app (this is exactly
+        # what broke a real customer's post-payment redirect).
         web_app_url = (getattr(settings, 'WEB_APP_URL', '') or 'https://www.urisocial.com').strip("'\"")
-        self.callback_url = f'{web_app_url}/workspace?tab=billing'
+        self.callback_url = f'{web_app_url}/workspace/?tab=billing'
 
     async def _get_current_mode(self) -> str:
         """Get current Squad mode from config (production: always use config value)"""

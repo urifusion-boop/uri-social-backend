@@ -1,3 +1,4 @@
+import asyncio
 import os
 
 from fastapi import FastAPI
@@ -20,6 +21,7 @@ from app.agents.social_media_manager.routers.custom_visual_guides_v2 import rout
 from app.agents.social_media_manager.routers.canvas_editor import router as canvas_editor_router
 from app.agents.social_media_manager.routers.jane_router import router as jane_router
 from app.agents.visual_engine_v2.routers.visual_engine_v2_router import router as visual_engine_v2_router
+from app.agents.content_calendar_v2.routers.content_calendar_v2_router import router as content_calendar_v2_router
 from app.routers.auth_router import router as auth_router
 from app.routers.billing_router import router as billing_router
 from app.routers.notification_router import router as notification_router
@@ -120,6 +122,20 @@ async def startup_event():
     except Exception as e:
         print(f"⚠️  Warning: Failed to create pending_instagram_connections TTL index: {e}")
 
+    # TTL-expire scheduled-job run claims (app/services/notification_scheduler.py's
+    # _try_claim_job_run) — only needed to survive the few-second window across
+    # the container's 4 uvicorn workers checking in for the same minute-bucketed
+    # job, so a generous 1-day expiry is just cleanup, not functional.
+    try:
+        from app.database import get_db
+        db = get_db()
+        await db["scheduled_job_locks"].create_index(
+            "claimed_at", expireAfterSeconds=86400, name="claimed_at_ttl"
+        )
+        print("✅ scheduled_job_locks TTL index ensured")
+    except Exception as e:
+        print(f"⚠️  Warning: Failed to create scheduled_job_locks TTL index: {e}")
+
     # Start notification scheduler (PRD 8: Scheduled Jobs)
     try:
         from app.services.notification_scheduler import start_notification_scheduler
@@ -127,6 +143,15 @@ async def startup_event():
         print("✅ Notification scheduler started")
     except Exception as e:
         print(f"⚠️  Warning: Failed to start notification scheduler: {e}")
+
+    # DocumentDB credential refresher — no-op unless DOCDB_SECRET_ARN is set
+    # (only where the cluster has AWS-managed password rotation). See
+    # app/services/docdb_credential_refresher.py for why this exists.
+    try:
+        from app.services.docdb_credential_refresher import start_background_refresher
+        asyncio.ensure_future(start_background_refresher())
+    except Exception as e:
+        print(f"⚠️  Warning: Failed to start DocumentDB credential refresher: {e}")
 
 # CORS
 # Use explicit origins only (no allow_origin_regex) — Starlette's elif chain
@@ -140,11 +165,12 @@ _ALLOWED_ORIGINS = [
     "http://localhost:8080",
     "http://127.0.0.1:3000",
     "http://127.0.0.1:3001",
-    # Staging
-    "https://staging.urisocial.com",
-    "https://app-staging.urisocial.com",
+    # Staging — staging.urisocial.com/app-staging.urisocial.com/api-staging.urisocial.com
+    # never actually existed as real DNS records; uri-staging (frontend) and
+    # api-social-dev (backend) are the real CNAMEs, confirmed directly against
+    # the DNS provider's own record list.
     "https://uri-staging.urisocial.com",
-    "https://api-staging.urisocial.com",
+    "https://api-social-dev.urisocial.com",
     # Production
     "https://urisocial.com",
     "https://www.urisocial.com",
@@ -152,6 +178,7 @@ _ALLOWED_ORIGINS = [
     "https://api.urisocial.com",
     # SDK Gateway
     "https://sdk-gateway.urisocial.com",
+    "https://sdk-gateway-dev.urisocial.com",
 ]
 app.add_middleware(
     CORSMiddleware,
@@ -237,6 +264,10 @@ app.include_router(custom_guides_v2_router)  # V2 - Advanced style transfer
 
 # Include Visual Engine V2 (4-layer compositing system)
 app.include_router(visual_engine_v2_router, prefix="/social-media/visual-engine", tags=["Visual Engine V2"])
+
+# Include Content Calendar V2 (30-day content intelligence engine, staging-only —
+# see /Users/macintoshhd/.claude/plans/enchanted-wiggling-treehouse.md)
+app.include_router(content_calendar_v2_router, prefix="/social-media/content-calendar-v2", tags=["Content Calendar V2"])
 
 # Include Canvas Editor (layered document editing)
 app.include_router(canvas_editor_router, prefix="/social-media", tags=["Canvas Editor"])

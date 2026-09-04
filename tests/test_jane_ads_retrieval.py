@@ -186,6 +186,43 @@ class TestExclusions:
         assert res.excluded[0].reason is ExclusionReason.INFRASTRUCTURE_MISSING
         assert res.excluded[0].detail == "customer_list"
 
+    def test_product_photo_required_and_missing_is_excluded(self):
+        """VSG-01 v3 §1.2/§6 — a format needing a real product photo (upload_as_is/
+        recomposite) must fail closed for a business with none on file, not render
+        with a generated stand-in. This is the retrieval-time half of the product
+        truthfulness rule — the format must never even surface."""
+        r = rec(requires=[Requirement.PRODUCT_PHOTO])
+        res = retrieve([r], request(), now=NOW)
+        assert res.excluded[0].reason is ExclusionReason.INFRASTRUCTURE_MISSING
+        assert res.excluded[0].detail == "product_photo"
+
+    def test_product_photo_required_and_present_is_not_excluded(self):
+        r = rec(requires=[Requirement.PRODUCT_PHOTO])
+        req = request(profile=BusinessProfile(has_product_photo=True))
+        assert len(retrieve([r], req, now=NOW).records) == 1
+
+    def test_real_customer_photo_required_and_missing_is_excluded(self):
+        """Same rule for a format asserting a specific customer's testimony
+        (Testimonial + Offer's person path, Text on a Face) — a generated face
+        paired with a first-person quote implies a customer who does not exist."""
+        r = rec(requires=[Requirement.REAL_CUSTOMER_PHOTO])
+        res = retrieve([r], request(), now=NOW)
+        assert res.excluded[0].reason is ExclusionReason.INFRASTRUCTURE_MISSING
+        assert res.excluded[0].detail == "real_customer_photo"
+
+    def test_real_customer_photo_required_and_present_is_not_excluded(self):
+        r = rec(requires=[Requirement.REAL_CUSTOMER_PHOTO])
+        req = request(profile=BusinessProfile(has_real_customer_photo=True))
+        assert len(retrieve([r], req, now=NOW).records) == 1
+
+    def test_product_photo_and_customer_photo_are_independent(self):
+        """Having one does not imply the other — a business with a product photo
+        but no customer testimony must still be excluded from a customer-photo
+        format, and vice versa."""
+        r = rec(requires=[Requirement.REAL_CUSTOMER_PHOTO])
+        req = request(profile=BusinessProfile(has_product_photo=True, has_real_customer_photo=False))
+        assert only_reason([r], req) is ExclusionReason.INFRASTRUCTURE_MISSING
+
     def test_not_approved_is_excluded(self):
         assert only_reason([rec(status=StrategyStatus.DRAFT)], request()) \
             is ExclusionReason.NOT_APPROVED
