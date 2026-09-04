@@ -49,6 +49,7 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.core.config import settings
 from .base import AdPlatformAdapter
 from ..destination import link_for_plan
+from ..geo import meta_targeting_from_geo
 from ..models import (
     CampaignPlan,
     ConversationDelivered,
@@ -286,7 +287,7 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                     "daily_budget": daily_budget_minor,
                     "billing_event": "IMPRESSIONS",
                     "bid_strategy": "LOWEST_COST_WITHOUT_CAP",
-                    "targeting": {"geo_locations": {"countries": ["NG"]}},
+                    "targeting": meta_targeting_from_geo(plan.geo),
                     "status": "PAUSED",
                     "start_time": start_time.isoformat(),
                     "end_time": end_time.isoformat(),
