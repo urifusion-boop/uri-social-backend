@@ -143,6 +143,12 @@ class Settings(BaseSettings):
     # here from the start rather than growing into it.
     TIKTOK_ADS_ADVERTISER_ID: str = ""
     TIKTOK_ADS_ACCESS_TOKEN: str = ""
+    # The Marketing API app's own id/secret (portal: App Detail > Basic Information),
+    # NOT the advertiser_id/access_token above — these authenticate the APP for the
+    # one-time admin OAuth code exchange (GET /jane-ads/tiktok-ads/admin/connect/*),
+    # which is what actually produces the TIKTOK_ADS_ACCESS_TOKEN/ADVERTISER_ID pair.
+    TIKTOK_ADS_APP_ID: str = ""
+    TIKTOK_ADS_APP_SECRET: str = ""
     TIKTOK_ADS_API_VERSION: str = "v1.3"
     # Confirmed live (2026-08-26) against a Sandbox Ad Account: sandbox tokens
     # 401/permission-error against the production host below and only work

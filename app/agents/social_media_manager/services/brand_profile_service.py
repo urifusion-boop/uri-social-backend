@@ -237,6 +237,21 @@ class BrandProfileService:
         if "cta_rotation_index" in data:
             doc["cta_rotation_index"] = data["cta_rotation_index"]
 
+        # Per-platform visual style overrides — additive, optional. A platform
+        # with no entry here (or an empty list) falls back to the brand-wide
+        # fields above unchanged; only present so a user CAN give a platform
+        # its own style/guide pool and rotation, never required to. Keyed by
+        # the same platform strings _generate_image_bg already receives
+        # (instagram/facebook/linkedin/tiktok/x/...).
+        if "style_selections_by_platform" in data:
+            doc["style_selections_by_platform"] = data["style_selections_by_platform"]
+        if "selected_custom_guides_by_platform" in data:
+            doc["selected_custom_guides_by_platform"] = data["selected_custom_guides_by_platform"]
+        if "selected_custom_guides_v2_by_platform" in data:
+            doc["selected_custom_guides_v2_by_platform"] = data["selected_custom_guides_v2_by_platform"]
+        if "style_rotation_index_by_platform" in data:
+            doc["style_rotation_index_by_platform"] = data["style_rotation_index_by_platform"]
+
         # OPTION 2: ONBOARDING VALIDATION - Enforce required fields
         # Only validate when user is ACTIVELY TRYING to complete onboarding (transition from False→True)
         # Don't block subsequent saves after onboarding is already complete
