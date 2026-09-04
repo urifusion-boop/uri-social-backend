@@ -336,6 +336,15 @@ class BrandProfileRequest(BaseModel):
     style_rotation_index: Optional[int] = None
     selected_custom_guides: Optional[List[str]] = None  # Custom visual guide V1 IDs (array)
     selected_custom_guides_v2: Optional[List[str]] = None  # Custom visual guide V2 IDs (array)
+    # Per-platform visual style overrides — additive, optional. A platform
+    # with no entry (or an empty list) falls back to the flat fields above
+    # unchanged; see _generate_image_bg for the resolution rule. Keyed by
+    # the same platform strings _generate_image_bg's own `platform` param
+    # receives (instagram/facebook/linkedin/twitter/...).
+    style_selections_by_platform: Optional[Dict[str, List[str]]] = None
+    selected_custom_guides_by_platform: Optional[Dict[str, List[str]]] = None
+    selected_custom_guides_v2_by_platform: Optional[Dict[str, List[str]]] = None
+    style_rotation_index_by_platform: Optional[Dict[str, int]] = None
     # Typography
     font_style: Optional[str] = None
     font_style_prompt: Optional[str] = None
@@ -5551,6 +5560,47 @@ async def analyze_voice_samples(
 # BACKGROUND TASKS
 # ==============================================================================
 
+def _resolve_platform_style_pool(bp: Dict[str, Any], platform: str) -> tuple:
+    """
+    Per-platform visual style override resolution. If `platform` has its own
+    style/guide pool in bp's *_by_platform maps, returns a new dict with
+    style_selections/style_prompt_fragments/selected_custom_guides/
+    selected_custom_guides_v2/style_rotation_index substituted for that
+    platform's values, under the SAME keys _generate_image_bg's two
+    selection branches already read via bp.get(...) — so those branches need
+    zero further changes to become platform-aware, whether called for the
+    brand default or an override. Falls back to bp's own (brand-wide) values
+    completely untouched when no override exists for this platform — a
+    brand that never sets one up behaves identically to before this existed.
+
+    No per-platform prompt-fragment freezing (yet) — style_prompt_fragments
+    comes back empty for an override, which is an already-supported path
+    (falls back to a live get_prompt_fragment(slug) lookup). Accepted
+    simplification: unlike the brand default's frozen-at-selection-time
+    fragments, a future library edit to a slug's own fragment would reach an
+    override immediately.
+
+    Returns (resolved_bp, rotation_field_path) — the second value is which
+    Mongo field a rotation-index write-back should target: the flat
+    style_rotation_index, or that platform's own entry in
+    style_rotation_index_by_platform.
+    """
+    platform_styles = (bp.get("style_selections_by_platform") or {}).get(platform) or []
+    platform_guides_v1 = (bp.get("selected_custom_guides_by_platform") or {}).get(platform) or []
+    platform_guides_v2 = (bp.get("selected_custom_guides_v2_by_platform") or {}).get(platform) or []
+    if platform_styles or platform_guides_v1 or platform_guides_v2:
+        resolved = {
+            **bp,
+            "style_selections": platform_styles,
+            "style_prompt_fragments": [],
+            "selected_custom_guides": platform_guides_v1,
+            "selected_custom_guides_v2": platform_guides_v2,
+            "style_rotation_index": int((bp.get("style_rotation_index_by_platform") or {}).get(platform) or 0),
+        }
+        return resolved, f"style_rotation_index_by_platform.{platform}"
+    return bp, "style_rotation_index"
+
+
 async def _generate_image_bg(
     draft_id: str,
     platform: str,
@@ -5619,8 +5669,18 @@ async def _generate_image_bg(
             # for this generation, so it takes priority over any custom guide.
             _bp = await db["brand_profiles"].find_one(
                 _style_profile_scope,
-                {"style_selections": 1, "style_prompt_fragments": 1, "style_rotation_index": 1, "industry": 1, "selected_custom_guides": 1, "selected_custom_guides_v2": 1},
+                {
+                    "style_selections": 1, "style_prompt_fragments": 1, "style_rotation_index": 1, "industry": 1,
+                    "selected_custom_guides": 1, "selected_custom_guides_v2": 1,
+                    "style_selections_by_platform": 1, "selected_custom_guides_by_platform": 1,
+                    "selected_custom_guides_v2_by_platform": 1, "style_rotation_index_by_platform": 1,
+                },
             ) or {}
+
+            # Per-platform override resolution — see _resolve_platform_style_pool.
+            _bp, _rotation_field_path = _resolve_platform_style_pool(_bp, platform)
+            if _rotation_field_path != "style_rotation_index":
+                print(f"🎨 [{platform}] has its own style/guide override — using it instead of the brand default")
 
             _custom_guide_ids_v1 = _bp.get("selected_custom_guides") or []
             _custom_guide_ids_v2 = _bp.get("selected_custom_guides_v2") or []
@@ -5653,7 +5713,7 @@ async def _generate_image_bg(
                                 {"id": carousel_id},
                                 {"$set": {"carousel_style_slug": _slug, "carousel_custom_guide_v2_id": _custom_guide_id, "carousel_custom_guide_v2_ref": _v2_ref}},
                             )
-                            await db["brand_profiles"].update_one(_style_profile_scope, {"$set": {"style_rotation_index": _next_index}})
+                            await db["brand_profiles"].update_one(_style_profile_scope, {"$set": {_rotation_field_path: _next_index}})
                             print(f"🎨 Custom V2 guide [{custom_guide.get('name')}] applied for all {total_slides} carousel slides")
                     else:
                         custom_guide = await CustomVisualGuideService.get_guide_detail(_custom_guide_id, db)
@@ -5666,7 +5726,7 @@ async def _generate_image_bg(
                                 {"id": carousel_id},
                                 {"$set": {"carousel_style_slug": _slug, "carousel_style_fragment": _fragment}},
                             )
-                            await db["brand_profiles"].update_one(_style_profile_scope, {"$set": {"style_rotation_index": _next_index}})
+                            await db["brand_profiles"].update_one(_style_profile_scope, {"$set": {_rotation_field_path: _next_index}})
                             await CustomVisualGuideService.track_guide_usage(_custom_guide_id, False, db)
                             print(f"🎨 Custom V1 guide [{custom_guide.get('name')}] applied for all {total_slides} carousel slides")
                 else:
@@ -5744,8 +5804,18 @@ async def _generate_image_bg(
             # Regular post: check for custom guides (V1 + V2) first, then fallback to style rotation
             _bp = await db["brand_profiles"].find_one(
                 _style_profile_scope,
-                {"style_selections": 1, "style_prompt_fragments": 1, "style_rotation_index": 1, "industry": 1, "selected_custom_guides": 1, "selected_custom_guides_v2": 1},
+                {
+                    "style_selections": 1, "style_prompt_fragments": 1, "style_rotation_index": 1, "industry": 1,
+                    "selected_custom_guides": 1, "selected_custom_guides_v2": 1,
+                    "style_selections_by_platform": 1, "selected_custom_guides_by_platform": 1,
+                    "selected_custom_guides_v2_by_platform": 1, "style_rotation_index_by_platform": 1,
+                },
             ) or {}
+
+            # Per-platform override resolution — see _resolve_platform_style_pool.
+            _bp, _rotation_field_path = _resolve_platform_style_pool(_bp, platform)
+            if _rotation_field_path != "style_rotation_index":
+                print(f"🎨 [{platform}] has its own style/guide override — using it instead of the brand default")
 
             # An on-the-fly style override always takes priority over custom guides too.
             _custom_guide_ids_v1 = _bp.get("selected_custom_guides") or []
@@ -5788,7 +5858,7 @@ async def _generate_image_bg(
                         # Update rotation index
                         await db["brand_profiles"].update_one(
                             _style_profile_scope,
-                            {"$set": {"style_rotation_index": _next_index}}
+                            {"$set": {_rotation_field_path: _next_index}}
                         )
                 else:
                     # V1: Use prompt fragment
@@ -5806,7 +5876,7 @@ async def _generate_image_bg(
                         # Update rotation index
                         await db["brand_profiles"].update_one(
                             _style_profile_scope,
-                            {"$set": {"style_rotation_index": _next_index}}
+                            {"$set": {_rotation_field_path: _next_index}}
                         )
             else:
                 # Fallback to library style rotation
@@ -5825,7 +5895,7 @@ async def _generate_image_bg(
                     # Persist incremented rotation index
                     await db["brand_profiles"].update_one(
                         _style_profile_scope,
-                        {"$set": {"style_rotation_index": _next_index}},
+                        {"$set": {_rotation_field_path: _next_index}},
                     )
 
         # For story posts pass image_type="story" so we get 1080x1920 dimensions

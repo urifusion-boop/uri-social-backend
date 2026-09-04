@@ -17,6 +17,9 @@ from app.agents.jane_ads.models import (
     AdCreative,
     CampaignObjective,
     CampaignPlan,
+    GeoMode,
+    GeoPin,
+    GeoPlan,
     Goal,
     Platform,
     PlatformPlan,
@@ -228,6 +231,39 @@ def test_launch_campaign_creates_full_chain_and_stores_record():
     assert record["ad_id"] == "ad_1"
     assert record["business_id"] == "b1"
     assert record["last_conversation_count"] == 0
+
+
+def test_launch_campaign_with_no_geo_targets_all_of_nigeria():
+    # A plan with no geo pins (never geocoded, or nothing validated) must still
+    # launch, broadly — the pre-pins behaviour, kept as the fallback.
+    responses = [{"id": "cmp_1"}, {"id": "adset_1"}, {"id": "creative_1"}, {"id": "ad_1"}]
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client(responses)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        _run(_adapter().launch_campaign(_plan(), _auth()))
+    adset_json = mock_client.post.call_args_list[1].kwargs["json"]
+    assert adset_json["targeting"] == {"geo_locations": {"countries": ["NG"]}}
+
+
+def test_launch_campaign_targets_the_plans_actual_geo_pins():
+    # Live-reported: the real launched ad set always targeted all of Nigeria no
+    # matter what Jane's geo reasoning (pins around Ikeja, a 2km radius, etc.) had
+    # decided — the pins were computed and shown in the plan card/estimate, but
+    # never reached the actual Meta ad set. The real launch must use them.
+    geo = GeoPlan(mode=GeoMode.OWN_RADIUS, city="Ikeja", pins=[
+        GeoPin(name="Ikeja", lat=6.6018, lng=3.3515, radius_km=3.0),
+    ])
+    responses = [{"id": "cmp_1"}, {"id": "adset_1"}, {"id": "creative_1"}, {"id": "ad_1"}]
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client(responses)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        _run(_adapter().launch_campaign(_plan(geo=geo), _auth()))
+    adset_json = mock_client.post.call_args_list[1].kwargs["json"]
+    assert adset_json["targeting"] == {
+        "geo_locations": {"custom_locations": [
+            {"latitude": 6.6018, "longitude": 3.3515, "radius": 3.0, "distance_unit": "kilometer"},
+        ]},
+    }
 
 
 def test_launch_campaign_followers_goal_builds_engagement_not_whatsapp():

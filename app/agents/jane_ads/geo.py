@@ -351,6 +351,22 @@ async def build_geo_plan(
                    explanation=_explain(mode, city, pins))
 
 
+def meta_targeting_from_geo(geo: Optional[GeoPlan]) -> dict:
+    """A GeoPlan's pins as Meta's `targeting.geo_locations` shape — the ONE place this
+    conversion happens, so the real ad set and the delivery-estimate preview can never
+    disagree on where an ad actually targets. Falls back to all of Nigeria when there
+    are no valid pins (a brand new enough that geocoding found nothing), same as
+    before pins existed."""
+    custom_locations = [
+        {"latitude": pin.lat, "longitude": pin.lng,
+         "radius": pin.radius_km, "distance_unit": "kilometer"}
+        for pin in (geo.pins if geo else [])
+        if pin.lat is not None and pin.lng is not None
+    ]
+    return ({"geo_locations": {"custom_locations": custom_locations}}
+            if custom_locations else {"geo_locations": {"countries": ["NG"]}})
+
+
 def _explain(mode: GeoMode, city: str, pins: list[GeoPin]) -> str:
     names = ", ".join(p.name for p in pins)
     where = "where your customers gather" if mode == GeoMode.WATERING_HOLE \
