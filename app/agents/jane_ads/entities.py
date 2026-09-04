@@ -293,6 +293,17 @@ class Requirement(str, Enum):
     CREATIVE_PRODUCTION = "creative_production"
     VIDEO_ASSET = "video_asset"
     EXISTING_WINNING_CREATIVE = "existing_winning_creative"
+    # VSG-01 v3 §1.2/§6 — a format whose asset_source is upload_as_is or
+    # recomposite must never surface for a business with no real photo to
+    # build it from; substituting a generated stand-in for a physical
+    # product the customer will actually receive is a misrepresentation,
+    # not a style choice. Gate at retrieval, not at render (§6, §9).
+    PRODUCT_PHOTO = "product_photo"
+    # Same rule for formats that assert a specific customer's testimony
+    # (Testimonial + Offer's person path, Text on a Face) — a generated
+    # face paired with a first-person quote implies a customer who does
+    # not exist (§1.2).
+    REAL_CUSTOMER_PHOTO = "real_customer_photo"
 
 
 class SalesCycle(str, Enum):

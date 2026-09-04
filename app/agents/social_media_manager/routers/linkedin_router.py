@@ -121,18 +121,18 @@ async def linkedin_oauth_callback(
 
     if error or not code or not state:
         return RedirectResponse(
-            f"{web_app_url}/settings/social-accounts?connected=false&platform=linkedin&error=access_denied"
+            f"{web_app_url}/settings/social-accounts/?connected=false&platform=linkedin&error=access_denied"
         )
 
     pending = await db["linkedin_oauth_pending"].find_one({"state": state})
     if not pending:
         return RedirectResponse(
-            f"{web_app_url}/settings/social-accounts?connected=false&platform=linkedin&error=session_expired"
+            f"{web_app_url}/settings/social-accounts/?connected=false&platform=linkedin&error=session_expired"
         )
     if pending.get("expires_at") and datetime.utcnow() > pending["expires_at"]:
         await db["linkedin_oauth_pending"].delete_one({"state": state})
         return RedirectResponse(
-            f"{web_app_url}/settings/social-accounts?connected=false&platform=linkedin&error=session_expired"
+            f"{web_app_url}/settings/social-accounts/?connected=false&platform=linkedin&error=session_expired"
         )
 
     user_id = pending["user_id"]
@@ -146,7 +146,7 @@ async def linkedin_oauth_callback(
         pages = await svc.get_admin_pages(access_token)
     except Exception as e:
         return RedirectResponse(
-            f"{web_app_url}/settings/social-accounts"
+            f"{web_app_url}/settings/social-accounts/"
             f"?connected=false&platform=linkedin&error={urllib.parse.quote(str(e))}"
         )
     finally:
@@ -197,12 +197,12 @@ async def linkedin_oauth_callback(
         import traceback as _tb
         print(f"[linkedin/callback] DB upsert error: {db_err}\n{_tb.format_exc()}")
         return RedirectResponse(
-            f"{web_app_url}/settings/social-accounts"
+            f"{web_app_url}/settings/social-accounts/"
             f"?connected=false&platform=linkedin&error={urllib.parse.quote(str(db_err))}"
         )
 
     return RedirectResponse(
-        f"{web_app_url}/settings/social-accounts"
+        f"{web_app_url}/settings/social-accounts/"
         f"?connected=true&platform=linkedin&username={urllib.parse.quote(name)}"
     )
 

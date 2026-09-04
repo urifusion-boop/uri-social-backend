@@ -72,6 +72,14 @@ class BusinessProfile:
     has_video_asset: bool = False
     has_winning_creative: bool = False
     isolated_ad_account: bool = False
+    # VSG-01 v3 §1.2/§6 — whether a real photo of the actual product exists to
+    # build an upload_as_is/recomposite format from. Distinct from
+    # has_video_asset: a business can have a product photo with no video, or
+    # vice versa.
+    has_product_photo: bool = False
+    # Whether a real customer's photo + permission-on-file exists, for formats
+    # that pair an image with a first-person claim (§1.2).
+    has_real_customer_photo: bool = False
 
 
 @dataclass
@@ -124,6 +132,8 @@ def _requirement_met(req: Requirement, p: BusinessProfile, tier: int) -> bool:
         Requirement.CREATIVE_PRODUCTION: tier >= TIER_FOR_PARALLEL_ADSETS,
         Requirement.VIDEO_ASSET: p.has_video_asset,
         Requirement.EXISTING_WINNING_CREATIVE: p.has_winning_creative,
+        Requirement.PRODUCT_PHOTO: p.has_product_photo,
+        Requirement.REAL_CUSTOMER_PHOTO: p.has_real_customer_photo,
     }[req]
 
 

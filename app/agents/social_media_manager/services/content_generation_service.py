@@ -287,6 +287,22 @@ Write one caption. No alternatives, no meta-commentary.
                 f'language for a premium brand, or exclusive/luxury language for a budget one).'
             )
 
+        if brand_context.get("business_stage"):
+            # Same wording as content_calendar_service.py's _STAGE_GUIDANCE — a
+            # single source of truth so a single post and a calendar week never
+            # disagree on what "new"/"growing"/etc. actually means for tone.
+            from .content_calendar_service import _STAGE_GUIDANCE
+            guidance = _STAGE_GUIDANCE.get(brand_context["business_stage"])
+            if guidance:
+                parts.append(f'- Business stage: this is {guidance}.')
+
+        priorities = brand_context.get("business_priorities")
+        if isinstance(priorities, list) and priorities:
+            parts.append(
+                f'- Current business priorities: {", ".join(priorities[:4])}. '
+                f'Lean into these where the post naturally supports them.'
+            )
+
         # ── Voice & tone ──────────────────────────────────────────────────────
         # Use platform-specific tone if available and same_tone_everywhere is False
         platform_tones = brand_context.get("platform_tones") or {}
@@ -323,6 +339,8 @@ Write one caption. No alternatives, no meta-commentary.
         # location/income), plus pain points and "why they choose us" separately,
         # since those two are directly actionable for a single post's hook/angle.
         cust_bits = []
+        if brand_context.get("customer_gender"):
+            cust_bits.append(brand_context["customer_gender"])
         if brand_context.get("customer_occupation"):
             cust_bits.append(brand_context["customer_occupation"])
         if brand_context.get("customer_location"):
@@ -340,6 +358,27 @@ Write one caption. No alternatives, no meta-commentary.
             parts.append(
                 f'- Customer pain points: {", ".join(pain_points[:4])}. '
                 f'Speak to at least one of these where relevant.'
+            )
+
+        interests = brand_context.get("customer_interests")
+        if isinstance(interests, list) and interests:
+            parts.append(
+                f'- Customer interests: {", ".join(interests[:4])}. '
+                f'Draw references or analogies from these where it fits naturally.'
+            )
+
+        needs = brand_context.get("customer_needs")
+        if isinstance(needs, list) and needs:
+            parts.append(
+                f'- Customer needs: {", ".join(needs[:4])}. '
+                f'Frame the value of the product/service around meeting these.'
+            )
+
+        objections = brand_context.get("customer_objections")
+        if isinstance(objections, list) and objections:
+            parts.append(
+                f'- Common objections customers have: {", ".join(objections[:4])}. '
+                f'Where the post is persuasive in nature, preempt or address at least one.'
             )
 
         if brand_context.get("why_customers_choose_us"):

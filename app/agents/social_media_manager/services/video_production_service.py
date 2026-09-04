@@ -1804,7 +1804,11 @@ def build_shotstack_timeline(
         srt_filename = f"{job_id or 'job'}_{cap_type}.srt"
         with open(f"{srt_dir}/{srt_filename}", "w", encoding="utf-8") as f:
             f.write("\n".join(lines))
-        srt_url = f"https://api-staging.urisocial.com/static/srt/{srt_filename}"
+        # This backend's own /static mount (main.py) — was hardcoded to a fixed
+        # staging domain regardless of which environment actually served the
+        # file, meaning prod had always pointed this at (now-dead) staging too.
+        _static_base = (settings.PUBLIC_API_URL or "").strip("'\"").rstrip("/")
+        srt_url = f"{_static_base}/static/srt/{srt_filename}"
         print(
             f"[VideoProduction] caption:{cap_type} {n_entries} entries → {srt_url}",
             flush=True,
@@ -2331,7 +2335,8 @@ async def run_production_job(
                 os.makedirs(_music_dir, exist_ok=True)
                 with open(f"{_music_dir}/{job_id}.mp3", "wb") as _mf:
                     _mf.write(custom_music_bytes)
-                custom_music_url = f"https://api-staging.urisocial.com/static/music/{job_id}.mp3"
+                _static_base = (settings.PUBLIC_API_URL or "").strip("'\"").rstrip("/")
+                custom_music_url = f"{_static_base}/static/music/{job_id}.mp3"
                 print(
                     f"[CustomMusic] static {len(custom_music_bytes)//1024}KB → {custom_music_url}",
                     flush=True,
@@ -2401,7 +2406,8 @@ async def run_production_job(
         try:
             with open(f"{video_static_dir}/{job_id}.mp4", "wb") as vf:
                 vf.write(cleaned_bytes)
-            static_url = f"https://api-staging.urisocial.com/static/videos/{job_id}.mp4"
+            _static_base = (settings.PUBLIC_API_URL or "").strip("'\"").rstrip("/")
+            static_url = f"{_static_base}/static/videos/{job_id}.mp4"
             print(f"[VideoProduction] static: {len(cleaned_bytes)//1024}KB → {static_url}", flush=True)
         except Exception as e:
             print(f"[VideoProduction] static write failed: {e}", flush=True)
