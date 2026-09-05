@@ -15,6 +15,7 @@ solar; notebook vs system; guesswork vs measured fitting.
 import re
 from typing import Dict, List, Tuple
 
+from ._text_metrics import wrap_text
 from .tokens import AdFormatDef, PLACEHOLDER_TOKENS
 from app.agents.social_media_manager.services.document_renderer_service import DocumentRendererService
 
@@ -25,6 +26,17 @@ FORMAT = AdFormatDef(
     layers_used="L4",
     requires=[],
 )
+
+# §1.6 floors — retrofitted after legibility.py's automated check found the
+# original 20/28/34px sizes here all below the 42px minimum (this format
+# predates that discipline; Borrowed Interface/Review Card/Day1→Day30 were
+# built with it from the start). Bumping font size means row/us values also
+# need real word-wrapping now (wrap_text, the same helper Borrowed
+# Interface/Review Card use) — unwrapped text was already a latent overflow
+# risk at the old smaller sizes and gets materially worse at 44px.
+_FONT_HEADER = 44
+_FONT_LABEL = 42
+_FONT_VALUE = 44
 
 
 class BrandNameRejected(ValueError):
@@ -93,21 +105,38 @@ def build_document(
     left_x = 72
     right_x = left_x + col_width + col_gap
     header_y = 72
-    row_height = 96
     rows_top = header_y + 96
+
+    label_height = int(_FONT_LABEL * 1.2)
+    label_gap = 8
+    value_line_height = int(_FONT_VALUE * 1.3)
+    row_gap_after = 32
 
     # Column headers.
     for label, x in ((them_label, left_x), (us_label, right_x)):
         z += 1
         layers.append({
             "type": "text", "z_index": z, "content": label,
-            "x": x, "y": header_y, "font_size": 34, "font_weight": 700, "color": t["ink"],
+            "x": x, "y": header_y, "font_size": _FONT_HEADER, "font_weight": 700, "color": t["ink"],
         })
+
+    # Pre-measure every row's wrapped content so both columns can share one
+    # row height each while still fitting whichever side wraps to more
+    # lines — a fixed row_height (the pre-wrap design) silently overflowed
+    # once font size grew, the identical bug class Borrowed Interface's
+    # chat bubbles had before they got the same treatment.
+    measured_rows = []
+    for row_label, them_value, us_value in rows:
+        them_lines = wrap_text(them_value, col_width, _FONT_VALUE)
+        us_lines = wrap_text(us_value, col_width, _FONT_VALUE)
+        n_lines = max(len(them_lines), len(us_lines))
+        row_height = label_height + label_gap + n_lines * value_line_height + row_gap_after
+        measured_rows.append((row_label, them_lines, us_lines, row_height))
 
     # Column backgrounds (fields the row content sits on) — left on
     # `surface` (already the canvas colour, so no separate fill needed),
     # right on `field`, running the full height of the rows.
-    total_rows_height = row_height * len(rows)
+    total_rows_height = sum(row_height for *_, row_height in measured_rows)
     z += 1
     layers.append({
         "type": "shape", "z_index": z, "shape": "rect",
@@ -115,40 +144,42 @@ def build_document(
         "fill_color": t["field"],
     })
 
-    for i, (row_label, them_value, us_value) in enumerate(rows):
-        row_y = rows_top + i * row_height
+    row_y = rows_top
+    for i, (row_label, them_lines, us_lines, row_height) in enumerate(measured_rows):
+        z += 1
+        layers.append({
+            "type": "text", "z_index": z, "content": row_label,
+            "x": left_x, "y": row_y, "font_size": _FONT_LABEL, "color": t["ink-quiet"],
+        })
+
+        value_y = row_y + label_height + label_gap
+        z += 1
+        layers.append({
+            "type": "text", "z_index": z, "content": "\n".join(them_lines),
+            "x": left_x, "y": value_y, "font_size": _FONT_VALUE, "color": t["ink-quiet"],
+        })
 
         z += 1
         layers.append({
             "type": "text", "z_index": z, "content": row_label,
-            "x": left_x, "y": row_y, "font_size": 20, "color": t["ink-quiet"],
+            "x": right_x, "y": row_y, "font_size": _FONT_LABEL, "color": t["ink-quiet"],
         })
 
         z += 1
         layers.append({
-            "type": "text", "z_index": z, "content": them_value,
-            "x": left_x, "y": row_y + 30, "font_size": 28, "color": t["ink-quiet"],
-        })
-
-        z += 1
-        layers.append({
-            "type": "text", "z_index": z, "content": row_label,
-            "x": right_x, "y": row_y, "font_size": 20, "color": t["ink-quiet"],
-        })
-
-        z += 1
-        layers.append({
-            "type": "text", "z_index": z, "content": us_value,
-            "x": right_x, "y": row_y + 30, "font_size": 28, "font_weight": 700, "color": t["ink"],
+            "type": "text", "z_index": z, "content": "\n".join(us_lines),
+            "x": right_x, "y": value_y, "font_size": _FONT_VALUE, "font_weight": 700, "color": t["ink"],
         })
 
         if i > 0:
             z += 1
             layers.append({
                 "type": "shape", "z_index": z, "shape": "line",
-                "x1": left_x, "y1": row_y - 12, "x2": left_x + col_width, "y2": row_y - 12,
-                "color": t["edge"], "stroke_width": 1,
+                "x1": left_x, "y1": row_y - 16, "x2": left_x + col_width, "y2": row_y - 16,
+                "color": t["edge"], "stroke_width": 2,
             })
+
+        row_y += row_height
 
     return {
         "canvas": {"width": width, "height": height, "background_color": t["surface"]},

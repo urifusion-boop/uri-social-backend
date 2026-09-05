@@ -97,3 +97,44 @@ class TestBuildDocument:
         headers = [l.get("content", "") for l in doc["layers"]]
         assert "Buying at the market" in headers
         assert "Ordering with us" in headers
+
+    def test_all_body_text_meets_the_42px_legibility_floor(self):
+        doc = build_document(rows=[
+            ("Delivery", "go to the market yourself and carry everything home", "delivered same day"),
+            ("Price", "transport cost extra", "flat rate"),
+        ])
+        for layer in doc["layers"]:
+            if layer["type"] == "text":
+                assert layer["font_size"] >= 42
+
+    def test_divider_is_not_a_hairline(self):
+        """Regression: the row divider was stroke_width=1 — below §1.6's
+        2px hairline floor, and the only line in the whole library that
+        was (every other format's dividers were already >=2)."""
+        doc = build_document(rows=[
+            ("Delivery", "go yourself", "delivered"),
+            ("Price", "higher", "lower"),
+        ])
+        divider = next(l for l in doc["layers"] if l.get("shape") == "line")
+        assert divider["stroke_width"] >= 2
+
+    def test_long_row_values_wrap_instead_of_overflowing(self):
+        """Regression: unwrapped them/us values at the (post-legibility-fix)
+        44px floor ran past their column into the other side — found by
+        rendering a realistic row, not a short test string.
+
+        Deliberately very long values rather than borderline ones: word
+        wrapping measures against the real render font's metrics, which
+        this machine's font-path fallback can't reproduce exactly (see
+        _text_metrics.py's own docstring) — a string this long wraps under
+        any plausible font metric, so the assertion holds regardless of
+        which font actually measured it."""
+        them_value = ("go all the way to the market yourself and carry everything home on your own "
+                      "without any help at all, every single week, no matter the weather or the traffic")
+        us_value = ("delivered straight to your door the very same day with no extra trips or waiting "
+                    "around required, rain or shine, any day of the week you choose")
+        doc = build_document(rows=[("Delivery", them_value, us_value)])
+        them_layer = next(l for l in doc["layers"] if l.get("content", "").startswith("go all"))
+        us_layer = next(l for l in doc["layers"] if l.get("content", "").startswith("delivered"))
+        assert "\n" in them_layer["content"]
+        assert "\n" in us_layer["content"]

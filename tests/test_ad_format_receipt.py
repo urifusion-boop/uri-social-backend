@@ -109,3 +109,27 @@ class TestBuildDocument:
         doc = self._doc(tokens=custom)
         total_layer = next(l for l in doc["layers"] if l.get("content") == "N3,500")
         assert total_layer["color"] == "#00FF00"
+
+    def test_all_body_text_meets_the_42px_legibility_floor(self):
+        doc = self._doc(business_name="Adaeze Couture", delivery_line="Ready in 3 days",
+                         payment_line="Cash or transfer")
+        for layer in doc["layers"]:
+            if layer["type"] == "text":
+                assert layer["font_size"] >= 42
+
+    def test_a_long_item_name_wraps_instead_of_overflowing(self):
+        """Regression: an unbounded single-line item name at the (post-
+        legibility-fix) 44px floor ran straight into the leader line and
+        price column — found by actually rendering one, not assumed safe
+        from a short test string.
+
+        Deliberately a very long name rather than a borderline one: word
+        wrapping measures against the real render font's metrics, which
+        this machine's font-path fallback can't reproduce exactly (see
+        _text_metrics.py's own docstring) — a string this long wraps under
+        any plausible font metric, so the assertion holds regardless of
+        which font actually measured it."""
+        long_name = "Ankara fabric six yards premium quality lace blend imported from Lagos Island market with hand finishing"
+        doc = self._doc(items=[(long_name, "N24,000")])
+        name_layer = next(l for l in doc["layers"] if l.get("content", "").startswith("Ankara"))
+        assert "\n" in name_layer["content"]
