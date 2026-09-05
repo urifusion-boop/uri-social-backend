@@ -94,7 +94,20 @@ class DocumentRendererService:
         canvas_width: int,
         canvas_height: int
     ):
-        """Render background image layer"""
+        """Render background image layer.
+
+        x/y/width/height default to the full canvas — every caller before
+        VSG-01's Problem/Solution format either passed those explicitly as
+        the full canvas size or omitted them entirely, so this preserves
+        their behaviour exactly. Previously this always resized to
+        (canvas_width, canvas_height) and pasted at (0, 0) regardless of
+        what a layer specified, silently ignoring x/y/width/height —
+        harmless when a document only ever has one full-canvas background,
+        but a real bug for a format needing two ai_generated_background
+        layers in different zones of the same canvas (confirmed live: the
+        second layer's full-canvas paste completely overwrote the first
+        zone's scrim and text). Brought in line with _render_product,
+        which already respects per-layer x/y/width/height correctly."""
         image_url = layer.get("url")
         if not image_url:
             return
@@ -104,11 +117,16 @@ class DocumentRendererService:
         if not bg_image:
             return
 
-        # Resize to canvas size
-        bg_image = bg_image.resize((canvas_width, canvas_height), Image.Resampling.LANCZOS)
+        x = layer.get("x", 0)
+        y = layer.get("y", 0)
+        width = layer.get("width", canvas_width)
+        height = layer.get("height", canvas_height)
 
-        # Paste onto canvas
-        canvas.paste(bg_image, (0, 0))
+        # Resize to the layer's own dimensions
+        bg_image = bg_image.resize((width, height), Image.Resampling.LANCZOS)
+
+        # Paste at the layer's own position
+        canvas.paste(bg_image, (x, y))
 
     @staticmethod
     async def _render_product(canvas: Image.Image, layer: Dict[str, Any]):
