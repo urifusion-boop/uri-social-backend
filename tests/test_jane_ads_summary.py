@@ -56,6 +56,32 @@ def test_audience_defaults_to_nigeria_without_pins():
     assert s.audience.value == "Nigeria"
 
 
+def test_audience_names_who_it_targets_not_only_where():
+    # Live-reported: a client picked an audience plan and the summary still read
+    # "Nigeria — No specific area given", as if the app had ignored the choice.
+    s = build_campaign_summary(_plan(), _req(),
+                               audience_text="small business owners going digital")
+    assert "small business owners going digital" in s.audience.value
+    assert "Surulere" in s.audience.value
+
+
+def test_audience_without_pins_still_names_who_rather_than_claiming_none_given():
+    s = build_campaign_summary(_plan(geo=None), _req(), audience_text="gym owners in Lekki")
+    assert "gym owners in Lekki" in s.audience.value
+    assert "No specific area given" not in s.audience.reason
+
+
+def test_audience_reason_names_the_interests_actually_sent_to_meta():
+    # The card must describe the ad that really ships — these interests are exactly
+    # what lands in the ad set's flexible_spec.
+    plan = _plan(audience_targeting={"flexible_spec": [{"interests": [
+        {"id": "1", "name": "Small business"}, {"id": "2", "name": "Digital marketing"},
+    ]}]})
+    s = build_campaign_summary(plan, _req(), audience_text="small business owners")
+    assert "Small business" in s.audience.reason
+    assert "Digital marketing" in s.audience.reason
+
+
 def test_duration_matches_plan_days():
     s = build_campaign_summary(_plan(), _req())
     assert s.duration.value == "7 days"

@@ -1618,6 +1618,15 @@ class MetaLaunchFromMessageBody(BaseModel):
                                           # that specific audience rather than the one
                                           # Jane would've picked silently. None → present
                                           # the ranked options instead of proceeding.
+    target_audience: str = ""             # the client's OWN audience, in their words
+                                          # ("gym owners in Lekki aged 25-40") — the
+                                          # "none of these" answer to the plan picker.
+                                          # A business knows its customers better than
+                                          # any generated variant does, so this OUTRANKS
+                                          # selected_plan_variant and the brand profile,
+                                          # counts as having chosen (so the picker isn't
+                                          # re-presented), and drives both the Meta
+                                          # interest targeting and the creative's copy.
     # Ad destination (the choose_destination stage) — where a tap on this ad lands.
     # "" uses the brand's saved default (a returning brand is never re-asked);
     # "ask" makes Jane present the picker instead of building; a concrete type uses
@@ -1990,13 +1999,19 @@ async def _build_campaign_plan(
     # (or, budget permitting, more), and THAT audience's own segment/geo/trigger drive
     # the rest of this build. Best-effort: an outage here never blocks planning, it
     # just falls back to today's silent-pick behaviour.
+    #
+    # A client who typed their OWN audience ("none of these") has chosen just as
+    # deliberately as one who tapped a card — so that answer skips the picker too.
+    # Without this it regenerated a fresh set of variants and asked again, which reads
+    # as the app ignoring what they just told it.
+    own_audience = (body.target_audience or "").strip()
     selected_variant: Optional[PlanVariant] = None
     if body.selected_plan_variant is not None:
         try:
             selected_variant = PlanVariant.model_validate(body.selected_plan_variant)
         except Exception as e:
             print(f"[oneshot] selected_plan_variant malformed, ignoring: {e}", flush=True)
-    if selected_variant is None:
+    if selected_variant is None and not own_audience:
         try:
             from .plan_variants import generate_plan_variants, PlanVariantsUnavailableError
             corpus = await _retrieve_for_plan_generation(db, parsed, business_id)
@@ -2124,14 +2139,19 @@ async def _build_campaign_plan(
     except Exception as e:
         print(f"[oneshot] geo skipped: {e}", flush=True)
 
-    # 3.5. Demographic/interest targeting — Jane's audience call (the selected
-    # variant's audience_segment, or the brand's own generic target_audience when no
-    # variant was selected), translated into what Meta's ad set actually accepts.
+    # 3.5. Demographic/interest targeting — the audience this campaign actually runs
+    # at, translated into what Meta's ad set accepts.
     # Live-reported: the real launched ad set always shipped broad (all ages, all
     # genders, no interests) regardless of this reasoning — it was computed and shown
     # in the plan card, never applied. Best-effort, same as geo above: unresolvable
     # text or an unreachable AI/Graph API just leaves this axis broad.
-    audience_text = ((selected_variant.audience_segment if selected_variant else "")
+    #
+    # Precedence, most specific first: what the CLIENT typed for this campaign beats a
+    # variant they picked off a card, which beats the brand profile's standing answer.
+    # The client's own words win outright — a business knows its customers better than
+    # a generated variant does, which is the whole reason "none of these" exists.
+    audience_text = (own_audience
+                     or (selected_variant.audience_segment if selected_variant else "")
                      or brand_profile.get("target_audience", ""))
     try:
         from .audience_targeting import resolve_audience_targeting
@@ -2234,7 +2254,9 @@ async def _build_campaign_plan(
     # A selected audience-plan variant's own phrasing drives Zone A/B here (spec §8)
     # instead of the brand's generic target_audience — empty when no variant was
     # selected, which is a no-op fallback to today's existing behaviour.
-    variant_segment = selected_variant.audience_segment if selected_variant else ""
+    # The client's OWN typed audience outranks both, same precedence as the Meta
+    # targeting above: the ad's words must describe the people it actually targets.
+    variant_segment = own_audience or (selected_variant.audience_segment if selected_variant else "")
     variant_who_its_for = selected_variant.who_its_for if selected_variant else ""
     # The variant's own named areas are real targeting parameters (Zone A), just like
     # geo_areas above — equally forbidden from appearing in copy. Live-confirmed leak:
@@ -2421,7 +2443,7 @@ async def _build_campaign_plan(
             except Exception as e:
                 print(f"[oneshot] delivery estimate skipped: {e}", flush=True)
         summary = build_campaign_summary(plan, req, price_per_result_ngn=price_per_conversation,
-                                         delivery_estimate=estimate)
+                                         delivery_estimate=estimate, audience_text=audience_text)
         summary_dump = summary.model_dump(mode="json")
     except Exception as e:
         print(f"[oneshot] summary skipped: {e}", flush=True)

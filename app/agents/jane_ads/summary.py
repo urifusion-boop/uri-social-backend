@@ -88,6 +88,7 @@ def build_campaign_summary(
     req: CampaignRequest,
     price_per_result_ngn: Optional[float] = None,
     delivery_estimate: Optional[dict] = None,
+    audience_text: str = "",
 ) -> CampaignSummary:
     """Assemble the structured, explained summary from the already-decided plan. Pure —
     the live Meta reach numbers are fetched by the caller and passed in as
@@ -102,13 +103,26 @@ def build_campaign_summary(
         reason=f"Your goal is {plan.goal.value} — everything below is chosen to serve that.",
     )
 
-    # Audience — from the geo plan (real, validated pins) or a national default.
+    # Audience — WHO this runs at, and WHERE. This row used to be built from the geo
+    # pins alone, so a client who had just picked an audience plan (or typed their own)
+    # still read "Nigeria — no specific area given", as if the app had ignored them.
+    # Live-reported. The interests are named too, because they're what Meta actually
+    # receives: the card must describe the ad that really ships.
     pins = plan.geo.pins if plan.geo else []
-    if pins:
+    where = ", ".join(p.name for p in pins)
+    who = (audience_text or "").strip()
+    interests = [
+        i.get("name", "") for spec in (plan.audience_targeting.get("flexible_spec") or [])
+        for i in (spec.get("interests") or []) if i.get("name")
+    ]
+    if who or where:
+        geo_reason = (plan.geo.explanation if plan.geo and plan.geo.explanation
+                      else "These areas match where your customers actually are.")
         audience = ReasonedValue(
-            value=", ".join(p.name for p in pins),
-            reason=(plan.geo.explanation if plan.geo and plan.geo.explanation
-                    else "These areas match where your customers actually are."),
+            value=" — ".join(bit for bit in (who, where or "Nigeria") if bit),
+            reason=(f"Targeting interests: {', '.join(interests)}. {geo_reason}" if interests
+                    else geo_reason if where
+                    else "Targeting these people nationwide — tell me a city to focus the spend."),
         )
     else:
         audience = ReasonedValue(
