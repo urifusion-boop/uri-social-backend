@@ -18,6 +18,17 @@ Unlike legibility.py's compression test, this genuinely cannot be
 determined from document metadata alone — it's a property of pixels a
 generation model produced, not something derivable from layout JSON.
 
+Verified live against the real dev credential (AWS SSM
+/uri/social-backend/dev/OPENAI_API_KEY — not the stale key in this repo's
+local .env, which is unrelated to what the deployed dev backend actually
+uses and doesn't work; this module's own local dev-environment test
+initially reached the wrong conclusion for exactly that reason before the
+real SSM-sourced key was checked) against three real stock photos: a
+person-less object photo (contains_person=False, correctly a vacuous
+pass), a lighter-skinned portrait (assessed "medium brown," correctly
+matches_target_range=False), and a dark-skinned portrait (assessed "deep
+brown," correctly matches_target_range=True).
+
 Not yet wired into a live call path: no L2 (generation-dependent) format
 exists in this codebase yet (VSG-01 step 7). This is the primitive that
 step calls on every generated image before it reaches Layer 4.
