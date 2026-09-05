@@ -233,6 +233,20 @@ def test_launch_campaign_creates_full_chain_and_stores_record():
     assert record["last_conversation_count"] == 0
 
 
+def test_adset_always_declares_the_advantage_audience_flag():
+    # Meta made targeting_automation.advantage_audience mandatory 2026-09-05 — without
+    # it EVERY ad set create fails with "Advantage audience flag required"
+    # (code=100, subcode=1870227). 0, not 1: 1 lets Meta deliver outside the detailed
+    # targeting, which would make the plan card's named interests/areas a lie.
+    responses = [{"id": "cmp_1"}, {"id": "adset_1"}, {"id": "creative_1"}, {"id": "ad_1"}]
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client(responses)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        _run(_adapter().launch_campaign(_plan(), _auth()))
+    targeting = mock_client.post.call_args_list[1].kwargs["json"]["targeting"]
+    assert targeting["targeting_automation"] == {"advantage_audience": 0}
+
+
 def test_launch_campaign_with_no_geo_targets_all_of_nigeria():
     # A plan with no geo pins (never geocoded, or nothing validated) must still
     # launch, broadly — the pre-pins behaviour, kept as the fallback.
@@ -242,7 +256,7 @@ def test_launch_campaign_with_no_geo_targets_all_of_nigeria():
         MockClient.return_value.__aenter__.return_value = mock_client
         _run(_adapter().launch_campaign(_plan(), _auth()))
     adset_json = mock_client.post.call_args_list[1].kwargs["json"]
-    assert adset_json["targeting"] == {"geo_locations": {"countries": ["NG"]}}
+    assert adset_json["targeting"]["geo_locations"] == {"countries": ["NG"]}
 
 
 def test_launch_campaign_targets_the_plans_actual_geo_pins():
@@ -259,11 +273,9 @@ def test_launch_campaign_targets_the_plans_actual_geo_pins():
         MockClient.return_value.__aenter__.return_value = mock_client
         _run(_adapter().launch_campaign(_plan(geo=geo), _auth()))
     adset_json = mock_client.post.call_args_list[1].kwargs["json"]
-    assert adset_json["targeting"] == {
-        "geo_locations": {"custom_locations": [
-            {"latitude": 6.6018, "longitude": 3.3515, "radius": 3.0, "distance_unit": "kilometer"},
-        ]},
-    }
+    assert adset_json["targeting"]["geo_locations"] == {"custom_locations": [
+        {"latitude": 6.6018, "longitude": 3.3515, "radius": 3.0, "distance_unit": "kilometer"},
+    ]}
 
 
 def test_launch_campaign_followers_goal_builds_engagement_not_whatsapp():
