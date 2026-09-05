@@ -6,9 +6,17 @@ ENV BUILD_DATE=${BUILD_DATE}
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 WORKDIR /app
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# libssl-dev was dropped 2026-09-05: it forced an upgrade of libssl1.1 to
+# 1.1.1w-0+deb11u8, which bullseye-security's index advertises but no longer has in
+# its pool — every build 404'd on that one .deb, across multiple CDN backends, so it
+# was not transient and re-running never helped. Nothing in requirements.txt compiles
+# against OpenSSL headers (the usual suspects — pycurl/M2Crypto/psycopg2/cryptography
+# built from source — are all absent), and Python's own ssl module links the libssl1.1
+# already in the base image, which is untouched. gcc stays for C extension builds.
+# The retry config mirrors what the production stage below already sets.
+RUN echo 'Acquire::Retries "5";' > /etc/apt/apt.conf.d/80-retries && \
+    apt-get update && apt-get install -y --no-install-recommends \
     gcc \
-    libssl-dev \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
