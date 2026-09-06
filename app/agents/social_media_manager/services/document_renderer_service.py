@@ -310,14 +310,33 @@ class DocumentRendererService:
 
     @staticmethod
     async def _fetch_image(url: str) -> Optional[Image.Image]:
-        """Download image from URL"""
-        try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                response = await client.get(url)
-                if response.status_code == 200:
-                    return Image.open(io.BytesIO(response.content)).convert("RGBA")
-        except Exception as e:
-            print(f"⚠️ Error fetching image {url}: {e}")
+        """Download image from URL.
+
+        Retries twice (1s, then 2s backoff) before giving up — found live
+        building VSG-01's News Headline format: a Cloudinary URL returned
+        by layer2_generation.generate_scene() immediately after upload
+        failed to fetch on the very next render call, then succeeded on a
+        manual retry seconds later (curl confirmed the same URL was a
+        real, complete image — a CDN propagation race, not a broken
+        upload or a bad URL). Every ai_generated_background/
+        composited_product/brand_asset layer goes through this method, so
+        a single transient failure previously meant a silently blank
+        background rather than the generated scene the whole format is
+        built around."""
+        last_error: Optional[Exception] = None
+        for attempt in range(3):
+            if attempt > 0:
+                import asyncio
+                await asyncio.sleep(attempt)  # 1s before 2nd try, 2s before 3rd
+            try:
+                async with httpx.AsyncClient(timeout=30) as client:
+                    response = await client.get(url)
+                    if response.status_code == 200:
+                        return Image.open(io.BytesIO(response.content)).convert("RGBA")
+                    last_error = f"HTTP {response.status_code}"
+            except Exception as e:
+                last_error = e
+        print(f"⚠️ Error fetching image {url} after 3 attempts: {last_error}")
         return None
 
     @staticmethod
