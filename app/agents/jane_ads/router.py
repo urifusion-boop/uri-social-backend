@@ -475,8 +475,51 @@ _UPLOAD_IMAGE_TYPES = {
 _UPLOAD_VIDEO_TYPES = {
     "video/mp4": "mp4", "video/quicktime": "mov", "video/webm": "webm", "video/x-m4v": "m4v",
 }
-_MAX_UPLOAD_IMAGE_BYTES = 8 * 1024 * 1024     # 8 MB
+# A real phone photo routinely lands well past 8MB (the ad-creative upload's original
+# hard cap — live-confirmed blocking a genuine 10.8MB JPEG straight off an iPhone).
+# _COMPRESS_ABOVE_BYTES is the real, common-case wall: anything past it gets resized/
+# re-encoded rather than rejected, so a real user's photo essentially never fails
+# outright. _MAX_UPLOAD_IMAGE_BYTES stays as a generous backstop for something
+# genuinely pathological (a corrupt file, a 500MB "image") that compression itself
+# can't be trusted to handle cheaply.
+_COMPRESS_ABOVE_BYTES = 4 * 1024 * 1024       # 4 MB
+_MAX_UPLOAD_IMAGE_BYTES = 20 * 1024 * 1024    # 20 MB
 _MAX_UPLOAD_VIDEO_BYTES = 100 * 1024 * 1024   # 100 MB — short vertical ad clips
+# Ad placements elsewhere in this codebase render at 1080px-wide canvases (creative.py,
+# ad_formats/*) — nothing downstream needs a dimension larger than this, and capping it
+# here is most of where the real byte savings come from (re-encoding alone helps far
+# less on a photo that's already 4000px+ on its long edge).
+_COMPRESS_MAX_DIMENSION = 2048
+_COMPRESS_JPEG_QUALITY = 85
+
+
+def _compress_image_if_needed(contents: bytes, content_type: str) -> bytes:
+    """Resize/re-encode an oversized image so a real phone photo (routinely 8-15MB)
+    almost never gets rejected outright. Always converts to JPEG when it actually
+    compresses — a PNG/WEBP under the threshold is returned untouched, preserving
+    format for the (rare) small upload. Returns the original bytes unchanged if PIL
+    can't decode it or compression doesn't actually help — the caller's own size
+    check is still the real gate, this only ever makes an oversized image smaller."""
+    if len(contents) <= _COMPRESS_ABOVE_BYTES:
+        return contents
+    try:
+        from io import BytesIO
+        from PIL import Image, ImageOps
+
+        img = Image.open(BytesIO(contents))
+        img = ImageOps.exif_transpose(img)  # phone photos carry orientation in EXIF,
+                                             # not the pixel data — without this a
+                                             # re-encode can silently rotate the image
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+        img.thumbnail((_COMPRESS_MAX_DIMENSION, _COMPRESS_MAX_DIMENSION), Image.LANCZOS)
+        out = BytesIO()
+        img.save(out, format="JPEG", quality=_COMPRESS_JPEG_QUALITY, optimize=True)
+        compressed = out.getvalue()
+        return compressed if len(compressed) < len(contents) else contents
+    except Exception as e:
+        print(f"[creative_upload] image compression skipped: {e}", flush=True)
+        return contents
 
 
 @router.post("/creative/upload")
@@ -498,12 +541,23 @@ async def creative_upload(
     if len(contents) > max_bytes:
         raise HTTPException(status_code=400, detail=f"File must be under {max_bytes // (1024*1024)} MB.")
 
+    if not is_video:
+        compressed = _compress_image_if_needed(contents, file.content_type)
+        if compressed is not contents:
+            contents = compressed
+            ext = "jpg"
+            file_content_type = "image/jpeg"
+        else:
+            file_content_type = file.content_type
+    else:
+        file_content_type = file.content_type
+
     from .creative import _upload_bytes_to_cloudinary
     import uuid as _uuid
     url = await _upload_bytes_to_cloudinary(
         contents, f"upload-{_uuid.uuid4().hex[:12]}",
         resource_type="video" if is_video else "image",
-        ext=ext, content_type=file.content_type,
+        ext=ext, content_type=file_content_type,
     )
     if not url:
         raise HTTPException(status_code=502, detail="Upload failed, please try again.")
