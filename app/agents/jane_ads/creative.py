@@ -919,36 +919,70 @@ async def generate_ad_creative(
                                city, behaviour, service_area, audience_segment, who_its_for,
                                geo_pockets=geo_pockets, corpus=corpus,
                                destination_type=destination_type)
-    # Image via the SAME content engine normal posts use (better visuals). Seed it with the
-    # scene idea; content conveys the theme/message so the graphic is on-topic.
-    content_for_image = copy.primary_text or copy.image_prompt or f"{business_name} — {description or category}"
-    # The image must say the same thing the button does. Live-observed: a click-to-
-    # WhatsApp ad whose creative read "Visit our website" while the copy said "message
-    # me to order" — two different destinations on one ad. So the image's CTA comes
-    # from the brand's real ad destination, not the brand playbook's generic one.
-    image_brand_context = {**(brand_context or {}),
-                           "override_cta": image_cta(coerce_type(destination_type))}
-    image_url = await generate_ad_image(content_for_image, image_brand_context, seed=copy.image_prompt)
-    # Caption LAST, matched to the actual generated image (vision) so it references the
-    # real visual instead of a generic line ("caption doesn't add up"). Falls back to the
-    # original copy if the vision pass fails.
-    if image_url:
-        summary = await describe_ad_image(image_url)
-        if summary:
-            # Same corpus as write_ad_copy above: this call OVERWRITES headline and
-            # primary_text, so without it the corpus shapes copy that is then discarded
-            # — which is exactly why the first live test showed no change in the ad.
-            matched = await write_ad_copy_for_image(
-                summary, business_name, category, goal, description, brand_context, city,
-                service_area, audience_segment, who_its_for, geo_pockets=geo_pockets,
-                corpus=corpus, destination_type=destination_type,
+
+    # VSG-01 v3 (§6-9, step 10) — try a corpus-selected, composited ad format
+    # (Us vs Them / Borrowed Interface / Problem-Solution today; see
+    # vsg01_orchestrator.py's own docstring for why only these three) before
+    # falling back to the single generic image every GENERATE ad used to get
+    # unconditionally. None at any point (no format retrieved, an LLM content
+    # call failed, a build failed its own legibility/skin-tone check, the
+    # render itself failed) means "fall through to the existing generic path
+    # below, unchanged" — this can only ever add a better creative, never
+    # remove the one that already worked.
+    vsg01_result = None
+    image_url = None
+    if db is not None:
+        from .vsg01_orchestrator import select_and_render_vsg01_creative
+        vsg01_result = await select_and_render_vsg01_creative(
+            db, business_name, category, description, brand_context,
+        )
+        if vsg01_result is not None:
+            image_url = await _upload_bytes_to_cloudinary(
+                vsg01_result["png_bytes"], f"vsg01-{uuid.uuid4().hex[:12]}",
             )
-            if matched.headline:
-                copy.headline = matched.headline
-            if matched.primary_text:
-                copy.primary_text = matched.primary_text
+            if image_url is None:
+                print("[Creative] VSG-01 render succeeded but Cloudinary upload failed, "
+                      "falling back to generic generation", flush=True)
+                vsg01_result = None
+
+    if vsg01_result is None:
+        # Image via the SAME content engine normal posts use (better visuals). Seed it with
+        # the scene idea; content conveys the theme/message so the graphic is on-topic.
+        content_for_image = copy.primary_text or copy.image_prompt or f"{business_name} — {description or category}"
+        # The image must say the same thing the button does. Live-observed: a click-to-
+        # WhatsApp ad whose creative read "Visit our website" while the copy said "message
+        # me to order" — two different destinations on one ad. So the image's CTA comes
+        # from the brand's real ad destination, not the brand playbook's generic one.
+        image_brand_context = {**(brand_context or {}),
+                               "override_cta": image_cta(coerce_type(destination_type))}
+        image_url = await generate_ad_image(content_for_image, image_brand_context, seed=copy.image_prompt)
+        # Caption LAST, matched to the actual generated image (vision) so it references the
+        # real visual instead of a generic line ("caption doesn't add up"). Falls back to the
+        # original copy if the vision pass fails. Skipped for a VSG-01 render above — that
+        # image already IS the message (a comparison table, a chat exchange); a vision
+        # description of its own composited text would just restate the layout back into
+        # headline/primary_text, not add anything write_ad_copy's corpus-aware pass didn't.
+        if image_url:
+            summary = await describe_ad_image(image_url)
+            if summary:
+                # Same corpus as write_ad_copy above: this call OVERWRITES headline and
+                # primary_text, so without it the corpus shapes copy that is then discarded
+                # — which is exactly why the first live test showed no change in the ad.
+                matched = await write_ad_copy_for_image(
+                    summary, business_name, category, goal, description, brand_context, city,
+                    service_area, audience_segment, who_its_for, geo_pockets=geo_pockets,
+                    corpus=corpus, destination_type=destination_type,
+                )
+                if matched.headline:
+                    copy.headline = matched.headline
+                if matched.primary_text:
+                    copy.primary_text = matched.primary_text
+
     ad = assemble_creative(copy, image_url, source=CreativeSource.GENERATE, service_area=service_area,
                            destination_type=destination_type, destination_cta=destination_cta)
+    if vsg01_result is not None:
+        ad.vsg01_format_id = vsg01_result["format_id"]
+        ad.vsg01_format_attributes = vsg01_result["attributes"]
     if corpus is not None:
         from .models import StrategyCitation
         ad.corpus_coverage = corpus.coverage
