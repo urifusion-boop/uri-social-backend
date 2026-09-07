@@ -206,3 +206,43 @@ def test_all_hits_unrelated_yields_nothing_rather_than_a_wrong_interest():
     hit = asyncio.get_event_loop().run_until_complete(
         _resolve_interest(client, "https://graph", "tok", "Gym"))
     assert hit is None   # broader beats wrong
+
+
+def test_interests_meta_reports_invalid_are_dropped_before_launch():
+    """Live-caught on a real launch: search returned "QC School of Event and Wedding
+    Planning" for a wedding audience, and ad-set creation then failed outright —
+    "Some detailed targeting options have been combined" (code=100, subcode=1870247).
+    A deprecated interest doesn't degrade targeting, it stops the campaign going live."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+    from app.agents.jane_ads.audience_targeting import _drop_invalid_interests
+
+    client = AsyncMock()
+    r = MagicMock()
+    r.json = lambda: {"data": [
+        {"id": "6012250005972", "name": "QC School of Event and Wedding Planning", "valid": False},
+        {"id": "6003092932417", "name": "Event management (event planning)", "valid": True},
+    ]}
+    client.get = AsyncMock(return_value=r)
+    kept = asyncio.get_event_loop().run_until_complete(_drop_invalid_interests(
+        client, "https://graph", "tok",
+        [{"id": "6012250005972", "name": "QC School of Event and Wedding Planning"},
+         {"id": "6003092932417", "name": "Event management (event planning)"}]))
+    assert kept == [{"id": "6003092932417", "name": "Event management (event planning)"}]
+
+
+def test_unknown_validity_is_kept_rather_than_silently_dropped():
+    # If Meta doesn't report on an id, assume it's fine — losing a good interest to a
+    # patchy response is worse than the rare deprecated one slipping through.
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+    from app.agents.jane_ads.audience_targeting import _drop_invalid_interests
+
+    client = AsyncMock()
+    r = MagicMock()
+    r.json = lambda: {"data": []}
+    client.get = AsyncMock(return_value=r)
+    given = [{"id": "1", "name": "Fitness and wellness (fitness)"}]
+    kept = asyncio.get_event_loop().run_until_complete(
+        _drop_invalid_interests(client, "https://graph", "tok", given))
+    assert kept == given
