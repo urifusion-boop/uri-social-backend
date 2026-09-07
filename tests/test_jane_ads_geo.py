@@ -149,3 +149,28 @@ def test_named_areas_skips_entries_with_no_name():
     ))
     assert len(plan.pins) == 1
     assert plan.pins[0].name == "Bode Thomas"
+
+
+# ── A place named in the client's own audience is the campaign's geography ──
+
+def test_place_named_in_finds_known_areas():
+    from app.agents.jane_ads.geo import place_named_in
+    assert place_named_in("gym owners lekki aged 20-25") == "Lekki"
+    assert place_named_in("brides-to-be in Lekki aged 25-35") == "Lekki"
+    assert place_named_in("wedding planners in surulere") == "Surulere"
+
+
+def test_place_named_in_prefers_the_longest_name():
+    from app.agents.jane_ads.geo import place_named_in
+    assert place_named_in("Lekki Phase 1 residents") == "Lekki Phase 1"
+
+
+def test_place_named_in_needs_a_whole_word_and_tolerates_none():
+    """Live-observed: the consultant picked Ikeja (from the earlier brief) over the
+    Lekki the client had just typed, so this is matched in code rather than prompted.
+    An audience naming no known place leaves the consultant's own read alone."""
+    from app.agents.jane_ads.geo import place_named_in
+    assert place_named_in("people in ikejawhatever") is None
+    assert place_named_in("small business owners") is None
+    assert place_named_in("") is None
+    assert place_named_in(None) is None

@@ -2137,6 +2137,18 @@ async def _build_campaign_plan(
     geo_areas = parsed.geo_areas
     if selected_variant and selected_variant.geo_pockets:
         geo_areas = [{"name": name, "reason": selected_variant.trigger} for name in selected_variant.geo_pockets]
+    # A place the client named inside their OWN audience outranks everything above it:
+    # they typed it as the answer to "who should this target", so it is this campaign's
+    # geography. Matched in CODE, not left to the consultant — live-observed picking
+    # Ikeja (from the earlier brief) over the Lekki the client had just typed, and
+    # explaining itself as "focusing on Ikeja since it's specified as the budget
+    # location". An unknown place matches nothing and the consultant's read stands.
+    if own_audience:
+        from .geo import place_named_in
+        stated_place = place_named_in(own_audience)
+        if stated_place:
+            geo_areas = [{"name": stated_place,
+                          "reason": "the area you named in the audience you specified"}]
     geo_dump = None
     try:
         if parsed.geo_mode:
