@@ -279,3 +279,50 @@ def test_no_note_when_latest_reply_has_no_matching_number():
 def test_latest_user_reply_takes_the_segment_after_the_last_period():
     assert _latest_user_reply("Get me more sales. 10000, ikeja") == "10000, ikeja"
     assert _latest_user_reply("") == ""
+
+
+# ── The client's own stated audience reaches the parse (not just the targeting) ──
+
+def test_stated_audience_is_given_to_the_consultant_as_decided():
+    """Live-reported: a client typed "gym owners in Lekki aged 20-25" into the plan
+    picker's "none of these" box and Jane's plan narrated "business owners across
+    Nigeria" back at them, targeting Lagos. target_audience only reached the Meta
+    targeting call downstream — the consultant, which writes stated_plan AND extracts
+    the city, never saw it. It has to arrive as a decided fact, before the parse."""
+    import asyncio, json
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from app.agents.jane_ads.jane_consultant import consult
+
+    resp = MagicMock()
+    resp.choices = [MagicMock(message=MagicMock(content=json.dumps({
+        "stage": "ready", "goal": "sales", "budget_ngn": 20000, "city": "Lekki",
+    })))]
+    create = AsyncMock(return_value=resp)
+    with patch("openai.AsyncOpenAI") as cls:
+        cls.return_value.chat.completions.create = create
+        asyncio.get_event_loop().run_until_complete(
+            consult("promote my gym kit", business_name="FitCo", category="fitness",
+                    stated_audience="gym owners in Lekki aged 20-25")
+        )
+
+    # messages[0] is the system prompt; the per-turn known-facts go in the last (user) one
+    prompt = create.call_args.kwargs["messages"][-1]["content"]
+    assert "gym owners in Lekki aged 20-25" in prompt
+    # and framed as settled, so it isn't re-derived or widened
+    assert "SPECIFIED" in prompt
+
+
+def test_no_stated_audience_leaves_the_prompt_untouched():
+    import asyncio, json
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from app.agents.jane_ads.jane_consultant import consult
+
+    resp = MagicMock()
+    resp.choices = [MagicMock(message=MagicMock(content=json.dumps({"stage": "ask"})))]
+    create = AsyncMock(return_value=resp)
+    with patch("openai.AsyncOpenAI") as cls:
+        cls.return_value.chat.completions.create = create
+        asyncio.get_event_loop().run_until_complete(
+            consult("promote my gym kit", business_name="FitCo", category="fitness")
+        )
+    assert "SPECIFIED this campaign's target audience" not in create.call_args.kwargs["messages"][-1]["content"]

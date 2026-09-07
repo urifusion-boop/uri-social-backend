@@ -1833,9 +1833,15 @@ async def _build_campaign_plan(
     # If the AI is unreachable (quota/outage), surface a clear "try again later"
     # instead of falling through to a follow-up question — otherwise every answer
     # re-triggers the same question (an infinite loop).
+    # An audience the client typed themselves ("none of these" on the plan picker) is
+    # an ANSWER, so the consultant has to see it BEFORE it parses — it drives the
+    # narration and the geography, not just the Meta targeting further down. Read here
+    # rather than at step 1.7 for that reason.
+    own_audience = (body.target_audience or "").strip()
     try:
         parsed = await consult(body.message, known_business_name, known_category,
-                               known_budget, thread_turns, offering=known_offering)
+                               known_budget, thread_turns, offering=known_offering,
+                               stated_audience=own_audience)
     except NlUnavailableError:
         raise HTTPException(status_code=503, detail=_AI_DIFFICULTIES)
 
@@ -2004,7 +2010,6 @@ async def _build_campaign_plan(
     # deliberately as one who tapped a card — so that answer skips the picker too.
     # Without this it regenerated a fresh set of variants and asked again, which reads
     # as the app ignoring what they just told it.
-    own_audience = (body.target_audience or "").strip()
     selected_variant: Optional[PlanVariant] = None
     if body.selected_plan_variant is not None:
         try:
