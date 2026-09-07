@@ -391,6 +391,11 @@ class CreativeForBrandBody(BaseModel):
     reference_image_url: str = ""      # required for source=upload/recomposite
     is_video: bool = False             # is reference_image_url a video? (from /creative/upload)
     draft_id: str = ""                 # required for source=draft
+    # VSG-01 v3 (§1.2/§6) — the user's own confirmation of what reference_image_url
+    # genuinely shows, collected once at upload time (never inferred): "product_photo" |
+    # "real_customer_photo" | None. None means exactly what it always meant — use the
+    # photo as-is, no format-selection attempt. See creative_from_upload's docstring.
+    asset_attestation: Optional[str] = None
 
 
 @router.post("/creative/for-brand")
@@ -421,6 +426,7 @@ async def creative_for_brand(
             body.description, user_id=user_id, db=db, brand_id=brand_id,
             is_video=body.is_video, city=body.city,
             destination_type=destination_type, destination_cta=destination_cta,
+            asset_attestation=body.asset_attestation,
         )
     elif body.source == "recomposite":
         if not body.reference_image_url:
@@ -429,6 +435,7 @@ async def creative_for_brand(
             body.business_name, body.category, body.reference_image_url, body.goal,
             body.description, user_id=user_id, db=db, brand_id=brand_id, city=body.city,
             destination_type=destination_type, destination_cta=destination_cta,
+            asset_attestation=body.asset_attestation,
         )
     elif body.source == "draft":
         if not body.draft_id:
@@ -1643,6 +1650,10 @@ class MetaLaunchFromMessageBody(BaseModel):
                                           # plan") — set by the server on the first
                                           # choose_plan_variant response, echoed back on
                                           # each follow-up selection call
+    # VSG-01 v3 (§1.2/§6) — see CreativeForBrandBody's identical field. Required for
+    # creative_source=upload/recomposite before a photo-based format can even be
+    # attempted; None for generate/draft/ask (no real photo exists on those paths).
+    asset_attestation: Optional[str] = None
 
 
 class _PlanBuildResult(BaseModel):
@@ -2276,7 +2287,7 @@ async def _build_campaign_plan(
             city=parsed.city, service_area=service_area,
             audience_segment=variant_segment, who_its_for=variant_who_its_for,
             geo_pockets=variant_geo_pockets, destination_type=destination_type.value,
-            destination_cta=destination_cta,
+            destination_cta=destination_cta, asset_attestation=body.asset_attestation,
         )
     elif body.creative_source == "recomposite":
         creative = await creative_from_recomposite(
@@ -2285,7 +2296,7 @@ async def _build_campaign_plan(
             city=parsed.city, service_area=service_area,
             audience_segment=variant_segment, who_its_for=variant_who_its_for,
             geo_pockets=variant_geo_pockets, destination_type=destination_type.value,
-            destination_cta=destination_cta,
+            destination_cta=destination_cta, asset_attestation=body.asset_attestation,
         )
     elif body.creative_source == "draft":
         creative = await creative_from_draft(
