@@ -674,3 +674,12 @@ def test_write_ad_copy_leaves_a_clean_image_prompt_untouched():
             "Uri Social", "social media tool", city="Lagos", geo_pockets=["Ikeja"],
         ))
     assert copy.image_prompt == clean["image_prompt"]
+
+
+def test_vsg01_drawn_formats_are_off_by_default():
+    """VSG-01's formats are DRAWN typographic layouts, not images from the content
+    engine normal posts use. Reported as visually much worse, so ads fall through to
+    generate_ad_image() unless JANE_ADS_VSG01_ENABLED is explicitly set. The library
+    itself is untouched — this only skips it."""
+    from app.core.config import settings
+    assert settings.JANE_ADS_VSG01_ENABLED is False

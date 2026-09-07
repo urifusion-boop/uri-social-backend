@@ -929,9 +929,15 @@ async def generate_ad_creative(
     # render itself failed) means "fall through to the existing generic path
     # below, unchanged" — this can only ever add a better creative, never
     # remove the one that already worked.
+    #
+    # Gated OFF by default (JANE_ADS_VSG01_ENABLED). These formats are DRAWN
+    # typographic layouts, not generated imagery, and the drawn output was reported
+    # as markedly worse-looking than what the content engine produces — so ads take
+    # the generate_ad_image() path below unless the flag is set. Nothing here is
+    # removed; flipping the flag restores the format library in front.
     vsg01_result = None
     image_url = None
-    if db is not None:
+    if db is not None and settings.JANE_ADS_VSG01_ENABLED:
         from .vsg01_orchestrator import select_and_render_vsg01_creative
         vsg01_result = await select_and_render_vsg01_creative(
             db, business_name, category, description, brand_context,
