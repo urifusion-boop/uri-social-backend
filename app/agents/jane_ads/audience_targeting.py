@@ -62,7 +62,16 @@ def _extraction_prompt(audience_text: str) -> str:
         "those null/\"all\" unless the text is explicit ('young professionals', "
         "'mothers', 'men's grooming'). Prefer fewer, more precise keywords over five "
         "vague ones; an empty list is correct if nothing in the text names a real "
-        "interest category."
+        "interest category.\n\n"
+        "Every keyword must come from WHAT THIS AUDIENCE DOES, SELLS, OR BUYS — their "
+        "trade, industry, or the category of thing they'd purchase. NEVER derive one "
+        "from an age, a generation, a location, or a lifestyle guess about people that "
+        "age. The age range is already handled by age_min/age_max above; restating it "
+        "as an interest just adds people who are nothing like the audience. Real "
+        "failure to avoid: \"gym owners in Lekki aged 20-25\" returned \"Hip-hop "
+        "music\" — a guess at what 20-25s enjoy, which targets the wrong people "
+        "entirely. \"Fitness and wellness\" and \"Gym\" are the correct reading, "
+        "because that is the trade the audience is actually in."
     )
 
 

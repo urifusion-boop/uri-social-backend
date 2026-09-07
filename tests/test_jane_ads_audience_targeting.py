@@ -141,3 +141,18 @@ def test_openai_outage_returns_broad_never_raises():
     with patch("openai.AsyncOpenAI", side_effect=Exception("down")):
         targeting = _run(resolve_audience_targeting("young professionals", "tok"))
     assert targeting == {}
+
+
+def test_prompt_forbids_deriving_interests_from_age_or_lifestyle():
+    """Live-observed: "gym owners in lekki aged 20-25" resolved to "Hip-hop music" —
+    a guess at what 20-25s enjoy rather than the trade the audience is in, which
+    targets the wrong people. The age range is already carried by age_min/age_max."""
+    from app.agents.jane_ads.audience_targeting import _extraction_prompt
+
+    prompt = _extraction_prompt("gym owners in lekki aged 20-25")
+    lowered = prompt.lower()
+    # The rule itself, and the concrete failure it exists to prevent.
+    assert "what this audience does, sells, or buys" in lowered
+    assert "hip-hop music" in lowered
+    for banned_source in ("age", "generation", "lifestyle"):
+        assert banned_source in lowered
