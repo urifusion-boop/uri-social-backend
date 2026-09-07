@@ -27,6 +27,84 @@ def _run(coro):
     return asyncio.get_event_loop().run_until_complete(coro)
 
 
+class _FakeResponse:
+    def __init__(self, status_code, content=b""):
+        self.status_code = status_code
+        self.content = content
+
+
+class _FakeAsyncClient:
+    """Stands in for httpx.AsyncClient — pops one canned response/exception
+    per call to .get(), same shape as the real async context manager."""
+    _queue = []
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    async def get(self, url):
+        item = _FakeAsyncClient._queue.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+def _png_bytes(color=(1, 2, 3)):
+    import io as _io
+    buf = _io.BytesIO()
+    Image.new("RGB", (10, 10), color).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+class TestFetchImageRetry:
+    """Real bug found building News Headline: a Cloudinary URL returned by
+    generate_scene() immediately after upload failed to fetch on the very
+    next render call, then succeeded seconds later on a manual retry (curl
+    confirmed the same URL was a complete, valid image — a CDN propagation
+    race, not a broken upload). _fetch_image now retries twice before
+    giving up; these tests exercise that against a fake HTTP client so
+    they're fast and deterministic, with asyncio.sleep patched out so the
+    1s/2s backoff doesn't actually slow the test suite down."""
+
+    def _fetch(self, queue):
+        _FakeAsyncClient._queue = queue
+        with patch("httpx.AsyncClient", _FakeAsyncClient), \
+             patch("asyncio.sleep", AsyncMock(return_value=None)):
+            return _run(DocumentRendererService._fetch_image("https://example.com/img.png"))
+
+    def test_succeeds_on_first_try(self):
+        img = self._fetch([_FakeResponse(200, _png_bytes())])
+        assert img is not None
+
+    def test_recovers_after_one_transient_failure(self):
+        img = self._fetch([
+            ConnectionError("transient network error"),
+            _FakeResponse(200, _png_bytes()),
+        ])
+        assert img is not None
+
+    def test_recovers_after_two_transient_failures(self):
+        img = self._fetch([
+            _FakeResponse(500),
+            ConnectionError("transient network error"),
+            _FakeResponse(200, _png_bytes()),
+        ])
+        assert img is not None
+
+    def test_gives_up_after_three_failures(self):
+        img = self._fetch([
+            ConnectionError("down"),
+            ConnectionError("down"),
+            ConnectionError("down"),
+        ])
+        assert img is None
+
+
 def _solid(color, size=(100, 100)):
     return Image.new("RGB", size, color)
 
