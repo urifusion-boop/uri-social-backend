@@ -230,6 +230,13 @@ class Settings(BaseSettings):
     VIDEO_EDIT_CREDITS_PER_MINUTE: int = 4
 
     # Bypass flags for local development
+    # VSG-01's composited ad formats (Us vs Them, Borrowed Interface, Problem/Solution)
+    # are typographic layouts DRAWN by the ad_formats library, not images from the
+    # content engine normal posts use. Off by default: the drawn output was reported as
+    # visually poor next to the generated imagery, so ads fall through to
+    # generate_ad_image() as before. Flip to true to put the format library back in
+    # front — nothing about it is removed, only skipped (see creative.py step 10).
+    JANE_ADS_VSG01_ENABLED: bool = False
     BYPASS_SUBSCRIPTION_CHECK: bool = False
     BYPASS_FEATURE_LIMIT_CHECK: bool = False
     LOCAL_DEV_MODE: bool = False
