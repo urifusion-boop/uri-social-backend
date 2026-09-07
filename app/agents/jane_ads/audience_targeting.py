@@ -27,6 +27,7 @@ launchable ad, so a failure here must never block the build.
 from __future__ import annotations
 
 import json
+import re
 from typing import Optional
 
 import httpx
@@ -64,14 +65,15 @@ def _extraction_prompt(audience_text: str) -> str:
         "vague ones; an empty list is correct if nothing in the text names a real "
         "interest category.\n\n"
         "Every keyword must come from WHAT THIS AUDIENCE DOES, SELLS, OR BUYS — their "
-        "trade, industry, or the category of thing they'd purchase. NEVER derive one "
-        "from an age, a generation, a location, or a lifestyle guess about people that "
-        "age. The age range is already handled by age_min/age_max above; restating it "
-        "as an interest just adds people who are nothing like the audience. Real "
-        "failure to avoid: \"gym owners in Lekki aged 20-25\" returned \"Hip-hop "
-        "music\" — a guess at what 20-25s enjoy, which targets the wrong people "
-        "entirely. \"Fitness and wellness\" and \"Gym\" are the correct reading, "
-        "because that is the trade the audience is actually in."
+        "trade, industry, or the category of thing they'd purchase. Never derive one "
+        "from an age, a generation, or a guess at what people that age enjoy: the age "
+        "range is already carried by age_min/age_max above, and restating it as an "
+        "interest just adds people nothing like the audience. For 'gym owners' the "
+        "keywords are about gyms and fitness businesses."
+        # NOTE: this deliberately no longer names a specific bad interest. An earlier
+        # version cited "Hip-hop music" as the thing to avoid, which did not help —
+        # the wrong interest was coming from META's search ranking, not from this
+        # model (see _resolve_interest), so the prompt was the wrong layer to fix it.
     )
 
 
@@ -86,17 +88,72 @@ async def _extract_hints(audience_text: str) -> dict:
     return json.loads(resp.choices[0].message.content or "{}")
 
 
+_PAREN_SUFFIX = re.compile(r"\s*\([^)]*\)\s*$")
+_WORD = re.compile(r"[a-z0-9]+")
+
+
+def _match_score(keyword: str, hit_name: str) -> int:
+    """How well a Meta interest actually matches the keyword we searched for.
+
+    3 = the same thing, 2 = contains every word we asked for, 1 = partial overlap,
+    0 = unrelated, so reject it. Meta puts its own category in a trailing
+    parenthetical ("Health club (fitness)"), which is not part of the name for
+    matching purposes.
+    """
+    base = _PAREN_SUFFIX.sub("", hit_name or "").strip().lower()
+    q = (keyword or "").strip().lower()
+    if not base or not q:
+        return 0
+    if base == q:
+        return 3
+    q_words, base_words = set(_WORD.findall(q)), set(_WORD.findall(base))
+    if not q_words or not base_words:
+        return 0
+    if q_words <= base_words:
+        return 2
+    return 1 if q_words & base_words else 0
+
+
 async def _resolve_interest(client: httpx.AsyncClient, graph_base: str,
                              access_token: str, keyword: str) -> Optional[dict]:
     """Meta's own targeting-search result for one keyword — an invented interest id
-    is rejected outright at ad-set creation, so this is the only reliable source."""
+    is rejected outright at ad-set creation, so this is the only reliable source of
+    real ids.
+
+    Meta's own ranking cannot be trusted blindly, though. Live-confirmed: searching
+    "Gym" with limit=1 returned "Hip-hop music (music)" as the single top hit, and it
+    shipped on a real ad set aimed at gym owners; searching the SAME term with a
+    larger limit doesn't return it at all. So ask for several and pick by actual
+    lexical match to what was searched, rejecting anything unrelated — those same
+    searches also surface "Government", "India" and "Reality television
+    personalities". Rejecting is safe: a dropped keyword just leaves the ad broader
+    on that axis, whereas a wrong interest spends the budget on the wrong people.
+    """
     resp = await client.get(
         f"{graph_base}/search",
-        params={"type": "adinterest", "q": keyword, "limit": 1, "access_token": access_token},
+        params={"type": "adinterest", "q": keyword, "limit": 10,
+                "fields": "id,name,topic", "access_token": access_token},
     )
-    data = resp.json()
-    hits = data.get("data") or []
-    return {"id": hits[0]["id"], "name": hits[0]["name"]} if hits else None
+    hits = [h for h in (resp.json().get("data") or []) if h.get("id")]
+    usable = [(_match_score(keyword, h.get("name", "")), h) for h in hits]
+    usable = [(s, h) for s, h in usable if s > 0]
+    if not usable:
+        if hits:
+            print(f"[AudienceTargeting] no relevant interest for {keyword!r} — "
+                  f"discarded {[h.get('name') for h in hits[:3]]}", flush=True)
+        return None
+    # Best match wins. Among equals prefer Meta's own generic categories, which it
+    # names with a trailing "(category)", over brand and person pages that merely
+    # contain the same words — then the plainest name ("Health club (fitness)" over
+    # "Goodlife Health Clubs, Australia"). Targeting one gym CHAIN's followers is a
+    # far narrower audience than people interested in gyms.
+    def _rank(sh):
+        score, h = sh
+        name = h.get("name", "")
+        return (score, 1 if _PAREN_SUFFIX.search(name) else 0, -len(name))
+
+    _, hit = max(usable, key=_rank)
+    return {"id": hit["id"], "name": hit["name"]}
 
 
 async def resolve_audience_targeting(audience_text: str, access_token: str) -> dict:
