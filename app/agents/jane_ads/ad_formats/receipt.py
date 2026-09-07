@@ -20,6 +20,7 @@ currently honoured.
 """
 from typing import Dict, List, Optional, Tuple
 
+from ._text_metrics import wrap_text
 from .tokens import AdFormatDef, PLACEHOLDER_TOKENS
 from app.agents.social_media_manager.services.document_renderer_service import DocumentRendererService
 
@@ -30,6 +31,19 @@ FORMAT = AdFormatDef(
     layers_used="L4",
     requires=[],  # nothing to gate — a drawn format needs no photo of anything
 )
+
+# §1.6 floors — retrofitted after legibility.py's automated check found the
+# original 24-40px sizes here all below the 42px minimum (this format
+# predates that discipline). Item names were previously unbounded/
+# unmeasured single-line text; at the old 32px that mostly got away with
+# it, but bumping to 44px makes a realistic item name run straight into
+# the leader line/price column, so item names now wrap too (wrap_text,
+# the same helper Borrowed Interface/Review Card/Us vs Them use).
+_FONT_BUSINESS_NAME = 48
+_FONT_ITEM = 44
+_FONT_TOTAL_LABEL = 44
+_FONT_TOTAL_AMOUNT = 48
+_FONT_FOOTER = 44
 
 
 def build_document(
@@ -72,38 +86,45 @@ def build_document(
         z += 1
         layers.append({
             "type": "text", "z_index": z, "content": business_name,
-            "x": 72, "y": 64, "font_size": 40, "font_weight": 700, "color": t["ink"],
+            "x": 72, "y": 64, "font_size": _FONT_BUSINESS_NAME, "font_weight": 700, "color": t["ink"],
         })
-        content_top = 140
+        content_top = 148
 
-    # Item rows: name left, dotted leader, price right-aligned at a fixed
-    # column so every price lines up regardless of name length.
+    # Item rows: name left (wrapped — an unbounded single line at 44px runs
+    # straight into the leader/price zone the moment a name is realistic
+    # rather than a short test string), dotted leader, price right-aligned
+    # at a fixed column so every price lines up regardless of name length.
     price_column_x = width - 72
-    row_height = 64
+    name_col_max_width = 420 - 72 - 20  # leader starts at x=420; small gap before it
+    item_line_height = int(_FONT_ITEM * 1.3)
+    single_line_row_height = 88
     row_y = content_top + 24
     for name, price in items:
+        name_lines = wrap_text(name, name_col_max_width, _FONT_ITEM)
         z += 1
         layers.append({
-            "type": "text", "z_index": z, "content": name,
-            "x": 72, "y": row_y, "font_size": 32, "color": t["ink"],
+            "type": "text", "z_index": z, "content": "\n".join(name_lines),
+            "x": 72, "y": row_y, "font_size": _FONT_ITEM, "color": t["ink"],
         })
-        # Leader runs from just after the name to just before the price —
-        # exact end points are approximate at placeholder-font-metrics
-        # precision (no live text-width measurement here); a real font pass
-        # can tighten this, but the leader is decorative, not load-bearing.
+        # Leader + price stay pinned to the name's first line, same as a
+        # real POS receipt where the price sits beside the top line of a
+        # wrapped item description. Exact leader end points are still
+        # approximate at placeholder-font-metrics precision — decorative,
+        # not load-bearing.
         z += 1
         layers.append({
             "type": "shape", "z_index": z, "shape": "line",
-            "x1": 420, "y1": row_y + 22, "x2": price_column_x - 90, "y2": row_y + 22,
+            "x1": 420, "y1": row_y + 26, "x2": price_column_x - 90, "y2": row_y + 26,
             "color": t["edge"], "stroke_width": 2, "dashed": True,
             "dash_length": 5, "gap_length": 6,
         })
         z += 1
         layers.append({
             "type": "text", "z_index": z, "content": price,
-            "x": price_column_x, "y": row_y, "font_size": 32, "color": t["ink"],
+            "x": price_column_x, "y": row_y, "font_size": _FONT_ITEM, "color": t["ink"],
             "text_align": "ra",
         })
+        row_height = max(single_line_row_height, len(name_lines) * item_line_height + 30)
         row_y += row_height
 
     # Rule above the total.
@@ -120,26 +141,26 @@ def build_document(
     z += 1
     layers.append({
         "type": "text", "z_index": z, "content": total_label,
-        "x": 72, "y": total_y, "font_size": 38, "font_weight": 700, "color": t["ink"],
+        "x": 72, "y": total_y, "font_size": _FONT_TOTAL_LABEL, "font_weight": 700, "color": t["ink"],
     })
     z += 1
     layers.append({
         "type": "text", "z_index": z, "content": total_amount,
-        "x": price_column_x, "y": total_y, "font_size": 40, "font_weight": 700,
+        "x": price_column_x, "y": total_y, "font_size": _FONT_TOTAL_AMOUNT, "font_weight": 700,
         "color": t["accent"], "text_align": "ra",
     })
 
-    # Delivery / payment lines — small, ink-quiet, below the total.
-    footer_y = total_y + 72
+    # Delivery / payment lines — ink-quiet, below the total.
+    footer_y = total_y + 88
     for line in (delivery_line, payment_line):
         if not line:
             continue
         z += 1
         layers.append({
             "type": "text", "z_index": z, "content": line,
-            "x": 72, "y": footer_y, "font_size": 24, "color": t["ink-quiet"],
+            "x": 72, "y": footer_y, "font_size": _FONT_FOOTER, "color": t["ink-quiet"],
         })
-        footer_y += 36
+        footer_y += 64
 
     return {
         "canvas": {"width": width, "height": height, "background_color": t["surface"]},

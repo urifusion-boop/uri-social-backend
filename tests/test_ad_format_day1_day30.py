@@ -23,6 +23,11 @@ class TestFormatDefinition:
         assert FORMAT.requires == ["product_photo"]
         assert FORMAT.layers_used == "L4"
 
+    def test_requires_isolation_per_section_6(self):
+        """§6 names SEED-078 (this format) explicitly as requiring the
+        usage cap — missed on first ship, found rereading §6 later."""
+        assert FORMAT.requires_isolation is True
+
 
 class TestCategoryAllowlist:
     @pytest.mark.parametrize("category", [

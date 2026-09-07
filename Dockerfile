@@ -1,20 +1,35 @@
 # Stage 1: Build
-FROM python:3.13.0-bullseye AS build
+# bookworm, not bullseye, since 2026-09-05: bullseye is EOL and its security binaries
+# have been pulled from the pool while the index still advertises them, so apt resolves
+# a version and then 404s fetching it. Verified: bullseye-security advertises
+# libswscale5 7:4.3.9-0+deb11u2 and libssl1.1 1.1.1w-0+deb11u8, and the pool has ZERO
+# .debs for either. Every build failed this way, on multiple CDN backends and re-runs.
+# It is not fixable per-package — anything needing a security-updated dep hits it.
+# NOTE: this moves ffmpeg from 4.3 (bullseye) to 5.1 (bookworm) in the production stage.
+FROM python:3.13.0-bookworm AS build
 # Force rebuild: Custom Visual Guides UriResponse fixes - 2026-06-11
 ARG BUILD_DATE=2026-06-11
 ENV BUILD_DATE=${BUILD_DATE}
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 WORKDIR /app
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# libssl-dev was dropped 2026-09-05: it forced an upgrade of libssl1.1 to
+# 1.1.1w-0+deb11u8, which bullseye-security's index advertises but no longer has in
+# its pool — every build 404'd on that one .deb, across multiple CDN backends, so it
+# was not transient and re-running never helped. Nothing in requirements.txt compiles
+# against OpenSSL headers (the usual suspects — pycurl/M2Crypto/psycopg2/cryptography
+# built from source — are all absent), and Python's own ssl module links the libssl1.1
+# already in the base image, which is untouched. gcc stays for C extension builds.
+# The retry config mirrors what the production stage below already sets.
+RUN echo 'Acquire::Retries "5";' > /etc/apt/apt.conf.d/80-retries && \
+    apt-get update && apt-get install -y --no-install-recommends \
     gcc \
-    libssl-dev \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 # Stage 2: Production
-FROM python:3.13.0-bullseye AS production
+FROM python:3.13.0-bookworm AS production
 WORKDIR /app
 RUN echo 'Acquire::Retries "5";' > /etc/apt/apt.conf.d/80-retries && \
     apt-get update && apt-get install -y --no-install-recommends \

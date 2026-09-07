@@ -57,6 +57,12 @@ FORMAT = AdFormatDef(
     # business with no real photo to build it from. A more precisely named
     # requirement can replace this later without changing behaviour.
     requires=["product_photo"],
+    # §6: "Formats marked requires_isolation (SEED-077, SEED-078, SEED-083)
+    # additionally require the usage cap check" — SEED-078 is this format.
+    # Missed on first ship; found rereading §6 while building Problem /
+    # Solution, not by any test (no isolation-cap mechanism exists yet to
+    # write a test against — SEED-079's usage cap is VSG-01 step 8).
+    requires_isolation=True,
 )
 
 _FONT_LABEL = 44  # §1.6 floor — applies even to "minimal" labels

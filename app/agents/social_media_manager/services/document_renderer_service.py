@@ -94,7 +94,20 @@ class DocumentRendererService:
         canvas_width: int,
         canvas_height: int
     ):
-        """Render background image layer"""
+        """Render background image layer.
+
+        x/y/width/height default to the full canvas — every caller before
+        VSG-01's Problem/Solution format either passed those explicitly as
+        the full canvas size or omitted them entirely, so this preserves
+        their behaviour exactly. Previously this always resized to
+        (canvas_width, canvas_height) and pasted at (0, 0) regardless of
+        what a layer specified, silently ignoring x/y/width/height —
+        harmless when a document only ever has one full-canvas background,
+        but a real bug for a format needing two ai_generated_background
+        layers in different zones of the same canvas (confirmed live: the
+        second layer's full-canvas paste completely overwrote the first
+        zone's scrim and text). Brought in line with _render_product,
+        which already respects per-layer x/y/width/height correctly."""
         image_url = layer.get("url")
         if not image_url:
             return
@@ -104,11 +117,16 @@ class DocumentRendererService:
         if not bg_image:
             return
 
-        # Resize to canvas size
-        bg_image = bg_image.resize((canvas_width, canvas_height), Image.Resampling.LANCZOS)
+        x = layer.get("x", 0)
+        y = layer.get("y", 0)
+        width = layer.get("width", canvas_width)
+        height = layer.get("height", canvas_height)
 
-        # Paste onto canvas
-        canvas.paste(bg_image, (0, 0))
+        # Resize to the layer's own dimensions
+        bg_image = bg_image.resize((width, height), Image.Resampling.LANCZOS)
+
+        # Paste at the layer's own position
+        canvas.paste(bg_image, (x, y))
 
     @staticmethod
     async def _render_product(canvas: Image.Image, layer: Dict[str, Any]):
@@ -292,14 +310,33 @@ class DocumentRendererService:
 
     @staticmethod
     async def _fetch_image(url: str) -> Optional[Image.Image]:
-        """Download image from URL"""
-        try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                response = await client.get(url)
-                if response.status_code == 200:
-                    return Image.open(io.BytesIO(response.content)).convert("RGBA")
-        except Exception as e:
-            print(f"⚠️ Error fetching image {url}: {e}")
+        """Download image from URL.
+
+        Retries twice (1s, then 2s backoff) before giving up — found live
+        building VSG-01's News Headline format: a Cloudinary URL returned
+        by layer2_generation.generate_scene() immediately after upload
+        failed to fetch on the very next render call, then succeeded on a
+        manual retry seconds later (curl confirmed the same URL was a
+        real, complete image — a CDN propagation race, not a broken
+        upload or a bad URL). Every ai_generated_background/
+        composited_product/brand_asset layer goes through this method, so
+        a single transient failure previously meant a silently blank
+        background rather than the generated scene the whole format is
+        built around."""
+        last_error: Optional[Exception] = None
+        for attempt in range(3):
+            if attempt > 0:
+                import asyncio
+                await asyncio.sleep(attempt)  # 1s before 2nd try, 2s before 3rd
+            try:
+                async with httpx.AsyncClient(timeout=30) as client:
+                    response = await client.get(url)
+                    if response.status_code == 200:
+                        return Image.open(io.BytesIO(response.content)).convert("RGBA")
+                    last_error = f"HTTP {response.status_code}"
+            except Exception as e:
+                last_error = e
+        print(f"⚠️ Error fetching image {url} after 3 attempts: {last_error}")
         return None
 
     @staticmethod
