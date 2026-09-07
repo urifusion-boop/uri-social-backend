@@ -290,7 +290,20 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                     # Geo (pins/country) plus Jane's resolved demographic/interest read
                     # (age_min/age_max/genders/flexible_spec, {} when nothing resolved) —
                     # disjoint keys, so merging never overwrites either side.
-                    "targeting": {**meta_targeting_from_geo(plan.geo), **plan.audience_targeting},
+                    #
+                    # advantage_audience is REQUIRED by Meta as of 2026-09-05 — without it
+                    # every ad set create fails with "Advantage audience flag required"
+                    # (code=100, subcode=1870227). Meta used to default it to 1 silently.
+                    # We send 0 deliberately: 1 lets Meta treat the detailed targeting as a
+                    # mere suggestion and deliver outside it, which would make the plan card
+                    # lie — it names the exact interests and areas being targeted, and this
+                    # whole feature exists so the client's own audience choice is honoured.
+                    # Flip to 1 only alongside changing what the card promises.
+                    "targeting": {
+                        **meta_targeting_from_geo(plan.geo),
+                        **plan.audience_targeting,
+                        "targeting_automation": {"advantage_audience": 0},
+                    },
                     "status": "PAUSED",
                     "start_time": start_time.isoformat(),
                     "end_time": end_time.isoformat(),
