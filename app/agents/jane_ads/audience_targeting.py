@@ -156,6 +156,41 @@ async def _resolve_interest(client: httpx.AsyncClient, graph_base: str,
     return {"id": hit["id"], "name": hit["name"]}
 
 
+async def _drop_invalid_interests(client: httpx.AsyncClient, graph_base: str,
+                                  access_token: str, interests: list[dict]) -> list[dict]:
+    """Interests Meta's own search happily returns, but its ad-set create then rejects.
+
+    Live-caught on a real launch: search for a wedding audience returned "QC School of
+    Event and Wedding Planning", which failed the launch outright with
+
+        Some detailed targeting options have been combined — please update the
+        targeting spec to remove them (code=100, subcode=1870247)
+
+    Meta marks these `valid: false` on its adinterestvalid endpoint, so one batch call
+    catches them before they can break a launch. A dropped interest just leaves the ad
+    broader; a deprecated one stops the campaign going live at all.
+    """
+    if not interests:
+        return []
+    resp = await client.get(
+        f"{graph_base}/search",
+        params={"type": "adinterestvalid",
+                "interest_fbid_list": json.dumps([i["id"] for i in interests]),
+                "access_token": access_token},
+    )
+    # Only an explicit `false` drops an interest. A missing id, a missing `valid`
+    # field, or an unexpected response shape all mean "unknown", and losing a good
+    # interest to a patchy response is worse than the rare deprecated one slipping by.
+    verdicts = {str(d.get("id")): d.get("valid") for d in (resp.json().get("data") or [])}
+    def _rejected(i: dict) -> bool:
+        return verdicts.get(str(i["id"]), True) is False
+    kept = [i for i in interests if not _rejected(i)]
+    dropped = [i["name"] for i in interests if _rejected(i)]
+    if dropped:
+        print(f"[AudienceTargeting] dropped interests Meta reports invalid: {dropped}", flush=True)
+    return kept
+
+
 async def resolve_audience_targeting(audience_text: str, access_token: str) -> dict:
     """Meta's targeting fields for this audience description, merge-ready alongside
     geo.meta_targeting_from_geo()'s geo_locations — {} (broad on this axis) for
@@ -190,6 +225,9 @@ async def resolve_audience_targeting(audience_text: str, access_token: str) -> d
                     continue
                 if hit:
                     interests.append(hit)
+            # One batch check before any of these reach an ad set — a deprecated
+            # interest doesn't merely degrade the targeting, it fails the whole launch.
+            interests = await _drop_invalid_interests(client, graph_base, access_token, interests)
     except Exception as e:
         print(f"[AudienceTargeting] interest resolution skipped: {e}", flush=True)
     if interests:
