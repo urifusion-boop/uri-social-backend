@@ -2932,9 +2932,41 @@ async def meta_launch_plan(
         thread_id=doc.get("thread_id", ""),
     )
     result = await _do_launch(built, doc["message"], doc["business_name"], brand_ctx, db)
+
+    # Take the money now the campaign really exists on Meta. Charged AFTER the launch,
+    # never before: a launch that fails raises out of _do_launch above, and a client
+    # must not be debited for a campaign that was never created.
+    #
+    # The budget is committed at this point — the full stated budget leaves the wallet
+    # and is not refunded if Meta under-delivers, which is why billing.py must not
+    # charge this campaign again as it spends (it skips any record carrying
+    # charged_upfront_ngn; without that the client would pay twice for the same ads).
+    campaign_id = result["launch"]["campaign_id"]
+    due = _total_due_ngn(req.budget_ngn)
+    try:
+        from .store import MongoWalletStore
+        from .wallet import InsufficientFundsError, WalletService
+
+        await WalletService(MongoWalletStore(db)).charge_ad_spend(
+            doc["business_id"], due, campaign_id=campaign_id,
+        )
+        await db["jane_ads_meta_campaigns"].update_one(
+            {"campaign_id": campaign_id}, {"$set": {"charged_upfront_ngn": due}},
+        )
+        result["wallet"] = {
+            "charged_ngn": due,
+            "balance_ngn": await WalletService(MongoWalletStore(db)).get_balance(doc["business_id"]),
+        }
+    except InsufficientFundsError as e:
+        # The gate above passed, so this is a race (a concurrent launch or charge) or
+        # a wallet suspended in between. The campaign IS live on Meta and paused, so
+        # the honest thing is to say so rather than pretend the launch failed.
+        print(f"[launch] campaign {campaign_id} created but wallet charge failed: {e}", flush=True)
+        result["wallet"] = {"charged_ngn": 0.0, "charge_failed": True}
+
     await db["jane_ads_pending_plans"].update_one(
         {"plan_id": plan_id},
-        {"$set": {"status": "launched", "campaign_id": result["launch"]["campaign_id"]}},
+        {"$set": {"status": "launched", "campaign_id": campaign_id}},
     )
     return result
 

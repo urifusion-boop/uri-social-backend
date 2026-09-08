@@ -122,6 +122,14 @@ async def _sweep_platform(db, wallet, notification_service, *, adapter, collecti
             await db[collection].delete_one({"campaign_id": campaign_id})
             continue
 
+        # Already paid in full at launch? Then this campaign owes nothing as it
+        # delivers — charging again would bill the client twice for the same ads.
+        # The sweep still runs for it (spend tracking, pause-on-dry, delivery
+        # status); it just never debits. Records without this key predate
+        # charge-at-launch and are still billed as they spend, as they were sold.
+        if r.get("charged_upfront_ngn"):
+            continue
+
         # Per campaign, not global: the markup this one was SOLD under. A campaign
         # launched before the fee moved inside the stated budget keeps the basis its
         # wallet was gated against, so changing the rate never re-bases a live
