@@ -246,3 +246,35 @@ def test_unknown_validity_is_kept_rather_than_silently_dropped():
     kept = asyncio.get_event_loop().run_until_complete(
         _drop_invalid_interests(client, "https://graph", "tok", given))
     assert kept == given
+
+
+def test_partial_only_matches_are_rejected_now_that_lists_are_longer():
+    """Live-observed once the keyword list grew to 6-10: "Sports and recreation"
+    resolved to "Swimming and water sports" on a single shared word, and
+    "Health and wellness" to a university's wellness centre. A keyword that resolves
+    to nothing just leaves the ad broader, which is the safe direction."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+    from app.agents.jane_ads.audience_targeting import _resolve_interest
+
+    client = AsyncMock()
+    r = MagicMock()
+    r.json = lambda: {"data": [{"id": "1", "name": "Swimming and water sports (sport)"}]}
+    client.get = AsyncMock(return_value=r)
+    hit = asyncio.get_event_loop().run_until_complete(
+        _resolve_interest(client, "https://graph", "tok", "Sports and recreation"))
+    assert hit is None
+
+
+def test_the_interest_cap_allows_a_full_targeting_group():
+    """Meta ORs interests inside one flexible_spec entry, so more relevant ones widen
+    reach within the same audience. A hand-built ad set for the same buyers carried
+    seven; the old cap of five was leaving reachable people out."""
+    from app.agents.jane_ads.audience_targeting import _MAX_INTERESTS
+    assert _MAX_INTERESTS >= 10
+
+
+def test_prompt_asks_for_a_full_list_not_two_or_three():
+    from app.agents.jane_ads.audience_targeting import _extraction_prompt
+    lowered = _extraction_prompt("small business owners").lower()
+    assert "6-10" in lowered
