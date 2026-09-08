@@ -944,13 +944,29 @@ async def jane_meta_connection_status(
     (never inferred from a single boolean), so the frontend can render the exact
     matching prompt. `connect_url` is only meaningful for states that need the
     OAuth grant (NONE/CONTENT_ONLY/EXPIRED/NO_PAGE)."""
-    from .ads_connection import resolve_connection_state
+    from .ads_connection import page_has_whatsapp_linked, resolve_connection_state
 
     state, ads = await resolve_connection_state(db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"))
+    # Whether META says the Page has WhatsApp connected — not whether we have a number
+    # on file. Saving a number here only records where leads should land; it does not
+    # link it to the Page, which is a manual OTP step in Meta's own Page settings. The
+    # difference matters enough to surface: a launch is blocked without the real link,
+    # and an ad running without it can never report a conversation. None = couldn't
+    # tell (API error), which the client is shown as "unknown", never as "missing".
+    page_id = (ads or {}).get("page_id", "")
+    whatsapp_linked = await page_has_whatsapp_linked(page_id, settings.META_ADS_ACCESS_TOKEN)
     return {
         "state": state.value,
         "page_name": (ads or {}).get("account_name", ""),
         "whatsapp_number": (ads or {}).get("whatsapp_number", ""),
+        # True/False from Meta itself, or None when it couldn't be determined.
+        "whatsapp_linked_to_page": whatsapp_linked,
+        # Deep link straight to this Page's WhatsApp settings, so "link it" is one
+        # click rather than a hunt through Meta's settings tree.
+        "whatsapp_link_url": (
+            f"https://business.facebook.com/latest/settings/whatsapp_account?asset_id={page_id}"
+            if page_id else ""
+        ),
         "connect_url": "/social-media/connect/facebook-ads/initiate",
         # Only meaningful when state == "expired" — which specific ads permissions
         # weren't granted, so the client knows exactly what to re-check on Facebook's
