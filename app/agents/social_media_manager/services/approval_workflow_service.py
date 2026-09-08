@@ -121,9 +121,17 @@ class ApprovalWorkflowService:
                     if schedule_option == "schedule":
                         # Validate before accepting — fail fast with a visible error.
                         if draft.get("platform") == "instagram" and draft.get("post_type", "feed") not in ("text", "carousel"):
+                            # Live-reported bug: an uploaded video (post_type stays "feed" —
+                            # the upload form has no "reel" option) was rejected here because
+                            # this only ever checked image_url, never video_url, even though
+                            # upload_user_content correctly sets video_url (and leaves
+                            # image_url None) for a video upload. A real video satisfies
+                            # Instagram's "needs visual media" requirement just as much as an
+                            # image does — only reject when BOTH are missing.
                             raw_img = ApprovalWorkflowService._resolve_image_url(draft.get("image_url") or "")
-                            if not raw_img:
-                                errors.append({"draft_id": draft_id, "error": "Instagram requires an image. Add one to this post before scheduling."})
+                            has_video = bool(draft.get("video_url"))
+                            if not raw_img and not has_video:
+                                errors.append({"draft_id": draft_id, "error": "Instagram requires an image or video. Add one to this post before scheduling."})
                                 continue
                         elif draft.get("platform") == "instagram" and draft.get("post_type") == "carousel":
                             if not draft.get("slides"):
