@@ -48,6 +48,7 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from app.core.config import settings
 from .base import AdPlatformAdapter
+from .. import constants as C
 from ..destination import link_for_plan
 from ..geo import meta_targeting_from_geo
 from ..models import (
@@ -423,6 +424,11 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                 "business_id": plan.business_id,
                 "platform": "meta",
                 "last_conversation_count": 0,
+                # The billing basis this campaign was SOLD under, frozen here so the
+                # meter can never re-base a live campaign onto a later fee change
+                # (billing.py reads this per record). Campaigns launched before this
+                # field existed fall back to C.LEGACY_AD_SPEND_MARKUP.
+                "ad_spend_markup": C.AD_SPEND_MARKUP,
                 "created_at": datetime.now(timezone.utc),
             }},
             upsert=True,

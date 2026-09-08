@@ -127,7 +127,7 @@ def test_charges_new_spend_times_markup_and_advances_watermark(monkeypatch):
     store = InMemoryWalletStore()
     _run(WalletService(store).top_up("brnd_1", 100_000, reference="seed"))
     rows = [{"campaign_id": "c1", "business_id": "brnd_1", "user_id": "u1",
-             "ad_id": "a1", "spend_billed_ngn": 0.0, "display_name": "Shop"}]
+             "ad_id": "a1", "spend_billed_ngn": 0.0, "ad_spend_markup": MARKUP, "display_name": "Shop"}]
     db, adapter, notifier = _setup(monkeypatch, rows, {"c1": _summary(2_000)}, store)
 
     res = _run(billing.reconcile_ad_spend_charges(db))
@@ -135,7 +135,7 @@ def test_charges_new_spend_times_markup_and_advances_watermark(monkeypatch):
     # ₦2,000 new Meta spend × 1.5 = ₦3,000 debited; wallet covers it fully.
     assert res["checked"] == 1 and res["paused"] == 0
     assert res["charged_ngn"] == round(2_000 * MARKUP, 2)
-    assert _run(WalletService(store).get_balance("brnd_1")) == 100_000 - 2_000 * MARKUP
+    assert _run(WalletService(store).get_balance("brnd_1")) == round(100_000 - 2_000 * MARKUP, 2)
     # Water mark tracks Meta SPEND recouped (₦2,000), not the marked-up amount.
     assert db._coll.rows[0]["spend_billed_ngn"] == 2_000
     assert adapter.paused == [] and notifier.calls == []
@@ -145,7 +145,7 @@ def test_only_new_spend_since_last_sweep_is_charged(monkeypatch):
     store = InMemoryWalletStore()
     _run(WalletService(store).top_up("brnd_1", 100_000, reference="seed"))
     rows = [{"campaign_id": "c1", "business_id": "brnd_1", "user_id": "u1",
-             "ad_id": "a1", "spend_billed_ngn": 1_500.0}]   # already billed ₦1,500 of spend
+             "ad_id": "a1", "spend_billed_ngn": 1_500.0, "ad_spend_markup": MARKUP}]   # already billed ₦1,500 of spend
     db, _, _ = _setup(monkeypatch, rows, {"c1": _summary(2_000)}, store)
 
     res = _run(billing.reconcile_ad_spend_charges(db))
@@ -158,7 +158,7 @@ def test_partial_slice_pauses_and_notifies_when_wallet_runs_dry(monkeypatch):
     store = InMemoryWalletStore()
     _run(WalletService(store).top_up("brnd_1", 6_000, reference="seed"))
     rows = [{"campaign_id": "c1", "business_id": "brnd_1", "user_id": "u1",
-             "ad_id": "a1", "spend_billed_ngn": 0.0, "display_name": "Shop"}]
+             "ad_id": "a1", "spend_billed_ngn": 0.0, "ad_spend_markup": MARKUP, "display_name": "Shop"}]
     # ₦10,000 new spend × 1.5 = ₦15,000 owed, but only ₦6,000 in the wallet.
     db, adapter, notifier = _setup(monkeypatch, rows, {"c1": _summary(10_000)}, store)
 
@@ -182,7 +182,7 @@ def test_remainder_billed_after_topup(monkeypatch):
     store = InMemoryWalletStore()
     _run(WalletService(store).top_up("brnd_1", 6_000, reference="seed"))
     rows = [{"campaign_id": "c1", "business_id": "brnd_1", "user_id": "u1",
-             "ad_id": "a1", "spend_billed_ngn": 0.0}]
+             "ad_id": "a1", "spend_billed_ngn": 0.0, "ad_spend_markup": MARKUP}]
     db, _, _ = _setup(monkeypatch, rows, {"c1": _summary(10_000)}, store)
     first = _run(billing.reconcile_ad_spend_charges(db))    # covers what the ₦6,000 wallet can
 
@@ -198,7 +198,7 @@ def test_idempotent_when_no_new_spend(monkeypatch):
     store = InMemoryWalletStore()
     _run(WalletService(store).top_up("brnd_1", 100_000, reference="seed"))
     rows = [{"campaign_id": "c1", "business_id": "brnd_1", "user_id": "u1",
-             "ad_id": "a1", "spend_billed_ngn": 2_000.0}]
+             "ad_id": "a1", "spend_billed_ngn": 2_000.0, "ad_spend_markup": MARKUP}]
     db, _, notifier = _setup(monkeypatch, rows, {"c1": _summary(2_000)}, store)
 
     res = _run(billing.reconcile_ad_spend_charges(db))
@@ -211,7 +211,7 @@ def test_skips_ownerless_campaigns(monkeypatch):
     store = InMemoryWalletStore()
     _run(WalletService(store).top_up("oneshot_x", 100_000, reference="seed"))
     rows = [{"campaign_id": "c1", "business_id": "oneshot_x", "user_id": None,
-             "ad_id": "a1", "spend_billed_ngn": 0.0}]
+             "ad_id": "a1", "spend_billed_ngn": 0.0, "ad_spend_markup": MARKUP}]
     db, _, _ = _setup(monkeypatch, rows, {"c1": _summary(5_000)}, store)
 
     res = _run(billing.reconcile_ad_spend_charges(db))
@@ -222,7 +222,7 @@ def test_skips_ownerless_campaigns(monkeypatch):
 def test_deleted_campaign_record_removed(monkeypatch):
     store = InMemoryWalletStore()
     rows = [{"campaign_id": "c1", "business_id": "brnd_1", "user_id": "u1",
-             "ad_id": "a1", "spend_billed_ngn": 0.0}]
+             "ad_id": "a1", "spend_billed_ngn": 0.0, "ad_spend_markup": MARKUP}]
     db, _, _ = _setup(monkeypatch, rows, {"c1": _summary(0, delivery="Deleted")}, store)
 
     _run(billing.reconcile_ad_spend_charges(db))
@@ -236,7 +236,7 @@ def test_concurrent_sweeps_charge_a_slice_only_once(monkeypatch):
     store = InMemoryWalletStore()
     _run(WalletService(store).top_up("brnd_1", 100_000, reference="seed"))
     rows = [{"campaign_id": "c1", "business_id": "brnd_1", "user_id": "u1",
-             "ad_id": "a1", "spend_billed_ngn": 0.0}]
+             "ad_id": "a1", "spend_billed_ngn": 0.0, "ad_spend_markup": MARKUP}]
     db, _, _ = _setup(monkeypatch, rows, {"c1": _summary(2_000)}, store)
 
     coll = db._coll
@@ -292,7 +292,7 @@ def test_tiktok_sweep_is_a_noop_when_unconfigured(monkeypatch):
     monkeypatch.setattr(settings, "META_AD_ACCOUNT_ID", "", raising=False)
     monkeypatch.setattr(settings, "META_ADS_ACCESS_TOKEN", "", raising=False)
     db = _FakeMultiDB(tiktok_rows=[
-        {"campaign_id": "t1", "business_id": "brnd_1", "user_id": "u1", "ad_id": "a1", "spend_billed_ngn": 0.0},
+        {"campaign_id": "t1", "business_id": "brnd_1", "user_id": "u1", "ad_id": "a1", "spend_billed_ngn": 0.0, "ad_spend_markup": MARKUP},
     ])
     res = _run(billing.reconcile_ad_spend_charges(db))
     assert res == {"checked": 0, "charged_ngn": 0.0, "paused": 0}
@@ -314,13 +314,13 @@ def test_tiktok_sweep_charges_when_configured(monkeypatch):
     monkeypatch.setattr("app.agents.jane_ads.adapters.tiktok.TikTokAdsAdapter", adapter)
 
     db = _FakeMultiDB(tiktok_rows=[
-        {"campaign_id": "t1", "business_id": "brnd_1", "user_id": "u1", "ad_id": "a1", "spend_billed_ngn": 0.0},
+        {"campaign_id": "t1", "business_id": "brnd_1", "user_id": "u1", "ad_id": "a1", "spend_billed_ngn": 0.0, "ad_spend_markup": MARKUP},
     ])
     res = _run(billing.reconcile_ad_spend_charges(db))
 
     assert res["checked"] == 1 and res["paused"] == 0
     assert res["charged_ngn"] == round(2_000 * MARKUP, 2)
-    assert _run(WalletService(store).get_balance("brnd_1")) == 100_000 - 2_000 * MARKUP
+    assert _run(WalletService(store).get_balance("brnd_1")) == round(100_000 - 2_000 * MARKUP, 2)
     assert db._tiktok_coll.rows[0]["spend_billed_ngn"] == 2_000
 
 
@@ -343,10 +343,27 @@ def test_meta_and_tiktok_sweeps_combine_into_one_summary(monkeypatch):
     monkeypatch.setattr("app.agents.jane_ads.adapters.tiktok.TikTokAdsAdapter", tiktok_adapter)
 
     db = _FakeMultiDB(
-        meta_rows=[{"campaign_id": "m1", "business_id": "brnd_1", "user_id": "u1", "ad_id": "a1", "spend_billed_ngn": 0.0}],
-        tiktok_rows=[{"campaign_id": "t1", "business_id": "brnd_2", "user_id": "u2", "ad_id": "a2", "spend_billed_ngn": 0.0}],
+        meta_rows=[{"campaign_id": "m1", "business_id": "brnd_1", "user_id": "u1", "ad_id": "a1", "spend_billed_ngn": 0.0, "ad_spend_markup": MARKUP}],
+        tiktok_rows=[{"campaign_id": "t1", "business_id": "brnd_2", "user_id": "u2", "ad_id": "a2", "spend_billed_ngn": 0.0, "ad_spend_markup": MARKUP}],
     )
     res = _run(billing.reconcile_ad_spend_charges(db))
 
     assert res["checked"] == 2
-    assert res["charged_ngn"] == round((2_000 + 3_000) * MARKUP, 2)
+    assert abs(res["charged_ngn"] - (2_000 + 3_000) * MARKUP) < 0.05
+
+
+def test_campaign_without_a_stamped_markup_bills_at_the_legacy_rate(monkeypatch):
+    """Campaigns launched before URI's fee moved INSIDE the client's stated budget were
+    planned and wallet-gated at a 1.10 markup (fee on top of ad spend). They carry no
+    ad_spend_markup, and must keep the basis they were sold under — re-basing a live
+    campaign onto a later rate would charge its owner maths they never agreed to."""
+    store = InMemoryWalletStore()
+    _run(WalletService(store).top_up("brnd_1", 100_000, reference="seed"))
+    rows = [{"campaign_id": "c_legacy", "business_id": "brnd_1", "user_id": "u1",
+             "ad_id": "a1", "spend_billed_ngn": 0.0, "display_name": "Shop"}]  # no stamp
+    db, adapter, notifier = _setup(monkeypatch, rows, {"c_legacy": _summary(2_000)}, store)
+
+    res = _run(billing.reconcile_ad_spend_charges(db))
+
+    assert res["charged_ngn"] == round(2_000 * C.LEGACY_AD_SPEND_MARKUP, 2)
+    assert res["charged_ngn"] != round(2_000 * C.AD_SPEND_MARKUP, 2)
