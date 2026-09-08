@@ -35,7 +35,16 @@ import openai
 
 from app.core.config import settings
 
-_MAX_INTERESTS = 5
+# Meta's own ad-set editor routinely carries 7-10 detailed-targeting entries, and a
+# hand-built ad set for the same audience had seven (Small business, Entrepreneurship,
+# Social media marketing, Facebook Page admins, Business page admins, Instagram
+# Business Profile Admins, Business Owner) where Jane was producing three or four.
+# Interests are OR'd inside one flexible_spec entry, so more of them widens reach
+# within the same audience rather than narrowing it — being stingy here just left
+# reachable buyers out. Resolution still rejects anything that doesn't match the
+# keyword (_match_score) and anything Meta marks invalid, so a longer list cannot
+# smuggle in junk.
+_MAX_INTERESTS = 10
 # Meta's own floor for any ads audience; also keeps a stray "13" from the model
 # (a plausible-sounding minimum a human might type, but usually meaning "everyone
 # old enough to buy this") from narrowing an ad only the youngest end wants.
@@ -53,7 +62,7 @@ def _extraction_prompt(audience_text: str) -> str:
         '  "age_min": <18-65, or null if the text implies no age skew>,\n'
         '  "age_max": <18-65, or null if the text implies no age skew>,\n'
         '  "gender": "male" | "female" | "all",\n'
-        '  "interest_keywords": [<0-5 short phrases you would type into Meta\'s own\n'
+        '  "interest_keywords": [<6-10 short phrases you would type into Meta\'s own\n'
         "     interest-targeting search box to reach this audience — real, searchable\n"
         "     interest/industry/behaviour terms, e.g. \"Small business\", \"Online\n"
         "     shopping\", \"Skincare\" — never a restatement of the sentence itself>]\n"
@@ -61,9 +70,16 @@ def _extraction_prompt(audience_text: str) -> str:
         "Most audience descriptions ('small businesses launching their first online "
         "campaign', 'homeowners in new estates') imply NO age or gender skew — leave "
         "those null/\"all\" unless the text is explicit ('young professionals', "
-        "'mothers', 'men's grooming'). Prefer fewer, more precise keywords over five "
-        "vague ones; an empty list is correct if nothing in the text names a real "
-        "interest category.\n\n"
+        "'mothers', 'men's grooming'). Aim for 6-10 keywords, not two or three: Meta ORs "
+        "them together inside one targeting group, so each additional relevant one "
+        "widens reach within the same audience rather than narrowing it, and a thin "
+        "list leaves reachable buyers out. Cover the audience from several angles — "
+        "their trade, the category they buy, the tools of their job, the role they "
+        "hold (e.g. for a social-media agency's buyers: Small business, "
+        "Entrepreneurship, Social media marketing, Digital marketing, Advertising, "
+        "Facebook Page admins, Business Owner). Every one still has to be a real, "
+        "searchable Meta term and genuinely describe this audience; an empty list is "
+        "correct only if nothing in the text names a real interest category.\n\n"
         "Every keyword must come from WHAT THIS AUDIENCE DOES, SELLS, OR BUYS — their "
         "trade, industry, or the category of thing they'd purchase. Never derive one "
         "from an age, a generation, or a guess at what people that age enjoy: the age "
@@ -136,7 +152,12 @@ async def _resolve_interest(client: httpx.AsyncClient, graph_base: str,
     )
     hits = [h for h in (resp.json().get("data") or []) if h.get("id")]
     usable = [(_match_score(keyword, h.get("name", "")), h) for h in hits]
-    usable = [(s, h) for s, h in usable if s > 0]
+    # Partial overlap (score 1) is not good enough. Live-observed once the keyword
+    # list grew: "Sports and recreation" resolved to "Swimming and water sports" on a
+    # single shared word. Requiring every word of the keyword to appear keeps a longer
+    # list from dragging in loosely-related interests — a keyword that resolves to
+    # nothing merely leaves the ad broader, which is the safe direction.
+    usable = [(s, h) for s, h in usable if s >= 2]
     if not usable:
         if hits:
             print(f"[AudienceTargeting] no relevant interest for {keyword!r} — "

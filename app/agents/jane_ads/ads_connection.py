@@ -139,6 +139,43 @@ async def verify_token_live(page_id: str, page_access_token: str, user_access_to
         return False, set()
 
 
+async def page_has_whatsapp_linked(page_id: str, access_token: str) -> Optional[bool]:
+    """Whether Meta itself says this Page has a WhatsApp number connected.
+
+    True/False when Meta answers cleanly, None when we genuinely cannot tell (an API
+    error, a missing token) — callers MUST treat None as "don't block", because a bad
+    read must never stop a real launch.
+
+    Why ask Meta rather than trust our own record: set_whatsapp_number stores the
+    number and sets whatsapp_page_linked=True the moment a client types it, which
+    proves only that they typed it. Linking is a manual OTP step in Meta's own Page
+    settings with no partner API, so our flag is optimism and this is evidence.
+
+    `whatsapp_number`/`has_whatsapp_number` are real fields (a nonexistent one 400s —
+    connected_whatsapp_business_account does), and Meta omits them from the response
+    when the Page has no number, which is what makes absence meaningful here.
+    """
+    if not page_id or not access_token:
+        return None
+    graph_base = f"https://graph.facebook.com/{settings.FACEBOOK_API_VERSION}"
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                f"{graph_base}/{page_id}",
+                params={"fields": "whatsapp_number,has_whatsapp_number",
+                        "access_token": access_token},
+            )
+        data = resp.json()
+        if "error" in data:
+            print(f"[AdsConnection] whatsapp-link check inconclusive for {page_id}: "
+                  f"{data['error'].get('message')}", flush=True)
+            return None
+        return bool(data.get("whatsapp_number") or data.get("has_whatsapp_number"))
+    except Exception as e:
+        print(f"[AdsConnection] whatsapp-link check failed for {page_id}: {e}", flush=True)
+        return None
+
+
 async def resolve_connection_state(
     db, user_id: Optional[str], brand_id: Optional[str], *, live_check: bool = True,
     require_whatsapp: bool = True,

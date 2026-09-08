@@ -399,3 +399,62 @@ def test_brand_page_is_used_even_when_its_whatsapp_was_never_linked_in_meta():
                new=AsyncMock(return_value=(True, REQUIRED_ADS_SCOPES))):
         result = _run(resolve_ads_page_for_launch(db, None, "brnd_1"))
     assert result["page_id"] == "pg_brand"
+
+
+# ── Does Meta itself say this Page has WhatsApp connected? ──
+
+def _run_(coro):
+    import asyncio
+    return asyncio.get_event_loop().run_until_complete(coro)
+
+
+def _graph(payload, raises=None):
+    from unittest.mock import AsyncMock, MagicMock
+    client = AsyncMock()
+    if raises is not None:
+        client.get = AsyncMock(side_effect=raises)
+    else:
+        r = MagicMock()
+        r.json = lambda: payload
+        client.get = AsyncMock(return_value=r)
+    return client
+
+
+def test_page_with_a_whatsapp_number_reads_as_linked():
+    from unittest.mock import patch
+    from app.agents.jane_ads.ads_connection import page_has_whatsapp_linked
+
+    with patch("httpx.AsyncClient") as cls:
+        cls.return_value.__aenter__.return_value = _graph(
+            {"id": "1", "whatsapp_number": "2348031234567"})
+        assert _run_(page_has_whatsapp_linked("1", "tok")) is True
+
+
+def test_page_without_one_reads_as_not_linked():
+    """Meta OMITS whatsapp_number/has_whatsapp_number when the Page has none — the
+    fields are real (a nonexistent one 400s), so absence is the answer, not a gap."""
+    from unittest.mock import patch
+    from app.agents.jane_ads.ads_connection import page_has_whatsapp_linked
+
+    with patch("httpx.AsyncClient") as cls:
+        cls.return_value.__aenter__.return_value = _graph({"id": "1"})
+        assert _run_(page_has_whatsapp_linked("1", "tok")) is False
+
+
+def test_an_inconclusive_answer_is_none_so_it_can_never_block_a_launch():
+    """A Graph error or an exception must return None, not False. The launch gate
+    only blocks on an explicit False — a bad read stopping real launches would be
+    far worse than letting an unlinked Page through."""
+    from unittest.mock import patch
+    from app.agents.jane_ads.ads_connection import page_has_whatsapp_linked
+
+    with patch("httpx.AsyncClient") as cls:
+        cls.return_value.__aenter__.return_value = _graph({"error": {"message": "nope"}})
+        assert _run_(page_has_whatsapp_linked("1", "tok")) is None
+
+    with patch("httpx.AsyncClient") as cls:
+        cls.return_value.__aenter__.return_value = _graph(None, raises=RuntimeError("down"))
+        assert _run_(page_has_whatsapp_linked("1", "tok")) is None
+
+    assert _run_(page_has_whatsapp_linked("", "tok")) is None
+    assert _run_(page_has_whatsapp_linked("1", "")) is None

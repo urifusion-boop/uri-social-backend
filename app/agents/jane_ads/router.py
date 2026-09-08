@@ -2896,6 +2896,32 @@ async def meta_launch_plan(
     except AdsConnectionRequired as e:
         raise HTTPException(status_code=409, detail=f"meta_connection_{e.state.value}")
     plan.page_id = ads_conn["page_id"]
+
+    # A WhatsApp ad has to run from a Page that really has WhatsApp connected inside
+    # Meta. Without it the ad can only be a plain wa.me LINK ad, which delivers but
+    # can never report a conversation: Meta fires messaging_conversation_started only
+    # for native WhatsApp destinations, which is why such campaigns showed "WhatsApp
+    # conversations 0" and "cost per conversation N/A" while genuinely running.
+    #
+    # Asked of Meta, not of our own record — set_whatsapp_number marks the connection
+    # linked as soon as a client types a number, which proves only that they typed it.
+    # A None answer means we could not tell (API error), and never blocks a launch.
+    if require_whatsapp:
+        from .ads_connection import page_has_whatsapp_linked
+
+        linked = await page_has_whatsapp_linked(plan.page_id, settings.META_ADS_ACCESS_TOKEN)
+        if linked is False:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Connect your WhatsApp number to the '{ads_conn.get('page_name') or 'connected'}' "
+                    "Facebook Page before launching a WhatsApp campaign — open the Page's settings in "
+                    "Meta, add the number under WhatsApp, and confirm the code it sends you. Until "
+                    "that is done Meta can't route messages to you or count a single conversation. "
+                    "You can also switch this campaign to your website or Instagram DMs instead."
+                ),
+            )
+
     plan.whatsapp_number = ads_conn["whatsapp_number"]
     plan.destination_type = destination_type.value
     plan.destination_link = build_link(
