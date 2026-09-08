@@ -264,6 +264,14 @@ _RECORDS = [
 ]
 
 
+# The reverse of the table above — strategy_id -> the format module that
+# renders it. Step 9's own corpus records are the single source of truth for
+# which module a given SEED-0xx id maps to; the orchestrator (step 10) looks
+# a retrieved Strategy's format up here rather than hand-maintaining a second
+# list that could drift from this one.
+FORMAT_MODULES = {record["format_module"].FORMAT.format_id: record["format_module"] for record in _RECORDS}
+
+
 def _requires_for(format_def) -> List[Requirement]:
     return [_REQUIREMENT_BY_VALUE[value] for value in format_def.requires]
 

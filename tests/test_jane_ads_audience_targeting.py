@@ -141,3 +141,108 @@ def test_openai_outage_returns_broad_never_raises():
     with patch("openai.AsyncOpenAI", side_effect=Exception("down")):
         targeting = _run(resolve_audience_targeting("young professionals", "tok"))
     assert targeting == {}
+
+
+def test_prompt_still_forbids_age_derived_interests():
+    from app.agents.jane_ads.audience_targeting import _extraction_prompt
+    lowered = _extraction_prompt("gym owners in lekki aged 20-25").lower()
+    assert "what this audience does, sells, or buys" in lowered
+    assert "never derive one" in lowered
+
+
+# ── Meta's own search ranking is not trustworthy — match lexically and reject ──
+
+def test_unrelated_top_hit_is_rejected_not_shipped():
+    """Live-confirmed: searching "Gym" with limit=1 returned "Hip-hop music (music)"
+    as the single top hit, and it shipped on a real ad set aimed at gym owners. The
+    same term with a bigger limit doesn't return it at all, so Meta's ranking can't
+    be taken on trust."""
+    from app.agents.jane_ads.audience_targeting import _match_score
+    assert _match_score("Gym", "Hip-hop music (music)") == 0
+    assert _match_score("Health club", "Government (government agency)") == 0
+    assert _match_score("Catering", "India") == 0
+
+
+def test_exact_and_containing_matches_score_above_partial():
+    from app.agents.jane_ads.audience_targeting import _match_score
+    # Meta's trailing category parenthetical isn't part of the name for matching.
+    assert _match_score("Health club", "Health club (fitness)") == 3
+    assert _match_score("wedding planning", "wedding planning (weddings)") == 3
+    assert _match_score("Gym", "Gold's Gym") == 2          # has every word we asked
+    assert _match_score("Personal trainer", "Jillian Michaels (personal trainer)") == 0
+    assert _match_score("Health club", "Youfit Health Clubs") == 1   # partial only
+
+
+def test_generic_interest_beats_a_brand_with_the_same_words():
+    """Among equally-scoring hits the plainest name wins, so a real category is
+    preferred over a brand or person that happens to contain the words."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+    from app.agents.jane_ads.audience_targeting import _resolve_interest
+
+    client = AsyncMock()
+    r = MagicMock()
+    r.json = lambda: {"data": [
+        {"id": "1", "name": "Hip-hop music (music)"},              # unrelated -> 0
+        {"id": "2", "name": "Goodlife Health Clubs, Australia"},   # partial
+        {"id": "3", "name": "Health club (fitness)"},              # exact
+    ]}
+    client.get = AsyncMock(return_value=r)
+    hit = asyncio.get_event_loop().run_until_complete(
+        _resolve_interest(client, "https://graph", "tok", "Health club"))
+    assert hit == {"id": "3", "name": "Health club (fitness)"}
+
+
+def test_all_hits_unrelated_yields_nothing_rather_than_a_wrong_interest():
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+    from app.agents.jane_ads.audience_targeting import _resolve_interest
+
+    client = AsyncMock()
+    r = MagicMock()
+    r.json = lambda: {"data": [{"id": "1", "name": "Hip-hop music (music)"},
+                               {"id": "2", "name": "Reality television personalities"}]}
+    client.get = AsyncMock(return_value=r)
+    hit = asyncio.get_event_loop().run_until_complete(
+        _resolve_interest(client, "https://graph", "tok", "Gym"))
+    assert hit is None   # broader beats wrong
+
+
+def test_interests_meta_reports_invalid_are_dropped_before_launch():
+    """Live-caught on a real launch: search returned "QC School of Event and Wedding
+    Planning" for a wedding audience, and ad-set creation then failed outright —
+    "Some detailed targeting options have been combined" (code=100, subcode=1870247).
+    A deprecated interest doesn't degrade targeting, it stops the campaign going live."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+    from app.agents.jane_ads.audience_targeting import _drop_invalid_interests
+
+    client = AsyncMock()
+    r = MagicMock()
+    r.json = lambda: {"data": [
+        {"id": "6012250005972", "name": "QC School of Event and Wedding Planning", "valid": False},
+        {"id": "6003092932417", "name": "Event management (event planning)", "valid": True},
+    ]}
+    client.get = AsyncMock(return_value=r)
+    kept = asyncio.get_event_loop().run_until_complete(_drop_invalid_interests(
+        client, "https://graph", "tok",
+        [{"id": "6012250005972", "name": "QC School of Event and Wedding Planning"},
+         {"id": "6003092932417", "name": "Event management (event planning)"}]))
+    assert kept == [{"id": "6003092932417", "name": "Event management (event planning)"}]
+
+
+def test_unknown_validity_is_kept_rather_than_silently_dropped():
+    # If Meta doesn't report on an id, assume it's fine — losing a good interest to a
+    # patchy response is worse than the rare deprecated one slipping through.
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+    from app.agents.jane_ads.audience_targeting import _drop_invalid_interests
+
+    client = AsyncMock()
+    r = MagicMock()
+    r.json = lambda: {"data": []}
+    client.get = AsyncMock(return_value=r)
+    given = [{"id": "1", "name": "Fitness and wellness (fitness)"}]
+    kept = asyncio.get_event_loop().run_until_complete(
+        _drop_invalid_interests(client, "https://graph", "tok", given))
+    assert kept == given

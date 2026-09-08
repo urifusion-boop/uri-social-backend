@@ -919,36 +919,76 @@ async def generate_ad_creative(
                                city, behaviour, service_area, audience_segment, who_its_for,
                                geo_pockets=geo_pockets, corpus=corpus,
                                destination_type=destination_type)
-    # Image via the SAME content engine normal posts use (better visuals). Seed it with the
-    # scene idea; content conveys the theme/message so the graphic is on-topic.
-    content_for_image = copy.primary_text or copy.image_prompt or f"{business_name} — {description or category}"
-    # The image must say the same thing the button does. Live-observed: a click-to-
-    # WhatsApp ad whose creative read "Visit our website" while the copy said "message
-    # me to order" — two different destinations on one ad. So the image's CTA comes
-    # from the brand's real ad destination, not the brand playbook's generic one.
-    image_brand_context = {**(brand_context or {}),
-                           "override_cta": image_cta(coerce_type(destination_type))}
-    image_url = await generate_ad_image(content_for_image, image_brand_context, seed=copy.image_prompt)
-    # Caption LAST, matched to the actual generated image (vision) so it references the
-    # real visual instead of a generic line ("caption doesn't add up"). Falls back to the
-    # original copy if the vision pass fails.
-    if image_url:
-        summary = await describe_ad_image(image_url)
-        if summary:
-            # Same corpus as write_ad_copy above: this call OVERWRITES headline and
-            # primary_text, so without it the corpus shapes copy that is then discarded
-            # — which is exactly why the first live test showed no change in the ad.
-            matched = await write_ad_copy_for_image(
-                summary, business_name, category, goal, description, brand_context, city,
-                service_area, audience_segment, who_its_for, geo_pockets=geo_pockets,
-                corpus=corpus, destination_type=destination_type,
+
+    # VSG-01 v3 (§6-9, step 10) — try a corpus-selected, composited ad format
+    # (Us vs Them / Borrowed Interface / Problem-Solution today; see
+    # vsg01_orchestrator.py's own docstring for why only these three) before
+    # falling back to the single generic image every GENERATE ad used to get
+    # unconditionally. None at any point (no format retrieved, an LLM content
+    # call failed, a build failed its own legibility/skin-tone check, the
+    # render itself failed) means "fall through to the existing generic path
+    # below, unchanged" — this can only ever add a better creative, never
+    # remove the one that already worked.
+    #
+    # Gated OFF by default (JANE_ADS_VSG01_ENABLED). These formats are DRAWN
+    # typographic layouts, not generated imagery, and the drawn output was reported
+    # as markedly worse-looking than what the content engine produces — so ads take
+    # the generate_ad_image() path below unless the flag is set. Nothing here is
+    # removed; flipping the flag restores the format library in front.
+    vsg01_result = None
+    image_url = None
+    if db is not None and settings.JANE_ADS_VSG01_ENABLED:
+        from .vsg01_orchestrator import select_and_render_vsg01_creative
+        vsg01_result = await select_and_render_vsg01_creative(
+            db, business_name, category, description, brand_context,
+        )
+        if vsg01_result is not None:
+            image_url = await _upload_bytes_to_cloudinary(
+                vsg01_result["png_bytes"], f"vsg01-{uuid.uuid4().hex[:12]}",
             )
-            if matched.headline:
-                copy.headline = matched.headline
-            if matched.primary_text:
-                copy.primary_text = matched.primary_text
+            if image_url is None:
+                print("[Creative] VSG-01 render succeeded but Cloudinary upload failed, "
+                      "falling back to generic generation", flush=True)
+                vsg01_result = None
+
+    if vsg01_result is None:
+        # Image via the SAME content engine normal posts use (better visuals). Seed it with
+        # the scene idea; content conveys the theme/message so the graphic is on-topic.
+        content_for_image = copy.primary_text or copy.image_prompt or f"{business_name} — {description or category}"
+        # The image must say the same thing the button does. Live-observed: a click-to-
+        # WhatsApp ad whose creative read "Visit our website" while the copy said "message
+        # me to order" — two different destinations on one ad. So the image's CTA comes
+        # from the brand's real ad destination, not the brand playbook's generic one.
+        image_brand_context = {**(brand_context or {}),
+                               "override_cta": image_cta(coerce_type(destination_type))}
+        image_url = await generate_ad_image(content_for_image, image_brand_context, seed=copy.image_prompt)
+        # Caption LAST, matched to the actual generated image (vision) so it references the
+        # real visual instead of a generic line ("caption doesn't add up"). Falls back to the
+        # original copy if the vision pass fails. Skipped for a VSG-01 render above — that
+        # image already IS the message (a comparison table, a chat exchange); a vision
+        # description of its own composited text would just restate the layout back into
+        # headline/primary_text, not add anything write_ad_copy's corpus-aware pass didn't.
+        if image_url:
+            summary = await describe_ad_image(image_url)
+            if summary:
+                # Same corpus as write_ad_copy above: this call OVERWRITES headline and
+                # primary_text, so without it the corpus shapes copy that is then discarded
+                # — which is exactly why the first live test showed no change in the ad.
+                matched = await write_ad_copy_for_image(
+                    summary, business_name, category, goal, description, brand_context, city,
+                    service_area, audience_segment, who_its_for, geo_pockets=geo_pockets,
+                    corpus=corpus, destination_type=destination_type,
+                )
+                if matched.headline:
+                    copy.headline = matched.headline
+                if matched.primary_text:
+                    copy.primary_text = matched.primary_text
+
     ad = assemble_creative(copy, image_url, source=CreativeSource.GENERATE, service_area=service_area,
                            destination_type=destination_type, destination_cta=destination_cta)
+    if vsg01_result is not None:
+        ad.vsg01_format_id = vsg01_result["format_id"]
+        ad.vsg01_format_attributes = vsg01_result["attributes"]
     if corpus is not None:
         from .models import StrategyCitation
         ad.corpus_coverage = corpus.coverage
@@ -967,6 +1007,7 @@ async def creative_from_upload(
     is_video: Optional[bool] = None, city: str = "", service_area: str = "",
     audience_segment: str = "", who_its_for: str = "", geo_pockets: Optional[list[str]] = None,
     destination_type: str = DEFAULT_DESTINATION.value, destination_cta: str = "",
+    asset_attestation: Optional[str] = None,
 ) -> AdCreative:
     """SOURCE 2 — the user's own uploaded photo OR video (uploaded via
     /jane-ads/creative/upload, or the existing /upload-user-content flow) becomes
@@ -974,11 +1015,46 @@ async def creative_from_upload(
     grounding needed for the IMAGE — the media IS the real place already — but the
     copy still needs `service_area`/`city` for the same leakage-check treatment as
     every other path. `audience_segment`/`who_its_for`/`geo_pockets` — see
-    write_ad_copy's docstring (Multi-Plan Audience Variants spec §8)."""
+    write_ad_copy's docstring (Multi-Plan Audience Variants spec §8).
+
+    `asset_attestation` ("product_photo" | "real_customer_photo" | None) — the
+    user's own confirmation of what this photo genuinely shows, collected once
+    at upload time. None (the default, and the only option for a plain upload
+    the user didn't tag) means exactly what it always meant: use the photo
+    as-is, no VSG-01 format-selection attempt — a format like Review Card or
+    Text on a Face must never surface for a photo nobody has actually
+    confirmed is real (VSG-01 §1.2)."""
     brand_context = await get_brand_context(user_id, db, brand_id) if user_id else {}
+
+    # VSG-01 v3 (§6-10) — only attempted when the photo has a real attestation
+    # and isn't a video (the format library only composites still images).
+    # None at any point (no eligible format, no genuine quote to pair with a
+    # photo-based format, a build/legibility failure) falls through to using
+    # the raw upload exactly as this function already did.
+    vsg01_result = None
+    final_image_url = image_url
+    if db is not None and not is_video and asset_attestation:
+        from .vsg01_orchestrator import select_and_render_vsg01_creative
+        vsg01_result = await select_and_render_vsg01_creative(
+            db, business_name, category, description, brand_context,
+            photo_url=image_url, photo_attestation=asset_attestation,
+        )
+        if vsg01_result is not None:
+            uploaded = await _upload_bytes_to_cloudinary(
+                vsg01_result["png_bytes"], f"vsg01-{uuid.uuid4().hex[:12]}",
+            )
+            if uploaded is None:
+                print("[Creative] VSG-01 render succeeded but Cloudinary upload failed, "
+                      "using the raw upload instead", flush=True)
+                vsg01_result = None
+            else:
+                final_image_url = uploaded
+
     # Caption matched to what the uploaded photo actually shows (skip for video — no still
-    # to describe), so the copy references the real visual.
-    summary = "" if is_video else await describe_ad_image(image_url)
+    # to describe), so the copy references the real visual. Also skipped for a VSG-01
+    # render — that image already IS the message (a review card, a labelled face) — see
+    # generate_ad_creative's identical note for why a vision re-match adds nothing there.
+    summary = "" if (is_video or vsg01_result is not None) else await describe_ad_image(image_url)
     if summary:
         copy = await write_ad_copy_for_image(
             summary, business_name, category, goal, description, brand_context, city,
@@ -990,9 +1066,13 @@ async def creative_from_upload(
                                    service_area=service_area, audience_segment=audience_segment,
                                    who_its_for=who_its_for, geo_pockets=geo_pockets,
                                    destination_type=destination_type)
-    return assemble_creative(copy, image_url, source=CreativeSource.UPLOAD, is_video=is_video,
-                             service_area=service_area, destination_type=destination_type,
-                             destination_cta=destination_cta)
+    ad = assemble_creative(copy, final_image_url, source=CreativeSource.UPLOAD, is_video=is_video,
+                           service_area=service_area, destination_type=destination_type,
+                           destination_cta=destination_cta)
+    if vsg01_result is not None:
+        ad.vsg01_format_id = vsg01_result["format_id"]
+        ad.vsg01_format_attributes = vsg01_result["attributes"]
+    return ad
 
 
 async def creative_from_draft(
@@ -1025,7 +1105,7 @@ async def creative_from_recomposite(
     description: str = "", user_id: str = "", db=None, brand_id: Optional[str] = None,
     city: str = "", service_area: str = "", audience_segment: str = "", who_its_for: str = "",
     geo_pockets: Optional[list[str]] = None, destination_type: str = DEFAULT_DESTINATION.value,
-    destination_cta: str = "",
+    destination_cta: str = "", asset_attestation: Optional[str] = None,
 ) -> AdCreative:
     """SOURCE 4 — the user's own real product photo, recomposited: background
     cleaned/replaced, the product itself preserved exactly (creative brief spec §7,
@@ -1034,14 +1114,38 @@ async def creative_from_recomposite(
     already has for this (`ImageContentService._generate_platform_image` with a
     `reference_image` — background removal → forensic product analysis →
     preservation block, confirmed already built and battle-tested); this is new
-    wiring, not a new image-generation capability."""
+    wiring, not a new image-generation capability.
+
+    `asset_attestation` — see creative_from_upload's docstring. Recomposite's
+    already-clean, background-processed cutout is also what makes VSG-01's
+    Starter Pack format buildable here specifically (never from a plain
+    upload — see vsg01_orchestrator.py's own note on why)."""
     brand_context = await get_brand_context(user_id, db, brand_id) if user_id else {}
     content_for_image = f"{business_name or category} — {description or category}"
     image_url = await generate_ad_image(
         content_for_image, brand_context, seed=description, reference_image=reference_image_url,
     )
     final_image = image_url or reference_image_url
-    summary = await describe_ad_image(final_image)
+
+    vsg01_result = None
+    if db is not None and asset_attestation:
+        from .vsg01_orchestrator import select_and_render_vsg01_creative
+        vsg01_result = await select_and_render_vsg01_creative(
+            db, business_name, category, description, brand_context,
+            photo_url=final_image, photo_attestation=asset_attestation, recomposite=True,
+        )
+        if vsg01_result is not None:
+            uploaded = await _upload_bytes_to_cloudinary(
+                vsg01_result["png_bytes"], f"vsg01-{uuid.uuid4().hex[:12]}",
+            )
+            if uploaded is None:
+                print("[Creative] VSG-01 render succeeded but Cloudinary upload failed, "
+                      "using the recomposited photo instead", flush=True)
+                vsg01_result = None
+            else:
+                final_image = uploaded
+
+    summary = "" if vsg01_result is not None else await describe_ad_image(final_image)
     if summary:
         copy = await write_ad_copy_for_image(
             summary, business_name, category, goal, description, brand_context, city,
@@ -1053,6 +1157,10 @@ async def creative_from_recomposite(
                                    audience_segment=audience_segment, who_its_for=who_its_for,
                                    service_area=service_area, geo_pockets=geo_pockets,
                                    destination_type=destination_type)
-    return assemble_creative(copy, final_image, source=CreativeSource.RECOMPOSITE,
-                             service_area=service_area, destination_type=destination_type,
-                             destination_cta=destination_cta)
+    ad = assemble_creative(copy, final_image, source=CreativeSource.RECOMPOSITE,
+                           service_area=service_area, destination_type=destination_type,
+                           destination_cta=destination_cta)
+    if vsg01_result is not None:
+        ad.vsg01_format_id = vsg01_result["format_id"]
+        ad.vsg01_format_attributes = vsg01_result["attributes"]
+    return ad
