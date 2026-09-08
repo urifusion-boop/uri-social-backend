@@ -197,6 +197,47 @@ async def create_draft_from_item_v2(
                     )
                 print(f"[CalendarV2] deducted {credits_to_deduct} credit(s) for draft {request_id}")
 
+            # Mirrors v1's create_draft_from_calendar_day include_images block
+            # (complete_social_manager.py) — confirmed missing here entirely:
+            # CreateDraftRequestV2.include_images was accepted by the model and
+            # sent by the frontend's "Include AI-generated image" checkbox, but
+            # never once read in this endpoint, so no image ever got generated
+            # regardless of the checkbox. V2 also has its own ai_image_prompt
+            # per item (v1 has no equivalent — an LLM-written, ready-to-use
+            # image-gen description), folded into the seed here for a stronger
+            # signal than v1's generic seed_content alone.
+            if request.include_images and drafts:
+                from app.agents.social_media_manager.routers.complete_social_manager import (
+                    _generate_image_bg, _BG_IMAGE_TASKS,
+                )
+                if draft_ids:
+                    await db["content_drafts"].update_many(
+                        {"id": {"$in": draft_ids}},
+                        {"$set": {"has_image": True, "image_failed": False}},
+                    )
+                    for d in drafts:
+                        d["has_image"] = True
+
+                image_seed_content = seed_content
+                if item.get("ai_image_prompt"):
+                    image_seed_content = f"{seed_content}\nImage direction: {item['ai_image_prompt']}"
+
+                _bg_image_tasks = [
+                    asyncio.create_task(_generate_image_bg(
+                        draft_id=d.get("draft_id") or d.get("id"),
+                        platform=d.get("platform", "facebook"),
+                        content=d.get("content", image_seed_content),
+                        seed_content=image_seed_content,
+                        brand_context=brand_context,
+                        db=db,
+                        reference_image=None,
+                    ))
+                    for d in drafts
+                ]
+                _BG_IMAGE_TASKS.update(_bg_image_tasks)
+                for t in _bg_image_tasks:
+                    t.add_done_callback(_BG_IMAGE_TASKS.discard)
+
         return result
     except HTTPException:
         raise
