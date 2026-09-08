@@ -466,17 +466,30 @@ async def _build_review_card(business_name: str, category: str, description: str
 
 # ── SEED-082: Text on a Face (needs a real, attested customer photo) ─────
 
-async def _content_text_on_a_face(business_name: str, category: str, description: str) -> Optional[str]:
+async def _content_text_on_a_face(business_name: str, category: str, description: str,
+                                  correction: str = "") -> Optional[str]:
     """The seller's own position/observed situation — safe to compose (this
     is not a claimed quote from anyone), but must clear the format's own
     ViewerPresumption/DisallowedPersonalTopic guards, which build_document
-    enforces regardless of what this returns."""
+    enforces regardless of what this returns.
+
+    §2.7's "one short line" is measured against real pixel width at a large
+    bold font (~968px plate, 48px bold) — live-confirmed a statement written
+    to only the vague instruction "one short line" still wrapped to three
+    lines. ~20 characters is the real, tested-safe budget (a 35-character
+    line already measured ~1252px, well past the plate), not a stylistic
+    preference — the prompt states it as a hard number for exactly that
+    reason."""
     prompt = (
         f"For a Nigerian ad for {_business_line(business_name, category, description)}, write ONE "
         "short first-person line (the business owner's own position or an observed situation about "
-        "their work) to sit across a photo of them — NOT a question, NOT a presumption about the "
-        "reader ('are you struggling with...'), and never touching health, body, finances, or "
-        "personal circumstance. Example style: 'I fix what others give up on.'\n"
+        "their work) to sit across a photo of them.\n"
+        "HARD LIMIT: 20 characters or fewer, INCLUDING spaces and punctuation — this is a real pixel-"
+        "width constraint, not a style preference. 3-4 words maximum. Correctly-sized examples: "
+        "'No job too hard.' (16 chars), 'I never give up.' (17 chars), 'Real fixes, fast.' (17 chars).\n"
+        "NOT a question, NOT a presumption about the reader ('are you struggling with...'), and never "
+        "touching health, body, finances, or personal circumstance.\n"
+        f"{('CORRECTION: ' + correction) if correction else ''}\n"
         "Return JSON: {\"statement\": \"...\"}. Return ONLY the JSON."
     )
     d = await _call_content_model(prompt)
@@ -493,19 +506,41 @@ async def _build_text_on_a_face(business_name: str, category: str, description: 
     statement = await _content_text_on_a_face(business_name, category, description)
     if not statement:
         return None
-    try:
+
+    def _try_build(stmt: str):
         # permission_on_file=True: the attestation step upstream (the user
         # confirming this is a real customer's photo before this call ever
         # happens) IS the permission confirmation this format requires.
-        document = text_on_a_face.build_document(
-            photo_url, statement, permission_on_file=True, canvas_size=_CANVAS_SIZE, tokens=tokens,
+        return text_on_a_face.build_document(
+            photo_url, stmt, permission_on_file=True, canvas_size=_CANVAS_SIZE, tokens=tokens,
         )
+
+    try:
+        return _try_build(statement)
+    except text_on_a_face.TextNotOneLine as e:
+        # The one correctable failure here — same "regenerate once with the
+        # exact correction, then accept whatever comes back" pattern as
+        # creative.py's write_ad_copy leakage retry, not an open-ended loop.
+        print(f"[VSG01] Text on a Face statement too long ({len(statement)} chars), retrying shorter: {e}",
+              flush=True)
+        retry_statement = await _content_text_on_a_face(
+            business_name, category, description,
+            correction=f"your last attempt ({statement!r}, {len(statement)} chars) was too long. "
+                       "Make it shorter — 15 characters or fewer this time.",
+        )
+        if not retry_statement:
+            return None
+        try:
+            return _try_build(retry_statement)
+        except Exception as e2:
+            print(f"[VSG01] Text on a Face still failed after retry: {e2}", flush=True)
+            return None
     except Exception as e:
-        # Catches TextNotOneLine/ViewerPresumption/DisallowedPersonalTopic too —
-        # a guard tripping means "skip this format this time," not a bug to retry.
+        # PermissionNotOnFile/ViewerPresumption/DisallowedPersonalTopic — a guard
+        # tripping on CONTENT (not length) means "skip this format this time,"
+        # not something a blind retry with the same casual prompt reliably fixes.
         print(f"[VSG01] Text on a Face build failed: {e}", flush=True)
         return None
-    return document
 
 
 # ── SEED-074: Testimonial + Offer, person path (needs a real customer photo) ─
