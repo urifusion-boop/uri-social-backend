@@ -367,3 +367,21 @@ def test_campaign_without_a_stamped_markup_bills_at_the_legacy_rate(monkeypatch)
 
     assert res["charged_ngn"] == round(2_000 * C.LEGACY_AD_SPEND_MARKUP, 2)
     assert res["charged_ngn"] != round(2_000 * C.AD_SPEND_MARKUP, 2)
+
+
+def test_a_campaign_paid_for_at_launch_is_never_charged_again_as_it_delivers(monkeypatch):
+    """Campaigns are debited in full when they launch (the budget is committed), so
+    the delivery sweep must not charge them a second time — that would bill the client
+    twice for the same ads. Records without charged_upfront_ngn predate charge-at-
+    launch and are still billed as they spend, exactly as they were sold."""
+    store = InMemoryWalletStore()
+    _run(WalletService(store).top_up("brnd_1", 100_000, reference="seed"))
+    rows = [{"campaign_id": "c_prepaid", "business_id": "brnd_1", "user_id": "u1",
+             "ad_id": "a1", "spend_billed_ngn": 0.0, "ad_spend_markup": MARKUP,
+             "charged_upfront_ngn": 20_000.0, "display_name": "Shop"}]
+    db, adapter, notifier = _setup(monkeypatch, rows, {"c_prepaid": _summary(2_000)}, store)
+
+    res = _run(billing.reconcile_ad_spend_charges(db))
+
+    assert res["charged_ngn"] == 0.0
+    assert _run(WalletService(store).get_balance("brnd_1")) == 100_000
