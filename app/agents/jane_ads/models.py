@@ -355,6 +355,15 @@ class AdCreative(BaseModel):
     shows_service_area: bool = False  # the resolved service_area string appears in the copy
     copy_length: int = 0             # len(headline) + len(primary_text), for quick analysis
 
+    # VSG-01 v3 §4/§6/step 10 — set only when the image is a corpus-selected,
+    # rendered ad format (vsg01_orchestrator.py), never for the generic
+    # single-image fallback. `vsg01_format_attributes` is the §4 schema
+    # (ad_formats/attribute_tagging.build_ad_format_attributes' output) —
+    # carried on the creative itself since there is no campaign_outcome
+    # event pipeline yet to emit it to (see that module's own docstring).
+    vsg01_format_id: str = ""
+    vsg01_format_attributes: dict = Field(default_factory=dict)
+
 
 # ── Path C: script-and-shoot (PRD §4.1) ───────────────────────────────────────
 

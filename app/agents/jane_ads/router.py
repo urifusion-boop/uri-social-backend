@@ -391,6 +391,11 @@ class CreativeForBrandBody(BaseModel):
     reference_image_url: str = ""      # required for source=upload/recomposite
     is_video: bool = False             # is reference_image_url a video? (from /creative/upload)
     draft_id: str = ""                 # required for source=draft
+    # VSG-01 v3 (§1.2/§6) — the user's own confirmation of what reference_image_url
+    # genuinely shows, collected once at upload time (never inferred): "product_photo" |
+    # "real_customer_photo" | None. None means exactly what it always meant — use the
+    # photo as-is, no format-selection attempt. See creative_from_upload's docstring.
+    asset_attestation: Optional[str] = None
 
 
 @router.post("/creative/for-brand")
@@ -421,6 +426,7 @@ async def creative_for_brand(
             body.description, user_id=user_id, db=db, brand_id=brand_id,
             is_video=body.is_video, city=body.city,
             destination_type=destination_type, destination_cta=destination_cta,
+            asset_attestation=body.asset_attestation,
         )
     elif body.source == "recomposite":
         if not body.reference_image_url:
@@ -429,6 +435,7 @@ async def creative_for_brand(
             body.business_name, body.category, body.reference_image_url, body.goal,
             body.description, user_id=user_id, db=db, brand_id=brand_id, city=body.city,
             destination_type=destination_type, destination_cta=destination_cta,
+            asset_attestation=body.asset_attestation,
         )
     elif body.source == "draft":
         if not body.draft_id:
@@ -468,8 +475,51 @@ _UPLOAD_IMAGE_TYPES = {
 _UPLOAD_VIDEO_TYPES = {
     "video/mp4": "mp4", "video/quicktime": "mov", "video/webm": "webm", "video/x-m4v": "m4v",
 }
-_MAX_UPLOAD_IMAGE_BYTES = 8 * 1024 * 1024     # 8 MB
+# A real phone photo routinely lands well past 8MB (the ad-creative upload's original
+# hard cap — live-confirmed blocking a genuine 10.8MB JPEG straight off an iPhone).
+# _COMPRESS_ABOVE_BYTES is the real, common-case wall: anything past it gets resized/
+# re-encoded rather than rejected, so a real user's photo essentially never fails
+# outright. _MAX_UPLOAD_IMAGE_BYTES stays as a generous backstop for something
+# genuinely pathological (a corrupt file, a 500MB "image") that compression itself
+# can't be trusted to handle cheaply.
+_COMPRESS_ABOVE_BYTES = 4 * 1024 * 1024       # 4 MB
+_MAX_UPLOAD_IMAGE_BYTES = 20 * 1024 * 1024    # 20 MB
 _MAX_UPLOAD_VIDEO_BYTES = 100 * 1024 * 1024   # 100 MB — short vertical ad clips
+# Ad placements elsewhere in this codebase render at 1080px-wide canvases (creative.py,
+# ad_formats/*) — nothing downstream needs a dimension larger than this, and capping it
+# here is most of where the real byte savings come from (re-encoding alone helps far
+# less on a photo that's already 4000px+ on its long edge).
+_COMPRESS_MAX_DIMENSION = 2048
+_COMPRESS_JPEG_QUALITY = 85
+
+
+def _compress_image_if_needed(contents: bytes, content_type: str) -> bytes:
+    """Resize/re-encode an oversized image so a real phone photo (routinely 8-15MB)
+    almost never gets rejected outright. Always converts to JPEG when it actually
+    compresses — a PNG/WEBP under the threshold is returned untouched, preserving
+    format for the (rare) small upload. Returns the original bytes unchanged if PIL
+    can't decode it or compression doesn't actually help — the caller's own size
+    check is still the real gate, this only ever makes an oversized image smaller."""
+    if len(contents) <= _COMPRESS_ABOVE_BYTES:
+        return contents
+    try:
+        from io import BytesIO
+        from PIL import Image, ImageOps
+
+        img = Image.open(BytesIO(contents))
+        img = ImageOps.exif_transpose(img)  # phone photos carry orientation in EXIF,
+                                             # not the pixel data — without this a
+                                             # re-encode can silently rotate the image
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+        img.thumbnail((_COMPRESS_MAX_DIMENSION, _COMPRESS_MAX_DIMENSION), Image.LANCZOS)
+        out = BytesIO()
+        img.save(out, format="JPEG", quality=_COMPRESS_JPEG_QUALITY, optimize=True)
+        compressed = out.getvalue()
+        return compressed if len(compressed) < len(contents) else contents
+    except Exception as e:
+        print(f"[creative_upload] image compression skipped: {e}", flush=True)
+        return contents
 
 
 @router.post("/creative/upload")
@@ -491,12 +541,23 @@ async def creative_upload(
     if len(contents) > max_bytes:
         raise HTTPException(status_code=400, detail=f"File must be under {max_bytes // (1024*1024)} MB.")
 
+    if not is_video:
+        compressed = _compress_image_if_needed(contents, file.content_type)
+        if compressed is not contents:
+            contents = compressed
+            ext = "jpg"
+            file_content_type = "image/jpeg"
+        else:
+            file_content_type = file.content_type
+    else:
+        file_content_type = file.content_type
+
     from .creative import _upload_bytes_to_cloudinary
     import uuid as _uuid
     url = await _upload_bytes_to_cloudinary(
         contents, f"upload-{_uuid.uuid4().hex[:12]}",
         resource_type="video" if is_video else "image",
-        ext=ext, content_type=file.content_type,
+        ext=ext, content_type=file_content_type,
     )
     if not url:
         raise HTTPException(status_code=502, detail="Upload failed, please try again.")
@@ -1643,6 +1704,10 @@ class MetaLaunchFromMessageBody(BaseModel):
                                           # plan") — set by the server on the first
                                           # choose_plan_variant response, echoed back on
                                           # each follow-up selection call
+    # VSG-01 v3 (§1.2/§6) — see CreativeForBrandBody's identical field. Required for
+    # creative_source=upload/recomposite before a photo-based format can even be
+    # attempted; None for generate/draft/ask (no real photo exists on those paths).
+    asset_attestation: Optional[str] = None
 
 
 class _PlanBuildResult(BaseModel):
@@ -1833,9 +1898,15 @@ async def _build_campaign_plan(
     # If the AI is unreachable (quota/outage), surface a clear "try again later"
     # instead of falling through to a follow-up question — otherwise every answer
     # re-triggers the same question (an infinite loop).
+    # An audience the client typed themselves ("none of these" on the plan picker) is
+    # an ANSWER, so the consultant has to see it BEFORE it parses — it drives the
+    # narration and the geography, not just the Meta targeting further down. Read here
+    # rather than at step 1.7 for that reason.
+    own_audience = (body.target_audience or "").strip()
     try:
         parsed = await consult(body.message, known_business_name, known_category,
-                               known_budget, thread_turns, offering=known_offering)
+                               known_budget, thread_turns, offering=known_offering,
+                               stated_audience=own_audience)
     except NlUnavailableError:
         raise HTTPException(status_code=503, detail=_AI_DIFFICULTIES)
 
@@ -2004,7 +2075,6 @@ async def _build_campaign_plan(
     # deliberately as one who tapped a card — so that answer skips the picker too.
     # Without this it regenerated a fresh set of variants and asked again, which reads
     # as the app ignoring what they just told it.
-    own_audience = (body.target_audience or "").strip()
     selected_variant: Optional[PlanVariant] = None
     if body.selected_plan_variant is not None:
         try:
@@ -2121,6 +2191,18 @@ async def _build_campaign_plan(
     geo_areas = parsed.geo_areas
     if selected_variant and selected_variant.geo_pockets:
         geo_areas = [{"name": name, "reason": selected_variant.trigger} for name in selected_variant.geo_pockets]
+    # A place the client named inside their OWN audience outranks everything above it:
+    # they typed it as the answer to "who should this target", so it is this campaign's
+    # geography. Matched in CODE, not left to the consultant — live-observed picking
+    # Ikeja (from the earlier brief) over the Lekki the client had just typed, and
+    # explaining itself as "focusing on Ikeja since it's specified as the budget
+    # location". An unknown place matches nothing and the consultant's read stands.
+    if own_audience:
+        from .geo import place_named_in
+        stated_place = place_named_in(own_audience)
+        if stated_place:
+            geo_areas = [{"name": stated_place,
+                          "reason": "the area you named in the audience you specified"}]
     geo_dump = None
     try:
         if parsed.geo_mode:
@@ -2271,7 +2353,7 @@ async def _build_campaign_plan(
             city=parsed.city, service_area=service_area,
             audience_segment=variant_segment, who_its_for=variant_who_its_for,
             geo_pockets=variant_geo_pockets, destination_type=destination_type.value,
-            destination_cta=destination_cta,
+            destination_cta=destination_cta, asset_attestation=body.asset_attestation,
         )
     elif body.creative_source == "recomposite":
         creative = await creative_from_recomposite(
@@ -2280,7 +2362,7 @@ async def _build_campaign_plan(
             city=parsed.city, service_area=service_area,
             audience_segment=variant_segment, who_its_for=variant_who_its_for,
             geo_pockets=variant_geo_pockets, destination_type=destination_type.value,
-            destination_cta=destination_cta,
+            destination_cta=destination_cta, asset_attestation=body.asset_attestation,
         )
     elif body.creative_source == "draft":
         creative = await creative_from_draft(

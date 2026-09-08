@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from abc import ABC, abstractmethod
 from typing import Optional
 
@@ -349,6 +350,30 @@ async def build_geo_plan(
 
     return GeoPlan(mode=mode, city=city, pins=pins,
                    explanation=_explain(mode, city, pins))
+
+
+def place_named_in(text: str) -> Optional[str]:
+    """The known place a free-text audience names, or None.
+
+    Deterministic, because the alternative was not reliable: when a client types
+    "gym owners lekki aged 20-25" into the plan picker, the place they named IS the
+    campaign's geography, but asking the consultant to honour it only worked
+    sometimes — live-observed picking Ikeja (from the earlier brief) over the Lekki
+    the client had just typed, and even explaining itself as "focusing on Ikeja since
+    it's specified as the budget location". Prompt wording cannot guarantee a
+    property like this, so it is matched in code instead.
+
+    Longest name first, so "lekki phase 1" beats "lekki". Word-boundary matched, so
+    "ikeja" in "ikejawhatever" doesn't count. Gazetteer-only and offline: an unknown
+    place returns None and the consultant's own read stands, exactly as before.
+    """
+    hay = f" {(text or '').lower().strip()} "
+    if not hay.strip():
+        return None
+    for name in sorted(_LAGOS_PLACES, key=len, reverse=True):
+        if re.search(rf"(?<![a-z0-9]){re.escape(name)}(?![a-z0-9])", hay):
+            return name.title()
+    return None
 
 
 def meta_targeting_from_geo(geo: Optional[GeoPlan]) -> dict:

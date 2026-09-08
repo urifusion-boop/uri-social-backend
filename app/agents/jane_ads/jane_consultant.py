@@ -315,7 +315,8 @@ def build_history_turns(saved: list[dict]) -> list[dict]:
 async def consult(message: str, business_name: str = "", category: str = "",
                   known_budget: Optional[float] = None,
                   history: Optional[list[dict]] = None,
-                  offering: str = "") -> ConsultantBrief:
+                  offering: str = "",
+                  stated_audience: str = "") -> ConsultantBrief:
     """One consultant turn. `history` — the real prior turns of THIS conversation
     (see build_history_turns) — is what lets the consultant actually track state
     across turns instead of re-deriving confusion from a jumbled flat string each
@@ -343,6 +344,19 @@ async def consult(message: str, business_name: str = "", category: str = "",
         known_bits.append(f"last campaign they spent ₦{known_budget:,.0f} (a PAST campaign — "
                           "do not treat this as THIS campaign's budget; you may offer it as a "
                           "suggestion, but only a budget the client states for THIS campaign counts)")
+    if stated_audience:
+        # The client typed this audience themselves ("none of these" on the plan picker).
+        # It is an ANSWER, not a hint: re-deriving an audience over the top of it produced
+        # a plan that narrated "business owners across Nigeria" back at someone who had
+        # just asked for "gym owners in Lekki aged 20-25". Live-reported. Any place named
+        # in it is this campaign's geography too, which is why it must reach the parse and
+        # not just the targeting call downstream.
+        known_bits.append(
+            f"the client has SPECIFIED this campaign's target audience themselves: "
+            f"\"{stated_audience}\" — treat it as decided. Reflect it in stated_plan, and if "
+            f"it names an area, that IS the geography (set city/geo_areas from it). Do not "
+            f"substitute a different audience or widen it"
+        )
     known_line = (f"Already known about this client — {', '.join(known_bits)}."
                   if known_bits else "Nothing known about this client yet.")
 
