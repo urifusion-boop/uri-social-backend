@@ -1907,6 +1907,17 @@ async def _build_campaign_plan(
             clarify += f" Last time you spent ₦{known_budget:,.0f} — want to do the same again?"
         return {"early_return": {"stage": "need_more", "understood": parsed.model_dump(), "question": clarify}}
 
+    # URI's fee comes out of the stated budget BEFORE anything is planned, so every
+    # decision below — platform split, duration, daily budget, the ad set Meta
+    # actually gets — is made against the money that will really be spent on ads.
+    # The client's own figure is kept as `stated_budget_ngn` for the wallet gate and
+    # the card: it is the whole of what leaves their wallet, and it is the only number
+    # they are ever shown. Planning against the stated budget instead would size a
+    # campaign the wallet cannot fund, and the old model asked them to fund the fee on
+    # top of the number they had just given.
+    stated_budget_ngn = req.budget_ngn
+    req.budget_ngn = C.ad_spend_from_budget(stated_budget_ngn)
+
     # 1.6. Now that the goal is actually known: a followers/engagement campaign never
     # routes off-platform, so step 0 above deliberately let ADS_NO_WHATSAPP through.
     # Every other goal DOES need a destination — but only a WhatsApp one needs the
@@ -2485,18 +2496,23 @@ async def _build_campaign_plan(
     )
 
 
-def _total_due_ngn(budget_ngn: float) -> float:
-    """What the customer's wallet must cover to run a `budget_ngn` campaign: the ad
-    budget PLUS URI's service fee (the AD_SPEND_MARKUP margin). Meta only ever spends
-    `budget_ngn`; billing (billing.py) debits the wallet up to budget × markup as the
-    campaign delivers, so the wallet is gated to exactly that here — which also makes
-    the wallet empty right when Meta's own budget is exhausted."""
-    return round(budget_ngn * C.AD_SPEND_MARKUP, 2)
+def _total_due_ngn(ad_spend_ngn: float) -> float:
+    """What the customer's wallet must cover for a campaign whose AD SPEND is
+    `ad_spend_ngn` — which is the client's stated budget, since URI's fee was already
+    taken out of it to arrive at that spend (constants.ad_spend_from_budget).
+
+    ad_spend × AD_SPEND_MARKUP reconstructs the stated budget exactly, because the
+    markup is derived from the same fee rate. Expressing it as a multiple of ad spend
+    rather than just returning the stated budget keeps it in step with billing.py,
+    which debits the wallet at ad_spend × markup as the campaign delivers — so the
+    wallet empties precisely as Meta's budget is exhausted, with nothing left over and
+    nothing uncollected."""
+    return round(ad_spend_ngn * C.AD_SPEND_MARKUP, 2)
 
 
 async def _wallet_status(db: AsyncIOMotorDatabase, business_id: str, budget_ngn: float) -> tuple[float, bool]:
-    """(balance, sufficient) — the real Mongo-backed balance vs. the TOTAL due (ad
-    budget + service fee), not just the ad budget."""
+    """(balance, sufficient) — the real Mongo-backed balance vs. the total due. Takes
+    AD SPEND, so the total due comes back out as the client's stated budget."""
     from .store import MongoWalletStore
     from .wallet import WalletService
 
@@ -2506,12 +2522,13 @@ async def _wallet_status(db: AsyncIOMotorDatabase, business_id: str, budget_ngn:
 
 
 def _wallet_shortfall_message(balance: float, budget_ngn: float) -> str:
+    """`budget_ngn` is AD SPEND; the client is told the one number that matters to
+    them — the total leaving their wallet, which is the budget they stated. The fee is
+    deliberately not itemised: it is inside that figure, not added to it."""
     due = _total_due_ngn(budget_ngn)
-    fee = round(due - budget_ngn, 2)
     return (
         f"Your ad wallet has ₦{balance:,.0f} — top up ₦{(due - balance):,.0f} more "
-        f"before launching. A ₦{budget_ngn:,.0f} campaign costs ₦{due:,.0f} "
-        f"(₦{budget_ngn:,.0f} ad spend + ₦{fee:,.0f} service fee)."
+        f"before launching. This campaign costs ₦{due:,.0f}."
     )
 
 
@@ -2719,8 +2736,12 @@ async def meta_plan_from_message(
         **_plan_response_dict(built),
         "wallet": {
             "balance_ngn": balance,
+            # `budget_ngn` here is AD SPEND (the stated budget less URI's fee) and is
+            # NOT shown to the client — total_due_ngn is, and equals the budget they
+            # stated. service_fee_ngn is deliberately gone: the fee sits inside the
+            # stated budget now, so itemising it invited the old "+ service fee" line
+            # that asked them to fund more than the number they gave.
             "budget_ngn": built.req.budget_ngn,
-            "service_fee_ngn": round(_total_due_ngn(built.req.budget_ngn) - built.req.budget_ngn, 2),
             "total_due_ngn": _total_due_ngn(built.req.budget_ngn),
             "sufficient": sufficient,
         },

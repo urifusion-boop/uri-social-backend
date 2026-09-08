@@ -157,3 +157,36 @@ def test_authorization_uses_wallet_balance_as_cap():
     auth = _run(svc.authorization_for("b1", total_funded_wallets_ngn=250_000))
     assert auth.funded_amount_ngn == 15_000
     assert auth.account_cap_ngn == 250_000
+
+
+# ── URI's fee comes OUT of the client's stated budget (not added on top) ──
+
+def test_fee_and_ad_spend_always_sum_to_the_stated_budget():
+    """The client's stated budget is the whole of what leaves their wallet. ₦20,000
+    stated = ₦2,000 fee + ₦18,000 of ads, and the duration is planned off the ₦18,000.
+    The previous model added the fee on top ("₦20,000 ad spend + ₦2,000 service fee =
+    ₦22,000 from your wallet"), asking clients to fund more than the figure they gave."""
+    from app.agents.jane_ads import constants as C
+
+    for budget in (5_000, 10_000, 20_000, 25_000, 137_500):
+        spend = C.ad_spend_from_budget(budget)
+        fee = C.service_fee_from_budget(budget)
+        assert round(spend + fee, 2) == float(budget), budget
+        assert spend < budget
+
+
+def test_twenty_thousand_splits_into_eighteen_and_two():
+    from app.agents.jane_ads import constants as C
+    assert C.ad_spend_from_budget(20_000) == 18_000.0
+    assert C.service_fee_from_budget(20_000) == 2_000.0
+
+
+def test_the_billing_meter_recoups_exactly_the_stated_budget():
+    """AD_SPEND_MARKUP is DERIVED from the fee rate so the wallet lands at zero when
+    Meta finishes spending. Hard-coding 1.10 alongside a 10%-of-total fee would have
+    collected ₦19,800 of every ₦20,000 and left ₦200 uncollected, every campaign."""
+    from app.agents.jane_ads import constants as C
+
+    for budget in (5_000, 10_000, 20_000, 25_000):
+        spend = C.ad_spend_from_budget(budget)
+        assert abs(round(spend * C.AD_SPEND_MARKUP, 2) - budget) < 0.01, budget

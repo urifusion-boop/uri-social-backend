@@ -49,11 +49,48 @@ DEFAULT_CAMPAIGN_DAYS: int = 5
 
 # ── Wallet / billing (PRD A4, B3) ────────────────────────────────────────────
 MIN_TOPUP_NGN: float = 5_000.0
+# URI's service fee, as a share of the budget the CLIENT states. The stated budget is
+# the whole of what leaves their wallet: the fee comes out of it first and the
+# remainder is what Meta actually spends (see ad_spend_from_budget below). ₦20,000
+# stated = ₦2,000 fee + ₦18,000 of ads, and the duration is worked out from the
+# ₦18,000 — not from the ₦20,000, which would plan a campaign the wallet can't fund.
+#
+# This replaced a fee charged ON TOP of the stated budget ("₦20,000 ad spend +
+# ₦2,000 service fee = ₦22,000 from your wallet"), which asked the client to fund
+# more than the number they had just given.
+SERVICE_FEE_RATE: float = 0.10
+
 # Production billing meter: recoup real Meta ad spend × this markup from the
 # customer's prepaid wallet (see billing.py). >1 guarantees URI is made whole on
 # every campaign plus margin — no basis risk from underperforming campaigns, unlike
-# the per-conversation meter below. 1.10 = a 10% service fee on top of ad spend.
-AD_SPEND_MARKUP: float = 1.10
+# the per-conversation meter below.
+#
+# DERIVED from SERVICE_FEE_RATE, never set by hand: the wallet has to land at exactly
+# zero when Meta finishes spending. Ad spend is budget × (1 - rate), so recouping it
+# in full needs ÷ (1 - rate) — at a 10% rate, 18,000 × 1.1111 = the ₦20,000 stated.
+# Hard-coding 1.10 here instead would have collected 19,800 and quietly left ₦200 of
+# every ₦20,000 campaign uncollected.
+AD_SPEND_MARKUP: float = round(1.0 / (1.0 - SERVICE_FEE_RATE), 6)
+
+
+# The markup campaigns launched BEFORE the fee moved inside the stated budget were
+# planned and wallet-gated under. billing.py bills each campaign at the markup stamped
+# on its own record and falls back to this for records that predate the stamp, so a
+# live campaign is never re-based mid-flight onto maths it wasn't sold under.
+LEGACY_AD_SPEND_MARKUP: float = 1.10
+
+
+def ad_spend_from_budget(budget_ngn: float) -> float:
+    """What Meta actually gets to spend out of a client's stated budget — the budget
+    less URI's fee. The ONE place this split is computed, so the plan, the duration,
+    the wallet gate and the ad set can't disagree about it."""
+    return round(budget_ngn * (1.0 - SERVICE_FEE_RATE), 2)
+
+
+def service_fee_from_budget(budget_ngn: float) -> float:
+    """URI's fee out of a client's stated budget. Complement of ad_spend_from_budget,
+    subtracted rather than multiplied so the two always sum to the budget exactly."""
+    return round(budget_ngn - ad_spend_from_budget(budget_ngn), 2)
 CONVERSATION_PRICE_FLOOR_NGN: float = 400.0   # MAX(₦400, trailing-7d cost × 1.5)
 CONVERSATION_PRICE_MULTIPLIER: float = 1.5
 TRAILING_COST_WINDOW_DAYS: int = 7

@@ -98,7 +98,6 @@ async def _sweep_platform(db, wallet, notification_service, *, adapter, collecti
     convention both adapters follow — see their own docstrings)."""
     from .wallet import InsufficientFundsError
 
-    markup = C.AD_SPEND_MARKUP
     records = await db[collection].find({}, {"_id": 0}).to_list(length=500)
 
     checked = paused_total = 0
@@ -123,6 +122,11 @@ async def _sweep_platform(db, wallet, notification_service, *, adapter, collecti
             await db[collection].delete_one({"campaign_id": campaign_id})
             continue
 
+        # Per campaign, not global: the markup this one was SOLD under. A campaign
+        # launched before the fee moved inside the stated budget keeps the basis its
+        # wallet was gated against, so changing the rate never re-bases a live
+        # campaign onto maths its owner never agreed to.
+        markup = float(r.get("ad_spend_markup") or C.LEGACY_AD_SPEND_MARKUP)
         platform_spend = float(summary.get("spend_ngn", 0.0))
         prior = r.get("spend_billed_ngn", 0.0)   # raw stored mark — used as the claim guard
         billed = float(prior or 0.0)
