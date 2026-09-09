@@ -41,6 +41,9 @@ from .models import (
 )
 from .payments import JaneAdsPayments
 from .store import InMemoryWalletStore, MongoWalletStore
+from .vsg01_corpus_seed import PLANNED_FORMAT_RECORDS
+from .vsg01_corpus_seed import _RECORDS as VSG01_FORMAT_RECORDS
+from .vsg01_orchestrator import _BUILDERS as VSG01_WIRED_FORMAT_IDS
 from .wallet import InsufficientFundsError, MinimumTopUpError, WalletService
 
 router = APIRouter(prefix="/jane-ads", tags=["Jane + Ads (demo)"])
@@ -454,6 +457,57 @@ async def creative_for_brand(
             destination_type=destination_type, destination_cta=destination_cta,
         )
     return ad.model_dump()
+
+
+@router.get("/ad-formats")
+async def list_ad_formats(_token: dict = Depends(JWTBearer())) -> dict:
+    """The Visual Styles — Ads library for the Brand Playbook and the in-flow
+    'Style: {name}' chip on a generated ad (VSG-01-PROMPTS v2 §6). Read-only,
+    not brand-scoped — every business sees the same format library; which
+    format actually renders for a given ad is a per-campaign retrieval
+    decision (see AdCreative.vsg01_format_id on the generated result), not a
+    standing choice made here.
+
+    status:
+      "live"    — wired into vsg01_orchestrator._BUILDERS, can actually be
+                  generated today
+      "built"   — has a real module + corpus record, but not yet wired into
+                  generation (News Headline/Day1->Day30/Censored Item need
+                  isolated ad accounts that don't exist yet; Humour/Cartoon
+                  needs a human-review workflow that doesn't exist yet)
+      "planned" — documented in VSG-01-PROMPTS v2, no module built yet
+    """
+    formats = []
+    for record in VSG01_FORMAT_RECORDS:
+        format_def = record["format_module"].FORMAT
+        formats.append({
+            "format_id": format_def.format_id,
+            "name": format_def.name,
+            "claim": record["claim"],
+            "mechanism": record["mechanism"],
+            "business_types": record["business_types"],
+            "modification_required": record["modification_required"],
+            "brand_mark": format_def.brand_mark,
+            "asset_source": format_def.asset_source,
+            "layers_used": format_def.layers_used,
+            "requires": format_def.requires,
+            "status": "live" if format_def.format_id in VSG01_WIRED_FORMAT_IDS else "built",
+        })
+    for record in PLANNED_FORMAT_RECORDS:
+        formats.append({
+            "format_id": record["format_id"],
+            "name": record["name"],
+            "claim": record["claim"],
+            "mechanism": record["mechanism"],
+            "business_types": record["business_types"],
+            "modification_required": record["modification_required"],
+            "brand_mark": record["brand_mark"],
+            "asset_source": None,
+            "layers_used": None,
+            "requires": [],
+            "status": "planned",
+        })
+    return {"formats": formats}
 
 
 @router.get("/creative/drafts")
