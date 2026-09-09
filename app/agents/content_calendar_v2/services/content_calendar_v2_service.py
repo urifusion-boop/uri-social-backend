@@ -346,29 +346,38 @@ concepts must come purely from business/audience/brand/creative-framework
 reasoning (nothing else exists in this task).
 
 Return ONLY a valid JSON array of exactly {n} objects with exactly these 7 keys, nothing else."""
-        try:
-            ai_request = AIService.build_ai_model(
-                messages=[{"role": "user", "content": prompt}], model="gpt-4o", temperature=1.0,
-            )
-            response = await AIService.chat_completion(ai_request)
-            raw = response.choices[0].message.content.strip()
-            if raw.startswith("```"):
-                raw = raw.split("```")[1]
-                if raw.startswith("json"):
-                    raw = raw[4:]
-            parsed = json.loads(raw.strip())
-            if not isinstance(parsed, list):
-                return []
-            forbidden = {"title", "hook", "caption", "key_points", "description", "exact_copy"}
-            for c in parsed:
-                if isinstance(c, dict):
-                    for f in forbidden:
-                        c.pop(f, None)
-                    c["creative_device"] = _as_creative_device(c.get("creative_device"))
-            return [c for c in parsed if isinstance(c, dict)]
-        except Exception as exc:
-            print(f"[CalendarV2] candidate chunk {chunk_idx} failed: {exc}", flush=True)
-            return []
+        # One retry on parse failure — was a bare try/except with no retry at
+        # all, so a single malformed response silently dropped the whole
+        # chunk (confirmed live: a framework-config bug made this fail
+        # systematically; keeping one retry now as a general resilience
+        # backstop, matching _generate_final_copy's pattern, not because
+        # transient parse failures are expected to be common).
+        last_exc: Optional[Exception] = None
+        for attempt in range(2):
+            try:
+                ai_request = AIService.build_ai_model(
+                    messages=[{"role": "user", "content": prompt}], model="gpt-4o", temperature=1.0,
+                )
+                response = await AIService.chat_completion(ai_request)
+                raw = response.choices[0].message.content.strip()
+                if raw.startswith("```"):
+                    raw = raw.split("```")[1]
+                    if raw.startswith("json"):
+                        raw = raw[4:]
+                parsed = json.loads(raw.strip())
+                if not isinstance(parsed, list):
+                    raise ValueError(f"expected a JSON array, got {type(parsed)}")
+                forbidden = {"title", "hook", "caption", "key_points", "description", "exact_copy"}
+                for c in parsed:
+                    if isinstance(c, dict):
+                        for f in forbidden:
+                            c.pop(f, None)
+                        c["creative_device"] = _as_creative_device(c.get("creative_device"))
+                return [c for c in parsed if isinstance(c, dict)]
+            except Exception as exc:
+                last_exc = exc
+        print(f"[CalendarV2] candidate chunk {chunk_idx} failed after retry: {last_exc}", flush=True)
+        return []
 
     results = await asyncio.gather(*[_one_chunk(i, size) for i, size in enumerate(chunk_sizes)])
     return [c for chunk in results for c in chunk]
@@ -1205,7 +1214,27 @@ async def generate_plan_v2(
     flagged_set = set(flagged_day_indices)
     anti_boring_notes = _anti_boring_check(all_items)
 
-    # Step 10 — ad opportunity scoring + copy
+    # Step 10 — ad opportunity scoring + copy. Scoring is pure/fast; copy
+    # generation is the one real LLM call here — fired concurrently for every
+    # candidate (asyncio.gather) instead of awaited one-by-one in the main
+    # loop, which was adding N sequential round-trips on top of an already
+    # 3-stage pipeline that's tight against the gateway timeout.
+    ad_scores: Dict[int, float] = {}
+    ad_angles: Dict[int, str] = {}
+    for i, idea in enumerate(all_items):
+        day_index = idea.get("day_index", i)
+        date_str = idea.get("date") or all_dates[day_index]
+        near_holiday = date_str in holidays_by_date
+        ad_scores[day_index] = _score_ad_opportunity(idea, near_holiday, has_active_promo)
+        if ad_scores[day_index] >= 55.0:
+            ad_angles[day_index] = _derive_ad_angle(idea.get("angle", ""))
+
+    candidate_indices = list(ad_angles.keys())
+    ad_copies = await asyncio.gather(*[
+        _write_calendar_ad_copy(items_by_index[di], brand, ad_angles[di]) for di in candidate_indices
+    ]) if candidate_indices else []
+    ad_copy_by_index = dict(zip(candidate_indices, ad_copies))
+
     items_out: List[Dict[str, Any]] = []
     for i, idea in enumerate(all_items):
         day_index = idea.get("day_index", i)
@@ -1215,13 +1244,12 @@ async def generate_plan_v2(
         is_carousel = idea.get("format") == "carousel"
         near_holiday = date_str in holidays_by_date
 
-        ad_score = _score_ad_opportunity(idea, near_holiday, has_active_promo)
-        if ad_score >= 55.0:
-            ad_angle = _derive_ad_angle(creative_angle)
-            ad_copy = await _write_calendar_ad_copy(idea, brand, ad_angle)
+        ad_score = ad_scores[day_index]
+        if day_index in ad_copy_by_index:
+            ad_angle = ad_angles[day_index]
             territory_label = framework["territories"].get(territory, {}).get("label", territory)
             ad_opportunity = AdOpportunityV2(
-                is_ad_candidate=True, score=ad_score, angle=ad_angle, ad_copy=ad_copy,
+                is_ad_candidate=True, score=ad_score, angle=ad_angle, ad_copy=ad_copy_by_index[day_index],
                 reason=f"Scored {ad_score}/100 — {territory_label} territory"
                        + (", near a relevant date" if near_holiday else ""),
             ).model_dump()
