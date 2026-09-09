@@ -54,6 +54,7 @@ FORMAT = AdFormatDef(
                             # construction); the no-person path uses `generate` for a
                             # people-free scene instead — see build_document_no_person
     layers_used="L4",
+    brand_mark="required",  # VSG-01-PROMPTS v2 §6.2
     requires=["real_customer_photo"],  # Requirement.REAL_CUSTOMER_PHOTO — §1.2: a
                                         # generated face paired with a quote implies a
                                         # customer who does not exist

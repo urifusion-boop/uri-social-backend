@@ -891,7 +891,7 @@ async def generate_ad_creative(
     behaviour: str = "", service_area: str = "", audience_segment: str = "",
     who_its_for: str = "", geo_pockets: Optional[list[str]] = None,
     budget_ngn: float = 0.0, destination_type: str = DEFAULT_DESTINATION.value,
-    destination_cta: str = "",
+    destination_cta: str = "", vsg01_format_id: Optional[str] = None,
 ) -> AdCreative:
     """SOURCE 1 (default) — Jane writes the copy and generates the image herself,
     using the brand playbook's colours/voice/region/industry, grounded in `city` (the
@@ -941,6 +941,7 @@ async def generate_ad_creative(
         from .vsg01_orchestrator import select_and_render_vsg01_creative
         vsg01_result = await select_and_render_vsg01_creative(
             db, business_name, category, description, brand_context,
+            forced_format_id=vsg01_format_id,
         )
         if vsg01_result is not None:
             image_url = await _upload_bytes_to_cloudinary(
@@ -1007,7 +1008,7 @@ async def creative_from_upload(
     is_video: Optional[bool] = None, city: str = "", service_area: str = "",
     audience_segment: str = "", who_its_for: str = "", geo_pockets: Optional[list[str]] = None,
     destination_type: str = DEFAULT_DESTINATION.value, destination_cta: str = "",
-    asset_attestation: Optional[str] = None,
+    asset_attestation: Optional[str] = None, vsg01_format_id: Optional[str] = None,
 ) -> AdCreative:
     """SOURCE 2 — the user's own uploaded photo OR video (uploaded via
     /jane-ads/creative/upload, or the existing /upload-user-content flow) becomes
@@ -1038,6 +1039,7 @@ async def creative_from_upload(
         vsg01_result = await select_and_render_vsg01_creative(
             db, business_name, category, description, brand_context,
             photo_url=image_url, photo_attestation=asset_attestation,
+            forced_format_id=vsg01_format_id,
         )
         if vsg01_result is not None:
             uploaded = await _upload_bytes_to_cloudinary(
@@ -1106,6 +1108,7 @@ async def creative_from_recomposite(
     city: str = "", service_area: str = "", audience_segment: str = "", who_its_for: str = "",
     geo_pockets: Optional[list[str]] = None, destination_type: str = DEFAULT_DESTINATION.value,
     destination_cta: str = "", asset_attestation: Optional[str] = None,
+    vsg01_format_id: Optional[str] = None,
 ) -> AdCreative:
     """SOURCE 4 — the user's own real product photo, recomposited: background
     cleaned/replaced, the product itself preserved exactly (creative brief spec §7,
@@ -1133,6 +1136,7 @@ async def creative_from_recomposite(
         vsg01_result = await select_and_render_vsg01_creative(
             db, business_name, category, description, brand_context,
             photo_url=final_image, photo_attestation=asset_attestation, recomposite=True,
+            forced_format_id=vsg01_format_id,
         )
         if vsg01_result is not None:
             uploaded = await _upload_bytes_to_cloudinary(
