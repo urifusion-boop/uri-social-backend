@@ -334,6 +334,8 @@ class BrandProfileRequest(BaseModel):
     style_selections: Optional[List[str]] = None
     style_prompt_fragments: Optional[List[str]] = None
     style_rotation_index: Optional[int] = None
+    ad_format_selections: Optional[List[str]] = None
+    ad_format_rotation_index: Optional[int] = None
     selected_custom_guides: Optional[List[str]] = None  # Custom visual guide V1 IDs (array)
     selected_custom_guides_v2: Optional[List[str]] = None  # Custom visual guide V2 IDs (array)
     # Per-platform visual style overrides — additive, optional. A platform
