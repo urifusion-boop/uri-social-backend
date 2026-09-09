@@ -139,6 +139,55 @@ async def verify_token_live(page_id: str, page_access_token: str, user_access_to
         return False, set()
 
 
+async def page_has_whatsapp_linked(page_id: str, access_token: str) -> Optional[bool]:
+    """Whether Meta itself says this Page has a WhatsApp number connected.
+
+    True/False when Meta answers cleanly, None when we genuinely cannot tell (an API
+    error, a missing token) — callers MUST treat None as "don't block", because a bad
+    read must never stop a real launch.
+
+    Why ask Meta rather than trust our own record: set_whatsapp_number stores the
+    number and sets whatsapp_page_linked=True the moment a client types it, which
+    proves only that they typed it. Linking is a manual OTP step in Meta's own Page
+    settings with no partner API, so our flag is optimism and this is evidence.
+
+    `whatsapp_number`/`has_whatsapp_number` are real fields (a nonexistent one 400s —
+    connected_whatsapp_business_account does), but their ABSENCE proves nothing. Page
+    203213912878798 returns neither field while Meta validates a native Click-to-
+    WhatsApp ad set on that same Page (live-verified 2026-09-09 via
+    execution_options=['validate_only']), because reading them needs
+    whatsapp_business_management — a scope this token does not hold, and Meta omits
+    what a token cannot see rather than erroring. So absence is reported as None
+    ("cannot tell"), never as False: a False here previously 409'd launches that
+    would have succeeded and mislabelled a linked Page as unlinked in the UI.
+
+    Only an explicit, present, falsey value is a real "no". Whether native Click-to-
+    WhatsApp is actually possible is decided at launch by dry-running the real ad set
+    (adapters/meta.py), which is the only oracle Meta answers reliably.
+    """
+    if not page_id or not access_token:
+        return None
+    graph_base = f"https://graph.facebook.com/{settings.FACEBOOK_API_VERSION}"
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                f"{graph_base}/{page_id}",
+                params={"fields": "whatsapp_number,has_whatsapp_number",
+                        "access_token": access_token},
+            )
+        data = resp.json()
+        if "error" in data:
+            print(f"[AdsConnection] whatsapp-link check inconclusive for {page_id}: "
+                  f"{data['error'].get('message')}", flush=True)
+            return None
+        if "whatsapp_number" not in data and "has_whatsapp_number" not in data:
+            return None
+        return bool(data.get("whatsapp_number") or data.get("has_whatsapp_number"))
+    except Exception as e:
+        print(f"[AdsConnection] whatsapp-link check failed for {page_id}: {e}", flush=True)
+        return None
+
+
 async def resolve_connection_state(
     db, user_id: Optional[str], brand_id: Optional[str], *, live_check: bool = True,
     require_whatsapp: bool = True,
@@ -185,8 +234,21 @@ async def resolve_connection_state(
             ads["_missing_scopes"] = [] if not valid else sorted(REQUIRED_ADS_SCOPES - granted)
             return ConnectionState.EXPIRED, ads
 
-    if require_whatsapp and not ads.get("whatsapp_page_linked"):
-        return ConnectionState.ADS_NO_WHATSAPP, ads
+    # Read the brand's ads WhatsApp number from the SAME place that sets it and that
+    # the launch path reads (jane_ads settings, via get_brand_whatsapp) — not
+    # whatsapp_page_linked on the social_connections doc, which nothing ever writes.
+    # That mismatch is why a brand with a saved number (GET /jane-ads/whatsapp
+    # returned it) still reported ads_no_whatsapp and showed "WhatsApp not linked
+    # yet" in Connected Accounts, live-confirmed 2026-09-09.
+    #
+    # Having the number is the whole requirement: a wa.me link ad needs no Meta-side
+    # linking, and whether the better native Click-to-WhatsApp form is available is
+    # settled at launch by dry-running the real ad set (adapters/meta.py).
+    if require_whatsapp:
+        from .whatsapp import get_brand_whatsapp
+
+        if not await get_brand_whatsapp(db, brand_id):
+            return ConnectionState.ADS_NO_WHATSAPP, ads
 
     return ConnectionState.READY, ads
 

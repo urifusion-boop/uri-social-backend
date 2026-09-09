@@ -58,6 +58,7 @@ FORMAT = AdFormatDef(
     name="The Censored Item",
     asset_source="upload",  # or `recomposite` — see module docstring; never `generate`
     layers_used="L4",
+    brand_mark="required",  # VSG-01-PROMPTS v2 §6.10
     requires=["product_photo"],
     requires_isolation=True,  # §6 names SEED-083 explicitly
 )

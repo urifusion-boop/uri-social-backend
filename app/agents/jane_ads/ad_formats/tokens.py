@@ -56,3 +56,15 @@ class AdFormatDef:
     layers_used: str          # "L4" | "L2-L4" | "L2-L3-L4"
     requires: List[str] = field(default_factory=list)  # Requirement values (§6 retrieval gate)
     requires_isolation: bool = False  # SEED-079 usage cap
+    brand_mark: str = "optional"  # VSG-01-PROMPTS v2 §0 item 1 / §5 — "required" |
+                                    # "optional" | "prohibited". Overrides the Brand
+                                    # Overlay Spec's logo-on-by-default (v3 §1.5) for
+                                    # formats a logo actively damages (Borrowed
+                                    # Interface, News Headline, Humour/Cartoon) or
+                                    # that need one to read as an ad at all (Review
+                                    # Card, Receipt, Us vs Them, Testimonial + Offer,
+                                    # Day1->Day30, Censored Item). Attribution always
+                                    # comes from Meta's own Sponsored label + Page
+                                    # name regardless of this value — nothing here
+                                    # governs whether the ad is attributed, only
+                                    # whether a logo belongs in frame.

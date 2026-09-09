@@ -399,3 +399,82 @@ def test_brand_page_is_used_even_when_its_whatsapp_was_never_linked_in_meta():
                new=AsyncMock(return_value=(True, REQUIRED_ADS_SCOPES))):
         result = _run(resolve_ads_page_for_launch(db, None, "brnd_1"))
     assert result["page_id"] == "pg_brand"
+
+
+# ── Does Meta itself say this Page has WhatsApp connected? ──
+
+def _run_(coro):
+    import asyncio
+    return asyncio.get_event_loop().run_until_complete(coro)
+
+
+def _graph(payload, raises=None):
+    from unittest.mock import AsyncMock, MagicMock
+    client = AsyncMock()
+    if raises is not None:
+        client.get = AsyncMock(side_effect=raises)
+    else:
+        r = MagicMock()
+        r.json = lambda: payload
+        client.get = AsyncMock(return_value=r)
+    return client
+
+
+def test_page_with_a_whatsapp_number_reads_as_linked():
+    from unittest.mock import patch
+    from app.agents.jane_ads.ads_connection import page_has_whatsapp_linked
+
+    with patch("httpx.AsyncClient") as cls:
+        cls.return_value.__aenter__.return_value = _graph(
+            {"id": "1", "whatsapp_number": "2348031234567"})
+        assert _run_(page_has_whatsapp_linked("1", "tok")) is True
+
+
+def test_absent_fields_read_as_unknown_not_as_not_linked():
+    """Absence proves NOTHING and must never read as False.
+
+    This asserted the opposite until 2026-09-09, when the real API disproved it: Page
+    203213912878798 returns neither whatsapp_number nor has_whatsapp_number, yet Meta
+    validates a native Click-to-WhatsApp ad set on that very Page
+    (execution_options=['validate_only'] returned success). Reading those fields needs
+    whatsapp_business_management, which this token does not hold, and Meta omits what a
+    token cannot see instead of erroring — so absence means "cannot tell".
+
+    The old False 409'd launches that would have succeeded and labelled a working Page
+    "WhatsApp not linked yet" in Connected Accounts."""
+    from unittest.mock import patch
+    from app.agents.jane_ads.ads_connection import page_has_whatsapp_linked
+
+    with patch("httpx.AsyncClient") as cls:
+        cls.return_value.__aenter__.return_value = _graph({"id": "1"})
+        assert _run_(page_has_whatsapp_linked("1", "tok")) is None
+
+
+def test_an_explicit_negative_still_reads_as_not_linked():
+    """A field that is PRESENT and falsey is a real answer from Meta, unlike absence."""
+    from unittest.mock import patch
+    from app.agents.jane_ads.ads_connection import page_has_whatsapp_linked
+
+    with patch("httpx.AsyncClient") as cls:
+        cls.return_value.__aenter__.return_value = _graph(
+            {"id": "1", "has_whatsapp_number": False})
+        assert _run_(page_has_whatsapp_linked("1", "tok")) is False
+
+
+def test_an_inconclusive_answer_is_none_so_it_can_never_block_a_launch():
+    """A Graph error or an exception must return None, not False. The launch gate
+    only blocks on an explicit False — a bad read stopping real launches would be
+    far worse than letting an unlinked Page through."""
+    from unittest.mock import patch
+    from app.agents.jane_ads.ads_connection import page_has_whatsapp_linked
+
+    with patch("httpx.AsyncClient") as cls:
+        cls.return_value.__aenter__.return_value = _graph({"error": {"message": "nope"}})
+        assert _run_(page_has_whatsapp_linked("1", "tok")) is None
+
+    with patch("httpx.AsyncClient") as cls:
+        cls.return_value.__aenter__.return_value = _graph(None, raises=RuntimeError("down"))
+        assert _run_(page_has_whatsapp_linked("1", "tok")) is None
+
+    assert _run_(page_has_whatsapp_linked("", "tok")) is None
+    assert _run_(page_has_whatsapp_linked("1", "")) is None

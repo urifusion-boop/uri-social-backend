@@ -334,6 +334,8 @@ class BrandProfileRequest(BaseModel):
     style_selections: Optional[List[str]] = None
     style_prompt_fragments: Optional[List[str]] = None
     style_rotation_index: Optional[int] = None
+    ad_format_selections: Optional[List[str]] = None
+    ad_format_rotation_index: Optional[int] = None
     selected_custom_guides: Optional[List[str]] = None  # Custom visual guide V1 IDs (array)
     selected_custom_guides_v2: Optional[List[str]] = None  # Custom visual guide V2 IDs (array)
     # Per-platform visual style overrides — additive, optional. A platform
@@ -1615,7 +1617,10 @@ async def tiktok_direct_finalize(
 # page (that's POST /{business_id}/owned_pages, deliberately not used here).
 
 @router.get("/connect/facebook-ads/initiate")
-async def facebook_ads_initiate(source: Optional[str] = Query("settings")):
+async def facebook_ads_initiate(
+    source: Optional[str] = Query("settings"),
+    rerequest: int = Query(0),
+):
     """Redirect to Facebook's OAuth page requesting advertising-scoped permissions
     for a Page, on top of the standard page-management scopes."""
     import urllib.parse
@@ -1640,18 +1645,22 @@ async def facebook_ads_initiate(source: Optional[str] = Query("settings")):
         "scope": ",".join(scopes),
         "response_type": "code",
         "state": source or "settings",
-        # Facebook's consent dialog does NOT re-prompt for a permission the user
-        # already decided on (granted OR declined) in a past login, even across
-        # completely different Page connections — it silently reuses that old
-        # decision. Live-confirmed on real connections: the first-ever connect got
-        # ads_management + pages_manage_ads granted; every later connect by the same
-        # person, for different Pages, silently carried forward whatever was
-        # decided that first time and came back WITHOUT them. auth_type=rerequest
-        # forces Facebook to show every requested permission again on every call,
-        # regardless of prior history, which is exactly what a per-brand ads
-        # connection needs — one person may connect several distinct Pages.
-        "auth_type": "rerequest",
     }
+    # auth_type=rerequest re-prompts ONLY the permissions the person previously
+    # DECLINED. It does not force every requested permission to re-display, so
+    # for someone who already granted the whole set there is nothing left to
+    # re-request and Facebook renders a completely EMPTY dialog — the flow
+    # dead-ends on a blank facebook.com page with no error and no code.
+    # Live-confirmed 2026-09-09 on an app administrator holding all five scopes.
+    #
+    # So the first dialog never sends it: when everything is already granted,
+    # Facebook redirects straight back with a code (exactly what we want), and
+    # when something is missing it prompts for the missing ones normally. The
+    # callback then verifies the grant against REQUIRED_ADS_SCOPES and only comes
+    # back through here with rerequest=1 if a required scope really is missing —
+    # which is the one case rerequest is actually needed for and can render.
+    if rerequest:
+        params["auth_type"] = "rerequest"
     auth_url = f"https://www.facebook.com/{settings.FACEBOOK_API_VERSION}/dialog/oauth?" + urllib.parse.urlencode(params)
     return RedirectResponse(auth_url)
 
@@ -1720,6 +1729,46 @@ async def facebook_ads_callback(
             )
             ll_data = ll_resp.json()
             long_token = ll_data.get("access_token", short_token)
+
+            # Facebook's dialog can hand back a SUBSET of the requested scopes: a
+            # permission declined on any past login for this app is silently reused
+            # without being shown again. auth_type=rerequest is what re-prompts
+            # those, but it can only be used here — sending it on the FIRST dialog
+            # renders an empty page for anyone who already granted everything
+            # (nothing left to re-request), which is what dead-ended the connect
+            # flow on a blank facebook.com page.
+            #
+            # So verify the actual grant and bounce back through the dialog with
+            # rerequest ONLY when a required scope is genuinely missing. `state`
+            # carries a one-shot marker so a permanent decline can't loop.
+            from app.agents.jane_ads.ads_connection import REQUIRED_ADS_SCOPES
+
+            already_rerequested = (state or "").endswith("|rr")
+            source = (state or "settings").removesuffix("|rr") or "settings"
+
+            perms_resp = await client.get(
+                f"{graph_base}/me/permissions", params={"access_token": long_token}
+            )
+            granted = {
+                row.get("permission")
+                for row in (perms_resp.json().get("data") or [])
+                if row.get("status") == "granted"
+            }
+            missing = REQUIRED_ADS_SCOPES - granted
+            if missing and not already_rerequested:
+                initiate = (
+                    f"{_base}/social-media/connect/facebook-ads/initiate"
+                    f"?source={urllib.parse.quote(source + '|rr')}&rerequest=1"
+                )
+                print(f"[FBAdsOAuth] ⚠️ missing scopes {sorted(missing)} — re-requesting")
+                return RedirectResponse(initiate)
+            if missing:
+                err_msg = urllib.parse.quote(
+                    "Facebook did not grant: "
+                    + ", ".join(sorted(missing))
+                    + ". Please approve every permission on the Facebook screen."
+                )
+                return RedirectResponse(f"{base_redirect}&connected=false&error={err_msg}")
 
             pages_resp = await client.get(
                 f"{graph_base}/me/accounts",

@@ -48,7 +48,8 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from app.core.config import settings
 from .base import AdPlatformAdapter
-from ..destination import link_for_plan
+from .. import constants as C
+from ..destination import DestinationType, link_for_plan
 from ..geo import meta_targeting_from_geo
 from ..models import (
     CampaignPlan,
@@ -255,6 +256,39 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
         # our DB — invisible in 'My Campaigns' and unmanageable from the app. Six such
         # orphans were found on the real account. Track what we created and undo it on
         # any failure, so a partial launch never leaves anything behind.
+        # Meta's NATIVE Click-to-WhatsApp, or a plain wa.me link ad?
+        #
+        # Native is the better ad by some distance: Meta optimises for conversations
+        # actually started rather than link clicks, and it is the only form that fires
+        # messaging_conversation_started — a wa.me link ad can never report a single
+        # conversation, which is why those campaigns showed "WhatsApp conversations 0"
+        # and "cost per conversation N/A" while genuinely running and delivering clicks.
+        #
+        # It has one hard requirement: the number must be LINKED to the Page inside
+        # Meta. Without that, create fails with "This WhatsApp phone number is not
+        # linked to your account" (code=100, subcode=1487246) and review fails with
+        # #2446880 — both live-confirmed, and the reason this was originally abandoned.
+        # Whether the number is linked is decided by DRY-RUNNING the real ad set
+        # payload, not by reading a Page field. GET /{page}?fields=whatsapp_number,
+        # has_whatsapp_number is not a usable oracle: for a Page that Meta will
+        # happily accept a native CTWA ad set on, both fields come back ABSENT, so
+        # the old check returned False and silently downgraded every such campaign
+        # to a wa.me link ad (and 409'd the launch gate). Live-verified 2026-09-09
+        # on Page 203213912878798, whose fields are empty while
+        # destination_type=WHATSAPP + promoted_object={page_id} validates clean.
+        #
+        # execution_options=['validate_only'] runs Meta's full validation and
+        # creates nothing, so asking is free and the answer is the same one the
+        # real create would give: valid means native works, subcode 1487246 means
+        # that number is not linked to this Page. It runs after the campaign
+        # exists because validation needs a real campaign_id.
+        want_native_whatsapp = bool(
+            not is_followers_goal
+            and destination.type == DestinationType.WHATSAPP
+            and plan.whatsapp_number
+        )
+        use_native_whatsapp = want_native_whatsapp
+
         campaign_id = ""
         adset_id = ""
         creative_id = ""
@@ -269,7 +303,16 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                         # sends the tap to a wa.me link, which is traffic off-platform —
                         # OUTCOME_TRAFFIC is the objective that allows LINK_CLICKS
                         # optimisation (confirmed live against the real ad account).
-                        "objective": "OUTCOME_ENGAGEMENT" if is_followers_goal else "OUTCOME_TRAFFIC",
+                        # OUTCOME_TRAFFIC is what allows LINK_CLICKS optimisation for a
+                        # link ad. A followers campaign and a native Click-to-WhatsApp
+                        # one are both real on-platform engagement, so both take
+                        # OUTCOME_ENGAGEMENT — CONVERSATIONS optimisation is not
+                        # available under OUTCOME_TRAFFIC.
+                        "objective": (
+                            "OUTCOME_ENGAGEMENT"
+                            if (is_followers_goal or use_native_whatsapp)
+                            else "OUTCOME_TRAFFIC"
+                        ),
                         "status": "PAUSED",
                         "special_ad_categories": [],
                         # Budget lives on the ad set (per-business isolation via caps.py/
@@ -333,14 +376,64 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                     # what whatsapp.py's own design already assumed ("no per-brand
                     # Facebook Page required, just their number"). Optimising for
                     # LINK_CLICKS is the matching goal — CONVERSATIONS only counts
-                    # native WhatsApp threads Meta can see.
-                    adset_payload["optimization_goal"] = "LINK_CLICKS"
+                    # native WhatsApp threads Meta can see, which is precisely why the
+                    # native form above is used whenever the Page actually allows it.
+                    if use_native_whatsapp:
+                        adset_payload["optimization_goal"] = "CONVERSATIONS"
+                        adset_payload["destination_type"] = "WHATSAPP"
+                        # Meta validates this pair at create time and rejects a number
+                        # that isn't linked to the Page — the check before the campaign
+                        # was created exists so that rejection can't reach a client.
+                        adset_payload["promoted_object"] = {
+                            "page_id": plan.page_id,
+                            "whatsapp_phone_number": plan.whatsapp_number,
+                        }
+                    else:
+                        adset_payload["optimization_goal"] = "LINK_CLICKS"
+
                 adset_resp = await client.post(
                     f"{self._graph_base}/act_{self._ad_account_id}/adsets",
                     params={"access_token": self._access_token},
                     json=adset_payload,
                 )
                 adset_data = adset_resp.json()
+
+                # Meta is the only reliable oracle for "is this number linked to this
+                # Page", and it answers by rejecting the create with subcode 1487246.
+                # A failed ad set create leaves NOTHING behind, so retrying as a wa.me
+                # link ad is safe and costs no extra call on the path that works —
+                # unlike the Page-field check this replaced, which returned False for a
+                # Page that Meta happily accepts native ads on and so downgraded every
+                # such campaign (live-verified 2026-09-09 on page 203213912878798).
+                #
+                # Only 1487246 falls back. Every other error must surface as itself
+                # rather than be silently turned into a lesser ad.
+                if (
+                    want_native_whatsapp
+                    and use_native_whatsapp
+                    and (adset_data.get("error") or {}).get("error_subcode") == 1487246
+                ):
+                    print(
+                        f"[MetaAds] {plan.whatsapp_number} is not linked to page "
+                        f"{plan.page_id} — retrying as a wa.me link ad",
+                        flush=True,
+                    )
+                    use_native_whatsapp = False
+                    # A NEW dict rather than mutating the rejected one: httpx holds a
+                    # reference to what was sent, so editing it in place would rewrite
+                    # the record of the first attempt too.
+                    adset_payload = {
+                        k: v for k, v in adset_payload.items()
+                        if k not in ("destination_type", "promoted_object")
+                    }
+                    adset_payload["optimization_goal"] = "LINK_CLICKS"
+                    adset_resp = await client.post(
+                        f"{self._graph_base}/act_{self._ad_account_id}/adsets",
+                        params={"access_token": self._access_token},
+                        json=adset_payload,
+                    )
+                    adset_data = adset_resp.json()
+
                 _raise_for_error(adset_data, "ad set creation")
                 adset_id = adset_data["id"]
 
@@ -359,7 +452,15 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                     # the destination has to ride on the CTA's value.link — which
                     # WHATSAPP_MESSAGE refuses to carry. destination.meta_cta owns that
                     # whole choice.
-                    cta = destination.meta_call_to_action(plan.creative.is_video)
+                    if use_native_whatsapp:
+                        # The native button carries no link: the ad set's
+                        # destination_type/promoted_object own the routing, and
+                        # WHATSAPP_MESSAGE refuses a value.link (which is exactly why
+                        # the link-ad path can't use it). Works for photo and video
+                        # alike, since neither needs a link on the CTA here.
+                        cta = {"type": "WHATSAPP_MESSAGE"}
+                    else:
+                        cta = destination.meta_call_to_action(plan.creative.is_video)
                 if plan.creative.is_video:
                     object_story_spec = {
                         "page_id": plan.page_id,
@@ -380,7 +481,15 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                             # there. For every other goal this is the REAL destination:
                             # wa.me/<the brand's number>. It used to be a bare
                             # "https://wa.me/" with no number, which went nowhere.
-                            "link": f"https://www.facebook.com/{plan.page_id}" if is_followers_goal else dest_link,
+                            # A native Click-to-WhatsApp ad routes through the ad set,
+                            # not through a link — Meta rejects a wa.me URL sitting in a
+                            # link-destination field (#2446860), which is what Ads
+                            # Manager complains about on the link-ad form.
+                            "link": (
+                                f"https://www.facebook.com/{plan.page_id}"
+                                if (is_followers_goal or use_native_whatsapp)
+                                else dest_link
+                            ),
                             "picture": plan.creative.image_url,
                             "call_to_action": cta,
                         },
@@ -423,6 +532,11 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                 "business_id": plan.business_id,
                 "platform": "meta",
                 "last_conversation_count": 0,
+                # The billing basis this campaign was SOLD under, frozen here so the
+                # meter can never re-base a live campaign onto a later fee change
+                # (billing.py reads this per record). Campaigns launched before this
+                # field existed fall back to C.LEGACY_AD_SPEND_MARKUP.
+                "ad_spend_markup": C.AD_SPEND_MARKUP,
                 "created_at": datetime.now(timezone.utc),
             }},
             upsert=True,
