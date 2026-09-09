@@ -741,12 +741,18 @@ async def select_and_render_vsg01_creative(
 
     `forced_format_id` — the user picked a specific format from the
     alternatives shown by POST /jane-ads/creative/suggest-format (the "change"
-    link next to the suggested style). If it's present in the SAME ranked/
-    eligible list this function would have used anyway, it's tried first;
-    otherwise (stale id, ineligible for this request) it's silently ignored
-    and ranking proceeds normally — an override can never force a format the
-    business isn't actually eligible for, and a bad override never breaks
-    generation.
+    link next to the suggested style) for THIS one ad. If it's present in the
+    SAME ranked/eligible list this function would have used anyway, it's tried
+    first; otherwise (stale id, ineligible for this request) it's silently
+    ignored and ranking proceeds normally — an override can never force a
+    format the business isn't actually eligible for, and a bad override never
+    breaks generation.
+
+    When no per-request override is given, falls back to the brand's own
+    standing preference — `brand_context["ad_format_selections"]` (set via the
+    Brand Playbook's "Visual Styles — Ads" gallery, same idea as organic's
+    `style_selections`) — using the FIRST selected format that's actually
+    eligible for this request, same fail-open contract as forced_format_id.
     """
     candidate_ids, has_product_photo, has_real_customer_photo, photo_url = _vsg01_candidate_params(
         photo_url=photo_url, photo_attestation=photo_attestation, recomposite=recomposite,
@@ -756,10 +762,17 @@ async def select_and_render_vsg01_creative(
         db, has_product_photo=has_product_photo, has_real_customer_photo=has_real_customer_photo,
         candidate_ids=candidate_ids,
     )
-    if forced_format_id and any(s.strategy_id == forced_format_id for s in ranked):
+    ranked_ids = {s.strategy_id for s in ranked}
+    effective_forced = forced_format_id if forced_format_id in ranked_ids else None
+    if effective_forced is None:
+        for preferred_id in (brand_context or {}).get("ad_format_selections") or []:
+            if preferred_id in ranked_ids:
+                effective_forced = preferred_id
+                break
+    if effective_forced:
         ranked = (
-            [s for s in ranked if s.strategy_id == forced_format_id]
-            + [s for s in ranked if s.strategy_id != forced_format_id]
+            [s for s in ranked if s.strategy_id == effective_forced]
+            + [s for s in ranked if s.strategy_id != effective_forced]
         )
     for strategy in ranked:
         result = await render_vsg01_creative(
