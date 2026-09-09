@@ -243,7 +243,7 @@ async def _generate_candidate_concepts(
     existing_assets_summary: str,
     creative_memory: Dict[str, Any],
     platforms: List[str],
-    cultural_moments: Optional[List[Dict[str, Any]]] = None,
+    cultural_moments: Optional[List[Any]] = None,  # entries are strings today (CulturalMomentService.get_trending_topics)
     industry_best_practices: Optional[Any] = None,
     target_count: int = CANDIDATE_POOL_SIZE,
 ) -> List[Dict[str, Any]]:
@@ -280,8 +280,17 @@ async def _generate_candidate_concepts(
     if industry_best_practices:
         context_lines.append(f"Industry best practices: {industry_best_practices}")
     if cultural_moments:
-        names = [m.get("name") or m.get("topic") or str(m) for m in cultural_moments[:5]]
-        context_lines.append(f"Relevant cultural moments this period: {', '.join(str(n) for n in names)}")
+        # CulturalMomentService.get_trending_topics() (what generate_plan_v2
+        # actually calls this list from) always returns List[str] — a
+        # SEPARATE method, get_cultural_moments(), returns List[Dict] with a
+        # "name" key. Handle both shapes defensively rather than assume one
+        # (confirmed live: assuming dicts crashed every real call, since
+        # trending_topics is what's actually wired in).
+        names = [
+            (m.get("name") or m.get("topic") or str(m)) if isinstance(m, dict) else str(m)
+            for m in cultural_moments[:5]
+        ]
+        context_lines.append(f"Relevant cultural moments this period: {', '.join(names)}")
     context_block = ("\n" + "\n".join(context_lines)) if context_lines else ""
 
     avoid_block = ""
@@ -1107,7 +1116,7 @@ async def generate_plan_v2(
     # Date/holiday/cultural signals — still valid, non-performance inputs (PRD §18)
     all_dates = [(period_start + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(PLAN_DAYS)]
     holidays_by_date: Dict[str, Dict[str, Any]] = {}
-    cultural_moments_all: List[Dict[str, Any]] = []
+    cultural_moments_all: List[Any] = []  # strings (CulturalMomentService.get_trending_topics), not dicts
     for chunk_start_idx in range(0, PLAN_DAYS, 7):
         chunk_week_start = all_dates[chunk_start_idx]
         for h in HolidayCalendarService.get_upcoming_holidays(chunk_week_start, region, industry) or []:
