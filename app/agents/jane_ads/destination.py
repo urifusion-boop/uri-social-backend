@@ -138,10 +138,7 @@ DESTINATION_OPTIONS: list[dict] = [
         # messaging_conversation_started only for native WhatsApp destinations). We
         # cannot detect the mismatch and warn later either — reading a Page's linked
         # number needs whatsapp_business_management, which our token doesn't hold.
-        "input_note": (
-            "Use the number linked to your Facebook Page in Meta. A different number "
-            "still works, but the ad can't report WhatsApp conversations."
-        ),
+        "input_note": "Must match the number linked to your Facebook Page in Meta.",
         "placeholder": "0803 123 4567",
         # Was False while WhatsApp used Meta's native WHATSAPP_MESSAGE button. It's a
         # plain link ad now, so its button is chooseable like any other destination's.
