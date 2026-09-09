@@ -68,3 +68,40 @@ class AdFormatDef:
                                     # name regardless of this value — nothing here
                                     # governs whether the ad is attributed, only
                                     # whether a logo belongs in frame.
+
+
+from typing import Dict, List as _List, Optional  # noqa: E402 (kept near the dataclass above)
+
+
+def logo_badge_layers(
+    brand_logo_url: Optional[str], canvas_width: int, canvas_height: int, z_start: int,
+) -> tuple[_List[Dict], int]:
+    """A small bottom-right logo badge — white rounded backing (for
+    legibility over any content underneath) + the brand's real logo image —
+    used by every format whose own build_document() doesn't already reserve
+    dedicated header space for a brand mark (Receipt and Review Card do
+    their own top-of-canvas placement; this is the shared fallback for the
+    rest). Returns ([], z_start) unchanged when there's no real logo to
+    place — never fabricates one, matching every other brand_logo_url
+    caller's own contract. Purely additive (drawn last, on top of existing
+    content) so it never risks the careful per-format wrap/overflow math
+    each layout already has tuned.
+    """
+    if not brand_logo_url:
+        return [], z_start
+    badge_w, badge_h, pad, margin = 140, 56, 10, 24
+    x = canvas_width - badge_w - margin
+    y = canvas_height - badge_h - margin
+    z = z_start
+    layers = [
+        {
+            "type": "shape", "z_index": z + 1, "shape": "rounded_rect",
+            "x": x - pad, "y": y - pad, "width": badge_w + 2 * pad, "height": badge_h + 2 * pad,
+            "corner_radius": 12, "fill_color": "#FFFFFFE6",
+        },
+        {
+            "type": "brand_asset", "z_index": z + 2,
+            "url": brand_logo_url, "x": x, "y": y, "width": badge_w, "height": badge_h,
+        },
+    ]
+    return layers, z + 2

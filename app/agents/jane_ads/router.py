@@ -531,6 +531,27 @@ async def list_ad_formats(_token: dict = Depends(JWTBearer())) -> dict:
 _VSG01_BOOTSTRAP_SECRET = "vsg01-corpus-bootstrap-2026-dev-only"
 
 
+# TEMPORARY — settles whether the deployed container's DejaVu Sans Bold
+# actually covers the Dingbats glyphs (✓ ✗ ★) the redesigned ad formats now
+# draw as text, rather than assuming from a local dev-machine test (which
+# falls back to Pillow's limited default font and would false-negative).
+# Delete alongside the other TEMPORARY endpoints above.
+@router.get("/admin/debug-glyph-test.png")
+async def debug_glyph_test(x_bootstrap_secret: str = Header(...)):
+    if x_bootstrap_secret != _VSG01_BOOTSTRAP_SECRET:
+        raise HTTPException(status_code=403, detail="Not authorized.")
+    from app.agents.social_media_manager.services.document_renderer_service import DocumentRendererService
+    document = {
+        "canvas": {"width": 400, "height": 150, "background_color": "#FFFFFF"},
+        "layers": [
+            {"type": "text", "z_index": 1, "content": "✓ ✗ ★ ☆", "x": 20, "y": 20,
+             "font_size": 60, "font_weight": 700, "color": "#000000"},
+        ],
+    }
+    png_bytes = await DocumentRendererService.render_to_png(document)
+    return Response(content=png_bytes, media_type="image/png")
+
+
 @router.post("/admin/bootstrap-vsg01-corpus")
 async def bootstrap_vsg01_corpus(
     x_bootstrap_secret: str = Header(...),
@@ -2768,26 +2789,6 @@ async def _build_campaign_plan(
     )
 
 
-def _stated_budget_ngn(record: dict) -> float:
-    """The budget the CLIENT typed for a launched campaign, from its stored record.
-
-    Records hold `budget_ngn` as the AD SPEND sent to Meta, which is the stated budget
-    minus URI's fee — so reading it straight back showed a ₦20,000 campaign as
-    ₦18,000 and read as money vanishing.
-
-    `charged_upfront_ngn` is the exact amount debited at launch and so is the truest
-    answer when present. Older records predate it and are reconstructed from the
-    markup stamped on them, falling back to LEGACY_AD_SPEND_MARKUP for records from
-    before the fee model changed — the same precedence billing.py uses, so the figure
-    shown always matches the figure charged."""
-    charged = record.get("charged_upfront_ngn")
-    if charged:
-        return round(float(charged), 2)
-    ad_spend = float(record.get("budget_ngn") or 0)
-    markup = float(record.get("ad_spend_markup") or C.LEGACY_AD_SPEND_MARKUP)
-    return round(ad_spend * markup, 2)
-
-
 def _total_due_ngn(ad_spend_ngn: float) -> float:
     """What the customer's wallet must cover for a campaign whose AD SPEND is
     `ad_spend_ngn` — which is the client's stated budget, since URI's fee was already
@@ -3406,7 +3407,7 @@ async def meta_campaigns(
             # at launch, so it wins when present; otherwise it's reconstructed from the
             # markup stamped on the record (legacy records carry none, hence the
             # LEGACY_AD_SPEND_MARKUP fallback billing.py already uses).
-            "budget_ngn": _stated_budget_ngn(r),
+            "budget_ngn": C.stated_budget_from_record(r),
             # What Meta actually received, kept for anything that needs the real spend.
             "ad_spend_ngn": r.get("budget_ngn"),
             "goal": r.get("goal", ""),

@@ -217,12 +217,14 @@ async def _content_us_vs_them(business_name: str, category: str, description: st
 
 
 async def _build_us_vs_them(business_name: str, category: str, description: str, tokens: dict,
-                            photo_url: Optional[str] = None):
+                            photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None):
     rows = await _content_us_vs_them(business_name, category, description)
     if not rows:
         return None
     try:
-        document = us_vs_them.build_document(rows, canvas_size=_CANVAS_SIZE, tokens=tokens)
+        document = us_vs_them.build_document(
+            rows, canvas_size=_CANVAS_SIZE, tokens=tokens, brand_logo_url=brand_logo_url,
+        )
     except Exception as e:
         print(f"[VSG01] Us vs Them build failed: {e}", flush=True)
         return None
@@ -256,7 +258,12 @@ async def _content_borrowed_interface(business_name: str, category: str, descrip
 
 
 async def _build_borrowed_interface(business_name: str, category: str, description: str, tokens: dict,
-                                    photo_url: Optional[str] = None):
+                                    photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None):
+    # brand_logo_url accepted (uniform call signature across every builder) but
+    # deliberately never used — VSG-01-PROMPTS v2 §6.6: "A logo destroys this
+    # format" (brand_mark="prohibited"). render_vsg01_creative never actually
+    # passes one here (gated on format_def.brand_mark), so this is belt-and-
+    # suspenders, not the real enforcement point.
     turns = await _content_borrowed_interface(business_name, category, description)
     if not turns:
         return None
@@ -312,7 +319,7 @@ async def _content_problem_solution(business_name: str, category: str, descripti
 
 
 async def _build_problem_solution(business_name: str, category: str, description: str, tokens: dict,
-                                  photo_url: Optional[str] = None):
+                                  photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None):
     content = await _content_problem_solution(business_name, category, description)
     if not content:
         return None
@@ -346,7 +353,7 @@ async def _build_problem_solution(business_name: str, category: str, description
         # own docstring) — no separate check_legibility call needed here.
         document = problem_solution.build_document(
             problem_url, solution_url, content["problem_text"], content["solution_text"],
-            canvas_size=_CANVAS_SIZE, tokens=tokens,
+            canvas_size=_CANVAS_SIZE, tokens=tokens, brand_logo_url=brand_logo_url,
         )
     except Exception as e:
         print(f"[VSG01] Problem/Solution build failed: {e}", flush=True)
@@ -422,7 +429,7 @@ async def _content_receipt(description: str) -> Optional[dict]:
 
 
 async def _build_receipt(business_name: str, category: str, description: str, tokens: dict,
-                         photo_url: Optional[str] = None):
+                         photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None):
     from .ad_formats import receipt
     content = await _content_receipt(description)
     if not content or not content["total_amount"]:
@@ -431,6 +438,7 @@ async def _build_receipt(business_name: str, category: str, description: str, to
         document = receipt.build_document(
             content["items"], content["total_label"], content["total_amount"],
             business_name=business_name, canvas_size=_CANVAS_SIZE, tokens=tokens,
+            brand_logo_url=brand_logo_url,
         )
     except Exception as e:
         print(f"[VSG01] Receipt build failed: {e}", flush=True)
@@ -444,7 +452,7 @@ async def _build_receipt(business_name: str, category: str, description: str, to
 # ── SEED-093: Review Card (needs a real, attested product photo) ─────────
 
 async def _build_review_card(business_name: str, category: str, description: str, tokens: dict,
-                             photo_url: Optional[str] = None):
+                             photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None):
     if not photo_url:
         return None
     real = await _extract_real_quote(description)
@@ -454,6 +462,7 @@ async def _build_review_card(business_name: str, category: str, description: str
         document = review_card.build_document(
             photo_url, real["quote"], real["attribution"] or "A happy customer",
             star_rating=real["star_rating"], canvas_size=_CANVAS_SIZE, tokens=tokens,
+            brand_logo_url=brand_logo_url,
         )
     except Exception as e:
         print(f"[VSG01] Review Card build failed: {e}", flush=True)
@@ -500,7 +509,7 @@ async def _content_text_on_a_face(business_name: str, category: str, description
 
 
 async def _build_text_on_a_face(business_name: str, category: str, description: str, tokens: dict,
-                                photo_url: Optional[str] = None):
+                                photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None):
     if not photo_url:
         return None
     statement = await _content_text_on_a_face(business_name, category, description)
@@ -513,6 +522,7 @@ async def _build_text_on_a_face(business_name: str, category: str, description: 
         # happens) IS the permission confirmation this format requires.
         return text_on_a_face.build_document(
             photo_url, stmt, permission_on_file=True, canvas_size=_CANVAS_SIZE, tokens=tokens,
+            brand_logo_url=brand_logo_url,
         )
 
     try:
@@ -562,7 +572,7 @@ async def _content_offer(business_name: str, category: str, description: str) ->
 
 
 async def _build_testimonial_offer(business_name: str, category: str, description: str, tokens: dict,
-                                   photo_url: Optional[str] = None):
+                                   photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None):
     if not photo_url:
         return None
     real = await _extract_real_quote(description)
@@ -574,6 +584,7 @@ async def _build_testimonial_offer(business_name: str, category: str, descriptio
             photo_url, real["quote"], real["attribution"] or "A happy customer",
             offer["offer_text"], permission_on_file=True,
             price_or_terms=offer["price_or_terms"], canvas_size=_CANVAS_SIZE, tokens=tokens,
+            brand_logo_url=brand_logo_url,
         )
     except Exception as e:
         print(f"[VSG01] Testimonial + Offer build failed: {e}", flush=True)
@@ -611,7 +622,7 @@ async def _content_starter_pack(business_name: str, category: str, description: 
 
 
 async def _build_starter_pack(business_name: str, category: str, description: str, tokens: dict,
-                              photo_url: Optional[str] = None):
+                              photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None):
     if not photo_url:
         return None
     content = await _content_starter_pack(business_name, category, description)
@@ -634,7 +645,7 @@ async def _build_starter_pack(business_name: str, category: str, description: st
     try:
         document = starter_pack.build_document(
             item_urls, item_labels, photo_url, content["product_label"],
-            canvas_size=_CANVAS_SIZE, tokens=tokens,
+            canvas_size=_CANVAS_SIZE, tokens=tokens, brand_logo_url=brand_logo_url,
         )
     except Exception as e:
         print(f"[VSG01] Starter Pack build failed: {e}", flush=True)
@@ -681,8 +692,17 @@ async def render_vsg01_creative(
         return None
     format_def = FORMAT_MODULES[strategy.strategy_id].FORMAT
     tokens = resolve_brand_tokens((brand_context or {}).get("brand_colors"))
+    # The user's actual real logo (Brand Playbook), never fabricated. Withheld
+    # entirely for a brand_mark="prohibited" format (a logo actively damages
+    # the mechanism there — §6.6/§6.8/§6.12) regardless of whether one is on
+    # file; every other format gets it when the brand actually has one.
+    brand_logo_url = (
+        (brand_context or {}).get("logo_url") if format_def.brand_mark != "prohibited" else None
+    )
 
-    document = await builder(business_name, category, description, tokens, photo_url=photo_url)
+    document = await builder(
+        business_name, category, description, tokens, photo_url=photo_url, brand_logo_url=brand_logo_url,
+    )
     if document is None:
         return None
 

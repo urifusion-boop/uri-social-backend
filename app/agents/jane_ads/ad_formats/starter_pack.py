@@ -61,7 +61,7 @@ from typing import Dict, List, Optional, Tuple
 from ..layer2_generation import generate_scene
 from .legibility import assert_legible
 from ._text_metrics import wrap_text
-from .tokens import AdFormatDef, PLACEHOLDER_TOKENS
+from .tokens import AdFormatDef, PLACEHOLDER_TOKENS, logo_badge_layers
 from app.agents.social_media_manager.services.document_renderer_service import DocumentRendererService
 
 FORMAT = AdFormatDef(
@@ -126,6 +126,7 @@ def build_document(
     product_index: Optional[int] = None,
     canvas_size: Tuple[int, int] = (1080, 1080),
     tokens: Dict[str, str] = None,
+    brand_logo_url: str = None,
 ) -> Dict:
     """
     item_image_urls / item_labels: the surrounding items — real Layer 2
@@ -190,6 +191,9 @@ def build_document(
             "x": cell_x + cell_w // 2, "y": cell_y + cell_h + 8,
             "font_size": _FONT_LABEL, "color": t["ink-quiet"], "text_align": "ma",
         })
+
+    badge_layers, z = logo_badge_layers(brand_logo_url, width, height, z)
+    layers.extend(badge_layers)
 
     document = {
         "canvas": {"width": width, "height": height, "background_color": t["surface"]},
