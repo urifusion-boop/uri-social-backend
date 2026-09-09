@@ -121,12 +121,100 @@ RECOMPOSITE_PHOTO_FORMAT_IDS = UPLOAD_PHOTO_FORMAT_IDS | {"SEED-088"}
 _CANVAS_SIZE = (1080, 1080)
 
 
+# ── Content fit (Layer 2) ─────────────────────────────────────────────────
+# Eligibility (retrieval.py, above) answers "what CAN this business run" —
+# photo/budget/platform facts about the account. It has no idea what the ad
+# actually SAYS. This layer narrows among the already-eligible formats using
+# real phrases the business itself wrote in `description` — it never makes
+# an ineligible format eligible, and a format with no phrase match is never
+# penalized, just left in its original (eligibility-score) order. Cheap,
+# deterministic keyword matching on purpose, not an LLM classification call:
+# no added latency/cost on every suggestion, and a keyword either is or
+# isn't in the text — nothing here is inferred or invented from the words,
+# matching this module's existing "never fabricate" contract for content.
+_CONTENT_FIT_SIGNALS: dict[str, tuple[str, ...]] = {
+    # Us vs Them — the brief itself frames a comparison.
+    "SEED-075": (
+        "vs ", "vs.", "versus", "unlike other", "unlike most", "compared to",
+        "better than", "while other", "other salons", "other brands",
+        "other shops", "not like other",
+    ),
+    # Price-Led Offer — a concrete price, discount, or markdown is stated.
+    # UPLOAD_PHOTO_FORMAT_IDS only (needs a real product photo to composite
+    # the price onto) — see module docstring's Precedence note: this signal
+    # can only ever win when a photo was actually provided.
+    "SEED-096": (
+        "% off", "percent off", "discount", "was ₦", "was $", "was £",
+        "now ₦", "now $", "now only", "limited time price", "price drop",
+        "slash", "half price",
+    ),
+    # Receipt — the NO_PHOTO-eligible home for the exact same price-drop
+    # signal above. A business that states a real price/discount but has no
+    # product photo yet still deserves a price-shaped format, not whatever
+    # ranked first with no content match at all — Receipt is built exactly
+    # for real, stated prices (see `_content_receipt`'s own "never invent a
+    # price" contract). Once a photo is actually attached, candidate_ids
+    # moves to UPLOAD_PHOTO_FORMAT_IDS and SEED-096 above takes over instead.
+    "SEED-081": (
+        "% off", "percent off", "discount", "was ₦", "was $", "was £",
+        "now ₦", "now $", "now only", "limited time price", "price drop",
+        "slash", "half price",
+    ),
+    # Testimonial+Offer / Review Card — a real customer's own words are quoted.
+    "SEED-074": (
+        "customer said", "she said", "he said", "they said", '"',
+        "testimonial", "highly recommend", "loved it", "changed my",
+    ),
+    "SEED-093": ("review", "star rating", "rated us", "5 stars", "customer said"),
+    # Problem/Solution — the brief names a pain point before the fix.
+    "SEED-080": (
+        "tired of", "struggling with", "frustrat", "no more", "fix your",
+        "sick of", "fed up",
+    ),
+    # Work In Progress — the brief is about an unfinished process, not a result.
+    "SEED-098": (
+        "coming soon", "in progress", "under construction", "still building",
+        "work in progress", "sneak peek", "underway",
+    ),
+    # Starter Pack — the brief describes a bundle/kit, not a single item.
+    "SEED-088": (
+        "starter kit", "starter pack", "bundle", "set includes",
+        "everything you need", "comes with",
+    ),
+    # Text-Only — an explicit single bold statement, no product/photo framing.
+    "SEED-097": ("just says", "one line", "bold statement", "headline that reads"),
+}
+
+
+def _content_fit_boost(description: str) -> dict[str, float]:
+    """Returns {format_id: 1.0} for every format whose signal phrases appear
+    verbatim in the business's own stated brief — empty dict (no boost, no
+    reorder) when nothing matches, which is the common case and the safe
+    default."""
+    text = (description or "").lower()
+    return {fid: 1.0 for fid, phrases in _CONTENT_FIT_SIGNALS.items() if any(p in text for p in phrases)}
+
+
+# The corpus's OWN authored fallback — problem_solution's record in
+# vsg01_corpus_seed.py literally says "Default choice when nothing more
+# specific fits — lowest policy risk in the library... any business,
+# especially where no more specific format applies." Nothing invented here;
+# this just actually uses that stated intent instead of leaving the "no
+# content signal" case to fall back on retrieval.py's score() — which is
+# grade x transfer x recency x origin (corpus data-quality/freshness), a
+# real and correct signal for OTHER categories but not a fit signal at all.
+# Without this, "nothing matched" silently meant "whichever record happens
+# to be freshest," which is not a logical match to anything about this ad.
+_DEFAULT_FORMAT_ID = "SEED-080"
+
+
 async def select_ranked_ad_formats(
     db, *,
     has_product_photo: bool = False,
     has_real_customer_photo: bool = False,
     isolated_ad_account: bool = False,
     candidate_ids: Optional[frozenset] = None,
+    description: str = "",
 ) -> list[Strategy]:
     """The actual §6 retrieval-time gate, applied to the CREATIVE_FORMATS
     category specifically. Reuses retrieval.py's exclusion_reason/retrieve
@@ -143,7 +231,14 @@ async def select_ranked_ad_formats(
     `select_and_render_vsg01_creative` tries them in order, not just the
     top one, so one candidate's content step coming up empty doesn't fall
     all the way back to the generic image while a lower-ranked real format
-    could still have worked."""
+    could still have worked.
+
+    `description` — the business's own ad brief — applies Layer 2 content-fit
+    on top of the eligibility ranking above (see `_content_fit_boost`): any
+    eligible format whose signal phrases appear in the brief is moved ahead
+    of eligible formats with no match, preserving the eligibility order
+    within each group (stable sort). Empty/no-match `description` leaves the
+    eligibility order exactly as retrieval.py produced it."""
     if db is None:
         return []
     approved = await MongoStrategyStore(db).fetch_approved()
@@ -173,7 +268,21 @@ async def select_ranked_ad_formats(
         profile=profile,
     )
     result = retrieve(candidates, req, limit=len(candidates))
-    return result.records
+    records = result.records
+    fit = _content_fit_boost(description)
+    if fit:
+        records = sorted(records, key=lambda s: -fit.get(s.strategy_id, 0.0))
+    else:
+        # No specific content signal fired — prefer the corpus's own
+        # documented generic default (see _DEFAULT_FORMAT_ID) over whatever
+        # wins on data-freshness score alone. A no-op when it isn't in this
+        # request's eligible pool (e.g. the upload-photo path, where it was
+        # never a candidate) — falls through to plain eligibility order.
+        records = (
+            [s for s in records if s.strategy_id == _DEFAULT_FORMAT_ID]
+            + [s for s in records if s.strategy_id != _DEFAULT_FORMAT_ID]
+        )
+    return records
 
 
 async def _call_content_model(prompt: str) -> Optional[dict]:
@@ -944,6 +1053,14 @@ async def select_and_render_vsg01_creative(
     Brand Playbook's "Visual Styles — Ads" gallery, same idea as organic's
     `style_selections`) — using the FIRST selected format that's actually
     eligible for this request, same fail-open contract as forced_format_id.
+
+    Precedence, highest first: an explicit `forced_format_id` > a standing
+    Playbook preference > `description`'s own content-fit signal (Layer 2,
+    see `_content_fit_boost`) > the corpus's documented generic default
+    (`_DEFAULT_FORMAT_ID`, only when NO content signal fired) > plain
+    eligibility order (last resort). Each layer only reorders what the layer
+    below it already found eligible — none of them can make an ineligible
+    format render.
     """
     candidate_ids, has_product_photo, has_real_customer_photo, photo_url = _vsg01_candidate_params(
         photo_url=photo_url, photo_attestation=photo_attestation, recomposite=recomposite,
@@ -951,7 +1068,7 @@ async def select_and_render_vsg01_creative(
 
     ranked = await select_ranked_ad_formats(
         db, has_product_photo=has_product_photo, has_real_customer_photo=has_real_customer_photo,
-        candidate_ids=candidate_ids,
+        candidate_ids=candidate_ids, description=description,
     )
     ranked_ids = {s.strategy_id for s in ranked}
     effective_forced = forced_format_id if forced_format_id in ranked_ids else None
