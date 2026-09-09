@@ -16,7 +16,7 @@ from typing import Optional
 
 import httpx
 from fastapi import (
-    APIRouter, Body, Depends, File, HTTPException, Query, Request, UploadFile,
+    APIRouter, Body, Depends, File, Header, HTTPException, Query, Request, UploadFile,
 )
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from motor.motor_asyncio import AsyncIOMotorDatabase
@@ -519,6 +519,48 @@ async def list_ad_formats(_token: dict = Depends(JWTBearer())) -> dict:
     formats = [_serialize_vsg01_format(r, is_planned=False) for r in VSG01_FORMAT_RECORDS]
     formats += [_serialize_vsg01_format(r, is_planned=True) for r in PLANNED_FORMAT_RECORDS]
     return {"formats": formats}
+
+
+# TEMPORARY — same pattern/secret as the original corpus bootstrap this session
+# (already deleted once the first 12 were seeded). Re-added, narrower this
+# time: only ingests+approves strategies not ALREADY approved, so it's safe
+# to run again now that 3 more format modules (Price-Led Offer, Text-Only,
+# Work In Progress) exist without touching the original 12. Delete again
+# after use, same as before.
+_VSG01_BOOTSTRAP_SECRET = "vsg01-corpus-bootstrap-2026-dev-only"
+
+
+@router.post("/admin/bootstrap-vsg01-corpus")
+async def bootstrap_vsg01_corpus(
+    x_bootstrap_secret: str = Header(...),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+) -> dict:
+    if x_bootstrap_secret != _VSG01_BOOTSTRAP_SECRET:
+        raise HTTPException(status_code=403, detail="Not authorized.")
+
+    from .entities import StrategyCategory
+    from .store import MongoStrategyStore
+    from .vsg01_corpus_seed import build_vsg01_strategies
+
+    store = MongoStrategyStore(db)
+    await store.ensure_indexes()
+
+    already_approved = {
+        s.strategy_id for s in await store.fetch_approved() if s.category is StrategyCategory.CREATIVE_FORMATS
+    }
+    strategies = [s for s in build_vsg01_strategies() if s.strategy_id not in already_approved]
+    if not strategies:
+        return {"status": "already_seeded", "count": len(already_approved), "strategy_ids": sorted(already_approved)}
+
+    for s in strategies:
+        await store.ingest(s)
+    newly_approved = []
+    for s in strategies:
+        a = await store.approve(s.strategy_id, version=s.version, approved_by="dev-bootstrap-endpoint")
+        newly_approved.append(a.strategy_id)
+
+    final = [s for s in await store.fetch_approved() if s.category is StrategyCategory.CREATIVE_FORMATS]
+    return {"status": "seeded", "newly_added": newly_approved, "total_count": len(final)}
 
 
 class SuggestAdFormatBody(BaseModel):
