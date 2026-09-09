@@ -27,6 +27,9 @@ async def get_campaign_history(db, business_id: str, limit: int = 3) -> list[dic
             {
                 "_id": 0, "campaign_id": 1, "display_name": 1, "category": 1,
                 "goal": 1, "budget_ngn": 1, "city": 1, "headline": 1, "created_at": 1,
+                # Needed to report the budget the CLIENT stated rather than the ad
+                # spend stored in budget_ngn — see remembered_budget_ngn below.
+                "charged_upfront_ngn": 1, "ad_spend_markup": 1,
             },
         ).sort("created_at", -1).limit(limit)
         return await cursor.to_list(length=limit)
@@ -47,4 +50,14 @@ def remembered_category(history: list[dict]) -> str:
 
 
 def remembered_budget_ngn(history: list[dict]) -> Optional[float]:
-    return next((h["budget_ngn"] for h in history if h.get("budget_ngn")), None)
+    """The budget the CLIENT stated last time, not the ad spend that was stored.
+
+    Records keep budget_ngn as the AD SPEND (stated budget less URI's fee), so
+    returning it raw had Jane telling a client "your past campaign was around
+    ₦18,000" about the campaign they had budgeted ₦20,000 for — and, worse, offering
+    to reuse that ₦18,000 as the new budget, which would shrink the campaign by 10%
+    every time they accepted."""
+    from . import constants as C
+
+    rec = next((h for h in history if h.get("budget_ngn")), None)
+    return C.stated_budget_from_record(rec) if rec else None
