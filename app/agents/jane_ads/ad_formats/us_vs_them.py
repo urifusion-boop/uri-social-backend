@@ -112,6 +112,12 @@ def build_document(
     label_gap = 8
     value_line_height = int(_FONT_VALUE * 1.3)
     row_gap_after = 32
+    # Reserved width for the ✓/✗ glyph in front of each value — confirmed
+    # rendering correctly with the renderer's own DejaVu Sans Bold (Unicode
+    # Dingbats coverage checked directly, not assumed). Subtracted from the
+    # wrap width up front so adding the icon can never push a value that
+    # already fit right to the edge of overflowing.
+    icon_gap = 48
 
     # Pre-measure every row's wrapped content so both columns can share one
     # row height each while still fitting whichever side wraps to more
@@ -126,8 +132,8 @@ def build_document(
     # is the right trade-off when centring costs nothing.
     measured_rows = []
     for row_label, them_value, us_value in rows:
-        them_lines = wrap_text(them_value, col_width, _FONT_VALUE)
-        us_lines = wrap_text(us_value, col_width, _FONT_VALUE)
+        them_lines = wrap_text(them_value, col_width - icon_gap, _FONT_VALUE)
+        us_lines = wrap_text(us_value, col_width - icon_gap, _FONT_VALUE)
         n_lines = max(len(them_lines), len(us_lines))
         row_height = label_height + label_gap + n_lines * value_line_height + row_gap_after
         measured_rows.append((row_label, them_lines, us_lines, row_height))
@@ -145,14 +151,26 @@ def build_document(
             "x": x, "y": header_y, "font_size": _FONT_HEADER, "font_weight": 700, "color": t["ink"],
         })
 
-    # Column backgrounds (fields the row content sits on) — left on
-    # `surface` (already the canvas colour, so no separate fill needed),
-    # right on `field`, running the full height of the rows.
+    # Column card (the row content sits on `field`, rounded — a plain sharp
+    # rect read as a spreadsheet, not an ad) — left stays on `surface` (the
+    # canvas colour already, no fill needed) so the contrast between "the
+    # old way" and "with us" is itself part of the comparison.
+    card_x, card_y = right_x - 24, rows_top - 16
+    card_w, card_h = col_width + 48, total_rows_height + 16
+    z += 1
+    layers.append({
+        "type": "shape", "z_index": z, "shape": "rounded_rect",
+        "x": card_x, "y": card_y, "width": card_w, "height": card_h,
+        "corner_radius": 20, "fill_color": t["field"],
+    })
+    # Accent edge on the winning side — the one deliberate colour hit in an
+    # otherwise two-tone layout, reading "this is the answer" at a glance
+    # before any text is read.
     z += 1
     layers.append({
         "type": "shape", "z_index": z, "shape": "rect",
-        "x": right_x - 24, "y": rows_top - 16, "width": col_width + 48, "height": total_rows_height + 16,
-        "fill_color": t["field"],
+        "x": card_x, "y": card_y, "width": 10, "height": card_h,
+        "fill_color": t["accent"],
     })
 
     row_y = rows_top
@@ -164,10 +182,19 @@ def build_document(
         })
 
         value_y = row_y + label_height + label_gap
+        # ✗ in the same muted tone as the method it's rejecting — the glyph
+        # reads as "not this" without needing its own attention-grabbing
+        # colour; the accent card + ✓ on the other side already carries the
+        # contrast.
+        z += 1
+        layers.append({
+            "type": "text", "z_index": z, "content": "✗",
+            "x": left_x, "y": value_y, "font_size": _FONT_VALUE, "font_weight": 700, "color": t["ink-quiet"],
+        })
         z += 1
         layers.append({
             "type": "text", "z_index": z, "content": "\n".join(them_lines),
-            "x": left_x, "y": value_y, "font_size": _FONT_VALUE, "color": t["ink-quiet"],
+            "x": left_x + icon_gap, "y": value_y, "font_size": _FONT_VALUE, "color": t["ink-quiet"],
         })
 
         z += 1
@@ -178,8 +205,13 @@ def build_document(
 
         z += 1
         layers.append({
+            "type": "text", "z_index": z, "content": "✓",
+            "x": right_x, "y": value_y, "font_size": _FONT_VALUE, "font_weight": 700, "color": t["accent"],
+        })
+        z += 1
+        layers.append({
             "type": "text", "z_index": z, "content": "\n".join(us_lines),
-            "x": right_x, "y": value_y, "font_size": _FONT_VALUE, "font_weight": 700, "color": t["ink"],
+            "x": right_x + icon_gap, "y": value_y, "font_size": _FONT_VALUE, "font_weight": 700, "color": t["ink"],
         })
 
         if i > 0:
