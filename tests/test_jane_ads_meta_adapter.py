@@ -90,6 +90,20 @@ def _mock_client(responses):
     return client
 
 
+# Meta's rejection of the native Click-to-WhatsApp form. Whether the brand's number
+# is linked to the Page is only knowable by asking Meta, and this is how it answers:
+# code=100/subcode=1487246 on the ad set create. The adapter retries as a wa.me link
+# ad, which is safe because a failed ad set create leaves nothing behind.
+_NATIVE_REJECTED = {
+    "error": {
+        "message": "Invalid parameter",
+        "code": 100,
+        "error_subcode": 1487246,
+        "error_user_msg": "This WhatsApp phone number is not linked to your account",
+    }
+}
+
+
 def _adapter(db=None) -> MetaAdPlatformAdapter:
     return MetaAdPlatformAdapter(db or FakeDb(), ad_account_id="123", access_token="tok")
 
@@ -203,27 +217,26 @@ def test_launch_campaign_creates_full_chain_and_stores_record():
     assert result.ad_ids == {"b1": "ad_1"}
     assert result.platforms == [Platform.META]
 
-    # wa.me LINK ad, not Meta's native Click-to-WhatsApp: the native form needs each
-    # number hand-linked to the Page inside Meta (no partner API), which rejected every
-    # launch with subcode 1487246 and cannot scale across brands on one shared Page.
+    # A WhatsApp-destination plan ATTEMPTS Meta's native Click-to-WhatsApp first —
+    # it's the only form that fires messaging_conversation_started. Meta accepting the
+    # ad set (as mocked here) is what proves the number is linked; the wa.me link ad is
+    # the fallback for when it rejects with subcode 1487246, not the default.
     campaign_json = mock_client.post.call_args_list[0].kwargs["json"]
-    assert campaign_json["objective"] == "OUTCOME_TRAFFIC"
+    assert campaign_json["objective"] == "OUTCOME_ENGAGEMENT"
     adset_json = mock_client.post.call_args_list[1].kwargs["json"]
-    assert adset_json["optimization_goal"] == "LINK_CLICKS"
-    # No native WhatsApp routing — that is precisely what required the linking.
-    assert "destination_type" not in adset_json
-    assert "promoted_object" not in adset_json
+    assert adset_json["optimization_goal"] == "CONVERSATIONS"
+    assert adset_json["destination_type"] == "WHATSAPP"
+    assert adset_json["promoted_object"] == {
+        "page_id": "pg123", "whatsapp_phone_number": "2348031234567",
+    }
     creative_spec = mock_client.post.call_args_list[2].kwargs["json"]["object_story_spec"]
     assert creative_spec["page_id"] == "pg123"
-    # The tap goes to a real chat with the brand's own number (it used to be a bare
-    # "https://wa.me/" with no number, which went nowhere), pre-filled with an opener
-    # (live-confirmed: an empty chat with an unfamiliar number got 186 clicks and zero
-    # messages — see test_wa_link_prefills_an_opening_message below).
-    assert creative_spec["link_data"]["link"].startswith("https://wa.me/2348031234567?text=")
-    # CONTACT_US, not Meta's native WHATSAPP_MESSAGE: the native button needs the Page
-    # to have a WhatsApp number connected and is blocked at review without it
-    # (#2446880). The wa.me link on the CTA is the destination either way.
-    assert creative_spec["link_data"]["call_to_action"]["type"] == "CONTACT_US"
+    # The ad set owns the routing on the native form, so the button carries no link —
+    # WHATSAPP_MESSAGE refuses a value.link ("Too many parameters in Call to Action",
+    # code=105, subcode=1815630), which is why only the fallback path can use a
+    # wa.me URL. See test_an_unlinked_page_falls_back_to_the_wa_me_link_ad.
+    assert creative_spec["link_data"]["call_to_action"] == {"type": "WHATSAPP_MESSAGE"}
+    assert "wa.me" not in creative_spec["link_data"]["link"]
     ad_json = mock_client.post.call_args_list[3].kwargs["json"]
     assert ad_json  # ad creation call still happens after creative
 
@@ -415,8 +428,10 @@ def test_launch_campaign_deletes_the_campaign_when_a_later_step_fails():
     adapter = _adapter(db)
     responses = [
         {"id": "cmp_1"},                                                      # campaign created
-        {"error": {"message": "WhatsApp number not linked", "code": 100,      # ad set REJECTED
-                   "error_subcode": 1487246}},
+        # Deliberately NOT subcode 1487246 — that one is retried as a wa.me link ad
+        # rather than failing, so it would never reach the rollback this asserts.
+        {"error": {"message": "Invalid bid strategy", "code": 100,             # ad set REJECTED
+                   "error_subcode": 2490487}},
         {"success": True},                                                    # rollback DELETE
     ]
     with patch("httpx.AsyncClient") as MockClient:
@@ -517,7 +532,10 @@ def test_video_creative_carries_the_wa_link_on_the_cta():
         {"id": "vid_1"},                                                    # video upload
         {"status": {"video_status": "ready"}},                              # poll
         {"data": [{"uri": "https://thumb/1.jpg", "is_preferred": True}]},   # thumbnails
-        {"id": "cmp_1"}, {"id": "adset_1"}, {"id": "creative_1"}, {"id": "ad_1"},
+        {"id": "cmp_1"},          # campaign
+        _NATIVE_REJECTED,         # native ad set refused — number not linked
+        {"id": "adset_1"},        # retried as a wa.me link ad
+        {"id": "creative_1"}, {"id": "ad_1"},
     ]
     plan = _plan(creative=AdCreative(image_url="https://cdn/ad.mp4", is_video=True,
                                      headline="h", primary_text="p"))
@@ -540,15 +558,126 @@ def test_wa_link_prefills_an_opening_message():
     db = FakeDb()
     adapter = _adapter(db)
     responses = [
-        {"id": "cmp_1"}, {"id": "adset_1"}, {"id": "creative_1"}, {"id": "ad_1"},
+        {"id": "cmp_1"},          # campaign
+        _NATIVE_REJECTED,         # native ad set refused — number not linked
+        {"id": "adset_1"},        # retried as a wa.me link ad
+        {"id": "creative_1"}, {"id": "ad_1"},
     ]
     with patch("httpx.AsyncClient") as MockClient:
         mock_client = _mock_client(responses)
         MockClient.return_value.__aenter__.return_value = mock_client
         _run(adapter.launch_campaign(_plan(), _auth()))
 
-    creative_spec = mock_client.post.call_args_list[2].kwargs["json"]["object_story_spec"]
+    creative_spec = mock_client.post.call_args_list[3].kwargs["json"]["object_story_spec"]
     link = creative_spec["link_data"]["link"]
     assert link.startswith("https://wa.me/2348031234567?text=")
     from urllib.parse import unquote
     assert unquote(link.split("?text=", 1)[1]).strip()
+
+
+# ── Native Click-to-WhatsApp, and the fallback when Meta says the number isn't linked ──
+#
+# There is no pre-flight Page-field check any more. GET /{page}?fields=whatsapp_number,
+# has_whatsapp_number is not a usable oracle — it returns neither field for a Page that
+# Meta accepts native ads on (live-verified 2026-09-09 on page 203213912878798, whose
+# ad set validated clean), so it downgraded campaigns that should have gone native.
+# Meta itself decides, by accepting or rejecting the real ad set.
+
+
+def test_linked_page_builds_a_native_click_to_whatsapp_ad():
+    """Native is the only form that fires messaging_conversation_started — a wa.me link
+    ad can never report a conversation, which is why those campaigns showed
+    "WhatsApp conversations 0" while genuinely delivering clicks."""
+    responses = [{"id": "cmp_1"}, {"id": "adset_1"}, {"id": "creative_1"}, {"id": "ad_1"}]
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client(responses)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        _run(_adapter().launch_campaign(_plan(), _auth()))
+
+    campaign = mock_client.post.call_args_list[0].kwargs["json"]
+    adset = mock_client.post.call_args_list[1].kwargs["json"]
+    spec = mock_client.post.call_args_list[2].kwargs["json"]["object_story_spec"]
+
+    # CONVERSATIONS optimisation isn't available under OUTCOME_TRAFFIC.
+    assert campaign["objective"] == "OUTCOME_ENGAGEMENT"
+    assert adset["optimization_goal"] == "CONVERSATIONS"
+    assert adset["destination_type"] == "WHATSAPP"
+    assert adset["promoted_object"] == {
+        "page_id": "pg123", "whatsapp_phone_number": "2348031234567",
+    }
+    # The button carries no link — the ad set owns the routing, and WHATSAPP_MESSAGE
+    # refuses a value.link, which is exactly why the link-ad path can't use it.
+    assert spec["link_data"]["call_to_action"] == {"type": "WHATSAPP_MESSAGE"}
+    assert "wa.me" not in spec["link_data"]["link"]
+
+
+def test_an_unlinked_page_falls_back_to_the_wa_me_link_ad():
+    """Unlinked Pages must keep launching. Meta refuses the native ad set with subcode
+    1487246 and creates nothing, so retrying as a wa.me link ad is what stops a
+    campaign failing to launch at all."""
+    responses = [
+        {"id": "cmp_1"},          # campaign
+        _NATIVE_REJECTED,         # native ad set refused
+        {"id": "adset_1"},        # retried as a wa.me link ad
+        {"id": "creative_1"}, {"id": "ad_1"},
+    ]
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client(responses)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        _run(_adapter().launch_campaign(_plan(), _auth()))
+
+    native_adset = mock_client.post.call_args_list[1].kwargs["json"]
+    retried_adset = mock_client.post.call_args_list[2].kwargs["json"]
+    spec = mock_client.post.call_args_list[3].kwargs["json"]["object_story_spec"]
+
+    # The native form was genuinely attempted — that attempt IS the check.
+    assert native_adset["destination_type"] == "WHATSAPP"
+    # The retry drops every trace of it, or Meta would refuse it again.
+    assert "destination_type" not in retried_adset
+    assert "promoted_object" not in retried_adset
+    assert retried_adset["optimization_goal"] == "LINK_CLICKS"
+    # The campaign was already created as OUTCOME_ENGAGEMENT and is not recreated;
+    # LINK_CLICKS is valid under it (live-verified against the real API 2026-09-09).
+    assert mock_client.post.call_args_list[0].kwargs["json"]["objective"] == "OUTCOME_ENGAGEMENT"
+    assert spec["link_data"]["link"].startswith("https://wa.me/")
+    assert spec["link_data"]["call_to_action"]["type"] == "CONTACT_US"
+
+
+def test_only_the_not_linked_error_falls_back_every_other_one_surfaces():
+    """The retry exists for exactly one Meta error. Treating any ad set failure as
+    "must not be linked" would silently ship a lesser ad — and hide a real bug — so
+    anything but subcode 1487246 has to fail the launch and roll the campaign back."""
+    responses = [
+        {"id": "cmp_1"},                                                  # campaign
+        {"error": {"message": "Invalid parameter", "code": 100,           # a DIFFERENT error
+                   "error_subcode": 1885183}},
+        {"success": True},                                                # rollback DELETE
+    ]
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client(responses)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        with pytest.raises(MetaAPIError, match="ad set creation"):
+            _run(_adapter().launch_campaign(_plan(), _auth()))
+
+    # Exactly one ad set attempt — no retry, no downgrade.
+    adset_calls = [c for c in mock_client.post.call_args_list if "adsets" in c.args[0]]
+    assert len(adset_calls) == 1
+    assert mock_client.delete.await_count == 1
+
+
+def test_a_website_destination_never_goes_native():
+    """Native routing is only right when the client actually chose WhatsApp. A website
+    campaign must not even ATTEMPT the native form — no destination_type, and so no
+    chance of the 1487246 retry — however linked the Page is."""
+    plan = _plan(destination_type="website", destination_link="https://example.com/shop")
+    responses = [{"id": "cmp_1"}, {"id": "adset_1"}, {"id": "creative_1"}, {"id": "ad_1"}]
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client(responses)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        _run(_adapter().launch_campaign(plan, _auth()))
+
+    adset = mock_client.post.call_args_list[1].kwargs["json"]
+    spec = mock_client.post.call_args_list[2].kwargs["json"]["object_story_spec"]
+    assert adset["optimization_goal"] == "LINK_CLICKS"
+    assert "destination_type" not in adset
+    assert spec["link_data"]["link"] == "https://example.com/shop"

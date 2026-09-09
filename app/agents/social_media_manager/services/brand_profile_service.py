@@ -184,6 +184,13 @@ class BrandProfileService:
             doc["style_selections"] = data["style_selections"]
         if "style_prompt_fragments" in data:
             doc["style_prompt_fragments"] = data["style_prompt_fragments"]
+        # VSG-01 ad format preference (Brand Playbook "Visual Styles — Ads" section) —
+        # same shape as style_selections/style_rotation_index above, but a separate
+        # field since it selects a corpus format_id, not an organic style_library slug.
+        if "ad_format_selections" in data:
+            doc["ad_format_selections"] = data["ad_format_selections"]
+        if "ad_format_rotation_index" in data:
+            doc["ad_format_rotation_index"] = data["ad_format_rotation_index"]
         if "font_style" in data:
             doc["font_style"] = data["font_style"]
         if "font_style_prompt" in data:
@@ -431,6 +438,8 @@ class BrandProfileService:
             "approval_workflow":    profile.get("approval_workflow", ""),
             "style_selections":     profile.get("style_selections") or [],
             "style_rotation_index": int(profile.get("style_rotation_index") or 0),
+            "ad_format_selections":     profile.get("ad_format_selections") or [],
+            "ad_format_rotation_index": int(profile.get("ad_format_rotation_index") or 0),
             "cta_rotation_index":   int(profile.get("cta_rotation_index") or 0),
             "font_style":           profile.get("font_style", ""),
             "font_style_prompt":    profile.get("font_style_prompt", ""),

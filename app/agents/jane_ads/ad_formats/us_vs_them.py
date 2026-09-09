@@ -24,6 +24,7 @@ FORMAT = AdFormatDef(
     name="Us vs Them",
     asset_source="drawn",
     layers_used="L4",
+    brand_mark="required",  # VSG-01-PROMPTS v2 §6.4
     requires=[],
 )
 

@@ -700,12 +700,29 @@ async def render_vsg01_creative(
     return {"png_bytes": png_bytes, "format_id": strategy.strategy_id, "attributes": attributes}
 
 
+def _vsg01_candidate_params(
+    *, photo_url: Optional[str], photo_attestation: Optional[str], recomposite: bool,
+) -> tuple[Optional[frozenset], bool, bool, Optional[str]]:
+    """The exact candidate_ids/has_product_photo/has_real_customer_photo logic
+    select_and_render_vsg01_creative already used inline — factored out so the
+    pre-generation suggest-format endpoint (router.py's POST /jane-ads/creative/
+    suggest-format) computes the SAME eligible pool a real generation call
+    would, rather than a second hand-maintained copy that could drift."""
+    if photo_url and photo_attestation:
+        candidate_ids = RECOMPOSITE_PHOTO_FORMAT_IDS if recomposite else UPLOAD_PHOTO_FORMAT_IDS
+        has_product_photo = photo_attestation == "product_photo"
+        has_real_customer_photo = photo_attestation == "real_customer_photo"
+        return candidate_ids, has_product_photo, has_real_customer_photo, photo_url
+    return NO_PHOTO_FORMAT_IDS, False, False, None
+
+
 async def select_and_render_vsg01_creative(
     db, business_name: str, category: str, description: str,
     brand_context: Optional[dict] = None, *,
     photo_url: Optional[str] = None,
     photo_attestation: Optional[str] = None,
     recomposite: bool = False,
+    forced_format_id: Optional[str] = None,
 ) -> Optional[dict]:
     """The one call creative.py's GENERATE/UPLOAD/RECOMPOSITE paths need:
     select eligible formats from the real corpus (scoped to what this module
@@ -721,20 +738,42 @@ async def select_and_render_vsg01_creative(
     the GENERATE path, which has no real photo and must never claim one.
     `recomposite=True` additionally allows Starter Pack (needs a clean cutout
     — see module docstring); a plain upload does not.
+
+    `forced_format_id` — the user picked a specific format from the
+    alternatives shown by POST /jane-ads/creative/suggest-format (the "change"
+    link next to the suggested style) for THIS one ad. If it's present in the
+    SAME ranked/eligible list this function would have used anyway, it's tried
+    first; otherwise (stale id, ineligible for this request) it's silently
+    ignored and ranking proceeds normally — an override can never force a
+    format the business isn't actually eligible for, and a bad override never
+    breaks generation.
+
+    When no per-request override is given, falls back to the brand's own
+    standing preference — `brand_context["ad_format_selections"]` (set via the
+    Brand Playbook's "Visual Styles — Ads" gallery, same idea as organic's
+    `style_selections`) — using the FIRST selected format that's actually
+    eligible for this request, same fail-open contract as forced_format_id.
     """
-    if photo_url and photo_attestation:
-        candidate_ids = RECOMPOSITE_PHOTO_FORMAT_IDS if recomposite else UPLOAD_PHOTO_FORMAT_IDS
-        has_product_photo = photo_attestation == "product_photo"
-        has_real_customer_photo = photo_attestation == "real_customer_photo"
-    else:
-        candidate_ids = NO_PHOTO_FORMAT_IDS
-        has_product_photo = has_real_customer_photo = False
-        photo_url = None
+    candidate_ids, has_product_photo, has_real_customer_photo, photo_url = _vsg01_candidate_params(
+        photo_url=photo_url, photo_attestation=photo_attestation, recomposite=recomposite,
+    )
 
     ranked = await select_ranked_ad_formats(
         db, has_product_photo=has_product_photo, has_real_customer_photo=has_real_customer_photo,
         candidate_ids=candidate_ids,
     )
+    ranked_ids = {s.strategy_id for s in ranked}
+    effective_forced = forced_format_id if forced_format_id in ranked_ids else None
+    if effective_forced is None:
+        for preferred_id in (brand_context or {}).get("ad_format_selections") or []:
+            if preferred_id in ranked_ids:
+                effective_forced = preferred_id
+                break
+    if effective_forced:
+        ranked = (
+            [s for s in ranked if s.strategy_id == effective_forced]
+            + [s for s in ranked if s.strategy_id != effective_forced]
+        )
     for strategy in ranked:
         result = await render_vsg01_creative(
             strategy, business_name, category, description, brand_context, photo_url=photo_url,

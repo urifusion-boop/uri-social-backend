@@ -48,6 +48,8 @@ FORMAT = AdFormatDef(
     name="Humour / Cartoon",
     asset_source="generate",
     layers_used="L2-L4",
+    brand_mark="prohibited",  # VSG-01-PROMPTS v2 §6.12 — a logo kills a joke;
+                               # attribution comes from Meta's Sponsored label
     requires=[],
 )
 

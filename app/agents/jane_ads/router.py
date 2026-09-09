@@ -10,12 +10,13 @@ The HTML page is served from the backend so it calls /jane-ads/plan same-origin
 """
 from __future__ import annotations
 
+import json
 import re
 from typing import Optional
 
 import httpx
 from fastapi import (
-    APIRouter, Body, Depends, File, HTTPException, Query, Request, UploadFile,
+    APIRouter, Body, Depends, File, Header, HTTPException, Query, Request, UploadFile,
 )
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from motor.motor_asyncio import AsyncIOMotorDatabase
@@ -41,6 +42,9 @@ from .models import (
 )
 from .payments import JaneAdsPayments
 from .store import InMemoryWalletStore, MongoWalletStore
+from .vsg01_corpus_seed import PLANNED_FORMAT_RECORDS
+from .vsg01_corpus_seed import _RECORDS as VSG01_FORMAT_RECORDS
+from .vsg01_orchestrator import _BUILDERS as VSG01_WIRED_FORMAT_IDS
 from .wallet import InsufficientFundsError, MinimumTopUpError, WalletService
 
 router = APIRouter(prefix="/jane-ads", tags=["Jane + Ads (demo)"])
@@ -396,6 +400,10 @@ class CreativeForBrandBody(BaseModel):
     # "real_customer_photo" | None. None means exactly what it always meant — use the
     # photo as-is, no format-selection attempt. See creative_from_upload's docstring.
     asset_attestation: Optional[str] = None
+    # The user's own pick from POST /jane-ads/creative/suggest-format's alternatives
+    # ("change" on the Style row) — None means "use whatever ranks best" (unchanged
+    # default behaviour). See select_and_render_vsg01_creative's forced_format_id.
+    vsg01_format_id: Optional[str] = None
 
 
 @router.post("/creative/for-brand")
@@ -426,7 +434,7 @@ async def creative_for_brand(
             body.description, user_id=user_id, db=db, brand_id=brand_id,
             is_video=body.is_video, city=body.city,
             destination_type=destination_type, destination_cta=destination_cta,
-            asset_attestation=body.asset_attestation,
+            asset_attestation=body.asset_attestation, vsg01_format_id=body.vsg01_format_id,
         )
     elif body.source == "recomposite":
         if not body.reference_image_url:
@@ -435,7 +443,7 @@ async def creative_for_brand(
             body.business_name, body.category, body.reference_image_url, body.goal,
             body.description, user_id=user_id, db=db, brand_id=brand_id, city=body.city,
             destination_type=destination_type, destination_cta=destination_cta,
-            asset_attestation=body.asset_attestation,
+            asset_attestation=body.asset_attestation, vsg01_format_id=body.vsg01_format_id,
         )
     elif body.source == "draft":
         if not body.draft_id:
@@ -452,8 +460,174 @@ async def creative_for_brand(
             body.business_name, body.category, body.goal, body.description,
             user_id=user_id, db=db, brand_id=brand_id, city=body.city,
             destination_type=destination_type, destination_cta=destination_cta,
+            vsg01_format_id=body.vsg01_format_id,
         )
     return ad.model_dump()
+
+
+def _serialize_vsg01_format(record: dict, *, is_planned: bool) -> dict:
+    """Shared by GET /jane-ads/ad-formats and POST /jane-ads/creative/suggest-format
+    so the two never drift into two different shapes for the same format."""
+    if is_planned:
+        return {
+            "format_id": record["format_id"],
+            "name": record["name"],
+            "claim": record["claim"],
+            "mechanism": record["mechanism"],
+            "business_types": record["business_types"],
+            "modification_required": record["modification_required"],
+            "brand_mark": record["brand_mark"],
+            "asset_source": None,
+            "layers_used": None,
+            "requires": [],
+            "status": "planned",
+        }
+    format_def = record["format_module"].FORMAT
+    return {
+        "format_id": format_def.format_id,
+        "name": format_def.name,
+        "claim": record["claim"],
+        "mechanism": record["mechanism"],
+        "business_types": record["business_types"],
+        "modification_required": record["modification_required"],
+        "brand_mark": format_def.brand_mark,
+        "asset_source": format_def.asset_source,
+        "layers_used": format_def.layers_used,
+        "requires": format_def.requires,
+        "status": "live" if format_def.format_id in VSG01_WIRED_FORMAT_IDS else "built",
+    }
+
+
+@router.get("/ad-formats")
+async def list_ad_formats(_token: dict = Depends(JWTBearer())) -> dict:
+    """The Visual Styles — Ads library for the Brand Playbook and the in-flow
+    'Style: {name}' chip on a generated ad (VSG-01-PROMPTS v2 §6). Read-only,
+    not brand-scoped — every business sees the same format library; which
+    format actually renders for a given ad is a per-campaign retrieval
+    decision (see AdCreative.vsg01_format_id on the generated result), not a
+    standing choice made here.
+
+    status:
+      "live"    — wired into vsg01_orchestrator._BUILDERS, can actually be
+                  generated today
+      "built"   — has a real module + corpus record, but not yet wired into
+                  generation (News Headline/Day1->Day30/Censored Item need
+                  isolated ad accounts that don't exist yet; Humour/Cartoon
+                  needs a human-review workflow that doesn't exist yet)
+      "planned" — documented in VSG-01-PROMPTS v2, no module built yet
+    """
+    formats = [_serialize_vsg01_format(r, is_planned=False) for r in VSG01_FORMAT_RECORDS]
+    formats += [_serialize_vsg01_format(r, is_planned=True) for r in PLANNED_FORMAT_RECORDS]
+    return {"formats": formats}
+
+
+# TEMPORARY — one-off bootstrap, delete this endpoint once it's been called. No
+# in-app user can trigger this and JANE_ADS_ADMIN_EMAILS isn't set on dev, so this
+# uses its own throwaway shared secret rather than JWTBearer/admin-email gating.
+# Ingests the 12 VSG-01 corpus records as draft and approves them (see
+# vsg01_corpus_seed.seed_vsg01_corpus's own docstring — "real human approval is a
+# separate, deliberate step this function does not perform"). Idempotent: a repeat
+# call is a no-op once CREATIVE_FORMATS records are already approved.
+_VSG01_BOOTSTRAP_SECRET = "vsg01-corpus-bootstrap-2026-dev-only"
+
+
+@router.post("/admin/bootstrap-vsg01-corpus")
+async def bootstrap_vsg01_corpus(
+    x_bootstrap_secret: str = Header(...),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+) -> dict:
+    if x_bootstrap_secret != _VSG01_BOOTSTRAP_SECRET:
+        raise HTTPException(status_code=403, detail="Not authorized.")
+
+    from .entities import StrategyCategory
+    from .store import MongoStrategyStore
+    from .vsg01_corpus_seed import build_vsg01_strategies
+
+    store = MongoStrategyStore(db)
+    await store.ensure_indexes()
+
+    existing = [s for s in await store.fetch_approved() if s.category is StrategyCategory.CREATIVE_FORMATS]
+    if existing:
+        return {"status": "already_seeded", "count": len(existing),
+                "strategy_ids": [s.strategy_id for s in existing]}
+
+    strategies = build_vsg01_strategies()
+    for s in strategies:
+        await store.ingest(s)
+    approved = []
+    for s in strategies:
+        a = await store.approve(s.strategy_id, version=s.version, approved_by="dev-bootstrap-endpoint")
+        approved.append(a.strategy_id)
+
+    final = [s for s in await store.fetch_approved() if s.category is StrategyCategory.CREATIVE_FORMATS]
+    return {"status": "seeded", "count": len(final), "strategy_ids": approved}
+
+
+# TEMPORARY — dev-only debug lookup so a real browser test-signup can be verified
+# without inbox access. Same throwaway secret as the bootstrap endpoint above.
+# Delete alongside it.
+@router.get("/admin/debug-verification-code")
+async def debug_verification_code(
+    email: str,
+    x_bootstrap_secret: str = Header(...),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+) -> dict:
+    if x_bootstrap_secret != _VSG01_BOOTSTRAP_SECRET:
+        raise HTTPException(status_code=403, detail="Not authorized.")
+    user = await db["users"].find_one({"email": email})
+    if not user:
+        raise HTTPException(status_code=404, detail="No such user.")
+    return {"verification_code": user.get("verification_code")}
+
+
+class SuggestAdFormatBody(BaseModel):
+    asset_attestation: Optional[str] = None  # "product_photo" | "real_customer_photo" | None
+    recomposite: bool = False
+    is_video: bool = False
+
+
+@router.post("/creative/suggest-format")
+async def suggest_ad_format(
+    body: SuggestAdFormatBody,
+    brand_ctx: dict = Depends(get_active_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+) -> dict:
+    """The pre-generation 'Style — {name} · change' moment (mirrors
+    JaneVideoChat.tsx's plan.style row): the SAME ranking
+    select_and_render_vsg01_creative would use for a real generation call,
+    computed BEFORE generation so the frontend can show it and let the user
+    override it (vsg01_format_id on the actual generate/plan call).
+
+    Returns {"suggested": <format>|null, "alternatives": [<format>...]} —
+    null/empty whenever nothing is eligible (a plain video, no eligible
+    format for this business, or the VSG-01 corpus has nothing approved yet)
+    — never an error, matching every other fail-open point in this system.
+    """
+    if body.is_video:
+        return {"suggested": None, "alternatives": []}
+
+    from .vsg01_orchestrator import _vsg01_candidate_params, select_ranked_ad_formats
+
+    candidate_ids, has_product_photo, has_real_customer_photo, _ = _vsg01_candidate_params(
+        photo_url="x" if body.asset_attestation else None,  # only presence matters here
+        photo_attestation=body.asset_attestation,
+        recomposite=body.recomposite,
+    )
+    ranked = await select_ranked_ad_formats(
+        db, has_product_photo=has_product_photo, has_real_customer_photo=has_real_customer_photo,
+        candidate_ids=candidate_ids,
+    )
+    if not ranked:
+        return {"suggested": None, "alternatives": []}
+
+    by_id = {r["format_module"].FORMAT.format_id: r for r in VSG01_FORMAT_RECORDS}
+    serialized = [
+        _serialize_vsg01_format(by_id[s.strategy_id], is_planned=False)
+        for s in ranked if s.strategy_id in by_id
+    ]
+    if not serialized:
+        return {"suggested": None, "alternatives": []}
+    return {"suggested": serialized[0], "alternatives": serialized[1:]}
 
 
 @router.get("/creative/drafts")
@@ -606,10 +780,25 @@ async def wallet_webhook(
     request: Request,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ) -> dict:
-    """Squad → us. Credits the wallet on a successful top-up (idempotent). No JWT —
-    Squad calls this directly; only references we created are acted on."""
-    payload = await request.json()
-    return await JaneAdsPayments(db).handle_webhook(payload)
+    """Squad → us. Credits the wallet on a successful top-up (idempotent).
+
+    No JWT — Squad calls this directly — so the HMAC-SHA512 signature is what
+    authenticates it. Without that check, anyone who guessed a reference could POST a
+    fake "success" here and credit a real wallet with money nobody paid; "only
+    references we created are acted on" is not authentication, because references are
+    predictable in shape and returned to the client.
+
+    Rejecting an unsigned or badly-signed call cannot lose a real payment: the
+    top-up's reference is persisted client-side and verified directly against Squad
+    on the next page load, which credits idempotently by the same reference.
+    """
+    raw_body = await request.body()
+    signature = request.headers.get("x-squad-encrypted-body", "")
+    payments = JaneAdsPayments(db)
+    if not await payments.verify_webhook_signature(raw_body, signature):
+        print("[JaneAdsWallet] rejected webhook with a missing/invalid signature", flush=True)
+        raise HTTPException(status_code=401, detail="invalid signature")
+    return await payments.handle_webhook(json.loads(raw_body))
 
 
 @router.get("/wallet/{business_id}/balance")
@@ -944,13 +1133,36 @@ async def jane_meta_connection_status(
     (never inferred from a single boolean), so the frontend can render the exact
     matching prompt. `connect_url` is only meaningful for states that need the
     OAuth grant (NONE/CONTENT_ONLY/EXPIRED/NO_PAGE)."""
-    from .ads_connection import resolve_connection_state
+    from app.core.config import settings
+    from .ads_connection import page_has_whatsapp_linked, resolve_connection_state
 
     state, ads = await resolve_connection_state(db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"))
+    # Whether META says the Page has WhatsApp connected — not whether we have a number
+    # on file. Saving a number here only records where leads should land; it does not
+    # link it to the Page, which is a manual OTP step in Meta's own Page settings. The
+    # difference matters enough to surface: a launch is blocked without the real link,
+    # and an ad running without it can never report a conversation. None = couldn't
+    # tell (API error), which the client is shown as "unknown", never as "missing".
+    page_id = (ads or {}).get("page_id", "")
+    whatsapp_linked = await page_has_whatsapp_linked(page_id, settings.META_ADS_ACCESS_TOKEN)
+    # Same source as GET /jane-ads/whatsapp and the launch path. The
+    # social_connections doc has no whatsapp_number on it, so reading it from there
+    # reported "" for brands that had one saved.
+    from .whatsapp import get_brand_whatsapp
+
+    ads_whatsapp_number = await get_brand_whatsapp(db, brand_ctx.get("brand_id"))
     return {
         "state": state.value,
         "page_name": (ads or {}).get("account_name", ""),
-        "whatsapp_number": (ads or {}).get("whatsapp_number", ""),
+        "whatsapp_number": ads_whatsapp_number,
+        # True/False from Meta itself, or None when it couldn't be determined.
+        "whatsapp_linked_to_page": whatsapp_linked,
+        # Deep link straight to this Page's WhatsApp settings, so "link it" is one
+        # click rather than a hunt through Meta's settings tree.
+        "whatsapp_link_url": (
+            f"https://business.facebook.com/latest/settings/whatsapp_account?asset_id={page_id}"
+            if page_id else ""
+        ),
         "connect_url": "/social-media/connect/facebook-ads/initiate",
         # Only meaningful when state == "expired" — which specific ads permissions
         # weren't granted, so the client knows exactly what to re-check on Facebook's
@@ -1708,6 +1920,9 @@ class MetaLaunchFromMessageBody(BaseModel):
     # creative_source=upload/recomposite before a photo-based format can even be
     # attempted; None for generate/draft/ask (no real photo exists on those paths).
     asset_attestation: Optional[str] = None
+    # See CreativeForBrandBody's identical field — the "change" pick from
+    # POST /jane-ads/creative/suggest-format's alternatives.
+    vsg01_format_id: Optional[str] = None
 
 
 class _PlanBuildResult(BaseModel):
@@ -1960,6 +2175,17 @@ async def _build_campaign_plan(
         if known_budget and "spend" in clarify.lower():
             clarify += f" Last time you spent ₦{known_budget:,.0f} — want to do the same again?"
         return {"early_return": {"stage": "need_more", "understood": parsed.model_dump(), "question": clarify}}
+
+    # URI's fee comes out of the stated budget BEFORE anything is planned, so every
+    # decision below — platform split, duration, daily budget, the ad set Meta
+    # actually gets — is made against the money that will really be spent on ads.
+    # The client's own figure is kept as `stated_budget_ngn` for the wallet gate and
+    # the card: it is the whole of what leaves their wallet, and it is the only number
+    # they are ever shown. Planning against the stated budget instead would size a
+    # campaign the wallet cannot fund, and the old model asked them to fund the fee on
+    # top of the number they had just given.
+    stated_budget_ngn = req.budget_ngn
+    req.budget_ngn = C.ad_spend_from_budget(stated_budget_ngn)
 
     # 1.6. Now that the goal is actually known: a followers/engagement campaign never
     # routes off-platform, so step 0 above deliberately let ADS_NO_WHATSAPP through.
@@ -2354,6 +2580,7 @@ async def _build_campaign_plan(
             audience_segment=variant_segment, who_its_for=variant_who_its_for,
             geo_pockets=variant_geo_pockets, destination_type=destination_type.value,
             destination_cta=destination_cta, asset_attestation=body.asset_attestation,
+            vsg01_format_id=body.vsg01_format_id,
         )
     elif body.creative_source == "recomposite":
         creative = await creative_from_recomposite(
@@ -2363,6 +2590,7 @@ async def _build_campaign_plan(
             audience_segment=variant_segment, who_its_for=variant_who_its_for,
             geo_pockets=variant_geo_pockets, destination_type=destination_type.value,
             destination_cta=destination_cta, asset_attestation=body.asset_attestation,
+            vsg01_format_id=body.vsg01_format_id,
         )
     elif body.creative_source == "draft":
         creative = await creative_from_draft(
@@ -2407,6 +2635,7 @@ async def _build_campaign_plan(
             # Drives creative-stage retrieval; without it budget is 0, retrieval
             # bails early, and the ad ships with corpus_coverage="none".
             budget_ngn=float(parsed.budget_ngn or 0),
+            vsg01_format_id=body.vsg01_format_id,
         )
         if creative.image_url:
             # "reason" is a strict Literal on CreditTransaction — "campaign_generation"
@@ -2539,18 +2768,43 @@ async def _build_campaign_plan(
     )
 
 
-def _total_due_ngn(budget_ngn: float) -> float:
-    """What the customer's wallet must cover to run a `budget_ngn` campaign: the ad
-    budget PLUS URI's service fee (the AD_SPEND_MARKUP margin). Meta only ever spends
-    `budget_ngn`; billing (billing.py) debits the wallet up to budget × markup as the
-    campaign delivers, so the wallet is gated to exactly that here — which also makes
-    the wallet empty right when Meta's own budget is exhausted."""
-    return round(budget_ngn * C.AD_SPEND_MARKUP, 2)
+def _stated_budget_ngn(record: dict) -> float:
+    """The budget the CLIENT typed for a launched campaign, from its stored record.
+
+    Records hold `budget_ngn` as the AD SPEND sent to Meta, which is the stated budget
+    minus URI's fee — so reading it straight back showed a ₦20,000 campaign as
+    ₦18,000 and read as money vanishing.
+
+    `charged_upfront_ngn` is the exact amount debited at launch and so is the truest
+    answer when present. Older records predate it and are reconstructed from the
+    markup stamped on them, falling back to LEGACY_AD_SPEND_MARKUP for records from
+    before the fee model changed — the same precedence billing.py uses, so the figure
+    shown always matches the figure charged."""
+    charged = record.get("charged_upfront_ngn")
+    if charged:
+        return round(float(charged), 2)
+    ad_spend = float(record.get("budget_ngn") or 0)
+    markup = float(record.get("ad_spend_markup") or C.LEGACY_AD_SPEND_MARKUP)
+    return round(ad_spend * markup, 2)
+
+
+def _total_due_ngn(ad_spend_ngn: float) -> float:
+    """What the customer's wallet must cover for a campaign whose AD SPEND is
+    `ad_spend_ngn` — which is the client's stated budget, since URI's fee was already
+    taken out of it to arrive at that spend (constants.ad_spend_from_budget).
+
+    ad_spend × AD_SPEND_MARKUP reconstructs the stated budget exactly, because the
+    markup is derived from the same fee rate. Expressing it as a multiple of ad spend
+    rather than just returning the stated budget keeps it in step with billing.py,
+    which debits the wallet at ad_spend × markup as the campaign delivers — so the
+    wallet empties precisely as Meta's budget is exhausted, with nothing left over and
+    nothing uncollected."""
+    return round(ad_spend_ngn * C.AD_SPEND_MARKUP, 2)
 
 
 async def _wallet_status(db: AsyncIOMotorDatabase, business_id: str, budget_ngn: float) -> tuple[float, bool]:
-    """(balance, sufficient) — the real Mongo-backed balance vs. the TOTAL due (ad
-    budget + service fee), not just the ad budget."""
+    """(balance, sufficient) — the real Mongo-backed balance vs. the total due. Takes
+    AD SPEND, so the total due comes back out as the client's stated budget."""
     from .store import MongoWalletStore
     from .wallet import WalletService
 
@@ -2560,12 +2814,13 @@ async def _wallet_status(db: AsyncIOMotorDatabase, business_id: str, budget_ngn:
 
 
 def _wallet_shortfall_message(balance: float, budget_ngn: float) -> str:
+    """`budget_ngn` is AD SPEND; the client is told the one number that matters to
+    them — the total leaving their wallet, which is the budget they stated. The fee is
+    deliberately not itemised: it is inside that figure, not added to it."""
     due = _total_due_ngn(budget_ngn)
-    fee = round(due - budget_ngn, 2)
     return (
         f"Your ad wallet has ₦{balance:,.0f} — top up ₦{(due - balance):,.0f} more "
-        f"before launching. A ₦{budget_ngn:,.0f} campaign costs ₦{due:,.0f} "
-        f"(₦{budget_ngn:,.0f} ad spend + ₦{fee:,.0f} service fee)."
+        f"before launching. This campaign costs ₦{due:,.0f}."
     )
 
 
@@ -2773,8 +3028,12 @@ async def meta_plan_from_message(
         **_plan_response_dict(built),
         "wallet": {
             "balance_ngn": balance,
+            # `budget_ngn` here is AD SPEND (the stated budget less URI's fee) and is
+            # NOT shown to the client — total_due_ngn is, and equals the budget they
+            # stated. service_fee_ngn is deliberately gone: the fee sits inside the
+            # stated budget now, so itemising it invited the old "+ service fee" line
+            # that asked them to fund more than the number they gave.
             "budget_ngn": built.req.budget_ngn,
-            "service_fee_ngn": round(_total_due_ngn(built.req.budget_ngn) - built.req.budget_ngn, 2),
             "total_due_ngn": _total_due_ngn(built.req.budget_ngn),
             "sufficient": sufficient,
         },
@@ -2875,6 +3134,20 @@ async def meta_launch_plan(
     except AdsConnectionRequired as e:
         raise HTTPException(status_code=409, detail=f"meta_connection_{e.state.value}")
     plan.page_id = ads_conn["page_id"]
+
+    # A WhatsApp campaign requires a WhatsApp NUMBER — enforced above by
+    # resolve_ads_page_for_launch(require_whatsapp=True), which refuses a brand that
+    # has none configured.
+    #
+    # It deliberately does NOT also require Meta to confirm the number is linked to
+    # the Page. That was gated on GET /{page}?fields=whatsapp_number,
+    # has_whatsapp_number, which is not a usable oracle: on Page 203213912878798 both
+    # fields come back absent while Meta validates a native Click-to-WhatsApp ad set
+    # on that very Page (live-verified 2026-09-09), so the gate 409'd launches that
+    # would have succeeded. Whether native is possible is now settled by the adapter
+    # dry-running the real ad set against Meta, which falls back to a wa.me link ad
+    # only on the one error that actually means "not linked" (subcode 1487246).
+
     plan.whatsapp_number = ads_conn["whatsapp_number"]
     plan.destination_type = destination_type.value
     plan.destination_link = build_link(
@@ -2911,9 +3184,41 @@ async def meta_launch_plan(
         thread_id=doc.get("thread_id", ""),
     )
     result = await _do_launch(built, doc["message"], doc["business_name"], brand_ctx, db)
+
+    # Take the money now the campaign really exists on Meta. Charged AFTER the launch,
+    # never before: a launch that fails raises out of _do_launch above, and a client
+    # must not be debited for a campaign that was never created.
+    #
+    # The budget is committed at this point — the full stated budget leaves the wallet
+    # and is not refunded if Meta under-delivers, which is why billing.py must not
+    # charge this campaign again as it spends (it skips any record carrying
+    # charged_upfront_ngn; without that the client would pay twice for the same ads).
+    campaign_id = result["launch"]["campaign_id"]
+    due = _total_due_ngn(req.budget_ngn)
+    try:
+        from .store import MongoWalletStore
+        from .wallet import InsufficientFundsError, WalletService
+
+        await WalletService(MongoWalletStore(db)).charge_ad_spend(
+            doc["business_id"], due, campaign_id=campaign_id,
+        )
+        await db["jane_ads_meta_campaigns"].update_one(
+            {"campaign_id": campaign_id}, {"$set": {"charged_upfront_ngn": due}},
+        )
+        result["wallet"] = {
+            "charged_ngn": due,
+            "balance_ngn": await WalletService(MongoWalletStore(db)).get_balance(doc["business_id"]),
+        }
+    except InsufficientFundsError as e:
+        # The gate above passed, so this is a race (a concurrent launch or charge) or
+        # a wallet suspended in between. The campaign IS live on Meta and paused, so
+        # the honest thing is to say so rather than pretend the launch failed.
+        print(f"[launch] campaign {campaign_id} created but wallet charge failed: {e}", flush=True)
+        result["wallet"] = {"charged_ngn": 0.0, "charge_failed": True}
+
     await db["jane_ads_pending_plans"].update_one(
         {"plan_id": plan_id},
-        {"$set": {"status": "launched", "campaign_id": result["launch"]["campaign_id"]}},
+        {"$set": {"status": "launched", "campaign_id": campaign_id}},
     )
     return result
 
@@ -3094,7 +3399,16 @@ async def meta_campaigns(
             "headline": r.get("headline", ""),
             "primary_text": r.get("primary_text", ""),
             "image_url": r.get("image_url", ""),
-            "budget_ngn": r.get("budget_ngn"),
+            # The budget the CLIENT typed, not the ad spend Meta received. The service
+            # fee comes OUT of the stated budget, so a ₦20,000 budget creates a
+            # ₦18,000 ad set — and showing that ₦18,000 back reads as money going
+            # missing. charged_upfront_ngn is the exact figure debited from the wallet
+            # at launch, so it wins when present; otherwise it's reconstructed from the
+            # markup stamped on the record (legacy records carry none, hence the
+            # LEGACY_AD_SPEND_MARKUP fallback billing.py already uses).
+            "budget_ngn": _stated_budget_ngn(r),
+            # What Meta actually received, kept for anything that needs the real spend.
+            "ad_spend_ngn": r.get("budget_ngn"),
             "goal": r.get("goal", ""),
             "city": r.get("city", ""),
             # Where leads for this campaign land, so the user can find their conversations.

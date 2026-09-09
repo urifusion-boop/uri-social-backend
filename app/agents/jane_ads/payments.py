@@ -13,6 +13,8 @@ The wallet crediting is the tested part; this module is the thin, Squad-specific
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
@@ -105,15 +107,53 @@ class JaneAdsPayments:
                 timeout=30.0,
             )
         data = resp.json()
-        ok = (resp.status_code == 200 and data.get("success")
-              and data.get("data", {}).get("transaction_status") == "success")
-        if ok:
+        status = str((data.get("data") or {}).get("transaction_status") or "").lower()
+        if resp.status_code == 200 and data.get("success") and status == "success":
             return await self._credit(rec, data)
+
+        # Only an EXPLICIT failed/reversed status from Squad is a failure. Anything
+        # else — a 5xx, an unparseable body, or a transaction still in flight — means
+        # we do not know yet, and must stay "pending" so a later verify or webhook can
+        # still credit it. Live-confirmed 2026-09-09: Squad's own ValidateOTP returned
+        # 504 on a card payment that had ALREADY succeeded (charged, receipted,
+        # webhook delivered), so treating "not success" as "failed" would have written
+        # a real, paid top-up off as failed.
+        if status in ("failed", "reversed", "abandoned"):
+            await self._topups.update_one({"reference": reference},
+                                          {"$set": {"status": "failed", "squad_response": data}})
+            return {"status": "failed"}
         await self._topups.update_one({"reference": reference},
-                                      {"$set": {"status": "failed", "squad_response": data}})
-        return {"status": "failed"}
+                                      {"$set": {"last_verify_response": data}})
+        return {"status": "pending"}
 
     # ── Webhook (Squad → us) ────────────────────────────────────────────────────
+    @staticmethod
+    async def verify_webhook_signature(raw_body: bytes, signature: str) -> bool:
+        """Whether `raw_body` really came from Squad.
+
+        Squad signs the webhook body with HMAC-SHA512 keyed on the MERCHANT SECRET
+        KEY (not a separate webhook secret — SQUAD_WEBHOOK_SECRET is not used for
+        this and holds a placeholder) and sends the digest as uppercase hex in
+        `x-squad-encrypted-body`.
+
+        The RAW request bytes are hashed, never a re-serialised dict: re-encoding
+        changes key order and separators, so the digest would never match what Squad
+        signed.
+
+        This route has no JWT — Squad calls it directly — so without this check
+        anyone who guessed a reference could POST a fake "success" and credit a real
+        wallet with money nobody paid.
+        """
+        if not signature:
+            return False
+        creds = await payment_service._get_squad_credentials()
+        secret = (creds or {}).get("secret_key") or ""
+        if not secret:
+            return False
+        expected = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha512).hexdigest().upper()
+        return hmac.compare_digest(expected, signature.strip().upper())
+
+
     async def handle_webhook(self, payload: dict) -> dict:
         """Handle a Squad webhook for a Jane Ads top-up. Credits idempotently on success."""
         reference = payload.get("TransactionRef") or payload.get("transaction_ref")

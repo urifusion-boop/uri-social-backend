@@ -56,6 +56,7 @@ FORMAT = AdFormatDef(
     name="Text on a Face",
     asset_source="upload",  # upload_as_is only — never generate (§1.2)
     layers_used="L4",
+    brand_mark="optional",  # VSG-01-PROMPTS v2 §6.7
     requires=["real_customer_photo"],  # Requirement.REAL_CUSTOMER_PHOTO — a generated
                                         # face paired with a first-person statement is a
                                         # misleading representation (§1.2)
