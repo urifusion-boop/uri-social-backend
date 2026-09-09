@@ -159,6 +159,14 @@ async def create_draft_from_item_v2(
         exact_copy = item.get("exact_copy") or {}
         if exact_copy.get("caption"):
             seed_parts.append(f"Publish-ready caption already written for this idea (use as the strong starting point): {exact_copy['caption']}")
+        # Richer creative direction the rewritten engine now produces (no v1
+        # equivalent) — folded into the seed so downstream generation gets
+        # the same visual intent the calendar item already committed to.
+        central_visual_idea = (item.get("creative_direction") or {}).get("central_visual_idea")
+        if central_visual_idea:
+            seed_parts.append(f"Central visual idea: {central_visual_idea}")
+        if item.get("designer_execution_notes"):
+            seed_parts.append(f"Production notes: {item['designer_execution_notes']}")
         seed_content = "\n".join(seed_parts)
 
         profile_result = await BrandProfileService.get(user_id, db, brand_id=brand_id)
