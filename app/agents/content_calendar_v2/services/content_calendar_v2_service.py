@@ -22,7 +22,7 @@ _generate_candidate_concepts, don't — that's exactly the line this rewrite
 exists to hold.
 
 Selection now runs a staged pipeline (PRD §32-38): load creative framework
--> generate ~100 candidate CONCEPTS (structured only, no copy) -> score on
+-> generate ~80 candidate CONCEPTS (structured only, no copy) -> score on
 9 non-performance dimensions -> diversity-optimized select 30 -> assign
 dates -> assign format (dynamic 2-5 slide carousels, not fixed) -> generate
 final copy + creative direction (concept-conditioned, one combined call per
@@ -72,8 +72,16 @@ from ..creative_framework import (
 
 COLLECTION = "content_calendar_v2_plans"
 PLAN_DAYS = 30
-CANDIDATE_POOL_SIZE = 100    # PRD §10 — recommended 80-150
-CANDIDATE_CHUNK_SIZE = 20    # 5 concurrent chunks, mirrors the proven content-chunking pattern
+CANDIDATE_POOL_SIZE = 80     # PRD §10's own stated floor (recommended range 80-150) —
+                              # confirmed live: this endpoint is hitting a 504 Gateway
+                              # Timeout, and the backend keeps working minutes after the
+                              # client gives up. Every stage's latency scales with pool
+                              # size (candidate generation AND the scoring call, which
+                              # also mis-fired at 100 candidates — 124 scores returned
+                              # for 102 candidates). Staying at the PRD's floor rather
+                              # than going below it trades some candidate-pool richness
+                              # for real margin against the timeout.
+CANDIDATE_CHUNK_SIZE = 20    # concurrent chunks, mirrors the proven content-chunking pattern
 CONTENT_CHUNK_SIZE = 6       # ~5 chunks of 6 for final copy — v1's own 7-item cap is
                               # evidence larger single structured-JSON calls degrade
 
@@ -403,25 +411,32 @@ async def _score_candidates(
     is built key-by-key from _REQUIRED_SCORE_KEYS only, so any
     performance_score/google_trends_score/etc a model might hallucinate in
     is structurally dropped, not merely instructed against — belt-and-
-    suspenders on top of the prompt (PRD §12's explicit 'must NOT include')."""
+    suspenders on top of the prompt (PRD §12's explicit 'must NOT include').
+
+    Chunked and run concurrently (was one giant unchunked call across every
+    candidate) — confirmed live: at 100+ candidates in one call the model
+    lost count and returned 124 scores for 102 concepts, and being fully
+    sequential (not gathered like every other stage) made it a real,
+    avoidable contributor to the 504 Gateway Timeout this pipeline was
+    hitting overall."""
     if not concepts:
         return []
     brand_name = brand.get("brand_name") or "the brand"
     industry = brand.get("industry") or "business"
-
-    listing = "\n".join(
-        f"{i}: territory={c.get('territory')}, subject={c.get('subject')}, angle={c.get('angle')}, "
-        f"device={(c.get('creative_device') or {}).get('device')}, format_hint={c.get('format_hint')}, "
-        f"concept_name={c.get('concept_name')}"
-        for i, c in enumerate(concepts)
-    )
     prior_block = ""
     if creative_memory.get("concept_names"):
         prior_block = "\nRecently used concepts (penalize repetition_risk if similar):\n" + "\n".join(
             f"- {c}" for c in creative_memory["concept_names"][:30]
         )
 
-    prompt = f"""Score these {len(concepts)} candidate content concepts for {brand_name}
+    async def _score_chunk(chunk: List[Dict[str, Any]], offset: int) -> List[Any]:
+        listing = "\n".join(
+            f"{i}: territory={c.get('territory')}, subject={c.get('subject')}, angle={c.get('angle')}, "
+            f"device={(c.get('creative_device') or {}).get('device')}, format_hint={c.get('format_hint')}, "
+            f"concept_name={c.get('concept_name')}"
+            for i, c in enumerate(chunk)
+        )
+        prompt = f"""Score these {len(chunk)} candidate content concepts for {brand_name}
 ({industry}).{prior_block}
 
 {listing}
@@ -440,29 +455,31 @@ For EACH concept (by index), score 0-10 on exactly these 9 dimensions:
 Do NOT score based on historical engagement, trending topics, follower growth,
 or search volume — none of that exists in this task and must never factor in.
 
-Return ONLY a valid JSON array of exactly {len(concepts)} objects, index-aligned
+Return ONLY a valid JSON array of exactly {len(chunk)} objects, index-aligned
 (object 0 = concept 0, etc.), each with exactly these 9 numeric keys:
 ["strategic_relevance", "audience_relevance", "creative_strength", "distinctiveness",
 "brand_fit", "commercial_relevance", "asset_feasibility", "context_relevance", "repetition_risk"]"""
+        try:
+            ai_request = AIService.build_ai_model(
+                messages=[{"role": "user", "content": prompt}], model="gpt-4o", temperature=0.4,
+            )
+            response = await AIService.chat_completion(ai_request)
+            raw = response.choices[0].message.content.strip()
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+            parsed = json.loads(raw.strip())
+            if isinstance(parsed, list) and len(parsed) == len(chunk):
+                return parsed
+            raise ValueError(f"expected {len(chunk)} scores, got {len(parsed) if isinstance(parsed, list) else type(parsed)}")
+        except Exception as exc:
+            print(f"[CalendarV2] candidate scoring chunk at offset {offset} failed ({exc}) — neutral scores for this chunk", flush=True)
+            return [{} for _ in chunk]
 
-    scores: List[Any] = [{} for _ in concepts]
-    try:
-        ai_request = AIService.build_ai_model(
-            messages=[{"role": "user", "content": prompt}], model="gpt-4o", temperature=0.4,
-        )
-        response = await AIService.chat_completion(ai_request)
-        raw = response.choices[0].message.content.strip()
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        parsed = json.loads(raw.strip())
-        if isinstance(parsed, list) and len(parsed) == len(concepts):
-            scores = parsed
-        else:
-            raise ValueError(f"expected {len(concepts)} scores, got {len(parsed) if isinstance(parsed, list) else type(parsed)}")
-    except Exception as exc:
-        print(f"[CalendarV2] candidate scoring failed ({exc}) — falling back to neutral scores", flush=True)
+    chunks = [concepts[i:i + CANDIDATE_CHUNK_SIZE] for i in range(0, len(concepts), CANDIDATE_CHUNK_SIZE)]
+    chunk_results = await asyncio.gather(*[_score_chunk(c, i * CANDIDATE_CHUNK_SIZE) for i, c in enumerate(chunks)])
+    scores: List[Any] = [s for chunk_scores in chunk_results for s in chunk_scores]
 
     scored: List[Dict[str, Any]] = []
     for concept, raw_score in zip(concepts, scores):
