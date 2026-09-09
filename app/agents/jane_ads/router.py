@@ -1117,6 +1117,7 @@ async def jane_meta_connection_status(
     (never inferred from a single boolean), so the frontend can render the exact
     matching prompt. `connect_url` is only meaningful for states that need the
     OAuth grant (NONE/CONTENT_ONLY/EXPIRED/NO_PAGE)."""
+    from app.core.config import settings
     from .ads_connection import page_has_whatsapp_linked, resolve_connection_state
 
     state, ads = await resolve_connection_state(db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"))
@@ -3102,6 +3103,7 @@ async def meta_launch_plan(
     # linked as soon as a client types a number, which proves only that they typed it.
     # A None answer means we could not tell (API error), and never blocks a launch.
     if require_whatsapp:
+        from app.core.config import settings
         from .ads_connection import page_has_whatsapp_linked
 
         linked = await page_has_whatsapp_linked(plan.page_id, settings.META_ADS_ACCESS_TOKEN)
