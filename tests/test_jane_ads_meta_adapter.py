@@ -28,6 +28,23 @@ from app.agents.jane_ads.models import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _page_not_whatsapp_linked(monkeypatch):
+    """Default every test to the wa.me LINK-ad path.
+
+    launch_campaign now asks Meta whether the Page has WhatsApp linked before it
+    creates anything, to decide between a native Click-to-WhatsApp ad and a wa.me link
+    ad. That is a real Graph call, so without this it would consume a response from
+    each test's canned queue. The native path has its own tests below, which override
+    this."""
+    async def _not_linked(page_id, token):
+        return False
+
+    monkeypatch.setattr(
+        "app.agents.jane_ads.ads_connection.page_has_whatsapp_linked", _not_linked
+    )
+
+
 def _run(coro):
     return asyncio.get_event_loop().run_until_complete(coro)
 
@@ -552,3 +569,97 @@ def test_wa_link_prefills_an_opening_message():
     assert link.startswith("https://wa.me/2348031234567?text=")
     from urllib.parse import unquote
     assert unquote(link.split("?text=", 1)[1]).strip()
+
+
+# ── Native Click-to-WhatsApp when the Page really has WhatsApp linked ──
+
+@pytest.fixture
+def _page_is_whatsapp_linked(monkeypatch):
+    async def _linked(page_id, token):
+        return True
+
+    monkeypatch.setattr(
+        "app.agents.jane_ads.ads_connection.page_has_whatsapp_linked", _linked
+    )
+
+
+def test_linked_page_builds_a_native_click_to_whatsapp_ad(_page_is_whatsapp_linked):
+    """Native is the only form that fires messaging_conversation_started — a wa.me link
+    ad can never report a conversation, which is why those campaigns showed
+    "WhatsApp conversations 0" while genuinely delivering clicks."""
+    responses = [{"id": "cmp_1"}, {"id": "adset_1"}, {"id": "creative_1"}, {"id": "ad_1"}]
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client(responses)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        _run(_adapter().launch_campaign(_plan(), _auth()))
+
+    campaign = mock_client.post.call_args_list[0].kwargs["json"]
+    adset = mock_client.post.call_args_list[1].kwargs["json"]
+    spec = mock_client.post.call_args_list[2].kwargs["json"]["object_story_spec"]
+
+    # CONVERSATIONS optimisation isn't available under OUTCOME_TRAFFIC.
+    assert campaign["objective"] == "OUTCOME_ENGAGEMENT"
+    assert adset["optimization_goal"] == "CONVERSATIONS"
+    assert adset["destination_type"] == "WHATSAPP"
+    assert adset["promoted_object"] == {
+        "page_id": "pg123", "whatsapp_phone_number": "2348031234567",
+    }
+    # The button carries no link — the ad set owns the routing, and WHATSAPP_MESSAGE
+    # refuses a value.link, which is exactly why the link-ad path can't use it.
+    assert spec["link_data"]["call_to_action"] == {"type": "WHATSAPP_MESSAGE"}
+    assert "wa.me" not in spec["link_data"]["link"]
+
+
+def test_an_unlinked_page_still_falls_back_to_the_wa_me_link_ad():
+    """Unlinked Pages must keep launching. Native create fails outright on them
+    ("This WhatsApp phone number is not linked to your account", subcode 1487246),
+    so the fallback is what stops a campaign failing to launch at all."""
+    responses = [{"id": "cmp_1"}, {"id": "adset_1"}, {"id": "creative_1"}, {"id": "ad_1"}]
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client(responses)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        _run(_adapter().launch_campaign(_plan(), _auth()))
+
+    campaign = mock_client.post.call_args_list[0].kwargs["json"]
+    adset = mock_client.post.call_args_list[1].kwargs["json"]
+    spec = mock_client.post.call_args_list[2].kwargs["json"]["object_story_spec"]
+
+    assert campaign["objective"] == "OUTCOME_TRAFFIC"
+    assert adset["optimization_goal"] == "LINK_CLICKS"
+    assert "destination_type" not in adset and "promoted_object" not in adset
+    assert spec["link_data"]["link"].startswith("https://wa.me/")
+
+
+def test_an_inconclusive_link_check_falls_back_rather_than_failing_the_launch(monkeypatch):
+    """None means Meta couldn't tell us. Guessing native there would fail the create
+    and the client would simply not get a campaign — broader beats broken."""
+    async def _unknown(page_id, token):
+        return None
+
+    monkeypatch.setattr(
+        "app.agents.jane_ads.ads_connection.page_has_whatsapp_linked", _unknown
+    )
+    responses = [{"id": "cmp_1"}, {"id": "adset_1"}, {"id": "creative_1"}, {"id": "ad_1"}]
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client(responses)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        _run(_adapter().launch_campaign(_plan(), _auth()))
+
+    assert mock_client.post.call_args_list[1].kwargs["json"]["optimization_goal"] == "LINK_CLICKS"
+
+
+def test_a_website_destination_never_goes_native_even_on_a_linked_page(_page_is_whatsapp_linked):
+    """Native routing is only right when the client actually chose WhatsApp — a
+    website campaign on a WhatsApp-linked Page must still open the website."""
+    plan = _plan(destination_type="website", destination_link="https://example.com/shop")
+    responses = [{"id": "cmp_1"}, {"id": "adset_1"}, {"id": "creative_1"}, {"id": "ad_1"}]
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client(responses)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        _run(_adapter().launch_campaign(plan, _auth()))
+
+    adset = mock_client.post.call_args_list[1].kwargs["json"]
+    spec = mock_client.post.call_args_list[2].kwargs["json"]["object_story_spec"]
+    assert adset["optimization_goal"] == "LINK_CLICKS"
+    assert "destination_type" not in adset
+    assert spec["link_data"]["link"] == "https://example.com/shop"
