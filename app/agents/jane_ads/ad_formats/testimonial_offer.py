@@ -44,7 +44,7 @@ from ..visual_slots import resolve_nigerian_setting
 from ..layer2_generation import generate_scene
 from .legibility import assert_legible
 from ._text_metrics import wrap_text
-from .tokens import AdFormatDef, PLACEHOLDER_TOKENS
+from .tokens import AdFormatDef, PLACEHOLDER_TOKENS, logo_badge_layers
 from app.agents.social_media_manager.services.document_renderer_service import DocumentRendererService
 
 FORMAT = AdFormatDef(
@@ -123,6 +123,7 @@ def build_document(
     price_or_terms: Optional[str] = None,
     canvas_size: Tuple[int, int] = (1080, 1080),
     tokens: Dict[str, str] = None,
+    brand_logo_url: str = None,
 ) -> Dict:
     """
     customer_photo_url: a real, permission-cleared photograph of the
@@ -222,6 +223,9 @@ def build_document(
             "x": _PADDING, "y": offer_content_y, "font_size": _FONT_PRICE, "font_weight": 700, "color": t["accent"],
         })
 
+    badge_layers, z = logo_badge_layers(brand_logo_url, width, height, z)
+    layers.extend(badge_layers)
+
     document = {
         "canvas": {"width": width, "height": height, "background_color": t["surface"]},
         "layers": layers,
@@ -238,6 +242,7 @@ def build_document_no_person(
     product_image_url: Optional[str] = None,
     canvas_size: Tuple[int, int] = (1080, 1080),
     tokens: Dict[str, str] = None,
+    brand_logo_url: str = None,
 ) -> Dict:
     """
     No-person construction (§1.2, §2.2): scene_image_url is a generated
@@ -334,6 +339,9 @@ def build_document_no_person(
             "type": "text", "z_index": z, "content": "\n".join(price_lines),
             "x": _PADDING, "y": offer_content_y, "font_size": _FONT_PRICE, "font_weight": 700, "color": t["accent"],
         })
+
+    badge_layers, z = logo_badge_layers(brand_logo_url, width, height, z)
+    layers.extend(badge_layers)
 
     document = {
         "canvas": {"width": width, "height": height, "background_color": t["surface"]},

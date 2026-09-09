@@ -39,7 +39,7 @@ from ..visual_slots import resolve_nigerian_setting
 from ..layer2_generation import generate_scene
 from .legibility import assert_legible
 from ._text_metrics import wrap_text
-from .tokens import AdFormatDef, PLACEHOLDER_TOKENS
+from .tokens import AdFormatDef, PLACEHOLDER_TOKENS, logo_badge_layers
 from app.agents.social_media_manager.services.document_renderer_service import DocumentRendererService
 
 FORMAT = AdFormatDef(
@@ -105,6 +105,7 @@ def build_document(
     solution_text: str,
     canvas_size: Tuple[int, int] = (1080, 1080),
     tokens: Dict[str, str] = None,
+    brand_logo_url: str = None,
 ) -> Dict:
     """
     problem_image_url / solution_image_url: already-generated Layer 2
@@ -169,6 +170,9 @@ def build_document(
         "x": _ZONE_TEXT_PADDING, "y": scrim2_y + _ZONE_TEXT_PADDING // 2,
         "font_size": _FONT_COPY, "font_weight": 700, "color": t["ink"],
     })
+
+    badge_layers, z = logo_badge_layers(brand_logo_url, width, height, z)
+    layers.extend(badge_layers)
 
     document = {
         "canvas": {"width": width, "height": height, "background_color": t["surface"]},
