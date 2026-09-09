@@ -241,10 +241,15 @@ ANGLES: List[Dict[str, str]] = [
     {"key": "the_expert_perspective", "label": "The Expert Perspective"},
     {"key": "the_founder_perspective", "label": "The Founder Perspective"},
     {"key": "the_customers_question", "label": "The Customer's Question"},
-    {"key": "before_you_buy", "label": "The \"Before You Buy\" Angle"},
-    {"key": "nobody_tells_you", "label": "The \"Nobody Tells You\" Angle"},
-    {"key": "what_happens_if", "label": "The \"What Happens If\" Angle"},
-    {"key": "what_would_you_choose", "label": "The \"What Would You Choose?\" Angle"},
+    # Single quotes deliberately, not double — confirmed live: a label with an
+    # embedded double-quote (e.g. The "Before You Buy" Angle) that the model
+    # is asked to echo back verbatim inside a JSON string value gets its
+    # internal quotes escaped inconsistently, producing malformed JSON
+    # ("Expecting ',' delimiter" parse failures on every candidate chunk).
+    {"key": "before_you_buy", "label": "The 'Before You Buy' Angle"},
+    {"key": "nobody_tells_you", "label": "The 'Nobody Tells You' Angle"},
+    {"key": "what_happens_if", "label": "The 'What Happens If' Angle"},
+    {"key": "what_would_you_choose", "label": "The 'What Would You Choose?' Angle"},
     {"key": "the_myth", "label": "The Myth"},
     {"key": "the_challenge", "label": "The Challenge"},
     {"key": "the_experiment", "label": "The Experiment"},
