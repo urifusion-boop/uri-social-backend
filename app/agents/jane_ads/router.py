@@ -531,6 +531,27 @@ async def list_ad_formats(_token: dict = Depends(JWTBearer())) -> dict:
 _VSG01_BOOTSTRAP_SECRET = "vsg01-corpus-bootstrap-2026-dev-only"
 
 
+# TEMPORARY — settles whether the deployed container's DejaVu Sans Bold
+# actually covers the Dingbats glyphs (✓ ✗ ★) the redesigned ad formats now
+# draw as text, rather than assuming from a local dev-machine test (which
+# falls back to Pillow's limited default font and would false-negative).
+# Delete alongside the other TEMPORARY endpoints above.
+@router.get("/admin/debug-glyph-test.png")
+async def debug_glyph_test(x_bootstrap_secret: str = Header(...)):
+    if x_bootstrap_secret != _VSG01_BOOTSTRAP_SECRET:
+        raise HTTPException(status_code=403, detail="Not authorized.")
+    from app.agents.social_media_manager.services.document_renderer_service import DocumentRendererService
+    document = {
+        "canvas": {"width": 400, "height": 150, "background_color": "#FFFFFF"},
+        "layers": [
+            {"type": "text", "z_index": 1, "content": "✓ ✗ ★ ☆", "x": 20, "y": 20,
+             "font_size": 60, "font_weight": 700, "color": "#000000"},
+        ],
+    }
+    png_bytes = await DocumentRendererService.render_to_png(document)
+    return Response(content=png_bytes, media_type="image/png")
+
+
 @router.post("/admin/bootstrap-vsg01-corpus")
 async def bootstrap_vsg01_corpus(
     x_bootstrap_secret: str = Header(...),
