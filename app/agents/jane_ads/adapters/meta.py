@@ -268,17 +268,26 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
         # Meta. Without that, create fails with "This WhatsApp phone number is not
         # linked to your account" (code=100, subcode=1487246) and review fails with
         # #2446880 — both live-confirmed, and the reason this was originally abandoned.
-        # Meta itself is asked, since our own record marks a connection linked as soon
-        # as a client types a number. Anything other than a definite yes falls back to
-        # the wa.me link ad, which needs no linking and still delivers, so a campaign
-        # can never fail to launch because this check was unavailable.
-        use_native_whatsapp = False
-        if not is_followers_goal and destination.type == DestinationType.WHATSAPP and plan.whatsapp_number:
-            from ..ads_connection import page_has_whatsapp_linked
-
-            use_native_whatsapp = (
-                await page_has_whatsapp_linked(plan.page_id, self._access_token) is True
-            )
+        # Whether the number is linked is decided by DRY-RUNNING the real ad set
+        # payload, not by reading a Page field. GET /{page}?fields=whatsapp_number,
+        # has_whatsapp_number is not a usable oracle: for a Page that Meta will
+        # happily accept a native CTWA ad set on, both fields come back ABSENT, so
+        # the old check returned False and silently downgraded every such campaign
+        # to a wa.me link ad (and 409'd the launch gate). Live-verified 2026-09-09
+        # on Page 203213912878798, whose fields are empty while
+        # destination_type=WHATSAPP + promoted_object={page_id} validates clean.
+        #
+        # execution_options=['validate_only'] runs Meta's full validation and
+        # creates nothing, so asking is free and the answer is the same one the
+        # real create would give: valid means native works, subcode 1487246 means
+        # that number is not linked to this Page. It runs after the campaign
+        # exists because validation needs a real campaign_id.
+        want_native_whatsapp = bool(
+            not is_followers_goal
+            and destination.type == DestinationType.WHATSAPP
+            and plan.whatsapp_number
+        )
+        use_native_whatsapp = want_native_whatsapp
 
         campaign_id = ""
         adset_id = ""
@@ -381,12 +390,50 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                         }
                     else:
                         adset_payload["optimization_goal"] = "LINK_CLICKS"
+
                 adset_resp = await client.post(
                     f"{self._graph_base}/act_{self._ad_account_id}/adsets",
                     params={"access_token": self._access_token},
                     json=adset_payload,
                 )
                 adset_data = adset_resp.json()
+
+                # Meta is the only reliable oracle for "is this number linked to this
+                # Page", and it answers by rejecting the create with subcode 1487246.
+                # A failed ad set create leaves NOTHING behind, so retrying as a wa.me
+                # link ad is safe and costs no extra call on the path that works —
+                # unlike the Page-field check this replaced, which returned False for a
+                # Page that Meta happily accepts native ads on and so downgraded every
+                # such campaign (live-verified 2026-09-09 on page 203213912878798).
+                #
+                # Only 1487246 falls back. Every other error must surface as itself
+                # rather than be silently turned into a lesser ad.
+                if (
+                    want_native_whatsapp
+                    and use_native_whatsapp
+                    and (adset_data.get("error") or {}).get("error_subcode") == 1487246
+                ):
+                    print(
+                        f"[MetaAds] {plan.whatsapp_number} is not linked to page "
+                        f"{plan.page_id} — retrying as a wa.me link ad",
+                        flush=True,
+                    )
+                    use_native_whatsapp = False
+                    # A NEW dict rather than mutating the rejected one: httpx holds a
+                    # reference to what was sent, so editing it in place would rewrite
+                    # the record of the first attempt too.
+                    adset_payload = {
+                        k: v for k, v in adset_payload.items()
+                        if k not in ("destination_type", "promoted_object")
+                    }
+                    adset_payload["optimization_goal"] = "LINK_CLICKS"
+                    adset_resp = await client.post(
+                        f"{self._graph_base}/act_{self._ad_account_id}/adsets",
+                        params={"access_token": self._access_token},
+                        json=adset_payload,
+                    )
+                    adset_data = adset_resp.json()
+
                 _raise_for_error(adset_data, "ad set creation")
                 adset_id = adset_data["id"]
 
