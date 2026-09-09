@@ -1,34 +1,48 @@
 # app/agents/content_calendar_v2/services/content_calendar_v2_service.py
 """
-Content Calendar V2 — 30-day content intelligence engine.
+Content Calendar V2 — Creative Intelligence Engine.
 
 Staging-only, fully isolated from the v1 7-day Content Calendar
 (app/agents/social_media_manager/services/content_calendar_service.py):
 own collection (content_calendar_v2_plans), own package, own router prefix.
-Scoped to the PRD's own §48 MVP list, built in §54 priority order — see
+
+Rewritten against "URI Social — Living Content Calendar & Creative
+Intelligence Engine" — see
 /Users/macintoshhd/.claude/plans/enchanted-wiggling-treehouse.md for the
 full plan this was built against.
 
-Reuses v1's pure signal-gathering/validation building blocks by import
-(never forked) — v1's own services already implement Layers 2/3/4
-(Performance/Trend/Calendar Intelligence) correctly:
-  - PerformanceAnalyticsService, TrendDataService, HolidayCalendarService,
-    CulturalMomentService, IndustryTrendService, ContentExplainerService
-  - _STAGE_GUIDANCE, _business_pulse_freshness_str, _validate_day,
-    _pick_mix_from_performance, DEFAULT_MIX_VARIANTS, INDUSTRY_MIX,
-    POST_FORMATS, HOOK_STYLES, POST_FORMAT_TO_KEY, CONTENT_TYPES,
-    CONTENT_TYPE_LABELS
+CRITICAL, non-negotiable (PRD §2): performance data and Google Trends must
+NEVER influence which content ideas get selected. This file has ZERO
+dependency on PerformanceAnalyticsService or TrendDataService anywhere in
+its generation path — sync_item_performance() is the one function allowed
+to touch a draft's performance metrics, and only AFTER publication, purely
+for user-facing display, never feeding back into generation. If you're
+about to add a performance/trend-derived signal to anything upstream of
+_generate_candidate_concepts, don't — that's exactly the line this rewrite
+exists to hold.
 
-Genuinely new here (v1 has no equivalent): chunked 30-day generation,
-carousel-slot assignment, ad-opportunity scoring + copy, creative-diversity
-validation, append-only versioning (mirrors blog_generation_service.py's
-edit_history $push pattern), approval, performance sync.
+Selection now runs a staged pipeline (PRD §32-38): load creative framework
+-> generate ~100 candidate CONCEPTS (structured only, no copy) -> score on
+9 non-performance dimensions -> diversity-optimized select 30 -> assign
+dates -> assign format (dynamic 2-5 slide carousels, not fixed) -> generate
+final copy + creative direction (concept-conditioned, one combined call per
+chunk — see _generate_final_copy's docstring for why two stages share one
+network round-trip) -> ad evaluation -> validate (deterministic + semantic
++ anti-boring) -> auto-regenerate flagged items.
+
+Reused from v1 (content_calendar_service.py) — only the genuinely
+content-type-agnostic pure helpers: _STAGE_GUIDANCE,
+_business_pulse_freshness_str, _validate_day. Deliberately NOT reused:
+_pick_mix_from_performance, DEFAULT_MIX_VARIANTS, INDUSTRY_MIX, POST_FORMATS,
+HOOK_STYLES, POST_FORMAT_TO_KEY, CONTENT_TYPES, CONTENT_TYPE_LABELS — all
+superseded by creative_framework.py's territory/subject/angle/device system,
+or (for _pick_mix_from_performance) removed outright as the one function
+that directly violated PRD §2.
 """
 from __future__ import annotations
 
 import asyncio
 import json
-import random
 import secrets
 import uuid
 from datetime import datetime, timedelta
@@ -37,11 +51,8 @@ from typing import Any, Dict, List, Optional
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from app.services.AIService import AIService
-from app.services.TrendDataService import TrendDataService
-from app.services.PerformanceAnalyticsService import PerformanceAnalyticsService
 
 from app.agents.social_media_manager.services.holiday_calendar_service import HolidayCalendarService
-from app.agents.social_media_manager.services.content_explainer_service import ContentExplainerService
 from app.agents.social_media_manager.services.cultural_moment_service import CulturalMomentService
 from app.agents.social_media_manager.services.industry_trend_service import IndustryTrendService
 
@@ -50,22 +61,68 @@ from app.agents.social_media_manager.services.content_calendar_service import (
     _STAGE_GUIDANCE,
     _business_pulse_freshness_str,
     _validate_day,
-    _pick_mix_from_performance,
-    DEFAULT_MIX_VARIANTS,
-    POST_FORMATS,
-    HOOK_STYLES,
-    POST_FORMAT_TO_KEY,
-    CONTENT_TYPES,
-    CONTENT_TYPE_LABELS,
 )
 
 from ..models import AdCopyV2, AdOpportunityV2
+from ..creative_framework import (
+    get_creative_framework,
+    STRUCTURAL_DEVICE_SLIDE_HINT,
+    ANTI_BORING_PHRASES,
+)
 
 COLLECTION = "content_calendar_v2_plans"
 PLAN_DAYS = 30
-CHUNK_SIZE = 6          # ~5 chunks of 6 for 30 days — v1's own 7-item cap is
-                         # evidence larger single structured-JSON calls degrade
-CAROUSEL_COUNT = 3      # PRD §9 — exactly 3, each exactly 3 slides, no exceptions
+CANDIDATE_POOL_SIZE = 100    # PRD §10 — recommended 80-150
+CANDIDATE_CHUNK_SIZE = 20    # 5 concurrent chunks, mirrors the proven content-chunking pattern
+CONTENT_CHUNK_SIZE = 6       # ~5 chunks of 6 for final copy — v1's own 7-item cap is
+                              # evidence larger single structured-JSON calls degrade
+
+# PRD §26 — Ad Angle Library, derived from an item's own 27-value creative
+# angle (creative_framework.ANGLES), not from content_type (the old
+# _ANGLE_BY_CONTENT_TYPE only ever reached 4/7 of its declared values).
+_AD_ANGLE_BY_CREATIVE_ANGLE: Dict[str, str] = {
+    "the_mistake": "problem", "the_hidden_cost": "problem", "the_misconception": "problem",
+    "the_warning": "problem",
+    "the_transformation": "outcome", "the_aspiration": "outcome",
+    "the_customer_story": "proof", "the_story": "proof", "the_confession": "proof",
+    "the_experiment": "proof",
+    "the_opportunity": "offer",
+    "before_you_buy": "objection", "the_customers_question": "objection", "nobody_tells_you": "objection",
+    "the_comparison": "comparison", "the_decision_guide": "comparison", "what_would_you_choose": "comparison",
+    "what_happens_if": "urgency", "the_challenge": "urgency",
+    "the_beginner_perspective": "convenience", "the_explanation": "convenience",
+    "the_unexpected_truth": "transformation", "the_myth": "transformation", "the_reaction": "transformation",
+    "the_expert_perspective": "product_demonstration", "the_founder_perspective": "product_demonstration",
+    "the_unpopular_opinion": "product_demonstration",
+}
+
+# Maps the new 12-territory classification back onto v1's 5-value
+# content_type enum, purely so the existing frontend TypeBadge (already
+# built, keyed off content_type) keeps rendering without changes — territory
+# is the real, richer selection dimension now; content_type is a
+# compatibility shim onto it, not the other way around.
+_CONTENT_TYPE_BY_TERRITORY: Dict[str, str] = {
+    "A_PROBLEM": "educational",
+    "B_DESIRE": "relatable",
+    "C_CURIOSITY": "educational",
+    "D_CONTRARIAN": "educational",
+    "E_PROOF": "promotional",
+    "F_PEOPLE": "behind_the_scenes",
+    "G_PROCESS": "behind_the_scenes",
+    "H_COMPARISON": "educational",
+    "I_EDUCATION": "educational",
+    "J_CULTURE_CONTEXT": "relatable",
+    "K_ENTERTAINMENT": "engagement",
+    "L_COMMERCIAL": "promotional",
+}
+
+
+def _derive_content_type(territory: str) -> str:
+    return _CONTENT_TYPE_BY_TERRITORY.get(territory, "educational")
+
+
+def _derive_ad_angle(creative_angle: str) -> str:
+    return _AD_ANGLE_BY_CREATIVE_ANGLE.get(creative_angle, "outcome")
 
 
 def _cal_v2_scope(user_id: str, brand_id: Optional[str]) -> Dict[str, Any]:
@@ -93,84 +150,493 @@ def _get_period_start(ref: datetime) -> datetime:
     return ref.replace(hour=0, minute=0, second=0, microsecond=0)
 
 
-# ── Carousel slot assignment (deterministic, no LLM call — PRD §9) ─────────────
+# ── PRD §20 — Creative memory (never performance) ───────────────────────────
 
-def _assign_carousel_slots(
-    content_type_mix: List[str],
-    holiday_dates: List[str],
-) -> List[int]:
-    """Pick exactly CAROUSEL_COUNT day-indexes (0..PLAN_DAYS-1) for carousels,
-    spread across different weeks, biased toward content types that suit a
-    3-slide how-to/comparison structure and toward holiday-adjacent days."""
-    chunk_of = lambda i: i // 7  # noqa: E731 — which ~week a day falls in
+async def _fetch_creative_memory(scope: Dict[str, Any], db: AsyncIOMotorDatabase) -> Dict[str, Any]:
+    """Remembers WHAT was used before, never how it performed — the exact
+    line PRD §20 draws ('we already used X' is fine; 'X performed well, make
+    another' is not). Extends the prior titles/key_points-only lookback to
+    also track territory/subject/angle/device/format/concept-name, still via
+    the same 2-most-recent-plans query — no new collection needed."""
+    memory: Dict[str, Any] = {
+        "titles": [], "key_points": [], "territories": [], "subjects": [],
+        "angles": [], "devices": [], "formats": [], "concept_names": [],
+    }
+    async for past in db[COLLECTION].find(
+        {**scope},
+        {"_id": 0, "items.title": 1, "items.key_points": 1, "items.territory": 1,
+         "items.subject": 1, "items.creative_angle": 1, "items.creative_device": 1,
+         "items.format": 1, "items.creative_concept_name": 1},
+    ).sort("created_at", -1).limit(2):
+        for it in past.get("items", []):
+            if it.get("title"):
+                memory["titles"].append(it["title"])
+            memory["key_points"] += [str(p) for p in (it.get("key_points") or []) if p]
+            if it.get("territory"):
+                memory["territories"].append(it["territory"])
+            if it.get("subject"):
+                memory["subjects"].append(it["subject"])
+            if it.get("creative_angle"):
+                memory["angles"].append(it["creative_angle"])
+            device = it.get("creative_device") or {}
+            if device.get("device"):
+                memory["devices"].append(device["device"])
+            if it.get("format"):
+                memory["formats"].append(it["format"])
+            if it.get("creative_concept_name"):
+                memory["concept_names"].append(it["creative_concept_name"])
+    return memory
 
-    def score(i: int) -> float:
-        ct = content_type_mix[i]
-        s = 0.0
-        if ct == "educational":
-            s += 3.0
-        elif ct == "promotional":
-            s += 1.5
-        elif ct == "relatable":
-            s += 1.0
-        if holiday_dates and i < len(holiday_dates) and holiday_dates[i]:
-            s += 1.5
-        return s
 
-    ranked = sorted(range(PLAN_DAYS), key=score, reverse=True)
-    chosen: List[int] = []
-    used_chunks: set = set()
-    for i in ranked:
-        if len(chosen) >= CAROUSEL_COUNT:
-            break
-        c = chunk_of(i)
-        if c in used_chunks:
+# ── PRD §22 — Asset-first intelligence, scoped to what's actually queryable ─
+
+async def _get_existing_assets_summary(
+    user_id: str, brand_id: Optional[str], db: AsyncIOMotorDatabase,
+) -> str:
+    """No asset-library/repurposing infrastructure exists anywhere in this
+    codebase (confirmed via exhaustive grep during planning) — the only
+    queryable 'existing content' a brand has on record is content_drafts
+    (past generated/uploaded media) and brand_profiles' own logo/sample
+    templates. Returns a short human-readable summary threaded into
+    generation prompts as a nudge toward reuse, not a full asset-management
+    subsystem (see plan's explicit deferral of full §23 repurposing)."""
+    query: Dict[str, Any] = {"brand_id": brand_id} if brand_id else {"user_id": user_id}
+    parts: List[str] = []
+    try:
+        image_count = await db["content_drafts"].count_documents({**query, "image_url": {"$exists": True, "$ne": None}})
+        video_count = await db["content_drafts"].count_documents({**query, "video_url": {"$exists": True, "$ne": None}})
+        if image_count:
+            parts.append(f"{image_count} existing product/brand image(s) from past drafts")
+        if video_count:
+            parts.append(f"{video_count} existing video(s) from past drafts")
+
+        profile = await db["brand_profiles"].find_one(query, {"logo_url": 1, "sample_template_urls": 1})
+        if profile:
+            if profile.get("logo_url"):
+                parts.append("a brand logo")
+            if profile.get("sample_template_urls"):
+                parts.append(f"{len(profile['sample_template_urls'])} sample design template(s)")
+    except Exception as exc:
+        print(f"[CalendarV2] existing-assets lookup failed (non-fatal): {exc}", flush=True)
+    return "; ".join(parts)
+
+
+# ── Step 3 — Candidate concept pool (PRD §10, §36) ──────────────────────────
+
+async def _generate_candidate_concepts(
+    brand: Dict[str, Any],
+    framework: Dict[str, Any],
+    existing_assets_summary: str,
+    creative_memory: Dict[str, Any],
+    platforms: List[str],
+    cultural_moments: Optional[List[Dict[str, Any]]] = None,
+    industry_best_practices: Optional[Any] = None,
+    target_count: int = CANDIDATE_POOL_SIZE,
+) -> List[Dict[str, Any]]:
+    """Generates 80-150 structured CONCEPTS — territory/subject/angle/
+    creative_device/format_hint/objective/audience_segment/concept_name
+    ONLY, explicitly no final copy yet (PRD §36: 'the system is deciding
+    WHAT to say, not yet writing exactly how to say it'). NEVER receives
+    performance or trend_keywords — that's the concrete enforcement of
+    PRD §2, not just a prompt instruction: those objects simply don't exist
+    in this function's argument list."""
+    brand_name = brand.get("brand_name") or "the brand"
+    industry = brand.get("industry") or "business"
+    audience = brand.get("target_audience") or "general audience"
+    voice = brand.get("brand_voice") or "professional and engaging"
+    description = brand.get("business_description", "")
+    usp = brand.get("unique_selling_proposition", "")
+    business_stage = brand.get("business_stage", "")
+    stage_note = (
+        f"Business stage: {business_stage} — {_STAGE_GUIDANCE.get(business_stage, '')}"
+        if business_stage else ""
+    )
+
+    territories_block = "\n".join(
+        f"- {key} ({t['label']}): {t['description']} Example subjects: {', '.join(t['subjects'][:8])}"
+        for key, t in framework["territories"].items()
+    )
+    angles_block = ", ".join(a["label"] for a in framework["angles"])
+    devices_block = "\n".join(
+        f"- {cat}: " + ", ".join(d["label"] for d in devices)
+        for cat, devices in framework["creative_devices"].items()
+    )
+
+    context_lines = []
+    if industry_best_practices:
+        context_lines.append(f"Industry best practices: {industry_best_practices}")
+    if cultural_moments:
+        names = [m.get("name") or m.get("topic") or str(m) for m in cultural_moments[:5]]
+        context_lines.append(f"Relevant cultural moments this period: {', '.join(str(n) for n in names)}")
+    context_block = ("\n" + "\n".join(context_lines)) if context_lines else ""
+
+    avoid_block = ""
+    if creative_memory.get("concept_names"):
+        avoid_block = (
+            "\nAlready explored recently — do not repeat these concept names or their "
+            "underlying territory+subject+angle combination:\n"
+            + "\n".join(f"- {c}" for c in creative_memory["concept_names"][:30])
+        )
+
+    assets_block = f"\nExisting assets available: {existing_assets_summary}" if existing_assets_summary else ""
+
+    remaining = target_count
+    chunk_sizes: List[int] = []
+    while remaining > 0:
+        size = min(CANDIDATE_CHUNK_SIZE, remaining)
+        chunk_sizes.append(size)
+        remaining -= size
+
+    async def _one_chunk(chunk_idx: int, n: int) -> List[Dict[str, Any]]:
+        prompt = f"""You are a senior creative strategist generating CANDIDATE content
+CONCEPTS for {brand_name}, a {industry} business. Target audience: {audience}.
+Brand voice: {voice}. {f'What they do: {description}.' if description else ''}
+{f'USP: {usp}.' if usp else ''}
+{stage_note}{context_block}{assets_block}{avoid_block}
+Platforms: {', '.join(platforms) if platforms else 'social media'}.
+
+Available Content Territories (draw from these freely — you don't need every one):
+{territories_block}
+
+Available Angles: {angles_block}
+
+Available Creative Devices:
+{devices_block}
+
+Generate exactly {n} DISTINCT candidate concepts. This is IDEATION only —
+DO NOT write titles, hooks, captions, or any final copy. Just decide WHAT
+each idea is, not HOW to say it yet.
+
+For each concept, return:
+- territory: one of the territory keys above (e.g. "A_PROBLEM")
+- subject: one specific subject from that territory's list (or a close industry-specific variant)
+- angle: one angle label from the list above, exactly as written
+- creative_device: {{"category": one of story|visual|conversational|psychological|structural, "device": one device label from that category, exactly as written}}
+- format_hint: one of image|carousel|video|product_video|ai_video|text (best guess — a later stage may override it)
+- objective: one of reach|engagement|leads|sales|awareness
+- audience_segment: which part of the audience this speaks to, 3-6 words
+- concept_name: a short 3-6 word internal name for this idea (e.g. "The Upfront Cost Trap")
+
+No two concepts in this batch may share the same territory+subject+angle combination.
+Never rely on historical engagement, trending topics, or search data — these
+concepts must come purely from business/audience/brand/creative-framework
+reasoning (nothing else exists in this task).
+
+Return ONLY a valid JSON array of exactly {n} objects with exactly these 7 keys, nothing else."""
+        try:
+            ai_request = AIService.build_ai_model(
+                messages=[{"role": "user", "content": prompt}], model="gpt-4o", temperature=1.0,
+            )
+            response = await AIService.chat_completion(ai_request)
+            raw = response.choices[0].message.content.strip()
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+            parsed = json.loads(raw.strip())
+            if not isinstance(parsed, list):
+                return []
+            forbidden = {"title", "hook", "caption", "key_points", "description", "exact_copy"}
+            for c in parsed:
+                if isinstance(c, dict):
+                    for f in forbidden:
+                        c.pop(f, None)
+            return [c for c in parsed if isinstance(c, dict)]
+        except Exception as exc:
+            print(f"[CalendarV2] candidate chunk {chunk_idx} failed: {exc}", flush=True)
+            return []
+
+    results = await asyncio.gather(*[_one_chunk(i, size) for i, size in enumerate(chunk_sizes)])
+    return [c for chunk in results for c in chunk]
+
+
+# ── Step 4 — Score candidates (PRD §11-12, §37) ─────────────────────────────
+
+_REQUIRED_SCORE_KEYS = (
+    "strategic_relevance", "audience_relevance", "creative_strength", "distinctiveness",
+    "brand_fit", "commercial_relevance", "asset_feasibility", "context_relevance", "repetition_risk",
+)
+_FORBIDDEN_SCORE_KEYS = {"performance_score", "google_trends_score", "engagement_score", "search_volume_score"}
+
+
+async def _score_candidates(
+    concepts: List[Dict[str, Any]],
+    brand: Dict[str, Any],
+    framework: Dict[str, Any],
+    creative_memory: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Explicitly must NOT be influenced by performance or trend data — no
+    such object is ever passed into this function. The returned score dict
+    is built key-by-key from _REQUIRED_SCORE_KEYS only, so any
+    performance_score/google_trends_score/etc a model might hallucinate in
+    is structurally dropped, not merely instructed against — belt-and-
+    suspenders on top of the prompt (PRD §12's explicit 'must NOT include')."""
+    if not concepts:
+        return []
+    brand_name = brand.get("brand_name") or "the brand"
+    industry = brand.get("industry") or "business"
+
+    listing = "\n".join(
+        f"{i}: territory={c.get('territory')}, subject={c.get('subject')}, angle={c.get('angle')}, "
+        f"device={(c.get('creative_device') or {}).get('device')}, format_hint={c.get('format_hint')}, "
+        f"concept_name={c.get('concept_name')}"
+        for i, c in enumerate(concepts)
+    )
+    prior_block = ""
+    if creative_memory.get("concept_names"):
+        prior_block = "\nRecently used concepts (penalize repetition_risk if similar):\n" + "\n".join(
+            f"- {c}" for c in creative_memory["concept_names"][:30]
+        )
+
+    prompt = f"""Score these {len(concepts)} candidate content concepts for {brand_name}
+({industry}).{prior_block}
+
+{listing}
+
+For EACH concept (by index), score 0-10 on exactly these 9 dimensions:
+- strategic_relevance: does it support the business's real objectives?
+- audience_relevance: does it matter to the actual target audience?
+- creative_strength: is the idea interesting enough to stop the scroll?
+- distinctiveness: does it feel different from the OTHER concepts in this list?
+- brand_fit: does it make sense for this specific brand?
+- commercial_relevance: can it meaningfully contribute to the business?
+- asset_feasibility: can this business realistically produce it?
+- context_relevance: any genuine date/seasonal tie-in relevance (0 if none)?
+- repetition_risk: HIGH (near 10) if this closely resembles a recently-used concept above or another concept in this same list, LOW (near 0) if genuinely fresh.
+
+Do NOT score based on historical engagement, trending topics, follower growth,
+or search volume — none of that exists in this task and must never factor in.
+
+Return ONLY a valid JSON array of exactly {len(concepts)} objects, index-aligned
+(object 0 = concept 0, etc.), each with exactly these 9 numeric keys:
+["strategic_relevance", "audience_relevance", "creative_strength", "distinctiveness",
+"brand_fit", "commercial_relevance", "asset_feasibility", "context_relevance", "repetition_risk"]"""
+
+    scores: List[Any] = [{} for _ in concepts]
+    try:
+        ai_request = AIService.build_ai_model(
+            messages=[{"role": "user", "content": prompt}], model="gpt-4o", temperature=0.4,
+        )
+        response = await AIService.chat_completion(ai_request)
+        raw = response.choices[0].message.content.strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        parsed = json.loads(raw.strip())
+        if isinstance(parsed, list) and len(parsed) == len(concepts):
+            scores = parsed
+        else:
+            raise ValueError(f"expected {len(concepts)} scores, got {len(parsed) if isinstance(parsed, list) else type(parsed)}")
+    except Exception as exc:
+        print(f"[CalendarV2] candidate scoring failed ({exc}) — falling back to neutral scores", flush=True)
+
+    scored: List[Dict[str, Any]] = []
+    for concept, raw_score in zip(concepts, scores):
+        clean_score: Dict[str, float] = {}
+        for key in _REQUIRED_SCORE_KEYS:
+            val = raw_score.get(key) if isinstance(raw_score, dict) else None
+            clean_score[key] = float(val) if isinstance(val, (int, float)) else 5.0
+        assert not (_FORBIDDEN_SCORE_KEYS & set(clean_score.keys())), "forbidden score key leaked in"
+        clean_score["diversity_gain"] = 0.0  # computed at selection time, see _select_diverse_thirty
+        scored.append({**concept, "selection_score": clean_score})
+    return scored
+
+
+# ── Step 5 — Select 30, diversity-optimized (PRD §13-15) ───────────────────
+
+def _buckets_for_concept(c: Dict[str, Any]) -> set:
+    """PRD §15's 9 minimum-creative-bucket requirements, mapped from
+    territory/device combinations — deterministic, no LLM call needed."""
+    buckets = set()
+    territory = c.get("territory", "")
+    device_category = (c.get("creative_device") or {}).get("category", "")
+    if device_category == "story":
+        buckets.add("story_driven")
+    if territory == "E_PROOF":
+        buckets.add("proof_social_proof")
+    if territory == "G_PROCESS":
+        buckets.add("behind_the_scenes_process")
+    if territory == "A_PROBLEM":
+        buckets.add("customer_problem")
+    if territory == "K_ENTERTAINMENT" or device_category == "conversational":
+        buckets.add("audience_interaction")
+    if territory == "L_COMMERCIAL":
+        buckets.add("commercial")
+    if territory == "D_CONTRARIAN":
+        buckets.add("opinion_contrarian")
+    if device_category == "visual":
+        buckets.add("visually_distinctive")
+    if territory in ("K_ENTERTAINMENT", "C_CURIOSITY"):
+        buckets.add("unexpected_experimental")
+    return buckets
+
+
+def _concept_base_score(c: Dict[str, Any]) -> float:
+    s = c.get("selection_score") or {}
+    return (
+        s.get("strategic_relevance", 0) + s.get("audience_relevance", 0) + s.get("creative_strength", 0)
+        + s.get("brand_fit", 0) + s.get("commercial_relevance", 0) + s.get("asset_feasibility", 0)
+        - s.get("repetition_risk", 0) * 0.5
+    )
+
+
+def _similarity_overlap(candidate: Dict[str, Any], selected: List[Dict[str, Any]]) -> int:
+    """Worst-case overlap against any already-selected item — the
+    diversity_gain input from PRD §13's illustrative algorithm. Deliberately
+    cheap/deterministic (territory/subject/angle/device/format overlap
+    count), not embedding-based — see plan's documented deferral of
+    embedding similarity as a fast-follow."""
+    worst = 0
+    c_device = (candidate.get("creative_device") or {}).get("device")
+    for s in selected:
+        overlap = sum([
+            candidate.get("territory") == s.get("territory"),
+            candidate.get("subject") == s.get("subject"),
+            candidate.get("angle") == s.get("angle"),
+            c_device == (s.get("creative_device") or {}).get("device"),
+            candidate.get("format_hint") == s.get("format_hint"),
+        ])
+        worst = max(worst, overlap)
+    return worst
+
+
+def _select_diverse_thirty(scored_concepts: List[Dict[str, Any]], framework: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Pick 30 optimizing strategic coverage + creative variety + business
+    relevance + production feasibility — NOT simply top-scoring (PRD §13:
+    'otherwise the system may select ten excellent but almost identical
+    ideas'). Implements the PRD's illustrative iterative-maximize algorithm."""
+    rules = framework["validation_rules"]
+    target = rules["item_count"]
+    max_commercial = max(1, round(target * rules["commercial_territory_max_share"]))
+
+    pool = list(scored_concepts)
+    selected: List[Dict[str, Any]] = []
+    commercial_count = 0
+
+    while len(selected) < target and pool:
+        best_idx, best_val = None, float("-inf")
+        for idx, c in enumerate(pool):
+            if c.get("territory") == "L_COMMERCIAL" and commercial_count >= max_commercial:
+                continue
+            overlap = _similarity_overlap(c, selected)
+            diversity_gain = max(0.0, 10.0 - overlap * 3.0)
+            val = _concept_base_score(c) + diversity_gain
+            if val > best_val:
+                best_val, best_idx = val, idx
+        if best_idx is None:
+            # Commercial cap is blocking every remaining candidate — relax
+            # rather than under-fill the plan.
+            best_idx = max(range(len(pool)), key=lambda i: _concept_base_score(pool[i]))
+        chosen = pool.pop(best_idx)
+        chosen["selection_score"]["diversity_gain"] = round(best_val - _concept_base_score(chosen), 2)
+        selected.append(chosen)
+        if chosen.get("territory") == "L_COMMERCIAL":
+            commercial_count += 1
+
+    # Backfill minimum creative buckets (PRD §15) — swap the best unselected
+    # candidate covering a missing bucket in for the currently-weakest
+    # selected item.
+    covered: set = set()
+    for c in selected:
+        covered |= _buckets_for_concept(c)
+    for bucket, need in rules["min_creative_buckets"].items():
+        if need <= 0 or bucket in covered or not selected:
             continue
-        chosen.append(i)
-        used_chunks.add(c)
-    # Fallback: if fewer than 3 distinct chunks had a candidate (very small
-    # plan windows, edge case), fill remaining slots from whatever's left.
-    if len(chosen) < CAROUSEL_COUNT:
-        for i in ranked:
-            if len(chosen) >= CAROUSEL_COUNT:
-                break
-            if i not in chosen:
-                chosen.append(i)
-    return sorted(chosen[:CAROUSEL_COUNT])
+        fix = max(
+            (c for c in pool if bucket in _buckets_for_concept(c)),
+            key=_concept_base_score, default=None,
+        )
+        if fix is None:
+            continue
+        weakest = min(selected, key=_concept_base_score)
+        selected.remove(weakest)
+        pool.append(weakest)
+        pool.remove(fix)
+        selected.append(fix)
+        covered |= _buckets_for_concept(fix)
+
+    return selected[:target]
 
 
-# ── Ad-opportunity scoring (rule-based, PRD §19) ────────────────────────────────
+# ── Step 6 — Assign dates (PRD §18) ─────────────────────────────────────────
 
-def _score_ad_opportunity(
-    item: Dict[str, Any],
-    performance: Dict[str, Any],
-    near_holiday: bool,
-) -> float:
+def _assign_dates(
+    selected: List[Dict[str, Any]], all_dates: List[str], holidays_by_date: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """A holiday/moment only stays attached to an item if the scoring stage
+    already gave it genuine context_relevance — never a blind 'Happy
+    [Holiday]' just because a date happens to be near one (PRD §18)."""
+    out = []
+    for day_index, concept in enumerate(selected):
+        date_str = all_dates[day_index]
+        item = {**concept, "day_index": day_index, "date": date_str}
+        score = concept.get("selection_score") or {}
+        if score.get("context_relevance", 0) >= 5 and date_str in holidays_by_date:
+            item["holiday_tie_in"] = holidays_by_date[date_str]
+        out.append(item)
+    return out
+
+
+# ── Step 7 — Assign format, dynamic 2-5 slide carousels (PRD §16-17) ───────
+
+def _pick_carousel_slide_count(concept: Dict[str, Any]) -> int:
+    device_key = (concept.get("creative_device") or {}).get("device", "")
+    return STRUCTURAL_DEVICE_SLIDE_HINT.get(device_key, 3)
+
+
+def _assign_format(concept: Dict[str, Any], brand: Dict[str, Any], existing_assets_summary: str) -> Dict[str, Any]:
+    """Per-idea format decision (PRD §17's worked examples as an explicit
+    rule table), replacing the old fixed-3-carousels-only pre-assignment.
+    Carousel eligibility is now an OUTCOME of this function, not a pre-
+    picked slot list."""
+    device_category = (concept.get("creative_device") or {}).get("category", "")
+    device_key = (concept.get("creative_device") or {}).get("device", "")
+    format_hint = concept.get("format_hint", "")
+    has_product_photo = "product" in (existing_assets_summary or "").lower()
+
+    if device_category == "story":
+        fmt = "video"
+    elif device_category == "structural" or format_hint == "carousel":
+        fmt = "carousel"
+    elif format_hint == "product_video" or (device_key == "product_hero" and has_product_photo):
+        fmt = "product_video"
+    elif format_hint == "ai_video":
+        fmt = "ai_video"
+    elif device_category == "conversational" and device_key == "talking_head":
+        fmt = "video"
+    elif format_hint in ("image", "video", "product_video", "ai_video", "text"):
+        fmt = format_hint
+    else:
+        fmt = "image"
+
+    result = {**concept, "format": fmt}
+    if fmt == "carousel":
+        result["carousel_slide_count"] = _pick_carousel_slide_count(concept)
+    return result
+
+
+# ── Ad-opportunity scoring (rule-based, PRD §19 — performance-free) ─────────
+
+def _score_ad_opportunity(item: Dict[str, Any], near_holiday: bool, has_active_promo: bool) -> float:
+    """The old version's avg_engagement_by_topic substring-match branch —
+    the one place this function directly touched performance data for a
+    selection-adjacent decision — is removed outright. Signals now: is this
+    idea Commercial-territory, how commercially relevant did scoring already
+    rate it, is there an active promo it could carry, is a real date nearby,
+    does it already have a CTA."""
     score = 0.0
-    if item.get("content_type") == "promotional":
-        score += 45.0
-    elif item.get("content_type") == "educational":
-        score += 15.0
-    avg_by_topic = (performance or {}).get("avg_engagement_by_topic") or {}
-    title_lower = (item.get("title") or "").lower()
-    for topic, eng in avg_by_topic.items():
-        if topic.lower() in title_lower:
-            score += min(eng, 30.0)
-            break
-    if near_holiday and item.get("content_type") in ("promotional", "educational"):
+    if item.get("territory") == "L_COMMERCIAL":
+        score += 40.0
+    selection_score = item.get("selection_score") or {}
+    score += min(selection_score.get("commercial_relevance", 0) * 3.0, 30.0)
+    if has_active_promo and item.get("territory") == "L_COMMERCIAL":
+        score += 10.0
+    if near_holiday and item.get("territory") in ("L_COMMERCIAL", "A_PROBLEM", "H_COMPARISON"):
         score += 10.0
     if item.get("cta"):
         score += 10.0
     return min(round(score, 1), 100.0)
-
-
-_ANGLE_BY_CONTENT_TYPE: Dict[str, str] = {
-    "promotional": "offer",
-    "educational": "problem_first",
-    "relatable": "outcome_first",
-    "engagement": "social_proof",
-    "behind_the_scenes": "social_proof",
-}
 
 
 async def _write_calendar_ad_copy(
@@ -186,10 +652,6 @@ async def _write_calendar_ad_copy(
     brand_name = brand.get("brand_name") or "the brand"
     usp = brand.get("unique_selling_proposition") or ""
     cta_preference = (brand.get("cta_styles") or [""])[0]
-    # Confirmed live: without this, the model has no active-promo data to work
-    # with at all, so it correctly (per its own anti-fabrication instruction
-    # below) falls back to generic "exclusive promotions today" instead of
-    # naming the real offer — this isn't a compliance failure, it's a data gap.
     business_pulse = brand.get("business_pulse") or {}
     promo_lines = [v for v in [
         ("Active promotion: " + "; ".join(business_pulse.get("current_promotions") or [])) if business_pulse.get("current_promotions") else "",
@@ -222,7 +684,7 @@ Write:
 
 Never invent a specific statistic, testimonial, discount amount, or customer
 count that wasn't given above — if you'd need one to make the copy work,
-write around it instead (PRD ad-safety rule: no fabricated claims).
+write around it instead (ad-safety rule: no fabricated claims).
 
 Return ONLY valid JSON: {{"headline": "...", "primary_text": "...", "short_copy": "...", "cta": "...", "image_prompt": "..."}}
 """
@@ -245,23 +707,16 @@ Return ONLY valid JSON: {{"headline": "...", "primary_text": "...", "short_copy"
         return AdCopyV2()
 
 
-# ── Creative diversity validation (rule-based + LLM self-check, PRD §18) ───────
+# ── Creative diversity + anti-boring validation (PRD §14, §29-30) ──────────
 
 def _rule_based_diversity_issues(items: List[Dict[str, Any]]) -> Dict[int, str]:
-    """Deterministic half of the diversity check: duplicate/near-duplicate
-    TITLE openings, and repeated content_type+format on adjacent days.
-
-    NOTE: this compares titles, not hooks — confirmed live: comparing hooks
-    flagged 29/30 items on a real 30-day run. HOOK_STYLES itself hands the
-    model literal canned phrases per style (e.g. "How-to opener — begin with
-    'Here's how…' or 'The exact steps we use to…'"), and with only 7 styles
-    rotating across 30 days each style recurs ~4x — the model reusing that
-    style's own suggested opening phrase each time is expected, by-design
-    behavior, not genuine repetition. Titles are the field the model is
-    actually instructed to keep unique ("no two titles share an opening
-    word", in the generation prompt below) and aren't handed a template
-    phrase to reuse, so they're the real diversity signal here.
-    """
+    """Deterministic half: duplicate/near-duplicate TITLE openings (titles
+    are the field the model is explicitly instructed to keep unique — hooks
+    aren't, confirmed live: comparing hooks flagged 29/30 items on a real
+    run because devices/angles legitimately recur across 30 days), and
+    genuinely repeated territory+subject+angle on adjacent days (a much
+    stronger, more specific signal than the old content_type+format pair
+    the earlier version compared)."""
     issues: Dict[int, str] = {}
     seen_openings: Dict[str, int] = {}
     for i, item in enumerate(items):
@@ -273,31 +728,24 @@ def _rule_based_diversity_issues(items: List[Dict[str, Any]]) -> Dict[int, str]:
             seen_openings[opening] = i
         if i > 0:
             prev = items[i - 1]
-            # NOTE: these items carry "assigned_format" at this stage (set in
-            # _generate_chunk_items), not "format" — items_out builds the final
-            # "format" key later. Confirmed live: comparing the wrong/missing
-            # keys here made both sides always None, so this condition was
-            # unconditionally True for every i>0 — the actual dominant cause of
-            # 29/30 items getting flagged (title-opening collisions were real
-            # but a much smaller contributor).
-            if (item.get("content_type") == prev.get("content_type")
-                    and item.get("assigned_format") == prev.get("assigned_format")):
-                issues[i] = issues.get(i, "") + "; repeats prior day's content_type+format pair"
+            if (item.get("territory") == prev.get("territory")
+                    and item.get("subject") == prev.get("subject")
+                    and item.get("angle") == prev.get("angle")):
+                issues[i] = issues.get(i, "") + "; repeats prior day's territory+subject+angle"
     return issues
 
 
 async def _llm_diversity_check(items: List[Dict[str, Any]]) -> List[int]:
-    """One extra LLM call across all items' titles/hooks/key_points asking
-    which pairs are substantially the same idea reworded — a cheap stand-in
-    for embedding-based semantic similarity (real embeddings noted as a
-    fast-follow in the plan, not built this pass)."""
+    """One extra LLM call across all items' titles/hooks asking which pairs
+    are substantially the same idea reworded — a cheap stand-in for
+    embedding-based semantic similarity (deferred as a fast-follow)."""
     listing = "\n".join(
         f"{i}: {it.get('title', '')} — {it.get('hook', '')}"
         for i, it in enumerate(items)
     )
     prompt = f"""Below are {len(items)} social media post ideas for one business. Which
 indexes, if any, are substantially the SAME underlying idea reworded (not
-just sharing a content_type — genuinely the same angle/message)?
+just sharing a territory — genuinely the same angle/message)?
 
 {listing}
 
@@ -321,10 +769,29 @@ duplicate another idea in the list, e.g. [4, 11] or [] if none duplicate.
         return []
 
 
-# ── Chunked generation ──────────────────────────────────────────────────────────
+def _anti_boring_check(items: List[Dict[str, Any]]) -> Dict[int, str]:
+    """PRD §30 — flags generic AI phrasings for a creative-quality-review
+    NOTE, never an auto-reject (the execution can still redeem a generic
+    opener)."""
+    flagged: Dict[int, str] = {}
+    for i, item in enumerate(items):
+        text = " ".join([
+            str(item.get("title", "")), str(item.get("hook", "")),
+            str((item.get("exact_copy") or {}).get("caption", "")),
+        ]).lower()
+        for phrase in ANTI_BORING_PHRASES:
+            check = phrase.split("{brand}")[0].strip() if "{brand}" in phrase else phrase
+            if check and check in text:
+                flagged[i] = f'generic phrasing detected: "{phrase}" — verify the execution redeems it'
+                break
+    return flagged
 
-def _validate_item_v2(idea: Dict[str, Any], is_carousel: bool) -> List[str]:
-    """Extends v1's _validate_day with the new MVP-required fields."""
+
+def _validate_item_v2(idea: Dict[str, Any], is_carousel: bool, expected_slides: int = 3) -> List[str]:
+    """Extends v1's _validate_day (hard deterministic rules, PRD §28) with
+    V2's own required fields, and a dynamic carousel-slide-count check
+    (2-5, per the concept's own creative device — PRD §17) replacing the
+    old hardcoded-exactly-3 rule."""
     issues = _validate_day(idea)
     if not str(idea.get("ai_image_prompt") or "").strip():
         issues.append("ai_image_prompt is empty")
@@ -332,159 +799,149 @@ def _validate_item_v2(idea: Dict[str, Any], is_carousel: bool) -> List[str]:
         issues.append("reasoning is empty")
     if not idea.get("primary_kpi"):
         issues.append("primary_kpi is empty")
+    if not str(idea.get("creative_concept_name") or "").strip():
+        issues.append("creative_concept_name is empty")
     if is_carousel:
         slides = ((idea.get("carousel") or {}).get("slides")) or []
-        if len(slides) != 3:
-            issues.append(f"carousel must have exactly 3 slides, got {len(slides)}")
+        if not (2 <= expected_slides <= 5):
+            issues.append(f"carousel slide count {expected_slides} out of the 2-5 range")
+        elif len(slides) != expected_slides:
+            issues.append(f"carousel must have exactly {expected_slides} slides, got {len(slides)}")
     return issues
 
 
-async def _generate_chunk_items(
+# ── Step 8+9 — Final copy + creative direction (PRD §37-38) ────────────────
+
+async def _generate_final_copy(
     brand: Dict[str, Any],
-    chunk_content_types: List[str],
-    chunk_formats: List[str],   # "carousel" for slots picked by _assign_carousel_slots
-    chunk_hooks: List[str],
-    chunk_dates: List[str],     # "YYYY-MM-DD", index-aligned
-    day_offset: int,            # absolute plan-day index of chunk[0]
+    concepts_chunk: List[Dict[str, Any]],   # each already has territory/subject/angle/device/format/date/day_index
     platforms: List[str],
-    previous_titles: List[str],
-    previous_key_points: List[str],
-    trend_keywords: List[Dict[str, Any]],
-    performance: Dict[str, Any],
+    existing_assets_summary: str,
     force: bool = False,
 ) -> List[Dict[str, Any]]:
-    n = len(chunk_content_types)
+    """PRD Step8 (final copy) and Step9 (creative direction) share ONE
+    chunked network call here rather than two — a deliberate simplification
+    documented in the plan: this pipeline already makes 3x the LLM calls the
+    old single-stage engine did (candidates -> score -> final copy), and
+    splitting copy/direction into a 4th sequential stage would meaningfully
+    worsen the exact proxy-timeout problem this codebase already fought hard
+    to fix (see generate_plan_v2's concurrency comments). The PRD's real
+    requirement — copy generation must not reinterpret the approved concept
+    — is satisfied by fixing territory/subject/angle/device/format as given
+    inputs the model is told not to touch, not by forcing a second round-trip."""
+    n = len(concepts_chunk)
     brand_name = brand.get("brand_name") or "the brand"
     industry = brand.get("industry") or "business"
-    voice = brand.get("brand_voice") or brand.get("derived_voice") or "professional and engaging"
+    voice = brand.get("brand_voice") or "professional and engaging"
     audience = brand.get("target_audience") or "general audience"
     platforms_str = ", ".join(platforms) if platforms else "social media"
     tagline = brand.get("tagline", "")
-    description = brand.get("business_description") or brand.get("product_description", "")
+    description = brand.get("business_description", "")
     region = brand.get("region", "")
-    business_stage = brand.get("business_stage", "")
     usp = brand.get("unique_selling_proposition", "")
     price_range = brand.get("price_range", "")
     business_pulse = brand.get("business_pulse") or {}
     business_pulse_updated_at = brand.get("business_pulse_updated_at")
 
-    stage_block = (
-        f"Business stage: {business_stage} — {_STAGE_GUIDANCE.get(business_stage, '')}"
-        if business_stage else ""
-    )
     bp_freshness = _business_pulse_freshness_str(business_pulse_updated_at)
-    bp_lines = [v for k, v in {
-        "goal": business_pulse.get("current_period_goal"),
-        "promotions": ", ".join(business_pulse.get("current_promotions") or []),
-        "campaigns": ", ".join(business_pulse.get("current_campaigns") or []),
-        "new products": ", ".join(business_pulse.get("new_products_services") or []),
-        "milestones": ", ".join(business_pulse.get("recent_milestones") or []),
-    }.items() if v]
+    bp_lines = [v for v in [
+        business_pulse.get("current_period_goal"),
+        ", ".join(business_pulse.get("current_promotions") or []),
+        ", ".join(business_pulse.get("current_campaigns") or []),
+        ", ".join(business_pulse.get("new_products_services") or []),
+        ", ".join(business_pulse.get("recent_milestones") or []),
+    ] if v]
     business_pulse_block = ""
     if bp_lines:
         freshness_note = f" ({bp_freshness})" if bp_freshness else ""
         business_pulse_block = f"Current business pulse{freshness_note}: " + "; ".join(bp_lines)
 
-    days_block = "\n".join(
-        f"Item {i} ({chunk_dates[i]}) → type: {chunk_content_types[i]} "
-        f"({CONTENT_TYPE_LABELS.get(chunk_content_types[i], chunk_content_types[i])}) | "
-        f"hook style: {chunk_hooks[i]} | "
-        f"format: {'CAROUSEL — exactly 3 slides, PRD-mandated' if chunk_formats[i] == 'carousel' else chunk_formats[i]}"
-        for i in range(n)
+    assets_block = (
+        f"\nExisting assets available (prefer reusing over requesting new production): {existing_assets_summary}"
+        if existing_assets_summary else ""
+    )
+    force_token = f"\n[Regen token: {secrets.token_hex(6)}]\n" if force else ""
+
+    def _fmt_line(c: Dict[str, Any]) -> str:
+        if c.get("format") == "carousel":
+            return f"CAROUSEL — exactly {c.get('carousel_slide_count', 3)} slides"
+        return str(c.get("format", "image"))
+
+    concepts_block = "\n\n".join(
+        f"""Item {i} — {c['date']}:
+  Territory: {c.get('territory')} | Subject: {c.get('subject')} | Angle: {c.get('angle')}
+  Creative device: {(c.get('creative_device') or {}).get('device')} ({(c.get('creative_device') or {}).get('category')})
+  Concept: {c.get('concept_name') or c.get('creative_concept_name', '')}
+  Objective: {c.get('objective')} | Audience segment: {c.get('audience_segment', '')}
+  Format: {_fmt_line(c)}"""
+        + (f"\n  Holiday tie-in: {c['holiday_tie_in'].get('name')}" if c.get("holiday_tie_in") else "")
+        for i, c in enumerate(concepts_chunk)
     )
 
-    avoid_block = ""
-    if previous_titles:
-        avoid_block = "\nAlready used (do not repeat these ideas or angles):\n" + "\n".join(f"- {t}" for t in previous_titles[:40] if t)
-    if previous_key_points:
-        avoid_block += "\nUnderlying points already covered (do not reuse the substance):\n" + "\n".join(f"- {p}" for p in previous_key_points[:40] if p)
+    carousel_spec_lines = [
+        f"Item {i}'s carousel must have EXACTLY {c.get('carousel_slide_count', 3)} slides, no more, no fewer."
+        for i, c in enumerate(concepts_chunk) if c.get("format") == "carousel"
+    ]
+    carousel_spec = ("\n" + "\n".join(carousel_spec_lines)) if carousel_spec_lines else ""
 
-    market_intel_block = ""
-    if trend_keywords:
-        market_intel_block = "Trending keywords (use as angles where relevant):\n" + "\n".join(
-            f"  - {kw.get('keyword')}" for kw in trend_keywords[:6]
-        )
-
-    performance_block = ""
-    if performance and performance.get("has_data"):
-        top_topics = performance.get("top_topics", [])
-        if top_topics:
-            performance_block = (
-                f"PROVEN TOP TOPICS (real engagement history — weight heavily): {', '.join(top_topics[:5])}"
-            )
-
-    force_token = f"\n[Regen token: {secrets.token_hex(6)}] Produce genuinely different ideas from any prior generation.\n" if force else ""
-
-    exact_copy_spec = """
-- exact_copy: {"headline": "publish-ready headline/first-line", "caption": "the FULL publish-ready caption text, ready to post as-is", "hashtags": ["2-5 relevant hashtags, no # symbol"]}"""
-    carousel_spec = """
-- carousel: null UNLESS this item's format is CAROUSEL, in which case:
-  {"slides": [
-    {"slide_index": 0, "headline": "hook slide headline", "body": "hook slide body text", "visual_note": "what the slide should show"},
-    {"slide_index": 1, "headline": "core info/insight headline", "body": "the substance", "visual_note": "..."},
-    {"slide_index": 2, "headline": "conclusion + CTA headline", "body": "wrap-up + CTA", "visual_note": "..."}
-  ]} — exactly 3 slides, no more, no fewer (PRD §9, non-negotiable)."""
-
-    prompt = f"""You are a senior social media strategist producing part of a 30-day
-content plan for {brand_name}{f' ("{tagline}")' if tagline else ''}.
+    prompt = f"""You are a senior social media copywriter turning {n} ALREADY-APPROVED
+content concepts into publish-ready posts for {brand_name}{f' ("{tagline}")' if tagline else ''}.
 Industry: {industry}. {f'What they do: {description}.' if description else ''}
-Target audience: {audience}{f', {region} market' if region else ''}.
-Brand voice: {voice}.
+Target audience: {audience}{f', {region} market' if region else ''}. Brand voice: {voice}.
 {f'USP: {usp}.' if usp else ''}
 {f'Price positioning: {price_range}.' if price_range else ''}
-{stage_block}
-{business_pulse_block}
-{performance_block}
-{market_intel_block}
+{business_pulse_block}{assets_block}
 Platforms: {platforms_str}
-{avoid_block}
 {force_token}
 
-Produce {n} COMPLETE, ready-to-publish content items — every field below is
-required, no field may be a placeholder:
+Each concept below is ALREADY DECIDED — its territory, subject, angle, and
+creative device are FIXED. Your job is EXECUTION only: write the actual copy
+that brings this specific concept to life. Do NOT invent a different idea,
+switch the angle, or change what the post is fundamentally about.
 
-- title: max 10 words, punchy, specific to this brand
-- hook: exact opening line (1 sentence)
+{concepts_block}
+{carousel_spec}
+
+For EACH item, return ALL of these fields:
+- title: max 10 words, punchy, specific to this brand — must clearly reflect its concept's subject+angle
+- hook: exact opening line (1 sentence), executing the item's creative device
 - key_points: 2-5 concrete specific points
 - description: 2-3 sentences tying the idea together
 - caption_direction: 1-2 sentences of specific guidance for the caption
 - keywords: 2-4 real keywords specific to this idea
 - cta: one specific call-to-action sentence
+- topic: 3-6 word plain-language topic label
+- promised_business_outcome: what result this post ultimately supports (1 short sentence)
+- content_pillar: which broad content pillar this belongs to (a few words)
+- customer_journey_stage: one of awareness|consideration|decision|retention
 - video_idea: {{"format": one of talking_head|product_demo|testimonial|tutorial|behind_the_scenes|trend_based, "hook": "...", "talking_points": ["..."], "scenes": ["..."], "cta": "..."}}
 - holiday_reference: null unless a real, relevant holiday/observance genuinely
-  falls on this item's date for {region or 'the audience region'} — never invent one{exact_copy_spec}{carousel_spec}
-- ai_image_prompt: 1 concrete sentence describing the ideal AI-generated image
-  for this post (subject, style, mood) — usable directly as an image-gen prompt
-- creative_direction: {{"visual_style": "...", "mood": "...", "color_note": "...", "composition_note": "..."}}
-- reasoning: 1-2 sentences on WHY this specific idea, for THIS day — reference
-  a real signal above (a proven performance topic, a trend keyword, the
-  business stage, a current promotion/campaign/milestone from Business Pulse,
-  or a gap in recent content) — this is shown to the user as "why this post?",
-  so it must name something concrete. Explaining why the HOOK STYLE or FORMAT
-  works in general (e.g. "using a question engages the audience", "a
-  side-by-side visual showcases results") is NOT a real signal, even though it
-  sounds specific — that's true of every post in that format, not this one
-- primary_kpi: one of reach|engagement|leads|sales|awareness — whichever this
-  specific item is actually optimized for
+  falls on this item's date for {region or 'the audience region'} — never invent one
+- exact_copy: {{"headline": "publish-ready headline/first-line", "caption": "the FULL publish-ready caption text, ready to post as-is", "hashtags": ["2-5 relevant hashtags, no # symbol"]}}
+- carousel: null UNLESS this item's format is CAROUSEL (see the exact slide count required above), in which case:
+  {{"slides": [{{"slide_index": 0, "headline": "...", "body": "...", "visual_note": "..."}}, ...exactly the required number of slides...]}}
+- creative_concept_name: a short, final version of the concept name
+- central_visual_idea: 1 concrete sentence describing the central visual concept
+- design_style: a few words describing the visual design style
+- layout_direction: a few words on layout/composition
+- visual_metaphor: the visual metaphor being used, or "" if none
+- ai_image_prompt: 1 concrete sentence describing the ideal AI-generated image (subject, style, mood) — usable directly as an image-gen prompt
+- required_assets: a short list of assets needed — prefer reusing anything listed as already available above over requesting new production
+- designer_execution_notes: 1-2 sentences of concrete guidance for whoever produces the visual
+- reasoning: 1-2 sentences on WHY this idea, for THIS day — reference something
+  concrete about the business, audience, business stage, date, or Business
+  Pulse. Never reference historical performance or trending searches (neither
+  exists in this task). Explaining why the format/device works in general
+  ("using a question engages the audience") is NOT a real reason.
+- primary_kpi: one of reach|engagement|leads|sales|awareness
 
 Never fabricate a specific statistic, named testimonial, exact customer count,
-or price that wasn't given to you above — write around missing specifics
-instead of inventing them.
+price, discount, or guarantee that wasn't given to you above — write around
+missing specifics instead of inventing them.
 
-Item assignments (follow type, hook style, and format exactly):
-{days_block}
-
-Return ONLY a valid JSON array of exactly {n} objects, each with day_offset
-set to its absolute plan-day index:
-[
-  {{"day_offset": {day_offset}, "title": "...", "hook": "...", "key_points": ["..."], "description": "...",
-    "caption_direction": "...", "keywords": ["..."], "cta": "...",
-    "video_idea": {{"format": "talking_head", "hook": "...", "talking_points": ["..."], "scenes": ["..."], "cta": "..."}},
-    "holiday_reference": null, "exact_copy": {{"headline": "...", "caption": "...", "hashtags": ["..."]}},
-    "carousel": null, "ai_image_prompt": "...", "creative_direction": {{"visual_style": "...", "mood": "...", "color_note": "...", "composition_note": "..."}},
-    "reasoning": "...", "primary_kpi": "engagement"}},
-  ...
-]
+Return ONLY a valid JSON array of exactly {n} objects, in the same order as
+above, each also including "day_offset" set to its item's absolute plan-day
+index.
 
 Rules: no two titles share an opening word; vary emotional tone across items;
 be specific — real product/service names, real audience details; every item
@@ -493,8 +950,7 @@ must be impossible to copy-paste to a different brand.
 
     async def _call_and_parse(full_prompt: str) -> List[Dict[str, Any]]:
         ai_request = AIService.build_ai_model(
-            messages=[{"role": "user", "content": full_prompt}],
-            model="gpt-4o",
+            messages=[{"role": "user", "content": full_prompt}], model="gpt-4o",
             temperature=0.95 if force else 0.9,
         )
         response = await AIService.chat_completion(ai_request)
@@ -518,12 +974,14 @@ must be impossible to copy-paste to a different brand.
         except Exception as exc:
             if attempt == 0:
                 raise
-            print(f"[CalendarV2] chunk retry failed to parse ({exc}) — using best-effort", flush=True)
+            print(f"[CalendarV2] final-copy chunk retry failed to parse ({exc}) — using best-effort", flush=True)
             break
 
         failures: Dict[int, List[str]] = {}
         for i, idea in enumerate(items):
-            issues = _validate_item_v2(idea, is_carousel=(chunk_formats[i] == "carousel"))
+            is_carousel = concepts_chunk[i].get("format") == "carousel"
+            expected_slides = concepts_chunk[i].get("carousel_slide_count", 3)
+            issues = _validate_item_v2(idea, is_carousel=is_carousel, expected_slides=expected_slides)
             if issues:
                 failures[i] = issues
         if not failures:
@@ -536,16 +994,43 @@ must be impossible to copy-paste to a different brand.
                 + f"\nRegenerate all {n} items, keeping what worked and fixing only what's listed.\n"
             )
 
+    # Merge the fixed concept fields (territory/subject/angle/device/format/
+    # date/day_index from Steps 3-7) back onto each generated item — the
+    # model only returned copy/direction fields, never asked to touch these.
+    merged = []
     for i, idea in enumerate(items):
-        idea["assigned_format"] = "carousel" if chunk_formats[i] == "carousel" else POST_FORMAT_TO_KEY.get(chunk_formats[i], "image")
-        # The LLM's raw JSON response never includes a content_type field (it
-        # wasn't asked for one — the real content_type/format for each day is
-        # assigned deterministically before generation, see chunk_content_types/
-        # chunk_formats above). Stamping it here so _rule_based_diversity_issues
-        # (which runs against these raw items, before items_out is built) can
-        # actually compare real values instead of two missing dict keys.
-        idea["content_type"] = chunk_content_types[i]
-    return items
+        concept = concepts_chunk[i]
+        merged.append({**concept, **idea, "day_offset": concept["day_index"]})
+    return merged
+
+
+async def _regenerate_flagged_items(
+    flagged_day_indices: List[int],
+    items_by_index: Dict[int, Dict[str, Any]],
+    brand: Dict[str, Any],
+    platforms: List[str],
+    existing_assets_summary: str,
+) -> Dict[int, Dict[str, Any]]:
+    """PRD §29: 'the system should regenerate flagged items rather than
+    simply displaying a warning.' One bounded pass; keeps each flagged
+    item's already-approved territory/subject/angle/device/format fixed and
+    just re-executes Step8+9 with force=True for a genuinely different
+    result — items still flagged after this pass fall back to manual-review
+    display (today's prior behavior), not an infinite retry loop."""
+    if not flagged_day_indices:
+        return {}
+    concepts_chunk = [items_by_index[i] for i in flagged_day_indices if i in items_by_index]
+    if not concepts_chunk:
+        return {}
+    try:
+        regenerated = await _generate_final_copy(
+            brand=brand, concepts_chunk=concepts_chunk, platforms=platforms,
+            existing_assets_summary=existing_assets_summary, force=True,
+        )
+    except Exception as exc:
+        print(f"[CalendarV2] auto-regeneration of {len(concepts_chunk)} flagged item(s) failed: {exc}", flush=True)
+        return {}
+    return {item["day_index"]: item for item in regenerated}
 
 
 # ── Main generation ──────────────────────────────────────────────────────────
@@ -576,33 +1061,24 @@ async def generate_plan_v2(
         existing = await get_active_plan(user_id, db, brand_id=brand_id)
         if existing:
             return existing
-    # NOTE: the old "archive the active plan, then generate" ordering was a real
-    # data-loss bug — confirmed live: generation can take several minutes (5
-    # chunks x up to 2 LLM calls + ad-copy + diversity check), which regularly
-    # outlives whatever proxy/gateway fronts this endpoint. If the request gets
-    # cancelled after the archive but before the new plan exists, the user is
-    # left with zero active plans and no way back to the one that just got
-    # archived. Archiving now happens right before the insert below, once the
-    # new plan is fully built — shrinking the unsafe window from "the entire
-    # generation" down to two adjacent Mongo calls, so a mid-generation
-    # disconnect just leaves the old plan intact instead of destroying it.
+    # NOTE: archiving the active plan happens right before the final insert
+    # below, not here — a mid-generation disconnect must never leave the
+    # user with zero active plans (confirmed live data-loss bug, fixed by
+    # this ordering).
 
     industry = brand.get("industry", "")
     region = brand.get("region", "")
 
-    previous_titles: List[str] = []
-    previous_key_points: List[str] = []
-    async for past in db[COLLECTION].find({**scope}, {"_id": 0, "items.title": 1, "items.key_points": 1}).sort("created_at", -1).limit(2):
-        for it in past.get("items", []):
-            if it.get("title"):
-                previous_titles.append(it["title"])
-            previous_key_points += [str(p) for p in (it.get("key_points") or []) if p]
+    # Step 2 — load the versioned creative framework (PRD §35)
+    framework = get_creative_framework(industry)
 
-    performance = await PerformanceAnalyticsService.get_user_performance(user_id, db)
-    trend_keywords = await TrendDataService.get_trending_keywords(industry, db=db)
+    # Step 1 supplement + Step-new — creative memory and existing assets,
+    # both explicitly performance-free (PRD §20, §22)
+    creative_memory = await _fetch_creative_memory(scope, db)
+    existing_assets_summary = await _get_existing_assets_summary(user_id, brand_id, db)
+    has_active_promo = bool((brand.get("business_pulse") or {}).get("current_promotions"))
 
-    # Signals gathered once per week-chunk across the 30-day window (these
-    # services are shaped for a 7-day window, same as v1 — call once per chunk).
+    # Date/holiday/cultural signals — still valid, non-performance inputs (PRD §18)
     all_dates = [(period_start + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(PLAN_DAYS)]
     holidays_by_date: Dict[str, Dict[str, Any]] = {}
     cultural_moments_all: List[Dict[str, Any]] = []
@@ -613,84 +1089,46 @@ async def generate_plan_v2(
         cultural_moments_all += CulturalMomentService.get_trending_topics(industry, region, chunk_week_start) or []
     industry_best_practices = IndustryTrendService.get_industry_best_practices(industry)
 
-    # ── Content-type mix, per-week-chunk (preserves v1's non-fixed-percentage property) ──
-    # NOTE: v1's _pick_mix_from_performance ignores week_number entirely whenever
-    # real performance data exists (its personalised branch derives the mix purely
-    # from avg_engagement_by_topic/primary_goal, both constant across a single
-    # generation run) — harmless in v1, which only ever calls it once per 7-day
-    # plan, but confirmed live here: calling it 5x for one 30-day plan returned
-    # the IDENTICAL mix every week, tiling one 7-day template across the month
-    # and driving heavy false-positive-looking (but real) diversity-check flags.
-    # Not a bug to fix in v1's shared function — vary it in V2's own layer instead,
-    # keeping the same performance-derived type distribution but a different
-    # day-to-day arrangement per week so weeks 2+ aren't a carbon copy of week 1.
-    content_type_mix: List[str] = []
-    for chunk_idx, chunk_start_idx in enumerate(range(0, PLAN_DAYS, 7)):
-        week_number = (period_start.isocalendar()[1] + chunk_idx) if not force else secrets.randbelow(52)
-        week_mix = _pick_mix_from_performance(performance, industry, brand, week_number=week_number)
-        if chunk_idx > 0:
-            week_mix = list(week_mix)
-            random.Random(f"{week_number}:{chunk_idx}").shuffle(week_mix)
-        content_type_mix += week_mix
-    content_type_mix = content_type_mix[:PLAN_DAYS]
+    # Step 3 — candidate pool (never receives performance/trend data)
+    candidates = await _generate_candidate_concepts(
+        brand=brand, framework=framework, existing_assets_summary=existing_assets_summary,
+        creative_memory=creative_memory, platforms=platforms,
+        cultural_moments=cultural_moments_all, industry_best_practices=industry_best_practices,
+    )
+    if not candidates:
+        raise RuntimeError("Content Calendar V2 generation failed — no candidate concepts produced.")
 
-    holiday_flags = [1 if all_dates[i] in holidays_by_date else 0 for i in range(PLAN_DAYS)]
-    carousel_slots = _assign_carousel_slots(content_type_mix, holiday_flags)
+    # Step 4 — score (9 named dims, no performance/trend fields — enforced in code)
+    scored = await _score_candidates(candidates, brand, framework, creative_memory)
 
-    # ── Format + hook-style rotation, per chunk ─────────────────────────────
-    # Carousel placement is decided EXCLUSIVELY by _assign_carousel_slots above
-    # (PRD §9 — exactly 3, no more) — POST_FORMATS' own "Carousel (3-5 slides)"
-    # entry must never enter this rotation pool, or a day outside carousel_slots
-    # could draw it independently and end up stored as format="carousel" with
-    # no slide instruction ever reaching the prompt (confirmed live: this
-    # produced 5 extra zero-slide "carousel" items before this exclusion).
-    _NON_CAROUSEL_FORMATS = [f for f in POST_FORMATS if POST_FORMAT_TO_KEY.get(f) != "carousel"]
-    formats: List[str] = []
-    hooks: List[str] = []
-    for chunk_start_idx in range(0, PLAN_DAYS, CHUNK_SIZE):
-        chunk_len = min(CHUNK_SIZE, PLAN_DAYS - chunk_start_idx)
-        shuffled_formats = (_NON_CAROUSEL_FORMATS * ((chunk_len // len(_NON_CAROUSEL_FORMATS)) + 1))[:chunk_len]
-        shuffled_hooks = (HOOK_STYLES * ((chunk_len // len(HOOK_STYLES)) + 1))[:chunk_len]
-        random.shuffle(shuffled_formats)
-        random.shuffle(shuffled_hooks)
-        formats += shuffled_formats
-        hooks += shuffled_hooks
-    for slot in carousel_slots:
-        formats[slot] = "carousel"
+    # Step 5 — select 30, diversity-optimized
+    selected = _select_diverse_thirty(scored, framework)
+    if len(selected) < PLAN_DAYS:
+        raise RuntimeError(
+            f"Content Calendar V2 generation failed — only {len(selected)}/{PLAN_DAYS} concepts survived selection."
+        )
 
-    # ── Generate in chunks, concurrently ─────────────────────────────────────
-    # Every chunk's inputs (formats/hooks/content-types/dates) are already
-    # fully precomputed above, so chunks don't need to run one-after-another —
-    # confirmed live: sequential generation took 5+ minutes for 5 chunks,
-    # regularly outliving whatever proxy/gateway fronts this endpoint and
-    # dropping the client mid-request. Running them concurrently instead cuts
-    # wall-clock time roughly 5x. Trade-off: each chunk only sees the
-    # anti-repetition context from PRIOR plan runs (previous_titles/
-    # previous_key_points, fetched from Mongo before this loop), not from
-    # sibling chunks generated in the same run — acceptable since the
-    # post-generation diversity check below still runs across the full,
-    # combined 30-item set regardless of how the chunks were produced.
-    chunk_starts = list(range(0, PLAN_DAYS, CHUNK_SIZE))
+    # Step 6 — assign dates
+    dated = _assign_dates(selected, all_dates, holidays_by_date)
+
+    # Step 7 — assign format, dynamic 2-5 slide carousels
+    formatted = [_assign_format(c, brand, existing_assets_summary) for c in dated]
+
+    # Step 8+9 — final copy + creative direction, concurrently chunked
+    # (same proven concurrency pattern this codebase already fixed a real
+    # proxy-timeout bug around — see _generate_final_copy's docstring for
+    # why copy+direction share one call instead of adding a 4th stage).
+    chunk_starts = list(range(0, PLAN_DAYS, CONTENT_CHUNK_SIZE))
 
     async def _run_chunk(chunk_start_idx: int) -> List[Dict[str, Any]]:
-        chunk_len = min(CHUNK_SIZE, PLAN_DAYS - chunk_start_idx)
+        chunk = formatted[chunk_start_idx:chunk_start_idx + CONTENT_CHUNK_SIZE]
         try:
-            return await _generate_chunk_items(
-                brand=brand,
-                chunk_content_types=content_type_mix[chunk_start_idx:chunk_start_idx + chunk_len],
-                chunk_formats=formats[chunk_start_idx:chunk_start_idx + chunk_len],
-                chunk_hooks=hooks[chunk_start_idx:chunk_start_idx + chunk_len],
-                chunk_dates=all_dates[chunk_start_idx:chunk_start_idx + chunk_len],
-                day_offset=chunk_start_idx,
-                platforms=platforms,
-                previous_titles=previous_titles,
-                previous_key_points=previous_key_points,
-                trend_keywords=trend_keywords or [],
-                performance=performance,
-                force=force,
+            return await _generate_final_copy(
+                brand=brand, concepts_chunk=chunk, platforms=platforms,
+                existing_assets_summary=existing_assets_summary, force=force,
             )
         except Exception as exc:
-            print(f"[CalendarV2] chunk at offset {chunk_start_idx} failed: {exc}", flush=True)
+            print(f"[CalendarV2] final-copy chunk at offset {chunk_start_idx} failed: {exc}", flush=True)
             return []
 
     chunk_results = await asyncio.gather(*[_run_chunk(idx) for idx in chunk_starts])
@@ -699,44 +1137,57 @@ async def generate_plan_v2(
     if not all_items:
         raise RuntimeError("Content Calendar V2 generation failed for every chunk — no items produced.")
 
-    # ── Diversity check (rule-based + one LLM self-check pass) ──────────────
+    items_by_index = {item["day_index"]: item for item in all_items}
+
+    # Step 11 — semantic/creative validation (deterministic hard rules were
+    # already enforced per-chunk inside _generate_final_copy's retry loop)
     rule_issues = _rule_based_diversity_issues(all_items)
     llm_flagged = await _llm_diversity_check(all_items)
     print(f"[CalendarV2] diversity check: rule_issues={len(rule_issues)} llm_flagged={len(llm_flagged)}", flush=True)
-    # Confirmed live: the self-check call can occasionally misread the task
-    # and return most/all indices instead of just the genuine duplicates —
-    # a single bad LLM response shouldn't be able to flag a large fraction of
-    # the plan as non-diverse. Treat an implausible result as unreliable and
-    # drop it (the rule-based half — real, deterministic duplicate detection
-    # — still applies either way, so a bad LLM call degrades to "rules only"
-    # rather than corrupting the whole plan's diversity_check field).
     if len(llm_flagged) > max(6, len(all_items) // 4):
         print(f"[CalendarV2] LLM diversity check flagged {len(llm_flagged)}/{len(all_items)} — implausible, discarding", flush=True)
         llm_flagged = []
-    flagged_set = set(rule_issues.keys()) | set(llm_flagged)
-    print(f"[CalendarV2] diversity check: final flagged_set size={len(flagged_set)}", flush=True)
+    flagged_day_indices = sorted(set(rule_issues.keys()) | set(llm_flagged))
+    print(f"[CalendarV2] diversity check: {len(flagged_day_indices)} item(s) flagged for auto-regeneration", flush=True)
 
-    # ── Ad opportunity scoring ────────────────────────────────────────────────
+    # Step 12 — regenerate flagged items only, one bounded pass
+    regenerated_day_indices: set = set()
+    if flagged_day_indices:
+        regenerated = await _regenerate_flagged_items(
+            flagged_day_indices=flagged_day_indices, items_by_index=items_by_index,
+            brand=brand, platforms=platforms, existing_assets_summary=existing_assets_summary,
+        )
+        for day_index, new_item in regenerated.items():
+            items_by_index[day_index] = new_item
+            regenerated_day_indices.add(day_index)
+        all_items = [items_by_index[i] for i in sorted(items_by_index.keys())]
+        # Re-run the cheap deterministic check once more so the stored
+        # diversity_check reflects post-regeneration reality.
+        rule_issues = _rule_based_diversity_issues(all_items)
+        still_flagged = set(flagged_day_indices) - regenerated_day_indices
+        flagged_day_indices = sorted(set(rule_issues.keys()) | still_flagged)
+
+    flagged_set = set(flagged_day_indices)
+    anti_boring_notes = _anti_boring_check(all_items)
+
+    # Step 10 — ad opportunity scoring + copy
     items_out: List[Dict[str, Any]] = []
     for i, idea in enumerate(all_items):
-        day_index = idea.get("day_offset", i)
-        if not isinstance(day_index, int) or not (0 <= day_index < PLAN_DAYS):
-            day_index = i
-        date_str = all_dates[day_index] if day_index < len(all_dates) else all_dates[i]
-        is_carousel = day_index in carousel_slots
-
+        day_index = idea.get("day_index", i)
+        date_str = idea.get("date") or all_dates[day_index]
+        territory = idea.get("territory", "")
+        creative_angle = idea.get("angle", "")
+        is_carousel = idea.get("format") == "carousel"
         near_holiday = date_str in holidays_by_date
-        ad_score = _score_ad_opportunity(
-            {"content_type": content_type_mix[day_index] if day_index < len(content_type_mix) else "", "title": idea.get("title", ""), "cta": idea.get("cta", "")},
-            performance, near_holiday,
-        )
-        ad_opportunity: Optional[Dict[str, Any]] = None
+
+        ad_score = _score_ad_opportunity(idea, near_holiday, has_active_promo)
         if ad_score >= 55.0:
-            angle = _ANGLE_BY_CONTENT_TYPE.get(content_type_mix[day_index] if day_index < len(content_type_mix) else "", "outcome_first")
-            ad_copy = await _write_calendar_ad_copy(idea, brand, angle)
+            ad_angle = _derive_ad_angle(creative_angle)
+            ad_copy = await _write_calendar_ad_copy(idea, brand, ad_angle)
+            territory_label = framework["territories"].get(territory, {}).get("label", territory)
             ad_opportunity = AdOpportunityV2(
-                is_ad_candidate=True, score=ad_score, angle=angle, ad_copy=ad_copy,
-                reason=f"Scored {ad_score}/100 — {content_type_mix[day_index] if day_index < len(content_type_mix) else 'n/a'} content"
+                is_ad_candidate=True, score=ad_score, angle=ad_angle, ad_copy=ad_copy,
+                reason=f"Scored {ad_score}/100 — {territory_label} territory"
                        + (", near a relevant date" if near_holiday else ""),
             ).model_dump()
         else:
@@ -750,23 +1201,18 @@ async def generate_plan_v2(
                 "content_angle": ai_holiday.get("why_relevant") or "",
             })
 
-        reasoning = idea.get("reasoning") or ContentExplainerService.explain_recommendation(
-            content_type=content_type_mix[day_index] if day_index < len(content_type_mix) else "educational",
-            topic=idea.get("title", ""),
-            post_day=(period_start + timedelta(days=day_index)).strftime("%A"),
-            primary_goal=brand.get("primary_goal", "engagement"),
-            historical_performance=performance if performance.get("has_data") else None,
-            upcoming_holidays=list(holidays_by_date.values()),
-            trending_topics=cultural_moments_all,
-            industry_best_practices=industry_best_practices,
-        )
-
         data_provenance = {
             "price_range": "known" if brand.get("price_range") else "unknown",
             "unique_selling_proposition": "known" if brand.get("unique_selling_proposition") else "unknown",
-            "testimonial_or_stat_claims": "unknown",  # never sourced — never fabricate, PRD §41/§42
+            "testimonial_or_stat_claims": "unknown",  # never sourced — never fabricate, PRD §31
         }
 
+        reasoning = idea.get("reasoning") or (
+            f"Selected for its {territory} territory around \"{idea.get('subject', '')}\", "
+            f"using the {creative_angle.replace('_', ' ')} angle."
+        )
+
+        device = idea.get("creative_device") or {}
         items_out.append({
             "item_id": str(uuid.uuid4()),
             "day_index": day_index,
@@ -780,23 +1226,50 @@ async def generate_plan_v2(
             "cta": idea.get("cta", ""),
             "video_idea": idea.get("video_idea", {}),
             "upcoming_holidays": day_holidays,
-            "format": idea.get("assigned_format", "image"),
-            "content_type": content_type_mix[day_index] if day_index < len(content_type_mix) else "educational",
+            "format": idea.get("format", "image"),
+            "content_type": _derive_content_type(territory),
+            "territory": territory,
+            "subject": idea.get("subject", ""),
+            "creative_angle": creative_angle,
+            "creative_device": {
+                "category": device.get("category", ""), "device": device.get("device", ""),
+                "label": device.get("device", ""),
+            },
+            "content_pillar": idea.get("content_pillar", ""),
+            "customer_journey_stage": idea.get("customer_journey_stage", ""),
+            "promised_business_outcome": idea.get("promised_business_outcome", ""),
+            "creative_concept_name": idea.get("creative_concept_name") or idea.get("concept_name", ""),
             "carousel": idea.get("carousel") if is_carousel else None,
-            "creative_direction": idea.get("creative_direction") or {},
+            "creative_direction": {
+                "visual_style": idea.get("design_style", ""),
+                "mood": (idea.get("creative_direction") or {}).get("mood", ""),
+                "color_note": (idea.get("creative_direction") or {}).get("color_note", ""),
+                "composition_note": idea.get("layout_direction", ""),
+                "central_visual_idea": idea.get("central_visual_idea", ""),
+            },
+            "design_style": idea.get("design_style", ""),
+            "layout_direction": idea.get("layout_direction", ""),
+            "visual_metaphor": idea.get("visual_metaphor", ""),
+            "required_assets": idea.get("required_assets", []),
+            "designer_execution_notes": idea.get("designer_execution_notes", ""),
             "ai_image_prompt": idea.get("ai_image_prompt", ""),
             "exact_copy": idea.get("exact_copy") or {},
             "reasoning": reasoning,
             "data_provenance": data_provenance,
             "ad_opportunity": ad_opportunity,
             "primary_kpi": idea.get("primary_kpi", "engagement"),
+            "selection_score": idea.get("selection_score", {}),
+            "series_id": None,
+            "series_name": None,
+            "creative_quality_review_note": anti_boring_notes.get(day_index),
             "diversity_check": {
                 "passed": day_index not in flagged_set,
                 "similarity_score": 1.0 if day_index in flagged_set else 0.0,
                 "flagged_against_item_id": None,
             },
             "version_history": [],
-            "regenerated_count": 0,
+            "regenerated_count": 1 if day_index in regenerated_day_indices else 0,
+            "last_regenerated_reason": "diversity_auto" if day_index in regenerated_day_indices else None,
             "acted_on": False,
             "acted_on_draft_ids": [],
             "status": "pending",
@@ -806,6 +1279,13 @@ async def generate_plan_v2(
     items_out.sort(key=lambda it: it["day_index"])
 
     plan_id = str(uuid.uuid4())
+    territory_counts: Dict[str, int] = {}
+    content_type_counts: Dict[str, int] = {}
+    for it in items_out:
+        territory_counts[it["territory"]] = territory_counts.get(it["territory"], 0) + 1
+        content_type_counts[it["content_type"]] = content_type_counts.get(it["content_type"], 0) + 1
+    n_items = len(items_out) or 1
+
     doc = {
         "plan_id": plan_id,
         "user_id": user_id,
@@ -813,17 +1293,21 @@ async def generate_plan_v2(
         "status": "active",
         "period_start": period_start.strftime("%Y-%m-%d"),
         "period_end": period_end.strftime("%Y-%m-%d"),
-        "generation_method": "data_driven" if performance.get("has_data") else ("trend_driven" if trend_keywords else "ai"),
+        # Replaces the old "data_driven"|"trend_driven"|"ai" values, which
+        # literally advertised performance/trend influence that no longer
+        # exists here (PRD §2).
+        "generation_method": "framework_driven",
+        "framework_version": framework["framework_version"],
+        "pipeline_version": "2026-09-v1",
         "platforms": platforms,
-        "carousel_slots": carousel_slots,
+        "carousel_slots": [it["day_index"] for it in items_out if it["format"] == "carousel"],
         "intelligence_snapshot": {
-            "performance_summary": {"has_data": performance.get("has_data", False), "top_topics": performance.get("top_topics", [])},
-            "trend_keywords": [k.get("keyword") for k in (trend_keywords or [])[:10]],
             "holidays": list(holidays_by_date.values()),
             "cultural_moments": cultural_moments_all[:10],
             "industry_best_practices": industry_best_practices,
         },
-        "content_mix": {t: round(content_type_mix.count(t) / len(content_type_mix), 2) for t in CONTENT_TYPES},
+        "territory_mix": {k: round(v / n_items, 2) for k, v in territory_counts.items()},
+        "content_mix": {k: round(v / n_items, 2) for k, v in content_type_counts.items()},
         "items": items_out,
         "created_at": now.isoformat(),
         "updated_at": now.isoformat(),
@@ -852,61 +1336,86 @@ async def regenerate_item_v2(
     if item is None:
         raise ValueError(f"Item {item_index} not found in plan")
 
-    brand = {}  # V2 regenerates against the brand snapshot embedded in intelligence_snapshot's
-    # absence is intentional for MVP — re-fetch the live brand profile instead, so a
-    # single-item regen always reflects the CURRENT brand context (unlike v1's
-    # frozen-snapshot choice) since V2 has no brand_snapshot field by design (see plan).
+    # Re-fetch the live brand profile (not a frozen snapshot) — a single-item
+    # regen always reflects the CURRENT brand context, same choice v1's
+    # frozen-snapshot regenerate does NOT make.
     from app.agents.social_media_manager.services.brand_profile_service import BrandProfileService
     profile_result = await BrandProfileService.get(user_id, db, brand_id=brand_id)
     raw_profile = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
     brand = BrandProfileService.to_brand_context(raw_profile) if raw_profile else {}
 
-    other_titles = [it.get("title", "") for it in plan["items"] if it.get("title") and it["day_index"] != item_index]
-    is_carousel = item.get("format") == "carousel"
+    existing_assets_summary = await _get_existing_assets_summary(user_id, brand_id, db)
 
-    chunk_items = await _generate_chunk_items(
-        brand=brand,
-        chunk_content_types=[item.get("content_type", "educational")],
-        chunk_formats=["carousel" if is_carousel else item.get("format", "image")],
-        chunk_hooks=[random.choice(HOOK_STYLES)],
-        chunk_dates=[item.get("date", "")],
-        day_offset=item_index,
-        platforms=plan.get("platforms") or [],
-        previous_titles=other_titles,
-        previous_key_points=[],
-        trend_keywords=[],
-        performance={},
-        force=True,
+    # Keeps the item's already-approved territory/subject/angle/device/
+    # format fixed — a manual regenerate re-executes final-copy only,
+    # same "don't reinterpret the concept" rule the auto-regen path follows.
+    device = item.get("creative_device") or {}
+    slide_count = len(((item.get("carousel") or {}).get("slides")) or []) or 3
+    concept = {
+        "territory": item.get("territory", ""),
+        "subject": item.get("subject", ""),
+        "angle": item.get("creative_angle", ""),
+        "creative_device": {"category": device.get("category", ""), "device": device.get("device", "")},
+        "format_hint": item.get("format", "image"),
+        "objective": item.get("primary_kpi", "engagement"),
+        "audience_segment": brand.get("target_audience", ""),
+        "concept_name": item.get("creative_concept_name", ""),
+        "day_index": item_index,
+        "date": item.get("date", ""),
+        "format": item.get("format", "image"),
+        "carousel_slide_count": slide_count,
+    }
+
+    chunk_items = await _generate_final_copy(
+        brand=brand, concepts_chunk=[concept], platforms=plan.get("platforms") or [],
+        existing_assets_summary=existing_assets_summary, force=True,
     )
     if not chunk_items:
         raise RuntimeError("Regeneration produced no result")
     new_idea = chunk_items[0]
+    is_carousel = concept["format"] == "carousel"
 
-    # ── Version snapshot BEFORE overwrite — the one place V2 must diverge from
-    # v1's regenerate_day, which overwrites with zero history. Mirrors
-    # blog_generation_service.py's edit_history $push shape.
+    # ── Version snapshot BEFORE overwrite — mirrors blog_generation_service.py's
+    # edit_history $push shape, the one place V2 must diverge from v1's
+    # regenerate_day (which overwrites with zero history).
     editable_fields = [
         "title", "description", "hook", "key_points", "caption_direction",
         "keywords", "cta", "video_idea", "exact_copy", "carousel",
-        "ai_image_prompt", "creative_direction",
+        "ai_image_prompt", "creative_direction", "design_style", "layout_direction",
+        "visual_metaphor", "required_assets", "designer_execution_notes",
+        "creative_concept_name",
     ]
     snapshot = {f: item.get(f) for f in editable_fields}
     version_entry = {"snapshot": snapshot, "edited_at": datetime.utcnow().isoformat(), "reason": reason}
 
     update_fields = {
-        f"items.$[it].title": new_idea.get("title", ""),
-        f"items.$[it].description": new_idea.get("description", ""),
-        f"items.$[it].hook": new_idea.get("hook", ""),
-        f"items.$[it].key_points": new_idea.get("key_points", []),
-        f"items.$[it].caption_direction": new_idea.get("caption_direction", ""),
-        f"items.$[it].keywords": new_idea.get("keywords", []),
-        f"items.$[it].cta": new_idea.get("cta", ""),
-        f"items.$[it].video_idea": new_idea.get("video_idea", {}),
-        f"items.$[it].exact_copy": new_idea.get("exact_copy") or {},
-        f"items.$[it].carousel": new_idea.get("carousel") if is_carousel else None,
-        f"items.$[it].ai_image_prompt": new_idea.get("ai_image_prompt", ""),
-        f"items.$[it].creative_direction": new_idea.get("creative_direction") or {},
-        f"items.$[it].regenerated_count": item.get("regenerated_count", 0) + 1,
+        "items.$[it].title": new_idea.get("title", ""),
+        "items.$[it].description": new_idea.get("description", ""),
+        "items.$[it].hook": new_idea.get("hook", ""),
+        "items.$[it].key_points": new_idea.get("key_points", []),
+        "items.$[it].caption_direction": new_idea.get("caption_direction", ""),
+        "items.$[it].keywords": new_idea.get("keywords", []),
+        "items.$[it].cta": new_idea.get("cta", ""),
+        "items.$[it].video_idea": new_idea.get("video_idea", {}),
+        "items.$[it].exact_copy": new_idea.get("exact_copy") or {},
+        "items.$[it].carousel": new_idea.get("carousel") if is_carousel else None,
+        "items.$[it].ai_image_prompt": new_idea.get("ai_image_prompt", ""),
+        "items.$[it].creative_direction": {
+            "visual_style": new_idea.get("design_style", ""),
+            "mood": (new_idea.get("creative_direction") or {}).get("mood", ""),
+            "color_note": (new_idea.get("creative_direction") or {}).get("color_note", ""),
+            "composition_note": new_idea.get("layout_direction", ""),
+            "central_visual_idea": new_idea.get("central_visual_idea", ""),
+        },
+        "items.$[it].design_style": new_idea.get("design_style", ""),
+        "items.$[it].layout_direction": new_idea.get("layout_direction", ""),
+        "items.$[it].visual_metaphor": new_idea.get("visual_metaphor", ""),
+        "items.$[it].required_assets": new_idea.get("required_assets", []),
+        "items.$[it].designer_execution_notes": new_idea.get("designer_execution_notes", ""),
+        "items.$[it].reasoning": new_idea.get("reasoning") or item.get("reasoning", ""),
+        "items.$[it].creative_concept_name": new_idea.get("creative_concept_name") or item.get("creative_concept_name", ""),
+        "items.$[it].regenerated_count": item.get("regenerated_count", 0) + 1,
+        "items.$[it].last_regenerated_reason": "manual",
         "updated_at": datetime.utcnow().isoformat(),
     }
     await db[COLLECTION].update_one(
@@ -959,9 +1468,12 @@ async def mark_acted_on_v2(
 async def sync_item_performance(
     plan_id: str, user_id: str, db: AsyncIOMotorDatabase, brand_id: Optional[str] = None,
 ) -> int:
-    """Manual/cron-triggered performance feedback (PRD §12/§48) — pulls
-    metrics for every acted-on item's linked drafts and stores a snapshot.
-    Not a live webhook (deferred, see plan's out-of-scope list)."""
+    """Manual/cron-triggered performance feedback — pulls metrics for every
+    acted-on item's linked drafts and stores a snapshot for user-facing
+    display. Not a live webhook. This is the ONLY function in this file
+    allowed to touch performance data, and only AFTER publication — it must
+    never feed back into generate_plan_v2 or any of the pipeline above
+    (PRD §2, §15)."""
     scope = _cal_v2_scope(user_id, brand_id)
     plan = await db[COLLECTION].find_one({**scope, "plan_id": plan_id}, {"_id": 0, "items": 1})
     if not plan:
