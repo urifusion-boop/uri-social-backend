@@ -10,6 +10,7 @@ The HTML page is served from the backend so it calls /jane-ads/plan same-origin
 """
 from __future__ import annotations
 
+import json
 import re
 from typing import Optional
 
@@ -779,10 +780,25 @@ async def wallet_webhook(
     request: Request,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ) -> dict:
-    """Squad → us. Credits the wallet on a successful top-up (idempotent). No JWT —
-    Squad calls this directly; only references we created are acted on."""
-    payload = await request.json()
-    return await JaneAdsPayments(db).handle_webhook(payload)
+    """Squad → us. Credits the wallet on a successful top-up (idempotent).
+
+    No JWT — Squad calls this directly — so the HMAC-SHA512 signature is what
+    authenticates it. Without that check, anyone who guessed a reference could POST a
+    fake "success" here and credit a real wallet with money nobody paid; "only
+    references we created are acted on" is not authentication, because references are
+    predictable in shape and returned to the client.
+
+    Rejecting an unsigned or badly-signed call cannot lose a real payment: the
+    top-up's reference is persisted client-side and verified directly against Squad
+    on the next page load, which credits idempotently by the same reference.
+    """
+    raw_body = await request.body()
+    signature = request.headers.get("x-squad-encrypted-body", "")
+    payments = JaneAdsPayments(db)
+    if not await payments.verify_webhook_signature(raw_body, signature):
+        print("[JaneAdsWallet] rejected webhook with a missing/invalid signature", flush=True)
+        raise HTTPException(status_code=401, detail="invalid signature")
+    return await payments.handle_webhook(json.loads(raw_body))
 
 
 @router.get("/wallet/{business_id}/balance")

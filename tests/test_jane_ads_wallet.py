@@ -294,3 +294,77 @@ def test_a_success_credits_the_wallet_once():
     # Idempotent: the second call must not credit again.
     assert second.get("already_credited") is True
     assert _run(pay._wallet.get_balance("b1")) == 5_000
+
+
+# ── Webhook authentication ────────────────────────────────────────────────────
+#
+# POST /jane-ads/wallet/webhook has no JWT — Squad calls it directly — so the
+# HMAC-SHA512 signature is the only thing standing between a stranger and a free
+# wallet credit. "Only references we created are acted on" is not authentication:
+# references are predictable in shape and handed to the client.
+#
+# Squad keys the digest on the MERCHANT SECRET KEY (not SQUAD_WEBHOOK_SECRET, which
+# is unused for this and holds a placeholder) and sends it uppercase-hex in
+# x-squad-encrypted-body.
+
+def _sign(raw: bytes, secret: str) -> str:
+    import hashlib
+    import hmac
+    return hmac.new(secret.encode(), raw, hashlib.sha512).hexdigest().upper()
+
+
+def _with_secret(secret):
+    from unittest.mock import AsyncMock, patch
+    return patch("app.agents.jane_ads.payments.payment_service._get_squad_credentials",
+                 new=AsyncMock(return_value={"secret_key": secret, "api_url": "https://x"}))
+
+
+def test_a_correctly_signed_body_is_accepted():
+    from app.agents.jane_ads.payments import JaneAdsPayments
+    raw = b'{"TransactionRef":"JANEADS_x","Body":{"transaction_status":"success"}}'
+    with _with_secret("sk_test"):
+        assert _run(JaneAdsPayments.verify_webhook_signature(raw, _sign(raw, "sk_test"))) is True
+
+
+def test_a_forged_body_is_rejected():
+    """The attack this blocks: a stranger POSTing a fake success for a guessed
+    reference to credit a real wallet with money nobody paid."""
+    from app.agents.jane_ads.payments import JaneAdsPayments
+    raw = b'{"TransactionRef":"JANEADS_x","Body":{"transaction_status":"success"}}'
+    forged = b'{"TransactionRef":"JANEADS_x","Body":{"transaction_status":"success"} }'
+    with _with_secret("sk_test"):
+        assert _run(JaneAdsPayments.verify_webhook_signature(forged, _sign(raw, "sk_test"))) is False
+
+
+def test_a_missing_signature_is_rejected():
+    from app.agents.jane_ads.payments import JaneAdsPayments
+    with _with_secret("sk_test"):
+        assert _run(JaneAdsPayments.verify_webhook_signature(b'{}', "")) is False
+
+
+def test_a_wrong_key_is_rejected():
+    from app.agents.jane_ads.payments import JaneAdsPayments
+    raw = b'{"TransactionRef":"JANEADS_x"}'
+    with _with_secret("sk_real"):
+        assert _run(JaneAdsPayments.verify_webhook_signature(raw, _sign(raw, "sk_attacker"))) is False
+
+
+def test_signature_is_computed_over_raw_bytes_not_a_reserialised_dict():
+    """Re-encoding the parsed body changes key order and separators, so the digest
+    would never match what Squad actually signed — the raw bytes are the payload."""
+    import json as _json
+    from app.agents.jane_ads.payments import JaneAdsPayments
+    raw = b'{"b": 2, "a": 1}'
+    reserialised = _json.dumps(_json.loads(raw), separators=(',', ':')).encode()
+    assert raw != reserialised
+    with _with_secret("sk_test"):
+        # Signed as Squad sent it → accepted.
+        assert _run(JaneAdsPayments.verify_webhook_signature(raw, _sign(raw, "sk_test"))) is True
+        # A digest over the re-serialised form → rejected, proving raw bytes are used.
+        assert _run(JaneAdsPayments.verify_webhook_signature(raw, _sign(reserialised, "sk_test"))) is False
+
+
+def test_no_configured_key_rejects_rather_than_letting_anything_through():
+    from app.agents.jane_ads.payments import JaneAdsPayments
+    with _with_secret(""):
+        assert _run(JaneAdsPayments.verify_webhook_signature(b'{}', "ANYTHING")) is False
