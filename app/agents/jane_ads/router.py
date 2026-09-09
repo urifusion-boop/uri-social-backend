@@ -1129,10 +1129,16 @@ async def jane_meta_connection_status(
     # tell (API error), which the client is shown as "unknown", never as "missing".
     page_id = (ads or {}).get("page_id", "")
     whatsapp_linked = await page_has_whatsapp_linked(page_id, settings.META_ADS_ACCESS_TOKEN)
+    # Same source as GET /jane-ads/whatsapp and the launch path. The
+    # social_connections doc has no whatsapp_number on it, so reading it from there
+    # reported "" for brands that had one saved.
+    from .whatsapp import get_brand_whatsapp
+
+    ads_whatsapp_number = await get_brand_whatsapp(db, brand_ctx.get("brand_id"))
     return {
         "state": state.value,
         "page_name": (ads or {}).get("account_name", ""),
-        "whatsapp_number": (ads or {}).get("whatsapp_number", ""),
+        "whatsapp_number": ads_whatsapp_number,
         # True/False from Meta itself, or None when it couldn't be determined.
         "whatsapp_linked_to_page": whatsapp_linked,
         # Deep link straight to this Page's WhatsApp settings, so "link it" is one
@@ -3093,31 +3099,18 @@ async def meta_launch_plan(
         raise HTTPException(status_code=409, detail=f"meta_connection_{e.state.value}")
     plan.page_id = ads_conn["page_id"]
 
-    # A WhatsApp ad has to run from a Page that really has WhatsApp connected inside
-    # Meta. Without it the ad can only be a plain wa.me LINK ad, which delivers but
-    # can never report a conversation: Meta fires messaging_conversation_started only
-    # for native WhatsApp destinations, which is why such campaigns showed "WhatsApp
-    # conversations 0" and "cost per conversation N/A" while genuinely running.
+    # A WhatsApp campaign requires a WhatsApp NUMBER — enforced above by
+    # resolve_ads_page_for_launch(require_whatsapp=True), which refuses a brand that
+    # has none configured.
     #
-    # Asked of Meta, not of our own record — set_whatsapp_number marks the connection
-    # linked as soon as a client types a number, which proves only that they typed it.
-    # A None answer means we could not tell (API error), and never blocks a launch.
-    if require_whatsapp:
-        from app.core.config import settings
-        from .ads_connection import page_has_whatsapp_linked
-
-        linked = await page_has_whatsapp_linked(plan.page_id, settings.META_ADS_ACCESS_TOKEN)
-        if linked is False:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"Connect your WhatsApp number to the '{ads_conn.get('page_name') or 'connected'}' "
-                    "Facebook Page before launching a WhatsApp campaign — open the Page's settings in "
-                    "Meta, add the number under WhatsApp, and confirm the code it sends you. Until "
-                    "that is done Meta can't route messages to you or count a single conversation. "
-                    "You can also switch this campaign to your website or Instagram DMs instead."
-                ),
-            )
+    # It deliberately does NOT also require Meta to confirm the number is linked to
+    # the Page. That was gated on GET /{page}?fields=whatsapp_number,
+    # has_whatsapp_number, which is not a usable oracle: on Page 203213912878798 both
+    # fields come back absent while Meta validates a native Click-to-WhatsApp ad set
+    # on that very Page (live-verified 2026-09-09), so the gate 409'd launches that
+    # would have succeeded. Whether native is possible is now settled by the adapter
+    # dry-running the real ad set against Meta, which falls back to a wa.me link ad
+    # only on the one error that actually means "not linked" (subcode 1487246).
 
     plan.whatsapp_number = ads_conn["whatsapp_number"]
     plan.destination_type = destination_type.value

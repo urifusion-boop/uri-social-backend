@@ -430,14 +430,34 @@ def test_page_with_a_whatsapp_number_reads_as_linked():
         assert _run_(page_has_whatsapp_linked("1", "tok")) is True
 
 
-def test_page_without_one_reads_as_not_linked():
-    """Meta OMITS whatsapp_number/has_whatsapp_number when the Page has none — the
-    fields are real (a nonexistent one 400s), so absence is the answer, not a gap."""
+def test_absent_fields_read_as_unknown_not_as_not_linked():
+    """Absence proves NOTHING and must never read as False.
+
+    This asserted the opposite until 2026-09-09, when the real API disproved it: Page
+    203213912878798 returns neither whatsapp_number nor has_whatsapp_number, yet Meta
+    validates a native Click-to-WhatsApp ad set on that very Page
+    (execution_options=['validate_only'] returned success). Reading those fields needs
+    whatsapp_business_management, which this token does not hold, and Meta omits what a
+    token cannot see instead of erroring — so absence means "cannot tell".
+
+    The old False 409'd launches that would have succeeded and labelled a working Page
+    "WhatsApp not linked yet" in Connected Accounts."""
     from unittest.mock import patch
     from app.agents.jane_ads.ads_connection import page_has_whatsapp_linked
 
     with patch("httpx.AsyncClient") as cls:
         cls.return_value.__aenter__.return_value = _graph({"id": "1"})
+        assert _run_(page_has_whatsapp_linked("1", "tok")) is None
+
+
+def test_an_explicit_negative_still_reads_as_not_linked():
+    """A field that is PRESENT and falsey is a real answer from Meta, unlike absence."""
+    from unittest.mock import patch
+    from app.agents.jane_ads.ads_connection import page_has_whatsapp_linked
+
+    with patch("httpx.AsyncClient") as cls:
+        cls.return_value.__aenter__.return_value = _graph(
+            {"id": "1", "has_whatsapp_number": False})
         assert _run_(page_has_whatsapp_linked("1", "tok")) is False
 
 
