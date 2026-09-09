@@ -16,7 +16,7 @@ from typing import Optional
 
 import httpx
 from fastapi import (
-    APIRouter, Body, Depends, File, Header, HTTPException, Query, Request, UploadFile,
+    APIRouter, Body, Depends, File, HTTPException, Query, Request, UploadFile,
 )
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from motor.motor_asyncio import AsyncIOMotorDatabase
@@ -519,86 +519,6 @@ async def list_ad_formats(_token: dict = Depends(JWTBearer())) -> dict:
     formats = [_serialize_vsg01_format(r, is_planned=False) for r in VSG01_FORMAT_RECORDS]
     formats += [_serialize_vsg01_format(r, is_planned=True) for r in PLANNED_FORMAT_RECORDS]
     return {"formats": formats}
-
-
-# TEMPORARY — one-off bootstrap, delete this endpoint once it's been called. No
-# in-app user can trigger this and JANE_ADS_ADMIN_EMAILS isn't set on dev, so this
-# uses its own throwaway shared secret rather than JWTBearer/admin-email gating.
-# Ingests the 12 VSG-01 corpus records as draft and approves them (see
-# vsg01_corpus_seed.seed_vsg01_corpus's own docstring — "real human approval is a
-# separate, deliberate step this function does not perform"). Idempotent: a repeat
-# call is a no-op once CREATIVE_FORMATS records are already approved.
-_VSG01_BOOTSTRAP_SECRET = "vsg01-corpus-bootstrap-2026-dev-only"
-
-
-# TEMPORARY — settles whether the deployed container's DejaVu Sans Bold
-# actually covers the Dingbats glyphs (✓ ✗ ★) the redesigned ad formats now
-# draw as text, rather than assuming from a local dev-machine test (which
-# falls back to Pillow's limited default font and would false-negative).
-# Delete alongside the other TEMPORARY endpoints above.
-@router.get("/admin/debug-glyph-test.png")
-async def debug_glyph_test(x_bootstrap_secret: str = Header(...)):
-    if x_bootstrap_secret != _VSG01_BOOTSTRAP_SECRET:
-        raise HTTPException(status_code=403, detail="Not authorized.")
-    from app.agents.social_media_manager.services.document_renderer_service import DocumentRendererService
-    document = {
-        "canvas": {"width": 400, "height": 150, "background_color": "#FFFFFF"},
-        "layers": [
-            {"type": "text", "z_index": 1, "content": "✓ ✗ ★ ☆", "x": 20, "y": 20,
-             "font_size": 60, "font_weight": 700, "color": "#000000"},
-        ],
-    }
-    png_bytes = await DocumentRendererService.render_to_png(document)
-    return Response(content=png_bytes, media_type="image/png")
-
-
-@router.post("/admin/bootstrap-vsg01-corpus")
-async def bootstrap_vsg01_corpus(
-    x_bootstrap_secret: str = Header(...),
-    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-) -> dict:
-    if x_bootstrap_secret != _VSG01_BOOTSTRAP_SECRET:
-        raise HTTPException(status_code=403, detail="Not authorized.")
-
-    from .entities import StrategyCategory
-    from .store import MongoStrategyStore
-    from .vsg01_corpus_seed import build_vsg01_strategies
-
-    store = MongoStrategyStore(db)
-    await store.ensure_indexes()
-
-    existing = [s for s in await store.fetch_approved() if s.category is StrategyCategory.CREATIVE_FORMATS]
-    if existing:
-        return {"status": "already_seeded", "count": len(existing),
-                "strategy_ids": [s.strategy_id for s in existing]}
-
-    strategies = build_vsg01_strategies()
-    for s in strategies:
-        await store.ingest(s)
-    approved = []
-    for s in strategies:
-        a = await store.approve(s.strategy_id, version=s.version, approved_by="dev-bootstrap-endpoint")
-        approved.append(a.strategy_id)
-
-    final = [s for s in await store.fetch_approved() if s.category is StrategyCategory.CREATIVE_FORMATS]
-    return {"status": "seeded", "count": len(final), "strategy_ids": approved}
-
-
-# TEMPORARY — dev-only debug lookup so a real browser test-signup can be verified
-# without inbox access. Same throwaway secret as the bootstrap endpoint above.
-# Delete alongside it.
-@router.get("/admin/debug-verification-code")
-async def debug_verification_code(
-    email: str,
-    x_bootstrap_secret: str = Header(...),
-    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-) -> dict:
-    if x_bootstrap_secret != _VSG01_BOOTSTRAP_SECRET:
-        raise HTTPException(status_code=403, detail="Not authorized.")
-    user = await db["users"].find_one({"email": email})
-    if not user:
-        raise HTTPException(status_code=404, detail="No such user.")
-    return {"verification_code": user.get("verification_code")}
 
 
 class SuggestAdFormatBody(BaseModel):
