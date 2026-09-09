@@ -562,6 +562,23 @@ async def bootstrap_vsg01_corpus(
     return {"status": "seeded", "count": len(final), "strategy_ids": approved}
 
 
+# TEMPORARY — dev-only debug lookup so a real browser test-signup can be verified
+# without inbox access. Same throwaway secret as the bootstrap endpoint above.
+# Delete alongside it.
+@router.get("/admin/debug-verification-code")
+async def debug_verification_code(
+    email: str,
+    x_bootstrap_secret: str = Header(...),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+) -> dict:
+    if x_bootstrap_secret != _VSG01_BOOTSTRAP_SECRET:
+        raise HTTPException(status_code=403, detail="Not authorized.")
+    user = await db["users"].find_one({"email": email})
+    if not user:
+        raise HTTPException(status_code=404, detail="No such user.")
+    return {"verification_code": user.get("verification_code")}
+
+
 class SuggestAdFormatBody(BaseModel):
     asset_attestation: Optional[str] = None  # "product_photo" | "real_customer_photo" | None
     recomposite: bool = False
