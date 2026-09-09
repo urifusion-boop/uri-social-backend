@@ -107,16 +107,28 @@ def build_document(
     bubble_width = int(width * 0.68)
     h_pad, v_pad = 28, 24
     line_height = int(_FONT_BODY * 1.3)
-    y = margin
 
+    # Pre-measure every bubble so a real 3-turn exchange (§2.6's floor) can be
+    # centred as one block instead of pinned to y=margin and growing
+    # downward — the fixed-top version left most of a 1080px canvas empty
+    # for anything short of the 4-turn maximum, the same class of wasted-
+    # space bug Us vs Them and Receipt had.
+    measured_turns = []
     for speaker, message, timestamp in turns:
+        is_us = speaker == "us"
+        lines = _wrap_text(message, bubble_width - 2 * h_pad, _FONT_BODY)
+        bubble_height = max(96, v_pad * 2 + len(lines) * line_height - (line_height - _FONT_BODY))
+        turn_height = bubble_height + 8 + _FONT_BODY + 32
+        measured_turns.append((speaker, lines, timestamp, bubble_height, turn_height))
+
+    total_height = sum(mt[4] for mt in measured_turns) - 32  # no trailing gap after the last turn
+    y = max(margin, (height - total_height) // 2)
+
+    for speaker, lines, timestamp, bubble_height, turn_height in measured_turns:
         is_us = speaker == "us"
         bubble_x = (width - margin - bubble_width) if is_us else margin
         fill = us_bubble_color if is_us else t["field"]
         border = None if is_us else t["edge"]
-
-        lines = _wrap_text(message, bubble_width - 2 * h_pad, _FONT_BODY)
-        bubble_height = max(96, v_pad * 2 + len(lines) * line_height - (line_height - _FONT_BODY))
 
         z += 1
         layers.append({
@@ -142,7 +154,7 @@ def build_document(
             **({"text_align": "ra"} if is_us else {}),
         })
 
-        y += bubble_height + 8 + _FONT_BODY + 32
+        y += turn_height
 
     return {
         "canvas": {"width": width, "height": height, "background_color": t["surface"]},
