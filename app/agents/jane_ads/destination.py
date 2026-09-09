@@ -132,6 +132,16 @@ DESTINATION_OPTIONS: list[dict] = [
         "hint": "They tap and land in a WhatsApp chat with you, message already typed.",
         "field": "whatsapp_number",
         "input_label": "Your WhatsApp number",
+        # Says the linking requirement at the moment the number is typed, because
+        # getting it wrong is silent: the ad still launches, just as a plain wa.me link
+        # ad that can never report a conversation (Meta fires
+        # messaging_conversation_started only for native WhatsApp destinations). We
+        # cannot detect the mismatch and warn later either — reading a Page's linked
+        # number needs whatsapp_business_management, which our token doesn't hold.
+        "input_note": (
+            "Use the number linked to your Facebook Page in Meta. A different number "
+            "still works, but the ad can't report WhatsApp conversations."
+        ),
         "placeholder": "0803 123 4567",
         # Was False while WhatsApp used Meta's native WHATSAPP_MESSAGE button. It's a
         # plain link ad now, so its button is chooseable like any other destination's.
