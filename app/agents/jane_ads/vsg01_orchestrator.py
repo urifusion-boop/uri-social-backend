@@ -140,7 +140,22 @@ _CONTENT_FIT_SIGNALS: dict[str, tuple[str, ...]] = {
         "other shops", "not like other",
     ),
     # Price-Led Offer — a concrete price, discount, or markdown is stated.
+    # UPLOAD_PHOTO_FORMAT_IDS only (needs a real product photo to composite
+    # the price onto) — see module docstring's Precedence note: this signal
+    # can only ever win when a photo was actually provided.
     "SEED-096": (
+        "% off", "percent off", "discount", "was ₦", "was $", "was £",
+        "now ₦", "now $", "now only", "limited time price", "price drop",
+        "slash", "half price",
+    ),
+    # Receipt — the NO_PHOTO-eligible home for the exact same price-drop
+    # signal above. A business that states a real price/discount but has no
+    # product photo yet still deserves a price-shaped format, not whatever
+    # ranked first with no content match at all — Receipt is built exactly
+    # for real, stated prices (see `_content_receipt`'s own "never invent a
+    # price" contract). Once a photo is actually attached, candidate_ids
+    # moves to UPLOAD_PHOTO_FORMAT_IDS and SEED-096 above takes over instead.
+    "SEED-081": (
         "% off", "percent off", "discount", "was ₦", "was $", "was £",
         "now ₦", "now $", "now only", "limited time price", "price drop",
         "slash", "half price",
