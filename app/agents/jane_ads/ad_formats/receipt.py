@@ -72,41 +72,79 @@ def build_document(
     layers = []
     z = 0
 
+    # Space consumed before the first item row starts, relative to the card's
+    # own content origin (content_top below) — NOT an absolute canvas
+    # position. Must match the header_offset used at row_y's actual layout
+    # further down, or the pre-measured card height and the real content
+    # drift apart (undersized card, or the extra empty space this redesign
+    # exists to remove creeping back in).
+    header_space = 100 if (brand_logo_url or business_name) else 24
+    name_col_max_width = 348 - 20  # gap before the leader line starts
+    item_line_height = int(_FONT_ITEM * 1.3)
+    single_line_row_height = 88
+
+    # Pre-measure the whole receipt (header + items + total + footer) so it
+    # can sit inside a real "paper" card, centred on the canvas, instead of
+    # floating text pinned to a fixed y=72 — the pre-card version left the
+    # bottom third of a 1080px canvas empty for a typical 2-3 item order and
+    # had no visual boundary distinguishing "the receipt" from the ad's own
+    # background at all.
+    row_heights = []
+    for name, _price in items:
+        name_lines = wrap_text(name, name_col_max_width, _FONT_ITEM)
+        row_heights.append(max(single_line_row_height, len(name_lines) * item_line_height + 30))
+    footer_lines_count = sum(1 for line in (delivery_line, payment_line) if line)
+    content_height = (
+        header_space + sum(row_heights) + 8  # items + rule gap
+        + 24 + _FONT_TOTAL_AMOUNT  # total row
+        + (footer_lines_count * 64 if footer_lines_count else 0)
+    )
+    card_pad = 56
+    card_h = content_height + 2 * card_pad
+    card_w = width - 96
+    card_x = (width - card_w) // 2
+    card_y = max(48, (height - card_h) // 2)
+
+    z += 1
+    layers.append({
+        "type": "shape", "z_index": z, "shape": "rounded_rect",
+        "x": card_x, "y": card_y, "width": card_w, "height": card_h,
+        "corner_radius": 24, "fill_color": t["field"],
+    })
+
+    content_left = card_x + card_pad
+    price_column_x = card_x + card_w - card_pad
+
     # Reserve the head for a brand mark — composited only if a real logo URL
     # is given; VSG-01 §1.5 defers actual position/size/treatment to the
     # Brand Overlay Spec, so this is a simple top-left placement, not a
     # final one.
-    content_top = 72
+    content_top = card_y + card_pad
     if brand_logo_url:
         z += 1
         layers.append({
             "type": "brand_asset", "z_index": z,
-            "url": brand_logo_url, "x": 72, "y": 56, "width": 160, "height": 64,
+            "url": brand_logo_url, "x": content_left, "y": content_top, "width": 160, "height": 64,
         })
-        content_top = 148
     elif business_name:
         z += 1
         layers.append({
             "type": "text", "z_index": z, "content": business_name,
-            "x": 72, "y": 64, "font_size": _FONT_BUSINESS_NAME, "font_weight": 700, "color": t["ink"],
+            "x": content_left, "y": content_top, "font_size": _FONT_BUSINESS_NAME, "font_weight": 700,
+            "color": t["ink"],
         })
-        content_top = 148
 
     # Item rows: name left (wrapped — an unbounded single line at 44px runs
     # straight into the leader/price zone the moment a name is realistic
     # rather than a short test string), dotted leader, price right-aligned
     # at a fixed column so every price lines up regardless of name length.
-    price_column_x = width - 72
-    name_col_max_width = 420 - 72 - 20  # leader starts at x=420; small gap before it
-    item_line_height = int(_FONT_ITEM * 1.3)
-    single_line_row_height = 88
-    row_y = content_top + 24
+    row_y = content_top + header_space
     for name, price in items:
         name_lines = wrap_text(name, name_col_max_width, _FONT_ITEM)
         z += 1
         layers.append({
             "type": "text", "z_index": z, "content": "\n".join(name_lines),
-            "x": 72, "y": row_y, "font_size": _FONT_ITEM, "color": t["ink"],
+            "x": content_left, "y": row_y, "font_size": _FONT_ITEM, "color": t["ink"],
         })
         # Leader + price stay pinned to the name's first line, same as a
         # real POS receipt where the price sits beside the top line of a
@@ -116,7 +154,7 @@ def build_document(
         z += 1
         layers.append({
             "type": "shape", "z_index": z, "shape": "line",
-            "x1": 420, "y1": row_y + 26, "x2": price_column_x - 90, "y2": row_y + 26,
+            "x1": content_left + 348, "y1": row_y + 26, "x2": price_column_x - 90, "y2": row_y + 26,
             "color": t["edge"], "stroke_width": 2, "dashed": True,
             "dash_length": 5, "gap_length": 6,
         })
@@ -134,7 +172,7 @@ def build_document(
     z += 1
     layers.append({
         "type": "shape", "z_index": z, "shape": "line",
-        "x1": 72, "y1": rule_y, "x2": width - 72, "y2": rule_y,
+        "x1": content_left, "y1": rule_y, "x2": price_column_x, "y2": rule_y,
         "color": t["ink"], "stroke_width": 3,
     })
 
@@ -143,7 +181,7 @@ def build_document(
     z += 1
     layers.append({
         "type": "text", "z_index": z, "content": total_label,
-        "x": 72, "y": total_y, "font_size": _FONT_TOTAL_LABEL, "font_weight": 700, "color": t["ink"],
+        "x": content_left, "y": total_y, "font_size": _FONT_TOTAL_LABEL, "font_weight": 700, "color": t["ink"],
     })
     z += 1
     layers.append({
@@ -160,7 +198,7 @@ def build_document(
         z += 1
         layers.append({
             "type": "text", "z_index": z, "content": line,
-            "x": 72, "y": footer_y, "font_size": _FONT_FOOTER, "color": t["ink-quiet"],
+            "x": content_left, "y": footer_y, "font_size": _FONT_FOOTER, "color": t["ink-quiet"],
         })
         footer_y += 64
 
