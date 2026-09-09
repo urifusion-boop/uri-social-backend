@@ -105,13 +105,24 @@ class JaneAdsPayments:
                 timeout=30.0,
             )
         data = resp.json()
-        ok = (resp.status_code == 200 and data.get("success")
-              and data.get("data", {}).get("transaction_status") == "success")
-        if ok:
+        status = str((data.get("data") or {}).get("transaction_status") or "").lower()
+        if resp.status_code == 200 and data.get("success") and status == "success":
             return await self._credit(rec, data)
+
+        # Only an EXPLICIT failed/reversed status from Squad is a failure. Anything
+        # else — a 5xx, an unparseable body, or a transaction still in flight — means
+        # we do not know yet, and must stay "pending" so a later verify or webhook can
+        # still credit it. Live-confirmed 2026-09-09: Squad's own ValidateOTP returned
+        # 504 on a card payment that had ALREADY succeeded (charged, receipted,
+        # webhook delivered), so treating "not success" as "failed" would have written
+        # a real, paid top-up off as failed.
+        if status in ("failed", "reversed", "abandoned"):
+            await self._topups.update_one({"reference": reference},
+                                          {"$set": {"status": "failed", "squad_response": data}})
+            return {"status": "failed"}
         await self._topups.update_one({"reference": reference},
-                                      {"$set": {"status": "failed", "squad_response": data}})
-        return {"status": "failed"}
+                                      {"$set": {"last_verify_response": data}})
+        return {"status": "pending"}
 
     # ── Webhook (Squad → us) ────────────────────────────────────────────────────
     async def handle_webhook(self, payload: dict) -> dict:

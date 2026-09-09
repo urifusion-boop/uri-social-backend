@@ -2752,6 +2752,26 @@ async def _build_campaign_plan(
     )
 
 
+def _stated_budget_ngn(record: dict) -> float:
+    """The budget the CLIENT typed for a launched campaign, from its stored record.
+
+    Records hold `budget_ngn` as the AD SPEND sent to Meta, which is the stated budget
+    minus URI's fee — so reading it straight back showed a ₦20,000 campaign as
+    ₦18,000 and read as money vanishing.
+
+    `charged_upfront_ngn` is the exact amount debited at launch and so is the truest
+    answer when present. Older records predate it and are reconstructed from the
+    markup stamped on them, falling back to LEGACY_AD_SPEND_MARKUP for records from
+    before the fee model changed — the same precedence billing.py uses, so the figure
+    shown always matches the figure charged."""
+    charged = record.get("charged_upfront_ngn")
+    if charged:
+        return round(float(charged), 2)
+    ad_spend = float(record.get("budget_ngn") or 0)
+    markup = float(record.get("ad_spend_markup") or C.LEGACY_AD_SPEND_MARKUP)
+    return round(ad_spend * markup, 2)
+
+
 def _total_due_ngn(ad_spend_ngn: float) -> float:
     """What the customer's wallet must cover for a campaign whose AD SPEND is
     `ad_spend_ngn` — which is the client's stated budget, since URI's fee was already
@@ -3363,7 +3383,16 @@ async def meta_campaigns(
             "headline": r.get("headline", ""),
             "primary_text": r.get("primary_text", ""),
             "image_url": r.get("image_url", ""),
-            "budget_ngn": r.get("budget_ngn"),
+            # The budget the CLIENT typed, not the ad spend Meta received. The service
+            # fee comes OUT of the stated budget, so a ₦20,000 budget creates a
+            # ₦18,000 ad set — and showing that ₦18,000 back reads as money going
+            # missing. charged_upfront_ngn is the exact figure debited from the wallet
+            # at launch, so it wins when present; otherwise it's reconstructed from the
+            # markup stamped on the record (legacy records carry none, hence the
+            # LEGACY_AD_SPEND_MARKUP fallback billing.py already uses).
+            "budget_ngn": _stated_budget_ngn(r),
+            # What Meta actually received, kept for anything that needs the real spend.
+            "ad_spend_ngn": r.get("budget_ngn"),
             "goal": r.get("goal", ""),
             "city": r.get("city", ""),
             # Where leads for this campaign land, so the user can find their conversations.

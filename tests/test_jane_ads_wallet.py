@@ -190,3 +190,107 @@ def test_the_billing_meter_recoups_exactly_the_stated_budget():
     for budget in (5_000, 10_000, 20_000, 25_000):
         spend = C.ad_spend_from_budget(budget)
         assert abs(round(spend * C.AD_SPEND_MARKUP, 2) - budget) < 0.01, budget
+
+
+# ── confirm_topup: what counts as a failed payment ────────────────────────────
+#
+# Squad's checkout can charge a card and still report failure. Live-confirmed
+# 2026-09-09: their ValidateOTP endpoint returned 504 on a payment that had ALREADY
+# succeeded — card debited, receipt emailed, webhook delivered, and their own
+# dashboard showing "Success" — while the popup told the customer "Payment Failed".
+# Writing an inconclusive verify off as "failed" would have marked a real, paid
+# top-up dead and stopped a later verify or webhook from ever crediting it.
+
+class _FakeTopups:
+    def __init__(self, docs):
+        self.docs = docs
+
+    async def find_one(self, query):
+        return next((dict(d) for d in self.docs if d["reference"] == query["reference"]), None)
+
+    async def update_one(self, query, update):
+        for d in self.docs:
+            if d["reference"] == query["reference"]:
+                d.update(update.get("$set", {}))
+
+
+class _FakeDb:
+    def __init__(self, topups):
+        self.jane_ads_topups = topups
+
+    def __getitem__(self, name):
+        return self.jane_ads_topups
+
+
+def _payments(record, verify_status_code, verify_body):
+    from unittest.mock import AsyncMock, patch
+    from app.agents.jane_ads.payments import JaneAdsPayments
+
+    topups = _FakeTopups([record])
+    pay = JaneAdsPayments.__new__(JaneAdsPayments)
+    pay._db = _FakeDb(topups)
+    pay._topups = topups
+    pay._wallet = WalletService(InMemoryWalletStore())
+
+    resp = type("R", (), {"status_code": verify_status_code, "json": lambda self: verify_body})()
+    client = AsyncMock()
+    client.get = AsyncMock(return_value=resp)
+    ctx = patch("httpx.AsyncClient")
+    creds = patch("app.agents.jane_ads.payments.payment_service._get_squad_credentials",
+                  new=AsyncMock(return_value={"api_url": "https://x", "secret_key": "sk"}))
+    return pay, topups, ctx, creds, client
+
+
+def _rec(**kw):
+    base = dict(reference="JANEADS_x", business_id="b1", amount_ngn=5_000.0,
+                email="a@b.c", status="pending")
+    base.update(kw)
+    return base
+
+
+def test_a_gateway_timeout_leaves_the_topup_pending_not_failed():
+    rec = _rec()
+    pay, topups, ctx, creds, client = _payments(rec, 504, {})
+    with ctx as MockClient, creds:
+        MockClient.return_value.__aenter__.return_value = client
+        out = _run(pay.confirm_topup("JANEADS_x"))
+    assert out["status"] == "pending"
+    # Still pending, so a later verify or the webhook can still credit it.
+    assert topups.docs[0]["status"] == "pending"
+
+
+def test_a_transaction_still_in_flight_stays_pending():
+    rec = _rec()
+    pay, topups, ctx, creds, client = _payments(
+        rec, 200, {"success": True, "data": {"transaction_status": "pending"}})
+    with ctx as MockClient, creds:
+        MockClient.return_value.__aenter__.return_value = client
+        out = _run(pay.confirm_topup("JANEADS_x"))
+    assert out["status"] == "pending"
+    assert topups.docs[0]["status"] == "pending"
+
+
+def test_an_explicit_failed_status_is_recorded_as_failed():
+    rec = _rec()
+    pay, topups, ctx, creds, client = _payments(
+        rec, 200, {"success": True, "data": {"transaction_status": "failed"}})
+    with ctx as MockClient, creds:
+        MockClient.return_value.__aenter__.return_value = client
+        out = _run(pay.confirm_topup("JANEADS_x"))
+    assert out["status"] == "failed"
+    assert topups.docs[0]["status"] == "failed"
+
+
+def test_a_success_credits_the_wallet_once():
+    rec = _rec()
+    pay, topups, ctx, creds, client = _payments(
+        rec, 200, {"success": True, "data": {"transaction_status": "success"}})
+    with ctx as MockClient, creds:
+        MockClient.return_value.__aenter__.return_value = client
+        first = _run(pay.confirm_topup("JANEADS_x"))
+        second = _run(pay.confirm_topup("JANEADS_x"))
+    assert first["status"] == "completed"
+    assert first["balance_ngn"] == 5_000
+    # Idempotent: the second call must not credit again.
+    assert second.get("already_credited") is True
+    assert _run(pay._wallet.get_balance("b1")) == 5_000
