@@ -1615,7 +1615,10 @@ async def tiktok_direct_finalize(
 # page (that's POST /{business_id}/owned_pages, deliberately not used here).
 
 @router.get("/connect/facebook-ads/initiate")
-async def facebook_ads_initiate(source: Optional[str] = Query("settings")):
+async def facebook_ads_initiate(
+    source: Optional[str] = Query("settings"),
+    rerequest: int = Query(1),
+):
     """Redirect to Facebook's OAuth page requesting advertising-scoped permissions
     for a Page, on top of the standard page-management scopes."""
     import urllib.parse
@@ -1650,8 +1653,13 @@ async def facebook_ads_initiate(source: Optional[str] = Query("settings")):
         # forces Facebook to show every requested permission again on every call,
         # regardless of prior history, which is exactly what a per-brand ads
         # connection needs — one person may connect several distinct Pages.
-        "auth_type": "rerequest",
     }
+    # Facebook renders an EMPTY consent dialog for auth_type=rerequest when the
+    # person has no previously-declined permission to re-request. ?rerequest=0
+    # drops it so a blank dialog can be diagnosed (and worked around) live,
+    # without a redeploy.
+    if rerequest:
+        params["auth_type"] = "rerequest"
     auth_url = f"https://www.facebook.com/{settings.FACEBOOK_API_VERSION}/dialog/oauth?" + urllib.parse.urlencode(params)
     return RedirectResponse(auth_url)
 
