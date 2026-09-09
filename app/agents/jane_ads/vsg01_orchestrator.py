@@ -98,8 +98,17 @@ from .store import MongoStrategyStore
 from .vsg01_corpus_seed import FORMAT_MODULES
 
 # See module docstring for the full reasoning behind each set below.
-NO_PHOTO_FORMAT_IDS = frozenset({"SEED-075", "SEED-087", "SEED-080", "SEED-081"})
-UPLOAD_PHOTO_FORMAT_IDS = frozenset({"SEED-093", "SEED-082", "SEED-074"})
+NO_PHOTO_FORMAT_IDS = frozenset({
+    "SEED-075", "SEED-087", "SEED-080", "SEED-081",
+    "SEED-097",
+    # Work In Progress ideally prefers a real upload of the client's own work
+    # (VSG-01-PROMPTS v2 §6.15) — wired here on the generate path only, since
+    # no photo-attestation type exists yet for "this is real work in
+    # progress" (only product_photo/real_customer_photo do). See
+    # work_in_progress.py's own module docstring for this disclosed gap.
+    "SEED-098",
+})
+UPLOAD_PHOTO_FORMAT_IDS = frozenset({"SEED-093", "SEED-082", "SEED-074", "SEED-096"})
 RECOMPOSITE_PHOTO_FORMAT_IDS = UPLOAD_PHOTO_FORMAT_IDS | {"SEED-088"}
 
 # The format library's own tested/documented canvas — every format module's
@@ -653,6 +662,165 @@ async def _build_starter_pack(business_name: str, category: str, description: st
     return document
 
 
+# ── SEED-096: Price-Led Offer (needs a real, attested product photo) ─
+
+async def _content_price_led_offer(description: str) -> Optional[dict]:
+    """Only ever fires when the business's own words already state a real,
+    currently-honoured price (VSG-01-PROMPTS v2 §6.13) — never invents one,
+    same contract as _content_receipt."""
+    if not (description or "").strip():
+        return None
+    prompt = (
+        f"Below is a business's own description/context text:\n\n{description}\n\n"
+        "Does this text state a REAL, specific price for what's being sold (e.g. "
+        "'sourdough bread ₦3,500')? If yes, extract it VERBATIM — never estimate, "
+        "round, or invent a price that isn't explicitly stated. Also extract, ONLY if "
+        "explicitly stated: a delivery area, a payment method, a short call-to-action "
+        "line, and a genuine PRIOR price (only if the text says it was actually charged "
+        "before, e.g. 'was ₦5,000 now ₦3,500').\n"
+        "If no real price is stated, return price as an empty string.\n"
+        "Return JSON: {\"price\": \"e.g. ₦3,500\", \"was_price\": \"...\" or \"\", "
+        "\"delivery_line\": \"...\" or \"\", \"payment_line\": \"...\" or \"\", "
+        "\"action_line\": \"...\" or \"\"}. Return ONLY the JSON."
+    )
+    d = await _call_content_model(prompt)
+    if not d or not str(d.get("price", "")).strip():
+        return None
+    return {
+        "price": str(d.get("price", "")).strip(),
+        "was_price": str(d.get("was_price", "")).strip() or None,
+        "delivery_line": str(d.get("delivery_line", "")).strip() or None,
+        "payment_line": str(d.get("payment_line", "")).strip() or None,
+        "action_line": str(d.get("action_line", "")).strip() or None,
+    }
+
+
+async def _build_price_led_offer(business_name: str, category: str, description: str, tokens: dict,
+                                 photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None):
+    if not photo_url:
+        return None
+    content = await _content_price_led_offer(description)
+    if not content:
+        return None
+    from .ad_formats import price_led_offer
+    try:
+        document = price_led_offer.build_document(
+            photo_url, content["price"],
+            delivery_line=content["delivery_line"], payment_line=content["payment_line"],
+            action_line=content["action_line"], was_price=content["was_price"],
+            canvas_size=_CANVAS_SIZE, tokens=tokens, brand_logo_url=brand_logo_url,
+        )
+    except Exception as e:
+        print(f"[VSG01] Price-Led Offer build failed: {e}", flush=True)
+        return None
+    return document
+
+
+# ── SEED-097: Text-Only (no photo at all) ────────────────────────
+
+async def _content_text_only(business_name: str, category: str, description: str) -> Optional[dict]:
+    """Same truthfulness contract as _content_receipt/_content_price_led_offer
+    — this format has NO image to fall back on, so §6.14 is explicit the
+    headline must carry a real fact, never invented sentiment. Only ever
+    fires when the business's own words state something concrete."""
+    if not (description or "").strip():
+        return None
+    prompt = (
+        f"For a Nigerian ad for {_business_line(business_name, category, description)}, does the "
+        "text above state one REAL, concrete fact worth leading with — a price, a delivery area, "
+        "a specific offer, an opening date? This format has NO image at all, so the headline must "
+        "carry real information, never vague sentiment like 'we're the best'.\n"
+        "If nothing concrete is stated, return headline as an empty string — do not invent one.\n"
+        "Return JSON: {\"headline\": \"the one real fact, as a short punchy line\", "
+        "\"subline\": \"...\" or \"\", \"action_line\": \"...\" or \"\"}. Return ONLY the JSON."
+    )
+    d = await _call_content_model(prompt)
+    if not d or not str(d.get("headline", "")).strip():
+        return None
+    return {
+        "headline": str(d.get("headline", "")).strip(),
+        "subline": str(d.get("subline", "")).strip() or None,
+        "action_line": str(d.get("action_line", "")).strip() or None,
+    }
+
+
+async def _build_text_only(business_name: str, category: str, description: str, tokens: dict,
+                           photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None):
+    content = await _content_text_only(business_name, category, description)
+    if not content:
+        return None
+    from .ad_formats import text_only
+    try:
+        document = text_only.build_document(
+            content["headline"], subline=content["subline"], action_line=content["action_line"],
+            canvas_size=_CANVAS_SIZE, tokens=tokens, brand_logo_url=brand_logo_url,
+        )
+    except Exception as e:
+        print(f"[VSG01] Text-Only build failed: {e}", flush=True)
+        return None
+    return document
+
+
+# ── SEED-098: Work In Progress (generated scene — see module
+# docstring on why this doesn't yet accept a real work photo) ─────────────
+
+async def _content_work_in_progress(business_name: str, category: str, description: str) -> Optional[dict]:
+    prompt = (
+        f"For a Nigerian ad for {_business_line(business_name, category, description)}, describe "
+        "the everyday hands-on WORK this business does (e.g. 'installing solar panels', 'fixing a "
+        "burst pipe', 'repairing a generator') and write one short line naming what's being done "
+        "and, if known, where they serve (e.g. 'Solar install underway — Lekki Phase 1').\n"
+        "- trade_activity: a short, concrete VISUAL scene for a documentary photo (what a camera "
+        "would see — hands, tools, the job partially complete), no brand/person names\n"
+        "- statement: the short line, 6 words or fewer\n"
+        f"- nigerian_setting: pick the single best-fitting option, copied EXACTLY, from this list: "
+        f"{list(_NIGERIAN_SETTINGS)}\n"
+        "Return ONLY the JSON with exactly these 3 keys."
+    )
+    d = await _call_content_model(prompt)
+    if not d:
+        return None
+    trade_activity = str(d.get("trade_activity", "")).strip()
+    statement = str(d.get("statement", "")).strip()
+    setting = str(d.get("nigerian_setting", "")).strip()
+    if setting not in _NIGERIAN_SETTINGS:
+        setting = _NIGERIAN_SETTINGS[0]
+    if not trade_activity or not statement:
+        return None
+    return {"trade_activity": trade_activity, "statement": statement, "nigerian_setting": setting}
+
+
+async def _build_work_in_progress(business_name: str, category: str, description: str, tokens: dict,
+                                  photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None):
+    content = await _content_work_in_progress(business_name, category, description)
+    if not content:
+        return None
+    from .ad_formats import work_in_progress
+    try:
+        scene_url = await generate_scene(
+            work_in_progress._scene_prompt(content["trade_activity"], content["nigerian_setting"]),
+            size=f"{_CANVAS_SIZE[0]}x{_CANVAS_SIZE[1]}",
+        )
+    except SceneGenerationFailed as e:
+        print(f"[VSG01] Work In Progress scene generation failed: {e}", flush=True)
+        return None
+
+    result = await verify_skin_rendering(scene_url)
+    if result["contains_person"] and not result["matches_target_range"]:
+        print(f"[VSG01] Work In Progress failed skin-tone check: {result['notes']}", flush=True)
+        return None
+
+    try:
+        document = work_in_progress.build_document(
+            scene_url, content["statement"], canvas_size=_CANVAS_SIZE, tokens=tokens,
+            brand_logo_url=brand_logo_url,
+        )
+    except Exception as e:
+        print(f"[VSG01] Work In Progress build failed: {e}", flush=True)
+        return None
+    return document
+
+
 _BUILDERS = {
     "SEED-075": _build_us_vs_them,
     "SEED-087": _build_borrowed_interface,
@@ -662,6 +830,9 @@ _BUILDERS = {
     "SEED-082": _build_text_on_a_face,
     "SEED-074": _build_testimonial_offer,
     "SEED-088": _build_starter_pack,
+    "SEED-096": _build_price_led_offer,
+    "SEED-097": _build_text_only,
+    "SEED-098": _build_work_in_progress,
 }
 
 
