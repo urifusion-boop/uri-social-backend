@@ -195,6 +195,19 @@ def _content_fit_boost(description: str) -> dict[str, float]:
     return {fid: 1.0 for fid, phrases in _CONTENT_FIT_SIGNALS.items() if any(p in text for p in phrases)}
 
 
+# The corpus's OWN authored fallback — problem_solution's record in
+# vsg01_corpus_seed.py literally says "Default choice when nothing more
+# specific fits — lowest policy risk in the library... any business,
+# especially where no more specific format applies." Nothing invented here;
+# this just actually uses that stated intent instead of leaving the "no
+# content signal" case to fall back on retrieval.py's score() — which is
+# grade x transfer x recency x origin (corpus data-quality/freshness), a
+# real and correct signal for OTHER categories but not a fit signal at all.
+# Without this, "nothing matched" silently meant "whichever record happens
+# to be freshest," which is not a logical match to anything about this ad.
+_DEFAULT_FORMAT_ID = "SEED-080"
+
+
 async def select_ranked_ad_formats(
     db, *,
     has_product_photo: bool = False,
@@ -259,6 +272,16 @@ async def select_ranked_ad_formats(
     fit = _content_fit_boost(description)
     if fit:
         records = sorted(records, key=lambda s: -fit.get(s.strategy_id, 0.0))
+    else:
+        # No specific content signal fired — prefer the corpus's own
+        # documented generic default (see _DEFAULT_FORMAT_ID) over whatever
+        # wins on data-freshness score alone. A no-op when it isn't in this
+        # request's eligible pool (e.g. the upload-photo path, where it was
+        # never a candidate) — falls through to plain eligibility order.
+        records = (
+            [s for s in records if s.strategy_id == _DEFAULT_FORMAT_ID]
+            + [s for s in records if s.strategy_id != _DEFAULT_FORMAT_ID]
+        )
     return records
 
 
@@ -1033,9 +1056,11 @@ async def select_and_render_vsg01_creative(
 
     Precedence, highest first: an explicit `forced_format_id` > a standing
     Playbook preference > `description`'s own content-fit signal (Layer 2,
-    see `_content_fit_boost`) > plain eligibility order. Each layer only
-    reorders what the layer below it already found eligible — none of them
-    can make an ineligible format render.
+    see `_content_fit_boost`) > the corpus's documented generic default
+    (`_DEFAULT_FORMAT_ID`, only when NO content signal fired) > plain
+    eligibility order (last resort). Each layer only reorders what the layer
+    below it already found eligible — none of them can make an ineligible
+    format render.
     """
     candidate_ids, has_product_photo, has_real_customer_photo, photo_url = _vsg01_candidate_params(
         photo_url=photo_url, photo_attestation=photo_attestation, recomposite=recomposite,
