@@ -29,6 +29,8 @@ FORMAT = AdFormatDef(
     name="The Receipt",
     asset_source="drawn",  # no photography at all — pure Layer 4 composite
     layers_used="L4",
+    brand_mark="required",  # VSG-01-PROMPTS v2 §6.5 — load-bearing: distinguishes a
+                             # seller's quotation from a payment/transfer alert
     requires=[],  # nothing to gate — a drawn format needs no photo of anything
 )
 

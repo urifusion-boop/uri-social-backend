@@ -53,6 +53,7 @@ FORMAT = AdFormatDef(
                             # the alternative path when the photo needs cleanup —
                             # both hand this module a single finished product_image_url
     layers_used="L4",
+    brand_mark="required",  # VSG-01-PROMPTS v2 §6.1
     requires=["product_photo"],  # Requirement.PRODUCT_PHOTO.value — §1.2/§6: never
                                   # surface this format for a business with no real
                                   # product photo to build it from

@@ -314,6 +314,71 @@ def build_vsg01_strategies() -> List[Strategy]:
     return strategies
 
 
+
+# VSG-01-PROMPTS v2 §6.13-6.15 — three formats the doc defines but that have no
+# built module yet (no AdFormatDef, no build_document, nothing in
+# app/agents/jane_ads/ad_formats/). Kept separate from _RECORDS/FORMAT_MODULES
+# on purpose: every function above (build_vsg01_strategies, FORMAT_MODULES)
+# assumes record["format_module"].FORMAT exists, which is false for these
+# three. This is reference content only — surfaced by GET /jane-ads/ad-formats
+# as "planned" cards so the format library isn't silently incomplete, not
+# ingested into the corpus and not selectable by retrieval. Move an entry out
+# of this list and into _RECORDS above once its module is actually built.
+PLANNED_FORMAT_RECORDS = [
+    dict(
+        format_id="PLANNED-price-led-offer",
+        name="Price-Led Offer",
+        brand_mark="required",
+        claim="Use for a straightforward priced offer — probably the most common "
+              "Nigerian SME ad pattern, and the one the original 12 formats missed.",
+        mechanism="A product photo with the price as the largest element after the "
+                  "product, plus delivery area and payment method, answers 'how much "
+                  "and how do I get it' in one glance.",
+        business_types=["Any business selling a single priced product or package"],
+        modification_required="Price must be current and honoured; no struck-through "
+                               "'was' price unless genuinely charged; delivery area and "
+                               "payment methods user-confirmed before entering live "
+                               "creative.",
+        funnel_stages=["conversion"],
+    ),
+    dict(
+        format_id="PLANNED-text-only",
+        name="Text-Only",
+        brand_mark="required",
+        claim="Use when the business has no usable photograph at all, or the message "
+              "is purely informational.",
+        mechanism="One line of real information — a price, a delivery area, a "
+                  "specific offer, a real fact — set large on a plain field stays "
+                  "legible even under heavy compression, with nothing else in frame "
+                  "to fail.",
+        business_types=["Any business with no product photography available"],
+        modification_required="The line must carry real information, not sentiment — "
+                               "abstraction fails harder here than anywhere else in "
+                               "the library; minimum 72px, 7:1 contrast, compression-"
+                               "tested.",
+        funnel_stages=["awareness", "conversion"],
+    ),
+    dict(
+        format_id="PLANNED-work-in-progress",
+        name="Work In Progress",
+        brand_mark="required",
+        claim="Use for a service business with no product to photograph — "
+              "installers, trades, clinics, schools.",
+        mechanism="Work visibly underway — hands, tools, a partially completed job — "
+                  "proves capability the way a product photo proves it for a business "
+                  "that sells a physical item.",
+        business_types=["Service businesses with no product to photograph "
+                        "(installation, repair, trades, clinics, schools)"],
+        modification_required="Prefer the client's own photographs over generated "
+                               "ones — a generated installation is not their work; no "
+                               "implied completed-job claim on generated imagery; no "
+                               "safety-violating depiction (no unprotected work at "
+                               "height, no exposed live electrical work).",
+        funnel_stages=["consideration"],
+    ),
+]
+
+
 async def seed_vsg01_corpus(store: StrategyStore) -> int:
     """Ingest all 12 VSG-01 format records into `store` as draft — real
     human approval (store.approve(...)) is a separate, deliberate step

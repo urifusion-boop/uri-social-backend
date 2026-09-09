@@ -69,6 +69,7 @@ FORMAT = AdFormatDef(
     name="Starter Pack",
     asset_source="generate",  # surrounding items; the product itself is upload_as_is
     layers_used="L2-L3-L4",
+    brand_mark="optional",  # VSG-01-PROMPTS v2 §6.11
     requires=["product_photo"],
 )
 

@@ -47,6 +47,7 @@ FORMAT = AdFormatDef(
     name="Problem / Solution",
     asset_source="generate",
     layers_used="L2-L4",
+    brand_mark="optional",  # VSG-01-PROMPTS v2 §6.3
     requires=[],  # `generate` needs no photo from the business at all
 )
 
