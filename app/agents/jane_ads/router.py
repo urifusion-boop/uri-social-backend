@@ -525,6 +525,11 @@ class SuggestAdFormatBody(BaseModel):
     asset_attestation: Optional[str] = None  # "product_photo" | "real_customer_photo" | None
     recomposite: bool = False
     is_video: bool = False
+    # The user's own ad brief so far — enables Layer 2 content-fit ranking
+    # (vsg01_orchestrator._content_fit_boost) on top of plain eligibility.
+    # Optional and additive: omitted/empty just means no content signal, same
+    # eligibility-only ranking as before.
+    description: Optional[str] = None
 
 
 @router.post("/creative/suggest-format")
@@ -556,7 +561,7 @@ async def suggest_ad_format(
     )
     ranked = await select_ranked_ad_formats(
         db, has_product_photo=has_product_photo, has_real_customer_photo=has_real_customer_photo,
-        candidate_ids=candidate_ids,
+        candidate_ids=candidate_ids, description=body.description or "",
     )
     if not ranked:
         return {"suggested": None, "alternatives": []}
