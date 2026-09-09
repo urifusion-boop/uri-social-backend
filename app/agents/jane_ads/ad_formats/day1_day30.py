@@ -50,6 +50,7 @@ FORMAT = AdFormatDef(
     name="Day 1 → Day 30",
     asset_source="upload",  # CreativeSource.UPLOAD ("upload_as_is") x2 — both panels
     layers_used="L4",
+    brand_mark="required",  # VSG-01-PROMPTS v2 §6.9
     # Requirement.PRODUCT_PHOTO is a best-fit reuse, not a precise semantic
     # match — "product" undersells a repair, a built room or a training
     # cohort — but the underlying gate is the same one PRODUCT_PHOTO exists

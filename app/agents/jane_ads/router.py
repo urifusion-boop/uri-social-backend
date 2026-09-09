@@ -15,7 +15,7 @@ from typing import Optional
 
 import httpx
 from fastapi import (
-    APIRouter, Body, Depends, File, HTTPException, Query, Request, UploadFile,
+    APIRouter, Body, Depends, File, Header, HTTPException, Query, Request, UploadFile,
 )
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from motor.motor_asyncio import AsyncIOMotorDatabase
@@ -41,6 +41,9 @@ from .models import (
 )
 from .payments import JaneAdsPayments
 from .store import InMemoryWalletStore, MongoWalletStore
+from .vsg01_corpus_seed import PLANNED_FORMAT_RECORDS
+from .vsg01_corpus_seed import _RECORDS as VSG01_FORMAT_RECORDS
+from .vsg01_orchestrator import _BUILDERS as VSG01_WIRED_FORMAT_IDS
 from .wallet import InsufficientFundsError, MinimumTopUpError, WalletService
 
 router = APIRouter(prefix="/jane-ads", tags=["Jane + Ads (demo)"])
@@ -396,6 +399,10 @@ class CreativeForBrandBody(BaseModel):
     # "real_customer_photo" | None. None means exactly what it always meant — use the
     # photo as-is, no format-selection attempt. See creative_from_upload's docstring.
     asset_attestation: Optional[str] = None
+    # The user's own pick from POST /jane-ads/creative/suggest-format's alternatives
+    # ("change" on the Style row) — None means "use whatever ranks best" (unchanged
+    # default behaviour). See select_and_render_vsg01_creative's forced_format_id.
+    vsg01_format_id: Optional[str] = None
 
 
 @router.post("/creative/for-brand")
@@ -426,7 +433,7 @@ async def creative_for_brand(
             body.description, user_id=user_id, db=db, brand_id=brand_id,
             is_video=body.is_video, city=body.city,
             destination_type=destination_type, destination_cta=destination_cta,
-            asset_attestation=body.asset_attestation,
+            asset_attestation=body.asset_attestation, vsg01_format_id=body.vsg01_format_id,
         )
     elif body.source == "recomposite":
         if not body.reference_image_url:
@@ -435,7 +442,7 @@ async def creative_for_brand(
             body.business_name, body.category, body.reference_image_url, body.goal,
             body.description, user_id=user_id, db=db, brand_id=brand_id, city=body.city,
             destination_type=destination_type, destination_cta=destination_cta,
-            asset_attestation=body.asset_attestation,
+            asset_attestation=body.asset_attestation, vsg01_format_id=body.vsg01_format_id,
         )
     elif body.source == "draft":
         if not body.draft_id:
@@ -452,8 +459,174 @@ async def creative_for_brand(
             body.business_name, body.category, body.goal, body.description,
             user_id=user_id, db=db, brand_id=brand_id, city=body.city,
             destination_type=destination_type, destination_cta=destination_cta,
+            vsg01_format_id=body.vsg01_format_id,
         )
     return ad.model_dump()
+
+
+def _serialize_vsg01_format(record: dict, *, is_planned: bool) -> dict:
+    """Shared by GET /jane-ads/ad-formats and POST /jane-ads/creative/suggest-format
+    so the two never drift into two different shapes for the same format."""
+    if is_planned:
+        return {
+            "format_id": record["format_id"],
+            "name": record["name"],
+            "claim": record["claim"],
+            "mechanism": record["mechanism"],
+            "business_types": record["business_types"],
+            "modification_required": record["modification_required"],
+            "brand_mark": record["brand_mark"],
+            "asset_source": None,
+            "layers_used": None,
+            "requires": [],
+            "status": "planned",
+        }
+    format_def = record["format_module"].FORMAT
+    return {
+        "format_id": format_def.format_id,
+        "name": format_def.name,
+        "claim": record["claim"],
+        "mechanism": record["mechanism"],
+        "business_types": record["business_types"],
+        "modification_required": record["modification_required"],
+        "brand_mark": format_def.brand_mark,
+        "asset_source": format_def.asset_source,
+        "layers_used": format_def.layers_used,
+        "requires": format_def.requires,
+        "status": "live" if format_def.format_id in VSG01_WIRED_FORMAT_IDS else "built",
+    }
+
+
+@router.get("/ad-formats")
+async def list_ad_formats(_token: dict = Depends(JWTBearer())) -> dict:
+    """The Visual Styles — Ads library for the Brand Playbook and the in-flow
+    'Style: {name}' chip on a generated ad (VSG-01-PROMPTS v2 §6). Read-only,
+    not brand-scoped — every business sees the same format library; which
+    format actually renders for a given ad is a per-campaign retrieval
+    decision (see AdCreative.vsg01_format_id on the generated result), not a
+    standing choice made here.
+
+    status:
+      "live"    — wired into vsg01_orchestrator._BUILDERS, can actually be
+                  generated today
+      "built"   — has a real module + corpus record, but not yet wired into
+                  generation (News Headline/Day1->Day30/Censored Item need
+                  isolated ad accounts that don't exist yet; Humour/Cartoon
+                  needs a human-review workflow that doesn't exist yet)
+      "planned" — documented in VSG-01-PROMPTS v2, no module built yet
+    """
+    formats = [_serialize_vsg01_format(r, is_planned=False) for r in VSG01_FORMAT_RECORDS]
+    formats += [_serialize_vsg01_format(r, is_planned=True) for r in PLANNED_FORMAT_RECORDS]
+    return {"formats": formats}
+
+
+# TEMPORARY — one-off bootstrap, delete this endpoint once it's been called. No
+# in-app user can trigger this and JANE_ADS_ADMIN_EMAILS isn't set on dev, so this
+# uses its own throwaway shared secret rather than JWTBearer/admin-email gating.
+# Ingests the 12 VSG-01 corpus records as draft and approves them (see
+# vsg01_corpus_seed.seed_vsg01_corpus's own docstring — "real human approval is a
+# separate, deliberate step this function does not perform"). Idempotent: a repeat
+# call is a no-op once CREATIVE_FORMATS records are already approved.
+_VSG01_BOOTSTRAP_SECRET = "vsg01-corpus-bootstrap-2026-dev-only"
+
+
+@router.post("/admin/bootstrap-vsg01-corpus")
+async def bootstrap_vsg01_corpus(
+    x_bootstrap_secret: str = Header(...),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+) -> dict:
+    if x_bootstrap_secret != _VSG01_BOOTSTRAP_SECRET:
+        raise HTTPException(status_code=403, detail="Not authorized.")
+
+    from .entities import StrategyCategory
+    from .store import MongoStrategyStore
+    from .vsg01_corpus_seed import build_vsg01_strategies
+
+    store = MongoStrategyStore(db)
+    await store.ensure_indexes()
+
+    existing = [s for s in await store.fetch_approved() if s.category is StrategyCategory.CREATIVE_FORMATS]
+    if existing:
+        return {"status": "already_seeded", "count": len(existing),
+                "strategy_ids": [s.strategy_id for s in existing]}
+
+    strategies = build_vsg01_strategies()
+    for s in strategies:
+        await store.ingest(s)
+    approved = []
+    for s in strategies:
+        a = await store.approve(s.strategy_id, version=s.version, approved_by="dev-bootstrap-endpoint")
+        approved.append(a.strategy_id)
+
+    final = [s for s in await store.fetch_approved() if s.category is StrategyCategory.CREATIVE_FORMATS]
+    return {"status": "seeded", "count": len(final), "strategy_ids": approved}
+
+
+# TEMPORARY — dev-only debug lookup so a real browser test-signup can be verified
+# without inbox access. Same throwaway secret as the bootstrap endpoint above.
+# Delete alongside it.
+@router.get("/admin/debug-verification-code")
+async def debug_verification_code(
+    email: str,
+    x_bootstrap_secret: str = Header(...),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+) -> dict:
+    if x_bootstrap_secret != _VSG01_BOOTSTRAP_SECRET:
+        raise HTTPException(status_code=403, detail="Not authorized.")
+    user = await db["users"].find_one({"email": email})
+    if not user:
+        raise HTTPException(status_code=404, detail="No such user.")
+    return {"verification_code": user.get("verification_code")}
+
+
+class SuggestAdFormatBody(BaseModel):
+    asset_attestation: Optional[str] = None  # "product_photo" | "real_customer_photo" | None
+    recomposite: bool = False
+    is_video: bool = False
+
+
+@router.post("/creative/suggest-format")
+async def suggest_ad_format(
+    body: SuggestAdFormatBody,
+    brand_ctx: dict = Depends(get_active_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+) -> dict:
+    """The pre-generation 'Style — {name} · change' moment (mirrors
+    JaneVideoChat.tsx's plan.style row): the SAME ranking
+    select_and_render_vsg01_creative would use for a real generation call,
+    computed BEFORE generation so the frontend can show it and let the user
+    override it (vsg01_format_id on the actual generate/plan call).
+
+    Returns {"suggested": <format>|null, "alternatives": [<format>...]} —
+    null/empty whenever nothing is eligible (a plain video, no eligible
+    format for this business, or the VSG-01 corpus has nothing approved yet)
+    — never an error, matching every other fail-open point in this system.
+    """
+    if body.is_video:
+        return {"suggested": None, "alternatives": []}
+
+    from .vsg01_orchestrator import _vsg01_candidate_params, select_ranked_ad_formats
+
+    candidate_ids, has_product_photo, has_real_customer_photo, _ = _vsg01_candidate_params(
+        photo_url="x" if body.asset_attestation else None,  # only presence matters here
+        photo_attestation=body.asset_attestation,
+        recomposite=body.recomposite,
+    )
+    ranked = await select_ranked_ad_formats(
+        db, has_product_photo=has_product_photo, has_real_customer_photo=has_real_customer_photo,
+        candidate_ids=candidate_ids,
+    )
+    if not ranked:
+        return {"suggested": None, "alternatives": []}
+
+    by_id = {r["format_module"].FORMAT.format_id: r for r in VSG01_FORMAT_RECORDS}
+    serialized = [
+        _serialize_vsg01_format(by_id[s.strategy_id], is_planned=False)
+        for s in ranked if s.strategy_id in by_id
+    ]
+    if not serialized:
+        return {"suggested": None, "alternatives": []}
+    return {"suggested": serialized[0], "alternatives": serialized[1:]}
 
 
 @router.get("/creative/drafts")
@@ -1724,6 +1897,9 @@ class MetaLaunchFromMessageBody(BaseModel):
     # creative_source=upload/recomposite before a photo-based format can even be
     # attempted; None for generate/draft/ask (no real photo exists on those paths).
     asset_attestation: Optional[str] = None
+    # See CreativeForBrandBody's identical field — the "change" pick from
+    # POST /jane-ads/creative/suggest-format's alternatives.
+    vsg01_format_id: Optional[str] = None
 
 
 class _PlanBuildResult(BaseModel):
@@ -2381,6 +2557,7 @@ async def _build_campaign_plan(
             audience_segment=variant_segment, who_its_for=variant_who_its_for,
             geo_pockets=variant_geo_pockets, destination_type=destination_type.value,
             destination_cta=destination_cta, asset_attestation=body.asset_attestation,
+            vsg01_format_id=body.vsg01_format_id,
         )
     elif body.creative_source == "recomposite":
         creative = await creative_from_recomposite(
@@ -2390,6 +2567,7 @@ async def _build_campaign_plan(
             audience_segment=variant_segment, who_its_for=variant_who_its_for,
             geo_pockets=variant_geo_pockets, destination_type=destination_type.value,
             destination_cta=destination_cta, asset_attestation=body.asset_attestation,
+            vsg01_format_id=body.vsg01_format_id,
         )
     elif body.creative_source == "draft":
         creative = await creative_from_draft(
@@ -2434,6 +2612,7 @@ async def _build_campaign_plan(
             # Drives creative-stage retrieval; without it budget is 0, retrieval
             # bails early, and the ad ships with corpus_coverage="none".
             budget_ngn=float(parsed.budget_ngn or 0),
+            vsg01_format_id=body.vsg01_format_id,
         )
         if creative.image_url:
             # "reason" is a strict Literal on CreditTransaction — "campaign_generation"

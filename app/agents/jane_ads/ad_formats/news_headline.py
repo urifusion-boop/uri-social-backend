@@ -57,6 +57,8 @@ FORMAT = AdFormatDef(
     name="News Headline",
     asset_source="generate",  # or upload_as_is — see module docstring
     layers_used="L2-L4",
+    brand_mark="prohibited",  # VSG-01-PROMPTS v2 §6.8 — a brand mark returns this to
+                               # an advertisement and forfeits the reportage read
     requires=[],
     requires_isolation=True,  # §6: SEED-077 named explicitly
 )

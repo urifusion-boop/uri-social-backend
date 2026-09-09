@@ -50,6 +50,8 @@ FORMAT = AdFormatDef(
     name="Borrowed Interface",
     asset_source="drawn",
     layers_used="L4",
+    brand_mark="prohibited",  # VSG-01-PROMPTS v2 §6.6 — a logo destroys the
+                               # "message, not an ad" mechanism this format relies on
     requires=[],
 )
 
