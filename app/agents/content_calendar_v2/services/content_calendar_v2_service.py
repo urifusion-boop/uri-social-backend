@@ -150,6 +150,20 @@ def _get_period_start(ref: datetime) -> datetime:
     return ref.replace(hour=0, minute=0, second=0, microsecond=0)
 
 
+def _as_creative_device(v: Any) -> Dict[str, str]:
+    """Normalizes creative_device to a guaranteed {"category","device"} dict
+    at the one point it enters the pipeline (candidate generation), so every
+    downstream .get() call on it is safe. Confirmed live: despite the prompt
+    asking for an object, the model can flatten this to a plain string
+    (e.g. "visual - split screen"), which crashed every .get("category")
+    call site downstream with 'str' object has no attribute 'get'."""
+    if isinstance(v, dict):
+        return {"category": str(v.get("category", "")), "device": str(v.get("device", ""))}
+    if isinstance(v, str) and v.strip():
+        return {"category": "", "device": v.strip()}
+    return {"category": "", "device": ""}
+
+
 # ── PRD §20 — Creative memory (never performance) ───────────────────────────
 
 async def _fetch_creative_memory(scope: Dict[str, Any], db: AsyncIOMotorDatabase) -> Dict[str, Any]:
@@ -341,6 +355,7 @@ Return ONLY a valid JSON array of exactly {n} objects with exactly these 7 keys,
                 if isinstance(c, dict):
                     for f in forbidden:
                         c.pop(f, None)
+                    c["creative_device"] = _as_creative_device(c.get("creative_device"))
             return [c for c in parsed if isinstance(c, dict)]
         except Exception as exc:
             print(f"[CalendarV2] candidate chunk {chunk_idx} failed: {exc}", flush=True)
@@ -995,12 +1010,23 @@ must be impossible to copy-paste to a different brand.
             )
 
     # Merge the fixed concept fields (territory/subject/angle/device/format/
-    # date/day_index from Steps 3-7) back onto each generated item — the
-    # model only returned copy/direction fields, never asked to touch these.
+    # date/day_index from Steps 3-7) back onto each generated item. The
+    # prompt never asks the model to return these, but confirmed live: it
+    # can echo one back anyway (e.g. its own flattened-string creative_device)
+    # despite not being asked to — {**concept, **idea} let that silently win
+    # and crashed every downstream .get() call on the now-wrong-shaped value.
+    # Strip these keys from idea explicitly so concept's values always win,
+    # not just "usually win because the model behaves."
+    _CONCEPT_FIELDS = {
+        "territory", "subject", "angle", "creative_device", "format_hint", "format",
+        "objective", "audience_segment", "concept_name", "day_index", "date",
+        "carousel_slide_count", "holiday_tie_in", "selection_score",
+    }
     merged = []
     for i, idea in enumerate(items):
         concept = concepts_chunk[i]
-        merged.append({**concept, **idea, "day_offset": concept["day_index"]})
+        idea_safe = {k: v for k, v in idea.items() if k not in _CONCEPT_FIELDS} if isinstance(idea, dict) else {}
+        merged.append({**concept, **idea_safe, "day_offset": concept["day_index"]})
     return merged
 
 
