@@ -91,6 +91,38 @@ def service_fee_from_budget(budget_ngn: float) -> float:
     """URI's fee out of a client's stated budget. Complement of ad_spend_from_budget,
     subtracted rather than multiplied so the two always sum to the budget exactly."""
     return round(budget_ngn - ad_spend_from_budget(budget_ngn), 2)
+
+
+def stated_budget_from_record(record: dict) -> float:
+    """The budget the CLIENT typed, recovered from a stored campaign record.
+
+    Records persist `budget_ngn` as the AD SPEND sent to the platform — the stated
+    budget less URI's fee — so reading it straight back reports a ₦20,000 campaign as
+    ₦18,000. That leaked into two client-facing places: the campaign card's BUDGET
+    column, and Jane recalling "your past campaign was around ₦18,000".
+
+    `charged_upfront_ngn` is the exact amount debited at launch and is therefore the
+    truest answer when present. Older records predate it and are reconstructed from
+    the markup stamped on them, falling back to LEGACY_AD_SPEND_MARKUP for records
+    from before the fee model changed — the same precedence billing.py uses, so the
+    figure shown always matches the figure charged.
+
+    Lives here, beside ad_spend_from_budget, so the split is computed in ONE place
+    and the card, Jane's memory and billing cannot disagree about it."""
+    charged = record.get("charged_upfront_ngn")
+    if charged:
+        return round(float(charged), 2)
+    ad_spend = float(record.get("budget_ngn") or 0)
+    markup = float(record.get("ad_spend_markup") or LEGACY_AD_SPEND_MARKUP)
+    # Rounded to whole naira, not kobo: AD_SPEND_MARKUP is 1/(1 - rate) rounded to six
+    # decimals, so multiplying back drifts a few kobo low at larger budgets
+    # (₦58,500 × 1.111111 = ₦64,999.99, and ₦225,000 → ₦249,999.97). Stated budgets
+    # are always whole naira, so rounding to naira recovers the exact figure the
+    # client typed instead of showing them ₦64,999.99.
+    return float(round(ad_spend * markup))
+
+
+# ── Per-conversation meter ───────────────────────────────────────────────────
 CONVERSATION_PRICE_FLOOR_NGN: float = 400.0   # MAX(₦400, trailing-7d cost × 1.5)
 CONVERSATION_PRICE_MULTIPLIER: float = 1.5
 TRAILING_COST_WINDOW_DAYS: int = 7

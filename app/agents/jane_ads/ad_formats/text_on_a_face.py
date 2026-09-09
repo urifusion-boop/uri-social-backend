@@ -48,7 +48,7 @@ from typing import Dict, Tuple
 from ._content_guards import mentions_disallowed_personal_topic, presumes_viewer_attribute
 from ._text_metrics import wrap_text
 from .legibility import assert_legible
-from .tokens import AdFormatDef, PLACEHOLDER_TOKENS
+from .tokens import AdFormatDef, PLACEHOLDER_TOKENS, logo_badge_layers
 from app.agents.social_media_manager.services.document_renderer_service import DocumentRendererService
 
 FORMAT = AdFormatDef(
@@ -110,6 +110,7 @@ def build_document(
     permission_on_file: bool,
     canvas_size: Tuple[int, int] = (1080, 1080),
     tokens: Dict[str, str] = None,
+    brand_logo_url: str = None,
 ) -> Dict:
     """
     photo_url: a real, permission-cleared close-up portrait — never
@@ -167,6 +168,9 @@ def build_document(
         "font_size": _FONT_STATEMENT, "font_weight": 700, "color": t["ink"],
         "text_align": "ma",
     })
+
+    badge_layers, z = logo_badge_layers(brand_logo_url, width, height, z)
+    layers.extend(badge_layers)
 
     document = {
         "canvas": {"width": width, "height": height, "background_color": t["surface"]},
