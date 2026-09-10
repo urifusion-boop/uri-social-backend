@@ -79,6 +79,7 @@ on any of these, exactly like `generate_ad_image` already does.
 from __future__ import annotations
 
 import json
+import re
 from typing import Optional
 
 from app.core.config import settings
@@ -148,17 +149,20 @@ _CONTENT_FIT_SIGNALS: dict[str, tuple[str, ...]] = {
         "now ₦", "now $", "now only", "limited time price", "price drop",
         "slash", "half price",
     ),
-    # Receipt — the NO_PHOTO-eligible home for the exact same price-drop
-    # signal above. A business that states a real price/discount but has no
-    # product photo yet still deserves a price-shaped format, not whatever
-    # ranked first with no content match at all — Receipt is built exactly
-    # for real, stated prices (see `_content_receipt`'s own "never invent a
-    # price" contract). Once a photo is actually attached, candidate_ids
+    # Text-Only — the NO_PHOTO-eligible home for a stated price/discount/offer
+    # when there's no product photo. NOT Receipt: a receipt is an itemised
+    # breakdown ("haircut ₦3,000, wash ₦1,000"), and `_content_receipt`
+    # correctly rejects a single before/after price, so pointing this signal
+    # at Receipt just guaranteed a fall-through. Text-Only's own corpus
+    # record is exactly this case: "one line of real information — a price, a
+    # delivery area, a specific offer". Once a photo is attached, candidate_ids
     # moves to UPLOAD_PHOTO_FORMAT_IDS and SEED-096 above takes over instead.
-    "SEED-081": (
+    "SEED-097": (
         "% off", "percent off", "discount", "was ₦", "was $", "was £",
         "now ₦", "now $", "now only", "limited time price", "price drop",
         "slash", "half price",
+        # kept from the original Text-Only signal set
+        "just says", "one line", "bold statement", "headline that reads",
     ),
     # Testimonial+Offer / Review Card — a real customer's own words are quoted.
     "SEED-074": (
@@ -181,8 +185,6 @@ _CONTENT_FIT_SIGNALS: dict[str, tuple[str, ...]] = {
         "starter kit", "starter pack", "bundle", "set includes",
         "everything you need", "comes with",
     ),
-    # Text-Only — an explicit single bold statement, no product/photo framing.
-    "SEED-097": ("just says", "one line", "bold statement", "headline that reads"),
 }
 
 
@@ -195,17 +197,26 @@ def _content_fit_boost(description: str) -> dict[str, float]:
     return {fid: 1.0 for fid, phrases in _CONTENT_FIT_SIGNALS.items() if any(p in text for p in phrases)}
 
 
-# The corpus's OWN authored fallback — problem_solution's record in
-# vsg01_corpus_seed.py literally says "Default choice when nothing more
-# specific fits — lowest policy risk in the library... any business,
-# especially where no more specific format applies." Nothing invented here;
-# this just actually uses that stated intent instead of leaving the "no
-# content signal" case to fall back on retrieval.py's score() — which is
-# grade x transfer x recency x origin (corpus data-quality/freshness), a
-# real and correct signal for OTHER categories but not a fit signal at all.
-# Without this, "nothing matched" silently meant "whichever record happens
-# to be freshest," which is not a logical match to anything about this ad.
-_DEFAULT_FORMAT_ID = "SEED-080"
+# The "no content signal fired" fallback order — an ORDERED list, tried in
+# sequence, all hoisted above the plain eligibility ranking.
+#
+#  1. SEED-080 Problem/Solution — the corpus's OWN authored default:
+#     "Default choice when nothing more specific fits — lowest policy risk in
+#     the library... any business, especially where no more specific format
+#     applies." Preferred when it renders (it generates a situational scene,
+#     which can fail its §1.7 skin-tone check with no retry — confirmed live).
+#  2. SEED-097 Text-Only — the reliable floor beneath it: no generated
+#     imagery, no skin-tone gate, no verbatim-content parsing, just "one line
+#     of real information set large on a plain field." Its corpus record is
+#     explicitly "use when the business has no usable photograph at all."
+#
+# Without this, "nothing matched" fell through to retrieval.py's score()
+# (grade x transfer x recency x origin — corpus data freshness, not fit) and
+# in practice always landed on Us vs Them, the one no-photo format whose
+# content step never fails. Ranked #1 != rendered: a higher pick whose
+# content/build step comes up empty is skipped, so Text-Only as #2 here is
+# what actually stops the Us-vs-Them-by-attrition problem.
+_DEFAULT_FORMAT_IDS = ("SEED-080", "SEED-097")
 
 
 async def select_ranked_ad_formats(
@@ -273,15 +284,13 @@ async def select_ranked_ad_formats(
     if fit:
         records = sorted(records, key=lambda s: -fit.get(s.strategy_id, 0.0))
     else:
-        # No specific content signal fired — prefer the corpus's own
-        # documented generic default (see _DEFAULT_FORMAT_ID) over whatever
-        # wins on data-freshness score alone. A no-op when it isn't in this
-        # request's eligible pool (e.g. the upload-photo path, where it was
-        # never a candidate) — falls through to plain eligibility order.
-        records = (
-            [s for s in records if s.strategy_id == _DEFAULT_FORMAT_ID]
-            + [s for s in records if s.strategy_id != _DEFAULT_FORMAT_ID]
-        )
+        # No specific content signal fired — hoist the ordered fallback list
+        # (see _DEFAULT_FORMAT_IDS) above the plain data-freshness score, in
+        # its own order. Any id not eligible for this request is simply
+        # absent and skipped (e.g. the upload-photo path never has these as
+        # candidates) — falls through to plain eligibility order.
+        rank = {fid: i for i, fid in enumerate(_DEFAULT_FORMAT_IDS)}
+        records = sorted(records, key=lambda s: rank.get(s.strategy_id, len(rank)))
     return records
 
 
@@ -320,8 +329,11 @@ async def _content_us_vs_them(business_name: str, category: str, description: st
         "HARD RULE: the 'them' side must name a generic METHOD ('buying at the market', "
         "'doing it yourself', 'guesswork', 'waiting days'), never a specific competitor or "
         "brand name — this is enforced downstream and a named business will be rejected.\n"
+        "Keep every 'them' and 'us' value to at most 6 words — short phrases, not sentences "
+        "(they are set large and wrap badly past two lines).\n"
         "Return JSON: {\"rows\": [{\"label\": \"short row label e.g. Price\", "
-        "\"them\": \"...\", \"us\": \"...\"}, ...]}. 2-3 rows only. Return ONLY the JSON."
+        "\"them\": \"...\", \"us\": \"...\"}, ...]}. Exactly 2 rows unless a 3rd is clearly "
+        "worth it. Return ONLY the JSON."
     )
     d = await _call_content_model(prompt)
     if not d or not isinstance(d.get("rows"), list):
@@ -412,8 +424,14 @@ async def _content_problem_solution(business_name: str, category: str, descripti
         "- problem_situation: a short, concrete VISUAL scene of the problem (what a camera would "
         "see, no people's names, no brand names, no location names)\n"
         "- solution_situation: a short, concrete VISUAL scene of the resolved state\n"
-        "- problem_text: the problem stated as a naira cost/pain, <=8 words\n"
-        "- solution_text: the solution stated as an outcome (not a feature), <=8 words\n"
+        "- problem_text: the problem stated as a felt pain or consequence, <=8 words. Do NOT "
+        "state a naira figure, percentage, or any number UNLESS that exact figure appears "
+        "verbatim in the business's own text above — never estimate or invent one.\n"
+        "- solution_text: the concrete RESULT the customer gets, <=8 words — a specific "
+        "changed situation, not a slogan. GOOD: 'Your posts ready a week ahead', 'Customers "
+        "message you first'. BAD (vague sentiment, reject these): 'Elevate your brand', "
+        "'Compelling storytelling', 'Unlock your potential', 'Take it to the next level'. "
+        "Same number rule: no invented figures.\n"
         f"- nigerian_setting: pick the single best-fitting option, copied EXACTLY, from this list: "
         f"{list(_NIGERIAN_SETTINGS)}\n"
         "Return ONLY the JSON with exactly these 5 keys."
@@ -433,6 +451,18 @@ async def _content_problem_solution(business_name: str, category: str, descripti
     }
     if not all([out["problem_situation"], out["solution_situation"], out["problem_text"], out["solution_text"]]):
         return None
+    # Guard against an invented figure the prompt was told not to produce — a
+    # ₦ amount, a percentage, or a 3+ digit number in the headline that isn't
+    # in the business's own text. Blank that headline word ("Wasting ₦50,000
+    # on chaos" -> "Wasting on chaos") and tidy the spacing; only bail out if
+    # blanking leaves nothing.
+    src_digits = re.sub(r"[^\d]", "", description or "")
+    for key in ("problem_text", "solution_text"):
+        for tok in re.findall(r"₦\s?[\d,]+|\d[\d,]*\s?%|\d[\d,]{2,}", out[key]):
+            if re.sub(r"[^\d]", "", tok) not in src_digits:
+                out[key] = re.sub(r"\s{2,}", " ", out[key].replace(tok, "")).strip(" ,.-")
+    if not out["problem_text"] or not out["solution_text"]:
+        return None
     return out
 
 
@@ -443,27 +473,34 @@ async def _build_problem_solution(business_name: str, category: str, description
         return None
     width, height = _CANVAS_SIZE
     zone_size = f"{width}x{height // 2}"
+    prompts = {
+        "problem": problem_solution._problem_prompt(content["problem_situation"], content["nigerian_setting"]),
+        "solution": problem_solution._solution_prompt(content["solution_situation"], content["nigerian_setting"]),
+    }
+
+    async def _gen_zone_passing_skin_check(prompt: str, zone: str) -> Optional[str]:
+        """§1.7 — generate the zone, verify skin rendering, and regenerate
+        ONCE if a person is rendered outside the deep-brown target range
+        (image models lighten skin intermittently — a second draw usually
+        lands, and the prompt now states the tone explicitly). Still fails
+        closed to the generic fallback if the retry also misses."""
+        for attempt in (1, 2):
+            url = await generate_scene(prompt, size=zone_size)
+            result = await verify_skin_rendering(url)
+            if not result["contains_person"] or result["matches_target_range"]:
+                return url
+            print(f"[VSG01] Problem/Solution {zone} zone failed skin-tone check "
+                  f"(attempt {attempt}/2): {result['notes']}", flush=True)
+        return None
+
     try:
-        problem_url = await generate_scene(
-            problem_solution._problem_prompt(content["problem_situation"], content["nigerian_setting"]),
-            size=zone_size,
-        )
-        solution_url = await generate_scene(
-            problem_solution._solution_prompt(content["solution_situation"], content["nigerian_setting"]),
-            size=zone_size,
-        )
+        problem_url = await _gen_zone_passing_skin_check(prompts["problem"], "problem")
+        solution_url = await _gen_zone_passing_skin_check(prompts["solution"], "solution")
     except SceneGenerationFailed as e:
         print(f"[VSG01] Problem/Solution scene generation failed: {e}", flush=True)
         return None
-
-    # §1.7 — verify skin rendering on every generation. Fails closed to the
-    # generic fallback (never ships a mismatched render) rather than raising
-    # and breaking the whole creative call.
-    for url in (problem_url, solution_url):
-        result = await verify_skin_rendering(url)
-        if result["contains_person"] and not result["matches_target_range"]:
-            print(f"[VSG01] Problem/Solution failed skin-tone check: {result['notes']}", flush=True)
-            return None
+    if problem_url is None or solution_url is None:
+        return None
 
     try:
         # build_document already calls legibility.assert_legible() itself
@@ -1056,11 +1093,14 @@ async def select_and_render_vsg01_creative(
 
     Precedence, highest first: an explicit `forced_format_id` > a standing
     Playbook preference > `description`'s own content-fit signal (Layer 2,
-    see `_content_fit_boost`) > the corpus's documented generic default
-    (`_DEFAULT_FORMAT_ID`, only when NO content signal fired) > plain
+    see `_content_fit_boost`) > the ordered no-signal fallback list
+    (`_DEFAULT_FORMAT_IDS`, only when NO content signal fired) > plain
     eligibility order (last resort). Each layer only reorders what the layer
     below it already found eligible — none of them can make an ineligible
-    format render.
+    format render. And ranked #1 != rendered: `select_and_render_...` walks
+    the list in order, skipping any pick whose content/build step comes up
+    empty, so the fallback list's 2nd entry (Text-Only, always renders) is
+    what actually catches a failed 1st entry instead of Us vs Them.
     """
     candidate_ids, has_product_photo, has_real_customer_photo, photo_url = _vsg01_candidate_params(
         photo_url=photo_url, photo_attestation=photo_attestation, recomposite=recomposite,

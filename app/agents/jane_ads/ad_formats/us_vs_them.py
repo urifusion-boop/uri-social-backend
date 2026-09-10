@@ -130,13 +130,36 @@ def build_document(
     # varies (VSG-01 §2.4 allows 2-3), so a fixed anchor either wastes
     # space or (with more rows) risks running off the bottom, and neither
     # is the right trade-off when centring costs nothing.
-    measured_rows = []
-    for row_label, them_value, us_value in rows:
-        them_lines = wrap_text(them_value, col_width - icon_gap, _FONT_VALUE)
-        us_lines = wrap_text(us_value, col_width - icon_gap, _FONT_VALUE)
-        n_lines = max(len(them_lines), len(us_lines))
-        row_height = label_height + label_gap + n_lines * value_line_height + row_gap_after
-        measured_rows.append((row_label, them_lines, us_lines, row_height))
+    def _measure(row_list, max_value_lines=None):
+        out = []
+        for row_label, them_value, us_value in row_list:
+            them_lines = wrap_text(them_value, col_width - icon_gap, _FONT_VALUE)
+            us_lines = wrap_text(us_value, col_width - icon_gap, _FONT_VALUE)
+            if max_value_lines:
+                them_lines = them_lines[:max_value_lines]
+                us_lines = us_lines[:max_value_lines]
+            n_lines = max(len(them_lines), len(us_lines))
+            row_height = label_height + label_gap + n_lines * value_line_height + row_gap_after
+            out.append((row_label, them_lines, us_lines, row_height))
+        return out
+
+    # Fit guarantee: 44px type wrapping to 3-4 lines across 3 rows ran clean
+    # off the bottom of the canvas (confirmed in a live render). §2.4 allows
+    # 2-3 rows, so drop the last row before touching type; only if even two
+    # full rows overflow (very long values) do we cap lines per value. The
+    # block must fit between header_to_rows_gap below the header and a bottom
+    # margin, or it clips — there is no scroll.
+    bottom_margin = 72
+    max_rows_height = height - 72 - header_to_rows_gap - bottom_margin
+    working = list(rows)
+    measured_rows = _measure(working)
+    while sum(r[-1] for r in measured_rows) > max_rows_height and len(working) > 2:
+        working = working[:-1]
+        measured_rows = _measure(working)
+    cap = 4
+    while sum(r[-1] for r in measured_rows) > max_rows_height and cap > 2:
+        cap -= 1
+        measured_rows = _measure(working, max_value_lines=cap)
 
     total_rows_height = sum(row_height for *_, row_height in measured_rows)
     total_block_height = _FONT_HEADER + header_to_rows_gap + total_rows_height
