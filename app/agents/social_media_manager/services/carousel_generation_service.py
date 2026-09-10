@@ -96,9 +96,15 @@ class CarouselGenerationService:
         platform: str,
         brand_context: Optional[Dict[str, Any]] = None,
         num_slides: int = 3,
+        force_num_slides: bool = False,
     ) -> Dict[str, Any]:
         """
         Generate carousel content for a single platform.
+
+        force_num_slides: skip the content-based slide-count detection and use
+        num_slides exactly (still capped 2-10). Calendar V2 sets this — its
+        pipeline already decided the slide count deterministically and the
+        draft must not silently expand a 3-slide idea into 7.
 
         Returns:
             {
@@ -118,7 +124,10 @@ class CarouselGenerationService:
 
         # Override num_slides with intelligent detection (unless explicitly forced)
         # If user explicitly requested a count, respect it. Otherwise use detected optimal.
-        if num_slides == 3:  # Default value, use intelligent detection
+        if force_num_slides:
+            # Caller decided the count deliberately — respect it exactly.
+            num_slides = max(2, min(10, num_slides))
+        elif num_slides == 3:  # Default value, use intelligent detection
             num_slides = content_analysis["optimal_slides"]
         else:
             # User specified custom count, but cap it
@@ -290,6 +299,7 @@ This is a {content_analysis['type'].upper()} carousel. Build a cohesive narrativ
         brand_context: Optional[Dict[str, Any]] = None,
         num_slides: int = 3,
         db=None,
+        force_num_slides: bool = False,
     ) -> Dict[str, Any]:
         """
         Generate carousel content for multiple platforms and persist drafts to DB.
@@ -308,6 +318,7 @@ This is a {content_analysis['type'].upper()} carousel. Build a cohesive narrativ
                 platform=platform,
                 brand_context=brand_context,
                 num_slides=num_slides,
+                force_num_slides=force_num_slides,
             )
 
             draft_id = str(uuid.uuid4())

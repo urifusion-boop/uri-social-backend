@@ -182,9 +182,16 @@ async def create_draft_from_item_v2(
 
         if item.get("format") == "carousel":
             from app.agents.social_media_manager.services.carousel_generation_service import CarouselGenerationService
+            # The V2 pipeline already committed to a slide count (2-5, PRD rule)
+            # and wrote that many slides. Pass it through with force_num_slides
+            # so the draft doesn't re-run content detection and expand a
+            # 3-slide idea into 7 (confirmed live bug).
+            planned_slides = len(((item.get("carousel") or {}).get("slides")) or []) \
+                or int(item.get("carousel_slide_count") or 3)
             result = await CarouselGenerationService.generate_multi_platform(
                 user_id=user_id, seed_content=seed_content, platforms=request.platforms,
                 brand_context=brand_context, db=db,
+                num_slides=planned_slides, force_num_slides=True,
             )
         else:
             result = await ContentGenerationService.generate_multi_platform_content(
