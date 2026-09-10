@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import secrets
 import uuid
 from datetime import datetime, timedelta
@@ -156,6 +157,33 @@ def _get_period_start(ref: datetime) -> datetime:
     """First day of the 30-day window — 'today', midnight UTC (unlike v1's
     Monday-anchored week, a 30-day plan has no natural week anchor)."""
     return ref.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def _loads_lenient(raw: str) -> Any:
+    """json.loads with repair passes for the two ways LLM JSON reliably
+    breaks (both confirmed live in this pipeline): invalid backslash escapes
+    (Invalid \\escape) and trailing commas. Also strips a leading ```json
+    fence. Raises the original JSONDecodeError if none of the repairs land."""
+    text = raw.strip()
+    if text.startswith("```"):
+        parts = text.split("```")
+        text = parts[1] if len(parts) >= 2 else text.strip("`")
+        if text.lstrip().startswith("json"):
+            text = text.lstrip()[4:]
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    # Double any backslash that isn't the start of a valid JSON escape.
+    repaired = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', text)
+    try:
+        return json.loads(repaired)
+    except json.JSONDecodeError:
+        pass
+    # Strip trailing commas before } or ].
+    repaired = re.sub(r',(\s*[}\]])', r'\1', repaired)
+    return json.loads(repaired)
 
 
 def _as_creative_device(v: Any) -> Dict[str, str]:
@@ -372,7 +400,7 @@ Return ONLY a valid JSON array of exactly {n} objects with exactly these 7 keys,
                     raw = raw.split("```")[1]
                     if raw.startswith("json"):
                         raw = raw[4:]
-                parsed = json.loads(raw.strip())
+                parsed = _loads_lenient(raw)
                 if not isinstance(parsed, list):
                     raise ValueError(f"expected a JSON array, got {type(parsed)}")
                 forbidden = {"title", "hook", "caption", "key_points", "description", "exact_copy"}
@@ -469,7 +497,7 @@ Return ONLY a valid JSON array of exactly {len(chunk)} objects, index-aligned
                 raw = raw.split("```")[1]
                 if raw.startswith("json"):
                     raw = raw[4:]
-            parsed = json.loads(raw.strip())
+            parsed = _loads_lenient(raw)
             if isinstance(parsed, list) and len(parsed) == len(chunk):
                 return parsed
             raise ValueError(f"expected {len(chunk)} scores, got {len(parsed) if isinstance(parsed, list) else type(parsed)}")
@@ -750,7 +778,7 @@ Return ONLY valid JSON: {{"headline": "...", "primary_text": "...", "short_copy"
             raw = raw.split("```")[1]
             if raw.startswith("json"):
                 raw = raw[4:]
-        data = json.loads(raw.strip())
+        data = _loads_lenient(raw)
         return AdCopyV2(**{k: data.get(k, "") for k in ("headline", "primary_text", "short_copy", "cta", "image_prompt")})
     except Exception as exc:
         print(f"[CalendarV2] ad copy generation failed: {exc}", flush=True)
@@ -812,7 +840,7 @@ duplicate another idea in the list, e.g. [4, 11] or [] if none duplicate.
             raw = raw.split("```")[1]
             if raw.startswith("json"):
                 raw = raw[4:]
-        parsed = json.loads(raw.strip())
+        parsed = _loads_lenient(raw)
         return [i for i in parsed if isinstance(i, int) and 0 <= i < len(items)]
     except Exception as exc:
         print(f"[CalendarV2] LLM diversity check failed (non-fatal): {exc}", flush=True)
@@ -1033,7 +1061,7 @@ must be impossible to copy-paste to a different brand.
             raw = raw.split("```")[1]
             if raw.startswith("json"):
                 raw = raw[4:]
-        parsed = json.loads(raw.strip())
+        parsed = _loads_lenient(raw)
         if not isinstance(parsed, list) or len(parsed) != n:
             raise ValueError(f"expected {n} items, got: {raw[:200]}")
         return parsed
@@ -1122,13 +1150,118 @@ async def _regenerate_flagged_items(
 
 # ── Main generation ──────────────────────────────────────────────────────────
 
+# Holds in-flight background generation tasks so they aren't garbage-
+# collected mid-run (same pattern complete_social_manager.py's
+# _BG_IMAGE_TASKS uses).
+_PLAN_GEN_TASKS: set = set()
+
+
 async def get_active_plan(
     user_id: str,
     db: AsyncIOMotorDatabase,
     brand_id: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
+    """The current LIVE plan — status 'active' only. Internal callers use
+    this; the router's GET /plan uses get_latest_plan so an in-progress or
+    failed generation is also visible to the frontend."""
     scope = _cal_v2_scope(user_id, brand_id)
     return await db[COLLECTION].find_one({**scope, "status": "active"}, {"_id": 0}, sort=[("created_at", -1)])
+
+
+async def get_latest_plan(
+    user_id: str,
+    db: AsyncIOMotorDatabase,
+    brand_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Most recent non-archived plan — active, generating, or failed — so the
+    frontend can render a 'generating…' state and poll, or show a failure."""
+    scope = _cal_v2_scope(user_id, brand_id)
+    return await db[COLLECTION].find_one(
+        {**scope, "status": {"$in": ["active", "generating", "failed"]}},
+        {"_id": 0}, sort=[("created_at", -1)],
+    )
+
+
+async def start_plan_generation(
+    user_id: str,
+    platforms: List[str],
+    brand: Dict[str, Any],
+    db: AsyncIOMotorDatabase,
+    force: bool = False,
+    brand_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Async entry point for the router. Returns near-instantly with either
+    the existing active plan (not force) or a status='generating'
+    placeholder, kicking the real multi-minute pipeline off as a background
+    task. This is the only way generation survives the API gateway's
+    timeout — the same job-then-poll shape the video pipeline already uses.
+    Confirmed live: the synchronous path reliably 504s while the backend is
+    still working minutes later."""
+    scope = _cal_v2_scope(user_id, brand_id)
+    if not force:
+        existing = await get_active_plan(user_id, db, brand_id=brand_id)
+        if existing:
+            return existing
+
+    # Clear any stale generating/failed placeholders in this scope so
+    # get_latest_plan always returns the one we're about to create.
+    await db[COLLECTION].update_many(
+        {**scope, "status": {"$in": ["generating", "failed"]}},
+        {"$set": {"status": "archived"}},
+    )
+
+    now = datetime.utcnow()
+    period_start = _get_period_start(now)
+    plan_id = str(uuid.uuid4())
+    placeholder = {
+        "plan_id": plan_id, "user_id": user_id, "brand_id": brand_id,
+        "status": "generating",
+        "period_start": period_start.strftime("%Y-%m-%d"),
+        "period_end": (period_start + timedelta(days=PLAN_DAYS - 1)).strftime("%Y-%m-%d"),
+        "generation_method": "framework_driven",
+        "framework_version": get_creative_framework(brand.get("industry", ""))["framework_version"],
+        "pipeline_version": "2026-09-v1",
+        "platforms": platforms, "carousel_slots": [],
+        "intelligence_snapshot": {}, "territory_mix": {}, "content_mix": {},
+        "items": [], "error": None,
+        "created_at": now.isoformat(), "updated_at": now.isoformat(),
+    }
+    await db[COLLECTION].insert_one({**placeholder, "_id": plan_id})
+
+    task = asyncio.create_task(
+        _run_plan_generation_bg(plan_id, user_id, platforms, brand, db, force, brand_id)
+    )
+    _PLAN_GEN_TASKS.add(task)
+    task.add_done_callback(_PLAN_GEN_TASKS.discard)
+    return {k: v for k, v in placeholder.items() if k != "_id"}
+
+
+async def _run_plan_generation_bg(
+    plan_id: str, user_id: str, platforms: List[str], brand: Dict[str, Any],
+    db: AsyncIOMotorDatabase, force: bool, brand_id: Optional[str],
+) -> None:
+    scope = _cal_v2_scope(user_id, brand_id)
+    try:
+        doc = await _build_plan_doc(user_id, platforms, brand, db, force, brand_id)
+        # Archive prior active plans, then fill the placeholder in place.
+        await db[COLLECTION].update_many(
+            {**scope, "status": "active", "plan_id": {"$ne": plan_id}},
+            {"$set": {"status": "archived"}},
+        )
+        fill = {k: v for k, v in doc.items()
+                if k not in ("plan_id", "user_id", "brand_id", "created_at", "_id")}
+        fill["status"] = "active"
+        fill["updated_at"] = datetime.utcnow().isoformat()
+        await db[COLLECTION].update_one({"plan_id": plan_id}, {"$set": fill})
+        print(f"[CalendarV2] plan {plan_id} complete — {len(doc.get('items', []))} items", flush=True)
+    except Exception as e:
+        import traceback
+        print(f"[CalendarV2] plan {plan_id} generation FAILED: {e}\n{traceback.format_exc()}", flush=True)
+        await db[COLLECTION].update_one(
+            {"plan_id": plan_id},
+            {"$set": {"status": "failed", "error": str(e)[:500],
+                      "updated_at": datetime.utcnow().isoformat()}},
+        )
 
 
 async def generate_plan_v2(
@@ -1139,19 +1272,34 @@ async def generate_plan_v2(
     force: bool = False,
     brand_id: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """Synchronous build-and-persist — kept for any non-router caller / tests.
+    The router now uses start_plan_generation instead (async, gateway-safe)."""
     scope = _cal_v2_scope(user_id, brand_id)
-    now = datetime.utcnow()
-    period_start = _get_period_start(now)
-    period_end = period_start + timedelta(days=PLAN_DAYS - 1)
-
     if not force:
         existing = await get_active_plan(user_id, db, brand_id=brand_id)
         if existing:
             return existing
-    # NOTE: archiving the active plan happens right before the final insert
-    # below, not here — a mid-generation disconnect must never leave the
-    # user with zero active plans (confirmed live data-loss bug, fixed by
-    # this ordering).
+    doc = await _build_plan_doc(user_id, platforms, brand, db, force, brand_id)
+    if force:
+        await db[COLLECTION].update_many({**scope, "status": "active"}, {"$set": {"status": "archived"}})
+    await db[COLLECTION].insert_one({**doc, "_id": doc["plan_id"]})
+    return doc
+
+
+async def _build_plan_doc(
+    user_id: str,
+    platforms: List[str],
+    brand: Dict[str, Any],
+    db: AsyncIOMotorDatabase,
+    force: bool = False,
+    brand_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Runs the full staged pipeline and returns the finished plan doc —
+    does NOT persist it (caller decides: insert, or fill a placeholder)."""
+    scope = _cal_v2_scope(user_id, brand_id)
+    now = datetime.utcnow()
+    period_start = _get_period_start(now)
+    period_end = period_start + timedelta(days=PLAN_DAYS - 1)
 
     industry = brand.get("industry", "")
     region = brand.get("region", "")
@@ -1418,9 +1566,8 @@ async def generate_plan_v2(
         "created_at": now.isoformat(),
         "updated_at": now.isoformat(),
     }
-    if force:
-        await db[COLLECTION].update_many({**scope, "status": "active"}, {"$set": {"status": "archived"}})
-    await db[COLLECTION].insert_one({**doc, "_id": plan_id})
+    # Pipeline only — persistence is the caller's job (generate_plan_v2 inserts;
+    # _run_plan_generation_bg fills the pre-created 'generating' placeholder).
     return doc
 
 

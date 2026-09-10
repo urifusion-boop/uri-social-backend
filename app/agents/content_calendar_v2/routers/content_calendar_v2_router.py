@@ -29,8 +29,10 @@ async def get_plan_v2(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
     ctx: dict = Depends(get_active_brand_context),
 ):
-    """Return the active 30-day V2 plan, or 404 if none exists."""
-    plan = await cal_v2_svc.get_active_plan(ctx["user_id"], db, brand_id=ctx["brand_id"])
+    """Return the most recent 30-day V2 plan (active, still generating, or
+    failed), or 404 if none exists. The frontend polls this while a plan
+    has status 'generating'."""
+    plan = await cal_v2_svc.get_latest_plan(ctx["user_id"], db, brand_id=ctx["brand_id"])
     if not plan:
         raise HTTPException(status_code=404, detail="No active Content Calendar V2 plan")
     return UriResponse.get_single_data_response("calendar_plan_v2", plan)
@@ -42,18 +44,22 @@ async def generate_plan_v2_endpoint(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
     ctx: dict = Depends(get_active_brand_context),
 ):
-    """Generate (or force-regenerate) the 30-day V2 content plan."""
+    """Kick off generation of the 30-day V2 content plan and return
+    immediately with either the existing active plan or a status='generating'
+    placeholder. The real multi-minute pipeline runs as a background task
+    (the synchronous path reliably exceeds the API gateway timeout); the
+    frontend polls GET /plan until status flips to 'active' or 'failed'."""
     user_id = ctx["user_id"]
     brand_id = ctx["brand_id"]
     try:
         profile_result = await BrandProfileService.get(user_id, db, brand_id=brand_id)
         raw_profile = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
         brand = BrandProfileService.to_brand_context(raw_profile) if raw_profile else {}
-        plan = await cal_v2_svc.generate_plan_v2(
+        plan = await cal_v2_svc.start_plan_generation(
             user_id=user_id, platforms=request.platforms, brand=brand, db=db,
             force=request.force_regenerate, brand_id=brand_id,
         )
-        print(f"[CalendarV2] plan_id={plan.get('plan_id')} generation_method={plan.get('generation_method')} items={len(plan.get('items', []))}")
+        print(f"[CalendarV2] plan_id={plan.get('plan_id')} status={plan.get('status')} items={len(plan.get('items', []))}")
         return UriResponse.get_single_data_response("calendar_plan_v2", plan)
     except Exception as e:
         import traceback
