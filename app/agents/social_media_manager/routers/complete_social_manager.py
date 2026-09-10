@@ -3010,6 +3010,26 @@ async def create_draft_from_calendar_day(
         if not day:
             raise HTTPException(status_code=404, detail=f"Day {day_index} not found")
 
+        # PRD 7.2 — this generates a real campaign and must be billed like every
+        # other generation path. Was missing entirely here: content created from
+        # the Content Calendar produced drafts without ever deducting a credit.
+        from app.services.CreditService import credit_service
+        from app.services.TrialService import trial_service
+
+        is_trial_user = await trial_service.has_active_trial(user_id)
+        if ctx.get("auth_type") != "api_key" and not is_trial_user:
+            has_credits = await credit_service.check_sufficient_credits(user_id)
+            if not has_credits:
+                return JSONResponse(
+                    status_code=402,
+                    content={
+                        "status": False,
+                        "responseCode": 402,
+                        "responseMessage": "You've run out of credits. Upgrade to continue.",
+                        "responseData": {"credits_remaining": 0, "upgrade_url": "/pricing"},
+                    },
+                )
+
         seed_content = f"{day['title']}. {day['description']}"
         profile_result = await BrandProfileService.get(user_id, db, brand_id=brand_id)
         brand = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
@@ -3029,6 +3049,22 @@ async def create_draft_from_calendar_day(
             drafts = result.get("responseData", {}).get("drafts", [])
             draft_ids = [d.get("draft_id") or d.get("id") for d in drafts if d]
             await cal_svc.mark_acted_on(plan_id, day_index, draft_ids, user_id, db, brand_id=brand_id)
+
+            # PRD 3.1 — 1 credit per campaign generation (skip for API-key users).
+            if ctx.get("auth_type") != "api_key":
+                request_id = result.get("responseData", {}).get("request_id")
+                if request_id:
+                    if is_trial_user:
+                        await trial_service.deduct_trial_credit(
+                            user_id=user_id, campaign_id=request_id, reason="campaign_generation",
+                        )
+                        print(f"✅ Deducted 1 trial credit from user {user_id} for calendar draft {request_id}")
+                    else:
+                        await credit_service.deduct_credit(
+                            user_id=user_id, campaign_id=request_id, reason="campaign_generation",
+                            retry_count=0,
+                        )
+                        print(f"✅ Deducted 1 credit from user {user_id} for calendar draft {request_id}")
 
             if request.include_images:
                 draft_ids = [d.get("draft_id") or d.get("id") for d in drafts if d]
