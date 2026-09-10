@@ -9,9 +9,16 @@ into a Secrets Manager secret on its own schedule. Nothing tells a
 hand-maintained connection string (MONGODB_URI, sourced from SSM here) that
 happened, so the app keeps authenticating with an increasingly stale
 password until every DB operation starts failing with "Authentication
-failed" — which is exactly what took prod down (root-caused and fixed
-live; this module is the permanent fix so it can't happen the same way
-again).
+failed" — which has taken prod down twice.
+
+Two halves make this permanent:
+  1. STARTUP — `database.with_current_docdb_password()` swaps in the current
+     password from Secrets Manager when the initial client is built, so a
+     task that starts after a rotation authenticates even if the new
+     password never reached SSM. (This module cannot help there: the app
+     crashes in its startup index-creation before the first poll runs.)
+  2. IN-FLIGHT — this module, for a rotation that lands while a task is
+     already up and serving.
 
 Deliberately a polling loop, not a reactive "retry on auth failure" wrapper:
 retrying a whole request after a failed write risks re-running a handler
@@ -82,21 +89,28 @@ async def _rebuild_client_if_changed() -> None:
         # already built the initial client from MONGODB_URI at startup.
         return
 
-    # A real rotation: same host/db/params, new password. Build a fresh
-    # client and swap it in — get_db() reads app.database.client fresh on
-    # every call, so every NEW request picks this up immediately. The old
-    # client is deliberately left to idle out on its own rather than
-    # force-closed, so any operation already in flight on it (using the old
-    # password, still valid during DocumentDB's rotation grace period)
-    # finishes without being cut off.
+    # A real rotation: same host/db/params, new password. Build fresh
+    # clients and swap them in — get_db()/get_sdk_gateway_db() read
+    # app.database.{client,sdk_gateway_client} fresh on every call, so every
+    # NEW request picks this up immediately. The old clients are deliberately
+    # left to idle out on their own rather than force-closed, so any
+    # operation already in flight (using the old password, still valid
+    # during DocumentDB's rotation grace period) finishes without being cut
+    # off.
     from motor.motor_asyncio import AsyncIOMotorClient
     from app import database as db_module
 
-    scheme, user, _old_password, rest = _split_uri(settings.MONGODB_URI)
-    new_uri = f"{scheme}{user}:{quote_plus(current_password)}@{rest}"
+    def _swap(uri: str) -> str:
+        scheme, user, _old, rest = _split_uri(uri)
+        return f"{scheme}{user}:{quote_plus(current_password)}@{rest}"
 
-    db_module.client = AsyncIOMotorClient(new_uri)
-    print("🔐 DocumentDB password rotation detected — connection refreshed automatically, no restart needed")
+    db_module.client = AsyncIOMotorClient(_swap(settings.MONGODB_URI))
+    # The SDK-gateway connection uses the same DocumentDB cluster + master
+    # user, so it rotates in lockstep — refresh it too, or API-key auth
+    # starts failing one interval later than the main DB did.
+    if settings.SDK_GATEWAY_MONGODB_URI and _URI_PATTERN.match(settings.SDK_GATEWAY_MONGODB_URI):
+        db_module.sdk_gateway_client = AsyncIOMotorClient(_swap(settings.SDK_GATEWAY_MONGODB_URI))
+    print("🔐 DocumentDB password rotation detected — connection(s) refreshed automatically, no restart needed")
 
 
 async def start_background_refresher(interval_seconds: int = 30) -> None:
