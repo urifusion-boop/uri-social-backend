@@ -16,7 +16,7 @@ from typing import Optional
 
 import httpx
 from fastapi import (
-    APIRouter, Body, Depends, File, HTTPException, Query, Request, UploadFile,
+    APIRouter, Body, Depends, File, Header, HTTPException, Query, Request, UploadFile,
 )
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from motor.motor_asyncio import AsyncIOMotorDatabase
@@ -519,6 +519,43 @@ async def list_ad_formats(_token: dict = Depends(JWTBearer())) -> dict:
     formats = [_serialize_vsg01_format(r, is_planned=False) for r in VSG01_FORMAT_RECORDS]
     formats += [_serialize_vsg01_format(r, is_planned=True) for r in PLANNED_FORMAT_RECORDS]
     return {"formats": formats}
+
+
+# TEMPORARY — one-off end-to-end check that JANE_ADS_VSG01_ENABLED is actually
+# live in the running container AND that select_and_render_vsg01_creative picks
+# + renders a real format for a given brief (content-fit + documented-default
+# layers included). Delete once confirmed. Throwaway shared secret, same as the
+# prior bootstrap endpoints — no in-app user can reach this.
+_VSG01_DEBUG_SECRET = "vsg01-corpus-bootstrap-2026-dev-only"
+
+
+@router.post("/admin/debug-vsg01-generate")
+async def debug_vsg01_generate(
+    body: dict = Body(...),
+    x_bootstrap_secret: str = Header(...),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+) -> dict:
+    if x_bootstrap_secret != _VSG01_DEBUG_SECRET:
+        raise HTTPException(status_code=403, detail="Not authorized.")
+    from app.core.config import settings
+    from .vsg01_orchestrator import select_and_render_vsg01_creative, select_ranked_ad_formats
+
+    description = body.get("description") or ""
+    ranked = await select_ranked_ad_formats(db, description=description)
+    result = await select_and_render_vsg01_creative(
+        db,
+        body.get("business_name") or "Uri Social",
+        body.get("category") or "social media management platform",
+        description,
+        {},
+    )
+    return {
+        "flag_JANE_ADS_VSG01_ENABLED": settings.JANE_ADS_VSG01_ENABLED,
+        "ranked_top5": [s.strategy_id for s in ranked[:5]],
+        "rendered": result is not None,
+        "rendered_format_id": (result or {}).get("format_id"),
+        "png_bytes_len": len((result or {}).get("png_bytes") or b"") or None,
+    }
 
 
 class SuggestAdFormatBody(BaseModel):
