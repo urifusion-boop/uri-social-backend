@@ -56,6 +56,20 @@ _ZONE_TEXT_PADDING = 56
 _LINE_HEIGHT = int(_FONT_COPY * 1.3)
 
 
+def _scrim_fill(field_color: str) -> str:
+    """A semi-transparent caption band, not an opaque block. The Layer 2
+    prompt already reserves an empty area in the photo for the text; a solid
+    fill covers exactly that reserved area with a flat slab and the result
+    reads as two photos crammed between two white bars (confirmed in a live
+    render where the brand's `field` token resolved to pure white). ~90%
+    opacity keeps dark text at the §1.6 contrast floor while letting the
+    photo's own texture through so it reads as one composed image."""
+    c = (field_color or "").strip()
+    if c.startswith("#") and len(c) == 7:
+        return c + "E6"
+    return "#FFFFFFE6"
+
+
 class TextOverflowsScrim(ValueError):
     """§2.3: 'Text-led, so §1.6 applies harder than anywhere else.'
     wrap_text only guarantees a line fits horizontally — it says nothing
@@ -131,10 +145,22 @@ def build_document(
     t = tokens or PLACEHOLDER_TOKENS
     width, height = canvas_size
     zone_height = height // 2
-    scrim_height = int(zone_height * 0.4)
+    # The scrim is a caption band sized to its text (+ padding), capped at
+    # 40% of the zone — not a fixed 40% slab regardless of how short the
+    # copy is.
+    max_scrim_height = int(zone_height * 0.4)
+    scrim_fill = _scrim_fill(t["field"])
 
     layers = []
     z = 0
+
+    problem_lines = wrap_text(problem_text, width - 2 * _ZONE_TEXT_PADDING, _FONT_COPY, 700)
+    _check_fits_scrim(problem_lines, "problem", max_scrim_height)
+    problem_scrim_h = min(max_scrim_height, len(problem_lines) * _LINE_HEIGHT + _ZONE_TEXT_PADDING)
+
+    solution_lines = wrap_text(solution_text, width - 2 * _ZONE_TEXT_PADDING, _FONT_COPY, 700)
+    _check_fits_scrim(solution_lines, "solution", max_scrim_height)
+    solution_scrim_h = min(max_scrim_height, len(solution_lines) * _LINE_HEIGHT + _ZONE_TEXT_PADDING)
 
     # Problem zone — top half, generated image, scrim + text at the TOP of
     # this zone (matching the {{top}} 40 percent empty band its own Layer 2
@@ -147,11 +173,9 @@ def build_document(
     z += 1
     layers.append({
         "type": "shape", "z_index": z, "shape": "rect",
-        "x": 0, "y": 0, "width": width, "height": scrim_height,
-        "fill_color": t["field"],
+        "x": 0, "y": 0, "width": width, "height": problem_scrim_h,
+        "fill_color": scrim_fill,
     })
-    problem_lines = wrap_text(problem_text, width - 2 * _ZONE_TEXT_PADDING, _FONT_COPY, 700)
-    _check_fits_scrim(problem_lines, "problem", scrim_height)
     z += 1
     layers.append({
         "type": "text", "z_index": z, "content": "\n".join(problem_lines),
@@ -167,15 +191,13 @@ def build_document(
         "type": "ai_generated_background", "z_index": z,
         "url": solution_image_url, "x": 0, "y": zone2_y, "width": width, "height": zone_height,
     })
-    scrim2_y = zone2_y + zone_height - scrim_height
+    scrim2_y = zone2_y + zone_height - solution_scrim_h
     z += 1
     layers.append({
         "type": "shape", "z_index": z, "shape": "rect",
-        "x": 0, "y": scrim2_y, "width": width, "height": scrim_height,
-        "fill_color": t["field"],
+        "x": 0, "y": scrim2_y, "width": width, "height": solution_scrim_h,
+        "fill_color": scrim_fill,
     })
-    solution_lines = wrap_text(solution_text, width - 2 * _ZONE_TEXT_PADDING, _FONT_COPY, 700)
-    _check_fits_scrim(solution_lines, "solution", scrim_height)
     z += 1
     layers.append({
         "type": "text", "z_index": z, "content": "\n".join(solution_lines),
