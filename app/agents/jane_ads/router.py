@@ -549,12 +549,20 @@ async def debug_vsg01_generate(
         description,
         {},
     )
+    image_url = None
+    if result is not None and result.get("png_bytes"):
+        import uuid
+        from .creative import _upload_bytes_to_cloudinary
+        image_url = await _upload_bytes_to_cloudinary(
+            result["png_bytes"], f"vsg01-debug-{uuid.uuid4().hex[:12]}",
+        )
     return {
         "flag_JANE_ADS_VSG01_ENABLED": settings.JANE_ADS_VSG01_ENABLED,
         "ranked_top5": [s.strategy_id for s in ranked[:5]],
         "rendered": result is not None,
         "rendered_format_id": (result or {}).get("format_id"),
         "png_bytes_len": len((result or {}).get("png_bytes") or b"") or None,
+        "image_url": image_url,
     }
 
 
