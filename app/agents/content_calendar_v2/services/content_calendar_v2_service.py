@@ -837,11 +837,34 @@ def _anti_boring_check(items: List[Dict[str, Any]]) -> Dict[int, str]:
     return flagged
 
 
+def _clamp_carousel(idea: Dict[str, Any], target: int) -> None:
+    """PRD §17/§28/§53 — 2-5 slides is a HARD rule that code enforces, not a
+    hint we hope the model follows (confirmed live: it produced 7-slide
+    carousels that then got accepted best-effort after the retry loop gave
+    up). Trims anything over 5 to `target`, keeping the first target-1 slides
+    plus the last (which carries the CTA in the PRD's slide structures), then
+    re-indexes. Under 2 is genuinely broken — left alone for validation to
+    flag, it's rare."""
+    carousel = idea.get("carousel")
+    if not isinstance(carousel, dict):
+        return
+    slides = carousel.get("slides")
+    if not isinstance(slides, list) or len(slides) <= 5:
+        return
+    keep_n = target if 2 <= target <= 5 else 3
+    trimmed = slides[: keep_n - 1] + [slides[-1]]
+    for new_idx, s in enumerate(trimmed):
+        if isinstance(s, dict):
+            s["slide_index"] = new_idx
+    carousel["slides"] = trimmed
+
+
 def _validate_item_v2(idea: Dict[str, Any], is_carousel: bool, expected_slides: int = 3) -> List[str]:
     """Extends v1's _validate_day (hard deterministic rules, PRD §28) with
-    V2's own required fields, and a dynamic carousel-slide-count check
-    (2-5, per the concept's own creative device — PRD §17) replacing the
-    old hardcoded-exactly-3 rule."""
+    V2's own required fields. Carousel check enforces the PRD's HARD 2-5
+    rule (§28), not the exact per-concept target — the target is a hint for
+    the model, 2-5 is the constraint. _clamp_carousel already trims anything
+    over 5 before this runs, so this mostly catches under-2."""
     issues = _validate_day(idea)
     if not str(idea.get("ai_image_prompt") or "").strip():
         issues.append("ai_image_prompt is empty")
@@ -853,10 +876,8 @@ def _validate_item_v2(idea: Dict[str, Any], is_carousel: bool, expected_slides: 
         issues.append("creative_concept_name is empty")
     if is_carousel:
         slides = ((idea.get("carousel") or {}).get("slides")) or []
-        if not (2 <= expected_slides <= 5):
-            issues.append(f"carousel slide count {expected_slides} out of the 2-5 range")
-        elif len(slides) != expected_slides:
-            issues.append(f"carousel must have exactly {expected_slides} slides, got {len(slides)}")
+        if not (2 <= len(slides) <= 5):
+            issues.append(f"carousel must have 2-5 slides (PRD hard rule), got {len(slides)}")
     return issues
 
 
@@ -914,7 +935,7 @@ async def _generate_final_copy(
 
     def _fmt_line(c: Dict[str, Any]) -> str:
         if c.get("format") == "carousel":
-            return f"CAROUSEL — exactly {c.get('carousel_slide_count', 3)} slides"
+            return f"CAROUSEL — ~{c.get('carousel_slide_count', 3)} slides (2-5 allowed)"
         return str(c.get("format", "image"))
 
     concepts_block = "\n\n".join(
@@ -929,7 +950,8 @@ async def _generate_final_copy(
     )
 
     carousel_spec_lines = [
-        f"Item {i}'s carousel must have EXACTLY {c.get('carousel_slide_count', 3)} slides, no more, no fewer."
+        f"Item {i}'s carousel: aim for {c.get('carousel_slide_count', 3)} slides. "
+        f"HARD LIMIT: never fewer than 2, never more than 5 (PRD rule — do not pad to reach 5)."
         for i, c in enumerate(concepts_chunk) if c.get("format") == "carousel"
     ]
     carousel_spec = ("\n" + "\n".join(carousel_spec_lines)) if carousel_spec_lines else ""
@@ -1031,6 +1053,8 @@ must be impossible to copy-paste to a different brand.
         for i, idea in enumerate(items):
             is_carousel = concepts_chunk[i].get("format") == "carousel"
             expected_slides = concepts_chunk[i].get("carousel_slide_count", 3)
+            if is_carousel:
+                _clamp_carousel(idea, expected_slides)  # deterministically enforce the 2-5 hard rule
             issues = _validate_item_v2(idea, is_carousel=is_carousel, expected_slides=expected_slides)
             if issues:
                 failures[i] = issues
@@ -1060,6 +1084,8 @@ must be impossible to copy-paste to a different brand.
     merged = []
     for i, idea in enumerate(items):
         concept = concepts_chunk[i]
+        if isinstance(idea, dict) and concept.get("format") == "carousel":
+            _clamp_carousel(idea, concept.get("carousel_slide_count", 3))  # final safety net if both retries broke
         idea_safe = {k: v for k, v in idea.items() if k not in _CONCEPT_FIELDS} if isinstance(idea, dict) else {}
         merged.append({**concept, **idea_safe, "day_offset": concept["day_index"]})
     return merged
