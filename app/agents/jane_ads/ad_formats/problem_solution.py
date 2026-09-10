@@ -78,23 +78,35 @@ def _check_fits_scrim(lines, zone_name: str, scrim_height: int) -> None:
         )
 
 
+# §1.7 — any person rendered must read as deep-brown-to-dark-brown West
+# African skin. Stated explicitly in the prompt (not left to the setting to
+# imply) because the skin-tone check downstream rejects "medium brown" and
+# lighter, and image models are known to lighten skin under bright-daylight
+# prompts — which _solution_prompt uses. Wording matches skin_tone_check.py's
+# own documented recommendation.
+_SKIN_TONE = (
+    "any people shown have deep brown to dark brown skin and West African "
+    "features"
+)
+
+
 def _problem_prompt(problem_situation: str, nigerian_setting: str) -> str:
     return (
         f"Documentary photograph illustrating {problem_situation} in "
-        f"{resolve_nigerian_setting(nigerian_setting)}, single clear subject, "
-        "uncluttered composition, muted desaturated palette, strong empty area "
-        "across the top 40 percent, overcast or shaded daylight, realistic, "
-        "unstyled, shot on a phone camera"
+        f"{resolve_nigerian_setting(nigerian_setting)}, {_SKIN_TONE}, single clear "
+        "subject, uncluttered composition, muted desaturated palette, strong "
+        "empty area across the top 40 percent, overcast or shaded daylight, "
+        "realistic, unstyled, shot on a phone camera"
     )
 
 
 def _solution_prompt(solution_situation: str, nigerian_setting: str) -> str:
     return (
         f"Documentary photograph illustrating {solution_situation} in "
-        f"{resolve_nigerian_setting(nigerian_setting)}, single clear subject, "
-        "uncluttered composition, bright natural daylight, warm palette, "
-        "resolved and orderly, strong empty area across the bottom 40 percent, "
-        "realistic, unstyled, shot on a phone camera"
+        f"{resolve_nigerian_setting(nigerian_setting)}, {_SKIN_TONE}, single clear "
+        "subject, uncluttered composition, bright natural daylight, warm "
+        "palette, resolved and orderly, strong empty area across the bottom 40 "
+        "percent, realistic, unstyled, shot on a phone camera"
     )
 
 
