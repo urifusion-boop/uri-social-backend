@@ -1,5 +1,11 @@
 # Stage 1: Build
-FROM python:3.13.0-bullseye AS build
+# bookworm, not bullseye, since 2026-09: bullseye is EOL and its security binaries
+# have been pulled from the pool while the index still advertises them, so apt
+# resolves a version and then 404s fetching it — every build 404'd on libssl1.1
+# 1.1.1w-0+deb11u8, not transient, re-running never helped. Brought over from
+# aws/dev (commits 381fa62 / 53063cd) where this was already fixed; prod's build
+# had been broken since ~2026-09-04 for this exact reason.
+FROM python:3.13.0-bookworm AS build
 
 # Force rebuild: Custom Visual Guides UriResponse fixes - 2026-06-11
 ARG BUILD_DATE=2026-06-11
@@ -10,9 +16,12 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# libssl-dev dropped alongside the bookworm move: nothing in requirements.txt
+# compiles against OpenSSL headers, and Python's ssl module links the base
+# image's own libssl. gcc stays for other C extension builds.
+RUN echo 'Acquire::Retries "5";' > /etc/apt/apt.conf.d/80-retries && \
+    apt-get update && apt-get install -y --no-install-recommends \
     gcc \
-    libssl-dev \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
@@ -21,7 +30,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Stage 2: Production
-FROM python:3.13.0-bullseye AS production
+FROM python:3.13.0-bookworm AS production
 
 WORKDIR /app
 
@@ -29,6 +38,7 @@ RUN echo 'Acquire::Retries "5";' > /etc/apt/apt.conf.d/80-retries && \
     apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     fonts-dejavu-core \
+    curl \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 RUN pip install uvicorn
