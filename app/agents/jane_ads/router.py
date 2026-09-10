@@ -541,13 +541,15 @@ async def debug_vsg01_generate(
     from .vsg01_orchestrator import select_and_render_vsg01_creative, select_ranked_ad_formats
 
     description = body.get("description") or ""
+    brand_context = body.get("brand_context") or {}
     ranked = await select_ranked_ad_formats(db, description=description)
     result = await select_and_render_vsg01_creative(
         db,
         body.get("business_name") or "Uri Social",
         body.get("category") or "social media management platform",
         description,
-        {},
+        brand_context,
+        forced_format_id=body.get("forced_format_id"),
     )
     image_url = None
     if result is not None and result.get("png_bytes"):
