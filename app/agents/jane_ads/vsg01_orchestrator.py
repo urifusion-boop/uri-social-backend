@@ -79,6 +79,7 @@ on any of these, exactly like `generate_ad_image` already does.
 from __future__ import annotations
 
 import json
+import re
 from typing import Optional
 
 from app.core.config import settings
@@ -328,8 +329,11 @@ async def _content_us_vs_them(business_name: str, category: str, description: st
         "HARD RULE: the 'them' side must name a generic METHOD ('buying at the market', "
         "'doing it yourself', 'guesswork', 'waiting days'), never a specific competitor or "
         "brand name — this is enforced downstream and a named business will be rejected.\n"
+        "Keep every 'them' and 'us' value to at most 6 words — short phrases, not sentences "
+        "(they are set large and wrap badly past two lines).\n"
         "Return JSON: {\"rows\": [{\"label\": \"short row label e.g. Price\", "
-        "\"them\": \"...\", \"us\": \"...\"}, ...]}. 2-3 rows only. Return ONLY the JSON."
+        "\"them\": \"...\", \"us\": \"...\"}, ...]}. Exactly 2 rows unless a 3rd is clearly "
+        "worth it. Return ONLY the JSON."
     )
     d = await _call_content_model(prompt)
     if not d or not isinstance(d.get("rows"), list):
@@ -420,8 +424,12 @@ async def _content_problem_solution(business_name: str, category: str, descripti
         "- problem_situation: a short, concrete VISUAL scene of the problem (what a camera would "
         "see, no people's names, no brand names, no location names)\n"
         "- solution_situation: a short, concrete VISUAL scene of the resolved state\n"
-        "- problem_text: the problem stated as a naira cost/pain, <=8 words\n"
-        "- solution_text: the solution stated as an outcome (not a feature), <=8 words\n"
+        "- problem_text: the problem stated as a felt pain or consequence, <=8 words. Do NOT "
+        "state a naira figure, percentage, or any number UNLESS that exact figure appears "
+        "verbatim in the business's own text above — never estimate or invent one.\n"
+        "- solution_text: the solution stated as an outcome (not a feature), <=8 words. Same "
+        "rule: no invented numbers, percentages, or naira figures — only ones stated verbatim "
+        "above.\n"
         f"- nigerian_setting: pick the single best-fitting option, copied EXACTLY, from this list: "
         f"{list(_NIGERIAN_SETTINGS)}\n"
         "Return ONLY the JSON with exactly these 5 keys."
@@ -440,6 +448,18 @@ async def _content_problem_solution(business_name: str, category: str, descripti
         "nigerian_setting": setting,
     }
     if not all([out["problem_situation"], out["solution_situation"], out["problem_text"], out["solution_text"]]):
+        return None
+    # Guard against an invented figure the prompt was told not to produce — a
+    # ₦ amount, a percentage, or a 3+ digit number in the headline that isn't
+    # in the business's own text. Blank that headline word ("Wasting ₦50,000
+    # on chaos" -> "Wasting on chaos") and tidy the spacing; only bail out if
+    # blanking leaves nothing.
+    src_digits = re.sub(r"[^\d]", "", description or "")
+    for key in ("problem_text", "solution_text"):
+        for tok in re.findall(r"₦\s?[\d,]+|\d[\d,]*\s?%|\d[\d,]{2,}", out[key]):
+            if re.sub(r"[^\d]", "", tok) not in src_digits:
+                out[key] = re.sub(r"\s{2,}", " ", out[key].replace(tok, "")).strip(" ,.-")
+    if not out["problem_text"] or not out["solution_text"]:
         return None
     return out
 

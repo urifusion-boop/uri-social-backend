@@ -71,8 +71,16 @@ def build_document(
     subline_line_h = int(_FONT_SUBLINE * 1.3)
     action_line_h = int(_FONT_ACTION * 1.3)
 
+    # A short brand-accent rule above the headline — the one piece of visual
+    # identity this otherwise bare format carries besides the logo badge.
+    # Kept small and centred so it reads as a considered mark, not decoration.
+    _RULE_H = 8
+    _RULE_W = 96
+    _RULE_GAP = 40
+
     block_height = (
-        len(headline_lines) * headline_line_h
+        _RULE_H + _RULE_GAP
+        + len(headline_lines) * headline_line_h
         + (24 + len(subline_lines) * subline_line_h if subline_lines else 0)
         + (48 + len(action_lines) * action_line_h if action_lines else 0)
     )
@@ -81,7 +89,15 @@ def build_document(
     layers = []
     z = 0
 
-    y = block_top
+    z += 1
+    layers.append({
+        "type": "shape", "z_index": z, "shape": "rounded_rect",
+        "x": (width - _RULE_W) // 2, "y": block_top,
+        "width": _RULE_W, "height": _RULE_H, "corner_radius": _RULE_H // 2,
+        "fill_color": t["accent"],
+    })
+
+    y = block_top + _RULE_H + _RULE_GAP
     z += 1
     layers.append({
         "type": "text", "z_index": z, "content": "\n".join(headline_lines),
