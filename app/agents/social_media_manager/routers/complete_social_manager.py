@@ -4598,30 +4598,6 @@ async def debug_connections_raw(
     return UriResponse.get_single_data_response("connections_raw", result)
 
 
-@router.get("/debug/raw-draft/{draft_id}")
-async def debug_raw_draft(
-    draft_id: str,
-    request: Request,
-    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-):
-    """TEMPORARY — investigating a scheduled-publish crash. Read-only,
-    system-wide (X-Bootstrap-Secret gated). Dumps a draft's raw field
-    values AND python types (created_at in particular — the scheduler's
-    dedup step sorts on it against datetime.min, which raises if it's
-    ever a string instead of a real date)."""
-    if request.headers.get("X-Bootstrap-Secret") != "vsg01-corpus-bootstrap-2026-dev-only":
-        raise HTTPException(status_code=404, detail="Not Found")
-
-    draft = await db["content_drafts"].find_one({"id": draft_id}, {"_id": 0})
-    if not draft:
-        return {"found": False}
-    return {
-        "found": True,
-        "fields": {k: str(v) for k, v in draft.items()},
-        "types": {k: type(v).__name__ for k, v in draft.items()},
-    }
-
-
 @router.get("/platform-requirements/{platform}")
 async def get_platform_requirements(platform: str):
     """Get content requirements for a specific platform"""
