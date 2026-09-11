@@ -323,6 +323,12 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                         "advertiser_id": self._advertiser_id,
                         "adgroup_id": adgroup_id,
                         "creatives": [{
+                            # Confirmed live (2026-09-11): ad/create rejects the
+                            # creative with "Missing required field(s): 'ad_format'"
+                            # without this. SINGLE_VIDEO is the only shape this
+                            # adapter ever builds (video_id is always set — Phase 1
+                            # is video-only, see the module docstring).
+                            "ad_format": "SINGLE_VIDEO",
                             "ad_name": f"JaneAds-{plan.business_id}-ad",
                             "ad_text": (plan.creative.primary_text or plan.creative.headline or "")[:100],
                             "video_id": video_id,
