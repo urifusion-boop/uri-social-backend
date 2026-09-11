@@ -130,20 +130,26 @@ async def generate_scene(prompt: str, size: str = "1080x1080") -> str:
     """
     from app.agents.social_media_manager.services.image_content_service import ImageContentService
 
-    # ImageContentService._call_dalle_api (the name predates its current
-    # provider chain) actually routes this call through Google Imagen 4.0
-    # Ultra ("nano-banana-2") first, falling back to OpenAI gpt-image-1.5 —
-    # not DALL-E 3, despite the helper's name. Kept at 4000 chars anyway as a
-    # conservative, provider-agnostic ceiling rather than tuning per-provider:
-    # the three fixed directives below already run ~2300 chars, and the
-    # longest format prompt (Work In Progress, with its representation block
-    # and real slot text filled in) comes within roughly 100 chars of it —
-    # too tight a margin when the scene description itself is built from
-    # LLM-generated free text (a business's own trade/activity wording is
-    # not length-bounded). Trim the caller's scene description, never the
-    # fixed directives — GLOBAL_NEGATIVE_PROMPT in particular is what keeps
-    # garbled text/logos out of a text-bearing ad format; that must never
-    # be the part that gets cut for space.
+    # Explicitly pinned to gpt-image-2 (image_model="openai/gpt-image-2") —
+    # without this, ImageContentService._call_dalle_api (the name predates
+    # its current provider chain) falls through to Google Imagen 4.0 Ultra
+    # ("nano-banana-2") first, then OpenAI gpt-image-1.5, neither of which is
+    # gpt-image-2. This is the same image_model value every other
+    # gpt-image-2 caller in the app already uses (product-photo edits,
+    # brand-guide generation), just with no reference image, so it takes
+    # the text-to-image branch of that same path.
+    #
+    # 4000 chars kept as a conservative prompt-length ceiling regardless of
+    # provider: the three fixed directives below already run ~2300 chars,
+    # and the longest format prompt (Work In Progress, with its
+    # representation block and real slot text filled in) comes within
+    # roughly 100 chars of it — too tight a margin when the scene
+    # description itself is built from LLM-generated free text (a
+    # business's own trade/activity wording is not length-bounded). Trim
+    # the caller's scene description, never the fixed directives —
+    # GLOBAL_NEGATIVE_PROMPT in particular is what keeps garbled text/logos
+    # out of a text-bearing ad format; that must never be the part that
+    # gets cut for space.
     _DALLE_MAX_CHARS = 4000
     _SAFETY_MARGIN = 100
     fixed_suffix = f" {COMPOSITION_DIRECTIVE} {TYPOGRAPHY_DIRECTIVE} {GLOBAL_NEGATIVE_PROMPT}"
@@ -153,7 +159,7 @@ async def generate_scene(prompt: str, size: str = "1080x1080") -> str:
         scene_description = scene_description[:budget].rsplit(" ", 1)[0] + "."
 
     full_prompt = f"{scene_description}{fixed_suffix}"
-    result = await ImageContentService._call_dalle_api(full_prompt, size=size)
+    result = await ImageContentService._call_dalle_api(full_prompt, size=size, image_model="openai/gpt-image-2")
     if not result.get("success"):
         raise SceneGenerationFailed(f"Layer 2 generation failed: {result.get('error')}")
 
