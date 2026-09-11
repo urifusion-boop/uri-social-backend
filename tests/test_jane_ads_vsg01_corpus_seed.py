@@ -1,9 +1,12 @@
 """
-vsg01_corpus_seed.py (VSG-01 v3 §6, step 9) — the 12 ad formats as real
-corpus records, verified through the actual InMemoryStrategyStore and
-retrieval.retrieve() (not a stand-in): draft on ingest, human approval
-required before anything retrieves, and correct precondition gating per
-business profile (product photo, real customer photo, isolated account).
+vsg01_corpus_seed.py (VSG-01 v3 §6, step 9) — the 15 ad formats as real
+corpus records (the original 12, plus 3 added in a later session: text_only,
+price_led_offer, work_in_progress — see FORMAT_MODULES in
+vsg01_corpus_seed.py itself, the actual source of truth this list mirrors),
+verified through the actual InMemoryStrategyStore and retrieval.retrieve()
+(not a stand-in): draft on ingest, human approval required before anything
+retrieves, and correct precondition gating per business profile (product
+photo, real customer photo, isolated account).
 """
 import asyncio
 
@@ -17,13 +20,15 @@ from app.agents.jane_ads.retrieval import RetrievalRequest, BudgetContext, Busin
 from app.agents.jane_ads.ad_formats import (
     receipt, us_vs_them, borrowed_interface, day1_day30, review_card,
     problem_solution, testimonial_offer, text_on_a_face, news_headline,
-    censored_item, starter_pack, humour_cartoon,
+    censored_item, starter_pack, humour_cartoon, text_only, price_led_offer,
+    work_in_progress,
 )
 
 ALL_FORMAT_MODULES = [
     receipt, us_vs_them, borrowed_interface, day1_day30, review_card,
     problem_solution, testimonial_offer, text_on_a_face, news_headline,
-    censored_item, starter_pack, humour_cartoon,
+    censored_item, starter_pack, humour_cartoon, text_only, price_led_offer,
+    work_in_progress,
 ]
 
 
@@ -32,13 +37,13 @@ def _run(coro):
 
 
 class TestBuildVsg01Strategies:
-    def test_produces_exactly_twelve_valid_records(self):
+    def test_produces_exactly_fifteen_valid_records(self):
         """Pydantic validation passing at construction IS a real test here
         — any record missing modification_required (mandatory whenever
         transfer_verdict is applies_with_modification) or a negative
         budget floor would raise before this assertion ever runs."""
         strategies = build_vsg01_strategies()
-        assert len(strategies) == 12
+        assert len(strategies) == 15
         assert {s.strategy_id for s in strategies} == {m.FORMAT.format_id for m in ALL_FORMAT_MODULES}
 
     def test_all_records_are_draft_never_pre_approved(self):
@@ -89,11 +94,11 @@ class TestSeedAndRetrieveEndToEnd:
     per business profile — against the actual InMemoryStrategyStore and
     retrieval.retrieve(), no stand-ins."""
 
-    def test_seeding_ingests_all_twelve_as_draft(self):
+    def test_seeding_ingests_all_fifteen_as_draft(self):
         store = InMemoryStrategyStore()
         count = _run(seed_vsg01_corpus(store))
-        assert count == 12
-        assert _run(store.count(status=StrategyStatus.DRAFT)) == 12
+        assert count == 15
+        assert _run(store.count(status=StrategyStatus.DRAFT)) == 15
         assert _run(store.count(status=StrategyStatus.APPROVED)) == 0
 
     def test_nothing_retrieves_before_human_approval(self):

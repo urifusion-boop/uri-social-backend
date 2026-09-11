@@ -49,10 +49,13 @@ class TestPermissionGuard:
 
 
 class TestScenePrompt:
-    def test_no_people_in_frame_and_empty_lower_third(self):
+    def test_no_people_and_lower_third_reserved_for_copy(self):
+        """VSG-01-PROMPTS v3 §6.2 — a generated person may not carry a
+        testimonial quote, so this scene excludes people entirely and
+        reserves the lower third for the testimonial/offer copy."""
         prompt = _scene_prompt("a tailoring workshop")
-        assert "no people in frame" in prompt
-        assert "clear empty space in the lower third" in prompt
+        assert "Do not include any people" in prompt
+        assert "lower third" in prompt
         assert "a tailoring workshop" in prompt
 
     def test_rejects_a_setting_outside_the_controlled_vocabulary(self):

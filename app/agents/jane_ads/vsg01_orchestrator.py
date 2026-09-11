@@ -96,6 +96,7 @@ from .layer2_generation import SceneGenerationFailed, generate_scene
 from .retrieval import BudgetContext, BusinessProfile, RetrievalRequest, retrieve
 from .skin_tone_check import verify_skin_rendering
 from .store import MongoStrategyStore
+from .visual_slots import NIGERIAN_SETTINGS
 from .vsg01_corpus_seed import FORMAT_MODULES
 
 # See module docstring for the full reasoning behind each set below.
@@ -410,11 +411,17 @@ async def _build_borrowed_interface(business_name: str, category: str, descripti
 
 # ── SEED-080: Problem / Solution ──────────────────────────────────────────
 
-_NIGERIAN_SETTINGS = (
-    "a Lagos street with informal shopfronts", "a small tiled shop interior",
-    "an open-air market stall", "a compound courtyard", "a tailoring workshop",
-    "a modern Lagos office interior", "a residential estate gate", "a roadside food stand",
-)
+# The content-generation LLM's menu of settings to pick from — aliased to
+# visual_slots.NIGERIAN_SETTINGS (the single source of truth that
+# resolve_nigerian_setting() actually validates against) rather than a
+# hand-maintained copy. A second copy is exactly how this drifted before:
+# this tuple offered 8 while visual_slots.py's real enforced vocabulary
+# also had only those same 8, so it happened to match by coincidence, not
+# by construction — expanding one without the other (as v3's 15-entry
+# vocabulary would have, had this stayed a copy) would have let the LLM
+# pick a setting resolve_nigerian_setting() then rejects with
+# InvalidSlotValue.
+_NIGERIAN_SETTINGS = NIGERIAN_SETTINGS
 
 
 async def _content_problem_solution(business_name: str, category: str, description: str) -> Optional[dict]:
@@ -475,7 +482,9 @@ async def _build_problem_solution(business_name: str, category: str, description
     zone_size = f"{width}x{height // 2}"
     prompts = {
         "problem": problem_solution._problem_prompt(content["problem_situation"], content["nigerian_setting"]),
-        "solution": problem_solution._solution_prompt(content["solution_situation"], content["nigerian_setting"]),
+        "solution": problem_solution._solution_prompt(
+            content["solution_situation"], content["problem_situation"], content["nigerian_setting"],
+        ),
     }
 
     async def _gen_zone_passing_skin_check(prompt: str, zone: str) -> Optional[str]:

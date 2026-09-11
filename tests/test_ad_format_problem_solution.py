@@ -31,17 +31,27 @@ class TestFormatDefinition:
 
 
 class TestPrompts:
-    def test_problem_prompt_uses_top_empty_band_and_muted_palette(self):
+    def test_problem_prompt_uses_muted_desaturated_palette_and_the_setting(self):
+        """VSG-01-PROMPTS v3 §6.3 — the problem half is muted/desaturated,
+        overcast or shaded, and states the resolved setting verbatim."""
         prompt = _problem_prompt("a trader losing customers to network downtime", "a roadside food stand")
-        assert "top 40 percent" in prompt
-        assert "muted desaturated palette" in prompt
+        assert "muted" in prompt and "desaturated" in prompt
+        assert "overcast or shaded daylight" in prompt
         assert "a roadside food stand" in prompt
 
-    def test_solution_prompt_uses_bottom_empty_band_and_warm_palette(self):
-        prompt = _solution_prompt("a trader serving customers without interruption", "a roadside food stand")
-        assert "bottom 40 percent" in prompt
-        assert "warm palette" in prompt
-        assert "resolved and orderly" in prompt
+    def test_solution_prompt_uses_brighter_warmer_tones_and_references_the_problem(self):
+        """v3 §6.3's solution prompt explicitly names the problem situation
+        being resolved (not just the resolved state on its own) so the two
+        images read as deliberate visual counterparts."""
+        prompt = _solution_prompt(
+            "a trader serving customers without interruption",
+            "a trader losing customers to network downtime",
+            "a roadside food stand",
+        )
+        assert "brighter natural daylight" in prompt
+        assert "warmer but realistic tones" in prompt
+        assert "a trader losing customers to network downtime" in prompt
+        assert "a roadside food stand" in prompt
 
     def test_prompts_reject_a_setting_outside_the_controlled_vocabulary(self):
         """§3's own named bug, same guard visual_slots.py already enforces
@@ -72,9 +82,16 @@ class TestBuildDocument:
         assert bgs[1]["url"] == SOLUTION_URL
         assert bgs[1]["y"] == doc["canvas"]["height"] // 2
 
-    def test_each_zone_has_a_solid_scrim_between_photo_and_text(self):
+    def test_each_zone_has_a_scrim_between_photo_and_text(self):
+        """Scrim is semi-transparent (~90% opacity, an 'E6' alpha suffix on
+        the field token) since the opacity fix — not fully solid — so the
+        photo's own texture shows through instead of reading as an opaque
+        white bar. See problem_solution.py's _scrim_fill."""
         doc = self._doc()
-        scrims = [l for l in doc["layers"] if l["type"] == "shape" and l.get("fill_color") == PLACEHOLDER_TOKENS["field"]]
+        scrims = [
+            l for l in doc["layers"]
+            if l["type"] == "shape" and str(l.get("fill_color", "")).startswith(PLACEHOLDER_TOKENS["field"])
+        ]
         assert len(scrims) == 2
 
     def test_problem_scrim_sits_at_the_top_of_its_zone(self):

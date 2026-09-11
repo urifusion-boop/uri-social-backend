@@ -47,6 +47,14 @@ from typing import Dict, List, Optional
 
 # §3: "a scene descriptor drawn from the slot vocabulary, not a resolved
 # geo-target. It describes a kind of place, never the targeting parameter."
+# VSG-01-PROMPTS v3 §5's full 15-entry {{nigerian_setting}} vocabulary (the
+# original 8, plus 7 added for service businesses — construction, schools,
+# clinics — that don't fit a shopfront). This is the single source of truth
+# other modules should import rather than hand-maintain a second copy —
+# vsg01_orchestrator.py did exactly that (a separate, shorter tuple used
+# only to tell the content-generation LLM which settings to pick from) and
+# it drifted out of sync with this the actual enforced vocabulary until
+# fixed alongside this v3 upgrade.
 NIGERIAN_SETTINGS = (
     "a Lagos street with informal shopfronts",
     "a small tiled shop interior",
@@ -56,6 +64,13 @@ NIGERIAN_SETTINGS = (
     "a modern Lagos office interior",
     "a residential estate gate",
     "a roadside food stand",
+    "a residential rooftop",
+    "a building under construction",
+    "a school compound",
+    "a Nigerian retail storefront",
+    "a modest professional office",
+    "a contemporary Nigerian home interior",
+    "a service-business workspace",
 )
 
 # §3: "No Northern-hemisphere lighting language."

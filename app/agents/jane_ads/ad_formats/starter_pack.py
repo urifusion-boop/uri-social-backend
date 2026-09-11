@@ -106,15 +106,24 @@ def _check_label_one_line(label: str, cell_width: int) -> None:
 
 
 def _item_prompt(item: str, nigerian_setting_hint: str = "") -> str:
-    """Per-item variant of §2.11's own flat-lay prompt — see module
-    docstring for why this is generated per item rather than as one
-    multi-item collage."""
+    """Per-item variant of VSG-01-PROMPTS v3 §6.11's flat-lay prompt — see
+    module docstring for why this is generated per item rather than as one
+    multi-item collage (v3's own text still describes the single-collage
+    version; the per-item architecture is a deliberate, reasoned deviation
+    from both v2 and v3 kept as-is here, with v3's compositional standard —
+    premium editorial quality, no decorative props, individually
+    recognisable at grid scale — applied to each item instead)."""
     return (
         f"Overhead flat lay of {item} on a plain surface, even soft daylight "
-        "from above, consistent scale, subtle uniform shadow, clean minimal "
-        "styling, no props beyond the item itself, Nigerian everyday object, "
-        "realistic wear and use"
-        + (f", {nigerian_setting_hint}" if nigerian_setting_hint else "")
+        "from above producing a subtle consistent shadow, styled but not "
+        "artificially perfect. Give the object enough breathing room to "
+        "remain individually recognisable once placed in a grid alongside "
+        "other items of matching scale. No decorative props, no unnecessary "
+        "flowers, plants, books, fabrics or lifestyle accessories — only the "
+        "item itself. A real Nigerian everyday object showing realistic wear "
+        "and use. The result should resemble a premium editorial flat lay, "
+        "not a catalogue inventory photograph."
+        + (f" Setting hint: {nigerian_setting_hint}." if nigerian_setting_hint else "")
     )
 
 
