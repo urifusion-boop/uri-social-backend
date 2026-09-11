@@ -1829,6 +1829,7 @@ async def outstand_oauth_callback(
     username: Optional[str] = Query(None),
     network_unique_id: Optional[str] = Query(None),
     network: Optional[str] = Query(None),
+    requested_network: Optional[str] = Query(None),
     success: Optional[str] = Query(None),
     error: Optional[str] = Query(None),
     source: Optional[str] = Query(None),
@@ -1840,9 +1841,15 @@ async def outstand_oauth_callback(
     Two possible flows:
     1. Session token flow (Facebook, LinkedIn etc.):
        Outstand sends sessionToken → redirect frontend to pending/finalize.
-    2. Direct flow (X/Twitter OAuth 2.0):
+    2. Direct flow (X/Twitter OAuth 2.0, TikTok):
        Outstand sends account_id + username directly → redirect frontend
-       with account details so it can call POST /x/finalize-direct.
+       with account details so it can call POST /connect/finalize-outstand-direct.
+       Outstand doesn't reliably echo back which network this is (confirmed
+       live for TikTok — no `network` param on the callback at all), so
+       `requested_network` — the network we asked for, round-tripped through
+       our own redirect_uri at initiate time (see initiate_connection_flow) —
+       is the dependable source; `network` (if Outstand ever does send it) wins
+       when present.
 
     source: "onboarding" → redirect to brand-setup, "settings" → redirect to settings/social-accounts
     """
@@ -1856,15 +1863,16 @@ async def outstand_oauth_callback(
         encoded_error = urllib.parse.quote(error)
         return RedirectResponse(f"{base_redirect}?connected=false&error={encoded_error}")
 
-    # Direct flow — X OAuth 2.0 returns account_id immediately
+    # Direct flow — X OAuth 2.0 / TikTok return account_id immediately
     if success == "true" and account_id:
         params = f"account_id={urllib.parse.quote(account_id)}&connected=direct"
         if username:
             params += f"&username={urllib.parse.quote(username)}"
         if network_unique_id:
             params += f"&network_unique_id={urllib.parse.quote(network_unique_id)}"
-        if network:
-            params += f"&network={urllib.parse.quote(network)}"
+        effective_network = network or requested_network
+        if effective_network:
+            params += f"&network={urllib.parse.quote(effective_network)}"
         return RedirectResponse(f"{base_redirect}?{params}")
 
     # Session token flow
@@ -1875,6 +1883,65 @@ async def outstand_oauth_callback(
     return RedirectResponse(
         f"{base_redirect}?sessionToken={urllib.parse.quote(token_value)}&connected=pending"
     )
+
+
+@router.post("/connect/finalize-outstand-direct")
+async def finalize_outstand_direct(
+    account_id: str,
+    network: str,
+    username: Optional[str] = None,
+    network_unique_id: Optional[str] = None,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    ctx: dict = Depends(get_flexible_brand_context),
+):
+    """
+    Finalizes an Outstand connection that used the "direct" callback shape —
+    Outstand returns the connected account_id immediately (TikTok, X) instead
+    of a session token requiring a separate page-selection step, so there was
+    never a finalize call to persist it. Was previously silently unhandled by
+    the frontend, so the connection only ever surfaced via a live Outstand
+    lookup at publish time — the account never showed as "Connected" and the
+    doc that fallback wrote had no `id` field, colliding with the unique
+    index the moment a second such doc landed (the `id: null` duplicate-key
+    errors seen repeatedly in logs). Mirrors finalize_connection's doc shape
+    (explicit `id: account_id`) to avoid that collision.
+    """
+    from app.models.brand_account import BrandAccount
+    user_id = ctx["user_id"]
+    brand_id = ctx["brand_id"]
+    is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
+
+    now = datetime.utcnow()
+    doc = {
+        "id": account_id,
+        "user_id": user_id,
+        "platform": network,
+        "outstand_account_id": account_id,
+        "username": username,
+        "account_name": username,
+        "network_unique_id": network_unique_id,
+        "connection_status": "active",
+        "connected_via": "outstand",
+        "connected_at": now,
+        "updated_at": now,
+    }
+    if not is_personal:
+        doc["brand_id"] = brand_id
+
+    brand_scope = {"user_id": user_id} if is_personal else {"brand_id": brand_id}
+    await db["social_connections"].delete_many({
+        "$or": [
+            {"id": account_id},
+            {**brand_scope, "platform": network},
+        ]
+    })
+    await db["social_connections"].insert_one(doc)
+
+    return UriResponse.get_single_data_response("account_connected", {
+        "outstand_account_id": account_id,
+        "platform": network,
+        "username": username,
+    })
 
 
 @router.get("/connect/pending/{session_token}")
