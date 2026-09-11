@@ -4141,6 +4141,38 @@ async def corpus_upload(
             os.unlink(tmp_path)
 
 
+@router.get("/debug/vsg01-v3-preview", include_in_schema=False)
+async def _debug_vsg01_v3_preview(request: Request, format_id: str = "SEED-081") -> Response:
+    """TEMPORARY — VSG-01-PROMPTS v3 Tier 1 live verification only. Runs one
+    real Layer 2+4 render through the actual v3-upgraded prompt code (no
+    mock), so the result can be looked at rather than merely trusted not to
+    have crashed. Secret-gated the same way this session's other one-off
+    diagnostic endpoints were; remove after use, confirm 404."""
+    if request.headers.get("X-Bootstrap-Secret") != "vsg01-corpus-bootstrap-2026-dev-only":
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    if format_id == "SEED-081":
+        from .ad_formats.problem_solution import render as _render
+        png = await _render(
+            problem_situation="a trader losing customers to network downtime",
+            solution_situation="a trader serving customers without interruption",
+            problem_text="Network downtime costs traders N5,000 a day",
+            solution_text="Stay online, keep every sale",
+            nigerian_setting="a roadside food stand",
+        )
+    elif format_id == "SEED-098":
+        from .ad_formats.work_in_progress import render as _render
+        png = await _render(
+            trade_activity="a solar panel installation",
+            nigerian_setting="a residential rooftop",
+            statement="Solar install underway — Lekki Phase 1",
+        )
+    else:
+        raise HTTPException(status_code=400, detail=f"no debug preview wired for {format_id!r}")
+
+    return Response(content=png, media_type="image/png")
+
+
 @router.get("/corpus/upload", response_class=HTMLResponse, include_in_schema=False)
 async def corpus_upload_page() -> str:
     """The page itself. Self-contained — no build step, no bundle, nothing to deploy
