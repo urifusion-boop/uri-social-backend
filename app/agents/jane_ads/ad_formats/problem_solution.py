@@ -36,7 +36,7 @@ Hard checks (§2.3):
 from typing import Dict, Tuple
 
 from ..visual_slots import resolve_nigerian_setting
-from ..layer2_generation import generate_scene
+from ..layer2_generation import REPRESENTATION_BLOCK, generate_scene
 from .legibility import assert_legible
 from ._text_metrics import wrap_text
 from .tokens import AdFormatDef, PLACEHOLDER_TOKENS, logo_badge_layers
@@ -92,35 +92,48 @@ def _check_fits_scrim(lines, zone_name: str, scrim_height: int) -> None:
         )
 
 
-# §1.7 — any person rendered must read as deep-brown-to-dark-brown West
-# African skin. Stated explicitly in the prompt (not left to the setting to
-# imply) because the skin-tone check downstream rejects "medium brown" and
-# lighter, and image models are known to lighten skin under bright-daylight
-# prompts — which _solution_prompt uses. Wording matches skin_tone_check.py's
-# own documented recommendation.
-_SKIN_TONE = (
-    "any people shown have deep brown to dark brown skin and West African "
-    "features"
-)
-
-
+# VSG-01-PROMPTS v3 §6.3 verbatim (slots filled). REPRESENTATION_BLOCK
+# (§4, imported from layer2_generation) replaces the earlier skin-tone-only
+# phrase — same §1.7 purpose, fuller v3 wording (also covers natural
+# unretouched texture and authentic Nigerian clothing/objects, not just
+# tone). §1.7 note preserved: image models are known to lighten skin under
+# bright-daylight prompts — which the solution half deliberately uses —
+# so stating this explicitly rather than leaving it to the setting to imply
+# still matters here.
 def _problem_prompt(problem_situation: str, nigerian_setting: str) -> str:
     return (
-        f"Documentary photograph illustrating {problem_situation} in "
-        f"{resolve_nigerian_setting(nigerian_setting)}, {_SKIN_TONE}, single clear "
-        "subject, uncluttered composition, muted desaturated palette, strong "
-        "empty area across the top 40 percent, overcast or shaded daylight, "
-        "realistic, unstyled, shot on a phone camera"
+        f"Create a realistic documentary-style Nigerian photograph that "
+        f"communicates {problem_situation} immediately without requiring "
+        f"explanatory text. Set the scene in {resolve_nigerian_setting(nigerian_setting)}. "
+        f"{REPRESENTATION_BLOCK}. Show one clear human situation, environmental "
+        "condition or physical consequence that communicates the problem. The "
+        "composition must be simple enough that the viewer understands the "
+        "situation within approximately one second. Use muted, slightly "
+        "desaturated natural colours with overcast or shaded daylight. Use one "
+        "dominant focal subject occupying approximately 40-55% of the frame. "
+        "Position the subject deliberately while preserving a broad area of "
+        "relatively calm space for the problem headline. The background should "
+        "establish context without becoming a second focal point. The image "
+        "should feel observed rather than staged: realistic, imperfect, "
+        "unpolished and documentary."
     )
 
 
-def _solution_prompt(solution_situation: str, nigerian_setting: str) -> str:
+def _solution_prompt(solution_situation: str, problem_situation: str, nigerian_setting: str) -> str:
     return (
-        f"Documentary photograph illustrating {solution_situation} in "
-        f"{resolve_nigerian_setting(nigerian_setting)}, {_SKIN_TONE}, single clear "
-        "subject, uncluttered composition, bright natural daylight, warm "
-        "palette, resolved and orderly, strong empty area across the bottom 40 "
-        "percent, realistic, unstyled, shot on a phone camera"
+        "Create a realistic documentary-style Nigerian photograph showing the "
+        f"positive resolution of {problem_situation}, represented by "
+        f"{solution_situation}. Set the scene in {resolve_nigerian_setting(nigerian_setting)}. "
+        f"{REPRESENTATION_BLOCK}. Show the same general world as the problem "
+        "image but with a visibly more organised, successful or satisfying "
+        "outcome. Use brighter natural daylight, warmer but realistic tones and "
+        "cleaner visual organisation. Do not make the result look exaggerated, "
+        "luxurious or impossibly perfect. Maintain a similar camera perspective, "
+        "subject scale and visual structure to the problem image so the two "
+        "images feel like deliberate visual counterparts. Preserve a clear "
+        "copy-safe area for the solution headline. The contrast should come "
+        "primarily from the situation itself, not excessive colour grading or "
+        "visual effects."
     )
 
 
@@ -233,7 +246,9 @@ async def render(
     zone_size = f"{width}x{height // 2}"
 
     problem_url = await generate_scene(_problem_prompt(problem_situation, nigerian_setting), size=zone_size)
-    solution_url = await generate_scene(_solution_prompt(solution_situation, nigerian_setting), size=zone_size)
+    solution_url = await generate_scene(
+        _solution_prompt(solution_situation, problem_situation, nigerian_setting), size=zone_size,
+    )
 
     document = build_document(problem_url, solution_url, problem_text, solution_text, canvas_size, tokens)
     return await DocumentRendererService.render_to_png(document)

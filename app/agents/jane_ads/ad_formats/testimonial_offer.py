@@ -351,12 +351,24 @@ def build_document_no_person(
     return document
 
 
+# VSG-01-PROMPTS v3 §6.2's no-person scene prompt, slots filled. No
+# REPRESENTATION_BLOCK here — this scene explicitly excludes people (a
+# generated person may not carry a testimonial quote; §6.2's hard rule).
 def _scene_prompt(nigerian_setting: str) -> str:
     return (
-        f"{resolve_nigerian_setting(nigerian_setting)}, no people in frame, strong "
-        "equatorial daylight, authentic documentary style, slight imperfection, not "
-        "studio lit, clear empty space in the lower third, shot on a phone camera, "
-        "natural colour"
+        "Create a realistic Nigerian lifestyle or documentary photograph "
+        "designed as the visual foundation of a testimonial-led static "
+        f"advertisement. Set the scene in {resolve_nigerian_setting(nigerian_setting)}. "
+        "Do not include any people. The environment should feel lived-in, "
+        "believable and specific rather than staged for a commercial "
+        "photoshoot. Use natural available light, realistic shadows and "
+        "subtle imperfections in surfaces and surroundings. Establish one "
+        "obvious visual focal point and a large calm negative-space region "
+        "reserved for the testimonial and offer, placed toward the lower "
+        "third of the frame. Use shallow-to-moderate depth of field where "
+        "appropriate, but avoid excessive artificial blur. The photograph "
+        "should feel as though it was captured naturally on a modern "
+        "smartphone while documenting a real Nigerian business environment."
     )
 
 

@@ -33,6 +33,7 @@ every other format's real-world-fact hard checks.
 """
 from typing import Dict, Tuple
 
+from ..layer2_generation import REPRESENTATION_BLOCK
 from ..visual_slots import resolve_nigerian_setting
 from ._text_metrics import wrap_text
 from .legibility import assert_legible
@@ -51,12 +52,33 @@ _FONT_STATEMENT = 48
 _PADDING = 56
 
 
+# VSG-01-PROMPTS v3 §6.15, slots filled and trimmed to fit DALL-E's 4000-char
+# cap alongside REPRESENTATION_BLOCK + layer2_generation's now-automatic
+# §2A/§2B/§2C (generate_scene() appends composition + copy-safety + negative
+# to every call — see that module). Trimmed only where §6.15's own wording
+# duplicated what those three already guarantee (environmental realism is
+# REPRESENTATION_BLOCK's job; general frame control is §2A's; generic
+# copy-zone protection is §2B's) — every requirement UNIQUE to this format
+# (visibly incomplete work, no implied-completed-job claim, safety depiction)
+# is kept. Previously had no representation block at all — a real gap for a
+# format whose whole point is a worker's hands actively doing a job.
 def _scene_prompt(trade_activity: str, nigerian_setting: str) -> str:
     return (
-        f"Documentary photograph of {trade_activity} underway in "
-        f"{resolve_nigerian_setting(nigerian_setting)}, hands and tools visible, "
-        "work partially complete, natural available light, candid and unposed, "
-        "realistic and unstyled, shot on a phone camera, muted realistic colour"
+        f"Create a realistic documentary photograph showing {trade_activity} "
+        f"actively underway in {resolve_nigerian_setting(nigerian_setting)}. "
+        f"{REPRESENTATION_BLOCK}. Show the work in a visibly incomplete stage — "
+        "hands, tools, equipment or materials communicating the job is actively "
+        "being performed, not finished. Candid and observational rather than "
+        "posed, natural available light. The worker should not look directly at "
+        "the camera unless the activity naturally requires it. Avoid "
+        "showroom-like environments unless the actual trade takes place there. "
+        "Realistic imperfections — dust, material variation, ordinary "
+        "environmental clutter — are welcome. The primary work activity should "
+        "occupy approximately 40-60% of the composition, with a clean reserved "
+        "area for copy naming what is being done and where the business "
+        "operates. The image must look like real work happening, not an "
+        "AI-generated representation of a finished project. Depict safety "
+        "equipment correctly where relevant; never depict dangerous practices."
     )
 
 
