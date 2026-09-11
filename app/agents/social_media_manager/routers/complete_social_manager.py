@@ -4598,6 +4598,62 @@ async def debug_connections_raw(
     return UriResponse.get_single_data_response("connections_raw", result)
 
 
+@router.get("/debug/duplicate-published-drafts")
+async def debug_duplicate_published_drafts(
+    request: Request,
+    days: int = 14,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """TEMPORARY — investigating a "content published more than once" report.
+    System-wide (not single-user), so gated by X-Bootstrap-Secret like this
+    session's other one-off diagnostics rather than flexible_auth. Read-only.
+
+    Groups published_content_drafts by (user_id, platform, content,
+    scheduled_date rounded to the minute) and returns any group with more
+    than one draft — distinguishes "one draft, published twice" (would show
+    as a single draft id with an anomaly elsewhere) from "two separate draft
+    documents created for the same scheduled content" (shows here as 2+
+    distinct ids/created_at times in one group)."""
+    if request.headers.get("X-Bootstrap-Secret") != "vsg01-corpus-bootstrap-2026-dev-only":
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    from datetime import datetime, timedelta
+    cutoff = datetime.utcnow() - timedelta(days=days)
+
+    drafts = await db["content_drafts"].find(
+        {"status": "published", "published_date": {"$gte": cutoff}},
+        {"_id": 0, "id": 1, "user_id": 1, "platform": 1, "content": 1,
+         "scheduled_date": 1, "created_at": 1, "published_date": 1,
+         "platform_post_id": 1, "media_type": 1, "video_url": 1, "image_url": 1},
+    ).to_list(length=5000)
+
+    groups: dict = {}
+    for d in drafts:
+        sched = d.get("scheduled_date")
+        sched_minute = sched.strftime("%Y-%m-%dT%H:%M") if hasattr(sched, "strftime") else str(sched)
+        content_key = (d.get("content") or "")[:200]
+        key = (str(d.get("user_id")), d.get("platform"), content_key, sched_minute)
+        groups.setdefault(key, []).append({
+            "id": d.get("id"),
+            "created_at": str(d.get("created_at")),
+            "published_date": str(d.get("published_date")),
+            "platform_post_id": d.get("platform_post_id"),
+            "media_type": d.get("media_type"),
+        })
+
+    duplicates = [
+        {"user_id": k[0], "platform": k[1], "content_preview": k[2][:80], "scheduled_minute": k[3], "drafts": v}
+        for k, v in groups.items() if len(v) > 1
+    ]
+
+    return {
+        "total_published_in_window": len(drafts),
+        "distinct_groups": len(groups),
+        "duplicate_groups_found": len(duplicates),
+        "duplicates": duplicates[:30],
+    }
+
+
 @router.get("/platform-requirements/{platform}")
 async def get_platform_requirements(platform: str):
     """Get content requirements for a specific platform"""
