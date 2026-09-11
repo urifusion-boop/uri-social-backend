@@ -4141,6 +4141,33 @@ async def corpus_upload(
             os.unlink(tmp_path)
 
 
+@router.get("/debug/ads-generation-e2e", include_in_schema=False)
+async def _debug_ads_generation_e2e(request: Request, db: AsyncIOMotorDatabase = Depends(get_db_dependency)) -> dict:
+    """TEMPORARY — reproduce "ads generation not working" on dev end-to-end
+    through the real generate_ad_creative() entry point, with no user_id/
+    brand_id (so it can't be blamed on one account's data), to see the
+    actual result or exception rather than guess. Same secret-gated
+    pattern as this session's other diagnostics; remove after use."""
+    if request.headers.get("X-Bootstrap-Secret") != "vsg01-corpus-bootstrap-2026-dev-only":
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    from .creative import generate_ad_creative
+    import traceback
+
+    try:
+        result = await generate_ad_creative(
+            business_name="Test Suya Spot",
+            category="restaurant",
+            goal="messages",
+            description="We sell grilled suya and fast delivery across Lagos.",
+            user_id="",
+            db=db,
+        )
+        return {"success": True, "result": result.model_dump() if hasattr(result, "model_dump") else str(result)}
+    except Exception as e:
+        return {"success": False, "error": str(e), "type": type(e).__name__, "traceback": traceback.format_exc()}
+
+
 @router.get("/corpus/upload", response_class=HTMLResponse, include_in_schema=False)
 async def corpus_upload_page() -> str:
     """The page itself. Self-contained — no build step, no bundle, nothing to deploy
