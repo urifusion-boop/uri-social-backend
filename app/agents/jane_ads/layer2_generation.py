@@ -130,10 +130,14 @@ async def generate_scene(prompt: str, size: str = "1080x1080") -> str:
     """
     from app.agents.social_media_manager.services.image_content_service import ImageContentService
 
-    # DALL-E 3 hard-caps prompts at 4000 characters. The three fixed
-    # directives below already run ~2300 chars, and the longest format
-    # prompt (Work In Progress, with its representation block and real
-    # slot text filled in) comes within roughly 100 chars of the ceiling —
+    # ImageContentService._call_dalle_api (the name predates its current
+    # provider chain) actually routes this call through Google Imagen 4.0
+    # Ultra ("nano-banana-2") first, falling back to OpenAI gpt-image-1.5 —
+    # not DALL-E 3, despite the helper's name. Kept at 4000 chars anyway as a
+    # conservative, provider-agnostic ceiling rather than tuning per-provider:
+    # the three fixed directives below already run ~2300 chars, and the
+    # longest format prompt (Work In Progress, with its representation block
+    # and real slot text filled in) comes within roughly 100 chars of it —
     # too tight a margin when the scene description itself is built from
     # LLM-generated free text (a business's own trade/activity wording is
     # not length-bounded). Trim the caller's scene description, never the
