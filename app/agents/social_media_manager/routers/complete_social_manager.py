@@ -4646,11 +4646,57 @@ async def debug_duplicate_published_drafts(
         for k, v in groups.items() if len(v) > 1
     ]
 
+    # Second check, looser than the exact-minute grouping above: same user +
+    # platform + actual media URL (video_url/image_url), regardless of
+    # scheduled_date or caption drift across retries — catches a re-publish
+    # of the identical asset that the first grouping's exact-minute match
+    # could miss (a retry commonly gets a freshly-computed scheduled_date).
+    media_groups: dict = {}
+    for d in drafts:
+        media = d.get("video_url") or d.get("image_url") or ""
+        if not media:
+            continue
+        key = (str(d.get("user_id")), d.get("platform"), media)
+        media_groups.setdefault(key, []).append({
+            "id": d.get("id"),
+            "created_at": str(d.get("created_at")),
+            "published_date": str(d.get("published_date")),
+            "platform_post_id": d.get("platform_post_id"),
+        })
+    media_duplicates = [
+        {"user_id": k[0], "platform": k[1], "media_url": k[2][:120], "drafts": v}
+        for k, v in media_groups.items() if len(v) > 1
+    ]
+
+    # video_publish_jobs is a SEPARATE collection from content_drafts — the
+    # immediate "Publish Video Now" endpoint (VideoPublishService.create_job)
+    # never flips a content_draft to "published" at all, so the check above
+    # can't see this path's activity. No idempotency key exists on job
+    # creation, so 2+ jobs sharing a draft_id is real evidence of the
+    # endpoint being invoked more than once for the same draft.
+    # created_at is stored as an ISO string (VideoPublishService.create_job),
+    # not a BSON date — sort+limit instead of a $gte date filter to avoid a
+    # string/date comparison mismatch.
+    jobs = await db["video_publish_jobs"].find(
+        {},
+        {"_id": 0, "job_id": 1, "draft_id": 1, "platform": 1, "status": 1,
+         "platform_post_id": 1, "created_at": 1, "user_id": 1},
+    ).sort("created_at", -1).to_list(length=500)
+    job_groups: dict = {}
+    for j in jobs:
+        job_groups.setdefault(j.get("draft_id"), []).append(j)
+    job_duplicates = {k: v for k, v in job_groups.items() if len(v) > 1}
+
     return {
         "total_published_in_window": len(drafts),
         "distinct_groups": len(groups),
         "duplicate_groups_found": len(duplicates),
         "duplicates": duplicates[:30],
+        "media_url_duplicate_groups_found": len(media_duplicates),
+        "media_url_duplicates": media_duplicates[:30],
+        "total_video_publish_jobs_in_window": len(jobs),
+        "draft_ids_with_multiple_video_jobs": len(job_duplicates),
+        "video_job_duplicates": list(job_duplicates.items())[:30],
     }
 
 
