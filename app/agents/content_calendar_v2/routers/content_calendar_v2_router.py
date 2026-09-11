@@ -153,6 +153,19 @@ async def create_draft_from_item_v2(
         if not item:
             raise HTTPException(status_code=404, detail=f"Item {item_index} not found")
 
+        # No auto-draft path for video ideas — there's no video render pipeline
+        # wired to the calendar (that's the separate Video tab / storyboard job
+        # flow). The item carries a full video_idea script; the frontend hides
+        # Create Draft for these formats and shows the plan instead, but guard
+        # server-side too so a direct API call can't silently produce a wrong
+        # text/image draft from what's meant to be a video script.
+        if item.get("format") in ("video", "product_video", "ai_video"):
+            raise HTTPException(
+                status_code=400,
+                detail="This is a video idea, not a draft-ready post. Use the plan (hook/talking points/scenes/cta) "
+                       "to build the video yourself in the Video tab.",
+            )
+
         seed_parts = [f"{item.get('title', '')}. {item.get('description', '')}"]
         if item.get("hook"):
             seed_parts.append(f"Opening hook to use: {item['hook']}")
