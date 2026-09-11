@@ -4141,34 +4141,6 @@ async def corpus_upload(
             os.unlink(tmp_path)
 
 
-@router.get("/debug/vsg01-v3-prompt-preview", include_in_schema=False)
-async def _debug_vsg01_v3_prompt_preview(request: Request, size: str = "1080x1080", seasonal: str = "") -> dict:
-    """TEMPORARY — live-verify Tier 2 (ratio clause resolution) and Tier 3
-    (seasonal-context slot + the orchestrator's real date-based resolver)
-    by returning assembled prompt TEXT, not a generated image — no OpenAI
-    spend needed to confirm the wiring is correct end-to-end on the actual
-    deployed image. Same secret-gated pattern as this session's other
-    diagnostics; remove after use, confirm 404."""
-    if request.headers.get("X-Bootstrap-Secret") != "vsg01-corpus-bootstrap-2026-dev-only":
-        raise HTTPException(status_code=404, detail="Not Found")
-
-    from .layer2_generation import _resolve_ratio_clause
-    from .vsg01_orchestrator import _resolve_current_seasonal_context
-    from .ad_formats.problem_solution import _problem_prompt
-
-    resolved_seasonal = seasonal or None
-    prompt = _problem_prompt("a trader losing customers to network downtime", "a roadside food stand", resolved_seasonal)
-    ratio_clause = _resolve_ratio_clause(size)
-
-    return {
-        "requested_size": size,
-        "resolved_ratio_clause": ratio_clause,
-        "todays_auto_resolved_seasonal_context": _resolve_current_seasonal_context(),
-        "prompt_with_explicit_seasonal_context": prompt,
-        "prompt_length": len(prompt),
-    }
-
-
 @router.get("/corpus/upload", response_class=HTMLResponse, include_in_schema=False)
 async def corpus_upload_page() -> str:
     """The page itself. Self-contained — no build step, no bundle, nothing to deploy
