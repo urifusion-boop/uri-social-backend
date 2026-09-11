@@ -1,7 +1,7 @@
 # app/agents/social_media_manager/services/approval_workflow_service.py
 
 from typing import Dict, List, Any, Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from bson import ObjectId
 import asyncio
@@ -657,10 +657,37 @@ class ApprovalWorkflowService:
             # Applies to both direct-publish drafts (no platform_post_id) and
             # Outstand-polled drafts (has platform_post_id). This prevents old Outstand
             # submissions from publishing after a newer draft has already been scheduled.
+            #
+            # Live-reported crash (on prod, ported here for the same reason): created_at
+            # is NOT consistently a BSON date across every draft-creation path in this
+            # codebase — the AI-video/ZapCap production pipeline stores it as an ISO
+            # string (datetime.now(timezone.utc).isoformat()), same pattern as
+            # video_publish_service.py's create_job, while most other paths store a real
+            # datetime. Sorting `d.get("created_at") or datetime.min` directly raises
+            # TypeError the moment a string and a datetime (or an aware and a naive
+            # datetime) land in the same candidate batch — which silently aborted the
+            # ENTIRE tick (every draft in it, not just the mismatched one) with no log
+            # line at all, because the outer except below returns {"error": ...} and the
+            # scheduler wrapper only ever checks the plural key "errors". Normalize every
+            # value to a naive UTC datetime before comparing, so type/tz drift between
+            # creation paths can never crash the batch again.
+            def _created_at_key(d: dict) -> datetime:
+                ca = d.get("created_at")
+                if isinstance(ca, str):
+                    try:
+                        ca = datetime.fromisoformat(ca)
+                    except ValueError:
+                        return datetime.min
+                if not isinstance(ca, datetime):
+                    return datetime.min
+                if ca.tzinfo is not None:
+                    ca = ca.astimezone(timezone.utc).replace(tzinfo=None)
+                return ca
+
             _seen_platform_user: dict = {}
             _to_cancel: list = []
             _all_scheduled = [d for d in scheduled_content if d.get("status") == _sched_status]
-            _all_scheduled.sort(key=lambda d: d.get("created_at") or datetime.min, reverse=True)
+            _all_scheduled.sort(key=_created_at_key, reverse=True)
             for _dup in _all_scheduled:
                 _key = (str(_dup.get("user_id")), _dup.get("platform"))
                 if _key in _seen_platform_user:
@@ -942,8 +969,20 @@ class ApprovalWorkflowService:
             }
 
         except Exception as e:
-            return {"error": f"Scheduled publishing failed: {str(e)}"}
-    
+            # Live-reported bug (on prod, ported here): this used to return
+            # {"error": ...} (singular) with no print at all — a crash here (e.g. the
+            # created_at TypeError above, before it was fixed) silently aborted the
+            # ENTIRE candidate batch every single tick it recurred, with zero trace in
+            # the logs, because the scheduler wrapper
+            # (notification_scheduler.py's _job_publish_scheduled_content) only ever
+            # checks the plural key "errors". Print unconditionally here so a future
+            # batch-level crash is never invisible again, and return the same "errors"
+            # shape the wrapper actually reads.
+            print(f"❌ publish_scheduled_content crashed before processing any candidate: {e}")
+            import traceback
+            traceback.print_exc()
+            return {"published_count": 0, "errors": [{"draft_id": "batch", "error": str(e)}]}
+
     @staticmethod
     async def _trigger_immediate_publishing(
         db: AsyncIOMotorDatabase,
