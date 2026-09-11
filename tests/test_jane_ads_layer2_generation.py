@@ -1,17 +1,22 @@
 """
-layer2_generation.py — VSG-01-PROMPTS v3 §3/§12: the ratio clause resolved
-per generation from actual pixel dimensions, not assumed square. No test
-file existed for this module before (generate_scene() itself needs a real
-or mocked network call to exercise end-to-end); this covers the pure,
-easily-isolated piece — _resolve_ratio_clause's distance-to-nearest-ratio
-logic — directly.
+layer2_generation.py — VSG-01-PROMPTS v3 §3/§8/§12: the ratio clause
+resolved per generation from actual pixel dimensions (not assumed square),
+and the optional §8 seasonal-context clause. No test file existed for this
+module before (generate_scene() itself needs a real or mocked network call
+to exercise end-to-end); this covers the pure, easily-isolated pieces —
+_resolve_ratio_clause's distance-to-nearest-ratio logic and
+seasonal_context_clause's validate-then-render behaviour — directly.
 """
+import pytest
+
 from app.agents.jane_ads.layer2_generation import (
     RATIO_CLAUSE_1_1,
     RATIO_CLAUSE_4_5,
     RATIO_CLAUSE_9_16,
     _resolve_ratio_clause,
+    seasonal_context_clause,
 )
+from app.agents.jane_ads.visual_slots import InvalidSlotValue
 
 
 class TestResolveRatioClause:
@@ -42,3 +47,31 @@ class TestResolveRatioClause:
 
     def test_the_three_clauses_are_distinct_strings(self):
         assert len({RATIO_CLAUSE_1_1, RATIO_CLAUSE_4_5, RATIO_CLAUSE_9_16}) == 3
+
+
+class TestSeasonalContextClause:
+    def test_none_produces_no_clause(self):
+        """§8: the slot is optional — no context supplied means nothing is
+        appended, not an empty-but-present sentence."""
+        assert seasonal_context_clause(None) == ""
+
+    def test_empty_string_also_produces_no_clause(self):
+        assert seasonal_context_clause("") == ""
+
+    def test_a_valid_context_produces_a_subtle_influence_sentence(self):
+        """§8: 'should influence environmental cues, styling and relevance
+        without overwhelming the core visual hierarchy' and 'Do not add
+        seasonal decorations merely because the slot is populated' — both
+        constraints should show up in the actual generated wording, not
+        just the spec."""
+        clause = seasonal_context_clause("Detty December")
+        assert "Detty December" in clause
+        assert "subtly" in clause or "subtle" in clause
+        assert "Do not add seasonal decorations" in clause
+
+    def test_a_value_outside_the_closed_vocabulary_is_rejected(self):
+        """Same fail-closed contract as every other slot in this library —
+        this function must not silently accept free text just because it's
+        optional when absent."""
+        with pytest.raises(InvalidSlotValue):
+            seasonal_context_clause("Black Friday")

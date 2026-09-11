@@ -58,7 +58,7 @@ the rest.
 import math
 from typing import Dict, List, Optional, Tuple
 
-from ..layer2_generation import generate_scene
+from ..layer2_generation import generate_scene, seasonal_context_clause
 from .legibility import assert_legible
 from ._text_metrics import wrap_text
 from .tokens import AdFormatDef, PLACEHOLDER_TOKENS, logo_badge_layers
@@ -105,7 +105,7 @@ def _check_label_one_line(label: str, cell_width: int) -> None:
         )
 
 
-def _item_prompt(item: str, nigerian_setting_hint: str = "") -> str:
+def _item_prompt(item: str, nigerian_setting_hint: str = "", seasonal_context: Optional[str] = None) -> str:
     """Per-item variant of VSG-01-PROMPTS v3 §6.11's flat-lay prompt — see
     module docstring for why this is generated per item rather than as one
     multi-item collage (v3's own text still describes the single-collage
@@ -113,6 +113,7 @@ def _item_prompt(item: str, nigerian_setting_hint: str = "") -> str:
     from both v2 and v3 kept as-is here, with v3's compositional standard —
     premium editorial quality, no decorative props, individually
     recognisable at grid scale — applied to each item instead)."""
+    seasonal = seasonal_context_clause(seasonal_context)
     return (
         f"Overhead flat lay of {item} on a plain surface, even soft daylight "
         "from above producing a subtle consistent shadow, styled but not "
@@ -124,6 +125,7 @@ def _item_prompt(item: str, nigerian_setting_hint: str = "") -> str:
         "and use. The result should resemble a premium editorial flat lay, "
         "not a catalogue inventory photograph."
         + (f" Setting hint: {nigerian_setting_hint}." if nigerian_setting_hint else "")
+        + (f" {seasonal}" if seasonal else "")
     )
 
 
@@ -220,12 +222,16 @@ async def render(
     product_index: Optional[int] = None,
     canvas_size: Tuple[int, int] = (1080, 1080),
     tokens: Dict[str, str] = None,
+    seasonal_context: Optional[str] = None,
 ) -> bytes:
     """Real Layer 2 generation, one call per surrounding item (see module
     docstring for why), then Layer 4 grid arrangement. item_descriptions
     are the scene descriptions to generate (e.g. "a bottle of zobo
     drink"); item_labels are the caption shown beneath each — same
-    length, index-matched, may describe the same item in different words."""
+    length, index-matched, may describe the same item in different words.
+
+    seasonal_context: optional §8 slot, applied identically to every item
+    (a single ad shows one seasonal moment, not a different one per item)."""
     if len(item_descriptions) != len(item_labels):
         raise ValueError("item_descriptions and item_labels must be the same length")
 
@@ -235,7 +241,9 @@ async def render(
 
     item_urls = []
     for description in item_descriptions:
-        item_urls.append(await generate_scene(_item_prompt(description), size=cell_size))
+        item_urls.append(
+            await generate_scene(_item_prompt(description, seasonal_context=seasonal_context), size=cell_size)
+        )
 
     document = build_document(
         item_urls, item_labels, product_image_url, product_label,
