@@ -59,6 +59,24 @@ class TestPrompts:
         with pytest.raises(InvalidSlotValue):
             _problem_prompt("a problem", "Lekki, Lagos")
 
+    def test_seasonal_context_is_optional_and_off_by_default(self):
+        """§8: omitting it is the common case — the prompt shouldn't
+        mention any seasonal framing when none was supplied."""
+        prompt = _problem_prompt("a problem", "a roadside food stand")
+        assert "seasonal" not in prompt.lower()
+
+    def test_a_supplied_seasonal_context_appears_in_both_prompts(self):
+        problem = _problem_prompt("a problem", "a roadside food stand", seasonal_context="Detty December")
+        solution = _solution_prompt(
+            "a solution", "a problem", "a roadside food stand", seasonal_context="Detty December",
+        )
+        assert "Detty December" in problem
+        assert "Detty December" in solution
+
+    def test_solution_prompt_rejects_an_invalid_seasonal_context(self):
+        with pytest.raises(InvalidSlotValue):
+            _solution_prompt("a solution", "a problem", "a roadside food stand", seasonal_context="Black Friday")
+
 
 class TestBuildDocument:
     def _doc(self, **kw):

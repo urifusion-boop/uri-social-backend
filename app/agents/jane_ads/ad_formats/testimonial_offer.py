@@ -41,7 +41,7 @@ Hard checks (§2.2):
 from typing import Dict, Optional, Tuple
 
 from ..visual_slots import resolve_nigerian_setting
-from ..layer2_generation import generate_scene
+from ..layer2_generation import generate_scene, seasonal_context_clause
 from .legibility import assert_legible
 from ._text_metrics import wrap_text
 from .tokens import AdFormatDef, PLACEHOLDER_TOKENS, logo_badge_layers
@@ -354,7 +354,8 @@ def build_document_no_person(
 # VSG-01-PROMPTS v3 §6.2's no-person scene prompt, slots filled. No
 # REPRESENTATION_BLOCK here — this scene explicitly excludes people (a
 # generated person may not carry a testimonial quote; §6.2's hard rule).
-def _scene_prompt(nigerian_setting: str) -> str:
+def _scene_prompt(nigerian_setting: str, seasonal_context: Optional[str] = None) -> str:
+    seasonal = seasonal_context_clause(seasonal_context)
     return (
         "Create a realistic Nigerian lifestyle or documentary photograph "
         "designed as the visual foundation of a testimonial-led static "
@@ -368,7 +369,7 @@ def _scene_prompt(nigerian_setting: str) -> str:
         "third of the frame. Use shallow-to-moderate depth of field where "
         "appropriate, but avoid excessive artificial blur. The photograph "
         "should feel as though it was captured naturally on a modern "
-        "smartphone while documenting a real Nigerian business environment."
+        f"smartphone while documenting a real Nigerian business environment.{(' ' + seasonal) if seasonal else ''}"
     )
 
 
@@ -397,12 +398,15 @@ async def render_no_person(
     product_image_url: Optional[str] = None,
     canvas_size: Tuple[int, int] = (1080, 1080),
     tokens: Dict[str, str] = None,
+    seasonal_context: Optional[str] = None,
 ) -> bytes:
     """Real Layer 2 generation for the no-people scene, then Layer 4
     template-fill — mirrors problem_solution.render()'s pattern."""
     width, height = canvas_size
     proof_zone_height = (height * 2) // 3
-    scene_url = await generate_scene(_scene_prompt(nigerian_setting), size=f"{width}x{proof_zone_height}")
+    scene_url = await generate_scene(
+        _scene_prompt(nigerian_setting, seasonal_context), size=f"{width}x{proof_zone_height}",
+    )
 
     document = build_document_no_person(
         scene_url, quote, offer_text, price_or_terms, product_image_url, canvas_size, tokens,

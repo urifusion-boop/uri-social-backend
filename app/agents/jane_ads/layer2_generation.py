@@ -161,6 +161,34 @@ REPRESENTATION_BLOCK = (
 )
 
 
+# §8 — appended by a format's own scene-prompt builder only when a seasonal
+# context is actually supplied (the slot is optional; most generations pass
+# none, per §8's own caution below). Deliberately phrased as a SUBTLE
+# influence, not a decoration instruction, mirroring §8's exact wording:
+# "should influence environmental cues, styling and relevance without
+# overwhelming the core visual hierarchy" and "Do not add seasonal
+# decorations merely because the slot is populated." Validated against
+# visual_slots.SEASONAL_CONTEXTS before use — same closed-vocabulary
+# reasoning as every other slot in this library.
+def seasonal_context_clause(seasonal_context) -> str:
+    """Returns "" when seasonal_context is None/empty (the common case —
+    nothing is appended to the prompt), otherwise a single validated
+    sentence. Raises visual_slots.InvalidSlotValue for a value outside
+    §8's enumerated list, same fail-closed behaviour as
+    resolve_nigerian_setting."""
+    from .visual_slots import resolve_seasonal_context
+
+    resolved = resolve_seasonal_context(seasonal_context)
+    if not resolved:
+        return ""
+    return (
+        f"Where it feels natural, let {resolved} subtly inform environmental cues, "
+        "styling and mood. Do not add seasonal decorations or props simply because "
+        "this context is present — it should read as a quiet, believable backdrop "
+        "detail, never as the focus of the composition."
+    )
+
+
 class SceneGenerationFailed(RuntimeError):
     """Raised when the underlying generation call or the follow-up
     Cloudinary upload fails — a format's render() should not silently

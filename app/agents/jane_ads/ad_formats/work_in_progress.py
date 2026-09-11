@@ -31,9 +31,9 @@ height, exposed live electrical work) — a caller-side guarantee this
 module cannot verify from a URL or a text statement alone, same category as
 every other format's real-world-fact hard checks.
 """
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
-from ..layer2_generation import REPRESENTATION_BLOCK
+from ..layer2_generation import REPRESENTATION_BLOCK, seasonal_context_clause
 from ..visual_slots import resolve_nigerian_setting
 from ._text_metrics import wrap_text
 from .legibility import assert_legible
@@ -62,7 +62,15 @@ _PADDING = 56
 # (visibly incomplete work, no implied-completed-job claim, safety depiction)
 # is kept. Previously had no representation block at all — a real gap for a
 # format whose whole point is a worker's hands actively doing a job.
-def _scene_prompt(trade_activity: str, nigerian_setting: str) -> str:
+def _scene_prompt(trade_activity: str, nigerian_setting: str, seasonal_context: Optional[str] = None) -> str:
+    # This format's prompt already runs close to the DALL-E length ceiling
+    # even without a seasonal addition (see generate_scene's own budget
+    # comment) — when seasonal_context IS supplied, the length guard may
+    # trim part or all of that clause rather than the safety-critical text
+    # before it, which is the guard's intended, disclosed trade-off (§8's
+    # own wording treats the slot as a light, optional touch, never
+    # something that must survive intact).
+    seasonal = seasonal_context_clause(seasonal_context)
     return (
         f"Create a realistic documentary photograph showing {trade_activity} "
         f"actively underway in {resolve_nigerian_setting(nigerian_setting)}. "
@@ -78,7 +86,7 @@ def _scene_prompt(trade_activity: str, nigerian_setting: str) -> str:
         "area for copy naming what is being done and where the business "
         "operates. The image must look like real work happening, not an "
         "AI-generated representation of a finished project. Depict safety "
-        "equipment correctly where relevant; never depict dangerous practices."
+        f"equipment correctly where relevant; never depict dangerous practices.{(' ' + seasonal) if seasonal else ''}"
     )
 
 
@@ -145,13 +153,25 @@ def build_document(
     return document
 
 
-async def render(trade_activity: str, nigerian_setting: str, statement: str, **kwargs) -> bytes:
+async def render(
+    trade_activity: str,
+    nigerian_setting: str,
+    statement: str,
+    seasonal_context: Optional[str] = None,
+    **kwargs,
+) -> bytes:
     """Generate an illustrative scene, then build + render — the fallback path
     for a business with no real work-in-progress photo of its own (§6.15).
-    A caller WITH a real photo should call build_document directly instead."""
+    A caller WITH a real photo should call build_document directly instead.
+
+    seasonal_context: optional §8 slot, taken as its own keyword (not swept
+    into **kwargs) since it belongs to the prompt builder, not
+    build_document, which has no such parameter."""
     from ..layer2_generation import generate_scene
     from app.agents.social_media_manager.services.document_renderer_service import DocumentRendererService
 
-    scene_url = await generate_scene(_scene_prompt(trade_activity, nigerian_setting), size="1080x1080")
+    scene_url = await generate_scene(
+        _scene_prompt(trade_activity, nigerian_setting, seasonal_context), size="1080x1080",
+    )
     document = build_document(scene_url, statement, **kwargs)
     return await DocumentRendererService.render_to_png(document)

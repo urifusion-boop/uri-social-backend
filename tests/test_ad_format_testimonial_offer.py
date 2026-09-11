@@ -62,6 +62,17 @@ class TestScenePrompt:
         with pytest.raises(InvalidSlotValue):
             _scene_prompt("Lekki, Lagos")
 
+    def test_seasonal_context_is_optional_and_off_by_default(self):
+        assert "seasonal" not in _scene_prompt("a tailoring workshop").lower()
+
+    def test_a_supplied_seasonal_context_appears_in_the_prompt(self):
+        prompt = _scene_prompt("a tailoring workshop", seasonal_context="Harmattan season")
+        assert "Harmattan season" in prompt
+
+    def test_rejects_an_invalid_seasonal_context(self):
+        with pytest.raises(InvalidSlotValue):
+            _scene_prompt("a tailoring workshop", seasonal_context="Black Friday")
+
 
 class TestBuildDocumentPersonPath(object):
     def _doc(self, **kw):

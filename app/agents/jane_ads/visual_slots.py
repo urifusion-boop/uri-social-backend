@@ -84,6 +84,27 @@ LIGHTING_DEFAULTS = (
 # §3: dress register options for {{customer_description}}.
 DRESS_REGISTERS = ("casual", "workwear", "formal", "traditional")
 
+# §8's own enumerated list for the optional {{seasonal_context}} slot —
+# "Seasonal context should remain a slot, not a new format." Unlike
+# NIGERIAN_SETTINGS/LIGHTING_DEFAULTS/DRESS_REGISTERS above, this slot is
+# genuinely optional at the call site (None/"" means no seasonal framing
+# this time — §8: "Do not add seasonal decorations merely because the slot
+# is populated"), but a *supplied* value is still validated against this
+# closed list rather than accepted as free text, for the same reason every
+# other slot here is closed: a foreign or hand-typed value could otherwise
+# smuggle in Zone A-shaped text through this path unreviewed.
+SEASONAL_CONTEXTS = (
+    "Harmattan season",
+    "Detty December",
+    "salary week",
+    "back-to-school season",
+    "Easter",
+    "Eid period",
+    "Christmas shopping period",
+    "rainy season",
+    "dry season",
+)
+
 # §1.3's own table — Zone A never appears in a prompt or on the asset;
 # Zone B may, because the customer needs it. Kept here as documentation and
 # for tests; the actual mechanical check is `check_visual_leakage` against
@@ -127,6 +148,21 @@ def resolve_lighting(lighting: str) -> str:
             f"must be one of {LIGHTING_DEFAULTS}"
         )
     return lighting
+
+
+def resolve_seasonal_context(seasonal_context: Optional[str]) -> Optional[str]:
+    """§8: unlike every other resolver in this module, None/"" is a valid,
+    expected input — the slot is optional by design, not merely unset. Only
+    a *non-empty* value gets checked against the closed list; an empty one
+    passes straight through as "no seasonal framing this time."""
+    if not seasonal_context:
+        return None
+    if seasonal_context not in SEASONAL_CONTEXTS:
+        raise InvalidSlotValue(
+            f"{seasonal_context!r} is not in the §8 slot vocabulary for "
+            f"{{{{seasonal_context}}}} — must be one of {SEASONAL_CONTEXTS} or empty/None"
+        )
+    return seasonal_context
 
 
 def resolve_surface_hex(tokens: Dict[str, str]) -> str:

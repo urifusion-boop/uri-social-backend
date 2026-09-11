@@ -33,10 +33,10 @@ Hard checks (§2.3):
    self-checks rather than leaving it to an external caller, because §2.3
    itself singles this format out for a harder bar than the rest.
 """
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 from ..visual_slots import resolve_nigerian_setting
-from ..layer2_generation import REPRESENTATION_BLOCK, generate_scene
+from ..layer2_generation import REPRESENTATION_BLOCK, generate_scene, seasonal_context_clause
 from .legibility import assert_legible
 from ._text_metrics import wrap_text
 from .tokens import AdFormatDef, PLACEHOLDER_TOKENS, logo_badge_layers
@@ -100,7 +100,8 @@ def _check_fits_scrim(lines, zone_name: str, scrim_height: int) -> None:
 # bright-daylight prompts — which the solution half deliberately uses —
 # so stating this explicitly rather than leaving it to the setting to imply
 # still matters here.
-def _problem_prompt(problem_situation: str, nigerian_setting: str) -> str:
+def _problem_prompt(problem_situation: str, nigerian_setting: str, seasonal_context: Optional[str] = None) -> str:
+    seasonal = seasonal_context_clause(seasonal_context)
     return (
         f"Create a realistic documentary-style Nigerian photograph that "
         f"communicates {problem_situation} immediately without requiring "
@@ -115,11 +116,14 @@ def _problem_prompt(problem_situation: str, nigerian_setting: str) -> str:
         "relatively calm space for the problem headline. The background should "
         "establish context without becoming a second focal point. The image "
         "should feel observed rather than staged: realistic, imperfect, "
-        "unpolished and documentary."
+        f"unpolished and documentary.{(' ' + seasonal) if seasonal else ''}"
     )
 
 
-def _solution_prompt(solution_situation: str, problem_situation: str, nigerian_setting: str) -> str:
+def _solution_prompt(
+    solution_situation: str, problem_situation: str, nigerian_setting: str, seasonal_context: Optional[str] = None,
+) -> str:
+    seasonal = seasonal_context_clause(seasonal_context)
     return (
         "Create a realistic documentary-style Nigerian photograph showing the "
         f"positive resolution of {problem_situation}, represented by "
@@ -133,7 +137,7 @@ def _solution_prompt(solution_situation: str, problem_situation: str, nigerian_s
         "images feel like deliberate visual counterparts. Preserve a clear "
         "copy-safe area for the solution headline. The contrast should come "
         "primarily from the situation itself, not excessive colour grading or "
-        "visual effects."
+        f"visual effects.{(' ' + seasonal) if seasonal else ''}"
     )
 
 
@@ -237,17 +241,24 @@ async def render(
     nigerian_setting: str,
     canvas_size: Tuple[int, int] = (1080, 1080),
     tokens: Dict[str, str] = None,
+    seasonal_context: Optional[str] = None,
 ) -> bytes:
     """Full pipeline: two real Layer 2 generations (problem, solution),
     then Layer 4 template-fill — the first render() in this library that
     does real generation rather than just building + rendering an
-    already-fully-supplied document."""
+    already-fully-supplied document.
+
+    seasonal_context: optional §8 slot (e.g. "Detty December") — validated
+    against visual_slots.SEASONAL_CONTEXTS inside the prompt builders below;
+    omit for no seasonal framing, which is the common case."""
     width, height = canvas_size
     zone_size = f"{width}x{height // 2}"
 
-    problem_url = await generate_scene(_problem_prompt(problem_situation, nigerian_setting), size=zone_size)
+    problem_url = await generate_scene(
+        _problem_prompt(problem_situation, nigerian_setting, seasonal_context), size=zone_size,
+    )
     solution_url = await generate_scene(
-        _solution_prompt(solution_situation, problem_situation, nigerian_setting), size=zone_size,
+        _solution_prompt(solution_situation, problem_situation, nigerian_setting, seasonal_context), size=zone_size,
     )
 
     document = build_document(problem_url, solution_url, problem_text, solution_text, canvas_size, tokens)

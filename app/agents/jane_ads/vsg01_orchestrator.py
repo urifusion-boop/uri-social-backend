@@ -80,6 +80,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import date
 from typing import Optional
 
 from app.core.config import settings
@@ -424,6 +425,35 @@ async def _build_borrowed_interface(business_name: str, category: str, descripti
 _NIGERIAN_SETTINGS = NIGERIAN_SETTINGS
 
 
+# §8: "Seasonal context should remain a slot, not a new format" — resolved
+# here from today's date and threaded into the real generation call sites
+# below, rather than left as an unreachable parameter nothing ever
+# populates (the same "built but never wired" gap this session already
+# found and fixed once for the corpus seed — see the Phase 2 plan).
+#
+# Deliberately covers only THREE of §8's nine possible values — the ones
+# with a fixed, non-controversial calendar window a Nigerian business
+# audience would recognise as "in season" without needing external data:
+# salary week (a short, high-salience commercial window), Detty December
+# (all of December), and back-to-school season (September, when most
+# Nigerian school terms resume). Harmattan/rainy/dry season are real but
+# diffuse weather windows that would fire for months at a time with no
+# single clear boundary, and Easter/Eid are movable feasts that need a
+# real calendar computation (lunar for Eid) to place correctly — guessing
+# either wrong is worse than the honest None returned here for the rest of
+# the year. §8's own text makes this restraint the correct default anyway:
+# "Do not add seasonal decorations merely because the slot is populated."
+def _resolve_current_seasonal_context(today: Optional[date] = None) -> Optional[str]:
+    d = today or date.today()
+    if d.month == 12:
+        return "Detty December"
+    if d.month == 9:
+        return "back-to-school season"
+    if d.day >= 28 or d.day <= 2:
+        return "salary week"
+    return None
+
+
 async def _content_problem_solution(business_name: str, category: str, description: str) -> Optional[dict]:
     prompt = (
         f"For a Nigerian ad for {_business_line(business_name, category, description)}, describe "
@@ -480,10 +510,14 @@ async def _build_problem_solution(business_name: str, category: str, description
         return None
     width, height = _CANVAS_SIZE
     zone_size = f"{width}x{height // 2}"
+    seasonal_context = _resolve_current_seasonal_context()
     prompts = {
-        "problem": problem_solution._problem_prompt(content["problem_situation"], content["nigerian_setting"]),
+        "problem": problem_solution._problem_prompt(
+            content["problem_situation"], content["nigerian_setting"], seasonal_context,
+        ),
         "solution": problem_solution._solution_prompt(
             content["solution_situation"], content["problem_situation"], content["nigerian_setting"],
+            seasonal_context,
         ),
     }
 
@@ -798,10 +832,15 @@ async def _build_starter_pack(business_name: str, category: str, description: st
     import math
     cols = math.ceil(math.sqrt(len(item_descriptions) + 1))
     cell_size = f"{width // cols}x{width // cols}"
+    seasonal_context = _resolve_current_seasonal_context()
     try:
         item_urls = []
         for desc in item_descriptions:
-            item_urls.append(await generate_scene(starter_pack._item_prompt(desc), size=cell_size))
+            item_urls.append(
+                await generate_scene(
+                    starter_pack._item_prompt(desc, seasonal_context=seasonal_context), size=cell_size,
+                )
+            )
     except SceneGenerationFailed as e:
         print(f"[VSG01] Starter Pack item generation failed: {e}", flush=True)
         return None
@@ -953,7 +992,9 @@ async def _build_work_in_progress(business_name: str, category: str, description
     from .ad_formats import work_in_progress
     try:
         scene_url = await generate_scene(
-            work_in_progress._scene_prompt(content["trade_activity"], content["nigerian_setting"]),
+            work_in_progress._scene_prompt(
+                content["trade_activity"], content["nigerian_setting"], _resolve_current_seasonal_context(),
+            ),
             size=f"{_CANVAS_SIZE[0]}x{_CANVAS_SIZE[1]}",
         )
     except SceneGenerationFailed as e:

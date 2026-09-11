@@ -10,6 +10,7 @@ from app.agents.jane_ads.visual_slots import (
     NIGERIAN_SETTINGS,
     LIGHTING_DEFAULTS,
     DRESS_REGISTERS,
+    SEASONAL_CONTEXTS,
     ZONE_A_FIELDS,
     ZONE_B_FIELDS,
     InvalidSlotValue,
@@ -17,6 +18,7 @@ from app.agents.jane_ads.visual_slots import (
     resolve_nigerian_setting,
     resolve_lighting,
     resolve_surface_hex,
+    resolve_seasonal_context,
     build_customer_description,
     visual_leakage_terms,
     check_visual_leakage,
@@ -45,6 +47,22 @@ class TestSlotVocabulary:
 
     def test_surface_hex_reads_from_the_token_set(self):
         assert resolve_surface_hex({"surface": "#0F766E", "field": "#FFFFFF"}) == "#0F766E"
+
+    @pytest.mark.parametrize("seasonal", SEASONAL_CONTEXTS)
+    def test_every_enumerated_seasonal_context_is_accepted(self, seasonal):
+        assert resolve_seasonal_context(seasonal) == seasonal
+
+    def test_none_is_valid_and_means_no_seasonal_framing(self):
+        """§8: unlike every other slot in this module, the slot being unset
+        is the expected common case, not an error."""
+        assert resolve_seasonal_context(None) is None
+
+    def test_empty_string_is_also_treated_as_unset(self):
+        assert resolve_seasonal_context("") is None
+
+    def test_a_value_outside_the_enumerated_list_is_rejected(self):
+        with pytest.raises(InvalidSlotValue):
+            resolve_seasonal_context("Black Friday")
 
 
 class TestCustomerDescription:
