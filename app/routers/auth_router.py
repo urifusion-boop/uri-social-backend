@@ -1,9 +1,10 @@
 import uuid
 import httpx
 import asyncio
+from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Header, Request
 from motor.motor_asyncio import AsyncIOMotorDatabase
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, BeforeValidator, EmailStr
 from passlib.context import CryptContext
 from bson import ObjectId
 import secrets
@@ -35,15 +36,33 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 VERIFICATION_RESEND_COOLDOWN_SECONDS = 30
 
 
+def _normalize_email(v: str) -> str:
+    """Every lookup in this file is `find_one({"email": ...})` — an exact
+    byte match, and Mongo has no case-insensitive index here — so an
+    account can only ever be found again by the identical casing it was
+    created with. Confirmed live: a user's forgot-password requests
+    silently matched nothing (still returning the generic "sent" message)
+    because her account was stored lowercase and she typed a capital
+    letter — no error, no hint, just silence. Normalizing at the request
+    boundary means every endpoint that takes `email` compares/stores the
+    same canonical form regardless of how the client capitalizes it."""
+    return v.strip().lower() if isinstance(v, str) else v
+
+
+# Apply to every `email` field below in place of a bare EmailStr — still
+# validates as a real email address, just canonicalized first.
+NormalizedEmail = Annotated[EmailStr, BeforeValidator(_normalize_email)]
+
+
 class SignupRequest(BaseModel):
-    email: EmailStr
+    email: NormalizedEmail
     password: str
     first_name: str = ""
     last_name: str = ""
 
 
 class LoginRequest(BaseModel):
-    email: EmailStr
+    email: NormalizedEmail
     password: str
 
 
@@ -174,6 +193,7 @@ async def google_auth(body: GoogleAuthRequest, db: AsyncIOMotorDatabase = Depend
     email = userinfo.get("email")
     if not email:
         raise HTTPException(status_code=400, detail="Could not retrieve email from Google account.")
+    email = _normalize_email(email)  # same canonical form as every other lookup in this file
 
     first_name = userinfo.get("given_name", "")
     last_name = userinfo.get("family_name", "")
@@ -359,12 +379,12 @@ async def login(body: LoginRequest, db: AsyncIOMotorDatabase = Depends(get_db_de
 # ==================== Email Verification Endpoints ====================
 
 class VerifyEmailRequest(BaseModel):
-    email: EmailStr
+    email: NormalizedEmail
     code: str
 
 
 class ResendVerificationRequest(BaseModel):
-    email: EmailStr
+    email: NormalizedEmail
 
 
 @router.post("/verify-email")
@@ -538,11 +558,11 @@ async def resend_verification(body: ResendVerificationRequest, db: AsyncIOMotorD
 # ==================== Password Management Endpoints ====================
 
 class ForgotPasswordRequest(BaseModel):
-    email: EmailStr
+    email: NormalizedEmail
 
 
 class ResetPasswordRequest(BaseModel):
-    email: EmailStr
+    email: NormalizedEmail
     code: str
     new_password: str
 
@@ -609,35 +629,6 @@ async def forgot_password(body: ForgotPasswordRequest, db: AsyncIOMotorDatabase 
         "responseMessage": "If an account exists with this email, a password reset code has been sent.",
         "responseData": {},
     }
-
-
-# TEMPORARY — one-off diagnostic for a user reporting no password-reset
-# email ever arrives. Read-only, no side effects; case-insensitive so it
-# also surfaces the exact-casing bug it's here to confirm/rule out. Delete
-# after use.
-@router.get("/admin/debug-user-lookup")
-async def debug_user_lookup(
-    email: str,
-    x_bootstrap_secret: str = Header(...),
-    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-):
-    if x_bootstrap_secret != "vsg01-corpus-bootstrap-2026-dev-only":
-        raise HTTPException(status_code=403, detail="Not authorized.")
-    import re
-    pattern = re.compile(f"^{re.escape(email)}$", re.IGNORECASE)
-    matches = []
-    async for u in db["users"].find({"email": pattern}):
-        matches.append({
-            "id": str(u.get("_id")),
-            "email": u.get("email"),
-            "auth_provider": u.get("auth_provider"),
-            "created_at": u.get("created_at"),
-            "email_verified": u.get("email_verified") or u.get("is_verified"),
-            "has_reset_code": bool(u.get("password_reset_code")),
-            "reset_code_expires": u.get("password_reset_code_expires"),
-            "updated_at": u.get("updated_at"),
-        })
-    return {"query_email": email, "match_count": len(matches), "matches": matches}
 
 
 @router.post("/reset-password")
