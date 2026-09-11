@@ -611,6 +611,35 @@ async def forgot_password(body: ForgotPasswordRequest, db: AsyncIOMotorDatabase 
     }
 
 
+# TEMPORARY — one-off diagnostic for a user reporting no password-reset
+# email ever arrives. Read-only, no side effects; case-insensitive so it
+# also surfaces the exact-casing bug it's here to confirm/rule out. Delete
+# after use.
+@router.get("/admin/debug-user-lookup")
+async def debug_user_lookup(
+    email: str,
+    x_bootstrap_secret: str = Header(...),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    if x_bootstrap_secret != "vsg01-corpus-bootstrap-2026-dev-only":
+        raise HTTPException(status_code=403, detail="Not authorized.")
+    import re
+    pattern = re.compile(f"^{re.escape(email)}$", re.IGNORECASE)
+    matches = []
+    async for u in db["users"].find({"email": pattern}):
+        matches.append({
+            "id": str(u.get("_id")),
+            "email": u.get("email"),
+            "auth_provider": u.get("auth_provider"),
+            "created_at": u.get("created_at"),
+            "email_verified": u.get("email_verified") or u.get("is_verified"),
+            "has_reset_code": bool(u.get("password_reset_code")),
+            "reset_code_expires": u.get("password_reset_code_expires"),
+            "updated_at": u.get("updated_at"),
+        })
+    return {"query_email": email, "match_count": len(matches), "matches": matches}
+
+
 @router.post("/reset-password")
 async def reset_password(body: ResetPasswordRequest, db: AsyncIOMotorDatabase = Depends(get_db_dependency)):
     """Reset password using the code sent to email."""
