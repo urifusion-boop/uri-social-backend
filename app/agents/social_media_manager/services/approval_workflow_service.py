@@ -1650,15 +1650,23 @@ class ApprovalWorkflowService:
                         else:
                             media_urls = [image_url]
 
-                # For reel posts, pass video_url as the Outstand media
-                if post_type == "reel" and not media_urls and draft.get("video_url"):
+                # Pass video_url as the Outstand media whenever no image/slide media was
+                # found — not gated on post_type == "reel". Live-reported bug: the upload
+                # form (UploadContentForm.tsx) has no "reel" option at all, so an uploaded
+                # video is always saved with post_type="feed" — the same root cause
+                # approve_content's schedule-time validation was fixed for (see that
+                # function's own "Instagram requires an image or video" comment), but this
+                # publish-time media assembly still had the old reel-only gate, so a
+                # scheduled video draft passed validation, sat as "scheduled", then failed
+                # (or posted with no media at all) when the cron actually tried to publish it.
+                if not media_urls and draft.get("video_url"):
                     media_urls = [draft["video_url"]]
-                    print(f"🎬 Reel: passing video_url to Outstand media: {draft['video_url'][:80]}")
+                    print(f"🎬 Video: passing video_url to Outstand media: {draft['video_url'][:80]}")
 
-                # Instagram requires at least one image — warn and skip if no media
+                # Instagram requires at least one image or video — warn and skip if no media
                 if platform == "instagram" and not media_urls:
-                    print(f"⚠️ Instagram post skipped — Instagram API requires an image. Generate content with 'include_images: true' to post on Instagram.")
-                    return {"success": False, "error": "Instagram requires an image. Re-generate this post with 'include_images: true' enabled."}
+                    print(f"⚠️ Instagram post skipped — Instagram API requires an image or video. Add media to this post before scheduling.")
+                    return {"success": False, "error": "Instagram requires an image or video. Add media to this post before scheduling."}
 
                 # For X/Twitter threads, pass the individual tweets so each becomes
                 # its own Outstand container (native thread support).
