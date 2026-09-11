@@ -4141,51 +4141,6 @@ async def corpus_upload(
             os.unlink(tmp_path)
 
 
-@router.get("/debug/vsg01-v3-preview", include_in_schema=False)
-async def _debug_vsg01_v3_preview(request: Request, format_id: str = "SEED-081") -> Response:
-    """TEMPORARY — verifying the gpt-image-2 pin in generate_scene() actually
-    takes effect (not just that it doesn't crash). Same secret-gated pattern
-    as this session's other one-off diagnostics; remove after use, confirm
-    404. Returns the model tag in a response header alongside the PNG so it
-    can be confirmed without digging through CloudWatch."""
-    if request.headers.get("X-Bootstrap-Secret") != "vsg01-corpus-bootstrap-2026-dev-only":
-        raise HTTPException(status_code=404, detail="Not Found")
-
-    from .layer2_generation import COMPOSITION_DIRECTIVE, TYPOGRAPHY_DIRECTIVE, GLOBAL_NEGATIVE_PROMPT
-    from app.agents.social_media_manager.services.image_content_service import ImageContentService
-
-    if format_id == "SEED-081":
-        from .ad_formats.problem_solution import _problem_prompt
-        prompt = _problem_prompt("a trader losing customers to network downtime", "a roadside food stand")
-    elif format_id == "SEED-098":
-        from .ad_formats.work_in_progress import _scene_prompt
-        prompt = _scene_prompt("a solar panel installation", "a residential rooftop")
-    else:
-        raise HTTPException(status_code=400, detail=f"no debug preview wired for {format_id!r}")
-
-    full_prompt = f"{prompt.strip()} {COMPOSITION_DIRECTIVE} {TYPOGRAPHY_DIRECTIVE} {GLOBAL_NEGATIVE_PROMPT}"
-    result = await ImageContentService._call_dalle_api(full_prompt, size="1080x1080", image_model="openai/gpt-image-2")
-    if not result.get("success"):
-        raise HTTPException(status_code=502, detail=f"generation failed: {result.get('error')}")
-
-    image_url = result["url"]
-    if image_url.startswith("data:"):
-        import base64
-        header, b64data = image_url.split(",", 1)
-        png_bytes = base64.b64decode(b64data)
-    else:
-        import httpx
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.get(image_url)
-            png_bytes = r.content
-
-    return Response(
-        content=png_bytes,
-        media_type="image/png",
-        headers={"X-Image-Model-Used": str(result.get("model"))},
-    )
-
-
 @router.get("/corpus/upload", response_class=HTMLResponse, include_in_schema=False)
 async def corpus_upload_page() -> str:
     """The page itself. Self-contained — no build step, no bundle, nothing to deploy
