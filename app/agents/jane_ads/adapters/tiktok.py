@@ -90,7 +90,14 @@ _BILLING_EVENT = "CPC"
 # avatar to be a 1:1 square image.
 _IDENTITY_COLLECTION = "jane_ads_tiktok_identity"
 _IDENTITY_DISPLAY_NAME = "URI Social"
-_IDENTITY_LOGO_URL = "https://staging.urisocial.com/images/uri-logo-1024.png"
+# staging.urisocial.com is dead (renamed in the 2026-08-28 staging migration —
+# see reference_aws_staging memory); confirmed live (2026-09-11) TikTok's
+# fetch-by-URL failed with "Failed to fetch the URL: ... Bad Gateway" against
+# the old domain. uri-staging.urisocial.com serves the same asset (200).
+# NOTE: www.urisocial.com/images/uri-logo-1024.png 404s on prod's current S3
+# build — re-check this URL before this adapter goes prod, it isn't
+# guaranteed to carry over.
+_IDENTITY_LOGO_URL = "https://uri-staging.urisocial.com/images/uri-logo-1024.png"
 
 # TikTok's operation_status values, translated to plain language for the campaign-
 # list view — same purpose as meta.py's own _DELIVERY_LABELS. An empty campaign/get/
