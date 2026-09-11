@@ -243,18 +243,50 @@ async def create_draft_from_item_v2(
                 if item.get("ai_image_prompt"):
                     image_seed_content = f"{seed_content}\nImage direction: {item['ai_image_prompt']}"
 
-                _bg_image_tasks = [
-                    asyncio.create_task(_generate_image_bg(
-                        draft_id=d.get("draft_id") or d.get("id"),
-                        platform=d.get("platform", "facebook"),
-                        content=d.get("content", image_seed_content),
-                        seed_content=image_seed_content,
-                        brand_context=brand_context,
-                        db=db,
-                        reference_image=None,
-                    ))
-                    for d in drafts
-                ]
+                # Carousel drafts need ONE _generate_image_bg call PER SLIDE
+                # (post_type="carousel", slide_index, total_slides, carousel_id)
+                # — that's how the image lands on slides[i].image_url, which is
+                # what the frontend actually polls. Calling it once per draft the
+                # way the non-carousel branch does leaves every slide's
+                # image_url null forever (confirmed live: "Generating slide
+                # image…" never resolves) — this mirrors the main Create-tab
+                # flow's carousel loop (complete_social_manager.py) that v1's
+                # own calendar create-draft endpoint is missing too.
+                _bg_image_tasks: list = []
+                if item.get("format") == "carousel":
+                    for d in drafts:
+                        draft_id = d.get("draft_id") or d.get("id")
+                        slides = d.get("slides") or []
+                        total_slides = len(slides)
+                        for slide_index, slide in enumerate(slides):
+                            slide_content = f"{slide.get('headline', '')} {slide.get('body', '')}".strip()
+                            enriched_seed = f"{image_seed_content}. This slide: {slide_content}"
+                            _bg_image_tasks.append(asyncio.create_task(_generate_image_bg(
+                                draft_id=draft_id,
+                                platform=d.get("platform", "facebook"),
+                                content=slide_content or d.get("content", image_seed_content),
+                                seed_content=enriched_seed,
+                                brand_context=brand_context,
+                                db=db,
+                                reference_image=None,
+                                post_type="carousel",
+                                slide_index=slide_index,
+                                total_slides=total_slides,
+                                carousel_id=draft_id,
+                            )))
+                else:
+                    _bg_image_tasks = [
+                        asyncio.create_task(_generate_image_bg(
+                            draft_id=d.get("draft_id") or d.get("id"),
+                            platform=d.get("platform", "facebook"),
+                            content=d.get("content", image_seed_content),
+                            seed_content=image_seed_content,
+                            brand_context=brand_context,
+                            db=db,
+                            reference_image=None,
+                        ))
+                        for d in drafts
+                    ]
                 _BG_IMAGE_TASKS.update(_bg_image_tasks)
                 for t in _bg_image_tasks:
                     t.add_done_callback(_BG_IMAGE_TASKS.discard)
