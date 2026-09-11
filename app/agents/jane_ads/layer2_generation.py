@@ -86,6 +86,62 @@ GLOBAL_NEGATIVE_PROMPT = (
 )
 
 
+# §3 verbatim — one of these three is resolved and inserted per generation
+# by _resolve_ratio_clause() below, in the §12 assembly position (right
+# after the format-specific prompt, before the representation/composition/
+# typography/negative blocks). "Generate each required ratio independently
+# where composition depends on negative space. Do not rely on cropping one
+# composition into another ratio" — so this is picked from the actual pixel
+# dimensions being requested, not assumed square.
+RATIO_CLAUSE_1_1 = (
+    "square composition with balanced outer margins, one dominant focal area, "
+    "subject occupying approximately 40-55% of the visual field where appropriate, "
+    "clear separation between the focal subject and the copy-safe area, "
+    "no important detail touching the crop boundaries"
+)
+RATIO_CLAUSE_4_5 = (
+    "vertical portrait advertising composition, strong visual hierarchy from upper "
+    "area to lower information area, subject concentrated primarily in the upper "
+    "or middle portion, approximately 25-35% of the lower frame kept calm and "
+    "copy-safe where the format requires an offer or action, generous side margins, "
+    "important details protected from the crop boundaries"
+)
+RATIO_CLAUSE_9_16 = (
+    "tall vertical advertising composition with a deliberate top-to-bottom visual "
+    "journey, primary subject concentrated around the middle 40-60% unless the "
+    "format specifies another hierarchy, generous copy-safe space above or below, "
+    "clear separation between visual zones, important details protected from the "
+    "extreme top and bottom crop areas, generous breathing room around all major "
+    "elements"
+)
+
+# §3's own three named ratios as (width, height) targets to measure distance
+# against — not a hardcoded aspect-ratio-value table, so a caller passing an
+# unusual size (e.g. a half-canvas zone like Problem/Solution's) still
+# resolves to whichever of the three it's closest to, rather than needing a
+# fourth case.
+_RATIO_TARGETS = (
+    (1, 1, RATIO_CLAUSE_1_1),
+    (4, 5, RATIO_CLAUSE_4_5),
+    (9, 16, RATIO_CLAUSE_9_16),
+)
+
+
+def _resolve_ratio_clause(size: str) -> str:
+    """Picks the §3 ratio clause whose aspect ratio is closest to the actual
+    width x height being generated. Falls back to 1:1 (the library's
+    universal default before this ratio work) if size can't be parsed —
+    matching generate_scene's own default rather than raising, since a
+    malformed size string is still going somewhere and getting SOME
+    composition guidance beats getting none."""
+    try:
+        width, height = map(int, size.lower().split("x"))
+        aspect = width / height
+    except (ValueError, ZeroDivisionError, AttributeError):
+        return RATIO_CLAUSE_1_1
+    return min(_RATIO_TARGETS, key=lambda t: abs(aspect - t[0] / t[1]))[2]
+
+
 # §4 verbatim — appended by a format's own scene-prompt builder wherever a
 # person appears in the generated scene (conditional, unlike §2A/§2B/§2C
 # above, which apply to every generation regardless of subject). Shared here
@@ -116,13 +172,18 @@ async def generate_scene(prompt: str, size: str = "1080x1080") -> str:
     """
     Generate a single Layer 2 scene image and return a real hosted URL.
 
-    prompt: the scene description ONLY — this function appends
-    COMPOSITION_DIRECTIVE, TYPOGRAPHY_DIRECTIVE and GLOBAL_NEGATIVE_PROMPT
-    itself, in that order (v3 §1/§12), so callers should not duplicate any
-    of them.
+    prompt: the scene description ONLY — this function appends the §3 ratio
+    clause (resolved from size), COMPOSITION_DIRECTIVE, TYPOGRAPHY_DIRECTIVE
+    and GLOBAL_NEGATIVE_PROMPT itself, in that order (v3 §12's assembly:
+    format prompt, ratio clause, representation if a person appears —
+    already inline in the format prompt itself for this library, see
+    REPRESENTATION_BLOCK's own docstring — then composition, typography,
+    negative), so callers should not duplicate any of them.
     size: "WIDTHxHEIGHT" — passed straight through to _call_dalle_api,
     which internally buckets to the nearest square/landscape/portrait
-    generation size and crops to the exact requested dimensions.
+    generation size and crops to the exact requested dimensions. Also used
+    here to resolve which of §3's three ratio clauses (1:1/4:5/9:16) best
+    matches what's actually being generated.
 
     Raises SceneGenerationFailed on any failure rather than returning None
     — every caller in this format library needs a real background to
@@ -152,7 +213,8 @@ async def generate_scene(prompt: str, size: str = "1080x1080") -> str:
     # gets cut for space.
     _DALLE_MAX_CHARS = 4000
     _SAFETY_MARGIN = 100
-    fixed_suffix = f" {COMPOSITION_DIRECTIVE} {TYPOGRAPHY_DIRECTIVE} {GLOBAL_NEGATIVE_PROMPT}"
+    ratio_clause = _resolve_ratio_clause(size)
+    fixed_suffix = f" {ratio_clause} {COMPOSITION_DIRECTIVE} {TYPOGRAPHY_DIRECTIVE} {GLOBAL_NEGATIVE_PROMPT}"
     scene_description = prompt.strip()
     budget = _DALLE_MAX_CHARS - _SAFETY_MARGIN - len(fixed_suffix)
     if len(scene_description) > budget:
