@@ -4142,12 +4142,23 @@ async def corpus_upload(
 
 
 @router.get("/debug/ads-generation-e2e", include_in_schema=False)
-async def _debug_ads_generation_e2e(request: Request, db: AsyncIOMotorDatabase = Depends(get_db_dependency)) -> dict:
+async def _debug_ads_generation_e2e(
+    request: Request,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    description: str = "We sell grilled suya and fast delivery across Lagos.",
+    business_name: str = "Test Suya Spot",
+    category: str = "restaurant",
+    format_id: str = "",
+) -> dict:
     """TEMPORARY — reproduce "ads generation not working" on dev end-to-end
     through the real generate_ad_creative() entry point, with no user_id/
     brand_id (so it can't be blamed on one account's data), to see the
-    actual result or exception rather than guess. Same secret-gated
-    pattern as this session's other diagnostics; remove after use."""
+    actual result or exception rather than guess. format_id forces
+    vsg01_format_id (tried first, same fail-open contract as the real
+    param — an ineligible/stale id is silently ignored, not an error) so a
+    specific format can be tested directly instead of relying on content-
+    fit trigger phrases in description. Same secret-gated pattern as this
+    session's other diagnostics; remove after use."""
     if request.headers.get("X-Bootstrap-Secret") != "vsg01-corpus-bootstrap-2026-dev-only":
         raise HTTPException(status_code=404, detail="Not Found")
 
@@ -4156,12 +4167,13 @@ async def _debug_ads_generation_e2e(request: Request, db: AsyncIOMotorDatabase =
 
     try:
         result = await generate_ad_creative(
-            business_name="Test Suya Spot",
-            category="restaurant",
+            business_name=business_name,
+            category=category,
             goal="messages",
-            description="We sell grilled suya and fast delivery across Lagos.",
+            description=description,
             user_id="",
             db=db,
+            vsg01_format_id=format_id or None,
         )
         return {"success": True, "result": result.model_dump() if hasattr(result, "model_dump") else str(result)}
     except Exception as e:
