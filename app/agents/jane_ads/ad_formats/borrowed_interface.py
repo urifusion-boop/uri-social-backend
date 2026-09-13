@@ -67,6 +67,19 @@ class TooManyTurns(ValueError):
     pass
 
 
+class ExchangeOverflowsCanvas(ValueError):
+    """Turn COUNT staying at/under 4 (TooManyTurns' own check) does not
+    guarantee the rendered content fits — four turns of long, multi-line
+    wrapped messages can still be taller than the canvas. Live-confirmed:
+    a real 4-turn exchange rendered with its final bubble (the turn that
+    carries the offer/answer, per this format's own reason for existing)
+    clipped off the bottom of the canvas, illegible. Raised instead of
+    silently clipping, same philosophy as every other overflow guard in
+    this format library (news_headline.ContentOverflowsZone,
+    problem_solution.TextOverflowsScrim)."""
+    pass
+
+
 def _tint(hex_color: str, toward: str, amount: float) -> str:
     """Blend `hex_color` toward `toward` by `amount` (0=hex_color, 1=toward).
     Used to derive the outgoing-bubble colour from the brand's own `accent`
@@ -85,9 +98,11 @@ def build_document(
     """
     Chat variant. turns: [(speaker, message, timestamp), ...] where speaker
     is "them" (incoming, left-aligned, `field` bubble) or "us" (outgoing,
-    right-aligned, tinted-`accent` bubble). Each message is rendered as a
-    single line — this renderer does not wrap text, matching every other
-    format module in this package.
+    right-aligned, tinted-`accent` bubble). Each message wraps to as many
+    lines as it needs within the bubble width (`_wrap_text`, same helper
+    Us vs Them/Review Card use) — raises ExchangeOverflowsCanvas if the
+    resulting block is taller than the canvas rather than silently
+    clipping the last bubble.
     """
     if len(turns) > 4:
         raise TooManyTurns(
@@ -122,6 +137,12 @@ def build_document(
         measured_turns.append((speaker, lines, timestamp, bubble_height, turn_height))
 
     total_height = sum(mt[4] for mt in measured_turns) - 32  # no trailing gap after the last turn
+    available_height = height - 2 * margin
+    if total_height > available_height:
+        raise ExchangeOverflowsCanvas(
+            f"{len(turns)}-turn exchange needs {total_height}px, taller than the "
+            f"available {available_height}px — shorten the messages"
+        )
     y = max(margin, (height - total_height) // 2)
 
     for speaker, lines, timestamp, bubble_height, turn_height in measured_turns:
