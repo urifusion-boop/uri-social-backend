@@ -75,9 +75,20 @@ different real reasons, not a gap in this module:
     `isolated_ad_account` bypassed) for manual/QA rendering outside the
     retrieval gate — see `/jane-ads/debug/vsg01-format-direct` in router.py.
 
-Day 1 -> Day 30 (SEED-078) and The Censored Item (SEED-083) remain
-unwired — both also `pooled_account_safe=REQUIRES_ISOLATION`, same
-platform-level gap as News Headline above.
+The Censored Item (SEED-083) and Day 1 -> Day 30 (SEED-078) now also have
+real builders (`_build_censored_item`, `_build_day1_day30`), completing all
+15 formats' registration in `_BUILDERS`. Both are `upload`-only (never
+generate the real product/progress photo itself — §1.2) and both are also
+`pooled_account_safe=REQUIRES_ISOLATION`, the same platform-level gap as
+News Headline above — neither auto-fires live today, for the same reason.
+Day 1 -> Day 30 has a SECOND real blocker on top: it needs two genuine
+photos of the same thing at two points in time (`day30_photo_url`), and no
+attestation flow in this codebase produces a second photo today (only
+single product_photo/real_customer_photo attestations exist) — so even
+with isolation lifted, an automatic call (which only ever has one
+`photo_url`) would still resolve to None via its own builder. Both
+builders are directly callable via `/jane-ads/debug/vsg01-format-direct`
+for manual/QA rendering, same as News Headline/Humour-Cartoon above.
 
 Falls back to the existing generic image (`generate_ad_image`) at every
 possible failure point — selection returning nothing, every candidate's
@@ -134,7 +145,17 @@ NO_PHOTO_FORMAT_IDS = frozenset({
     # real human review (see that builder's own docstring).
     "SEED-089",
 })
-UPLOAD_PHOTO_FORMAT_IDS = frozenset({"SEED-093", "SEED-082", "SEED-074", "SEED-096"})
+UPLOAD_PHOTO_FORMAT_IDS = frozenset({
+    "SEED-093", "SEED-082", "SEED-074", "SEED-096",
+    # Censored Item / Day 1 -> Day 30 — same completeness/readiness note as
+    # News Headline above: both are also pooled_account_safe=REQUIRES_ISOLATION,
+    # so retrieval.py blocks them from live selection regardless of
+    # membership here. Day 1 -> Day 30 additionally needs a SECOND real photo
+    # (day30_photo_url) that no attestation flow produces today, so even a
+    # single-photo_url automatic call would still resolve to None via its own
+    # builder — membership here has no live effect until both gaps close.
+    "SEED-083", "SEED-078",
+})
 RECOMPOSITE_PHOTO_FORMAT_IDS = UPLOAD_PHOTO_FORMAT_IDS | {"SEED-088"}
 
 # The format library's own tested/documented canvas — every format module's
@@ -1263,6 +1284,150 @@ async def _build_humour_cartoon(business_name: str, category: str, description: 
     return document
 
 
+# ── SEED-083: The Censored Item (needs a real, attested product photo) ───
+
+async def _content_censored_item(business_name: str, category: str, description: str) -> Optional[dict]:
+    """§2.10: 'There is a real pending reveal.' Same verbatim-fact contract
+    as _content_receipt/_content_price_led_offer — only ever fires when the
+    business's own words already state a genuine reveal date or mechanism;
+    never invents one to fill the format."""
+    if not (description or "").strip():
+        return None
+    prompt = (
+        f"Below is a business's own description/context text:\n\n{description}\n\n"
+        "Does this text state a REAL pending reveal — something specific being kept "
+        "back until a stated date or mechanism (e.g. 'full menu revealed 1 October', "
+        "'unboxed live on Friday')? This format only exists to build anticipation for "
+        "an ACTUAL upcoming reveal, never to imply withheld shocking content.\n"
+        "If no real reveal date/mechanism is stated, return reveal_text as an empty "
+        "string — do not invent one.\n"
+        "- reveal_text: the reveal date or mechanism, stated plainly (<=40 characters)\n"
+        "- what_is_obscured: a short, neutral description of what's hidden (e.g. 'the new "
+        "lid design') — MUST NOT be a price, cost, or amount; this format never obscures a "
+        "price\n"
+        "Return ONLY the JSON with exactly these 2 keys."
+    )
+    d = await _call_content_model(prompt)
+    if not d or not str(d.get("reveal_text", "")).strip():
+        return None
+    what = str(d.get("what_is_obscured", "")).strip()
+    if not what:
+        return None
+    return {"reveal_text": str(d.get("reveal_text", "")).strip(), "what_is_obscured": what}
+
+
+async def _build_censored_item(business_name: str, category: str, description: str, tokens: dict,
+                               photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None,
+                               obscure_box: Optional[tuple] = None):
+    """§2.10: 'The obscured item must be the real product' — this builder
+    only ever places the caller's own real photo_url, never a generated one
+    (see censored_item.py's own module docstring on why `generate` is never
+    permitted for the product itself).
+
+    obscure_box: (x, y, width, height) of the redaction bar. This module has
+    no way to locate 'the interesting part' of an arbitrary photo — the
+    format's own docstring already discloses this as a caller-side concern,
+    not something to guess via a vision call. Defaults to a generic centred
+    box over roughly the middle third of the photo zone when not supplied
+    (a placeholder good enough to exercise the real layout/legibility path,
+    not a substitute for a caller who actually knows what's interesting in
+    their own photo)."""
+    if not photo_url:
+        return None
+    content = await _content_censored_item(business_name, category, description)
+    if not content:
+        return None
+    from .ad_formats import censored_item
+    width, height = _CANVAS_SIZE
+    photo_zone_height = int(height * 0.78)
+    if obscure_box is None:
+        box_w, box_h = int(width * 0.4), int(photo_zone_height * 0.25)
+        obscure_box = ((width - box_w) // 2, (photo_zone_height - box_h) // 2, box_w, box_h)
+    try:
+        document = censored_item.build_document(
+            photo_url, *obscure_box, content["reveal_text"], content["what_is_obscured"],
+            canvas_size=_CANVAS_SIZE, tokens=tokens,
+        )
+    except Exception as e:
+        print(f"[VSG01] Censored Item build failed: {e}", flush=True)
+        return None
+    if check_legibility(document, tokens):
+        print("[VSG01] Censored Item failed legibility check, falling back", flush=True)
+        return None
+    return document
+
+
+# ── SEED-078: Day 1 -> Day 30 (needs two real, caller-supplied photos) ───
+
+async def _content_day1_day30(business_name: str, category: str, description: str) -> Optional[dict]:
+    """§2.9: excluded outright for health/weight/skin/appearance — picks
+    only from day1_day30.py's own closed allowlist, and only when the
+    business's own words actually support that category (never defaults
+    to one silently)."""
+    from .ad_formats.day1_day30 import _PERMITTED_CATEGORIES
+    prompt = (
+        f"For a Nigerian ad for {_business_line(business_name, category, description)}, does this "
+        "business's work fit one of these EXACT categories: "
+        f"{sorted(_PERMITTED_CATEGORIES)}? This format shows real progress over time — it is "
+        "STRICTLY NEVER permitted for anything about a person's body, weight, skin, or "
+        "appearance, regardless of how the business describes itself.\n"
+        "If none of the listed categories genuinely fits, return category as an empty string.\n"
+        "- category: copied EXACTLY from the list above, or empty string\n"
+        "- day1_label: a short label for the earlier photo (<=12 characters), e.g. 'Day 1' — "
+        "plain and factual, never a health/appearance claim\n"
+        "- day30_label: a short label for the later photo (<=12 characters), e.g. 'Day 30'\n"
+        "Return ONLY the JSON with exactly these 3 keys."
+    )
+    d = await _call_content_model(prompt)
+    if not d:
+        return None
+    category_pick = str(d.get("category", "")).strip()
+    if category_pick not in _PERMITTED_CATEGORIES:
+        return None
+    return {
+        "category": category_pick,
+        "day1_label": str(d.get("day1_label", "")).strip() or "Day 1",
+        "day30_label": str(d.get("day30_label", "")).strip() or "Day 30",
+    }
+
+
+async def _build_day1_day30(business_name: str, category: str, description: str, tokens: dict,
+                            photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None,
+                            day30_photo_url: Optional[str] = None):
+    """Both photo_url (day 1) and day30_photo_url (day 30) must be real,
+    caller-supplied photos of the SAME real thing at two points in time —
+    this builder never generates either (§1.2/§2.9's own stronger
+    'excluded outright... never generate a synthetic transformation').
+    There is no current attestation flow that produces a genuine day30_photo_url
+    (only single product_photo/real_customer_photo attestations exist — see
+    day1_day30.py's own module docstring), so this never actually receives
+    one through the real automatic generation path today; it's real,
+    tested code, ready for whenever that attestation exists, callable
+    directly today for manual/QA rendering."""
+    if not photo_url or not day30_photo_url:
+        return None
+    content = await _content_day1_day30(business_name, category, description)
+    if not content:
+        return None
+    from .ad_formats import day1_day30
+    try:
+        document = day1_day30.build_document(
+            photo_url, day30_photo_url, content["category"],
+            day1_label=content["day1_label"], day30_label=content["day30_label"],
+            canvas_size=_CANVAS_SIZE, tokens=tokens,
+        )
+    except Exception as e:
+        print(f"[VSG01] Day 1 -> Day 30 build failed: {e}", flush=True)
+        return None
+    # day1_day30.build_document doesn't self-check legibility (unlike most
+    # other format modules — see that module's own code) — external check
+    # here, same pattern as Us vs Them/Receipt/Review Card.
+    if check_legibility(document, tokens):
+        print("[VSG01] Day 1 -> Day 30 failed legibility check, falling back", flush=True)
+        return None
+    return document
+
+
 _BUILDERS = {
     "SEED-075": _build_us_vs_them,
     "SEED-087": _build_borrowed_interface,
@@ -1277,6 +1442,8 @@ _BUILDERS = {
     "SEED-098": _build_work_in_progress,
     "SEED-077": _build_news_headline,
     "SEED-089": _build_humour_cartoon,
+    "SEED-083": _build_censored_item,
+    "SEED-078": _build_day1_day30,
 }
 
 
