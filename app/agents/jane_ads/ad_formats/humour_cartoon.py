@@ -116,7 +116,11 @@ def _illustration_prompt(situation: str, nigerian_setting: str) -> str:
         f"Single-panel cartoon illustration depicting {situation}, in "
         f"{resolve_nigerian_setting(nigerian_setting)}, humorous and lighthearted, "
         "clean simple linework, bright flat colours, expressive characters, "
-        "one single clear visual punchline, comic illustration style"
+        "one single clear visual punchline, comic illustration style. Any "
+        "human characters shown must have deep brown to dark brown skin and "
+        "West African features, consistent with a Nigerian setting — never "
+        "default to light-skinned or Western-coded characters. Fill the "
+        "frame edge to edge with the scene, no empty background padding."
     )
 
 

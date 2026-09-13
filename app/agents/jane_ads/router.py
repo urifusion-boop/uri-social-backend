@@ -4180,6 +4180,56 @@ async def _debug_ads_generation_e2e(
         return {"success": False, "error": str(e), "type": type(e).__name__, "traceback": traceback.format_exc()}
 
 
+@router.get("/debug/vsg01-format-direct", include_in_schema=False)
+async def _debug_vsg01_format_direct(
+    request: Request,
+    format_id: str,
+    description: str = "We sell grilled suya and fast delivery across Lagos.",
+    business_name: str = "Test Suya Spot",
+    category: str = "restaurant",
+    photo_url: str = "",
+    human_reviewed: bool = False,
+) -> dict:
+    """TEMPORARY — call a VSG01 format's builder DIRECTLY, bypassing
+    select_ranked_ad_formats/retrieval.py entirely. Exists because News
+    Headline (SEED-077) and Humour/Cartoon (SEED-089) are wired with real
+    builders but deliberately never pass retrieval's own eligibility gate
+    (isolation-cap / human-review — see vsg01_orchestrator.py's module
+    docstring) — this is the only way to render+inspect their real output
+    for QA without weakening that gate. `human_reviewed` is only meaningful
+    for SEED-089, and passing it True here is itself the human review this
+    endpoint's caller is performing by looking at the result. Same
+    secret-gated pattern as this session's other diagnostics; remove after use."""
+    if request.headers.get("X-Bootstrap-Secret") != "vsg01-corpus-bootstrap-2026-dev-only":
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    import time
+    import traceback
+    from .ad_formats.brand_tokens import resolve_brand_tokens
+    from .creative import _upload_bytes_to_cloudinary
+    from .vsg01_orchestrator import _BUILDERS
+    from app.agents.social_media_manager.services.document_renderer_service import DocumentRendererService
+
+    builder = _BUILDERS.get(format_id)
+    if builder is None:
+        return {"success": False, "error": f"{format_id!r} has no registered builder"}
+
+    tokens = resolve_brand_tokens(None)
+    kwargs = {"photo_url": photo_url or None, "brand_logo_url": None}
+    if format_id == "SEED-089":
+        kwargs["human_reviewed"] = human_reviewed
+
+    try:
+        document = await builder(business_name, category, description, tokens, **kwargs)
+        if document is None:
+            return {"success": False, "error": "builder returned None — content step or generation likely came up empty; check server logs"}
+        png_bytes = await DocumentRendererService.render_to_png(document)
+        image_url = await _upload_bytes_to_cloudinary(png_bytes, public_id=f"vsg01-direct-{format_id.lower()}-{int(time.time())}")
+        return {"success": True, "format_id": format_id, "image_url": image_url}
+    except Exception as e:
+        return {"success": False, "error": str(e), "type": type(e).__name__, "traceback": traceback.format_exc()}
+
+
 @router.get("/corpus/upload", response_class=HTMLResponse, include_in_schema=False)
 async def corpus_upload_page() -> str:
     """The page itself. Self-contained — no build step, no bundle, nothing to deploy
