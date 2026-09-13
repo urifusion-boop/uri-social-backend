@@ -4141,6 +4141,32 @@ async def corpus_upload(
             os.unlink(tmp_path)
 
 
+@router.get("/debug/starter-pack-items", include_in_schema=False)
+async def _debug_starter_pack_items(request: Request) -> dict:
+    """TEMPORARY — Starter Pack requires a real product photo attestation
+    (requires=["product_photo"]), so it can never surface through the full
+    generate_ad_creative() ranking pipeline for a synthetic test business
+    with no such photo. This calls the format's own real Layer 2 item
+    generation directly (_item_prompt + generate_scene, exactly what
+    _build_starter_pack does per item) to review the surrounding flat-lay
+    items' quality in isolation, without needing a real product cutout.
+    Same secret-gated pattern as this session's other diagnostics; remove
+    after use."""
+    if request.headers.get("X-Bootstrap-Secret") != "vsg01-corpus-bootstrap-2026-dev-only":
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    from .ad_formats.starter_pack import _item_prompt
+    from .layer2_generation import generate_scene
+
+    items = ["a bag of garri", "a bottle of zobo drink", "a tin of peak milk", "a bag of roasted groundnuts"]
+    cell_size = "360x360"
+    urls = []
+    for item in items:
+        url = await generate_scene(_item_prompt(item), size=cell_size)
+        urls.append({"item": item, "url": url})
+    return {"items": urls}
+
+
 @router.get("/debug/ads-generation-e2e", include_in_schema=False)
 async def _debug_ads_generation_e2e(request: Request, db: AsyncIOMotorDatabase = Depends(get_db_dependency)) -> dict:
     """TEMPORARY — reproduce "ads generation not working" on dev end-to-end
