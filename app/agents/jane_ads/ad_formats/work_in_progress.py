@@ -74,19 +74,18 @@ def _scene_prompt(trade_activity: str, nigerian_setting: str, seasonal_context: 
     return (
         f"Create a realistic documentary photograph showing {trade_activity} "
         f"actively underway in {resolve_nigerian_setting(nigerian_setting)}. "
-        f"{REPRESENTATION_BLOCK}. Show the work in a visibly incomplete stage — "
-        "hands, tools, equipment or materials communicating the job is actively "
-        "being performed, not finished. Candid and observational rather than "
-        "posed, natural available light. The worker should not look directly at "
+        f"{REPRESENTATION_BLOCK}. Depict safety equipment correctly where "
+        "relevant; never depict dangerous practices. Show the work in a "
+        "visibly incomplete stage — hands, tools, equipment or materials "
+        "communicating the job is actively being performed, not finished. "
+        "Candid rather than posed; the worker should not look directly at "
         "the camera unless the activity naturally requires it. Avoid "
         "showroom-like environments unless the actual trade takes place there. "
         "Realistic imperfections — dust, material variation, ordinary "
-        "environmental clutter — are welcome. The primary work activity should "
-        "occupy approximately 40-60% of the composition, with a clean reserved "
-        "area for copy naming what is being done and where the business "
-        "operates. The image must look like real work happening, not an "
-        "AI-generated representation of a finished project. Depict safety "
-        f"equipment correctly where relevant; never depict dangerous practices.{(' ' + seasonal) if seasonal else ''}"
+        "environmental clutter — are welcome, with a clean reserved area for "
+        "copy naming what is being done and where the business operates. The "
+        "image must look like real work happening, not a finished project."
+        f"{(' ' + seasonal) if seasonal else ''}"
     )
 
 

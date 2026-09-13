@@ -82,7 +82,13 @@ GLOBAL_NEGATIVE_PROMPT = (
     "no generic stock-photo styling, no excessive cinematic grading, "
     "no unnecessary props, no visual clutter, no random decorative objects, "
     "no Western suburban setting unless explicitly required, "
-    "no snow, no autumn foliage"
+    "no snow, no autumn foliage, "
+    # Added after a live-confirmed failure mode: gpt-image-2 rendered "medium
+    # brown" skin twice in a row on a real generation despite
+    # REPRESENTATION_BLOCK's positive instruction below — a negative
+    # alongside the positive gives the model two independent signals
+    # instead of one. No-op (harmless) on any generation with no person.
+    "no light or medium-brown skin, no fair or olive skin, no lightened skin tone"
 )
 
 
@@ -154,10 +160,12 @@ def _resolve_ratio_clause(size: str) -> str:
 # recommends. Verify skin rendering on every generation regardless — models
 # are known to lighten skin under bright-light prompts even when told not to.
 REPRESENTATION_BLOCK = (
-    "deep brown to dark brown skin tones, West African features, Nigerian setting "
-    "where contextually appropriate, strong equatorial daylight or realistic Nigerian "
-    "available light, natural unretouched skin texture, believable local environmental "
-    "details, authentic contemporary Nigerian clothing and objects where relevant"
+    "Any person shown must have deep brown to dark brown skin — a strict requirement, "
+    "never light, fair, tan, medium-brown or olive. West African features, Nigerian "
+    "setting where contextually appropriate, strong equatorial daylight or realistic "
+    "Nigerian available light, natural unretouched skin texture, believable local "
+    "environmental details, authentic contemporary Nigerian clothing and objects "
+    "where relevant"
 )
 
 
