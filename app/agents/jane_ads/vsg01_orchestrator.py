@@ -1363,6 +1363,63 @@ async def _content_censored_item(business_name: str, category: str, description:
     return {"reveal_text": str(d.get("reveal_text", "")).strip(), "what_is_obscured": what}
 
 
+async def _locate_reveal_region(photo_url: str, zone_width: int, zone_height: int) -> Optional[tuple]:
+    """Vision-based redaction placement — same GPT-4o-mini vision-call
+    pattern as skin_tone_check.py's own verify_skin_rendering (JSON-only
+    response, temperature=0). This module has no way to locate 'the
+    interesting part' of an arbitrary photo from text alone, but a vision
+    model looking at the actual pixels can give a genuinely informed
+    answer instead of a blind guess. Returns (x, y, width, height) in real
+    pixel coordinates within the photo zone, or None on any failure/
+    implausible answer — the caller falls back to a generic centred box,
+    same fail-safe contract as every vision call in this codebase."""
+    import json as _json
+    from app.services.AIService import AIService
+
+    prompt = (
+        "This real product photo will be used for a 'coming soon' reveal ad. "
+        "Identify ONE rectangular region of the image worth redacting to build "
+        "anticipation — a distinguishing label, logo, or unique design detail "
+        "of the product itself. Never a region containing any price or text. "
+        "The region should sit entirely within the photo (not touching the "
+        "very edges) and cover roughly 25-45% of the image's width and "
+        "15-30% of its height.\n"
+        "Return JSON only: {\"x\": 0.0-1.0, \"y\": 0.0-1.0, \"width\": 0.0-1.0, "
+        "\"height\": 0.0-1.0} as fractions of the image's own width/height. "
+        "Return ONLY the JSON, no markdown."
+    )
+    try:
+        ai_request = AIService.build_ai_model(
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": photo_url}},
+                    {"type": "text", "text": prompt},
+                ],
+            }],
+            model="gpt-4o-mini",
+            temperature=0,
+            max_tokens=150,
+        )
+        ai_response = await AIService.chat_completion(ai_request)
+        if isinstance(ai_response, dict) and "error" in ai_response:
+            raise Exception(ai_response["error"])
+        raw = ai_response.choices[0].message.content.strip()
+        if raw.startswith("```"):
+            raw = "\n".join(line for line in raw.split("\n") if not line.startswith("```"))
+        result = _json.loads(raw)
+        fx, fy, fw, fh = (float(result[k]) for k in ("x", "y", "width", "height"))
+        if not all(0.0 <= v <= 1.0 for v in (fx, fy, fw, fh)) or fx + fw > 1.0 or fy + fh > 1.0:
+            return None
+        x, y, w, h = int(fx * zone_width), int(fy * zone_height), int(fw * zone_width), int(fh * zone_height)
+        if w < 20 or h < 20:
+            return None
+        return (x, y, w, h)
+    except Exception as e:
+        print(f"[VSG01] Censored Item reveal-region detection failed: {e}", flush=True)
+        return None
+
+
 async def _build_censored_item(business_name: str, category: str, description: str, tokens: dict,
                                photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None,
                                obscure_box: Optional[tuple] = None):
@@ -1371,14 +1428,14 @@ async def _build_censored_item(business_name: str, category: str, description: s
     (see censored_item.py's own module docstring on why `generate` is never
     permitted for the product itself).
 
-    obscure_box: (x, y, width, height) of the redaction bar. This module has
-    no way to locate 'the interesting part' of an arbitrary photo — the
-    format's own docstring already discloses this as a caller-side concern,
-    not something to guess via a vision call. Defaults to a generic centred
-    box over roughly the middle third of the photo zone when not supplied
-    (a placeholder good enough to exercise the real layout/legibility path,
-    not a substitute for a caller who actually knows what's interesting in
-    their own photo)."""
+    obscure_box: (x, y, width, height) of the redaction bar, in real pixel
+    coordinates. Explicit callers may still pass one directly; the normal
+    path instead asks a vision model to locate a genuinely informed region
+    on the actual photo (_locate_reveal_region), falling back to a generic
+    centred box over roughly the middle third of the photo zone only if
+    that call fails — a real, pixel-aware placement rather than a blind
+    guess, but still not infallible, so the fallback stays as a safety
+    net."""
     if not photo_url:
         return None
     content = await _content_censored_item(business_name, category, description)
@@ -1387,6 +1444,8 @@ async def _build_censored_item(business_name: str, category: str, description: s
     from .ad_formats import censored_item
     width, height = _CANVAS_SIZE
     photo_zone_height = int(height * 0.78)
+    if obscure_box is None:
+        obscure_box = await _locate_reveal_region(photo_url, width, photo_zone_height)
     if obscure_box is None:
         box_w, box_h = int(width * 0.4), int(photo_zone_height * 0.25)
         obscure_box = ((width - box_w) // 2, (photo_zone_height - box_h) // 2, box_w, box_h)
