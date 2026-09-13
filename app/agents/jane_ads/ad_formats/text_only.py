@@ -24,6 +24,21 @@ from ._text_metrics import wrap_text
 from .legibility import assert_legible
 from .tokens import AdFormatDef, PLACEHOLDER_TOKENS, logo_badge_layers
 
+
+class ContentOverflowsCanvas(ValueError):
+    """assert_legible/check_legibility never validate content height against
+    the canvas at all (confirmed reading legibility.py directly — it only
+    checks font size/weight/contrast/hairline-stroke per layer) — so an
+    unusually long headline (this format's own requirement is only that it
+    carry "the one real fact," with no length cap on what that fact's
+    actual sentence looks like) stacked with a subline and action
+    line could in principle wrap to more lines than the canvas has room
+    for. Raised instead of silently letting the block run off the frame or
+    collide with the logo badge, same philosophy as this library's other
+    overflow guards (borrowed_interface.ExchangeOverflowsCanvas,
+    receipt.ReceiptOverflowsCanvas)."""
+    pass
+
 FORMAT = AdFormatDef(
     format_id="SEED-097",
     name="Text-Only",
@@ -84,6 +99,12 @@ def build_document(
         + (24 + len(subline_lines) * subline_line_h if subline_lines else 0)
         + (48 + len(action_lines) * action_line_h if action_lines else 0)
     )
+    outer_margin = 72
+    if block_height > height - 2 * outer_margin:
+        raise ContentOverflowsCanvas(
+            f"content block needs {block_height}px, taller than the available "
+            f"{height - 2 * outer_margin}px — shorten the headline/subline/action_line"
+        )
     block_top = (height - block_height) // 2
 
     layers = []

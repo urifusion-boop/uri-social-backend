@@ -708,6 +708,20 @@ async def _content_receipt(description: str) -> Optional[dict]:
     items = [i for i in items if all(i)]
     if not items:
         return None
+    # receipt.py's own layout has no upper bound on item count (its card
+    # grows to fit whatever it's given) and legibility.py's check never
+    # validates content height against the canvas at all — confirmed
+    # reading that module directly. A truncated *display* of, say, the
+    # first 6 of 8 real items would still be individually verbatim, but
+    # total_amount (the business's own stated full total) would then no
+    # longer match what's actually shown — a real, different accuracy
+    # problem, arguably worse than the format simply not firing. Same
+    # "under-fire rather than over-fire" direction this module's own
+    # docstring already commits to for quotes/prices: too many items to
+    # show accurately means this format doesn't fit this business's offer,
+    # not something to silently truncate.
+    if len(items) > 6:
+        return None
     return {
         "items": items,
         "total_label": str(d.get("total_label", "Total")).strip() or "Total",
