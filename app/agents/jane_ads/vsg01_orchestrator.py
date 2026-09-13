@@ -1405,15 +1405,20 @@ async def _locate_reveal_region(photo_url: str, zone_width: int, zone_height: in
         if isinstance(ai_response, dict) and "error" in ai_response:
             raise Exception(ai_response["error"])
         raw = ai_response.choices[0].message.content.strip()
+        print(f"[VSG01] Censored Item reveal-region raw response: {raw!r}", flush=True)
         if raw.startswith("```"):
             raw = "\n".join(line for line in raw.split("\n") if not line.startswith("```"))
         result = _json.loads(raw)
         fx, fy, fw, fh = (float(result[k]) for k in ("x", "y", "width", "height"))
         if not all(0.0 <= v <= 1.0 for v in (fx, fy, fw, fh)) or fx + fw > 1.0 or fy + fh > 1.0:
+            print(f"[VSG01] Censored Item reveal-region implausible fractions "
+                  f"x={fx} y={fy} w={fw} h={fh}, falling back to default", flush=True)
             return None
         x, y, w, h = int(fx * zone_width), int(fy * zone_height), int(fw * zone_width), int(fh * zone_height)
         if w < 20 or h < 20:
+            print(f"[VSG01] Censored Item reveal-region too small w={w} h={h}, falling back to default", flush=True)
             return None
+        print(f"[VSG01] Censored Item reveal-region located at x={x} y={y} w={w} h={h}", flush=True)
         return (x, y, w, h)
     except Exception as e:
         print(f"[VSG01] Censored Item reveal-region detection failed: {e}", flush=True)
