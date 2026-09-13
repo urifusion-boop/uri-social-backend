@@ -30,7 +30,14 @@ class TestFormatDefinition:
 class TestScenePrompt:
     def test_lower_third_empty_and_photojournalistic(self):
         prompt = _scene_prompt("a school handover ceremony", "a modern Lagos office interior")
-        assert "clear empty space across the lower third" in prompt
+        # A live render exposed the original wording's real failure: a
+        # generic "clear empty space" instruction with no stated location
+        # let the model put a huge dead zone wherever it liked (confirmed
+        # in Work In Progress's own identical bug) — the prompt now states
+        # exactly where the reserved space is AND requires the rest of the
+        # frame to be filled edge to edge, not just that some space exists.
+        assert "reserved space is a plain strip across the lower third" in prompt
+        assert "Fill the frame edge to edge" in prompt
         assert "Photojournalistic" in prompt
         assert "a modern Lagos office interior" in prompt
 
