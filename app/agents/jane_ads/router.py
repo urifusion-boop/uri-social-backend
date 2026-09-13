@@ -4233,6 +4233,26 @@ async def _debug_vsg01_format_direct(
         return {"success": False, "error": str(e), "type": type(e).__name__, "traceback": traceback.format_exc()}
 
 
+@router.get("/debug/vsg01-raw-scene", include_in_schema=False)
+async def _debug_vsg01_raw_scene(request: Request, prompt: str, size: str = "1080x1080") -> dict:
+    """TEMPORARY — generate one raw Layer 2 scene and return its URL, no
+    format/document involved. Exists to manufacture stand-in "real photo"
+    test inputs (a product photo, a before/after pair) for QA-testing the
+    upload-only formats (Censored Item, Day 1 -> Day 30) via
+    /jane-ads/debug/vsg01-format-direct, which need a real photo_url this
+    session has no actual uploaded business photo to supply. Same
+    secret-gated pattern as this session's other diagnostics; remove after use."""
+    if request.headers.get("X-Bootstrap-Secret") != "vsg01-corpus-bootstrap-2026-dev-only":
+        raise HTTPException(status_code=404, detail="Not Found")
+    import traceback
+    from .layer2_generation import generate_scene
+    try:
+        url = await generate_scene(prompt, size=size)
+        return {"success": True, "image_url": url}
+    except Exception as e:
+        return {"success": False, "error": str(e), "type": type(e).__name__, "traceback": traceback.format_exc()}
+
+
 @router.get("/corpus/upload", response_class=HTMLResponse, include_in_schema=False)
 async def corpus_upload_page() -> str:
     """The page itself. Self-contained — no build step, no bundle, nothing to deploy
