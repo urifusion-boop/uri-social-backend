@@ -76,6 +76,20 @@ class TimedOutcomeClaim(ValueError):
     pass
 
 
+class FieldOverflowsCanvas(ValueError):
+    """§2.1's 55-60% product-zone range is a clamp, not a promise that
+    needed_field_height always fits inside the remaining 40-45% — the
+    `max(int(height*0.55), ...)` floor below can force product_zone_height
+    back UP even when the field content (a long quote + stars + logo)
+    genuinely needs more room than that leaves, silently pushing content
+    past the bottom of the canvas with nothing catching it (legibility.py's
+    own check never validates content height against the canvas at all).
+    Raised instead, same philosophy as this library's other overflow
+    guards (borrowed_interface.ExchangeOverflowsCanvas, receipt.
+    ReceiptOverflowsCanvas)."""
+    pass
+
+
 _TIME_PHRASE = re.compile(
     r"\b(?:in|within|after)\s+(?:just\s+)?(?:a|one|two|three|four|five|six|seven|"
     r"\d+)\s*(?:day|days|week|weeks|month|months)\b",
@@ -148,8 +162,15 @@ def build_document(
     # §2.1: "subject occupying 55-60%." Size the field block to exactly what
     # its content needs, but keep the product zone within that stated
     # range — clamped rather than shrunk arbitrarily on either end.
+    min_product_zone = int(height * 0.55)
+    if needed_field_height > height - min_product_zone:
+        raise FieldOverflowsCanvas(
+            f"field content needs {needed_field_height}px, more than the "
+            f"{height - min_product_zone}px available once the product zone takes its "
+            "§2.1-minimum 55% — shorten the quote"
+        )
     ideal_product_zone = height - needed_field_height
-    product_zone_height = max(int(height * 0.55), min(int(height * 0.60), ideal_product_zone))
+    product_zone_height = max(min_product_zone, min(int(height * 0.60), ideal_product_zone))
 
     z += 1
     layers.append({

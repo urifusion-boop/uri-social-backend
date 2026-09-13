@@ -26,6 +26,17 @@ from ._text_metrics import text_width, wrap_text
 from .legibility import assert_legible
 from .tokens import AdFormatDef, PLACEHOLDER_TOKENS, logo_badge_layers
 
+
+class FieldOverflowsCanvas(ValueError):
+    """The 58-66% product-zone clamp below is a range, not a promise that
+    needed_field_height always fits the remaining 34-42% — the
+    `max(int(height*0.58), ...)` floor can force product_zone_height back
+    UP even when a long delivery+payment+action combination genuinely
+    needs more room, silently pushing content past the canvas (same bug
+    class as review_card.FieldOverflowsCanvas, found and fixed there
+    first). Raised instead of letting it happen silently."""
+    pass
+
 FORMAT = AdFormatDef(
     format_id="SEED-096",
     name="Price-Led Offer",
@@ -87,8 +98,15 @@ def build_document(
         + len(payment_lines) * line_height
         + (24 + len(action_lines) * int(_FONT_ACTION * 1.3) if action_lines else 0)
     )
+    min_product_zone = int(height * 0.58)
+    if needed_field_height > height - min_product_zone:
+        raise FieldOverflowsCanvas(
+            f"field content needs {needed_field_height}px, more than the "
+            f"{height - min_product_zone}px available once the product zone takes its "
+            "minimum 58% — shorten the delivery/payment/action lines"
+        )
     ideal_product_zone = height - needed_field_height
-    product_zone_height = max(int(height * 0.58), min(int(height * 0.66), ideal_product_zone))
+    product_zone_height = max(min_product_zone, min(int(height * 0.66), ideal_product_zone))
     field_height = height - product_zone_height
     # Centre the actual content within whatever field height results, rather
     # than padding from the top only — the 58-66% clamp above is a safety
