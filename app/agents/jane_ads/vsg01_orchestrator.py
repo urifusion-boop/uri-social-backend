@@ -8,7 +8,7 @@ call path... this is the primitive that step calls." This module is that
 step — the one place that actually calls them together, in order, around a
 real render.
 
-SCOPE. All 12 formats are real, retrievable corpus records (step 9) and
+SCOPE. All 15 formats are real, retrievable corpus records (step 9) and
 `select_ranked_ad_formats` below applies the full VSG-01 eligibility logic to
 all of them via the SAME retrieval engine every other corpus category already
 uses (retrieval.py's exclusion_reason/retrieve — nothing format-specific was
@@ -53,21 +53,31 @@ before it reaches here, so a quote/price mentioned earlier in a longer
 conversation may not have survived into it — these three formats will
 under-fire rather than over-fire, which is the safe direction to fail in.
 
-The remaining 5 formats (News Headline, Day 1->Day 30, The Censored Item,
-Humour/Cartoon) are deliberately NOT auto-rendered — each for a real,
-distinct reason, not a gap in this module (see the plan this was built from,
-`~/.claude/plans/lovely-prancing-seahorse.md` at time of writing, for the
-full reasoning):
-  - News Headline / Day 1->Day 30 / The Censored Item all require
-    `isolated_ad_account=True`. Grep confirms no per-brand ad account exists
-    anywhere in this codebase — every brand advertises through the single
-    global `settings.META_AD_ACCOUNT_ID`. This is a platform-level gap
-    (per-brand Meta ad accounts, a separate infrastructure initiative), not
-    something a BusinessProfile flag here can honestly satisfy.
-  - Humour/Cartoon's own build_document HARD-BLOCKS on human_reviewed=True
-    with no default — satisfying that honestly means an async
-    generate-hold-approve-resume workflow this endpoint doesn't have, not a
-    data flag.
+News Headline (SEED-077) and Humour/Cartoon (SEED-089) now have real
+builders (`_build_news_headline`, `_build_humour_cartoon`) registered in
+`_BUILDERS` — the full content-generation + Layer 2 + build_document path
+is genuine, tested code, not a stub. Both are still deliberately NEVER
+auto-selected in the live `select_and_render_vsg01_creative` path, for two
+different real reasons, not a gap in this module:
+  - News Headline requires `isolated_ad_account=True` (its corpus record's
+    `pooled_account_safe=REQUIRES_ISOLATION`, enforced by retrieval.py's own
+    exclusion_reason). Grep confirms no per-brand ad account exists anywhere
+    in this codebase — every brand advertises through the single global
+    `settings.META_AD_ACCOUNT_ID`. This is a platform-level gap (per-brand
+    Meta ad accounts, a separate infrastructure initiative), not something a
+    BusinessProfile flag here can honestly satisfy. Membership in
+    `NO_PHOTO_FORMAT_IDS` is future-readiness, not a live path.
+  - Humour/Cartoon's own builder hard-requires `human_reviewed=True` with no
+    default, and the automatic call path never passes it — satisfying §2.12
+    honestly means an async generate-hold-approve-resume workflow this
+    endpoint doesn't have, not a data flag pretending to be one. Both
+    builders are directly callable (with `human_reviewed=True` /
+    `isolated_ad_account` bypassed) for manual/QA rendering outside the
+    retrieval gate — see `/jane-ads/debug/vsg01-format-direct` in router.py.
+
+Day 1 -> Day 30 (SEED-078) and The Censored Item (SEED-083) remain
+unwired — both also `pooled_account_safe=REQUIRES_ISOLATION`, same
+platform-level gap as News Headline above.
 
 Falls back to the existing generic image (`generate_ad_image`) at every
 possible failure point — selection returning nothing, every candidate's
@@ -110,6 +120,19 @@ NO_PHOTO_FORMAT_IDS = frozenset({
     # progress" (only product_photo/real_customer_photo do). See
     # work_in_progress.py's own module docstring for this disclosed gap.
     "SEED-098",
+    # News Headline — included for completeness/readiness, but retrieval.py's
+    # own exclusion_reason (pooled_account_safe=REQUIRES_ISOLATION) blocks it
+    # from ever actually being selected until isolated_ad_account=True is
+    # genuinely true for a request, which nothing in this codebase sets
+    # today (see module docstring). Membership here has no live effect until
+    # that infrastructure exists.
+    "SEED-077",
+    # Humour/Cartoon — included for completeness/readiness, but its own
+    # builder (_build_humour_cartoon) hard-requires human_reviewed=True,
+    # which the automatic call path here never passes — so it always
+    # resolves to None and falls through, never actually auto-firing without
+    # real human review (see that builder's own docstring).
+    "SEED-089",
 })
 UPLOAD_PHOTO_FORMAT_IDS = frozenset({"SEED-093", "SEED-082", "SEED-074", "SEED-096"})
 RECOMPOSITE_PHOTO_FORMAT_IDS = UPLOAD_PHOTO_FORMAT_IDS | {"SEED-088"}
@@ -1029,6 +1052,165 @@ async def _build_work_in_progress(business_name: str, category: str, description
     return document
 
 
+# ── SEED-077: News Headline (generate path only here — see module docstring
+# on the isolation-cap gate; upload_as_is of a real event photo is also
+# permitted by the format itself but has no attestation type to trigger it) ─
+
+async def _content_news_headline(business_name: str, category: str, description: str) -> Optional[dict]:
+    """§2.8: 'Real announcements only.' Same verbatim-fact contract as
+    _content_text_only/_content_receipt — only ever fires when the
+    business's own words already state a genuine announcement; never
+    invents one to fill the format."""
+    if not (description or "").strip():
+        return None
+    prompt = (
+        f"Below is a business's own description/context text:\n\n{description}\n\n"
+        "Does this text state a REAL, specific announcement worth leading with as news — "
+        "a new branch opening, an admissions deadline, an event date, a genuine milestone? "
+        "This format is photojournalistic 'news' style: the headline must state something "
+        "that actually happened or is happening, never invented sentiment or a generic "
+        "promotional claim.\n"
+        "If nothing concrete is stated, return headline as an empty string — do not invent one.\n"
+        "- headline: the announcement itself, stated plainly (e.g. 'Admissions close 14 "
+        "September'), NEVER a 'Breaking News'-style label\n"
+        "- secondary_line: one short supporting detail, only if stated, else empty string\n"
+        "- date_stamp: a real date/timeframe, only if stated, else empty string\n"
+        "- announcement_subject: a short, concrete VISUAL scene for a documentary photo of "
+        "this announcement (what a camera would see), no brand/person names\n"
+        f"- nigerian_setting: pick the single best-fitting option, copied EXACTLY, from this list: "
+        f"{list(_NIGERIAN_SETTINGS)}\n"
+        "Return ONLY the JSON with exactly these 5 keys."
+    )
+    d = await _call_content_model(prompt)
+    if not d or not str(d.get("headline", "")).strip():
+        return None
+    subject = str(d.get("announcement_subject", "")).strip()
+    if not subject:
+        return None
+    setting = str(d.get("nigerian_setting", "")).strip()
+    if setting not in _NIGERIAN_SETTINGS:
+        setting = _NIGERIAN_SETTINGS[0]
+    return {
+        "headline": str(d.get("headline", "")).strip(),
+        "secondary_line": str(d.get("secondary_line", "")).strip() or None,
+        "date_stamp": str(d.get("date_stamp", "")).strip() or None,
+        "announcement_subject": subject,
+        "nigerian_setting": setting,
+    }
+
+
+async def _build_news_headline(business_name: str, category: str, description: str, tokens: dict,
+                               photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None):
+    content = await _content_news_headline(business_name, category, description)
+    if not content:
+        return None
+    from .ad_formats import news_headline
+    width, height = _CANVAS_SIZE
+
+    async def _gen_passing_skin_check(prompt: str) -> Optional[str]:
+        """Same corrective-retry pattern as Problem/Solution's own helper
+        (§1.7) — a real photojournalistic scene is likely to include a
+        person, so this format needs the same skin-tone gate."""
+        current_prompt = prompt
+        for attempt in (1, 2):
+            url = await generate_scene(current_prompt, size=f"{width}x{height}")
+            result = await verify_skin_rendering(url)
+            if not result["contains_person"] or result["matches_target_range"]:
+                return url
+            observed = result.get("skin_tone_observed") or "too light"
+            print(f"[VSG01] News Headline scene failed skin-tone check "
+                  f"(attempt {attempt}/2): {result['notes']}", flush=True)
+            current_prompt = (
+                f"CRITICAL: skin must be deep brown to dark brown, NOT {observed} "
+                f"as last time. {prompt}"
+            )
+        return None
+
+    try:
+        scene_url = photo_url or await _gen_passing_skin_check(
+            news_headline._scene_prompt(content["announcement_subject"], content["nigerian_setting"]),
+        )
+    except SceneGenerationFailed as e:
+        print(f"[VSG01] News Headline scene generation failed: {e}", flush=True)
+        return None
+    if not scene_url:
+        return None
+
+    try:
+        document = news_headline.build_document(
+            scene_url, content["headline"], secondary_line=content["secondary_line"],
+            date_stamp=content["date_stamp"], canvas_size=_CANVAS_SIZE, tokens=tokens,
+        )
+    except Exception as e:
+        print(f"[VSG01] News Headline build failed: {e}", flush=True)
+        return None
+    return document
+
+
+# ── SEED-089: Humour / Cartoon ────────────────────────────────────────────
+
+async def _content_humour_cartoon(business_name: str, category: str, description: str) -> Optional[dict]:
+    prompt = (
+        f"For a Nigerian ad for {_business_line(business_name, category, description)}, invent a "
+        "single-panel cartoon sight gag about a SHARED SITUATION this business's customers "
+        "would recognise (e.g. waiting forever for slow delivery, a messy DIY repair before "
+        "calling a professional). The joke must target the SITUATION, never a group, "
+        "ethnicity, region, or religion — no stereotypes.\n"
+        "- situation: a short, concrete VISUAL gag description for a cartoon illustration — "
+        "the punchline must be visible in the picture itself, not need a caption\n"
+        f"- nigerian_setting: pick the single best-fitting option, copied EXACTLY, from this list: "
+        f"{list(_NIGERIAN_SETTINGS)}\n"
+        "Return ONLY the JSON with exactly these 2 keys."
+    )
+    d = await _call_content_model(prompt)
+    if not d:
+        return None
+    situation = str(d.get("situation", "")).strip()
+    if not situation:
+        return None
+    setting = str(d.get("nigerian_setting", "")).strip()
+    if setting not in _NIGERIAN_SETTINGS:
+        setting = _NIGERIAN_SETTINGS[0]
+    return {"situation": situation, "nigerian_setting": setting}
+
+
+async def _build_humour_cartoon(business_name: str, category: str, description: str, tokens: dict,
+                                photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None,
+                                human_reviewed: bool = False):
+    """§2.12: 'Needs human review before shipping on the ₦15k tier, where no
+    operator sees the asset first.' No async generate-hold-approve-resume
+    workflow exists in this codebase (see module docstring) — rather than
+    working around that with a hardcoded True, the real automatic
+    generation path (which never passes human_reviewed) simply never gets
+    a document from this builder, matching §2.12's actual requirement
+    instead of a data flag pretending to satisfy it. human_reviewed=True is
+    only ever passed by a genuinely human-supervised call site (e.g. a
+    manual QA render, never `select_and_render_vsg01_creative`)."""
+    if not human_reviewed:
+        return None
+    content = await _content_humour_cartoon(business_name, category, description)
+    if not content:
+        return None
+    from .ad_formats import humour_cartoon
+    width, height = _CANVAS_SIZE
+    try:
+        illustration_url = await generate_scene(
+            humour_cartoon._illustration_prompt(content["situation"], content["nigerian_setting"]),
+            size=f"{width}x{height}",
+        )
+    except SceneGenerationFailed as e:
+        print(f"[VSG01] Humour/Cartoon illustration generation failed: {e}", flush=True)
+        return None
+    try:
+        document = humour_cartoon.build_document(
+            illustration_url, human_reviewed=True, canvas_size=_CANVAS_SIZE, tokens=tokens,
+        )
+    except Exception as e:
+        print(f"[VSG01] Humour/Cartoon build failed: {e}", flush=True)
+        return None
+    return document
+
+
 _BUILDERS = {
     "SEED-075": _build_us_vs_them,
     "SEED-087": _build_borrowed_interface,
@@ -1041,6 +1223,8 @@ _BUILDERS = {
     "SEED-096": _build_price_led_offer,
     "SEED-097": _build_text_only,
     "SEED-098": _build_work_in_progress,
+    "SEED-077": _build_news_headline,
+    "SEED-089": _build_humour_cartoon,
 }
 
 

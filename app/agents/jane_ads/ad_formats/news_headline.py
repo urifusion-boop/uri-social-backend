@@ -46,7 +46,7 @@ import re
 from typing import Dict, Optional, Tuple
 
 from ..visual_slots import resolve_nigerian_setting
-from ..layer2_generation import generate_scene
+from ..layer2_generation import REPRESENTATION_BLOCK, generate_scene
 from .legibility import assert_legible
 from ._text_metrics import wrap_text
 from .tokens import AdFormatDef, PLACEHOLDER_TOKENS
@@ -204,9 +204,12 @@ def _scene_prompt(announcement_subject: str, nigerian_setting: str) -> str:
     return (
         f"Photojournalistic image of {announcement_subject} in "
         f"{resolve_nigerian_setting(nigerian_setting)}, candid unposed moment, "
-        "natural available light, slight motion, documentary reportage style, "
-        "muted realistic colour, clear empty space across the lower third, "
-        "shot on a 35mm lens, authentic and unstyled"
+        f"natural available light, slight motion, documentary reportage style, "
+        f"muted realistic colour, shot on a 35mm lens, authentic and unstyled. "
+        f"{REPRESENTATION_BLOCK}. Fill the frame edge to edge with the subject "
+        "and setting, including the left and right thirds — no large empty "
+        "background areas. The only reserved space is a plain strip across "
+        "the lower third of the frame for a headline bar."
     )
 
 
