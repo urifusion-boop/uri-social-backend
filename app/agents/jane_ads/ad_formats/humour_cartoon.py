@@ -119,8 +119,10 @@ def _illustration_prompt(situation: str, nigerian_setting: str) -> str:
         "one single clear visual punchline, comic illustration style. Any "
         "human characters shown must have deep brown to dark brown skin and "
         "West African features, consistent with a Nigerian setting — never "
-        "default to light-skinned or Western-coded characters. Fill the "
-        "frame edge to edge with the scene, no empty background padding."
+        "default to light-skinned or Western-coded characters. No real-world "
+        "brand logos, uniforms, or liveries on any person or vehicle — "
+        "generic, unbranded clothing and vehicles only. Fill the frame edge "
+        "to edge with the scene, no empty background padding."
     )
 
 

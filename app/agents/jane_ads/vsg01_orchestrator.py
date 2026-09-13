@@ -1056,11 +1056,21 @@ async def _build_work_in_progress(business_name: str, category: str, description
 # on the isolation-cap gate; upload_as_is of a real event photo is also
 # permitted by the format itself but has no attestation type to trigger it) ─
 
-async def _content_news_headline(business_name: str, category: str, description: str) -> Optional[dict]:
+async def _content_news_headline(business_name: str, category: str, description: str,
+                                 correction: str = "") -> Optional[dict]:
     """§2.8: 'Real announcements only.' Same verbatim-fact contract as
     _content_text_only/_content_receipt — only ever fires when the
     business's own words already state a genuine announcement; never
-    invents one to fill the format."""
+    invents one to fill the format.
+
+    The headline's 26-character hard limit is a real, measured pixel-width
+    budget, not a style preference — Text on a Face already established
+    that DejaVuSans-Bold at 48px (the same font/size news_headline.py's own
+    headline uses) needs roughly this budget to guarantee a single line at
+    a ~968px plate width (that module's own docstring: a 35-char line
+    already measured ~1252px, well past the plate). Live-confirmed here
+    too: an ungapped 'Admissions close 14 September' (30 chars) wrapped to
+    2 lines and overflowed the fixed lower-third bar zone in a real render."""
     if not (description or "").strip():
         return None
     prompt = (
@@ -1071,14 +1081,18 @@ async def _content_news_headline(business_name: str, category: str, description:
         "that actually happened or is happening, never invented sentiment or a generic "
         "promotional claim.\n"
         "If nothing concrete is stated, return headline as an empty string — do not invent one.\n"
-        "- headline: the announcement itself, stated plainly (e.g. 'Admissions close 14 "
-        "September'), NEVER a 'Breaking News'-style label\n"
-        "- secondary_line: one short supporting detail, only if stated, else empty string\n"
-        "- date_stamp: a real date/timeframe, only if stated, else empty string\n"
+        "- headline: the announcement itself, stated plainly, NEVER a 'Breaking News'-style "
+        "label. HARD LIMIT: 26 characters or fewer, including spaces and punctuation — this is "
+        "a real pixel-width constraint, not a style preference. Correctly-sized examples: "
+        "'Admissions close Sept 14' (25 chars), 'New Yaba branch now open' (25 chars).\n"
+        "- secondary_line: one short supporting detail (<=35 characters), only if stated, else "
+        "empty string\n"
+        "- date_stamp: a real date/timeframe (<=15 characters), only if stated, else empty string\n"
         "- announcement_subject: a short, concrete VISUAL scene for a documentary photo of "
         "this announcement (what a camera would see), no brand/person names\n"
         f"- nigerian_setting: pick the single best-fitting option, copied EXACTLY, from this list: "
         f"{list(_NIGERIAN_SETTINGS)}\n"
+        f"{('CORRECTION: ' + correction) if correction else ''}\n"
         "Return ONLY the JSON with exactly these 5 keys."
     )
     d = await _call_content_model(prompt)
@@ -1136,15 +1150,36 @@ async def _build_news_headline(business_name: str, category: str, description: s
     if not scene_url:
         return None
 
-    try:
-        document = news_headline.build_document(
-            scene_url, content["headline"], secondary_line=content["secondary_line"],
-            date_stamp=content["date_stamp"], canvas_size=_CANVAS_SIZE, tokens=tokens,
+    def _try_build(c: dict):
+        return news_headline.build_document(
+            scene_url, c["headline"], secondary_line=c["secondary_line"],
+            date_stamp=c["date_stamp"], canvas_size=_CANVAS_SIZE, tokens=tokens,
         )
+
+    try:
+        return _try_build(content)
+    except news_headline.ContentOverflowsZone as e:
+        # Same "regenerate once with the exact correction, then accept
+        # whatever comes back" pattern as Text on a Face's own length
+        # retry — the 26-char headline cap above should make this rare,
+        # not eliminate it outright (a long secondary_line/date_stamp
+        # stacked with a full-length headline can still overflow).
+        print(f"[VSG01] News Headline content overflowed its zone, retrying shorter: {e}", flush=True)
+        retry_content = await _content_news_headline(
+            business_name, category, description,
+            correction=f"your last attempt overflowed its fixed text zone ({e}). "
+                       "Make the headline and any secondary_line/date_stamp shorter this time.",
+        )
+        if not retry_content:
+            return None
+        try:
+            return _try_build(retry_content)
+        except Exception as e2:
+            print(f"[VSG01] News Headline still failed after retry: {e2}", flush=True)
+            return None
     except Exception as e:
         print(f"[VSG01] News Headline build failed: {e}", flush=True)
         return None
-    return document
 
 
 # ── SEED-089: Humour / Cartoon ────────────────────────────────────────────
