@@ -412,14 +412,25 @@ async def _build_us_vs_them(business_name: str, category: str, description: str,
 
 # ── SEED-087: Borrowed Interface ──────────────────────────────────────────
 
-async def _content_borrowed_interface(business_name: str, category: str, description: str) -> Optional[list]:
+async def _content_borrowed_interface(business_name: str, category: str, description: str,
+                                      correction: str = "") -> Optional[list]:
+    """Real per-message character cap, not just a style ask — live-confirmed
+    a 4-turn exchange with realistically longer messages (2-4 wrapped lines
+    each) rendered with its final bubble clipped off the canvas (see
+    borrowed_interface.ExchangeOverflowsCanvas, added after that failure).
+    A chat message is naturally short anyway, so this constraint should
+    read as normal phrasing, not a compression exercise."""
     prompt = (
         f"For a Nigerian ad for {_business_line(business_name, category, description)}, write a "
         "short, realistic WhatsApp-style exchange (3-4 messages total) between a customer and the "
         "business, ending with the business's offer or answer as the final message. Plausible "
         "casual Nigerian phrasing, no emoji spam.\n"
+        "HARD LIMIT: each message must be 45 characters or fewer, including spaces and "
+        "punctuation — a real chat message, not a paragraph. Correctly-sized examples: 'Do "
+        "you deliver to Lekki?' (22 chars), 'Yes! Same day, ₦1,500 fee.' (26 chars).\n"
         "Return JSON: {\"turns\": [{\"speaker\": \"them\"|\"us\", \"message\": \"...\", "
         "\"timestamp\": \"e.g. 10:41 AM\"}, ...]}. 3-4 turns, last turn speaker must be \"us\". "
+        f"{('CORRECTION: ' + correction) if correction else ''}\n"
         "Return ONLY the JSON."
     )
     d = await _call_content_model(prompt)
@@ -443,8 +454,30 @@ async def _build_borrowed_interface(business_name: str, category: str, descripti
     turns = await _content_borrowed_interface(business_name, category, description)
     if not turns:
         return None
+
+    def _try_build(t):
+        return borrowed_interface.build_document(t, canvas_size=_CANVAS_SIZE, tokens=tokens)
+
     try:
-        document = borrowed_interface.build_document(turns, canvas_size=_CANVAS_SIZE, tokens=tokens)
+        document = _try_build(turns)
+    except borrowed_interface.ExchangeOverflowsCanvas as e:
+        # Same "regenerate once with the exact correction, then accept
+        # whatever comes back" pattern as Text on a Face/News Headline's
+        # own overflow retries — the 45-char cap above should make this
+        # rare, not eliminate it outright.
+        print(f"[VSG01] Borrowed Interface exchange overflowed canvas, retrying shorter: {e}", flush=True)
+        retry_turns = await _content_borrowed_interface(
+            business_name, category, description,
+            correction=f"your last attempt overflowed the canvas ({e}). Make every message "
+                       "noticeably shorter this time — 30 characters or fewer.",
+        )
+        if not retry_turns:
+            return None
+        try:
+            document = _try_build(retry_turns)
+        except Exception as e2:
+            print(f"[VSG01] Borrowed Interface still failed after retry: {e2}", flush=True)
+            return None
     except Exception as e:
         print(f"[VSG01] Borrowed Interface build failed: {e}", flush=True)
         return None
