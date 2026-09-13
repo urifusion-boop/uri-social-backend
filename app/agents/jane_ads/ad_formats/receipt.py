@@ -24,6 +24,20 @@ from ._text_metrics import wrap_text
 from .tokens import AdFormatDef, PLACEHOLDER_TOKENS
 from app.agents.social_media_manager.services.document_renderer_service import DocumentRendererService
 
+
+class ReceiptOverflowsCanvas(ValueError):
+    """legibility.py's own check never validates content height against the
+    canvas at all (it only checks font size/weight/contrast/hairline-stroke
+    — confirmed reading that module directly) — so an item count driven
+    entirely by however many real item+price pairs a business happens to
+    state in its own text (no cap upstream) can produce a card taller than
+    the canvas with nothing catching it. Raised instead of silently
+    rendering a card that runs off the bottom of the frame, same
+    philosophy as this library's other overflow guards
+    (borrowed_interface.ExchangeOverflowsCanvas, news_headline.
+    ContentOverflowsZone)."""
+    pass
+
 FORMAT = AdFormatDef(
     format_id="SEED-081",
     name="The Receipt",
@@ -103,7 +117,13 @@ def build_document(
     card_h = content_height + 2 * card_pad
     card_w = width - 96
     card_x = (width - card_w) // 2
-    card_y = max(48, (height - card_h) // 2)
+    outer_margin = 48
+    if card_h > height - 2 * outer_margin:
+        raise ReceiptOverflowsCanvas(
+            f"receipt needs {card_h}px, taller than the available "
+            f"{height - 2 * outer_margin}px — fewer items or shorter names/lines"
+        )
+    card_y = max(outer_margin, (height - card_h) // 2)
 
     z += 1
     layers.append({
