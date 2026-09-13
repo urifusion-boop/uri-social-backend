@@ -1106,10 +1106,25 @@ async def _content_news_headline(business_name: str, category: str, description:
     setting = str(d.get("nigerian_setting", "")).strip()
     if setting not in _NIGERIAN_SETTINGS:
         setting = _NIGERIAN_SETTINGS[0]
+    headline = str(d.get("headline", "")).strip()
+    date_stamp = str(d.get("date_stamp", "")).strip() or None
+    # Belt-and-suspenders, not just a prompt instruction: when the only real
+    # date in the source text already sits inside the headline (a single-
+    # date announcement, the common case), the model tends to restate it in
+    # date_stamp too regardless of being told not to — live-confirmed
+    # ("Admissions close 30 Sept" + date_stamp "30 September" both shipped
+    # in the same render despite the prompt's explicit instruction). Drop
+    # date_stamp outright whenever any of its own words already appear in
+    # the headline, rather than trusting instruction-following alone.
+    if date_stamp:
+        headline_words = set(re.findall(r"[a-z0-9]+", headline.lower()))
+        date_words = set(re.findall(r"[a-z0-9]+", date_stamp.lower()))
+        if date_words & headline_words:
+            date_stamp = None
     return {
-        "headline": str(d.get("headline", "")).strip(),
+        "headline": headline,
         "secondary_line": str(d.get("secondary_line", "")).strip() or None,
-        "date_stamp": str(d.get("date_stamp", "")).strip() or None,
+        "date_stamp": date_stamp,
         "announcement_subject": subject,
         "nigerian_setting": setting,
     }
