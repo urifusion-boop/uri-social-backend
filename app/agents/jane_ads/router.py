@@ -4188,6 +4188,7 @@ async def _debug_vsg01_format_direct(
     business_name: str = "Test Suya Spot",
     category: str = "restaurant",
     photo_url: str = "",
+    photo_url_2: str = "",
     human_reviewed: bool = False,
 ) -> dict:
     """TEMPORARY — call a VSG01 format's builder DIRECTLY, bypassing
@@ -4218,6 +4219,8 @@ async def _debug_vsg01_format_direct(
     kwargs = {"photo_url": photo_url or None, "brand_logo_url": None}
     if format_id == "SEED-089":
         kwargs["human_reviewed"] = human_reviewed
+    if format_id == "SEED-078":
+        kwargs["day30_photo_url"] = photo_url_2 or None
 
     try:
         document = await builder(business_name, category, description, tokens, **kwargs)
