@@ -524,16 +524,28 @@ async def _build_problem_solution(business_name: str, category: str, description
     async def _gen_zone_passing_skin_check(prompt: str, zone: str) -> Optional[str]:
         """§1.7 — generate the zone, verify skin rendering, and regenerate
         ONCE if a person is rendered outside the deep-brown target range
-        (image models lighten skin intermittently — a second draw usually
-        lands, and the prompt now states the tone explicitly). Still fails
-        closed to the generic fallback if the retry also misses."""
+        (image models lighten skin intermittently). Live-confirmed gap in
+        the original version of this retry: it re-sent the IDENTICAL prompt
+        on attempt 2 — a pure reroll, no correction — which is why a real
+        production run saw the same "medium brown" verdict twice in a row.
+        The retry now prepends a short, specific correction naming the
+        actual wrong tone the vision check just observed. Prepended (not
+        appended) so it survives generate_scene's own length-truncation
+        guard regardless of budget pressure — that guard only ever trims
+        from the end of the string."""
+        current_prompt = prompt
         for attempt in (1, 2):
-            url = await generate_scene(prompt, size=zone_size)
+            url = await generate_scene(current_prompt, size=zone_size)
             result = await verify_skin_rendering(url)
             if not result["contains_person"] or result["matches_target_range"]:
                 return url
+            observed = result.get("skin_tone_observed") or "too light"
             print(f"[VSG01] Problem/Solution {zone} zone failed skin-tone check "
                   f"(attempt {attempt}/2): {result['notes']}", flush=True)
+            current_prompt = (
+                f"CRITICAL: skin must be deep brown to dark brown, NOT {observed} "
+                f"as last time. {prompt}"
+            )
         return None
 
     try:
