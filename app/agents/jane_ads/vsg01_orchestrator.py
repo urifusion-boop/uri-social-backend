@@ -1376,7 +1376,6 @@ async def _locate_reveal_region(photo_url: str, zone_width: int, zone_height: in
     import json as _json
     from app.services.AIService import AIService
 
-    print(f"[VSG01] Censored Item reveal-region: entering detection for {photo_url}", flush=True)
     prompt = (
         "This real product photo will be used for a 'coming soon' reveal ad. "
         "Identify ONE rectangular region of the image worth redacting to build "
@@ -1450,7 +1449,6 @@ async def _build_censored_item(business_name: str, category: str, description: s
     from .ad_formats import censored_item
     width, height = _CANVAS_SIZE
     photo_zone_height = int(height * 0.78)
-    print(f"[VSG01] Censored Item: obscure_box param is {obscure_box!r} before detection", flush=True)
     if obscure_box is None:
         obscure_box = await _locate_reveal_region(photo_url, width, photo_zone_height)
     if obscure_box is None:
