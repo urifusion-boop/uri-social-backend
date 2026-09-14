@@ -72,6 +72,7 @@ def build_document(
     brand_logo_url: Optional[str] = None,
     canvas_size: Tuple[int, int] = (1080, 1080),
     tokens: Dict[str, str] = None,
+    background_url: Optional[str] = None,
 ) -> Dict:
     """
     items: [(name, formatted_price), ...] — price already formatted with the
@@ -79,12 +80,28 @@ def build_document(
     currency formatting — every figure must be real and currently honoured
     per §2.5, which is a caller-side guarantee, not something derivable
     here).
+
+    background_url: an optional AI-generated backdrop (see vsg01_orchestrator's
+    _build_receipt) painted full-canvas, behind the receipt card — the card
+    itself stays a solid, opaque field colour regardless, so this never
+    touches legibility (§1.6's text-over-photography rule is about text
+    sitting directly on a photo; text here still sits on the same solid
+    card it always did, just with a nicer backdrop around/behind it).
+    Omitted entirely (None) keeps the original flat `surface` colour
+    background — every existing manual/QA caller keeps working unchanged.
     """
     t = tokens or PLACEHOLDER_TOKENS
     width, height = canvas_size
 
     layers = []
     z = 0
+
+    if background_url:
+        z += 1
+        layers.append({
+            "type": "ai_generated_background", "z_index": z,
+            "url": background_url, "x": 0, "y": 0, "width": width, "height": height,
+        })
 
     # Space consumed before the first item row starts, relative to the card's
     # own content origin (content_top below) — NOT an absolute canvas

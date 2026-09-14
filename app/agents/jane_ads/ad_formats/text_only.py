@@ -64,6 +64,7 @@ def build_document(
     brand_logo_url: str = None,
     canvas_size: Tuple[int, int] = (1080, 1080),
     tokens: Dict[str, str] = None,
+    background_url: Optional[str] = None,
 ) -> Dict:
     """
     headline: the one real fact this ad exists to say — a price, a delivery
@@ -73,6 +74,14 @@ def build_document(
     subline / action_line: optional supporting line and closing price/action
     — both genuinely optional per §6.14; omitting either is a normal,
     correct use of this format, not a partial one.
+
+    background_url: an optional AI-generated backdrop (see vsg01_orchestrator's
+    _build_text_only). Unlike Receipt, this format has no enclosing card —
+    text sits directly on the canvas — so a solid `field`-coloured card is
+    added behind the text block whenever a background is present, satisfying
+    §1.6's "text over photography requires a solid field plate" rule.
+    Omitted (None) keeps the original flat `surface` background with no
+    card, exactly as before.
     """
     t = tokens or PLACEHOLDER_TOKENS
     width, height = canvas_size
@@ -109,6 +118,22 @@ def build_document(
 
     layers = []
     z = 0
+
+    if background_url:
+        z += 1
+        layers.append({
+            "type": "ai_generated_background", "z_index": z,
+            "url": background_url, "x": 0, "y": 0, "width": width, "height": height,
+        })
+        card_pad = 64
+        z += 1
+        layers.append({
+            "type": "shape", "z_index": z, "shape": "rounded_rect",
+            "x": outer_margin - card_pad, "y": block_top - card_pad,
+            "width": width - 2 * (outer_margin - card_pad),
+            "height": block_height + 2 * card_pad,
+            "corner_radius": 24, "fill_color": t["field"],
+        })
 
     z += 1
     layers.append({
