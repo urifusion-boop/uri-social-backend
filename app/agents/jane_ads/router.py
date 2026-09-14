@@ -4243,6 +4243,49 @@ async def corpus_upload(
             os.unlink(tmp_path)
 
 
+@router.get("/debug/vsg01-news-headline-prompt", include_in_schema=False)
+async def _debug_vsg01_news_headline_prompt(
+    request: Request,
+    business_name: str = "Test Business",
+    category: str = "",
+    description: str = "",
+    brand_colors: str = "",
+) -> dict:
+    """TEMPORARY — returns the EXACT, real final prompt News Headline would
+    send to gpt-image-2 for a given brief, using a REAL content-model call
+    for announcement_subject (not a hand-picked example) — so it can be
+    handed to the user for a genuine side-by-side GPT comparison, same
+    rigor as the prompt already given earlier this session. Does NOT call
+    the image model itself (cheap/fast — just the content step + prompt
+    assembly). brand_colors: comma-separated hex, optional. Same secret-
+    gated pattern as this session's other diagnostics; remove after use."""
+    if request.headers.get("X-Bootstrap-Secret") != "vsg01-corpus-bootstrap-2026-dev-only":
+        raise HTTPException(status_code=404, detail="Not Found")
+    from .vsg01_orchestrator import _content_news_headline, _CANVAS_SIZE
+    from .ad_formats.news_headline import _scene_prompt
+    from .layer2_generation import COMPOSITION_DIRECTIVE, TYPOGRAPHY_DIRECTIVE, GLOBAL_NEGATIVE_PROMPT, _resolve_ratio_clause, brand_palette_clause
+
+    content = await _content_news_headline(business_name, category, description)
+    if not content:
+        return {"success": False, "error": "content model returned nothing usable for this description"}
+
+    brand_context = {"brand_colors": [c.strip() for c in brand_colors.split(",") if c.strip()]} if brand_colors else None
+    scene = _scene_prompt(content["announcement_subject"], content["nigerian_setting"])
+    width, height = _CANVAS_SIZE
+    ratio_clause = _resolve_ratio_clause(f"{width}x{height}")
+    palette_clause = brand_palette_clause(brand_context)
+    fixed_suffix = (
+        f" {ratio_clause}"
+        f"{' ' + palette_clause if palette_clause else ''}"
+        f" {COMPOSITION_DIRECTIVE} {TYPOGRAPHY_DIRECTIVE} {GLOBAL_NEGATIVE_PROMPT}"
+    )
+    return {
+        "success": True,
+        "content": content,
+        "full_prompt": f"{scene.strip()}{fixed_suffix}",
+    }
+
+
 @router.get("/debug/vsg01-select-trace", include_in_schema=False)
 async def _debug_vsg01_select_trace(
     request: Request,
