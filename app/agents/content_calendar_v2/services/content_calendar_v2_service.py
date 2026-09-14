@@ -1168,18 +1168,50 @@ async def get_active_plan(
     return await db[COLLECTION].find_one({**scope, "status": "active"}, {"_id": 0}, sort=[("created_at", -1)])
 
 
+# The pipeline normally finishes in ~4-6 min (see start_plan_generation's own
+# docstring). Generous buffer above that before treating a 'generating' plan
+# as dead rather than just slow.
+_STALE_GENERATING_AFTER = timedelta(minutes=12)
+
+
 async def get_latest_plan(
     user_id: str,
     db: AsyncIOMotorDatabase,
     brand_id: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Most recent non-archived plan — active, generating, or failed — so the
-    frontend can render a 'generating…' state and poll, or show a failure."""
+    frontend can render a 'generating…' state and poll, or show a failure.
+
+    Also self-heals a stuck 'generating' plan: the background task is an
+    in-process asyncio.Task (see start_plan_generation), so it dies silently
+    — without ever reaching its own except-block — whenever the ECS task
+    running it gets replaced mid-run (a routine backend deploy). Confirmed
+    live: a plan sat at 'generating' for 76+ minutes with nothing to flip it
+    and no way for the frontend's poll loop to escape. Every GET /plan call
+    routes through here, so the very next poll after this ships auto-repairs
+    any plan already stuck from before it existed."""
     scope = _cal_v2_scope(user_id, brand_id)
-    return await db[COLLECTION].find_one(
+    plan = await db[COLLECTION].find_one(
         {**scope, "status": {"$in": ["active", "generating", "failed"]}},
         {"_id": 0}, sort=[("created_at", -1)],
     )
+    if plan and plan.get("status") == "generating":
+        try:
+            created_at = datetime.fromisoformat(plan["created_at"])
+        except (TypeError, ValueError, KeyError):
+            created_at = None
+        if created_at and datetime.utcnow() - created_at > _STALE_GENERATING_AFTER:
+            error_msg = (
+                "Generation was interrupted (most likely a backend deploy while it was running) "
+                "and never finished. Please try again."
+            )
+            now_iso = datetime.utcnow().isoformat()
+            await db[COLLECTION].update_one(
+                {"plan_id": plan["plan_id"]},
+                {"$set": {"status": "failed", "error": error_msg, "updated_at": now_iso}},
+            )
+            plan = {**plan, "status": "failed", "error": error_msg, "updated_at": now_iso}
+    return plan
 
 
 async def start_plan_generation(
