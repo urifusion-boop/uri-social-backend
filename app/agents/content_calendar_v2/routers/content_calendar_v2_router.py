@@ -132,19 +132,6 @@ async def create_draft_from_item_v2(
         from app.services.CreditService import credit_service
         from app.services.TrialService import trial_service
 
-        is_trial_user = await trial_service.has_active_trial(user_id)
-        if not is_trial_user:
-            has_credits = await credit_service.check_sufficient_credits(user_id)
-            if not has_credits:
-                return JSONResponse(
-                    status_code=402,
-                    content={
-                        "status": False, "responseCode": 402,
-                        "responseMessage": "You've run out of credits. Upgrade to continue.",
-                        "responseData": {"credits_remaining": 0, "upgrade_url": "/pricing"},
-                    },
-                )
-
         scope = cal_v2_svc._cal_v2_scope(user_id, brand_id)
         plan = await db[cal_v2_svc.COLLECTION].find_one({**scope, "plan_id": plan_id}, {"_id": 0})
         if not plan:
@@ -165,6 +152,48 @@ async def create_draft_from_item_v2(
                 detail="This is a video idea, not a draft-ready post. Use the plan (hook/talking points/scenes/cta) "
                        "to build the video yourself in the Video tab.",
             )
+
+        # Computed early (moved ahead of generation) so the sufficiency check
+        # below can use the REAL cost, not a flat "has at least 1 credit"
+        # guess — closes the gap where the pre-check passed on 1 credit but
+        # the actual charge (per-slide for a carousel) needed more, and the
+        # unchecked deduct_credit()/deduct_trial_credit() return value let
+        # the draft through as a silent free ride. See PRD 7.2 / the credit
+        # cost rule this endpoint documents further down at credits_to_deduct.
+        is_carousel = item.get("format") == "carousel"
+        planned_slides = (
+            len(((item.get("carousel") or {}).get("slides")) or [])
+            or int(item.get("carousel_slide_count") or 3)
+        ) if is_carousel else 1
+        estimated_credits = planned_slides if is_carousel else 1
+
+        is_trial_user = await trial_service.has_active_trial(user_id)
+        if is_trial_user:
+            # TrialService has no amount-aware sufficiency check (only
+            # has_active_trial(), which is the same "≥1 credit" shape as the
+            # paid path's old bug) — read the trial doc directly rather than
+            # add a new shared-service method for a V2-only change.
+            trial_doc = await trial_service.trials_collection.find_one({"user_id": user_id})
+            if not trial_doc or trial_doc.get("credits_remaining", 0) < estimated_credits:
+                return JSONResponse(
+                    status_code=402,
+                    content={
+                        "status": False, "responseCode": 402,
+                        "responseMessage": f"This needs {estimated_credits} trial credit(s) — you don't have enough left.",
+                        "responseData": {"credits_remaining": (trial_doc or {}).get("credits_remaining", 0), "upgrade_url": "/pricing"},
+                    },
+                )
+        else:
+            has_credits = await credit_service.check_sufficient_credits(user_id, required=estimated_credits)
+            if not has_credits:
+                return JSONResponse(
+                    status_code=402,
+                    content={
+                        "status": False, "responseCode": 402,
+                        "responseMessage": f"This needs {estimated_credits} credit(s) — you don't have enough. Upgrade to continue.",
+                        "responseData": {"credits_remaining": 0, "upgrade_url": "/pricing"},
+                    },
+                )
 
         seed_parts = [f"{item.get('title', '')}. {item.get('description', '')}"]
         if item.get("hook"):
@@ -193,14 +222,13 @@ async def create_draft_from_item_v2(
         brand_context = BrandProfileService.to_brand_context(raw_profile) if raw_profile else {}
         brand_context["brand_id"] = brand_id
 
-        if item.get("format") == "carousel":
+        if is_carousel:
             from app.agents.social_media_manager.services.carousel_generation_service import CarouselGenerationService
-            # The V2 pipeline already committed to a slide count (2-5, PRD rule)
-            # and wrote that many slides. Pass it through with force_num_slides
-            # so the draft doesn't re-run content detection and expand a
-            # 3-slide idea into 7 (confirmed live bug).
-            planned_slides = len(((item.get("carousel") or {}).get("slides")) or []) \
-                or int(item.get("carousel_slide_count") or 3)
+            # planned_slides was computed above (before the credit check) —
+            # the V2 pipeline already committed to a slide count (2-5, PRD
+            # rule) and wrote that many slides. Pass it through with
+            # force_num_slides so the draft doesn't re-run content detection
+            # and expand a 3-slide idea into 7 (confirmed live bug).
             result = await CarouselGenerationService.generate_multi_platform(
                 user_id=user_id, seed_content=seed_content, platforms=request.platforms,
                 brand_context=brand_context, db=db,
@@ -221,20 +249,29 @@ async def create_draft_from_item_v2(
             # V2-only cost rule (deliberately diverges from v1's create_draft_from_calendar_day,
             # which charges 1 credit PER PLATFORM draft): 1 credit per SLIDE, flat across every
             # platform — a 3-slide carousel is 3 credits whether it's posted to 1 platform or 4.
-            # planned_slides was set above in the same `format == "carousel"` branch that ran
-            # CarouselGenerationService, so it's always defined here when this condition is True.
-            credits_to_deduct = planned_slides if (item.get("format") == "carousel" and drafts) else 1
+            credits_to_deduct = planned_slides if (is_carousel and drafts) else 1
             if request_id:
                 if is_trial_user:
-                    await trial_service.deduct_trial_credit(
+                    deducted = await trial_service.deduct_trial_credit(
                         user_id=user_id, campaign_id=request_id, reason="campaign_generation", amount=credits_to_deduct,
                     )
                 else:
-                    await credit_service.deduct_credit(
+                    deducted = await credit_service.deduct_credit(
                         user_id=user_id, campaign_id=request_id, reason="campaign_generation",
                         retry_count=0, amount=credits_to_deduct,
                     )
-                print(f"[CalendarV2] deducted {credits_to_deduct} credit(s) for draft {request_id}")
+                # The pre-generation sufficiency check above already confirmed enough
+                # balance for credits_to_deduct, so a False here means a genuine race
+                # (another request drained the balance in between) — rare, but the old
+                # code printed "deducted" unconditionally either way, silently letting
+                # the draft through uncharged. Content is already generated (real AI
+                # cost already spent) so there's nothing to roll back; at minimum this
+                # makes the failure visible instead of misreporting success.
+                if deducted:
+                    print(f"[CalendarV2] deducted {credits_to_deduct} credit(s) for draft {request_id}")
+                else:
+                    print(f"⚠️ [CalendarV2] credit deduction of {credits_to_deduct} FAILED for draft {request_id} "
+                          f"(user_id={user_id}) — draft was created but balance was not charged")
 
             # Mirrors v1's create_draft_from_calendar_day include_images block
             # (complete_social_manager.py) — confirmed missing here entirely:
