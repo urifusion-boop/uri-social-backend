@@ -4177,32 +4177,55 @@ async def corpus_upload(
 async def _debug_vsg01_select_trace(
     request: Request,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    business_name: str = "Test Business",
+    category: str = "",
     description: str = "",
     forced_format_id: str = "",
+    render: bool = False,
 ) -> dict:
     """TEMPORARY — trace exactly what select_ranked_ad_formats/
     select_and_render_vsg01_creative do for a given description + optional
     forced_format_id, WITHOUT going through the frontend's multi-step chat
-    state. Exists to root-cause a live report: a real chat session forced
-    News Headline via the style-choice card, but the actual generation
-    call rendered Problem/Solution instead with no News Headline log line
-    at all — need to see the real ranked list to know whether the force
-    was honored, ignored, or never reached this function. Same
+    state. render=true additionally does a REAL render via
+    select_and_render_vsg01_creative (the exact function the real chat flow
+    calls) and returns the image URL, to inspect the raw generated asset
+    directly — e.g. a live report that the photo itself has a large empty
+    gap the fixed scene-prompt wording was supposed to prevent. Same
     secret-gated pattern as this session's other diagnostics; remove after
     use."""
     if request.headers.get("X-Bootstrap-Secret") != "vsg01-corpus-bootstrap-2026-dev-only":
         raise HTTPException(status_code=404, detail="Not Found")
     from .vsg01_orchestrator import (
-        VSG01_ISOLATED_AD_ACCOUNT, NO_PHOTO_FORMAT_IDS, select_ranked_ad_formats,
+        VSG01_ISOLATED_AD_ACCOUNT, NO_PHOTO_FORMAT_IDS, select_and_render_vsg01_creative,
+        select_ranked_ad_formats,
     )
     ranked = await select_ranked_ad_formats(
         db, isolated_ad_account=VSG01_ISOLATED_AD_ACCOUNT,
         candidate_ids=NO_PHOTO_FORMAT_IDS, description=description,
     )
-    return {
+    result = {
         "ranked_ids_in_order": [s.strategy_id for s in ranked],
         "forced_format_id_would_be_honored": forced_format_id in {s.strategy_id for s in ranked} if forced_format_id else None,
     }
+    if render:
+        import time
+        import traceback
+        from .creative import _upload_bytes_to_cloudinary
+        try:
+            vsg01_result = await select_and_render_vsg01_creative(
+                db, business_name, category, description,
+                forced_format_id=forced_format_id or None,
+            )
+            if vsg01_result is None:
+                result["render"] = {"success": False, "error": "select_and_render_vsg01_creative returned None"}
+            else:
+                image_url = await _upload_bytes_to_cloudinary(
+                    vsg01_result["png_bytes"], f"vsg01-trace-{int(time.time())}",
+                )
+                result["render"] = {"success": True, "format_id": vsg01_result["format_id"], "image_url": image_url}
+        except Exception as e:
+            result["render"] = {"success": False, "error": str(e), "traceback": traceback.format_exc()}
+    return result
 
 
 @router.get("/corpus/upload", response_class=HTMLResponse, include_in_schema=False)
