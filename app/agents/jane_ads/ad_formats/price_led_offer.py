@@ -23,6 +23,7 @@ price, never presented as equal or larger.
 from typing import Dict, Optional, Tuple
 
 from ._text_metrics import text_width, wrap_text
+from .brand_tokens import bold_panel_colors
 from .legibility import assert_legible
 from .tokens import AdFormatDef, PLACEHOLDER_TOKENS, logo_badge_layers
 
@@ -126,24 +127,35 @@ def build_document(
         "url": product_image_url, "x": 0, "y": 0, "width": width, "height": product_zone_height,
     })
 
+    # THIS brand's own bold panel colour (see bold_panel_colors), not the
+    # fixed `field` token — the price is the hero element here, deserving
+    # the same bold, on-brand treatment as every other format's offer/
+    # panel band in this library.
+    panel_color, panel_text = bold_panel_colors(t)
+    # A quieter version of the same panel text colour (not a separate
+    # ink-quiet token, which assumes a light background) — works whether
+    # panel_text is white or dark, for the "was" price/strike, which needs
+    # to read as visually de-emphasised regardless of the panel's own tone.
+    muted_panel_text = panel_text + "99"
+
     field_y = product_zone_height
     z += 1
     layers.append({
         "type": "shape", "z_index": z, "shape": "rect",
         "x": 0, "y": field_y, "width": width, "height": field_height,
-        "fill_color": t["field"],
+        "fill_color": panel_color,
     })
 
     content_y = field_y + top_pad
 
     # Price row — the largest element after the product itself (§6.13). A
-    # genuine "was" price sits beside it, smaller, in ink-quiet, with a
+    # genuine "was" price sits beside it, smaller and de-emphasised, with a
     # single horizontal strike drawn across its own measured width — never
     # rendered at equal size/weight to the real price.
     z += 1
     layers.append({
         "type": "text", "z_index": z, "content": price,
-        "x": _PADDING, "y": content_y, "font_size": _FONT_PRICE, "font_weight": 700, "color": t["accent"],
+        "x": _PADDING, "y": content_y, "font_size": _FONT_PRICE, "font_weight": 700, "color": panel_text,
     })
     if was_price:
         was_x = _PADDING + text_width(price, _FONT_PRICE, 700) + 24
@@ -151,7 +163,7 @@ def build_document(
         z += 1
         layers.append({
             "type": "text", "z_index": z, "content": was_price,
-            "x": was_x, "y": was_y, "font_size": _FONT_WAS_PRICE, "color": t["ink-quiet"],
+            "x": was_x, "y": was_y, "font_size": _FONT_WAS_PRICE, "color": muted_panel_text,
         })
         was_w = text_width(was_price, _FONT_WAS_PRICE)
         strike_y = was_y + _FONT_WAS_PRICE // 2
@@ -159,7 +171,7 @@ def build_document(
         layers.append({
             "type": "shape", "z_index": z, "shape": "line",
             "x1": was_x, "y1": strike_y, "x2": was_x + was_w, "y2": strike_y,
-            "color": t["ink-quiet"], "stroke_width": 3,
+            "color": muted_panel_text, "stroke_width": 3,
         })
     content_y += _FONT_PRICE + 16
 
@@ -169,7 +181,7 @@ def build_document(
         z += 1
         layers.append({
             "type": "text", "z_index": z, "content": "\n".join(lines),
-            "x": _PADDING, "y": content_y, "font_size": _FONT_LINE, "color": t["ink"],
+            "x": _PADDING, "y": content_y, "font_size": _FONT_LINE, "color": panel_text,
         })
         content_y += len(lines) * line_height
 
@@ -178,7 +190,7 @@ def build_document(
         z += 1
         layers.append({
             "type": "text", "z_index": z, "content": "\n".join(action_lines),
-            "x": _PADDING, "y": content_y, "font_size": _FONT_ACTION, "font_weight": 700, "color": t["ink"],
+            "x": _PADDING, "y": content_y, "font_size": _FONT_ACTION, "font_weight": 700, "color": panel_text,
         })
 
     badge_layers, z = logo_badge_layers(brand_logo_url, width, height, z)
