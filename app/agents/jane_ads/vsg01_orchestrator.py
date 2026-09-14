@@ -119,7 +119,39 @@ from .retrieval import BudgetContext, BusinessProfile, RetrievalRequest, retriev
 from .skin_tone_check import verify_skin_rendering
 from .store import MongoStrategyStore
 from .visual_slots import NIGERIAN_SETTINGS
+from .vsg01_corpus_seed import _RECORDS as _VSG01_RECORDS
 from .vsg01_corpus_seed import FORMAT_MODULES
+
+# Each format's own real corpus claim (vsg01_corpus_seed.py's own authored
+# "use when..." sentence) — the actual content this format is for, used by
+# _content_fit_boost below to REASON about a fit rather than pattern-match
+# a hardcoded phrase list.
+_FORMAT_CLAIMS: dict[str, str] = {
+    r["format_module"].FORMAT.format_id: r["claim"] for r in _VSG01_RECORDS
+}
+
+# News Headline/Censored Item/Day 1->Day 30's corpus records are
+# pooled_account_safe=REQUIRES_ISOLATION, and retrieval.py's exclusion_reason
+# only ever passes that when profile.isolated_ad_account is True. No
+# per-brand Meta ad account exists anywhere on this platform (grep-confirmed:
+# every launch/billing/monitoring call uses the single global
+# settings.META_AD_ACCOUNT_ID) — but §6/§2.8's own design already names the
+# real compensating control for exactly this situation: "cap usage across the
+# book before scaling" (SEED-079, isolation_cap.py) — a book-wide usage
+# ceiling built specifically so these formats can run safely on a POOLED
+# account, not a literal separate one. That module existed, fully built and
+# tested, with a real docstring saying "not yet wired into a live call path"
+# — select_and_render_vsg01_creative's own render loop is that wiring: it
+# enforces the actual cap (check before rendering, record after) per
+# candidate. This constant is what makes isolated_ad_account=True a TRUE
+# statement wherever it's used — "safe on this pooled account under the real
+# cap enforced elsewhere", not a false claim about account architecture —
+# shared so every call site that ranks VSG01 formats (the real generation
+# path AND the pre-generation suggest-format endpoint) applies the exact
+# same eligibility, rather than two hand-maintained copies that could drift
+# apart (confirmed they already had: suggest-format never set this at all,
+# so these 3 formats could never even appear as a suggestion).
+VSG01_ISOLATED_AD_ACCOUNT = True
 
 # See module docstring for the full reasoning behind each set below.
 NO_PHOTO_FORMAT_IDS = frozenset({
@@ -171,14 +203,23 @@ _CANVAS_SIZE = (1080, 1080)
 # ── Content fit (Layer 2) ─────────────────────────────────────────────────
 # Eligibility (retrieval.py, above) answers "what CAN this business run" —
 # photo/budget/platform facts about the account. It has no idea what the ad
-# actually SAYS. This layer narrows among the already-eligible formats using
-# real phrases the business itself wrote in `description` — it never makes
-# an ineligible format eligible, and a format with no phrase match is never
-# penalized, just left in its original (eligibility-score) order. Cheap,
-# deterministic keyword matching on purpose, not an LLM classification call:
-# no added latency/cost on every suggestion, and a keyword either is or
-# isn't in the text — nothing here is inferred or invented from the words,
-# matching this module's existing "never fabricate" contract for content.
+# actually SAYS. This layer narrows among the already-eligible formats
+# based on what `description` is actually saying — it never makes an
+# ineligible format eligible, and "nothing stands out" is never penalized,
+# just left in its original (eligibility-score) order.
+#
+# _content_fit_boost (below _CONTENT_FIT_SIGNALS) is the real, primary
+# mechanism: one content-model call reasoning about the brief against each
+# ELIGIBLE format's own authored corpus claim — genuinely understands a
+# differently-worded announcement/reveal/complaint, not just phrases
+# someone thought to enumerate in advance. _CONTENT_FIT_SIGNALS below is
+# kept as _keyword_content_fit_boost, a zero-latency, zero-cost fallback
+# for when that call fails (an LLM outage should degrade the suggestion
+# quality, not remove content-fit entirely) — never the primary path, and
+# itself a real, live-confirmed illustration of why: it originally had no
+# entry at all for News Headline, so a brief that was EXACTLY a news
+# announcement ("we're opening a new branch in Yaba on 1 October, tell
+# people about it") still fell through to Problem/Solution's default.
 _CONTENT_FIT_SIGNALS: dict[str, tuple[str, ...]] = {
     # Us vs Them — the brief itself frames a comparison.
     "SEED-075": (
@@ -231,16 +272,100 @@ _CONTENT_FIT_SIGNALS: dict[str, tuple[str, ...]] = {
         "starter kit", "starter pack", "bundle", "set includes",
         "everything you need", "comes with",
     ),
+    # News Headline — the brief states a genuine, dated announcement. Live-
+    # confirmed gap: this format had NO signal entry at all, so a brief that
+    # was exactly this shape ("we're opening a new branch in Yaba on 1
+    # October, tell people about it") still fell through to Problem/
+    # Solution's default — being eligible was never enough on its own to
+    # ever get suggested.
+    "SEED-077": (
+        "we're opening", "now open", "opening on", "opens on", "launching on",
+        "launch date", "new branch", "grand opening", "admissions close",
+        "admissions open", "tell people about it", "announce", "announcing",
+        "new campus", "now enrolling",
+    ),
+    # Humour/Cartoon — the brief frames a shared, relatable annoyance as the
+    # ad's own angle (not just naming a problem to solve, which is
+    # Problem/Solution's signal — "so annoying"/"let's be honest" read as
+    # wanting to be funny about it, not just fix it).
+    "SEED-089": (
+        "so annoying", "the worst part", "we've all been there", "let's be honest",
+        "nobody likes", "relatable", "make you laugh", "funny",
+    ),
+    # The Censored Item — a real pending reveal, distinct from Work In
+    # Progress's "still building" framing: something specific is being kept
+    # back until a stated moment.
+    "SEED-083": (
+        "revealing", "reveal on", "unveiling", "under wraps", "big reveal",
+        "can't show you yet", "keeping it secret",
+    ),
 }
 
 
-def _content_fit_boost(description: str) -> dict[str, float]:
-    """Returns {format_id: 1.0} for every format whose signal phrases appear
-    verbatim in the business's own stated brief — empty dict (no boost, no
-    reorder) when nothing matches, which is the common case and the safe
-    default."""
+def _keyword_content_fit_boost(description: str) -> dict[str, float]:
+    """The original mechanism — returns {format_id: 1.0} for every format
+    whose signal phrases appear verbatim in the business's own stated
+    brief. Real, live-confirmed limitation: a brief that says exactly what
+    a format is for, just in different words than whatever was hardcoded
+    here, gets no boost at all — "we're opening a new branch in Yaba on 1
+    October, tell people about it" matched none of News Headline's
+    original phrase list despite being exactly a news announcement. Kept
+    now only as a zero-latency, zero-cost FALLBACK for when the real
+    classifier below (_content_fit_boost) can't run — never the primary
+    mechanism."""
     text = (description or "").lower()
     return {fid: 1.0 for fid, phrases in _CONTENT_FIT_SIGNALS.items() if any(p in text for p in phrases)}
+
+
+async def _content_fit_boost(description: str, eligible: list[Strategy]) -> dict[str, float]:
+    """Real content-fit classification: asks the content model which ONE
+    eligible format's actual, authored corpus claim best matches what the
+    business brief is really saying — an announcement, a reveal, a
+    relatable complaint, a comparison, a bundle, a testimonial, an
+    unfinished process — rather than pattern-matching a hardcoded phrase
+    list that can only ever cover phrasings someone thought to enumerate.
+    Only ever reasons about formats retrieval.py has ALREADY found
+    eligible for this request (passed in as `eligible`) — this can narrow
+    among them, never make an ineligible one eligible, same contract the
+    keyword version always had.
+
+    Empty/no-match description, an empty eligible list, or the content
+    model call failing all return {} (no boost, no reorder) — the safe
+    default, same as the keyword version — but on a genuine call failure
+    this falls back to the keyword matcher above rather than going
+    straight to the no-signal default order, so a transient LLM outage
+    degrades to the old behaviour instead of losing content-fit entirely.
+    """
+    text = (description or "").strip()
+    if not text or not eligible:
+        return {}
+    catalogue = "\n".join(
+        f"- {s.strategy_id}: {_FORMAT_CLAIMS[s.strategy_id]}"
+        for s in eligible if s.strategy_id in _FORMAT_CLAIMS
+    )
+    if not catalogue:
+        return {}
+    prompt = (
+        f"A Nigerian business wrote this ad brief:\n\n{text}\n\n"
+        "Below is a list of ad visual formats this business is ALREADY eligible to "
+        "use, each with its own real, authored description of what it's actually "
+        "for. Pick the ONE format whose real purpose best matches what this brief "
+        "is genuinely saying — judge the actual content/situation being described, "
+        "not just general ad quality. If nothing genuinely stands out over a plain "
+        "default, return format_id as an empty string; do not force a fit.\n\n"
+        f"{catalogue}\n\n"
+        "Return JSON: {\"format_id\": \"SEED-XXX\" or \"\"}. Return ONLY the JSON."
+    )
+    try:
+        d = await _call_content_model(prompt)
+    except Exception as e:
+        print(f"[VSG01] content-fit classification failed, falling back to keyword match: {e}", flush=True)
+        return _keyword_content_fit_boost(description)
+    if not d:
+        return _keyword_content_fit_boost(description)
+    picked = str(d.get("format_id", "")).strip()
+    valid_ids = {s.strategy_id for s in eligible}
+    return {picked: 1.0} if picked in valid_ids else {}
 
 
 # The "no content signal fired" fallback order — an ORDERED list, tried in
@@ -326,7 +451,7 @@ async def select_ranked_ad_formats(
     )
     result = retrieve(candidates, req, limit=len(candidates))
     records = result.records
-    fit = _content_fit_boost(description)
+    fit = await _content_fit_boost(description, records)
     if fit:
         records = sorted(records, key=lambda s: -fit.get(s.strategy_id, 0.0))
     else:
@@ -1698,28 +1823,9 @@ async def select_and_render_vsg01_creative(
     candidate_ids, has_product_photo, has_real_customer_photo, photo_url = _vsg01_candidate_params(
         photo_url=photo_url, photo_attestation=photo_attestation, recomposite=recomposite,
     )
-
-    # News Headline/Censored Item/Day 1->Day 30's corpus records are
-    # pooled_account_safe=REQUIRES_ISOLATION, and retrieval.py's
-    # exclusion_reason only ever passes that when profile.isolated_ad_account
-    # is True. No per-brand Meta ad account exists anywhere on this platform
-    # (grep-confirmed: every launch/billing/monitoring call uses the single
-    # global settings.META_AD_ACCOUNT_ID) — but §6/§2.8's own design already
-    # names the REAL compensating control for exactly this situation: "cap
-    # usage across the book before scaling" (SEED-079, isolation_cap.py) — a
-    # book-wide usage ceiling built specifically so these formats can run
-    # safely on a POOLED account, not a literal separate one. That module
-    # existed, fully built and tested, with a real docstring saying "not yet
-    # wired into a live call path" — this is that wiring: eligibility here
-    # treats the pooled account as acceptable (isolated_ad_account=True is a
-    # true statement about "safe to use on this pooled account under the real
-    # cap enforced below", not a false claim about account architecture), and
-    # the loop below enforces the actual cap per candidate before rendering,
-    # would have if left False.
-    isolated_ad_account = True
     ranked = await select_ranked_ad_formats(
         db, has_product_photo=has_product_photo, has_real_customer_photo=has_real_customer_photo,
-        isolated_ad_account=isolated_ad_account, candidate_ids=candidate_ids, description=description,
+        isolated_ad_account=VSG01_ISOLATED_AD_ACCOUNT, candidate_ids=candidate_ids, description=description,
     )
     ranked_ids = {s.strategy_id for s in ranked}
     effective_forced = forced_format_id if forced_format_id in ranked_ids else None
