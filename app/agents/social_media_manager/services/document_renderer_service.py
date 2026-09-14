@@ -68,6 +68,9 @@ class DocumentRendererService:
                 elif layer_type == "brand_asset":
                     await DocumentRendererService._render_asset(canvas, layer)
 
+                elif layer_type == "shape":
+                    await DocumentRendererService._render_shape(canvas, layer)
+
             except Exception as e:
                 print(f"⚠️ Error rendering layer {layer.get('id')}: {e}")
                 # Continue rendering other layers even if one fails
@@ -91,7 +94,20 @@ class DocumentRendererService:
         canvas_width: int,
         canvas_height: int
     ):
-        """Render background image layer"""
+        """Render background image layer.
+
+        x/y/width/height default to the full canvas — every caller before
+        VSG-01's Problem/Solution format either passed those explicitly as
+        the full canvas size or omitted them entirely, so this preserves
+        their behaviour exactly. Previously this always resized to
+        (canvas_width, canvas_height) and pasted at (0, 0) regardless of
+        what a layer specified, silently ignoring x/y/width/height —
+        harmless when a document only ever has one full-canvas background,
+        but a real bug for a format needing two ai_generated_background
+        layers in different zones of the same canvas (confirmed live: the
+        second layer's full-canvas paste completely overwrote the first
+        zone's scrim and text). Brought in line with _render_product,
+        which already respects per-layer x/y/width/height correctly."""
         image_url = layer.get("url")
         if not image_url:
             return
@@ -101,11 +117,16 @@ class DocumentRendererService:
         if not bg_image:
             return
 
-        # Resize to canvas size
-        bg_image = bg_image.resize((canvas_width, canvas_height), Image.Resampling.LANCZOS)
+        x = layer.get("x", 0)
+        y = layer.get("y", 0)
+        width = layer.get("width", canvas_width)
+        height = layer.get("height", canvas_height)
 
-        # Paste onto canvas
-        canvas.paste(bg_image, (0, 0))
+        # Resize to the layer's own dimensions
+        bg_image = bg_image.resize((width, height), Image.Resampling.LANCZOS)
+
+        # Paste at the layer's own position
+        canvas.paste(bg_image, (x, y))
 
     @staticmethod
     async def _render_product(canvas: Image.Image, layer: Dict[str, Any]):
@@ -162,9 +183,16 @@ class DocumentRendererService:
         # Load font
         font = DocumentRendererService._load_font(font_family, font_size, font_weight)
 
-        # Draw text
+        # Draw text. `text_align` maps straight onto Pillow's own anchor
+        # strings (e.g. "ra" = right-ascender) — added for right-aligned
+        # numbers (Receipt's prices need to line up at a fixed right edge,
+        # which means anchoring at x rather than measuring text width
+        # ourselves in every format builder that needs it). Left/top-anchored
+        # ("la", Pillow's own default) is unchanged for every existing caller
+        # that doesn't pass this.
         rgba_color = DocumentRendererService._hex_to_rgba(color)
-        draw.text((x, y), content, font=font, fill=rgba_color)
+        anchor = layer.get("text_align")
+        draw.text((x, y), content, font=font, fill=rgba_color, anchor=anchor)
 
     @staticmethod
     async def _render_asset(canvas: Image.Image, layer: Dict[str, Any]):
@@ -184,9 +212,24 @@ class DocumentRendererService:
         width = layer.get("width")
         height = layer.get("height")
 
-        # Resize if dimensions specified
+        # Fit within (width, height) preserving the logo's own aspect ratio,
+        # then center it in the box — every caller (tokens.logo_badge_layers,
+        # review_card.py, humour_cartoon.py, receipt.py) sizes this box to
+        # its OWN fixed aspect ratio (e.g. 140x56, 2.5:1), which is almost
+        # never a real logo's actual shape. A plain resize((width, height))
+        # here stretched every logo to that box's ratio regardless — live-
+        # confirmed a real wordmark logo rendered visibly squeezed/distorted.
+        # Fixed once at this single render choke point rather than in each
+        # of the 4 callers, since none of them can know a specific
+        # business's real logo shape in advance anyway.
         if width and height:
-            asset_image = asset_image.resize((width, height), Image.Resampling.LANCZOS)
+            orig_w, orig_h = asset_image.size
+            if orig_w and orig_h:
+                scale = min(width / orig_w, height / orig_h)
+                fit_w, fit_h = max(1, round(orig_w * scale)), max(1, round(orig_h * scale))
+                asset_image = asset_image.resize((fit_w, fit_h), Image.Resampling.LANCZOS)
+                x += (width - fit_w) // 2
+                y += (height - fit_h) // 2
 
         # Apply opacity if specified
         opacity = layer.get("opacity", 1.0)
@@ -201,15 +244,114 @@ class DocumentRendererService:
         canvas.paste(asset_image, (x, y), asset_image if asset_image.mode == 'RGBA' else None)
 
     @staticmethod
+    async def _render_shape(canvas: Image.Image, layer: Dict[str, Any]):
+        """
+        Render a plain/rounded rectangle or a (optionally dashed) line — the
+        one primitive this renderer was missing, needed for VSG-01's L4-only
+        formats: Receipt's leader lines and rule-above-total, Us vs Them's
+        field blocks and row rules, Borrowed Interface's message bubbles.
+        No image download, no external dependency — pure Pillow drawing, same
+        as _render_text below.
+
+        rect / rounded_rect: {x, y, width, height, corner_radius (rounded_rect
+        only), fill_color, border_color, border_width}. fill_color and/or
+        border_color may be omitted (an outline-only or fill-only shape).
+
+        line: {x1, y1, x2, y2, color, stroke_width, dashed, dash_length,
+        gap_length}. Deliberately a distinct coordinate scheme from rect
+        (endpoints, not x/y/width/height) — a leader line runs between two
+        specific points, not a box.
+        """
+        shape = layer.get("shape", "rect")
+        draw = ImageDraw.Draw(canvas)
+
+        if shape in ("rect", "rounded_rect"):
+            x, y = layer.get("x", 0), layer.get("y", 0)
+            width, height = layer.get("width", 0), layer.get("height", 0)
+            if width <= 0 or height <= 0:
+                return
+            box = [x, y, x + width, y + height]
+            fill = DocumentRendererService._hex_to_rgba(layer["fill_color"]) if layer.get("fill_color") else None
+            outline = DocumentRendererService._hex_to_rgba(layer["border_color"]) if layer.get("border_color") else None
+            border_width = layer.get("border_width", 2)
+            if fill is None and outline is None:
+                return  # nothing would actually render — matches _render_text's early-return-on-empty-content
+            if shape == "rounded_rect":
+                radius = layer.get("corner_radius", 8)
+                draw.rounded_rectangle(box, radius=radius, fill=fill, outline=outline, width=border_width)
+            else:
+                draw.rectangle(box, fill=fill, outline=outline, width=border_width)
+
+        elif shape == "line":
+            x1, y1 = layer.get("x1", 0), layer.get("y1", 0)
+            x2, y2 = layer.get("x2", 0), layer.get("y2", 0)
+            color = DocumentRendererService._hex_to_rgba(layer.get("color", "#000000"))
+            stroke_width = layer.get("stroke_width", 2)
+            if not layer.get("dashed"):
+                draw.line([(x1, y1), (x2, y2)], fill=color, width=stroke_width)
+                return
+            # Dashed: walk the segment in dash+gap steps. Only horizontal and
+            # vertical lines are supported dashed (every use case here —
+            # Receipt's leaders, rule dividers — is axis-aligned); a diagonal
+            # dashed line falls back to solid rather than silently drawing
+            # nothing.
+            dash_length = layer.get("dash_length", 6)
+            gap_length = layer.get("gap_length", 4)
+            step = dash_length + gap_length
+            if y1 == y2:
+                total = abs(x2 - x1)
+                direction = 1 if x2 >= x1 else -1
+                pos = 0
+                while pos < total:
+                    seg_end = min(pos + dash_length, total)
+                    draw.line(
+                        [(x1 + direction * pos, y1), (x1 + direction * seg_end, y1)],
+                        fill=color, width=stroke_width,
+                    )
+                    pos += step
+            elif x1 == x2:
+                total = abs(y2 - y1)
+                direction = 1 if y2 >= y1 else -1
+                pos = 0
+                while pos < total:
+                    seg_end = min(pos + dash_length, total)
+                    draw.line(
+                        [(x1, y1 + direction * pos), (x1, y1 + direction * seg_end)],
+                        fill=color, width=stroke_width,
+                    )
+                    pos += step
+            else:
+                draw.line([(x1, y1), (x2, y2)], fill=color, width=stroke_width)
+
+    @staticmethod
     async def _fetch_image(url: str) -> Optional[Image.Image]:
-        """Download image from URL"""
-        try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                response = await client.get(url)
-                if response.status_code == 200:
-                    return Image.open(io.BytesIO(response.content)).convert("RGBA")
-        except Exception as e:
-            print(f"⚠️ Error fetching image {url}: {e}")
+        """Download image from URL.
+
+        Retries twice (1s, then 2s backoff) before giving up — found live
+        building VSG-01's News Headline format: a Cloudinary URL returned
+        by layer2_generation.generate_scene() immediately after upload
+        failed to fetch on the very next render call, then succeeded on a
+        manual retry seconds later (curl confirmed the same URL was a
+        real, complete image — a CDN propagation race, not a broken
+        upload or a bad URL). Every ai_generated_background/
+        composited_product/brand_asset layer goes through this method, so
+        a single transient failure previously meant a silently blank
+        background rather than the generated scene the whole format is
+        built around."""
+        last_error: Optional[Exception] = None
+        for attempt in range(3):
+            if attempt > 0:
+                import asyncio
+                await asyncio.sleep(attempt)  # 1s before 2nd try, 2s before 3rd
+            try:
+                async with httpx.AsyncClient(timeout=30) as client:
+                    response = await client.get(url)
+                    if response.status_code == 200:
+                        return Image.open(io.BytesIO(response.content)).convert("RGBA")
+                    last_error = f"HTTP {response.status_code}"
+            except Exception as e:
+                last_error = e
+        print(f"⚠️ Error fetching image {url} after 3 attempts: {last_error}")
         return None
 
     @staticmethod

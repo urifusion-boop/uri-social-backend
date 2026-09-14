@@ -1,0 +1,285 @@
+"""
+Problem / Solution — VSG-01 v3 §2.3 (SEED-080).
+
+"Default choice when nothing more specific fits. Lowest policy risk in the
+library." Two zones, fixed order: problem (top), solution (bottom) — a
+naira-cost problem stated concretely, a solution stated as outcome, not
+feature. One focal point per zone, roughly 15 words total between them.
+
+Asset source: `generate` — permitted here specifically because the image
+illustrates a SITUATION, not the product (§1.2's product-truthfulness rule
+still applies: if the solution zone needs to show the actual product, that
+half is upload_as_is instead, not generated — out of scope for this
+module, which only ever generates).
+
+Each zone's own Layer 2 prompt reserves a real empty band (top 40% for the
+problem zone, bottom 40% for the solution zone, per §2.3's own
+{{top|bottom}} choice) for Layer 4 text — composited here with a solid
+`field` scrim between the generated photo and the text (§1.6: "text over
+photography requires a solid field plate, a gradient scrim, or a hard
+outline. Never a subtle drop shadow"), never floating text on top of an
+uncontrolled background.
+
+Hard checks (§2.3):
+
+1. "The pain named must be one the seller can actually resolve." Caller-
+   side guarantee, same category as Receipt's "every figure real and
+   honoured" — this module has no way to judge whether a stated problem is
+   one a given business can actually fix.
+
+2. "Text-led, so §1.6 applies harder than anywhere else." Enforced, not
+   just noted: build_document calls legibility.assert_legible() on its own
+   output before returning — the only format module in this library that
+   self-checks rather than leaving it to an external caller, because §2.3
+   itself singles this format out for a harder bar than the rest.
+"""
+from typing import Dict, Optional, Tuple
+
+from ..visual_slots import resolve_nigerian_setting
+from ..layer2_generation import REPRESENTATION_BLOCK, generate_scene, seasonal_context_clause
+from .brand_tokens import bold_panel_colors
+from .legibility import assert_legible
+from ._text_metrics import wrap_text
+from .tokens import AdFormatDef, PLACEHOLDER_TOKENS, logo_badge_layers
+from app.agents.social_media_manager.services.document_renderer_service import DocumentRendererService
+
+FORMAT = AdFormatDef(
+    format_id="SEED-080",
+    name="Problem / Solution",
+    asset_source="generate",
+    layers_used="L2-L4",
+    brand_mark="optional",  # VSG-01-PROMPTS v2 §6.3
+    requires=[],  # `generate` needs no photo from the business at all
+)
+
+_FONT_COPY = 56  # text-led format — well above the §1.6 floor, not just at it
+_ZONE_TEXT_PADDING = 56
+_LINE_HEIGHT = int(_FONT_COPY * 1.3)
+
+
+def _scrim_fill(hex_color: str) -> str:
+    """A semi-transparent caption band, not an opaque block. The Layer 2
+    prompt already reserves an empty area in the photo for the text; a solid
+    fill covers exactly that reserved area with a flat slab and the result
+    reads as two photos crammed between two flat bars (confirmed live).
+    ~90% opacity keeps text at the §1.6 contrast floor while letting the
+    photo's own texture through so it reads as one composed image.
+
+    Takes THIS brand's own bold-panel colour (see bold_panel_colors), not
+    the fixed `field` token — same "always the brand's real colour, never
+    a generic neutral" decision as News Headline's banner/panel."""
+    c = (hex_color or "").strip()
+    if c.startswith("#") and len(c) == 7:
+        return c + "E6"
+    return "#FFFFFFE6"
+
+
+class TextOverflowsScrim(ValueError):
+    """§2.3: 'Text-led, so §1.6 applies harder than anywhere else.'
+    wrap_text only guarantees a line fits horizontally — it says nothing
+    about whether the wrapped block's total height still fits inside the
+    zone's solid scrim band. Text that overflows the scrim lands directly
+    on the raw generated photo behind it, which legibility.py's own check
+    would not catch (it samples a text layer's origin point, not the full
+    vertical extent of a multi-line block) — caught here explicitly
+    instead, before that gap could ship."""
+    pass
+
+
+def _check_fits_scrim(lines, zone_name: str, scrim_height: int) -> None:
+    available = scrim_height - _ZONE_TEXT_PADDING
+    needed = len(lines) * _LINE_HEIGHT
+    if needed > available:
+        raise TextOverflowsScrim(
+            f"{zone_name} text wraps to {len(lines)} line(s) ({needed}px), taller than "
+            f"its scrim band ({available}px) — shorten it (§2.3: roughly 15 words total)"
+        )
+
+
+# VSG-01-PROMPTS v3 §6.3 verbatim (slots filled). REPRESENTATION_BLOCK
+# (§4, imported from layer2_generation) replaces the earlier skin-tone-only
+# phrase — same §1.7 purpose, fuller v3 wording (also covers natural
+# unretouched texture and authentic Nigerian clothing/objects, not just
+# tone). §1.7 note preserved: image models are known to lighten skin under
+# bright-daylight prompts — which the solution half deliberately uses —
+# so stating this explicitly rather than leaving it to the setting to imply
+# still matters here.
+def _problem_prompt(problem_situation: str, nigerian_setting: str, seasonal_context: Optional[str] = None) -> str:
+    seasonal = seasonal_context_clause(seasonal_context)
+    # Editorial advertising photography, not amateur/unpolished documentary
+    # — same "REVISED DECISION" reasoning as News Headline: the load-bearing
+    # rule is that the situation is real and believable, not that the
+    # photography itself looks rough or accidental. The muted/desaturated
+    # colour treatment stays — that contrast against the solution zone's
+    # brighter tones is the format's actual storytelling device (§2.3), not
+    # a proxy for "unpolished".
+    return (
+        f"Create a professionally shot, real Nigerian photograph that "
+        f"communicates {problem_situation} immediately without requiring "
+        f"explanatory text. Set the scene in {resolve_nigerian_setting(nigerian_setting)}, "
+        "with specific, believable environmental detail — real worn surfaces, "
+        "textures and everyday objects that genuinely belong in this exact "
+        "setting, never a generic or empty backdrop. "
+        f"{REPRESENTATION_BLOCK}. Frame the shot with at least one face and "
+        "upper body clearly visible — never just legs or backs. Capture a "
+        "genuine, unguarded expression of frustration or difficulty. Show one "
+        "clear human situation that communicates the problem instantly, with "
+        "the relevant object or context visible in sharp, tangible detail. "
+        "Concentrate the subject and "
+        "action in the lower two-thirds of the frame, keeping the top third "
+        "visually calm and uncluttered — a headline is placed there. Use "
+        "muted, slightly desaturated natural colours with overcast or shaded "
+        "daylight and soft directional shadow, composed with the same care as a "
+        "real published advertisement. The image should feel genuine and true to "
+        "life, never staged or artificial, while still being deliberately and "
+        f"professionally composed — real, not amateur.{(' ' + seasonal) if seasonal else ''}"
+    )
+
+
+def _solution_prompt(
+    solution_situation: str, problem_situation: str, nigerian_setting: str, seasonal_context: Optional[str] = None,
+) -> str:
+    seasonal = seasonal_context_clause(seasonal_context)
+    return (
+        "Create a professionally shot, real Nigerian photograph showing the "
+        f"positive resolution of {problem_situation}, represented by "
+        f"{solution_situation}. Set the scene in {resolve_nigerian_setting(nigerian_setting)}, "
+        "with the same specific environmental detail as the problem photo — "
+        "real textures and objects, now visibly tidier and more purposeful. "
+        f"{REPRESENTATION_BLOCK}. This must depict the SAME location and scene "
+        "as the problem photo — not a different place — now visibly more "
+        "organised and satisfying. Capture a genuine expression of relief or "
+        "quiet satisfaction. Concentrate the subject and action in the "
+        "upper two-thirds of the frame, keeping the bottom third visually "
+        "calm and uncluttered — a headline is placed there. Match the problem "
+        "photo's camera distance and framing so the two read as one "
+        "continuous story. Use brighter natural daylight and warmer but "
+        "realistic tones, gentle golden-hour quality where believable. Not exaggerated or "
+        f"impossibly perfect. The contrast should come from the situation "
+        f"itself, not colour grading.{(' ' + seasonal) if seasonal else ''}"
+    )
+
+
+def build_document(
+    problem_image_url: str,
+    solution_image_url: str,
+    problem_text: str,
+    solution_text: str,
+    canvas_size: Tuple[int, int] = (1080, 1080),
+    tokens: Dict[str, str] = None,
+    brand_logo_url: str = None,
+) -> Dict:
+    """
+    problem_image_url / solution_image_url: already-generated Layer 2
+    scenes (produced by render() below via generate_scene) — this function
+    only lays them out, matching every other format module's
+    build_document/render split.
+    problem_text / solution_text: the actual Layer 4 copy — a naira-cost
+    problem, an outcome-stated solution (§2.3's caller-side guarantee, not
+    enforced here — see module docstring's hard check 1).
+    """
+    t = tokens or PLACEHOLDER_TOKENS
+    width, height = canvas_size
+    zone_height = height // 2
+    # The scrim is a caption band sized to its text (+ padding), capped at
+    # 40% of the zone — not a fixed 40% slab regardless of how short the
+    # copy is.
+    max_scrim_height = int(zone_height * 0.4)
+    panel_color, panel_text = bold_panel_colors(t)
+    scrim_fill = _scrim_fill(panel_color)
+
+    layers = []
+    z = 0
+
+    problem_lines = wrap_text(problem_text, width - 2 * _ZONE_TEXT_PADDING, _FONT_COPY, 700)
+    _check_fits_scrim(problem_lines, "problem", max_scrim_height)
+    problem_scrim_h = min(max_scrim_height, len(problem_lines) * _LINE_HEIGHT + _ZONE_TEXT_PADDING)
+
+    solution_lines = wrap_text(solution_text, width - 2 * _ZONE_TEXT_PADDING, _FONT_COPY, 700)
+    _check_fits_scrim(solution_lines, "solution", max_scrim_height)
+    solution_scrim_h = min(max_scrim_height, len(solution_lines) * _LINE_HEIGHT + _ZONE_TEXT_PADDING)
+
+    # Problem zone — top half, generated image, scrim + text at the TOP of
+    # this zone (matching the {{top}} 40 percent empty band its own Layer 2
+    # prompt requested).
+    z += 1
+    layers.append({
+        "type": "ai_generated_background", "z_index": z,
+        "url": problem_image_url, "x": 0, "y": 0, "width": width, "height": zone_height,
+    })
+    z += 1
+    layers.append({
+        "type": "shape", "z_index": z, "shape": "rect",
+        "x": 0, "y": 0, "width": width, "height": problem_scrim_h,
+        "fill_color": scrim_fill,
+    })
+    z += 1
+    layers.append({
+        "type": "text", "z_index": z, "content": "\n".join(problem_lines),
+        "x": _ZONE_TEXT_PADDING, "y": _ZONE_TEXT_PADDING // 2,
+        "font_size": _FONT_COPY, "font_weight": 700, "color": panel_text,
+    })
+
+    # Solution zone — bottom half, generated image, scrim + text at the
+    # BOTTOM of this zone (matching its {{bottom}} 40 percent empty band).
+    zone2_y = zone_height
+    z += 1
+    layers.append({
+        "type": "ai_generated_background", "z_index": z,
+        "url": solution_image_url, "x": 0, "y": zone2_y, "width": width, "height": zone_height,
+    })
+    scrim2_y = zone2_y + zone_height - solution_scrim_h
+    z += 1
+    layers.append({
+        "type": "shape", "z_index": z, "shape": "rect",
+        "x": 0, "y": scrim2_y, "width": width, "height": solution_scrim_h,
+        "fill_color": scrim_fill,
+    })
+    z += 1
+    layers.append({
+        "type": "text", "z_index": z, "content": "\n".join(solution_lines),
+        "x": _ZONE_TEXT_PADDING, "y": scrim2_y + _ZONE_TEXT_PADDING // 2,
+        "font_size": _FONT_COPY, "font_weight": 700, "color": panel_text,
+    })
+
+    badge_layers, z = logo_badge_layers(brand_logo_url, width, height, z)
+    layers.extend(badge_layers)
+
+    document = {
+        "canvas": {"width": width, "height": height, "background_color": t["surface"]},
+        "layers": layers,
+    }
+    assert_legible(document, t)
+    return document
+
+
+async def render(
+    problem_situation: str,
+    solution_situation: str,
+    problem_text: str,
+    solution_text: str,
+    nigerian_setting: str,
+    canvas_size: Tuple[int, int] = (1080, 1080),
+    tokens: Dict[str, str] = None,
+    seasonal_context: Optional[str] = None,
+) -> bytes:
+    """Full pipeline: two real Layer 2 generations (problem, solution),
+    then Layer 4 template-fill — the first render() in this library that
+    does real generation rather than just building + rendering an
+    already-fully-supplied document.
+
+    seasonal_context: optional §8 slot (e.g. "Detty December") — validated
+    against visual_slots.SEASONAL_CONTEXTS inside the prompt builders below;
+    omit for no seasonal framing, which is the common case."""
+    width, height = canvas_size
+    zone_size = f"{width}x{height // 2}"
+
+    problem_url = await generate_scene(
+        _problem_prompt(problem_situation, nigerian_setting, seasonal_context), size=zone_size,
+    )
+    solution_url = await generate_scene(
+        _solution_prompt(solution_situation, problem_situation, nigerian_setting, seasonal_context), size=zone_size,
+    )
+
+    document = build_document(problem_url, solution_url, problem_text, solution_text, canvas_size, tokens)
+    return await DocumentRendererService.render_to_png(document)

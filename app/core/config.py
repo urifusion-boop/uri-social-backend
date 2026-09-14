@@ -16,6 +16,10 @@ class Settings(BaseSettings):
     # only once someone can't log in. See app/services/docdb_credential_refresher.py.
     DOCDB_SECRET_ARN: str = ""
     OPENAI_API_KEY: str
+    # Optional dedicated OpenAI key for Jane + Ads only, isolated from the shared
+    # OPENAI_API_KEY the rest of the app uses. Empty → Jane Ads falls back to the
+    # shared key (see the jane_ads_openai_key property).
+    ADS_OPENAI_API_KEY: str = ""
     AUTHJWT_SECRET_KEY: str
 
     # Shared secret between the SDK Gateway and this backend for internal
@@ -40,6 +44,36 @@ class Settings(BaseSettings):
     META_APP_ID: str = ""
     META_APP_SECRET: str = ""
     META_SYSTEM_TOKEN: str = ""
+    # URI's own Meta Business Manager id — owned by Ibukun. Until this is set,
+    # the ads page-connect flow still runs and stores the page token; only the
+    # final "grant URI's Business Manager ADVERTISE access" step is skipped.
+    META_BUSINESS_MANAGER_ID: str = ""
+    # The BM system user that actually creates the ads. Sharing a client's Page with
+    # the business is NOT enough — a system user does not inherit Page access from
+    # the business, so each Page must also be assigned to this user or ad-creative
+    # creation fails with "Missing Page permission ... Advertiser role or higher".
+    # Must be the APP-SCOPED id (what GET /me returns using the system user's own
+    # token), not the business-scoped id shown in Business Settings > Users > System
+    # users — /{page}/assigned_users rejects the latter with "(#100) Param user does
+    # not accept global user IDs. Pass an app-scoped ID instead."
+    META_ADS_SYSTEM_USER_ID: str = ""
+    # Numeric id only, no "act_" prefix (the Marketing API adds that itself).
+    META_AD_ACCOUNT_ID: str = ""
+    # Working credential for real ad-account calls. A long-lived USER access token
+    # (~60 day expiry) obtained via /connect/facebook-ads OAuth consent — confirmed
+    # live to work where a system-user-generated token (META_SYSTEM_TOKEN) did not,
+    # for reasons not yet root-caused. Needs periodic manual refresh until that's
+    # sorted out. This is URI's OWN token, used to run every ad-account write for
+    # every brand.
+    META_ADS_ACCESS_TOKEN: str = ""
+    # URI's own Facebook Page — every brand's ads run from this one Page (the
+    # intended architecture: what distinguishes one brand's ads from another's is
+    # the WhatsApp number leads land in and the creative, never a separate Page
+    # identity). Must be a Page URI's Business Manager actually has ADVERTISE
+    # access to (ads_connection.py's business_manager_shared tracks this per any
+    # per-brand Page a client separately connects, but this shared Page's own
+    # access has to be confirmed manually in Meta Business Settings).
+    META_ADS_PAGE_ID: str = ""
 
     # Instagram Business Login (separate app credentials from the Instagram product)
     INSTAGRAM_APP_ID: str = ""
@@ -79,6 +113,58 @@ class Settings(BaseSettings):
     # Google OAuth (Sign in with Google)
     GOOGLE_CLIENT_ID: Optional[str] = None
     GOOGLE_CLIENT_SECRET: Optional[str] = None
+
+    # Google Ads (Jane + Ads Google adapter) — a DEDICATED OAuth client, deliberately
+    # separate from GOOGLE_CLIENT_ID/SECRET above (that pair is Sign-in-with-Google
+    # only: a one-shot code->token->userinfo exchange with no refresh-token persistence,
+    # almost certainly the wrong Google Cloud project/consent scope for the Ads API).
+    # See app/agents/jane_ads/google_ads_connection.py.
+    GOOGLE_ADS_CLIENT_ID: str = ""
+    GOOGLE_ADS_CLIENT_SECRET: str = ""
+    # Issued once per Manager Account (MCC), starts at Test Account Access tier until
+    # Basic Access is approved.
+    GOOGLE_ADS_DEVELOPER_TOKEN: str = ""
+    # URI's own Manager Account (MCC) customer id, digits only, no dashes — the account
+    # manager-link requests originate FROM and client accounts get created UNDER.
+    # Analogous to META_BUSINESS_MANAGER_ID, NOT to META_AD_ACCOUNT_ID/META_ADS_PAGE_ID:
+    # there is deliberately no "default ad account" setting here and never should be —
+    # every real call operates against a specific brand's own customer_id, resolved
+    # per-brand via google_ads_connection.resolve_customer_id_for_launch(), never a
+    # shared/default one (see tests/test_jane_ads_google_no_fallback_account.py, which
+    # fails the build if a shared- or default-account-shaped Google Ads setting ever
+    # appears anywhere in the codebase — Meta's own META_ADS_PAGE_ID shared-fallback
+    # is the exact mistake this guards against repeating).
+    GOOGLE_ADS_MCC_CUSTOMER_ID: str = ""
+    # v17 sunset 2025-06-04 (Google Ads API versions live ~1 year) — every request
+    # against it now 404s at Google's edge with a generic HTML error page instead of
+    # a JSON API error, which is what actually broke create-account/link-existing on
+    # staging. Bump this periodically; check developers.google.com/google-ads/api/docs/sunset-dates.
+    GOOGLE_ADS_API_VERSION: str = "v24"
+
+    # TikTok Marketing API (Jane + Ads, Phase 1 — see app/agents/jane_ads/adapters/tiktok.py)
+    # Unlike Meta/Google, Phase 1 does NOT run ads from the brand's own TikTok presence
+    # (that's Spark Ads, which needs a manual per-video authorization code from the
+    # creator — no OAuth path exists for it). Every brand's video ad is uploaded to and
+    # launched from this one shared URI-owned advertiser account instead — the same
+    # already-established pattern META_ADS_PAGE_ID uses for Meta, just made explicit
+    # here from the start rather than growing into it.
+    TIKTOK_ADS_ADVERTISER_ID: str = ""
+    TIKTOK_ADS_ACCESS_TOKEN: str = ""
+    # The Marketing API app's own id/secret (portal: App Detail > Basic Information),
+    # NOT the advertiser_id/access_token above — these authenticate the APP for the
+    # one-time admin OAuth code exchange (GET /jane-ads/tiktok-ads/admin/connect/*),
+    # which is what actually produces the TIKTOK_ADS_ACCESS_TOKEN/ADVERTISER_ID pair.
+    TIKTOK_ADS_APP_ID: str = ""
+    TIKTOK_ADS_APP_SECRET: str = ""
+    TIKTOK_ADS_API_VERSION: str = "v1.3"
+    # Confirmed live (2026-08-26) against a Sandbox Ad Account: sandbox tokens
+    # 401/permission-error against the production host below and only work
+    # against sandbox-ads.tiktok.com — a real host split TikTok doesn't
+    # document clearly. Override to "https://sandbox-ads.tiktok.com" in
+    # .env.staging while testing against a Sandbox Ad Account; leave unset
+    # (production default) once TIKTOK_ADS_ADVERTISER_ID is a real, funded
+    # account.
+    TIKTOK_ADS_API_BASE: str = "https://business-api.tiktok.com"
 
     # SQUAD Payment Gateway (PRD Section 6.2: Payment Integration)
     # Production: Always use live mode for real payments
@@ -159,6 +245,11 @@ class Settings(BaseSettings):
     JANE_WA_BASE_URL: str = "https://jane-whatsapp.urisocial.com"
 
     # Bypass flags for local development
+    # VSG-01's composited ad formats (Us vs Them, Borrowed Interface, Problem/Solution,
+    # etc.) are typographic layouts DRAWN by the ad_formats library, not images from the
+    # content engine normal posts use. Off by default until deliberately turned on for
+    # a given environment.
+    JANE_ADS_VSG01_ENABLED: bool = False
     BYPASS_SUBSCRIPTION_CHECK: bool = False
     BYPASS_FEATURE_LIMIT_CHECK: bool = False
     LOCAL_DEV_MODE: bool = False
@@ -177,6 +268,10 @@ class Settings(BaseSettings):
     SMTP_FROM_NAME: str = "URI Social"
     SMTP_USE_TLS: bool = True
     ADMIN_NOTIFICATION_EMAIL: str = ""
+    # Comma-separated emails allowed to see the Jane Ads admin billing report
+    # (all-users ad spend / margin). Overridable by the env var of the same name;
+    # the default seeds the current admins so the report works without server config.
+    JANE_ADS_ADMIN_EMAILS: str = "shorekoya@gmail.com,urisocialingsight@gmail.com"
 
     # Sentry (optional)
     SENTRY_DSN: Optional[str] = None
@@ -185,6 +280,11 @@ class Settings(BaseSettings):
     POSTHOG_API_KEY: str = ""
     POSTHOG_HOST: str = "https://us.i.posthog.com"
 
+    @property
+    def jane_ads_openai_key(self) -> str:
+        """The OpenAI key Jane + Ads uses — its own dedicated key when set, otherwise
+        the shared one. Keeps ad usage/quota isolated from the rest of the app."""
+        return self.ADS_OPENAI_API_KEY or self.OPENAI_API_KEY
 
     # SDK Gateway Database (for API key authentication only)
     SDK_GATEWAY_MONGODB_URI: Optional[str] = None
