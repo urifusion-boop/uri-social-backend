@@ -571,9 +571,15 @@ async def _content_borrowed_interface(business_name: str, category: str, descrip
         "short, realistic WhatsApp-style exchange (3-4 messages total) between a customer and the "
         "business, ending with the business's offer or answer as the final message. Plausible "
         "casual Nigerian phrasing, no emoji spam.\n"
+        "HARD RULE (§2.6: 'must not misrepresent price, delivery or availability'): the final "
+        "message must NEVER state a specific price, delivery fee, delivery area, or availability "
+        "claim UNLESS that exact detail appears verbatim in the business's own text above — never "
+        "invent one. If no real detail is stated, make the final message a natural next step "
+        "instead ('Sure, what do you need?', 'Let me get your details'), never a specific "
+        "commitment that isn't backed by the business's own words.\n"
         "HARD LIMIT: each message must be 45 characters or fewer, including spaces and "
         "punctuation — a real chat message, not a paragraph. Correctly-sized examples: 'Do "
-        "you deliver to Lekki?' (22 chars), 'Yes! Same day, ₦1,500 fee.' (26 chars).\n"
+        "you deliver to Lekki?' (22 chars), 'Sure, what do you need?' (24 chars).\n"
         "Return JSON: {\"turns\": [{\"speaker\": \"them\"|\"us\", \"message\": \"...\", "
         "\"timestamp\": \"e.g. 10:41 AM\"}, ...]}. 3-4 turns, last turn speaker must be \"us\". "
         f"{('CORRECTION: ' + correction) if correction else ''}\n"
@@ -587,7 +593,21 @@ async def _content_borrowed_interface(business_name: str, category: str, descrip
         for t in d["turns"] if isinstance(t, dict)
     ]
     turns = [t for t in turns if t[0] in ("them", "us") and t[1] and t[2]][:4]
-    return turns or None
+    if not turns:
+        return None
+    # Enforced backstop, not just a prompt instruction — same belt-and-
+    # suspenders pattern as Problem/Solution's own digit guard. A ₦ amount,
+    # percentage, or 3+ digit number in ANY turn that doesn't appear
+    # verbatim in the business's own description is a fabricated price/
+    # fee/availability claim, exactly what §2.6 forbids this format from
+    # ever showing — reject the whole exchange rather than surgically
+    # editing a chat bubble into broken grammar.
+    src_digits = re.sub(r"[^\d]", "", description or "")
+    for _, message, _ in turns:
+        for tok in re.findall(r"₦\s?[\d,]+|\d[\d,]*\s?%|\d[\d,]{2,}", message):
+            if re.sub(r"[^\d]", "", tok) not in src_digits:
+                return None
+    return turns
 
 
 async def _build_borrowed_interface(business_name: str, category: str, description: str, tokens: dict,
