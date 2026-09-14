@@ -40,6 +40,8 @@ prompt already used. A format's own prompt (problem_solution.py,
 work_in_progress.py, etc.) still owns what the scene IS; this module owns
 how it must be composed to receive an ad's typography afterward.
 """
+from typing import Optional
+
 # §2A verbatim — appended to every Layer 2 generation call this module makes.
 # "Compose as an ad, not a standalone photograph" — the core v3 upgrade.
 COMPOSITION_DIRECTIVE = (
@@ -197,6 +199,79 @@ def seasonal_context_clause(seasonal_context) -> str:
     )
 
 
+# A general nearest-named-color lookup (CSS/X11-style basic palette) — not a
+# per-brand or per-format hardcode. Works for any hex code any business's
+# Brand Playbook happens to store, the same way organic content's own
+# _generate_image_brief asks GPT to name brand colors in words ("say 'deep
+# magenta' not '#CD1B78'") rather than pass hex straight through — an image
+# model renders a literal hex string as on-canvas text if it ever leaks
+# through, so naming is not cosmetic, it's a correctness requirement.
+_NAMED_COLORS: dict[str, tuple[int, int, int]] = {
+    "black": (0, 0, 0), "charcoal": (54, 54, 54), "dark grey": (89, 89, 89),
+    "grey": (128, 128, 128), "silver": (192, 192, 192), "white": (255, 255, 255),
+    "deep red": (139, 0, 0), "red": (220, 20, 20), "crimson": (200, 20, 60),
+    "burgundy": (128, 0, 32), "maroon": (95, 33, 32), "rust": (183, 65, 14),
+    "terracotta": (204, 78, 46), "orange": (230, 126, 34), "warm orange": (216, 100, 33),
+    "amber": (230, 160, 20), "gold": (212, 175, 55), "saffron": (244, 196, 48),
+    "mustard": (200, 164, 32), "yellow": (241, 196, 15), "olive": (110, 110, 30),
+    "lime": (140, 200, 60), "dark green": (20, 90, 50), "forest green": (34, 90, 34),
+    "green": (46, 160, 67), "emerald": (16, 160, 110), "teal": (20, 130, 130),
+    "turquoise": (48, 190, 190), "cyan": (60, 200, 220), "deep blue": (20, 50, 130),
+    "navy": (25, 40, 90), "blue": (41, 98, 189), "sky blue": (100, 170, 230),
+    "indigo": (60, 40, 140), "deep purple": (85, 30, 120), "purple": (128, 60, 170),
+    "violet": (150, 100, 200), "magenta": (200, 30, 140), "deep magenta": (150, 20, 100),
+    "pink": (230, 100, 160), "hot pink": (230, 40, 130), "rose": (210, 100, 120),
+    "brown": (110, 70, 40), "dark brown": (70, 45, 25), "tan": (200, 170, 130),
+    "beige": (220, 200, 170), "cream": (240, 230, 200),
+}
+
+
+def _hex_to_color_word(hex_code: str) -> Optional[str]:
+    """Nearest named color by Euclidean RGB distance. Returns None for
+    anything that isn't a parseable 3/6-digit hex string — a caller should
+    just skip that entry rather than fabricate a name."""
+    code = (hex_code or "").strip().lstrip("#")
+    if len(code) == 3:
+        code = "".join(c * 2 for c in code)
+    if len(code) != 6:
+        return None
+    try:
+        r, g, b = (int(code[i:i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        return None
+    return min(
+        _NAMED_COLORS.items(),
+        key=lambda item: sum((a - b) ** 2 for a, b in zip((r, g, b), item[1])),
+    )[0]
+
+
+def brand_palette_clause(brand_context: Optional[dict]) -> str:
+    """A general clause folding a business's REAL brand colors into the
+    scene as environmental influence — the same strategy organic content's
+    _generate_image_brief already uses ("these MUST appear... incorporate
+    them in clothing, props, or environmental accents"), adapted for this
+    library's own absolute rule that Layer 2 never renders text, logos or
+    brand marks (§1.1 — unaffected by this clause, still enforced
+    separately by TYPOGRAPHY_DIRECTIVE + GLOBAL_NEGATIVE_PROMPT below).
+
+    Reads brand_colors generically from whatever brand_context dict is
+    passed — works for any business's Playbook data, nothing here is
+    specific to one format, one industry or one brand. Returns "" (no-op)
+    when there's nothing usable, matching every other optional clause in
+    this module (seasonal_context_clause does the same)."""
+    colors = (brand_context or {}).get("brand_colors") or []
+    words = list(dict.fromkeys(w for w in (_hex_to_color_word(c) for c in colors[:3]) if w))
+    if not words:
+        return ""
+    palette = ", ".join(words)
+    return (
+        f"This brand's real color palette is {palette} — let it subtly and naturally "
+        "inform the scene wherever it fits (environmental accents, props, wardrobe, "
+        "signage-free surfaces), without forcing it or making the palette itself the "
+        "subject. Do not render any text, logo, or brand mark of any kind."
+    )
+
+
 class SceneGenerationFailed(RuntimeError):
     """Raised when the underlying generation call or the follow-up
     Cloudinary upload fails — a format's render() should not silently
@@ -204,22 +279,30 @@ class SceneGenerationFailed(RuntimeError):
     pass
 
 
-async def generate_scene(prompt: str, size: str = "1080x1080") -> str:
+async def generate_scene(
+    prompt: str, size: str = "1080x1080", brand_context: Optional[dict] = None,
+) -> str:
     """
     Generate a single Layer 2 scene image and return a real hosted URL.
 
     prompt: the scene description ONLY — this function appends the §3 ratio
-    clause (resolved from size), COMPOSITION_DIRECTIVE, TYPOGRAPHY_DIRECTIVE
-    and GLOBAL_NEGATIVE_PROMPT itself, in that order (v3 §12's assembly:
-    format prompt, ratio clause, representation if a person appears —
-    already inline in the format prompt itself for this library, see
-    REPRESENTATION_BLOCK's own docstring — then composition, typography,
-    negative), so callers should not duplicate any of them.
+    clause (resolved from size), the brand palette clause (if brand_context
+    has real colors — see brand_palette_clause), COMPOSITION_DIRECTIVE,
+    TYPOGRAPHY_DIRECTIVE and GLOBAL_NEGATIVE_PROMPT itself, in that order
+    (v3 §12's assembly: format prompt, ratio clause, representation if a
+    person appears — already inline in the format prompt itself for this
+    library, see REPRESENTATION_BLOCK's own docstring — then composition,
+    typography, negative), so callers should not duplicate any of them.
     size: "WIDTHxHEIGHT" — passed straight through to _call_dalle_api,
     which internally buckets to the nearest square/landscape/portrait
     generation size and crops to the exact requested dimensions. Also used
     here to resolve which of §3's three ratio clauses (1:1/4:5/9:16) best
     matches what's actually being generated.
+    brand_context: the same dict BrandProfileService.to_brand_context
+    already produces for organic content (brand_colors, etc.) — optional,
+    and a no-op when omitted or when it has no usable brand_colors, so
+    every existing caller that doesn't pass it keeps behaving exactly as
+    before.
 
     Raises SceneGenerationFailed on any failure rather than returning None
     — every caller in this format library needs a real background to
@@ -250,7 +333,12 @@ async def generate_scene(prompt: str, size: str = "1080x1080") -> str:
     _DALLE_MAX_CHARS = 4000
     _SAFETY_MARGIN = 100
     ratio_clause = _resolve_ratio_clause(size)
-    fixed_suffix = f" {ratio_clause} {COMPOSITION_DIRECTIVE} {TYPOGRAPHY_DIRECTIVE} {GLOBAL_NEGATIVE_PROMPT}"
+    palette_clause = brand_palette_clause(brand_context)
+    fixed_suffix = (
+        f" {ratio_clause}"
+        f"{' ' + palette_clause if palette_clause else ''}"
+        f" {COMPOSITION_DIRECTIVE} {TYPOGRAPHY_DIRECTIVE} {GLOBAL_NEGATIVE_PROMPT}"
+    )
     scene_description = prompt.strip()
     budget = _DALLE_MAX_CHARS - _SAFETY_MARGIN - len(fixed_suffix)
     if len(scene_description) > budget:
