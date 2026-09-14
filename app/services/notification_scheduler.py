@@ -9,16 +9,18 @@ Runs daily batch jobs:
 - PRD 8.3: Trial expiry checks (every 6 hours)
 - PRD 8.3: Subscription expiry checks (daily at 00:00 UTC)
 - WhatsApp daily content push (08:00 UTC / 09:00 WAT)
+- Jane + Ads mid-flight monitoring (every 4 hours) — campaign roadmap Tier 4
+- Jane + Ads ad-spend billing (hourly) — recoup Meta spend × markup from prepaid wallets
 - Publish scheduled content (every 5 minutes)
 
 Note on publish_scheduled_content: an earlier version of this file ran it
 via a separate GitHub Actions workflow instead (publish-scheduled-posts.yml)
 and deliberately left it out of this scheduler to avoid double-firing. That
 workflow is currently disabled (.yml.txt, not .yml — GitHub only runs the
-literal extension) on both dev and prod, so this in-process job is the only
-thing actually publishing scheduled posts right now. If that workflow is
-ever re-enabled, this job must come back out first, or every post fires
-from both places again.
+literal extension) on both dev and prod, so this in-process job is what
+actually publishes scheduled posts. If that workflow is ever re-enabled,
+this job must come back out first, or every post fires from both places
+again.
 """
 import asyncio
 from datetime import datetime
@@ -41,10 +43,9 @@ async def _try_claim_job_run(job_id: str) -> bool:
     every job here has always fired 4 times at the same instant (briefly
     more, during a blue/green deploy's old+new task overlap) — this is what
     caused the daily content-idea email to arrive multiple times at once,
-    and just as seriously means publish_scheduled_content (every 5 minutes)
-    has been attempting to publish the same due post up to 4 times per tick,
-    a real risk of duplicate posts landing on a customer's connected
-    platform accounts.
+    and just as seriously means jane_ads_billing (hourly wallet charges) has
+    been quadruple-charging customer wallets on every run, silently, since
+    nothing about that job's output looks wrong from a single log line.
 
     Uses the fire-time-bucketed job id as a Mongo document's _id — the
     collection's unique _id index makes the first insert_one an atomic
@@ -123,6 +124,44 @@ def _job_whatsapp_daily_push():
     _run_async("whatsapp_daily_push", _run)
 
 
+def _job_jane_ads_monitoring():
+    """Jane + Ads mid-flight monitoring (campaign roadmap Tier 4) — flags
+    underperforming campaigns and announces finished ones."""
+    async def _run():
+        from app.database import get_db
+        from app.agents.jane_ads.monitoring import check_active_campaigns
+        db = get_db()
+        result = await check_active_campaigns(db)
+        print(f"📊 Jane Ads monitoring: {result}")
+    _run_async("jane_ads_monitoring", _run)
+
+
+def _job_jane_ads_token_health():
+    """Jane + Ads per-brand connection token health (Per-Brand Page Connection
+    plan §8) — daily, since a token dying mid-flight is rare but silent otherwise:
+    pauses that brand's running campaigns and notifies the owner once."""
+    async def _run():
+        from app.database import get_db
+        from app.agents.jane_ads.ads_connection import run_token_health_check
+        db = get_db()
+        result = await run_token_health_check(db)
+        print(f"🔑 Jane Ads token health: {result}")
+    _run_async("jane_ads_token_health", _run)
+
+
+def _job_jane_ads_billing():
+    """Jane + Ads ad-spend billing — recoups real Meta spend (× markup) from each
+    customer's prepaid wallet and pauses any campaign whose wallet can no longer
+    cover it, so URI never fronts money it can't recoup."""
+    async def _run():
+        from app.database import get_db
+        from app.agents.jane_ads.billing import reconcile_ad_spend_charges
+        db = get_db()
+        result = await reconcile_ad_spend_charges(db)
+        print(f"💳 Jane Ads billing: {result}")
+    _run_async("jane_ads_billing", _run)
+
+
 def _job_publish_scheduled_content():
     async def _run():
         from app.database import get_db
@@ -196,7 +235,38 @@ def start_notification_scheduler():
         **_JOB_DEFAULTS,
     )
 
-    # Publish scheduled content every 5 minutes
+    # Jane + Ads mid-flight monitoring every 4 hours — ad campaigns move faster
+    # than subscription/trial checks, so this runs more often than those.
+    _scheduler.add_job(
+        _job_jane_ads_monitoring,
+        CronTrigger(hour="*/4", minute=30),
+        id="jane_ads_monitoring",
+        **_JOB_DEFAULTS,
+    )
+
+    # Jane + Ads ad-spend billing hourly — recoups real Meta spend from the
+    # customer's prepaid wallet and pauses a campaign the moment its wallet can't
+    # cover more. Runs more often than monitoring to keep unrecouped spend small.
+    _scheduler.add_job(
+        _job_jane_ads_billing,
+        CronTrigger(minute=0),
+        id="jane_ads_billing",
+        **_JOB_DEFAULTS,
+    )
+
+    # Jane + Ads per-brand ads connection token health, daily at 06:00 UTC — a
+    # dead token doesn't stop a launched campaign from delivering wrong (or
+    # spending), so this is a proactive pause+notify, not just a read-time check.
+    _scheduler.add_job(
+        _job_jane_ads_token_health,
+        CronTrigger(hour=6, minute=0),
+        id="jane_ads_token_health",
+        **_JOB_DEFAULTS,
+    )
+
+    # Publish scheduled content every 5 minutes — see the module docstring:
+    # the GH Actions workflow that used to own this is currently disabled,
+    # so this in-process job is what actually publishes scheduled posts.
     _scheduler.add_job(
         _job_publish_scheduled_content,
         CronTrigger(minute="*/5"),
@@ -205,7 +275,7 @@ def start_notification_scheduler():
     )
 
     _scheduler.start()
-    print("📅 Notification scheduler started with 6 jobs")
+    print("📅 Notification scheduler started with 9 jobs")
 
 
 def stop_notification_scheduler():

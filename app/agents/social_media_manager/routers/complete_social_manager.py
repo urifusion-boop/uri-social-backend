@@ -12,7 +12,7 @@ from typing import List, Optional, Dict, Any, AsyncGenerator
 from datetime import datetime
 from bson import ObjectId
 
-from app.dependencies import get_db_dependency, get_flexible_brand_context, flexible_auth
+from app.dependencies import get_db_dependency, get_flexible_brand_context, flexible_auth, get_active_brand_context
 from app.core.config import settings
 from app.domain.responses.uri_response import UriResponse
 from app.middleware.api_key_auth import verify_api_key
@@ -1472,6 +1472,323 @@ async def facebook_direct_finalize(
         raise HTTPException(status_code=404, detail="Facebook connection not found — try reconnecting")
 
     return UriResponse.get_single_data_response("facebook_connected", {"fb_page_id": fb_page_id})
+
+
+
+# ── Facebook Login for Business — the "hybrid page grant" (Ibukun's engineering
+# work-split item 2.3). Same OAuth shape as facebook-direct above, but requests
+# advertising permissions and — once URI's Business Manager id is configured —
+# grants that Business Manager ADVERTISE-only access to the page via
+# MetaAdsService.share_page_with_business_manager(). Never claims/transfers the
+# page (that's POST /{business_id}/owned_pages, deliberately not used here).
+
+@router.get("/connect/facebook-ads/initiate")
+async def facebook_ads_initiate(
+    source: Optional[str] = Query("settings"),
+    rerequest: int = Query(0),
+):
+    """Redirect to Facebook's OAuth page requesting advertising-scoped permissions
+    for a Page, on top of the standard page-management scopes."""
+    import urllib.parse
+
+    app_id = settings.META_APP_ID
+    if not app_id:
+        raise HTTPException(status_code=500, detail="META_APP_ID not configured")
+
+    _base = (settings.PUBLIC_API_URL or settings.URI_GATEWAY_BASE_API_URL).rstrip("/")
+    redirect_uri = f"{_base}/social-media/connect/facebook-ads/callback"
+
+    scopes = [
+        "pages_show_list",
+        "pages_read_engagement",
+        "business_management",
+        "ads_management",
+        "pages_manage_ads",
+    ]
+    params = {
+        "client_id": app_id,
+        "redirect_uri": redirect_uri,
+        "scope": ",".join(scopes),
+        "response_type": "code",
+        "state": source or "settings",
+    }
+    # auth_type=rerequest re-prompts ONLY the permissions the person previously
+    # DECLINED. It does not force every requested permission to re-display, so
+    # for someone who already granted the whole set there is nothing left to
+    # re-request and Facebook renders a completely EMPTY dialog — the flow
+    # dead-ends on a blank facebook.com page with no error and no code.
+    # Live-confirmed 2026-09-09 on an app administrator holding all five scopes.
+    #
+    # So the first dialog never sends it: when everything is already granted,
+    # Facebook redirects straight back with a code (exactly what we want), and
+    # when something is missing it prompts for the missing ones normally. The
+    # callback then verifies the grant against REQUIRED_ADS_SCOPES and only comes
+    # back through here with rerequest=1 if a required scope really is missing —
+    # which is the one case rerequest is actually needed for and can render.
+    if rerequest:
+        params["auth_type"] = "rerequest"
+    auth_url = f"https://www.facebook.com/{settings.FACEBOOK_API_VERSION}/dialog/oauth?" + urllib.parse.urlencode(params)
+    return RedirectResponse(auth_url)
+
+
+@router.get("/connect/facebook-ads/callback")
+async def facebook_ads_callback(
+    code: Optional[str] = Query(None),
+    state: Optional[str] = Query(None),
+    error: Optional[str] = Query(None),
+    error_reason: Optional[str] = Query(None),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """Exchanges the auth code for an ads-scoped Page token, stores the pending
+    connection, and — if URI's Business Manager id is configured — requests
+    ADVERTISE-only access to the page for it."""
+    import urllib.parse
+    import httpx
+    from datetime import timezone
+    from app.services.MetaAdsService import (
+        BusinessManagerNotConfigured,
+        SystemUserNotConfigured,
+        assign_page_to_system_user,
+        share_page_with_business_manager,
+    )
+
+    web_app_url = settings.WEB_APP_URL.strip("'\"")
+    base_redirect = f"{web_app_url}/workspace/?tab=connections"
+
+    if error:
+        msg = urllib.parse.quote(error_reason or error)
+        return RedirectResponse(f"{base_redirect}&connected=false&error={msg}")
+
+    if not code:
+        return RedirectResponse(f"{base_redirect}&connected=false&error=missing_code")
+
+    _base = (settings.PUBLIC_API_URL or settings.URI_GATEWAY_BASE_API_URL).rstrip("/")
+    redirect_uri = f"{_base}/social-media/connect/facebook-ads/callback"
+    app_id = settings.META_APP_ID
+    app_secret = settings.META_APP_SECRET
+    graph_base = f"https://graph.facebook.com/{settings.FACEBOOK_API_VERSION}"
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            token_resp = await client.get(
+                f"{graph_base}/oauth/access_token",
+                params={
+                    "client_id": app_id,
+                    "client_secret": app_secret,
+                    "redirect_uri": redirect_uri,
+                    "code": code,
+                },
+            )
+            token_data = token_resp.json()
+            if "error" in token_data:
+                raise ValueError(f"Token exchange error: {token_data['error'].get('message')}")
+            short_token = token_data["access_token"]
+
+            ll_resp = await client.get(
+                f"{graph_base}/oauth/access_token",
+                params={
+                    "grant_type": "fb_exchange_token",
+                    "client_id": app_id,
+                    "client_secret": app_secret,
+                    "fb_exchange_token": short_token,
+                },
+            )
+            ll_data = ll_resp.json()
+            long_token = ll_data.get("access_token", short_token)
+
+            # Facebook's dialog can hand back a SUBSET of the requested scopes: a
+            # permission declined on any past login for this app is silently reused
+            # without being shown again. auth_type=rerequest is what re-prompts
+            # those, but it can only be used here — sending it on the FIRST dialog
+            # renders an empty page for anyone who already granted everything
+            # (nothing left to re-request), which is what dead-ended the connect
+            # flow on a blank facebook.com page.
+            #
+            # So verify the actual grant and bounce back through the dialog with
+            # rerequest ONLY when a required scope is genuinely missing. `state`
+            # carries a one-shot marker so a permanent decline can't loop.
+            from app.agents.jane_ads.ads_connection import REQUIRED_ADS_SCOPES
+
+            already_rerequested = (state or "").endswith("|rr")
+            source = (state or "settings").removesuffix("|rr") or "settings"
+
+            perms_resp = await client.get(
+                f"{graph_base}/me/permissions", params={"access_token": long_token}
+            )
+            granted = {
+                row.get("permission")
+                for row in (perms_resp.json().get("data") or [])
+                if row.get("status") == "granted"
+            }
+            missing = REQUIRED_ADS_SCOPES - granted
+            if missing and not already_rerequested:
+                initiate = (
+                    f"{_base}/social-media/connect/facebook-ads/initiate"
+                    f"?source={urllib.parse.quote(source + '|rr')}&rerequest=1"
+                )
+                print(f"[FBAdsOAuth] ⚠️ missing scopes {sorted(missing)} — re-requesting")
+                return RedirectResponse(initiate)
+            if missing:
+                err_msg = urllib.parse.quote(
+                    "Facebook did not grant: "
+                    + ", ".join(sorted(missing))
+                    + ". Please approve every permission on the Facebook screen."
+                )
+                return RedirectResponse(f"{base_redirect}&connected=false&error={err_msg}")
+
+            pages_resp = await client.get(
+                f"{graph_base}/me/accounts",
+                params={"access_token": long_token, "fields": "id,name,access_token,picture"},
+            )
+            pages_data = pages_resp.json()
+            pages = pages_data.get("data", [])
+
+            if not pages:
+                err_msg = urllib.parse.quote("No Facebook Pages found. You need a Facebook Page to connect.")
+                return RedirectResponse(f"{base_redirect}&connected=false&error={err_msg}")
+
+            page = pages[0]
+            page_id = page["id"]
+            page_name = page["name"]
+            page_token = page["access_token"]
+            profile_pic = page.get("picture", {}).get("data", {}).get("url", "") if isinstance(page.get("picture"), dict) else ""
+
+            business_manager_shared = False
+            business_manager_error = None
+            try:
+                await share_page_with_business_manager(page_id, page_token)
+                business_manager_shared = True
+                print(f"[FBAdsOAuth] ✅ Granted URI Business Manager ADVERTISE access to page {page_id}")
+
+                # Sharing with the business is not enough on its own: a system user
+                # does NOT inherit Page access from the business it belongs to, so
+                # ad-creative creation fails with "Missing Page permission ...
+                # Advertiser role or higher" even though the business holds
+                # PROFILE_PLUS_ADVERTISE. Live-confirmed 2026-08-31. Without this the
+                # only alternative is an admin assigning every client Page by hand.
+                try:
+                    await assign_page_to_system_user(page_id, page_token)
+                    print(f"[FBAdsOAuth] ✅ Assigned ads system user to page {page_id}")
+                except SystemUserNotConfigured:
+                    business_manager_error = (
+                        "META_ADS_SYSTEM_USER_ID not set — ads cannot run from this Page yet."
+                    )
+                    print(f"[FBAdsOAuth] ⚠️ system user not configured — page {page_id} not assignable")
+                except Exception as e:
+                    # The share succeeded; only the assignment failed. Record it rather
+                    # than reporting the connection as fully shared, because a launch
+                    # from this Page will fail until it is resolved.
+                    business_manager_error = f"system-user assignment: {e}"
+                    print(f"[FBAdsOAuth] ⚠️ system-user assignment failed for {page_id}: {e}")
+            except BusinessManagerNotConfigured:
+                print(f"[FBAdsOAuth] ⚠️ META_BUSINESS_MANAGER_ID not set — page {page_id} token stored, BM share deferred")
+            except Exception as e:
+                business_manager_error = str(e)
+                print(f"[FBAdsOAuth] ❌ Business Manager share failed for page {page_id}: {e}")
+
+            now = datetime.now(timezone.utc).isoformat()
+            conn_doc = {
+                "id": f"fbads_{page_id}",
+                "user_id": None,               # set by finalize
+                "platform": "facebook_ads",
+                "connected_via": "facebook_ads_oauth",
+                "page_id": page_id,
+                "page_access_token": page_token,
+                # The USER-level long-lived token, kept separately from page_access_token —
+                # GET /me/permissions (the only way to read back which scopes were actually
+                # granted) only returns meaningful data for a user token; a Page token there
+                # comes back empty every time, which is exactly what silently broke the
+                # daily health check and the live pre-flight check before this was added.
+                "user_access_token": long_token,
+                "account_name": page_name,
+                "profile_picture_url": profile_pic,
+                "connection_status": "pending_user_match",
+                "business_manager_shared": business_manager_shared,
+                "business_manager_error": business_manager_error,
+                "connected_at": now,
+                "updated_at": now,
+            }
+            await db["social_connections"].update_one(
+                {"id": f"fbads_{page_id}"},
+                {"$set": conn_doc},
+                upsert=True,
+            )
+            print(f"[FBAdsOAuth] ✅ Stored ads-scoped page '{page_name}' (page_id={page_id}) pending user match")
+
+            params_out = (
+                f"connected=facebook_ads"
+                f"&fb_page_id={urllib.parse.quote(page_id)}"
+                f"&page_name={urllib.parse.quote(page_name)}"
+            )
+            return RedirectResponse(f"{base_redirect}&{params_out}")
+
+    except Exception as e:
+        print(f"[FBAdsOAuth] ❌ Error: {e}")
+        return RedirectResponse(
+            f"{base_redirect}&connected=false&error={urllib.parse.quote(str(e))}"
+        )
+
+
+@router.post("/connect/facebook-ads/finalize")
+async def facebook_ads_finalize(
+    fb_page_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    ctx: dict = Depends(get_active_brand_context),
+):
+    """Associates the pending ads-scoped connection with the authenticated user
+    and active brand — same pattern as /connect/facebook-direct/finalize."""
+    from app.models.brand_account import BrandAccount
+    user_id = ctx["user_id"]
+    brand_id = ctx["brand_id"]
+    is_personal = (not brand_id) or brand_id == BrandAccount.personal_brand_id(user_id)
+
+    update_fields: dict = {
+        "user_id": user_id, "connection_status": "active", "updated_at": datetime.utcnow().isoformat(),
+        # A fresh reconnect means the token is good again — clear the daily
+        # health-check job's one-time notice flag so a FUTURE expiry gets
+        # re-announced instead of being silently swallowed by the old flag.
+        "token_expired_notified": False,
+    }
+    if not is_personal:
+        update_fields["brand_id"] = brand_id
+
+    # A personal brand's ads connection is a single slot, not a growing list — before
+    # this reconnect, personal-brand connections were never tagged with brand_id (see
+    # above), so get_ads_connection's lookup matches EVERY page this user_id ever
+    # connected and just takes whichever has the newest connected_at. Reconnecting a
+    # DIFFERENT page silently lost to an older-but-still-"active" one that happened to
+    # have already been reconnected more recently — live-confirmed: a user connected
+    # "Living the truth" then, days later, reconnected a different page for unrelated
+    # testing, and every ad kept using the unrelated page because it was newer, with no
+    # way to tell from the data which page was actually meant to be in use. Retiring
+    # every other active connection in this same scope on every finalize makes "active"
+    # mean what it says: exactly one connection per (personal user | agency brand).
+    supersede_scope = (
+        {"user_id": user_id} if is_personal else {"brand_id": brand_id}
+    )
+    await db["social_connections"].update_many(
+        {"platform": "facebook_ads", "connection_status": "active",
+         "id": {"$ne": f"fbads_{fb_page_id}"}, **supersede_scope},
+        {"$set": {"connection_status": "superseded", "updated_at": datetime.utcnow().isoformat()}},
+    )
+
+    result = await db["social_connections"].update_one(
+        {"id": f"fbads_{fb_page_id}"},
+        {"$set": update_fields},
+    )
+    if result.matched_count > 0:
+        # Any campaigns paused by the health-check job on the OLD token can now
+        # resume on their own next campaign-list load — clear the pause flag so
+        # the user isn't stuck manually re-activating each one after fixing the
+        # connection that broke them.
+        await db["jane_ads_meta_campaigns"].update_many(
+            {"brand_id": brand_id, "paused_for_token_health": True},
+            {"$set": {"paused_for_token_health": False}},
+        )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Facebook ads connection not found — try reconnecting")
+
+    return UriResponse.get_single_data_response("facebook_ads_connected", {"fb_page_id": fb_page_id})
 
 
 @router.get("/connect/instagram-direct/initiate")
