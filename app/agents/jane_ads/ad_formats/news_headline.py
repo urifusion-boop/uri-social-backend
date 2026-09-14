@@ -169,6 +169,19 @@ def build_document(
         "fill_color": t["field"],
     })
 
+    # A slim accent-coloured rule at the very top of the bar — the one
+    # deliberate colour hit this otherwise plain bar carries, same "single
+    # accent edge" convention Us vs Them already uses. Purely decorative,
+    # not a masthead/logo (§2.8 point 2 still holds: no network-branded
+    # chrome), just enough to read as designed rather than a flat plate.
+    _ACCENT_RULE_H = 6
+    z += 1
+    layers.append({
+        "type": "shape", "z_index": z, "shape": "rect",
+        "x": 0, "y": bar_y, "width": width, "height": _ACCENT_RULE_H,
+        "fill_color": t["accent"],
+    })
+
     content_y = bar_y + _PADDING
     z += 1
     layers.append({
@@ -186,10 +199,14 @@ def build_document(
         content_y += len(secondary_lines) * _LINE_HEIGHT_SECONDARY + 24
 
     if date_stamp:
+        # Accent-coloured, not muted ink-quiet — reads as a considered
+        # highlight (like a date chip) rather than fine-print metadata,
+        # since for many announcements this is the single most actionable
+        # fact ("when does this happen") a reader takes away.
         z += 1
         layers.append({
             "type": "text", "z_index": z, "content": date_stamp,
-            "x": _PADDING, "y": content_y, "font_size": _FONT_DATE, "color": t["ink-quiet"],
+            "x": _PADDING, "y": content_y, "font_size": _FONT_DATE, "font_weight": 700, "color": t["accent"],
         })
 
     document = {

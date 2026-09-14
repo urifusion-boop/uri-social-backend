@@ -115,12 +115,15 @@ class TestBuildDocument:
         date = next(l for l in doc["layers"] if l.get("content") == "Sept 6")
         assert headline["y"] < secondary["y"] < date["y"]
 
-    def test_date_uses_ink_quiet_headline_uses_ink(self):
+    def test_date_uses_accent_headline_uses_ink(self):
+        """date_stamp is deliberately styled as an accent-coloured highlight,
+        not muted ink-quiet metadata — for many announcements it's the single
+        most actionable fact a reader takes away ("when does this happen")."""
         doc = self._doc()
         headline = next(l for l in doc["layers"] if l.get("content") == "New campus now open in Yaba")
         date = next(l for l in doc["layers"] if l.get("content") == "Sept 6")
         assert headline["color"] == PLACEHOLDER_TOKENS["ink"]
-        assert date["color"] == PLACEHOLDER_TOKENS["ink-quiet"]
+        assert date["color"] == PLACEHOLDER_TOKENS["accent"]
 
     def test_secondary_line_and_date_are_optional(self):
         doc = self._doc(secondary_line=None, date_stamp=None)

@@ -1418,12 +1418,23 @@ async def _content_news_headline(business_name: str, category: str, description:
         "pixel-width constraint, not a style preference. Correctly-sized examples: 'New Yaba "
         "branch now open' (25 chars), 'Term 2 admissions open' (23 chars).\n"
         "- secondary_line: one short supporting detail (<=35 characters), only if stated, else "
-        "empty string\n"
+        "empty string — must NOT restate the date/timeframe (that belongs in date_stamp only)\n"
         "- date_stamp: WHEN it happens/closes (<=15 characters), only if a real date/timeframe "
-        "is stated, else empty string. Do NOT repeat a date that's already inside the headline "
-        "itself — state the date in exactly ONE of headline or date_stamp, never both.\n"
+        "is stated, else empty string. A live-confirmed real failure: headline omitted the date, "
+        "secondary_line said 'Opening date is 1 October', AND date_stamp separately said "
+        "'1 October' — the same date rendered twice, once spelled out and once bare. The date "
+        "must appear in EXACTLY ONE of headline, secondary_line, or date_stamp — never in two of "
+        "them, and never in all three.\n"
         "- announcement_subject: a short, concrete VISUAL scene for a documentary photo of "
-        "this announcement (what a camera would see), no brand/person names\n"
+        "this SPECIFIC announcement — it must visibly show the actual event happening, not a "
+        "generic 'person working' or 'person on a laptop' scene that could belong to any "
+        "announcement. A live-confirmed real failure: 'a new branch now open' produced the weak, "
+        "generic subject 'a woman working on a laptop in a store' — that photo could be any "
+        "business on any day, it shows nothing about an OPENING. For a branch/store opening: "
+        "the storefront exterior with visible activity, an open door with people entering, staff "
+        "arranging the space for its first day. For an admissions deadline: students at a real "
+        "campus/office setting engaged with the actual process. For an event: the specific "
+        "activity of that event underway. No brand/person names.\n"
         f"- nigerian_setting: pick the single best-fitting option, copied EXACTLY, from this list: "
         f"{list(_NIGERIAN_SETTINGS)}\n"
         f"{('CORRECTION: ' + correction) if correction else ''}\n"
@@ -1439,6 +1450,7 @@ async def _content_news_headline(business_name: str, category: str, description:
     if setting not in _NIGERIAN_SETTINGS:
         setting = _NIGERIAN_SETTINGS[0]
     headline = str(d.get("headline", "")).strip()
+    secondary_line = str(d.get("secondary_line", "")).strip() or None
     date_stamp = str(d.get("date_stamp", "")).strip() or None
     # Belt-and-suspenders, not just a prompt instruction: when the only real
     # date in the source text already sits inside the headline (a single-
@@ -1447,15 +1459,23 @@ async def _content_news_headline(business_name: str, category: str, description:
     # ("Admissions close 30 Sept" + date_stamp "30 September" both shipped
     # in the same render despite the prompt's explicit instruction). Drop
     # date_stamp outright whenever any of its own words already appear in
-    # the headline, rather than trusting instruction-following alone.
+    # the headline, rather than trusting instruction-following alone. Same
+    # live-confirmed failure mode against secondary_line too — a real render
+    # shipped secondary_line "Opening date is 1 October" AND date_stamp
+    # "1 October" together, the same date spelled out twice.
     if date_stamp:
         headline_words = set(re.findall(r"[a-z0-9]+", headline.lower()))
         date_words = set(re.findall(r"[a-z0-9]+", date_stamp.lower()))
         if date_words & headline_words:
             date_stamp = None
+    if date_stamp and secondary_line:
+        secondary_words = set(re.findall(r"[a-z0-9]+", secondary_line.lower()))
+        date_words = set(re.findall(r"[a-z0-9]+", date_stamp.lower()))
+        if date_words & secondary_words:
+            date_stamp = None
     return {
         "headline": headline,
-        "secondary_line": str(d.get("secondary_line", "")).strip() or None,
+        "secondary_line": secondary_line,
         "date_stamp": date_stamp,
         "announcement_subject": subject,
         "nigerian_setting": setting,
