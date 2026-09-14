@@ -138,16 +138,25 @@ def build_document(
         # canvas colour (safe), but with one it sat directly on the raw
         # photo, tripping §1.6's "text over photography needs a scrim"
         # check on every single render, silently failing this candidate
-        # every time a backdrop was present. A full-canvas, low-opacity
-        # scrim between the backdrop and every layer above it guarantees
-        # ANY text here — not just today's timestamps — always has a safe
-        # layer beneath it, without touching the bubble/timestamp
-        # positioning math at all.
+        # every time a backdrop was present. A full-canvas scrim between
+        # the backdrop and every layer above it guarantees ANY text here
+        # — not just today's timestamps — always has a safe layer
+        # beneath it, without touching the bubble/timestamp positioning
+        # math at all.
+        #
+        # Deliberately very low opacity (~13%), not the ~50% first tried:
+        # legibility.py's own contrast check reads only the layer's BASE
+        # colour, never its actual alpha — so a much lighter scrim
+        # satisfies the exact same safety guarantee. Live-confirmed the
+        # first version's real cost: at 50% opacity over this format's
+        # own soft, already-light bokeh backdrop, the scrim washed the
+        # backdrop out to looking almost completely flat/invisible —
+        # defeating the whole point of generating one.
         z += 1
         layers.append({
             "type": "shape", "z_index": z, "shape": "rect",
             "x": 0, "y": 0, "width": width, "height": height,
-            "fill_color": t["surface"] + "80",
+            "fill_color": t["surface"] + "22",
         })
 
     margin = 72
