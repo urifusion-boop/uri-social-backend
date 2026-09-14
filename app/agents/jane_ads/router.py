@@ -4295,6 +4295,7 @@ async def _debug_vsg01_select_trace(
     description: str = "",
     forced_format_id: str = "",
     render: bool = False,
+    brand_colors: str = "",
 ) -> dict:
     """TEMPORARY — trace exactly what select_ranked_ad_formats/
     select_and_render_vsg01_creative do for a given description + optional
@@ -4325,9 +4326,13 @@ async def _debug_vsg01_select_trace(
         import traceback
         from .creative import _upload_bytes_to_cloudinary
         try:
+            brand_context = (
+                {"brand_colors": [c.strip() for c in brand_colors.split(",") if c.strip()]}
+                if brand_colors else None
+            )
             vsg01_result = await select_and_render_vsg01_creative(
                 db, business_name, category, description,
-                forced_format_id=forced_format_id or None,
+                brand_context=brand_context, forced_format_id=forced_format_id or None,
             )
             if vsg01_result is None:
                 result["render"] = {"success": False, "error": "select_and_render_vsg01_creative returned None"}
