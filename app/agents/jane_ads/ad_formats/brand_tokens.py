@@ -94,3 +94,43 @@ def resolve_brand_tokens(brand_colors: Optional[List[str]]) -> Dict[str, str]:
     # tokens["accent"] stays PLACEHOLDER_TOKENS' own default, already
     # verified (see tests) to clear it.
     return tokens
+
+
+def darken_to_contrast(hex_color: str, against: str, min_ratio: float) -> str:
+    """Same hue and saturation as hex_color, lightness reduced only as far
+    as needed to reach min_ratio contrast against `against` — general
+    helper shared by any format that wants to use a brand colour as a BOLD
+    PANEL BACKGROUND (not just as small-emphasis text, which is all
+    resolve_brand_tokens' own accent-selection validates). A deep shade of
+    the brand's real colour still reads as "this brand's colour"; an
+    unrelated neutral does not — used so a caller never has to fall back
+    to a generic colour just because the raw accent alone can't carry
+    legible text on its own in this different (background, not text) role."""
+    hc = hex_color.lstrip("#")
+    r, g, b = (int(hc[i:i + 2], 16) / 255 for i in (0, 2, 4))
+    h, l, s = colorsys.rgb_to_hls(r, g, b)
+    candidate = hex_color
+    for _ in range(60):
+        rr, gg, bb = colorsys.hls_to_rgb(h, l, s)
+        candidate = "#{:02X}{:02X}{:02X}".format(round(rr * 255), round(gg * 255), round(bb * 255))
+        if contrast_ratio(candidate, against) >= min_ratio:
+            return candidate
+        if l <= 0.0:
+            break
+        l = max(0.0, l - 0.02)
+    return candidate
+
+
+def bold_panel_colors(tokens: Dict[str, str], min_ratio: float = 7.0) -> tuple:
+    """(panel_fill, text_color) for a bold panel/banner background —
+    ALWAYS this brand's own accent colour family, never a generic neutral
+    fallback (explicit product decision, see news_headline.py's own
+    module docstring). Picks whichever of white/ink text contrasts better
+    against the raw accent; if neither clears min_ratio, darkens the
+    accent itself (same hue, less lightness) until one does."""
+    accent = tokens["accent"]
+    white_contrast = contrast_ratio("#FFFFFF", accent)
+    ink_contrast = contrast_ratio(tokens["ink"], accent)
+    if max(white_contrast, ink_contrast) >= min_ratio:
+        return accent, ("#FFFFFF" if white_contrast >= ink_contrast else tokens["ink"])
+    return darken_to_contrast(accent, "#FFFFFF", min_ratio), "#FFFFFF"

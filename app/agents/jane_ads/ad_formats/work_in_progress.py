@@ -71,16 +71,21 @@ def _scene_prompt(trade_activity: str, nigerian_setting: str, seasonal_context: 
     # own wording treats the slot as a light, optional touch, never
     # something that must survive intact).
     seasonal = seasonal_context_clause(seasonal_context)
+    # Professionally shot, not amateur-documentary — same "REVISED DECISION"
+    # reasoning as News Headline/Problem-Solution: what makes this real is
+    # that the work is genuinely incomplete and the worker isn't posing for
+    # the camera, not that the photo itself looks rough or accidental.
     return (
-        f"Create a realistic documentary photograph showing {trade_activity} "
-        f"actively underway in {resolve_nigerian_setting(nigerian_setting)}. "
-        f"{REPRESENTATION_BLOCK}. Depict safety equipment correctly where "
-        "relevant; never depict dangerous practices. Show the work visibly "
+        f"Create a professionally shot, real photograph showing {trade_activity} "
+        f"actively underway in {resolve_nigerian_setting(nigerian_setting)}, with "
+        "flattering natural light and deliberate composition, like a real published "
+        f"advertisement. {REPRESENTATION_BLOCK}. Depict safety equipment correctly "
+        "where relevant; never depict dangerous practices. Show the work visibly "
         "incomplete — hands, tools, equipment or materials communicating the "
         "job is actively underway. Candid, not posed — the worker should not "
-        "look at the camera unless the activity naturally requires it. "
-        "Realistic imperfections — dust, material variation, ordinary "
-        "clutter — welcome. Fill the frame edge to edge with the worker and "
+        "look at the camera unless the activity naturally requires it. Real, "
+        "believable material texture and detail — not staged or artificial. "
+        "Fill the frame edge to edge with the worker and "
         "the environment, including the left and right thirds — no large "
         "empty background areas anywhere in the frame. The only reserved "
         "copy space is a slim strip along the very bottom, roughly an "

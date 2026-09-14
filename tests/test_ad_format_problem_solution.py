@@ -15,6 +15,7 @@ from app.agents.jane_ads.ad_formats.problem_solution import (
     _solution_prompt,
     _check_fits_scrim,
 )
+from app.agents.jane_ads.ad_formats.brand_tokens import bold_panel_colors
 from app.agents.jane_ads.ad_formats.legibility import check_legibility
 from app.agents.jane_ads.ad_formats.tokens import PLACEHOLDER_TOKENS
 from app.agents.jane_ads.visual_slots import InvalidSlotValue
@@ -101,14 +102,17 @@ class TestBuildDocument:
         assert bgs[1]["y"] == doc["canvas"]["height"] // 2
 
     def test_each_zone_has_a_scrim_between_photo_and_text(self):
-        """Scrim is semi-transparent (~90% opacity, an 'E6' alpha suffix on
-        the field token) since the opacity fix — not fully solid — so the
-        photo's own texture shows through instead of reading as an opaque
-        white bar. See problem_solution.py's _scrim_fill."""
+        """Scrim is semi-transparent (~90% opacity, an 'E6' alpha suffix)
+        since the opacity fix — not fully solid — so the photo's own
+        texture shows through instead of reading as an opaque bar. Uses
+        THIS brand's own bold-panel colour (bold_panel_colors), not the
+        fixed `field` token — same "always the brand's real colour"
+        decision as News Headline's banner/panel. See _scrim_fill."""
         doc = self._doc()
+        panel_color, _ = bold_panel_colors(PLACEHOLDER_TOKENS)
         scrims = [
             l for l in doc["layers"]
-            if l["type"] == "shape" and str(l.get("fill_color", "")).startswith(PLACEHOLDER_TOKENS["field"])
+            if l["type"] == "shape" and str(l.get("fill_color", "")).startswith(panel_color)
         ]
         assert len(scrims) == 2
 
