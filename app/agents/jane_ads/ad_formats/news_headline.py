@@ -209,8 +209,11 @@ def build_document(
     width, height = canvas_size
     max_text_width = width - 2 * _PADDING
 
-    bar_zone_height = height - (height * 2) // 3
-    bar_y = height - bar_zone_height
+    # The maximum the bar is EVER allowed to claim — the photo's own prompt
+    # tells the AI "the reserved space is a plain strip across the lower
+    # third", so the bar must never exceed that third regardless of how
+    # little text it holds.
+    max_bar_zone_height = height - (height * 2) // 3
 
     headline_lines = wrap_text(headline, max_text_width, _FONT_HEADLINE, 700)
     secondary_lines = wrap_text(secondary_line, max_text_width, _FONT_SECONDARY) if secondary_line else []
@@ -220,7 +223,21 @@ def build_document(
         + (24 + len(secondary_lines) * _LINE_HEIGHT_SECONDARY if secondary_lines else 0)
         + (24 + _FONT_DATE if date_stamp else 0)
     )
-    _check_bar_fits(bar_content_height, bar_zone_height)
+    _check_bar_fits(bar_content_height, max_bar_zone_height)
+
+    # Live-confirmed real failure: a headline + date_stamp with no
+    # secondary_line left roughly a third of the canvas as dead white space
+    # below the text, because the bar was always drawn at the FULL
+    # reserved third regardless of how little content it actually held —
+    # the same "fixed box, variable content" bug already fixed for
+    # Receipt/Text Only/Us vs Them/Borrowed Interface. The bar now sizes to
+    # its real content (with a floor so a single short headline doesn't
+    # look like a thin sliver), sitting flush at the bottom — the AI photo
+    # simply shows more of its own plain, already-reserved lower area
+    # above it, which is exactly what it was asked to keep simple anyway.
+    _MIN_BAR_ZONE_HEIGHT = 220
+    bar_zone_height = max(_MIN_BAR_ZONE_HEIGHT, min(bar_content_height, max_bar_zone_height))
+    bar_y = height - bar_zone_height
 
     layers = []
     z = 0
