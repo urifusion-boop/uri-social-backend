@@ -2133,6 +2133,27 @@ async def _build_campaign_plan(
             clarify += f" Last time you spent ₦{known_budget:,.0f} — want to do the same again?"
         return {"early_return": {"stage": "need_more", "understood": parsed.model_dump(), "question": clarify}}
 
+    # ParsedCampaign has no free-text field at all — to_campaign_request maps
+    # only its structured fields (business_name/category/goal/budget/city/
+    # behaviour flags), so req.description stayed at CampaignRequest's own
+    # default ("") for every chat-driven plan, always, regardless of what the
+    # business actually wrote. Live-confirmed real-world effect: a business
+    # said "We're opening a new branch in Yaba on 1 October, tell people
+    # about it" — a genuine, specific, verbatim-checkable fact VSG-01's own
+    # content-generation functions exist to read — and every one of them
+    # (_content_news_headline, _content_problem_solution, _content_receipt,
+    # the new _content_fit_boost classifier, all of them) received "" and had
+    # nothing real to work with, so News Headline's own honest
+    # "never fabricate an announcement" contract correctly refused to fire,
+    # and generation silently fell through to Problem/Solution inventing a
+    # generic, business-unrelated situation instead. body.message is the
+    # frontend's own accumulated brief for this campaign (CampaignsPage.tsx
+    # chains each turn onto the last via briefSoFar specifically so the full
+    # context survives across turns, not just the latest reply) — the
+    # business's own words, verbatim, exactly what every VSG-01 content
+    # function already expects and never invents beyond.
+    req.description = body.message
+
     # URI's fee comes out of the stated budget BEFORE anything is planned, so every
     # decision below — platform split, duration, daily budget, the ad set Meta
     # actually gets — is made against the money that will really be spent on ads.
