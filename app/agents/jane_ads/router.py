@@ -559,7 +559,7 @@ async def suggest_ad_format(
     if body.is_video:
         return {"suggested": None, "alternatives": []}
 
-    from .vsg01_orchestrator import _vsg01_candidate_params, select_ranked_ad_formats
+    from .vsg01_orchestrator import VSG01_ISOLATED_AD_ACCOUNT, _vsg01_candidate_params, select_ranked_ad_formats
 
     candidate_ids, has_product_photo, has_real_customer_photo, _ = _vsg01_candidate_params(
         photo_url="x" if body.asset_attestation else None,  # only presence matters here
@@ -568,6 +568,7 @@ async def suggest_ad_format(
     )
     ranked = await select_ranked_ad_formats(
         db, has_product_photo=has_product_photo, has_real_customer_photo=has_real_customer_photo,
+        isolated_ad_account=VSG01_ISOLATED_AD_ACCOUNT,
         candidate_ids=candidate_ids, description=body.description or "",
     )
     if not ranked:
