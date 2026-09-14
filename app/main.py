@@ -322,6 +322,10 @@ app.include_router(sdk_router, tags=["SDK"])
 # Include Jane's First Message (personalized onboarding welcome message)
 app.include_router(jane_router, prefix="/social-media", tags=["Jane's First Message"])
 
+# Jane + Ads (VSG-01 ad format library, campaign chat, connected ad-account flows)
+from app.agents.jane_ads.router import router as jane_ads_router
+app.include_router(jane_ads_router)
+
 # Include multi-tenant routers (Enterprise/SDK features)
 app.include_router(client_router)
 app.include_router(workspace_router)
