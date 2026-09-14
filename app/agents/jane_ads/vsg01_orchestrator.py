@@ -190,20 +190,6 @@ UPLOAD_PHOTO_FORMAT_IDS = frozenset({
 })
 RECOMPOSITE_PHOTO_FORMAT_IDS = UPLOAD_PHOTO_FORMAT_IDS | {"SEED-088"}
 
-# Formats whose builder calls generate_scene() to AI-paint at least part of
-# the scene from scratch, as opposed to only compositing a real photo the
-# business already supplied — these are the only builders that receive
-# brand_context, since it exists to influence what generate_scene actually
-# paints (real brand colors as environmental/wardrobe/prop accents — see
-# layer2_generation.brand_palette_clause), not to annotate an existing photo.
-_AI_GENERATED_SCENE_FORMAT_IDS = frozenset({
-    "SEED-080",  # Problem/Solution
-    "SEED-088",  # Starter Pack — item icons; the hero product photo stays real
-    "SEED-098",  # Work In Progress
-    "SEED-077",  # News Headline (generate path only)
-    "SEED-089",  # Humour/Cartoon
-})
-
 # The format library's own tested/documented canvas — every format module's
 # unit tests and hard-check reasoning (line wrapping, scrim heights, column
 # widths) assume this square shape. Ad placements elsewhere in this codebase
@@ -500,15 +486,33 @@ async def _call_content_model(prompt: str) -> Optional[dict]:
         return None
 
 
-def _business_line(business_name: str, category: str, description: str) -> str:
-    return f"'{business_name or 'a business'}' (a {category or 'local business'}){(' — ' + description) if description else ''}"
+def _business_line(business_name: str, category: str, description: str,
+                    brand_context: Optional[dict] = None) -> str:
+    """The one shared line nearly every content-generation prompt in this
+    module opens with — the single choke point for folding in brand voice,
+    same reasoning as layer2_generation.brand_palette_clause for images:
+    organic content's own write_ad_copy is explicitly "voice-matched to the
+    brand playbook when a profile exists" (creative.py's own docstring);
+    this module's copy never was, regardless of format, because nothing
+    here read brand_context at all. General and additive — reads whatever
+    fields brand_context happens to have, works for any brand, and is a
+    no-op (identical to the old behaviour) when brand_context is empty."""
+    line = f"'{business_name or 'a business'}' (a {category or 'local business'}){(' — ' + description) if description else ''}"
+    bc = brand_context or {}
+    voice = (bc.get("brand_voice") or "").strip()
+    audience = (bc.get("target_audience") or "").strip()
+    voice_bits = [v for v in (voice, f"speaking to {audience}" if audience else "") if v]
+    if voice_bits:
+        line += f" [brand voice/tone: {'; '.join(voice_bits)}]"
+    return line
 
 
 # ── SEED-075: Us vs Them ──────────────────────────────────────────────────
 
-async def _content_us_vs_them(business_name: str, category: str, description: str) -> Optional[list]:
+async def _content_us_vs_them(business_name: str, category: str, description: str,
+                              brand_context: Optional[dict] = None) -> Optional[list]:
     prompt = (
-        f"For a Nigerian ad for {_business_line(business_name, category, description)}, "
+        f"For a Nigerian ad for {_business_line(business_name, category, description, brand_context)}, "
         "write 2-3 short comparison rows contrasting the OLD/informal way people currently "
         "handle this against how this business does it.\n"
         "HARD RULE: the 'them' side must name a generic METHOD ('buying at the market', "
@@ -532,8 +536,9 @@ async def _content_us_vs_them(business_name: str, category: str, description: st
 
 
 async def _build_us_vs_them(business_name: str, category: str, description: str, tokens: dict,
-                            photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None):
-    rows = await _content_us_vs_them(business_name, category, description)
+                            photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None,
+                            brand_context: Optional[dict] = None):
+    rows = await _content_us_vs_them(business_name, category, description, brand_context)
     if not rows:
         return None
     try:
@@ -552,7 +557,8 @@ async def _build_us_vs_them(business_name: str, category: str, description: str,
 # ── SEED-087: Borrowed Interface ──────────────────────────────────────────
 
 async def _content_borrowed_interface(business_name: str, category: str, description: str,
-                                      correction: str = "") -> Optional[list]:
+                                      correction: str = "",
+                                      brand_context: Optional[dict] = None) -> Optional[list]:
     """Real per-message character cap, not just a style ask — live-confirmed
     a 4-turn exchange with realistically longer messages (2-4 wrapped lines
     each) rendered with its final bubble clipped off the canvas (see
@@ -560,7 +566,7 @@ async def _content_borrowed_interface(business_name: str, category: str, descrip
     A chat message is naturally short anyway, so this constraint should
     read as normal phrasing, not a compression exercise."""
     prompt = (
-        f"For a Nigerian ad for {_business_line(business_name, category, description)}, write a "
+        f"For a Nigerian ad for {_business_line(business_name, category, description, brand_context)}, write a "
         "short, realistic WhatsApp-style exchange (3-4 messages total) between a customer and the "
         "business, ending with the business's offer or answer as the final message. Plausible "
         "casual Nigerian phrasing, no emoji spam.\n"
@@ -584,13 +590,14 @@ async def _content_borrowed_interface(business_name: str, category: str, descrip
 
 
 async def _build_borrowed_interface(business_name: str, category: str, description: str, tokens: dict,
-                                    photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None):
+                                    photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None,
+                                    brand_context: Optional[dict] = None):
     # brand_logo_url accepted (uniform call signature across every builder) but
     # deliberately never used — VSG-01-PROMPTS v2 §6.6: "A logo destroys this
     # format" (brand_mark="prohibited"). render_vsg01_creative never actually
     # passes one here (gated on format_def.brand_mark), so this is belt-and-
     # suspenders, not the real enforcement point.
-    turns = await _content_borrowed_interface(business_name, category, description)
+    turns = await _content_borrowed_interface(business_name, category, description, brand_context=brand_context)
     if not turns:
         return None
 
@@ -609,6 +616,7 @@ async def _build_borrowed_interface(business_name: str, category: str, descripti
             business_name, category, description,
             correction=f"your last attempt overflowed the canvas ({e}). Make every message "
                        "noticeably shorter this time — 30 characters or fewer.",
+            brand_context=brand_context,
         )
         if not retry_turns:
             return None
@@ -670,9 +678,10 @@ def _resolve_current_seasonal_context(today: Optional[date] = None) -> Optional[
     return None
 
 
-async def _content_problem_solution(business_name: str, category: str, description: str) -> Optional[dict]:
+async def _content_problem_solution(business_name: str, category: str, description: str,
+                                    brand_context: Optional[dict] = None) -> Optional[dict]:
     prompt = (
-        f"For a Nigerian ad for {_business_line(business_name, category, description)}, describe "
+        f"For a Nigerian ad for {_business_line(business_name, category, description, brand_context)}, describe "
         "the PROBLEM this business solves and the SOLUTION it offers, for a two-zone visual ad.\n"
         "- problem_situation: a short, concrete VISUAL scene of the problem (what a camera would "
         "see, no people's names, no brand names, no location names)\n"
@@ -722,7 +731,7 @@ async def _content_problem_solution(business_name: str, category: str, descripti
 async def _build_problem_solution(business_name: str, category: str, description: str, tokens: dict,
                                   photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None,
                                   brand_context: Optional[dict] = None):
-    content = await _content_problem_solution(business_name, category, description)
+    content = await _content_problem_solution(business_name, category, description, brand_context)
     if not content:
         return None
     width, height = _CANVAS_SIZE
@@ -870,7 +879,12 @@ async def _content_receipt(description: str) -> Optional[dict]:
 
 
 async def _build_receipt(business_name: str, category: str, description: str, tokens: dict,
-                         photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None):
+                         photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None,
+                         brand_context: Optional[dict] = None):
+    # brand_context accepted (uniform builder signature) but unused: Receipt's
+    # own content contract is verbatim-fact extraction only ("every figure
+    # real and honoured") — there is no styled prose here for a voice clause
+    # to influence.
     from .ad_formats import receipt
     content = await _content_receipt(description)
     if not content or not content["total_amount"]:
@@ -893,7 +907,12 @@ async def _build_receipt(business_name: str, category: str, description: str, to
 # ── SEED-093: Review Card (needs a real, attested product photo) ─────────
 
 async def _build_review_card(business_name: str, category: str, description: str, tokens: dict,
-                             photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None):
+                             photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None,
+                             brand_context: Optional[dict] = None):
+    # brand_context accepted (uniform builder signature) but unused: the
+    # quote/rating here are a real customer's own words, extracted verbatim
+    # by _extract_real_quote — nothing here is written prose a voice clause
+    # could influence.
     if not photo_url:
         return None
     real = await _extract_real_quote(description)
@@ -917,7 +936,8 @@ async def _build_review_card(business_name: str, category: str, description: str
 # ── SEED-082: Text on a Face (needs a real, attested customer photo) ─────
 
 async def _content_text_on_a_face(business_name: str, category: str, description: str,
-                                  correction: str = "") -> Optional[str]:
+                                  correction: str = "",
+                                  brand_context: Optional[dict] = None) -> Optional[str]:
     """The seller's own position/observed situation — safe to compose (this
     is not a claimed quote from anyone), but must clear the format's own
     ViewerPresumption/DisallowedPersonalTopic guards, which build_document
@@ -931,7 +951,7 @@ async def _content_text_on_a_face(business_name: str, category: str, description
     preference — the prompt states it as a hard number for exactly that
     reason."""
     prompt = (
-        f"For a Nigerian ad for {_business_line(business_name, category, description)}, write ONE "
+        f"For a Nigerian ad for {_business_line(business_name, category, description, brand_context)}, write ONE "
         "short first-person line (the business owner's own position or an observed situation about "
         "their work) to sit across a photo of them.\n"
         "HARD LIMIT: 20 characters or fewer, INCLUDING spaces and punctuation — this is a real pixel-"
@@ -950,10 +970,11 @@ async def _content_text_on_a_face(business_name: str, category: str, description
 
 
 async def _build_text_on_a_face(business_name: str, category: str, description: str, tokens: dict,
-                                photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None):
+                                photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None,
+                                brand_context: Optional[dict] = None):
     if not photo_url:
         return None
-    statement = await _content_text_on_a_face(business_name, category, description)
+    statement = await _content_text_on_a_face(business_name, category, description, brand_context=brand_context)
     if not statement:
         return None
 
@@ -978,6 +999,7 @@ async def _build_text_on_a_face(business_name: str, category: str, description: 
             business_name, category, description,
             correction=f"your last attempt ({statement!r}, {len(statement)} chars) was too long. "
                        "Make it shorter — 15 characters or fewer this time.",
+            brand_context=brand_context,
         )
         if not retry_statement:
             return None
@@ -996,9 +1018,10 @@ async def _build_text_on_a_face(business_name: str, category: str, description: 
 
 # ── SEED-074: Testimonial + Offer, person path (needs a real customer photo) ─
 
-async def _content_offer(business_name: str, category: str, description: str) -> Optional[dict]:
+async def _content_offer(business_name: str, category: str, description: str,
+                         brand_context: Optional[dict] = None) -> Optional[dict]:
     prompt = (
-        f"For a Nigerian ad for {_business_line(business_name, category, description)}, write a "
+        f"For a Nigerian ad for {_business_line(business_name, category, description, brand_context)}, write a "
         "short, concrete offer line and, only if the text above states one, real price/terms.\n"
         "Return JSON: {\"offer_text\": \"...\", \"price_or_terms\": \"...\" or \"\"}. "
         "Never invent a price — leave price_or_terms empty if none was stated. Return ONLY the JSON."
@@ -1013,11 +1036,12 @@ async def _content_offer(business_name: str, category: str, description: str) ->
 
 
 async def _build_testimonial_offer(business_name: str, category: str, description: str, tokens: dict,
-                                   photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None):
+                                   photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None,
+                                   brand_context: Optional[dict] = None):
     if not photo_url:
         return None
     real = await _extract_real_quote(description)
-    offer = await _content_offer(business_name, category, description)
+    offer = await _content_offer(business_name, category, description, brand_context)
     if not real or not offer:
         return None
     try:
@@ -1035,9 +1059,10 @@ async def _build_testimonial_offer(business_name: str, category: str, descriptio
 
 # ── SEED-088: Starter Pack (recomposite-only — needs a clean product cutout) ─
 
-async def _content_starter_pack(business_name: str, category: str, description: str) -> Optional[dict]:
+async def _content_starter_pack(business_name: str, category: str, description: str,
+                                brand_context: Optional[dict] = None) -> Optional[dict]:
     prompt = (
-        f"For a Nigerian ad for {_business_line(business_name, category, description)}, this "
+        f"For a Nigerian ad for {_business_line(business_name, category, description, brand_context)}, this "
         "business's product will sit in a flat-lay grid among 3-6 OTHER everyday items that "
         "belong to the same lifestyle/identity as the business's real customer (VSG-01 Starter "
         "Pack format — never build this on an ethnic, regional, or religious stereotype; the "
@@ -1067,7 +1092,7 @@ async def _build_starter_pack(business_name: str, category: str, description: st
                               brand_context: Optional[dict] = None):
     if not photo_url:
         return None
-    content = await _content_starter_pack(business_name, category, description)
+    content = await _content_starter_pack(business_name, category, description, brand_context)
     if not content:
         return None
     item_descriptions = [i[0] for i in content["items"]]
@@ -1135,7 +1160,11 @@ async def _content_price_led_offer(description: str) -> Optional[dict]:
 
 
 async def _build_price_led_offer(business_name: str, category: str, description: str, tokens: dict,
-                                 photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None):
+                                 photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None,
+                                 brand_context: Optional[dict] = None):
+    # brand_context accepted (uniform builder signature) but unused: same
+    # verbatim-fact contract as Receipt — a real, currently-honoured price
+    # extracted as-is, never styled prose.
     if not photo_url:
         return None
     content = await _content_price_led_offer(description)
@@ -1157,7 +1186,8 @@ async def _build_price_led_offer(business_name: str, category: str, description:
 
 # ── SEED-097: Text-Only (no photo at all) ────────────────────────
 
-async def _content_text_only(business_name: str, category: str, description: str) -> Optional[dict]:
+async def _content_text_only(business_name: str, category: str, description: str,
+                             brand_context: Optional[dict] = None) -> Optional[dict]:
     """Same truthfulness contract as _content_receipt/_content_price_led_offer
     — this format has NO image to fall back on, so §6.14 is explicit the
     headline must carry a real fact, never invented sentiment. Only ever
@@ -1165,7 +1195,7 @@ async def _content_text_only(business_name: str, category: str, description: str
     if not (description or "").strip():
         return None
     prompt = (
-        f"For a Nigerian ad for {_business_line(business_name, category, description)}, does the "
+        f"For a Nigerian ad for {_business_line(business_name, category, description, brand_context)}, does the "
         "text above state one REAL, concrete fact worth leading with — a price, a delivery area, "
         "a specific offer, an opening date? This format has NO image at all, so the headline must "
         "carry real information, never vague sentiment like 'we're the best'.\n"
@@ -1184,8 +1214,9 @@ async def _content_text_only(business_name: str, category: str, description: str
 
 
 async def _build_text_only(business_name: str, category: str, description: str, tokens: dict,
-                           photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None):
-    content = await _content_text_only(business_name, category, description)
+                           photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None,
+                           brand_context: Optional[dict] = None):
+    content = await _content_text_only(business_name, category, description, brand_context)
     if not content:
         return None
     from .ad_formats import text_only
@@ -1203,9 +1234,10 @@ async def _build_text_only(business_name: str, category: str, description: str, 
 # ── SEED-098: Work In Progress (generated scene — see module
 # docstring on why this doesn't yet accept a real work photo) ─────────────
 
-async def _content_work_in_progress(business_name: str, category: str, description: str) -> Optional[dict]:
+async def _content_work_in_progress(business_name: str, category: str, description: str,
+                                    brand_context: Optional[dict] = None) -> Optional[dict]:
     prompt = (
-        f"For a Nigerian ad for {_business_line(business_name, category, description)}, describe "
+        f"For a Nigerian ad for {_business_line(business_name, category, description, brand_context)}, describe "
         "the everyday hands-on WORK this business does (e.g. 'installing solar panels', 'fixing a "
         "burst pipe', 'repairing a generator') and write one short line naming what's being done "
         "and, if known, where they serve (e.g. 'Solar install underway — Lekki Phase 1').\n"
@@ -1232,7 +1264,7 @@ async def _content_work_in_progress(business_name: str, category: str, descripti
 async def _build_work_in_progress(business_name: str, category: str, description: str, tokens: dict,
                                   photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None,
                                   brand_context: Optional[dict] = None):
-    content = await _content_work_in_progress(business_name, category, description)
+    content = await _content_work_in_progress(business_name, category, description, brand_context)
     if not content:
         return None
     from .ad_formats import work_in_progress
@@ -1414,9 +1446,10 @@ async def _build_news_headline(business_name: str, category: str, description: s
 
 # ── SEED-089: Humour / Cartoon ────────────────────────────────────────────
 
-async def _content_humour_cartoon(business_name: str, category: str, description: str) -> Optional[dict]:
+async def _content_humour_cartoon(business_name: str, category: str, description: str,
+                                  brand_context: Optional[dict] = None) -> Optional[dict]:
     prompt = (
-        f"For a Nigerian ad for {_business_line(business_name, category, description)}, invent a "
+        f"For a Nigerian ad for {_business_line(business_name, category, description, brand_context)}, invent a "
         "single-panel cartoon sight gag about a SHARED SITUATION this business's customers "
         "would recognise (e.g. waiting forever for slow delivery, a messy DIY repair before "
         "calling a professional). The joke must target the SITUATION, never a group, "
@@ -1453,7 +1486,7 @@ async def _build_humour_cartoon(business_name: str, category: str, description: 
     manual QA render, never `select_and_render_vsg01_creative`)."""
     if not human_reviewed:
         return None
-    content = await _content_humour_cartoon(business_name, category, description)
+    content = await _content_humour_cartoon(business_name, category, description, brand_context)
     if not content:
         return None
     from .ad_formats import humour_cartoon
@@ -1572,11 +1605,14 @@ async def _locate_reveal_region(photo_url: str, zone_width: int, zone_height: in
 
 async def _build_censored_item(business_name: str, category: str, description: str, tokens: dict,
                                photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None,
-                               obscure_box: Optional[tuple] = None):
+                               obscure_box: Optional[tuple] = None,
+                               brand_context: Optional[dict] = None):
     """§2.10: 'The obscured item must be the real product' — this builder
     only ever places the caller's own real photo_url, never a generated one
     (see censored_item.py's own module docstring on why `generate` is never
-    permitted for the product itself).
+    permitted for the product itself). brand_context accepted (uniform
+    builder signature) but unused: same verbatim-fact contract as Receipt/
+    Price-Led Offer.
 
     obscure_box: (x, y, width, height) of the redaction bar, in real pixel
     coordinates. Explicit callers may still pass one directly; the normal
@@ -1615,14 +1651,15 @@ async def _build_censored_item(business_name: str, category: str, description: s
 
 # ── SEED-078: Day 1 -> Day 30 (needs two real, caller-supplied photos) ───
 
-async def _content_day1_day30(business_name: str, category: str, description: str) -> Optional[dict]:
+async def _content_day1_day30(business_name: str, category: str, description: str,
+                              brand_context: Optional[dict] = None) -> Optional[dict]:
     """§2.9: excluded outright for health/weight/skin/appearance — picks
     only from day1_day30.py's own closed allowlist, and only when the
     business's own words actually support that category (never defaults
     to one silently)."""
     from .ad_formats.day1_day30 import _PERMITTED_CATEGORIES
     prompt = (
-        f"For a Nigerian ad for {_business_line(business_name, category, description)}, does this "
+        f"For a Nigerian ad for {_business_line(business_name, category, description, brand_context)}, does this "
         "business's work fit one of these EXACT categories: "
         f"{sorted(_PERMITTED_CATEGORIES)}? This format shows real progress over time — it is "
         "STRICTLY NEVER permitted for anything about a person's body, weight, skin, or "
@@ -1649,7 +1686,8 @@ async def _content_day1_day30(business_name: str, category: str, description: st
 
 async def _build_day1_day30(business_name: str, category: str, description: str, tokens: dict,
                             photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None,
-                            day30_photo_url: Optional[str] = None):
+                            day30_photo_url: Optional[str] = None,
+                            brand_context: Optional[dict] = None):
     """Both photo_url (day 1) and day30_photo_url (day 30) must be real,
     caller-supplied photos of the SAME real thing at two points in time —
     this builder never generates either (§1.2/§2.9's own stronger
@@ -1662,7 +1700,7 @@ async def _build_day1_day30(business_name: str, category: str, description: str,
     directly today for manual/QA rendering."""
     if not photo_url or not day30_photo_url:
         return None
-    content = await _content_day1_day30(business_name, category, description)
+    content = await _content_day1_day30(business_name, category, description, brand_context)
     if not content:
         return None
     from .ad_formats import day1_day30
@@ -1752,18 +1790,21 @@ async def render_vsg01_creative(
         extra_kwargs["human_reviewed"] = True
     if strategy.strategy_id == "SEED-078":
         extra_kwargs["day30_photo_url"] = day30_photo_url
-    # Only the builders that actually call generate_scene() to AI-paint a
-    # scene from scratch take brand_context — it exists to influence what
-    # that call paints (real brand colors as environmental/wardrobe/prop
-    # accents, same strategy organic content's own image-brief generator
-    # already uses), so it has nothing to do for a format that only
-    # composites a real photo the business already supplied.
-    if strategy.strategy_id in _AI_GENERATED_SCENE_FORMAT_IDS:
-        extra_kwargs["brand_context"] = brand_context
 
+    # brand_context now goes to every builder, not just the 5 that
+    # AI-generate a scene: it's also how copy (headline, quote, offer text,
+    # chat turns, etc.) gets voice-matched to the brand — same idea as
+    # organic content's write_ad_copy, which is explicitly "voice-matched
+    # to the brand playbook when a profile exists" (creative.py's own
+    # docstring) and always has been, unlike this module's copy until now.
+    # A builder that has no use for it (Receipt/Price-Led Offer/Censored
+    # Item — genuinely verbatim-fact extraction, not styled prose; see each
+    # _content_* function's own "never invents" contract) simply accepts
+    # and ignores the param, same uniform-signature pattern tokens/
+    # photo_url/brand_logo_url already use.
     document = await builder(
         business_name, category, description, tokens, photo_url=photo_url, brand_logo_url=brand_logo_url,
-        **extra_kwargs,
+        brand_context=brand_context, **extra_kwargs,
     )
     if document is None:
         return None
