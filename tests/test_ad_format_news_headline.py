@@ -156,15 +156,23 @@ class TestBuildDocument:
         date = next(l for l in doc["layers"] if l.get("content") == "Sept 6")
         assert headline["y"] < secondary["y"] < date["y"]
 
-    def test_date_uses_accent_headline_uses_ink(self):
-        """date_stamp is deliberately styled as an accent-coloured highlight,
-        not muted ink-quiet metadata — for many announcements it's the single
-        most actionable fact a reader takes away ("when does this happen")."""
+    def test_headline_and_date_share_the_panel_text_colour(self):
+        """The bottom panel is a dark, on-brand-tinted plate (same colour
+        as the BREAKING NEWS banner, see _banner_colors), not flat white —
+        so headline/date text is whichever of white/ink actually contrasts
+        against it, not a fixed ink/accent pairing that assumed a light
+        panel. Both share the SAME colour deliberately: the raw accent is
+        too close in hue to a darkened version of itself to reliably
+        contrast, so date_stamp no longer tries to stand out via colour
+        (bold weight still gives it emphasis)."""
+        from app.agents.jane_ads.ad_formats.news_headline import _banner_colors
+
         doc = self._doc()
         headline = next(l for l in doc["layers"] if l.get("content") == "New campus now open in Yaba")
         date = next(l for l in doc["layers"] if l.get("content") == "Sept 6")
-        assert headline["color"] == PLACEHOLDER_TOKENS["ink"]
-        assert date["color"] == PLACEHOLDER_TOKENS["accent"]
+        _, expected_text = _banner_colors(PLACEHOLDER_TOKENS)
+        assert headline["color"] == expected_text
+        assert date["color"] == expected_text
 
     def test_secondary_line_and_date_are_optional(self):
         doc = self._doc(secondary_line=None, date_stamp=None)
