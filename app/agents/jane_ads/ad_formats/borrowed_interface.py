@@ -133,6 +133,22 @@ def build_document(
             "type": "ai_generated_background", "z_index": z,
             "url": background_url, "x": 0, "y": 0, "width": width, "height": height,
         })
+        # Live-confirmed real bug: each turn's timestamp is drawn BELOW its
+        # bubble, not inside it — with no backdrop that sat on the flat
+        # canvas colour (safe), but with one it sat directly on the raw
+        # photo, tripping §1.6's "text over photography needs a scrim"
+        # check on every single render, silently failing this candidate
+        # every time a backdrop was present. A full-canvas, low-opacity
+        # scrim between the backdrop and every layer above it guarantees
+        # ANY text here — not just today's timestamps — always has a safe
+        # layer beneath it, without touching the bubble/timestamp
+        # positioning math at all.
+        z += 1
+        layers.append({
+            "type": "shape", "z_index": z, "shape": "rect",
+            "x": 0, "y": 0, "width": width, "height": height,
+            "fill_color": t["surface"] + "80",
+        })
 
     margin = 72
     bubble_width = int(width * 0.68)
