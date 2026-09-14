@@ -537,6 +537,14 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                 # (billing.py reads this per record). Campaigns launched before this
                 # field existed fall back to C.LEGACY_AD_SPEND_MARKUP.
                 "ad_spend_markup": C.AD_SPEND_MARKUP,
+                # Whether this campaign can EVER report a conversation. Meta fires
+                # onsite_conversion.messaging_conversation_started only for native
+                # Click-to-WhatsApp; a wa.me link ad reports 0 forever — which is not
+                # "nobody messaged", it is "unmeasurable". Without this flag the
+                # dashboard's headline metric ("X people messaged you") renders a
+                # confident zero on every fallback campaign, so it is recorded at the
+                # moment the distinction is actually known.
+                "conversations_measurable": bool(use_native_whatsapp),
                 "created_at": datetime.now(timezone.utc),
             }},
             upsert=True,

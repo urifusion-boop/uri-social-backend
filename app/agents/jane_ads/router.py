@@ -26,6 +26,7 @@ from app.core.auth_bearer import JWTBearer
 from app.dependencies import get_active_brand_context, get_db_dependency
 
 from . import constants as C
+from . import measurability as M
 from .adapters.mock import MockAdPlatformAdapter
 from .decision_engine import apply_platform_override, plan_campaign
 from .instrumentation import InstrumentationService, MongoInstrumentationStore
@@ -3398,12 +3399,23 @@ async def meta_campaigns(
                     await db[collection].delete_one({"campaign_id": r["campaign_id"]})
                     continue
                 row["status"] = summary["delivery"].lower()
+                # A wa.me link ad reports 0 conversations forever — Meta only fires
+                # the conversation metric for native Click-to-WhatsApp. Rendering that
+                # raw would tell a client their ad produced nothing when the truth is
+                # we cannot see it, so the count is suppressed to null and the reason
+                # travels with it (see measurability.py).
+                reportable = M.conversations_reportable(r)
+                row["conversations_reportable"] = reportable
+                row["conversations_unreportable_reason"] = (
+                    "" if reportable else M.unreportable_reason(r)
+                )
                 row["metrics"] = {
                     "spend_ngn": round(summary["spend_ngn"], 2),
-                    "conversations": summary["conversations"],
+                    "conversations": M.conversation_count(r, summary["conversations"]),
                     "cost_per_conversation_ngn": (
                         round(summary["cost_per_conversation_ngn"], 2)
-                        if summary["cost_per_conversation_ngn"] is not None else None
+                        if reportable and summary["cost_per_conversation_ngn"] is not None
+                        else None
                     ),
                     "impressions": summary["impressions"],
                     "reach": summary["reach"],
@@ -3416,6 +3428,61 @@ async def meta_campaigns(
 
     out.sort(key=lambda row: row.get("created_at") or "", reverse=True)
     return {"campaigns": out}
+
+
+@router.get("/dashboard/home")
+async def dashboard_home(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """The Home surface (DASH-PRD-01 §4) — the four questions in ONE call.
+
+    One request on purpose. §11 requires the delta to answer before anything heavy
+    renders, on a mid-range Android over constrained data; four round trips to
+    assemble one screen is the thing that makes a dashboard feel broken there.
+
+    Reuses meta_campaigns() rather than re-reading the platform: the metrics fetch,
+    the deleted-campaign self-heal and the conversation-suppression rule all live
+    there already, and a second copy would drift from it.
+    """
+    from . import dashboard as D
+
+    brand_id = brand_ctx.get("brand_id")
+    user_id = brand_ctx.get("user_id") or ""
+
+    # Read the previous visit BEFORE recording this one, or opening Home would clear
+    # the very delta the client came to see.
+    last_seen = await D.read_last_seen(db, brand_id)
+
+    campaigns = (await meta_campaigns(db=db, brand_ctx=brand_ctx, with_metrics=True))["campaigns"]
+
+    balance = 0.0
+    if brand_id:
+        balance = await WalletService(MongoWalletStore(db)).get_balance(brand_id)
+
+    credits: Optional[int] = None
+    if user_id:
+        try:
+            from app.services.CreditService import credit_service
+            credits = (await credit_service.get_credit_balance(user_id)).credits_remaining
+        except Exception as e:
+            # Credits are context, not one of the four questions — a failure here
+            # must not cost the client the whole screen.
+            print(f"[dashboard] credit balance unavailable: {e}", flush=True)
+
+    money = D.money_line(balance, credits)
+    result = {
+        "since_you_last_looked": D.since_you_last_looked(campaigns, last_seen),
+        "live_campaigns": D.live_campaign_strip(campaigns),
+        "money": money,
+        "suggestions": D.build_suggestions(campaigns, money),
+        # §12 — a brand-new client must get an action, never a screen of zeros. The
+        # frontend needs to know which of the two it is rendering.
+        "is_first_run": not campaigns,
+    }
+
+    await D.mark_seen(db, brand_id)
+    return result
 
 
 class CampaignStatusBody(BaseModel):
