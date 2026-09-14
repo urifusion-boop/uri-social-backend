@@ -13,7 +13,7 @@ local comparisons: buying at the market vs delivered to you; generator vs
 solar; notebook vs system; guesswork vs measured fitting.
 """
 import re
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from ._text_metrics import wrap_text
 from .tokens import AdFormatDef, PLACEHOLDER_TOKENS, logo_badge_layers
@@ -83,12 +83,22 @@ def build_document(
     canvas_size: Tuple[int, int] = (1080, 1080),
     tokens: Dict[str, str] = None,
     brand_logo_url: str = None,
+    background_url: Optional[str] = None,
 ) -> Dict:
     """
     rows: [(row_label, them_value, us_value), ...] — row_label is shared
     across both columns ("Delivery", "Price", "Setup time"...); them_value
     must name a METHOD, never a business — raises BrandNameRejected if it
     looks like one.
+
+    background_url: an optional AI-generated backdrop (see vsg01_orchestrator's
+    _build_us_vs_them). The "them" column deliberately sits on bare canvas
+    (no card) so its plainness is itself part of the comparison — that
+    contrast is preserved by wrapping the WHOLE header+rows block in one
+    neutral `surface`-coloured card sitting on top of the photo, rather
+    than putting the photo directly behind either column's text. Omitted
+    (None) keeps the original flat `surface` background with no wrapper
+    card, exactly as before.
     """
     for _, them_value, _us in rows:
         if _looks_like_a_brand_name(them_value):
@@ -165,6 +175,24 @@ def build_document(
     total_block_height = _FONT_HEADER + header_to_rows_gap + total_rows_height
     header_y = max(72, (height - total_block_height) // 2)
     rows_top = header_y + header_to_rows_gap
+
+    if background_url:
+        z += 1
+        layers.append({
+            "type": "ai_generated_background", "z_index": z,
+            "url": background_url, "x": 0, "y": 0, "width": width, "height": height,
+        })
+        wrap_pad = 48
+        wrap_x = left_x - wrap_pad
+        wrap_y = header_y - wrap_pad
+        wrap_w = (right_x + col_width) - left_x + 2 * wrap_pad
+        wrap_h = total_block_height + 2 * wrap_pad
+        z += 1
+        layers.append({
+            "type": "shape", "z_index": z, "shape": "rounded_rect",
+            "x": wrap_x, "y": wrap_y, "width": wrap_w, "height": wrap_h,
+            "corner_radius": 24, "fill_color": t["surface"],
+        })
 
     # Column headers.
     for label, x in ((them_label, left_x), (us_label, right_x)):

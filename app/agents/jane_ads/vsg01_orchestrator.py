@@ -536,15 +536,41 @@ async def _content_us_vs_them(business_name: str, category: str, description: st
     return rows[:3] or None
 
 
+async def _generate_elegant_background(scene_description: str, brand_context: Optional[dict]) -> Optional[str]:
+    """A purely decorative AI backdrop for this module's 4 "drawn"
+    formats (Receipt, Us vs Them, Borrowed Interface, Text Only) — asset_
+    source='drawn' formats that otherwise render on one flat colour with
+    no photography at all, which read as unfinished next to organic
+    content's own AI-generated posters. Every one of these formats
+    already draws its real content (a card, a bubble, a text block) on
+    its own solid, opaque fill — never directly on this backdrop — so a
+    failed/missing background never touches legibility or correctness:
+    this returns None on any failure rather than raising, and each
+    caller's build_document falls back to its original flat-colour
+    canvas exactly as it did before this existed."""
+    try:
+        return await generate_scene(scene_description, size=f"{_CANVAS_SIZE[0]}x{_CANVAS_SIZE[1]}", brand_context=brand_context)
+    except SceneGenerationFailed as e:
+        print(f"[VSG01] Decorative background generation failed, falling back to flat colour: {e}", flush=True)
+        return None
+
+
 async def _build_us_vs_them(business_name: str, category: str, description: str, tokens: dict,
                             photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None,
                             brand_context: Optional[dict] = None):
     rows = await _content_us_vs_them(business_name, category, description, brand_context)
     if not rows:
         return None
+    background_url = await _generate_elegant_background(
+        "An elegant, softly blurred abstract background with gentle organic "
+        "colour gradients and soft ambient light — premium, calm, minimal, "
+        "and non-distracting, suitable for a comparison graphic to sit on top of.",
+        brand_context,
+    )
     try:
         document = us_vs_them.build_document(
             rows, canvas_size=_CANVAS_SIZE, tokens=tokens, brand_logo_url=brand_logo_url,
+            background_url=background_url,
         )
     except Exception as e:
         print(f"[VSG01] Us vs Them build failed: {e}", flush=True)
@@ -621,9 +647,17 @@ async def _build_borrowed_interface(business_name: str, category: str, descripti
     turns = await _content_borrowed_interface(business_name, category, description, brand_context=brand_context)
     if not turns:
         return None
+    background_url = await _generate_elegant_background(
+        "A softly blurred, realistic phone-screen ambient background — subtle "
+        "warm bokeh light, calm and minimal, like the soft background blur "
+        "behind a genuine phone screenshot, not a busy or distracting scene.",
+        brand_context,
+    )
 
     def _try_build(t):
-        return borrowed_interface.build_document(t, canvas_size=_CANVAS_SIZE, tokens=tokens)
+        return borrowed_interface.build_document(
+            t, canvas_size=_CANVAS_SIZE, tokens=tokens, background_url=background_url,
+        )
 
     try:
         document = _try_build(turns)
@@ -914,19 +948,26 @@ async def _content_receipt(description: str) -> Optional[dict]:
 async def _build_receipt(business_name: str, category: str, description: str, tokens: dict,
                          photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None,
                          brand_context: Optional[dict] = None):
-    # brand_context accepted (uniform builder signature) but unused: Receipt's
-    # own content contract is verbatim-fact extraction only ("every figure
-    # real and honoured") — there is no styled prose here for a voice clause
-    # to influence.
+    # brand_context doesn't reach the CONTENT here: Receipt's own contract is
+    # verbatim-fact extraction only ("every figure real and honoured") —
+    # there's no styled prose for a voice clause to influence. It does reach
+    # the decorative background below, same as every other "drawn" format.
     from .ad_formats import receipt
     content = await _content_receipt(description)
     if not content or not content["total_amount"]:
         return None
+    background_url = await _generate_elegant_background(
+        "A softly blurred, elegant flat surface for a premium receipt display "
+        "— warm wood grain, subtle marble, or soft linen texture, gentle "
+        "natural window light, shallow depth of field, calm and uncluttered, "
+        "like a stylish invoice photographed on a boutique shop counter.",
+        brand_context,
+    )
     try:
         document = receipt.build_document(
             content["items"], content["total_label"], content["total_amount"],
             business_name=business_name, canvas_size=_CANVAS_SIZE, tokens=tokens,
-            brand_logo_url=brand_logo_url,
+            brand_logo_url=brand_logo_url, background_url=background_url,
         )
     except Exception as e:
         print(f"[VSG01] Receipt build failed: {e}", flush=True)
@@ -1260,10 +1301,17 @@ async def _build_text_only(business_name: str, category: str, description: str, 
     if not content:
         return None
     from .ad_formats import text_only
+    background_url = await _generate_elegant_background(
+        "An elegant, softly blurred abstract background with gentle organic "
+        "colour gradients and soft ambient light — premium, calm, minimal, "
+        "like a high-end brand's own social media backdrop.",
+        brand_context,
+    )
     try:
         document = text_only.build_document(
             content["headline"], subline=content["subline"], action_line=content["action_line"],
             canvas_size=_CANVAS_SIZE, tokens=tokens, brand_logo_url=brand_logo_url,
+            background_url=background_url,
         )
     except Exception as e:
         print(f"[VSG01] Text-Only build failed: {e}", flush=True)

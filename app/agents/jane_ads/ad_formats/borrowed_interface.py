@@ -94,6 +94,7 @@ def build_document(
     turns: List[Tuple[str, str, str]],
     canvas_size: Tuple[int, int] = (1080, 1080),
     tokens: Dict[str, str] = None,
+    background_url: Optional[str] = None,
 ) -> Dict:
     """
     Chat variant. turns: [(speaker, message, timestamp), ...] where speaker
@@ -103,6 +104,13 @@ def build_document(
     Us vs Them/Review Card use) — raises ExchangeOverflowsCanvas if the
     resulting block is taller than the canvas rather than silently
     clipping the last bubble.
+
+    background_url: an optional AI-generated backdrop (see vsg01_orchestrator's
+    _build_borrowed_interface) — genuinely realistic here, since a real
+    WhatsApp screen has its own wallpaper behind the bubbles. Each bubble
+    already has its own solid fill, so this never touches legibility.
+    Omitted (None) keeps the original flat `surface` background, exactly
+    as before.
     """
     if len(turns) > 4:
         raise TooManyTurns(
@@ -118,6 +126,14 @@ def build_document(
 
     layers = []
     z = 0
+
+    if background_url:
+        z += 1
+        layers.append({
+            "type": "ai_generated_background", "z_index": z,
+            "url": background_url, "x": 0, "y": 0, "width": width, "height": height,
+        })
+
     margin = 72
     bubble_width = int(width * 0.68)
     h_pad, v_pad = 28, 24
