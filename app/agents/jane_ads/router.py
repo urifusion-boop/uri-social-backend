@@ -3406,6 +3406,9 @@ async def meta_campaigns(
                 # travels with it (see measurability.py).
                 reportable = M.conversations_reportable(r)
                 row["conversations_reportable"] = reportable
+                # measurable / unmeasurable / unknown — callers must distinguish
+                # "this ad can't be counted" from "we don't know about this old one".
+                row["conversations_state"] = M.conversation_state(r)
                 row["conversations_unreportable_reason"] = (
                     "" if reportable else M.unreportable_reason(r)
                 )
