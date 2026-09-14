@@ -203,9 +203,15 @@ def build_document(
 def _scene_prompt(announcement_subject: str, nigerian_setting: str) -> str:
     return (
         f"Photojournalistic image of {announcement_subject} in "
-        f"{resolve_nigerian_setting(nigerian_setting)}, candid unposed moment, "
-        f"natural available light, slight motion, documentary reportage style, "
-        f"muted realistic colour, shot on a 35mm lens, authentic and unstyled. "
+        f"{resolve_nigerian_setting(nigerian_setting)}, candid unposed moment caught "
+        "mid-action, genuine unguarded expression, natural available light with "
+        "believable shadow and highlight falloff, slight motion blur on a moving "
+        "hand or fabric, documentary reportage style, muted realistic colour "
+        "grading, shot on a 35mm lens with shallow depth of field separating the "
+        "subject from a richly detailed, specific background — real signage-free "
+        "objects and textures that genuinely belong to this exact setting, never "
+        "a generic or empty backdrop. Authentic and unstyled, like a real press "
+        f"photograph, not a posed advertisement. "
         f"{REPRESENTATION_BLOCK}. Fill the frame edge to edge with the subject "
         "and setting, including the left and right thirds — no large empty "
         "background areas. The only reserved space is a plain strip across "

@@ -246,30 +246,59 @@ def _hex_to_color_word(hex_code: str) -> Optional[str]:
 
 
 def brand_palette_clause(brand_context: Optional[dict]) -> str:
-    """A general clause folding a business's REAL brand colors into the
+    """A general clause folding a business's REAL brand info into the
     scene as environmental influence — the same strategy organic content's
-    _generate_image_brief already uses ("these MUST appear... incorporate
-    them in clothing, props, or environmental accents"), adapted for this
-    library's own absolute rule that Layer 2 never renders text, logos or
-    brand marks (§1.1 — unaffected by this clause, still enforced
+    _generate_image_brief already uses (brand colors "MUST appear...
+    incorporate them in clothing, props, or environmental accents", plus a
+    brand_block folding in business_description/industry so props and
+    setting feel like THIS business, not a generic stock scene), adapted
+    for this library's own absolute rule that Layer 2 never renders text,
+    logos or brand marks (§1.1 — unaffected by this clause, still enforced
     separately by TYPOGRAPHY_DIRECTIVE + GLOBAL_NEGATIVE_PROMPT below).
 
-    Reads brand_colors generically from whatever brand_context dict is
-    passed — works for any business's Playbook data, nothing here is
-    specific to one format, one industry or one brand. Returns "" (no-op)
-    when there's nothing usable, matching every other optional clause in
-    this module (seasonal_context_clause does the same)."""
-    colors = (brand_context or {}).get("brand_colors") or []
+    Reads generically from whatever brand_context dict is passed — works
+    for any business's Playbook data, nothing here is specific to one
+    format, one industry or one brand. Returns "" (no-op) when there's
+    nothing usable at all, matching every other optional clause in this
+    module (seasonal_context_clause does the same); either piece
+    (colors/description) is independently optional."""
+    # Capped, not passed through raw: business_description is free text a
+    # business can write at any length, and this whole module assembles
+    # prompts by plain string concatenation with a hard total-length budget
+    # (see generate_scene's _DALLE_MAX_CHARS) — unlike organic content's own
+    # _generate_image_brief, which safely absorbs arbitrary-length brand
+    # fields because an LLM rewrites everything into a bounded brief before
+    # it reaches the image model. An unbounded description here would eat
+    # generate_scene's length budget unpredictably, in the worst case past
+    # zero (a negative Python slice silently reads from the string's end,
+    # not the failure this should surface as).
+    _MAX_DESCRIPTION_CHARS = 200
+
+    bc = brand_context or {}
+    colors = bc.get("brand_colors") or []
     words = list(dict.fromkeys(w for w in (_hex_to_color_word(c) for c in colors[:3]) if w))
-    if not words:
+    description = (bc.get("business_description") or "").strip()
+    if len(description) > _MAX_DESCRIPTION_CHARS:
+        description = description[:_MAX_DESCRIPTION_CHARS].rsplit(" ", 1)[0] + "…"
+
+    parts: list[str] = []
+    if words:
+        palette = ", ".join(words)
+        parts.append(
+            f"This brand's real color palette is {palette} — let it subtly and naturally "
+            "inform the scene wherever it fits (environmental accents, props, wardrobe, "
+            "signage-free surfaces), without forcing it or making the palette itself the "
+            "subject."
+        )
+    if description:
+        parts.append(
+            f"Real business context, for authentic props/setting/styling choices only: "
+            f"{description}"
+        )
+    if not parts:
         return ""
-    palette = ", ".join(words)
-    return (
-        f"This brand's real color palette is {palette} — let it subtly and naturally "
-        "inform the scene wherever it fits (environmental accents, props, wardrobe, "
-        "signage-free surfaces), without forcing it or making the palette itself the "
-        "subject. Do not render any text, logo, or brand mark of any kind."
-    )
+    parts.append("Do not render any text, logo, or brand mark of any kind.")
+    return " ".join(parts)
 
 
 class SceneGenerationFailed(RuntimeError):
@@ -319,18 +348,30 @@ async def generate_scene(
     # brand-guide generation), just with no reference image, so it takes
     # the text-to-image branch of that same path.
     #
-    # 4000 chars kept as a conservative prompt-length ceiling regardless of
-    # provider: the three fixed directives below already run ~2300 chars,
-    # and the longest format prompt (Work In Progress, with its
-    # representation block and real slot text filled in) comes within
-    # roughly 100 chars of it — too tight a margin when the scene
-    # description itself is built from LLM-generated free text (a
-    # business's own trade/activity wording is not length-bounded). Trim
-    # the caller's scene description, never the fixed directives —
-    # GLOBAL_NEGATIVE_PROMPT in particular is what keeps garbled text/logos
-    # out of a text-bearing ad format; that must never be the part that
-    # gets cut for space.
-    _DALLE_MAX_CHARS = 4000
+    # OpenAI's actual documented prompt limit for the gpt-image family is
+    # 32,000 characters (confirmed: _call_dalle_api's gpt-image-2 branch
+    # passes `prompt` straight through to images.edit/images.generate with
+    # no truncation of its own) — 4000 here was a self-imposed, much more
+    # conservative ceiling that turned out too tight once brand_context
+    # additions (brand_palette_clause) started eating into it: the fixed
+    # directives plus ratio/palette clauses can now run ~2650-3300 chars on
+    # their own, and the longest format prompt (Work In Progress, with its
+    # representation block and real slot text filled in) already runs
+    # ~1250 chars unmodified — that combination was landing at or past the
+    # old ceiling even before any enrichment, silently truncating the very
+    # "fill the frame, no empty background" instruction meant to prevent
+    # exactly the empty-gap failure this library exists to avoid. Raised to
+    # a still-conservative fraction of the real 32,000-char limit, not the
+    # limit itself — no evidence justifies going further than this library
+    # actually needs. Trim the caller's scene description, never the fixed
+    # directives — GLOBAL_NEGATIVE_PROMPT in particular is what keeps
+    # garbled text/logos out of a text-bearing ad format; that must never
+    # be the part that gets cut for space. budget is floored at 0 (never
+    # negative) as a second, independent guard on top of
+    # brand_palette_clause's own description-length cap — a negative
+    # Python slice silently reads from the string's end instead of
+    # surfacing as the length problem it is.
+    _DALLE_MAX_CHARS = 8000
     _SAFETY_MARGIN = 100
     ratio_clause = _resolve_ratio_clause(size)
     palette_clause = brand_palette_clause(brand_context)
@@ -340,7 +381,7 @@ async def generate_scene(
         f" {COMPOSITION_DIRECTIVE} {TYPOGRAPHY_DIRECTIVE} {GLOBAL_NEGATIVE_PROMPT}"
     )
     scene_description = prompt.strip()
-    budget = _DALLE_MAX_CHARS - _SAFETY_MARGIN - len(fixed_suffix)
+    budget = max(0, _DALLE_MAX_CHARS - _SAFETY_MARGIN - len(fixed_suffix))
     if len(scene_description) > budget:
         scene_description = scene_description[:budget].rsplit(" ", 1)[0] + "."
 

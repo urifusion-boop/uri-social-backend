@@ -116,7 +116,9 @@ def _item_prompt(item: str, nigerian_setting_hint: str = "", seasonal_context: O
     seasonal = seasonal_context_clause(seasonal_context)
     return (
         f"Overhead flat lay of {item} on a plain surface, even soft daylight "
-        "from above producing a subtle consistent shadow, styled but not "
+        "from above producing a subtle consistent shadow, true-to-life "
+        "material rendering — genuine surface texture, sheen and colour "
+        "fidelity for exactly what this object is — styled but not "
         "artificially perfect. Give the object enough breathing room to "
         "remain individually recognisable once placed in a grid alongside "
         "other items of matching scale. No decorative props, no unnecessary "
