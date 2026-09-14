@@ -37,6 +37,7 @@ from typing import Dict, Optional, Tuple
 
 from ..visual_slots import resolve_nigerian_setting
 from ..layer2_generation import REPRESENTATION_BLOCK, generate_scene, seasonal_context_clause
+from .brand_tokens import bold_panel_colors
 from .legibility import assert_legible
 from ._text_metrics import wrap_text
 from .tokens import AdFormatDef, PLACEHOLDER_TOKENS, logo_badge_layers
@@ -56,15 +57,18 @@ _ZONE_TEXT_PADDING = 56
 _LINE_HEIGHT = int(_FONT_COPY * 1.3)
 
 
-def _scrim_fill(field_color: str) -> str:
+def _scrim_fill(hex_color: str) -> str:
     """A semi-transparent caption band, not an opaque block. The Layer 2
     prompt already reserves an empty area in the photo for the text; a solid
     fill covers exactly that reserved area with a flat slab and the result
-    reads as two photos crammed between two white bars (confirmed in a live
-    render where the brand's `field` token resolved to pure white). ~90%
-    opacity keeps dark text at the §1.6 contrast floor while letting the
-    photo's own texture through so it reads as one composed image."""
-    c = (field_color or "").strip()
+    reads as two photos crammed between two flat bars (confirmed live).
+    ~90% opacity keeps text at the §1.6 contrast floor while letting the
+    photo's own texture through so it reads as one composed image.
+
+    Takes THIS brand's own bold-panel colour (see bold_panel_colors), not
+    the fixed `field` token — same "always the brand's real colour, never
+    a generic neutral" decision as News Headline's banner/panel."""
+    c = (hex_color or "").strip()
     if c.startswith("#") and len(c) == 7:
         return c + "E6"
     return "#FFFFFFE6"
@@ -102,8 +106,15 @@ def _check_fits_scrim(lines, zone_name: str, scrim_height: int) -> None:
 # still matters here.
 def _problem_prompt(problem_situation: str, nigerian_setting: str, seasonal_context: Optional[str] = None) -> str:
     seasonal = seasonal_context_clause(seasonal_context)
+    # Editorial advertising photography, not amateur/unpolished documentary
+    # — same "REVISED DECISION" reasoning as News Headline: the load-bearing
+    # rule is that the situation is real and believable, not that the
+    # photography itself looks rough or accidental. The muted/desaturated
+    # colour treatment stays — that contrast against the solution zone's
+    # brighter tones is the format's actual storytelling device (§2.3), not
+    # a proxy for "unpolished".
     return (
-        f"Create a realistic documentary-style Nigerian photograph that "
+        f"Create a professionally shot, real Nigerian photograph that "
         f"communicates {problem_situation} immediately without requiring "
         f"explanatory text. Set the scene in {resolve_nigerian_setting(nigerian_setting)}, "
         "with specific, believable environmental detail — real worn surfaces, "
@@ -118,8 +129,10 @@ def _problem_prompt(problem_situation: str, nigerian_setting: str, seasonal_cont
         "action in the lower two-thirds of the frame, keeping the top third "
         "visually calm and uncluttered — a headline is placed there. Use "
         "muted, slightly desaturated natural colours with overcast or shaded "
-        "daylight and soft directional shadow. The image should feel observed rather than staged: "
-        f"realistic, imperfect, unpolished and documentary.{(' ' + seasonal) if seasonal else ''}"
+        "daylight and soft directional shadow, composed with the same care as a "
+        "real published advertisement. The image should feel genuine and true to "
+        "life, never staged or artificial, while still being deliberately and "
+        f"professionally composed — real, not amateur.{(' ' + seasonal) if seasonal else ''}"
     )
 
 
@@ -128,7 +141,7 @@ def _solution_prompt(
 ) -> str:
     seasonal = seasonal_context_clause(seasonal_context)
     return (
-        "Create a realistic documentary-style Nigerian photograph showing the "
+        "Create a professionally shot, real Nigerian photograph showing the "
         f"positive resolution of {problem_situation}, represented by "
         f"{solution_situation}. Set the scene in {resolve_nigerian_setting(nigerian_setting)}, "
         "with the same specific environmental detail as the problem photo — "
@@ -172,7 +185,8 @@ def build_document(
     # 40% of the zone — not a fixed 40% slab regardless of how short the
     # copy is.
     max_scrim_height = int(zone_height * 0.4)
-    scrim_fill = _scrim_fill(t["field"])
+    panel_color, panel_text = bold_panel_colors(t)
+    scrim_fill = _scrim_fill(panel_color)
 
     layers = []
     z = 0
@@ -203,7 +217,7 @@ def build_document(
     layers.append({
         "type": "text", "z_index": z, "content": "\n".join(problem_lines),
         "x": _ZONE_TEXT_PADDING, "y": _ZONE_TEXT_PADDING // 2,
-        "font_size": _FONT_COPY, "font_weight": 700, "color": t["ink"],
+        "font_size": _FONT_COPY, "font_weight": 700, "color": panel_text,
     })
 
     # Solution zone — bottom half, generated image, scrim + text at the
@@ -225,7 +239,7 @@ def build_document(
     layers.append({
         "type": "text", "z_index": z, "content": "\n".join(solution_lines),
         "x": _ZONE_TEXT_PADDING, "y": scrim2_y + _ZONE_TEXT_PADDING // 2,
-        "font_size": _FONT_COPY, "font_weight": 700, "color": t["ink"],
+        "font_size": _FONT_COPY, "font_weight": 700, "color": panel_text,
     })
 
     badge_layers, z = logo_badge_layers(brand_logo_url, width, height, z)
