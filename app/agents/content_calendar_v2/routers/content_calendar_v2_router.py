@@ -218,7 +218,12 @@ async def create_draft_from_item_v2(
             await cal_v2_svc.mark_acted_on_v2(plan_id, item_index, draft_ids, user_id, db, brand_id=brand_id)
 
             request_id = result.get("responseData", {}).get("request_id")
-            credits_to_deduct = len(drafts) if (item.get("format") == "carousel" and drafts) else 1
+            # V2-only cost rule (deliberately diverges from v1's create_draft_from_calendar_day,
+            # which charges 1 credit PER PLATFORM draft): 1 credit per SLIDE, flat across every
+            # platform — a 3-slide carousel is 3 credits whether it's posted to 1 platform or 4.
+            # planned_slides was set above in the same `format == "carousel"` branch that ran
+            # CarouselGenerationService, so it's always defined here when this condition is True.
+            credits_to_deduct = planned_slides if (item.get("format") == "carousel" and drafts) else 1
             if request_id:
                 if is_trial_user:
                     await trial_service.deduct_trial_credit(
