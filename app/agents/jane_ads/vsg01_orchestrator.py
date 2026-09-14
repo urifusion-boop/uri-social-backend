@@ -562,9 +562,12 @@ async def _build_us_vs_them(business_name: str, category: str, description: str,
     if not rows:
         return None
     background_url = await _generate_elegant_background(
-        "An elegant, softly blurred abstract background with gentle organic "
-        "colour gradients and soft ambient light — premium, calm, minimal, "
-        "and non-distracting, suitable for a comparison graphic to sit on top of.",
+        "A purely abstract, non-representational background — soft blurred "
+        "colour gradients and gentle ambient light only, premium and calm. "
+        "Absolutely no people, faces, hands, body parts, or any recognisable "
+        "object, product, or scene of any kind — pure colour, light, and soft "
+        "shape only, non-distracting, suitable for a comparison graphic to sit "
+        "on top of.",
         brand_context,
     )
     try:
@@ -650,7 +653,9 @@ async def _build_borrowed_interface(business_name: str, category: str, descripti
     background_url = await _generate_elegant_background(
         "A softly blurred, realistic phone-screen ambient background — subtle "
         "warm bokeh light, calm and minimal, like the soft background blur "
-        "behind a genuine phone screenshot, not a busy or distracting scene.",
+        "behind a genuine phone screenshot, not a busy or distracting scene. "
+        "Pure light and blur only — no people, faces, hands, body parts, or "
+        "any recognisable object or product anywhere in frame.",
         brand_context,
     )
 
@@ -960,7 +965,9 @@ async def _build_receipt(business_name: str, category: str, description: str, to
         "A softly blurred, elegant flat surface for a premium receipt display "
         "— warm wood grain, subtle marble, or soft linen texture, gentle "
         "natural window light, shallow depth of field, calm and uncluttered, "
-        "like a stylish invoice photographed on a boutique shop counter.",
+        "like a stylish invoice photographed on a boutique shop counter. Only "
+        "the surface and ambient light — no people, faces, hands, or any "
+        "other object or product anywhere in frame.",
         brand_context,
     )
     try:
@@ -1302,9 +1309,12 @@ async def _build_text_only(business_name: str, category: str, description: str, 
         return None
     from .ad_formats import text_only
     background_url = await _generate_elegant_background(
-        "An elegant, softly blurred abstract background with gentle organic "
-        "colour gradients and soft ambient light — premium, calm, minimal, "
-        "like a high-end brand's own social media backdrop.",
+        "A purely abstract, non-representational background — soft blurred "
+        "colour gradients and gentle ambient light only, premium and calm, "
+        "like a high-end brand's own social media backdrop. Absolutely no "
+        "people, faces, hands, body parts, or any recognisable object, "
+        "product, or scene of any kind — pure colour, light, and soft shape "
+        "only.",
         brand_context,
     )
     try:
