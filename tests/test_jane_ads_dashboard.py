@@ -18,7 +18,7 @@ def _row(**kw):
     base = dict(
         campaign_id="c1", name="bags for students", status="active",
         destination_type="whatsapp", budget_ngn=25_000.0,
-        conversations_reportable=True,
+        conversations_reportable=True, conversations_state=M.MEASURABLE,
         metrics={"spend_ngn": 14_200.0, "conversations": 18, "ends_at": None},
     )
     base.update(kw)
@@ -143,7 +143,8 @@ def test_nothing_worth_saying_produces_an_empty_list():
 def test_an_unmeasurable_live_campaign_is_the_first_thing_raised():
     money = D.money_line(50_000, 12)
     out = D.build_suggestions(
-        [_row(conversations_reportable=False, metrics={"spend_ngn": 5_000.0, "conversations": None})],
+        [_row(conversations_reportable=False, conversations_state=M.UNMEASURABLE,
+              metrics={"spend_ngn": 5_000.0, "conversations": None})],
         money)
     assert out[0]["kind"] == "link_whatsapp_number"
     assert out[0]["action"] == "connections"
@@ -153,6 +154,7 @@ def test_only_one_link_suggestion_however_many_campaigns_qualify():
     """The three-cap is load-bearing — five unmeasurable campaigns must not fill the
     whole block with the same advice."""
     rows = [_row(campaign_id=f"c{i}", conversations_reportable=False,
+                 conversations_state=M.UNMEASURABLE,
                  metrics={"spend_ngn": 5_000.0, "conversations": None}) for i in range(5)]
     out = D.build_suggestions(rows, D.money_line(50_000, 12))
     assert len([s for s in out if s["kind"] == "link_whatsapp_number"]) == 1
@@ -180,7 +182,7 @@ def test_a_spending_campaign_with_messages_is_not_flagged():
 
 def test_a_low_wallet_is_raised_last():
     """It blocks the NEXT campaign rather than damaging a running one."""
-    rows = [_row(conversations_reportable=False,
+    rows = [_row(conversations_reportable=False, conversations_state=M.UNMEASURABLE,
                  metrics={"spend_ngn": 5_000.0, "conversations": None})]
     out = D.build_suggestions(rows, D.money_line(100, 12))
     assert out[-1]["kind"] == "wallet_low"
@@ -188,8 +190,20 @@ def test_a_low_wallet_is_raised_last():
 
 def test_never_more_than_three_suggestions():
     rows = [_row(campaign_id="a", conversations_reportable=False,
+                 conversations_state=M.UNMEASURABLE,
                  metrics={"spend_ngn": 5_000.0, "conversations": None})]
     rows += [_row(campaign_id=f"q{i}", metrics={"spend_ngn": 9_000.0, "conversations": 0})
              for i in range(6)]
     out = D.build_suggestions(rows, D.money_line(100, 12))
     assert len(out) <= D.MAX_SUGGESTIONS == 3
+
+
+def test_an_old_campaign_is_never_told_to_go_link_a_number():
+    """UNKNOWN is not UNMEASURABLE. A campaign that merely predates the stamp may
+    already be native — live case: one launched hours before the stamp existed — and
+    telling its owner to fix something that isn't broken is advice we cannot stand
+    behind."""
+    rows = [_row(conversations_reportable=False, conversations_state=M.UNKNOWN,
+                 metrics={"spend_ngn": 5_000.0, "conversations": None})]
+    out = D.build_suggestions(rows, D.money_line(50_000, 12))
+    assert not any(s["kind"] == "link_whatsapp_number" for s in out)

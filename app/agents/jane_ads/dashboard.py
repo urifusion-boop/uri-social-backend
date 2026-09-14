@@ -177,6 +177,13 @@ def build_suggestions(campaign_rows: list[dict], money: dict) -> list[dict]:
             continue
         if (row.get("destination_type") or "") != "whatsapp":
             continue
+        # ONLY a campaign we know is a wa.me fallback. A campaign that merely predates
+        # the measurability stamp is UNKNOWN — telling its owner to go link a number
+        # that may already be linked (live case: a native campaign launched hours
+        # before the stamp existed) is advice we cannot stand behind, and it sends
+        # them to fix something that isn't broken.
+        if row.get("conversations_state") != M.UNMEASURABLE:
+            continue
         suggestions.append({
             "kind": "link_whatsapp_number",
             "text": f"We can't count messages from “{row.get('name') or 'your campaign'}”",
