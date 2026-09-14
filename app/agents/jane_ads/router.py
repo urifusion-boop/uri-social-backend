@@ -1876,6 +1876,9 @@ class MetaLaunchFromMessageBody(BaseModel):
     # See CreativeForBrandBody's identical field — the "change" pick from
     # POST /jane-ads/creative/suggest-format's alternatives.
     vsg01_format_id: Optional[str] = None
+    # See CreativeForBrandBody's identical field — Day 1 -> Day 30 (SEED-078)
+    # only, a second real photo of the same thing at a later point in time.
+    reference_image_url_2: str = ""
 
 
 class _PlanBuildResult(BaseModel):
@@ -2533,7 +2536,7 @@ async def _build_campaign_plan(
             audience_segment=variant_segment, who_its_for=variant_who_its_for,
             geo_pockets=variant_geo_pockets, destination_type=destination_type.value,
             destination_cta=destination_cta, asset_attestation=body.asset_attestation,
-            vsg01_format_id=body.vsg01_format_id,
+            vsg01_format_id=body.vsg01_format_id, day30_photo_url=body.reference_image_url_2 or None,
         )
     elif body.creative_source == "recomposite":
         creative = await creative_from_recomposite(
