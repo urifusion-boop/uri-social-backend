@@ -132,11 +132,25 @@ def _check_bar_fits(bar_content_height: int, bar_zone_height: int) -> None:
         )
 
 
-_BREAKING_RED = "#A6192E"    # 7.50:1 against white — clears legibility.py's
-                              # default 7:1 floor (matches no token role, so
-                              # it's checked at the strict bar, not the 4.5:1
-                              # accent one)
-_BREAKING_NAVY = "#0B1F3A"   # 16.5:1 against white
+def _banner_colors(t: Dict[str, str]) -> Tuple[str, str]:
+    """(bar_fill, text_color) for the banner's bold top bar — derived from
+    THIS brand's own accent token, never a fixed hex. resolve_brand_tokens
+    only validates accent's contrast as TEXT against light surface/field
+    backgrounds (§1.6) — using it here as a BOLD BACKGROUND with text on
+    top is a different pairing that isn't automatically guaranteed, so
+    contrast is checked again here, live, against both candidate text
+    colours. Falls back to `ink` as the bar fill (always a safe, dark,
+    on-brand-adjacent neutral already used everywhere else in this format)
+    only on the rare brand accent that clears neither — never to an
+    unrelated invented colour."""
+    from .brand_tokens import contrast_ratio
+
+    accent = t["accent"]
+    white_contrast = contrast_ratio("#FFFFFF", accent)
+    ink_contrast = contrast_ratio(t["ink"], accent)
+    if max(white_contrast, ink_contrast) >= 7.0:
+        return accent, ("#FFFFFF" if white_contrast >= ink_contrast else t["ink"])
+    return t["ink"], "#FFFFFF"
 
 
 def build_document(
@@ -156,11 +170,11 @@ def build_document(
 
     show_breaking_news_banner: see the module docstring's "REVISED
     DECISION" — an explicit, deliberate business choice, not a default.
-    Drawn reliably in Layer 4 (never AI-generated, so it's typo-proof),
-    using a generic red/white convention shared across many real outlets
-    rather than any one broadcaster's specific branding (§2.8 point 2
-    still holds). Defaults to False — every existing caller keeps
-    rendering exactly as before unless it opts in.
+    Drawn reliably in Layer 4 (never AI-generated, so it's typo-proof) —
+    but its colour is THIS brand's own accent token (see _banner_colors),
+    never a fixed hex, same as every other coloured element in this
+    format. Defaults to False — every existing caller keeps rendering
+    exactly as before unless it opts in.
     """
     if _SENSATIONAL_LABEL.search(headline) or (secondary_line and _SENSATIONAL_LABEL.search(secondary_line)):
         raise SensationalLabelRejected(
@@ -196,34 +210,37 @@ def build_document(
 
     if show_breaking_news_banner:
         # Two-tone banner sitting in the photo zone's upper-left, the same
-        # generic convention real outlets/advertisers use — deliberately
-        # NOT any one broadcaster's exact colours/wordmark (§2.8 point 2).
+        # generic CONVENTION real outlets/advertisers use — deliberately
+        # not any one broadcaster's exact wordmark (§2.8 point 2) — but
+        # every colour in it comes from THIS brand's own tokens
+        # (_banner_colors/t["field"]/t["ink"]), never an invented hex.
         _banner_x, _banner_y = 40, 48
         _banner_w = int(width * 0.58)
         _banner_bar_h = 84
+        _bar_fill, _bar_text = _banner_colors(t)
         z += 1
         layers.append({
             "type": "shape", "z_index": z, "shape": "rect",
             "x": _banner_x, "y": _banner_y, "width": _banner_w, "height": _banner_bar_h,
-            "fill_color": _BREAKING_RED,
+            "fill_color": _bar_fill,
         })
         z += 1
         layers.append({
             "type": "text", "z_index": z, "content": "BREAKING",
             "x": _banner_x + 24, "y": _banner_y + 14,
-            "font_size": 52, "font_weight": 700, "color": "#FFFFFF",
+            "font_size": 52, "font_weight": 700, "color": _bar_text,
         })
         z += 1
         layers.append({
             "type": "shape", "z_index": z, "shape": "rect",
             "x": _banner_x, "y": _banner_y + _banner_bar_h, "width": _banner_w, "height": _banner_bar_h,
-            "fill_color": "#FFFFFF",
+            "fill_color": t["field"],
         })
         z += 1
         layers.append({
             "type": "text", "z_index": z, "content": "NEWS",
             "x": _banner_x + 24, "y": _banner_y + _banner_bar_h + 14,
-            "font_size": 52, "font_weight": 700, "color": _BREAKING_NAVY,
+            "font_size": 52, "font_weight": 700, "color": t["ink"],
         })
 
     z += 1
