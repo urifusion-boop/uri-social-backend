@@ -1,0 +1,289 @@
+"""
+Us vs Them — VSG-01 v3 §2.4 (SEED-075).
+
+"Displacing an established habit or method." Two columns, equal width,
+shared row labels, `edge` rules between rows. Left column is the displaced
+METHOD in `ink-quiet` on `surface`; right is the offer in `ink` on `field`.
+Identical row labels both sides or it is not a comparison.
+
+Hard checks — strictest in the library. The left column names a method,
+never an identified business; the field must reject brand names at input
+rather than relying on Jane or the user to self-censor (SEED-050). Safe
+local comparisons: buying at the market vs delivered to you; generator vs
+solar; notebook vs system; guesswork vs measured fitting.
+"""
+import re
+from typing import Dict, List, Optional, Tuple
+
+from ._text_metrics import wrap_text
+from .tokens import AdFormatDef, PLACEHOLDER_TOKENS, logo_badge_layers
+from app.agents.social_media_manager.services.document_renderer_service import DocumentRendererService
+
+FORMAT = AdFormatDef(
+    format_id="SEED-075",
+    name="Us vs Them",
+    asset_source="drawn",
+    layers_used="L4",
+    brand_mark="required",  # VSG-01-PROMPTS v2 §6.4
+    requires=[],
+)
+
+# §1.6 floors — retrofitted after legibility.py's automated check found the
+# original 20/28/34px sizes here all below the 42px minimum (this format
+# predates that discipline; Borrowed Interface/Review Card/Day1→Day30 were
+# built with it from the start). Bumping font size means row/us values also
+# need real word-wrapping now (wrap_text, the same helper Borrowed
+# Interface/Review Card use) — unwrapped text was already a latent overflow
+# risk at the old smaller sizes and gets materially worse at 44px.
+_FONT_HEADER = 44
+_FONT_LABEL = 42
+_FONT_VALUE = 44
+
+
+class BrandNameRejected(ValueError):
+    """Raised when the left ("them") column looks like it names a specific
+    business rather than a generic method. This is best-effort, defense-in-
+    depth — a heuristic, not a brand-name database — matching VSG-01's own
+    framing: retrieval-time corpus curation (§6, the actual named-brand-
+    input-field design) is the real control; this just refuses to render a
+    document that got past it with something obviously wrong, rather than
+    silently rendering a named competitor's name into an ad."""
+    pass
+
+
+# 2+ consecutive "brand-shaped" words, anywhere including the very start,
+# reads as a proper noun ("Jumia Food", "Chicken Republic", "Coca-Cola
+# Nigeria", "MTN Nigeria", "Domino's Pizza") — a genuine method description
+# ("buying at the market", "guesswork vs measured fitting") is lowercase
+# prose, brand name or not. A "brand-shaped" word is either Title-Case
+# (letters plus an internal apostrophe, so "Domino's" counts as one word,
+# not broken by the ') or an all-caps acronym of 2+ letters (MTN, GTB, UBA —
+# common in Nigerian brand names and otherwise invisible to a Title-Case-
+# only check). Deliberately NOT excluding position 0 — that's exactly where
+# most real brand names start, and excluding it would let the single most
+# common shape of brand name straight through. False positive: a method
+# description someone happens to Title-Case for style. False negative: a
+# single-word brand ("Uber", "Bolt"). Not a substitute for retrieval-time
+# curation — only a last-resort refusal.
+_BRAND_WORD = r"(?:[A-Z][a-z']+|[A-Z]{2,})"
+_TITLE_CASE_RUN = re.compile(rf"(?:{_BRAND_WORD}\s+){{1,}}{_BRAND_WORD}")
+_TRADEMARK_MARK = re.compile(r"[™®©]")
+
+
+def _looks_like_a_brand_name(text: str) -> bool:
+    if _TRADEMARK_MARK.search(text):
+        return True
+    return bool(_TITLE_CASE_RUN.search(text))
+
+
+def build_document(
+    rows: List[Tuple[str, str, str]],
+    them_label: str = "The old way",
+    us_label: str = "With us",
+    canvas_size: Tuple[int, int] = (1080, 1080),
+    tokens: Dict[str, str] = None,
+    brand_logo_url: str = None,
+    background_url: Optional[str] = None,
+) -> Dict:
+    """
+    rows: [(row_label, them_value, us_value), ...] — row_label is shared
+    across both columns ("Delivery", "Price", "Setup time"...); them_value
+    must name a METHOD, never a business — raises BrandNameRejected if it
+    looks like one.
+
+    background_url: an optional AI-generated backdrop (see vsg01_orchestrator's
+    _build_us_vs_them). The "them" column deliberately sits on bare canvas
+    (no card) so its plainness is itself part of the comparison — that
+    contrast is preserved by wrapping the WHOLE header+rows block in one
+    neutral `surface`-coloured card sitting on top of the photo, rather
+    than putting the photo directly behind either column's text. Omitted
+    (None) keeps the original flat `surface` background with no wrapper
+    card, exactly as before.
+    """
+    for _, them_value, _us in rows:
+        if _looks_like_a_brand_name(them_value):
+            raise BrandNameRejected(
+                f"'{them_value}' looks like a named business, not a method — "
+                "Us vs Them can only compare against a generic method (VSG-01 §2.4)"
+            )
+
+    t = tokens or PLACEHOLDER_TOKENS
+    width, height = canvas_size
+    layers = []
+    z = 0
+
+    col_gap = 16
+    col_width = (width - 144 - col_gap) // 2
+    left_x = 72
+    right_x = left_x + col_width + col_gap
+    header_to_rows_gap = 96
+
+    label_height = int(_FONT_LABEL * 1.2)
+    label_gap = 8
+    value_line_height = int(_FONT_VALUE * 1.3)
+    row_gap_after = 32
+    # Reserved width for the ✓/✗ glyph in front of each value — confirmed
+    # rendering correctly with the renderer's own DejaVu Sans Bold (Unicode
+    # Dingbats coverage checked directly, not assumed). Subtracted from the
+    # wrap width up front so adding the icon can never push a value that
+    # already fit right to the edge of overflowing.
+    icon_gap = 48
+
+    # Pre-measure every row's wrapped content so both columns can share one
+    # row height each while still fitting whichever side wraps to more
+    # lines — a fixed row_height (the pre-wrap design) silently overflowed
+    # once font size grew, the identical bug class Borrowed Interface's
+    # chat bubbles had before they got the same treatment. Measured BEFORE
+    # header_y below so the whole block (header + rows) can be centred as
+    # one unit — a 2-3 row comparison used to anchor at a fixed y=72 and
+    # leave nearly half a 1080px canvas empty underneath; the row count
+    # varies (VSG-01 §2.4 allows 2-3), so a fixed anchor either wastes
+    # space or (with more rows) risks running off the bottom, and neither
+    # is the right trade-off when centring costs nothing.
+    def _measure(row_list, max_value_lines=None):
+        out = []
+        for row_label, them_value, us_value in row_list:
+            them_lines = wrap_text(them_value, col_width - icon_gap, _FONT_VALUE)
+            us_lines = wrap_text(us_value, col_width - icon_gap, _FONT_VALUE)
+            if max_value_lines:
+                them_lines = them_lines[:max_value_lines]
+                us_lines = us_lines[:max_value_lines]
+            n_lines = max(len(them_lines), len(us_lines))
+            row_height = label_height + label_gap + n_lines * value_line_height + row_gap_after
+            out.append((row_label, them_lines, us_lines, row_height))
+        return out
+
+    # Fit guarantee: 44px type wrapping to 3-4 lines across 3 rows ran clean
+    # off the bottom of the canvas (confirmed in a live render). §2.4 allows
+    # 2-3 rows, so drop the last row before touching type; only if even two
+    # full rows overflow (very long values) do we cap lines per value. The
+    # block must fit between header_to_rows_gap below the header and a bottom
+    # margin, or it clips — there is no scroll.
+    bottom_margin = 72
+    max_rows_height = height - 72 - header_to_rows_gap - bottom_margin
+    working = list(rows)
+    measured_rows = _measure(working)
+    while sum(r[-1] for r in measured_rows) > max_rows_height and len(working) > 2:
+        working = working[:-1]
+        measured_rows = _measure(working)
+    cap = 4
+    while sum(r[-1] for r in measured_rows) > max_rows_height and cap > 2:
+        cap -= 1
+        measured_rows = _measure(working, max_value_lines=cap)
+
+    total_rows_height = sum(row_height for *_, row_height in measured_rows)
+    total_block_height = _FONT_HEADER + header_to_rows_gap + total_rows_height
+    header_y = max(72, (height - total_block_height) // 2)
+    rows_top = header_y + header_to_rows_gap
+
+    if background_url:
+        z += 1
+        layers.append({
+            "type": "ai_generated_background", "z_index": z,
+            "url": background_url, "x": 0, "y": 0, "width": width, "height": height,
+        })
+        wrap_pad = 48
+        wrap_x = left_x - wrap_pad
+        wrap_y = header_y - wrap_pad
+        wrap_w = (right_x + col_width) - left_x + 2 * wrap_pad
+        wrap_h = total_block_height + 2 * wrap_pad
+        z += 1
+        layers.append({
+            "type": "shape", "z_index": z, "shape": "rounded_rect",
+            "x": wrap_x, "y": wrap_y, "width": wrap_w, "height": wrap_h,
+            "corner_radius": 24, "fill_color": t["surface"],
+        })
+
+    # Column headers.
+    for label, x in ((them_label, left_x), (us_label, right_x)):
+        z += 1
+        layers.append({
+            "type": "text", "z_index": z, "content": label,
+            "x": x, "y": header_y, "font_size": _FONT_HEADER, "font_weight": 700, "color": t["ink"],
+        })
+
+    # Column card (the row content sits on `field`, rounded — a plain sharp
+    # rect read as a spreadsheet, not an ad) — left stays on `surface` (the
+    # canvas colour already, no fill needed) so the contrast between "the
+    # old way" and "with us" is itself part of the comparison.
+    card_x, card_y = right_x - 24, rows_top - 16
+    card_w, card_h = col_width + 48, total_rows_height + 16
+    z += 1
+    layers.append({
+        "type": "shape", "z_index": z, "shape": "rounded_rect",
+        "x": card_x, "y": card_y, "width": card_w, "height": card_h,
+        "corner_radius": 20, "fill_color": t["field"],
+    })
+    # Accent edge on the winning side — the one deliberate colour hit in an
+    # otherwise two-tone layout, reading "this is the answer" at a glance
+    # before any text is read.
+    z += 1
+    layers.append({
+        "type": "shape", "z_index": z, "shape": "rect",
+        "x": card_x, "y": card_y, "width": 10, "height": card_h,
+        "fill_color": t["accent"],
+    })
+
+    row_y = rows_top
+    for i, (row_label, them_lines, us_lines, row_height) in enumerate(measured_rows):
+        z += 1
+        layers.append({
+            "type": "text", "z_index": z, "content": row_label,
+            "x": left_x, "y": row_y, "font_size": _FONT_LABEL, "color": t["ink-quiet"],
+        })
+
+        value_y = row_y + label_height + label_gap
+        # ✗ in the same muted tone as the method it's rejecting — the glyph
+        # reads as "not this" without needing its own attention-grabbing
+        # colour; the accent card + ✓ on the other side already carries the
+        # contrast.
+        z += 1
+        layers.append({
+            "type": "text", "z_index": z, "content": "✗",
+            "x": left_x, "y": value_y, "font_size": _FONT_VALUE, "font_weight": 700, "color": t["ink-quiet"],
+        })
+        z += 1
+        layers.append({
+            "type": "text", "z_index": z, "content": "\n".join(them_lines),
+            "x": left_x + icon_gap, "y": value_y, "font_size": _FONT_VALUE, "color": t["ink-quiet"],
+        })
+
+        z += 1
+        layers.append({
+            "type": "text", "z_index": z, "content": row_label,
+            "x": right_x, "y": row_y, "font_size": _FONT_LABEL, "color": t["ink-quiet"],
+        })
+
+        z += 1
+        layers.append({
+            "type": "text", "z_index": z, "content": "✓",
+            "x": right_x, "y": value_y, "font_size": _FONT_VALUE, "font_weight": 700, "color": t["accent"],
+        })
+        z += 1
+        layers.append({
+            "type": "text", "z_index": z, "content": "\n".join(us_lines),
+            "x": right_x + icon_gap, "y": value_y, "font_size": _FONT_VALUE, "font_weight": 700, "color": t["ink"],
+        })
+
+        if i > 0:
+            z += 1
+            layers.append({
+                "type": "shape", "z_index": z, "shape": "line",
+                "x1": left_x, "y1": row_y - 16, "x2": left_x + col_width, "y2": row_y - 16,
+                "color": t["edge"], "stroke_width": 2,
+            })
+
+        row_y += row_height
+
+    badge_layers, z = logo_badge_layers(brand_logo_url, width, height, z)
+    layers.extend(badge_layers)
+
+    return {
+        "canvas": {"width": width, "height": height, "background_color": t["surface"]},
+        "layers": layers,
+    }
+
+
+async def render(*args, **kwargs) -> bytes:
+    document = build_document(*args, **kwargs)
+    return await DocumentRendererService.render_to_png(document)
