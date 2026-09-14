@@ -190,6 +190,20 @@ UPLOAD_PHOTO_FORMAT_IDS = frozenset({
 })
 RECOMPOSITE_PHOTO_FORMAT_IDS = UPLOAD_PHOTO_FORMAT_IDS | {"SEED-088"}
 
+# Formats whose builder calls generate_scene() to AI-paint at least part of
+# the scene from scratch, as opposed to only compositing a real photo the
+# business already supplied — these are the only builders that receive
+# brand_context, since it exists to influence what generate_scene actually
+# paints (real brand colors as environmental/wardrobe/prop accents — see
+# layer2_generation.brand_palette_clause), not to annotate an existing photo.
+_AI_GENERATED_SCENE_FORMAT_IDS = frozenset({
+    "SEED-080",  # Problem/Solution
+    "SEED-088",  # Starter Pack — item icons; the hero product photo stays real
+    "SEED-098",  # Work In Progress
+    "SEED-077",  # News Headline (generate path only)
+    "SEED-089",  # Humour/Cartoon
+})
+
 # The format library's own tested/documented canvas — every format module's
 # unit tests and hard-check reasoning (line wrapping, scrim heights, column
 # widths) assume this square shape. Ad placements elsewhere in this codebase
@@ -706,7 +720,8 @@ async def _content_problem_solution(business_name: str, category: str, descripti
 
 
 async def _build_problem_solution(business_name: str, category: str, description: str, tokens: dict,
-                                  photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None):
+                                  photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None,
+                                  brand_context: Optional[dict] = None):
     content = await _content_problem_solution(business_name, category, description)
     if not content:
         return None
@@ -737,7 +752,7 @@ async def _build_problem_solution(business_name: str, category: str, description
         from the end of the string."""
         current_prompt = prompt
         for attempt in (1, 2):
-            url = await generate_scene(current_prompt, size=zone_size)
+            url = await generate_scene(current_prompt, size=zone_size, brand_context=brand_context)
             result = await verify_skin_rendering(url)
             if not result["contains_person"] or result["matches_target_range"]:
                 return url
@@ -1048,7 +1063,8 @@ async def _content_starter_pack(business_name: str, category: str, description: 
 
 
 async def _build_starter_pack(business_name: str, category: str, description: str, tokens: dict,
-                              photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None):
+                              photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None,
+                              brand_context: Optional[dict] = None):
     if not photo_url:
         return None
     content = await _content_starter_pack(business_name, category, description)
@@ -1067,6 +1083,7 @@ async def _build_starter_pack(business_name: str, category: str, description: st
             item_urls.append(
                 await generate_scene(
                     starter_pack._item_prompt(desc, seasonal_context=seasonal_context), size=cell_size,
+                    brand_context=brand_context,
                 )
             )
     except SceneGenerationFailed as e:
@@ -1213,7 +1230,8 @@ async def _content_work_in_progress(business_name: str, category: str, descripti
 
 
 async def _build_work_in_progress(business_name: str, category: str, description: str, tokens: dict,
-                                  photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None):
+                                  photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None,
+                                  brand_context: Optional[dict] = None):
     content = await _content_work_in_progress(business_name, category, description)
     if not content:
         return None
@@ -1224,6 +1242,7 @@ async def _build_work_in_progress(business_name: str, category: str, description
                 content["trade_activity"], content["nigerian_setting"], _resolve_current_seasonal_context(),
             ),
             size=f"{_CANVAS_SIZE[0]}x{_CANVAS_SIZE[1]}",
+            brand_context=brand_context,
         )
     except SceneGenerationFailed as e:
         print(f"[VSG01] Work In Progress scene generation failed: {e}", flush=True)
@@ -1324,7 +1343,8 @@ async def _content_news_headline(business_name: str, category: str, description:
 
 
 async def _build_news_headline(business_name: str, category: str, description: str, tokens: dict,
-                               photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None):
+                               photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None,
+                               brand_context: Optional[dict] = None):
     content = await _content_news_headline(business_name, category, description)
     if not content:
         return None
@@ -1337,7 +1357,7 @@ async def _build_news_headline(business_name: str, category: str, description: s
         person, so this format needs the same skin-tone gate."""
         current_prompt = prompt
         for attempt in (1, 2):
-            url = await generate_scene(current_prompt, size=f"{width}x{height}")
+            url = await generate_scene(current_prompt, size=f"{width}x{height}", brand_context=brand_context)
             result = await verify_skin_rendering(url)
             if not result["contains_person"] or result["matches_target_range"]:
                 return url
@@ -1421,7 +1441,7 @@ async def _content_humour_cartoon(business_name: str, category: str, description
 
 async def _build_humour_cartoon(business_name: str, category: str, description: str, tokens: dict,
                                 photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None,
-                                human_reviewed: bool = False):
+                                human_reviewed: bool = False, brand_context: Optional[dict] = None):
     """§2.12: 'Needs human review before shipping on the ₦15k tier, where no
     operator sees the asset first.' No async generate-hold-approve-resume
     workflow exists in this codebase (see module docstring) — rather than
@@ -1441,7 +1461,7 @@ async def _build_humour_cartoon(business_name: str, category: str, description: 
     try:
         illustration_url = await generate_scene(
             humour_cartoon._illustration_prompt(content["situation"], content["nigerian_setting"]),
-            size=f"{width}x{height}",
+            size=f"{width}x{height}", brand_context=brand_context,
         )
     except SceneGenerationFailed as e:
         print(f"[VSG01] Humour/Cartoon illustration generation failed: {e}", flush=True)
@@ -1732,6 +1752,14 @@ async def render_vsg01_creative(
         extra_kwargs["human_reviewed"] = True
     if strategy.strategy_id == "SEED-078":
         extra_kwargs["day30_photo_url"] = day30_photo_url
+    # Only the builders that actually call generate_scene() to AI-paint a
+    # scene from scratch take brand_context — it exists to influence what
+    # that call paints (real brand colors as environmental/wardrobe/prop
+    # accents, same strategy organic content's own image-brief generator
+    # already uses), so it has nothing to do for a format that only
+    # composites a real photo the business already supplied.
+    if strategy.strategy_id in _AI_GENERATED_SCENE_FORMAT_IDS:
+        extra_kwargs["brand_context"] = brand_context
 
     document = await builder(
         business_name, category, description, tokens, photo_url=photo_url, brand_logo_url=brand_logo_url,
