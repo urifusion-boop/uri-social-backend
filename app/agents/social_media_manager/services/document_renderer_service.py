@@ -212,9 +212,24 @@ class DocumentRendererService:
         width = layer.get("width")
         height = layer.get("height")
 
-        # Resize if dimensions specified
+        # Fit within (width, height) preserving the logo's own aspect ratio,
+        # then center it in the box — every caller (tokens.logo_badge_layers,
+        # review_card.py, humour_cartoon.py, receipt.py) sizes this box to
+        # its OWN fixed aspect ratio (e.g. 140x56, 2.5:1), which is almost
+        # never a real logo's actual shape. A plain resize((width, height))
+        # here stretched every logo to that box's ratio regardless — live-
+        # confirmed a real wordmark logo rendered visibly squeezed/distorted.
+        # Fixed once at this single render choke point rather than in each
+        # of the 4 callers, since none of them can know a specific
+        # business's real logo shape in advance anyway.
         if width and height:
-            asset_image = asset_image.resize((width, height), Image.Resampling.LANCZOS)
+            orig_w, orig_h = asset_image.size
+            if orig_w and orig_h:
+                scale = min(width / orig_w, height / orig_h)
+                fit_w, fit_h = max(1, round(orig_w * scale)), max(1, round(orig_h * scale))
+                asset_image = asset_image.resize((fit_w, fit_h), Image.Resampling.LANCZOS)
+                x += (width - fit_w) // 2
+                y += (height - fit_h) // 2
 
         # Apply opacity if specified
         opacity = layer.get("opacity", 1.0)
