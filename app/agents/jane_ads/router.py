@@ -4228,6 +4228,56 @@ async def _debug_vsg01_select_trace(
     return result
 
 
+@router.get("/debug/organic-prompt-sample", include_in_schema=False)
+async def _debug_organic_prompt_sample(request: Request, style: str = "afro_glam") -> dict:
+    """TEMPORARY — call the EXISTING organic-content image-brief generator
+    (image_content_service.py's _generate_image_brief, the system already
+    used for regular social posts) with a realistic Nigerian brand context,
+    to produce one REAL example prompt for direct side-by-side comparison
+    against a VSG-01 ad prompt — same request that produced the VSG-01
+    sample, now asking to see the organic system's equivalent output
+    rather than a description of how it works. Same secret-gated pattern
+    as this session's other diagnostics; remove after use."""
+    if request.headers.get("X-Bootstrap-Secret") != "vsg01-corpus-bootstrap-2026-dev-only":
+        raise HTTPException(status_code=404, detail="Not Found")
+    from app.agents.social_media_manager.services.image_content_service import ImageContentService
+    from app.agents.social_media_manager.services.style_library import STYLES
+
+    style_entry = STYLES.get(style)
+    if style_entry is None:
+        return {"success": False, "error": f"unknown style {style!r}", "available": list(STYLES.keys())}
+
+    brand_context = {
+        "brand_name": "Naija Glow Cosmetics",
+        "industry": "beauty_wellness",
+        "tagline": "Glow that speaks your language",
+        "business_description": "We make natural, locally-sourced skincare and haircare for Nigerian skin and climate.",
+        "key_products_services": ["shea butter body cream", "black soap", "herbal hair pomade"],
+        "brand_colors": ["#CD1B78", "#F5A623", "#1A1A1A"],
+        "brand_voice": "warm, confident, proudly Nigerian",
+        "target_audience": "young Nigerian women aged 20-35 who care about natural beauty",
+        "ideal_customer_profile": "a Lagos professional who wants effective skincare rooted in local ingredients",
+        "audience_age_range": "20-35",
+        "primary_goal": "build a loyal, proud local beauty brand",
+        "region": "Lagos, Nigeria",
+    }
+    try:
+        result = await ImageContentService._generate_image_brief(
+            content="We're opening a new branch in Yaba on 1 October, tell people about it",
+            seed_content="new branch opening announcement",
+            platform="instagram",
+            brand_context=brand_context,
+            specs={"format": "square"},
+            style_fragment=style_entry["prompt_fragment"],
+        )
+        if result is None:
+            return {"success": False, "error": "_generate_image_brief returned None — check server logs"}
+        return {"success": True, "style_used": style_entry["name"], **result}
+    except Exception as e:
+        import traceback
+        return {"success": False, "error": str(e), "traceback": traceback.format_exc()}
+
+
 @router.get("/corpus/upload", response_class=HTMLResponse, include_in_schema=False)
 async def corpus_upload_page() -> str:
     """The page itself. Self-contained — no build step, no bundle, nothing to deploy
