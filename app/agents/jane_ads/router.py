@@ -404,6 +404,12 @@ class CreativeForBrandBody(BaseModel):
     # ("change" on the Style row) — None means "use whatever ranks best" (unchanged
     # default behaviour). See select_and_render_vsg01_creative's forced_format_id.
     vsg01_format_id: Optional[str] = None
+    # Day 1 -> Day 30 (SEED-078) only: a second real photo of the SAME thing at
+    # a later point in time, uploaded via the same POST /jane-ads/creative/upload
+    # the first one used. Omitted (the default) means every other format still
+    # works exactly as before; Day 1 -> Day 30 itself simply never has content to
+    # build without it (fail-open, same as every other format's missing input).
+    reference_image_url_2: str = ""
 
 
 @router.post("/creative/for-brand")
@@ -435,6 +441,7 @@ async def creative_for_brand(
             is_video=body.is_video, city=body.city,
             destination_type=destination_type, destination_cta=destination_cta,
             asset_attestation=body.asset_attestation, vsg01_format_id=body.vsg01_format_id,
+            day30_photo_url=body.reference_image_url_2 or None,
         )
     elif body.source == "recomposite":
         if not body.reference_image_url:
