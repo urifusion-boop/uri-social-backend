@@ -1389,7 +1389,8 @@ async def _build_work_in_progress(business_name: str, category: str, description
 # permitted by the format itself but has no attestation type to trigger it) ─
 
 async def _content_news_headline(business_name: str, category: str, description: str,
-                                 correction: str = "") -> Optional[dict]:
+                                 correction: str = "",
+                                 brand_context: Optional[dict] = None) -> Optional[dict]:
     """§2.8: 'Real announcements only.' Same verbatim-fact contract as
     _content_text_only/_content_receipt — only ever fires when the
     business's own words already state a genuine announcement; never
@@ -1406,12 +1407,14 @@ async def _content_news_headline(business_name: str, category: str, description:
     if not (description or "").strip():
         return None
     prompt = (
-        f"Below is a business's own description/context text:\n\n{description}\n\n"
+        f"This is for a Nigerian ad for {_business_line(business_name, category, '', brand_context)}\n\n"
+        "Below is that business's own description/context text:\n\n"
+        f"{description}\n\n"
         "Does this text state a REAL, specific announcement worth leading with as news — "
-        "a new branch opening, an admissions deadline, an event date, a genuine milestone? "
-        "This format is photojournalistic 'news' style: the headline must state something "
-        "that actually happened or is happening, never invented sentiment or a generic "
-        "promotional claim.\n"
+        "a new branch opening, an admissions deadline, an event date, a genuine milestone, or "
+        "anything else concrete? This format is photojournalistic 'news' style: the headline "
+        "must state something that actually happened or is happening, never invented sentiment "
+        "or a generic promotional claim.\n"
         "If nothing concrete is stated, return headline as an empty string — do not invent one.\n"
         "- headline: WHAT happened, stated plainly, NEVER a 'Breaking News'-style label. HARD "
         "LIMIT: 26 characters or fewer, including spaces and punctuation — this is a real "
@@ -1425,16 +1428,18 @@ async def _content_news_headline(business_name: str, category: str, description:
         "'1 October' — the same date rendered twice, once spelled out and once bare. The date "
         "must appear in EXACTLY ONE of headline, secondary_line, or date_stamp — never in two of "
         "them, and never in all three.\n"
-        "- announcement_subject: a short, concrete VISUAL scene for a documentary photo of "
-        "this SPECIFIC announcement — it must visibly show the actual event happening, not a "
-        "generic 'person working' or 'person on a laptop' scene that could belong to any "
-        "announcement. A live-confirmed real failure: 'a new branch now open' produced the weak, "
-        "generic subject 'a woman working on a laptop in a store' — that photo could be any "
-        "business on any day, it shows nothing about an OPENING. For a branch/store opening: "
-        "the storefront exterior with visible activity, an open door with people entering, staff "
-        "arranging the space for its first day. For an admissions deadline: students at a real "
-        "campus/office setting engaged with the actual process. For an event: the specific "
-        "activity of that event underway. No brand/person names.\n"
+        "- announcement_subject: a short, concrete VISUAL scene for a documentary photo that "
+        "could ONLY be this specific announcement for this specific business — never a scene "
+        "generic enough to belong to any business on any day. Reason it out fresh each time: "
+        "what does THIS particular news actually look like, physically, for a business that "
+        "does THIS? A milestone (e.g. a customer-count achievement) does not look like a branch "
+        "opening, which does not look like an admissions deadline, which does not look like a "
+        "generic confident portrait — each is a genuinely different physical scene. Two "
+        "live-confirmed real failures this must avoid: 'a woman working on a laptop in a store' "
+        "for a branch opening (shows nothing about an opening), and 'a confident businesswoman, "
+        "arms crossed, in a shop' for a customer-milestone announcement (a generic default pose "
+        "reused regardless of what the news actually was — the milestone itself never appeared "
+        "anywhere in the scene). No brand/person names.\n"
         f"- nigerian_setting: pick the single best-fitting option, copied EXACTLY, from this list: "
         f"{list(_NIGERIAN_SETTINGS)}\n"
         f"{('CORRECTION: ' + correction) if correction else ''}\n"
@@ -1485,7 +1490,7 @@ async def _content_news_headline(business_name: str, category: str, description:
 async def _build_news_headline(business_name: str, category: str, description: str, tokens: dict,
                                photo_url: Optional[str] = None, brand_logo_url: Optional[str] = None,
                                brand_context: Optional[dict] = None):
-    content = await _content_news_headline(business_name, category, description)
+    content = await _content_news_headline(business_name, category, description, brand_context=brand_context)
     if not content:
         return None
     from .ad_formats import news_headline
@@ -1540,6 +1545,7 @@ async def _build_news_headline(business_name: str, category: str, description: s
             business_name, category, description,
             correction=f"your last attempt overflowed its fixed text zone ({e}). "
                        "Make the headline and any secondary_line/date_stamp shorter this time.",
+            brand_context=brand_context,
         )
         if not retry_content:
             return None
