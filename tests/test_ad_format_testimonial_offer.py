@@ -16,6 +16,7 @@ from app.agents.jane_ads.ad_formats.testimonial_offer import (
     _check_proof_zone_fits,
     _check_offer_zone_fits,
 )
+from app.agents.jane_ads.ad_formats.brand_tokens import bold_panel_colors
 from app.agents.jane_ads.ad_formats.legibility import check_legibility
 from app.agents.jane_ads.ad_formats.tokens import PLACEHOLDER_TOKENS
 from app.agents.jane_ads.visual_slots import InvalidSlotValue
@@ -99,17 +100,23 @@ class TestBuildDocumentPersonPath(object):
         height = doc["canvas"]["height"]
         assert offer["y"] >= (height * 2) // 3
 
-    def test_price_uses_accent_offer_text_uses_ink(self):
+    def test_price_and_offer_text_share_the_offer_panel_colour(self):
+        """Offer band is THIS brand's own bold panel colour (see
+        bold_panel_colors), not a fixed field/ink/accent triple — offer
+        copy and price/terms both use the matching panel text colour so
+        they're legible against whatever that panel colour resolves to."""
         doc = self._doc(price_or_terms="Pay on delivery")
         offer = next(l for l in doc["layers"] if l.get("content") == "Same-day delivery across Lagos")
         price = next(l for l in doc["layers"] if l.get("content") == "Pay on delivery")
-        assert offer["color"] == PLACEHOLDER_TOKENS["ink"]
-        assert price["color"] == PLACEHOLDER_TOKENS["accent"]
+        _, expected_text = bold_panel_colors(PLACEHOLDER_TOKENS)
+        assert offer["color"] == expected_text
+        assert price["color"] == expected_text
 
     def test_divider_separates_quote_block_from_offer_band(self):
         """§2.2: the offer must read as different background weight, 'not
-        merely a new paragraph' — both blocks are `field`, so a divider is
-        required, not just spacing."""
+        merely a new paragraph' — the offer band is now a genuinely
+        different, bold on-brand colour from the quote block's clean
+        `field`, with a divider line for a crisp edge regardless."""
         doc = self._doc()
         assert any(l.get("shape") == "line" for l in doc["layers"])
 

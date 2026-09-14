@@ -42,6 +42,7 @@ from typing import Dict, Optional, Tuple
 
 from ..visual_slots import resolve_nigerian_setting
 from ..layer2_generation import generate_scene, seasonal_context_clause
+from .brand_tokens import bold_panel_colors
 from .legibility import assert_legible
 from ._text_metrics import wrap_text
 from .tokens import AdFormatDef, PLACEHOLDER_TOKENS, logo_badge_layers
@@ -189,19 +190,21 @@ def build_document(
             "x": _PADDING, "y": content_y, "font_size": _FONT_ATTRIBUTION, "color": t["ink-quiet"],
         })
 
-    # Offer band — lower third, `field`, offer copy in `ink`, price/terms
-    # in `accent`. Order fixed: this is always the LAST thing on the
-    # canvas, never before the proof. Immediately adjacent to the quote
-    # block above (also `field`) — §2.2 is explicit that the offer must
-    # read as a different background weight, "not merely a new paragraph,"
-    # so a divider line separates the two rather than leaning on spacing
-    # alone (same fix as build_document_no_person).
+    # Offer band — lower third, THIS brand's own bold panel colour (see
+    # bold_panel_colors), offer copy and price/terms both in the matching
+    # panel text colour. Order fixed: this is always the LAST thing on the
+    # canvas, never before the proof. §2.2 is explicit that the offer must
+    # read as a different background weight, "not merely a new paragraph"
+    # — a genuinely different, bold, on-brand colour satisfies that far
+    # more than the quote block's own clean `field` ever could on its own,
+    # with a divider line for a crisp edge between the two regardless.
+    offer_panel_color, offer_panel_text = bold_panel_colors(t)
     offer_y = proof_zone_height
     z += 1
     layers.append({
         "type": "shape", "z_index": z, "shape": "rect",
         "x": 0, "y": offer_y, "width": width, "height": offer_zone_height,
-        "fill_color": t["field"],
+        "fill_color": offer_panel_color,
     })
     z += 1
     layers.append({
@@ -213,14 +216,15 @@ def build_document(
     z += 1
     layers.append({
         "type": "text", "z_index": z, "content": "\n".join(offer_lines),
-        "x": _PADDING, "y": offer_content_y, "font_size": _FONT_OFFER, "font_weight": 700, "color": t["ink"],
+        "x": _PADDING, "y": offer_content_y, "font_size": _FONT_OFFER, "font_weight": 700, "color": offer_panel_text,
     })
     if price_lines:
         offer_content_y += len(offer_lines) * offer_line_height + 24
         z += 1
         layers.append({
             "type": "text", "z_index": z, "content": "\n".join(price_lines),
-            "x": _PADDING, "y": offer_content_y, "font_size": _FONT_PRICE, "font_weight": 700, "color": t["accent"],
+            "x": _PADDING, "y": offer_content_y, "font_size": _FONT_PRICE, "font_weight": 700,
+            "color": offer_panel_text,
         })
 
     badge_layers, z = logo_badge_layers(brand_logo_url, width, height, z)
@@ -308,17 +312,19 @@ def build_document_no_person(
         "x": _PADDING, "y": quote_y + _PADDING, "font_size": _FONT_QUOTE, "color": t["ink"],
     })
 
-    # Offer band — also `field` (matching the person path's single-field
-    # convention), but immediately adjacent to the quote block above (also
-    # `field`), so a divider line keeps the two readable as separate
-    # sections rather than one blended block (same reasoning as Us vs
-    # Them's/Day 1 → Day 30's dividers between same-coloured sections).
+    # Offer band — THIS brand's own bold panel colour (see bold_panel_colors),
+    # not the same `field` as the quote block above it — a genuinely
+    # different, bold, on-brand colour satisfies §2.2's "different
+    # background weight, not merely a new paragraph" far more than a flat
+    # colour match ever could, with a divider line for a crisp edge
+    # between the two regardless.
+    offer_panel_color, offer_panel_text = bold_panel_colors(t)
     offer_y = proof_zone_height
     z += 1
     layers.append({
         "type": "shape", "z_index": z, "shape": "rect",
         "x": 0, "y": offer_y, "width": width, "height": offer_zone_height,
-        "fill_color": t["field"],
+        "fill_color": offer_panel_color,
     })
     z += 1
     layers.append({
@@ -330,14 +336,15 @@ def build_document_no_person(
     z += 1
     layers.append({
         "type": "text", "z_index": z, "content": "\n".join(offer_lines),
-        "x": _PADDING, "y": offer_content_y, "font_size": _FONT_OFFER, "font_weight": 700, "color": t["ink"],
+        "x": _PADDING, "y": offer_content_y, "font_size": _FONT_OFFER, "font_weight": 700, "color": offer_panel_text,
     })
     if price_lines:
         offer_content_y += len(offer_lines) * offer_line_height + 24
         z += 1
         layers.append({
             "type": "text", "z_index": z, "content": "\n".join(price_lines),
-            "x": _PADDING, "y": offer_content_y, "font_size": _FONT_PRICE, "font_weight": 700, "color": t["accent"],
+            "x": _PADDING, "y": offer_content_y, "font_size": _FONT_PRICE, "font_weight": 700,
+            "color": offer_panel_text,
         })
 
     badge_layers, z = logo_badge_layers(brand_logo_url, width, height, z)

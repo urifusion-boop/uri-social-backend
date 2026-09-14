@@ -47,6 +47,7 @@ from typing import Dict, Tuple
 
 from ._content_guards import mentions_disallowed_personal_topic, presumes_viewer_attribute
 from ._text_metrics import wrap_text
+from .brand_tokens import bold_panel_colors
 from .legibility import assert_legible
 from .tokens import AdFormatDef, PLACEHOLDER_TOKENS, logo_badge_layers
 from app.agents.social_media_manager.services.document_renderer_service import DocumentRendererService
@@ -154,18 +155,22 @@ def build_document(
         "url": photo_url, "x": 0, "y": 0, "width": width, "height": height,
     })
 
+    # THIS brand's own bold panel colour (see bold_panel_colors), not the
+    # fixed `field` token — same reasoning as every other format's own
+    # caption/offer panel in this library.
+    panel_color, panel_text = bold_panel_colors(t)
     z += 1
     layers.append({
         "type": "shape", "z_index": z, "shape": "rect",
         "x": 0, "y": plate_y, "width": width, "height": plate_height,
-        "fill_color": t["field"],
+        "fill_color": panel_color,
     })
 
     z += 1
     layers.append({
         "type": "text", "z_index": z, "content": lines[0],
         "x": width // 2, "y": plate_y + (plate_height - _FONT_STATEMENT) // 2,
-        "font_size": _FONT_STATEMENT, "font_weight": 700, "color": t["ink"],
+        "font_size": _FONT_STATEMENT, "font_weight": 700, "color": panel_text,
         "text_align": "ma",
     })
 

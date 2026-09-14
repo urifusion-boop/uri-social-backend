@@ -48,6 +48,7 @@ import re
 from typing import Dict, Optional, Tuple
 
 from ..layer2_generation import generate_scene
+from .brand_tokens import bold_panel_colors
 from .legibility import assert_legible
 from ._text_metrics import wrap_text
 from .tokens import AdFormatDef, PLACEHOLDER_TOKENS
@@ -165,18 +166,25 @@ def build_document(
     reveal_content_height = 2 * _PADDING + len(reveal_lines) * reveal_line_height
     _check_reveal_fits(reveal_content_height, reveal_zone_height)
 
+    # THIS brand's own bold panel colour (see bold_panel_colors), not the
+    # fixed `field` token — same reasoning as every other format's own
+    # caption/offer panel in this library. The redaction bar above stays
+    # `ink` (unchanged): that's a censoring convention, not a caption
+    # background, and a bright brand colour there would read as decorative
+    # rather than "this is hidden".
+    panel_color, panel_text = bold_panel_colors(t)
     reveal_y = photo_zone_height
     z += 1
     layers.append({
         "type": "shape", "z_index": z, "shape": "rect",
         "x": 0, "y": reveal_y, "width": width, "height": reveal_zone_height,
-        "fill_color": t["field"],
+        "fill_color": panel_color,
     })
     z += 1
     layers.append({
         "type": "text", "z_index": z, "content": "\n".join(reveal_lines),
         "x": _PADDING, "y": reveal_y + _PADDING, "font_size": _FONT_REVEAL,
-        "font_weight": 700, "color": t["accent"],
+        "font_weight": 700, "color": panel_text,
     })
 
     document = {

@@ -18,6 +18,7 @@ from app.agents.jane_ads.ad_formats.censored_item import (
     _background_prompt,
     _check_reveal_fits,
 )
+from app.agents.jane_ads.ad_formats.brand_tokens import bold_panel_colors
 from app.agents.jane_ads.ad_formats.legibility import check_legibility
 from app.agents.jane_ads.ad_formats.tokens import PLACEHOLDER_TOKENS
 
@@ -114,14 +115,18 @@ class TestBuildDocument:
         assert background["url"] == BACKGROUND_URL
         assert background["z_index"] < product["z_index"]
 
-    def test_reveal_text_uses_accent_on_a_field_band(self):
+    def test_reveal_text_sits_on_the_brand_panel_colour(self):
+        """The reveal band is THIS brand's own bold panel colour (see
+        bold_panel_colors), not a fixed field/accent pair — matching every
+        other format's own caption/offer panel in this library."""
         doc = self._doc()
         reveal = next(l for l in doc["layers"] if l.get("content") == "Reveals 20 September")
+        panel_color, panel_text = bold_panel_colors(PLACEHOLDER_TOKENS)
         band = next(
             l for l in doc["layers"]
-            if l["type"] == "shape" and l.get("fill_color") == PLACEHOLDER_TOKENS["field"]
+            if l["type"] == "shape" and l.get("fill_color") == panel_color
         )
-        assert reveal["color"] == PLACEHOLDER_TOKENS["accent"]
+        assert reveal["color"] == panel_text
         assert band["y"] < reveal["y"]
 
     def test_passes_its_own_legibility_self_check(self):
