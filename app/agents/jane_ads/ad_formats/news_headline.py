@@ -63,6 +63,7 @@ from typing import Dict, Optional, Tuple
 
 from ..visual_slots import resolve_nigerian_setting
 from ..layer2_generation import REPRESENTATION_BLOCK, generate_scene
+from .brand_tokens import contrast_ratio
 from .legibility import assert_legible
 from ._text_metrics import wrap_text
 from .tokens import AdFormatDef, PLACEHOLDER_TOKENS
@@ -132,25 +133,47 @@ def _check_bar_fits(bar_content_height: int, bar_zone_height: int) -> None:
         )
 
 
-def _banner_colors(t: Dict[str, str]) -> Tuple[str, str]:
-    """(bar_fill, text_color) for the banner's bold top bar — derived from
-    THIS brand's own accent token, never a fixed hex. resolve_brand_tokens
-    only validates accent's contrast as TEXT against light surface/field
-    backgrounds (§1.6) — using it here as a BOLD BACKGROUND with text on
-    top is a different pairing that isn't automatically guaranteed, so
-    contrast is checked again here, live, against both candidate text
-    colours. Falls back to `ink` as the bar fill (always a safe, dark,
-    on-brand-adjacent neutral already used everywhere else in this format)
-    only on the rare brand accent that clears neither — never to an
-    unrelated invented colour."""
-    from .brand_tokens import contrast_ratio
+def _darken_to_contrast(hex_color: str, against: str, min_ratio: float) -> str:
+    """Same hue and saturation as hex_color, lightness reduced only as far
+    as needed to reach min_ratio contrast against `against` — explicit
+    decision: the banner must always use the brand's own colour family,
+    never substitute an unrelated neutral, even when the raw accent value
+    alone can't carry legible text. A deep shade of the brand's real pink
+    still reads as "this brand's colour"; a generic dark grey does not."""
+    import colorsys
 
+    hc = hex_color.lstrip("#")
+    r, g, b = (int(hc[i:i + 2], 16) / 255 for i in (0, 2, 4))
+    h, l, s = colorsys.rgb_to_hls(r, g, b)
+    candidate = hex_color
+    for _ in range(60):
+        rr, gg, bb = colorsys.hls_to_rgb(h, l, s)
+        candidate = "#{:02X}{:02X}{:02X}".format(round(rr * 255), round(gg * 255), round(bb * 255))
+        if contrast_ratio(candidate, against) >= min_ratio:
+            return candidate
+        if l <= 0.0:
+            break
+        l = max(0.0, l - 0.02)
+    return candidate
+
+
+def _banner_colors(t: Dict[str, str]) -> Tuple[str, str]:
+    """(bar_fill, text_color) for the banner's bold top bar. ALWAYS the
+    brand's own accent colour family — explicit instruction: the banner
+    must use the user's real brand colour, never fall back to an
+    unrelated neutral. resolve_brand_tokens only validates accent's
+    contrast as TEXT against light surface/field backgrounds (§1.6) —
+    using it here as a BOLD BACKGROUND with text on top is a different
+    pairing that isn't automatically guaranteed, so when the raw accent
+    doesn't carry legible white or ink text on its own, it's darkened
+    (same hue/saturation, only lightness reduced) until it does — still
+    unmistakably the brand's colour, just a deeper shade of it."""
     accent = t["accent"]
     white_contrast = contrast_ratio("#FFFFFF", accent)
     ink_contrast = contrast_ratio(t["ink"], accent)
     if max(white_contrast, ink_contrast) >= 7.0:
         return accent, ("#FFFFFF" if white_contrast >= ink_contrast else t["ink"])
-    return t["ink"], "#FFFFFF"
+    return _darken_to_contrast(accent, "#FFFFFF", 7.0), "#FFFFFF"
 
 
 def build_document(
