@@ -28,7 +28,7 @@ class TestFormatDefinition:
 
 
 class TestScenePrompt:
-    def test_lower_third_empty_and_photojournalistic(self):
+    def test_lower_third_empty_and_editorial_style(self):
         prompt = _scene_prompt("a school handover ceremony", "a modern Lagos office interior")
         # A live render exposed the original wording's real failure: a
         # generic "clear empty space" instruction with no stated location
@@ -38,7 +38,14 @@ class TestScenePrompt:
         # frame to be filled edge to edge, not just that some space exists.
         assert "reserved space is a plain strip across the lower third" in prompt
         assert "Fill the frame edge to edge" in prompt
-        assert "Photojournalistic" in prompt
+        # Deliberately NOT "Photojournalistic"/"candid"/"documentary" — see
+        # the module docstring's "REVISED DECISION": the load-bearing rule
+        # was always truthfulness, not a raw/candid photographic style. A
+        # live comparison against a real published competitor ad showed the
+        # candid style reading as amateur next to a polished, professional
+        # advertising photograph of an equally real, non-fabricated subject.
+        assert "Professional editorial advertising photograph" in prompt
+        assert "Photojournalistic" not in prompt
         assert "a modern Lagos office interior" in prompt
 
     def test_rejects_a_setting_outside_the_controlled_vocabulary(self):
@@ -70,6 +77,40 @@ class TestSensationalLabelGuard:
     def test_genuine_announcements_allowed(self, headline):
         doc = build_document(PHOTO_URL, headline)
         assert doc is not None
+
+
+class TestBreakingNewsBanner:
+    """See the module docstring's "REVISED DECISION" — an explicit,
+    deliberate opt-in, not a default, and never a substitute for the
+    headline itself stating real information (SensationalLabelGuard above
+    is untouched by this)."""
+
+    def test_omitted_by_default(self):
+        doc = build_document(PHOTO_URL, "New branch now open in Yaba")
+        assert not any(l.get("content") in ("BREAKING", "NEWS") for l in doc["layers"])
+
+    def test_shown_when_requested(self):
+        doc = build_document(
+            PHOTO_URL, "New branch now open in Yaba", show_breaking_news_banner=True,
+        )
+        contents = [l.get("content") for l in doc["layers"]]
+        assert "BREAKING" in contents
+        assert "NEWS" in contents
+
+    def test_still_enforces_the_sensational_label_guard_on_the_headline(self):
+        """The banner is decorative framing — it never bypasses the
+        requirement that the headline itself states real information,
+        not a hype label standing in for actual news."""
+        with pytest.raises(SensationalLabelRejected):
+            build_document(
+                PHOTO_URL, "BREAKING NEWS: huge announcement", show_breaking_news_banner=True,
+            )
+
+    def test_banner_text_passes_legibility(self):
+        doc = build_document(
+            PHOTO_URL, "New branch now open in Yaba", show_breaking_news_banner=True,
+        )
+        assert not check_legibility(doc, PLACEHOLDER_TOKENS)
 
 
 class TestBarOverflowGuard:
