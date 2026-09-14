@@ -1524,6 +1524,7 @@ async def _build_news_headline(business_name: str, category: str, description: s
         return news_headline.build_document(
             scene_url, c["headline"], secondary_line=c["secondary_line"],
             date_stamp=c["date_stamp"], canvas_size=_CANVAS_SIZE, tokens=tokens,
+            show_breaking_news_banner=True,
         )
 
     try:
