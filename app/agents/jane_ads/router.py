@@ -4152,6 +4152,38 @@ async def corpus_upload(
             os.unlink(tmp_path)
 
 
+@router.get("/debug/vsg01-select-trace", include_in_schema=False)
+async def _debug_vsg01_select_trace(
+    request: Request,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    description: str = "",
+    forced_format_id: str = "",
+) -> dict:
+    """TEMPORARY — trace exactly what select_ranked_ad_formats/
+    select_and_render_vsg01_creative do for a given description + optional
+    forced_format_id, WITHOUT going through the frontend's multi-step chat
+    state. Exists to root-cause a live report: a real chat session forced
+    News Headline via the style-choice card, but the actual generation
+    call rendered Problem/Solution instead with no News Headline log line
+    at all — need to see the real ranked list to know whether the force
+    was honored, ignored, or never reached this function. Same
+    secret-gated pattern as this session's other diagnostics; remove after
+    use."""
+    if request.headers.get("X-Bootstrap-Secret") != "vsg01-corpus-bootstrap-2026-dev-only":
+        raise HTTPException(status_code=404, detail="Not Found")
+    from .vsg01_orchestrator import (
+        VSG01_ISOLATED_AD_ACCOUNT, NO_PHOTO_FORMAT_IDS, select_ranked_ad_formats,
+    )
+    ranked = await select_ranked_ad_formats(
+        db, isolated_ad_account=VSG01_ISOLATED_AD_ACCOUNT,
+        candidate_ids=NO_PHOTO_FORMAT_IDS, description=description,
+    )
+    return {
+        "ranked_ids_in_order": [s.strategy_id for s in ranked],
+        "forced_format_id_would_be_honored": forced_format_id in {s.strategy_id for s in ranked} if forced_format_id else None,
+    }
+
+
 @router.get("/corpus/upload", response_class=HTMLResponse, include_in_schema=False)
 async def corpus_upload_page() -> str:
     """The page itself. Self-contained — no build step, no bundle, nothing to deploy
