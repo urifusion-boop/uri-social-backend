@@ -99,6 +99,7 @@ on any of these, exactly like `generate_ad_image` already does.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from datetime import date
@@ -774,9 +775,21 @@ async def _build_problem_solution(business_name: str, category: str, description
             )
         return None
 
+    # The two zones are fully independent generations — no reason to make a
+    # user wait for them sequentially. Live-confirmed real-world impact:
+    # a single skin-tone retry on the solution zone alone (after the
+    # problem zone had already run) pushed one real request past 165
+    # seconds end to end for this format alone, well past the ALB's 120s
+    # idle timeout — the frontend reports that as a bare "Network Error"
+    # with no indication generation was actually still succeeding server-
+    # side. Running both concurrently is a pure latency win with no
+    # behaviour change: same two prompts, same retry logic, same failure
+    # handling — just not waited on one after the other.
     try:
-        problem_url = await _gen_zone_passing_skin_check(prompts["problem"], "problem")
-        solution_url = await _gen_zone_passing_skin_check(prompts["solution"], "solution")
+        problem_url, solution_url = await asyncio.gather(
+            _gen_zone_passing_skin_check(prompts["problem"], "problem"),
+            _gen_zone_passing_skin_check(prompts["solution"], "solution"),
+        )
     except SceneGenerationFailed as e:
         print(f"[VSG01] Problem/Solution scene generation failed: {e}", flush=True)
         return None
@@ -1103,14 +1116,21 @@ async def _build_starter_pack(business_name: str, category: str, description: st
     cell_size = f"{width // cols}x{width // cols}"
     seasonal_context = _resolve_current_seasonal_context()
     try:
-        item_urls = []
-        for desc in item_descriptions:
-            item_urls.append(
-                await generate_scene(
-                    starter_pack._item_prompt(desc, seasonal_context=seasonal_context), size=cell_size,
-                    brand_context=brand_context,
-                )
+        # 3-6 fully independent item generations — sequential here meant a
+        # worst case of 6 back-to-back gpt-image-2 calls (each observed
+        # taking anywhere from ~10s to ~60s+ in production) stacking into
+        # several minutes for one request, well past both the frontend's
+        # own 240s timeout and the ALB's 120s idle timeout (see
+        # _build_problem_solution's identical fix for the real production
+        # timeline that surfaced this). Same prompts, same failure
+        # handling — just generated concurrently instead of one at a time.
+        item_urls = await asyncio.gather(*(
+            generate_scene(
+                starter_pack._item_prompt(desc, seasonal_context=seasonal_context), size=cell_size,
+                brand_context=brand_context,
             )
+            for desc in item_descriptions
+        ))
     except SceneGenerationFailed as e:
         print(f"[VSG01] Starter Pack item generation failed: {e}", flush=True)
         return None
