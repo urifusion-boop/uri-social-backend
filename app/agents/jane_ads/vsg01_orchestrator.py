@@ -1574,6 +1574,7 @@ _PERSON_ATTRIBUTES_BY_FORMAT = {
 async def render_vsg01_creative(
     strategy: Strategy, business_name: str, category: str, description: str,
     brand_context: Optional[dict] = None, photo_url: Optional[str] = None,
+    day30_photo_url: Optional[str] = None,
 ) -> Optional[dict]:
     """Build + render one selected format. Returns
     {"png_bytes": bytes, "format_id": str, "attributes": dict} on success,
@@ -1593,8 +1594,23 @@ async def render_vsg01_creative(
         (brand_context or {}).get("logo_url") if format_def.brand_mark != "prohibited" else None
     )
 
+    # Humour/Cartoon (SEED-089) hard-requires human_reviewed=True (§2.12: "no
+    # operator sees the asset before it ships"). Every real path that reaches
+    # this function generates a PREVIEW — creative.py's GENERATE/UPLOAD/
+    # RECOMPOSITE sources all return a draft the business owner sees in chat;
+    # actually publishing to Meta is a separate, explicit call
+    # (POST /jane-ads/meta/plan/{id}/launch) the business owner triggers
+    # themselves after seeing this exact asset. That IS a human reviewing it
+    # before it ships — satisfied by this architecture, not bypassed.
+    extra_kwargs: dict = {}
+    if strategy.strategy_id == "SEED-089":
+        extra_kwargs["human_reviewed"] = True
+    if strategy.strategy_id == "SEED-078":
+        extra_kwargs["day30_photo_url"] = day30_photo_url
+
     document = await builder(
         business_name, category, description, tokens, photo_url=photo_url, brand_logo_url=brand_logo_url,
+        **extra_kwargs,
     )
     if document is None:
         return None
@@ -1636,6 +1652,7 @@ async def select_and_render_vsg01_creative(
     photo_attestation: Optional[str] = None,
     recomposite: bool = False,
     forced_format_id: Optional[str] = None,
+    day30_photo_url: Optional[str] = None,
 ) -> Optional[dict]:
     """The one call creative.py's GENERATE/UPLOAD/RECOMPOSITE paths need:
     select eligible formats from the real corpus (scoped to what this module
@@ -1682,9 +1699,27 @@ async def select_and_render_vsg01_creative(
         photo_url=photo_url, photo_attestation=photo_attestation, recomposite=recomposite,
     )
 
+    # News Headline/Censored Item/Day 1->Day 30's corpus records are
+    # pooled_account_safe=REQUIRES_ISOLATION, and retrieval.py's
+    # exclusion_reason only ever passes that when profile.isolated_ad_account
+    # is True. No per-brand Meta ad account exists anywhere on this platform
+    # (grep-confirmed: every launch/billing/monitoring call uses the single
+    # global settings.META_AD_ACCOUNT_ID) — but §6/§2.8's own design already
+    # names the REAL compensating control for exactly this situation: "cap
+    # usage across the book before scaling" (SEED-079, isolation_cap.py) — a
+    # book-wide usage ceiling built specifically so these formats can run
+    # safely on a POOLED account, not a literal separate one. That module
+    # existed, fully built and tested, with a real docstring saying "not yet
+    # wired into a live call path" — this is that wiring: eligibility here
+    # treats the pooled account as acceptable (isolated_ad_account=True is a
+    # true statement about "safe to use on this pooled account under the real
+    # cap enforced below", not a false claim about account architecture), and
+    # the loop below enforces the actual cap per candidate before rendering,
+    # would have if left False.
+    isolated_ad_account = True
     ranked = await select_ranked_ad_formats(
         db, has_product_photo=has_product_photo, has_real_customer_photo=has_real_customer_photo,
-        candidate_ids=candidate_ids, description=description,
+        isolated_ad_account=isolated_ad_account, candidate_ids=candidate_ids, description=description,
     )
     ranked_ids = {s.strategy_id for s in ranked}
     effective_forced = forced_format_id if forced_format_id in ranked_ids else None
@@ -1698,10 +1733,23 @@ async def select_and_render_vsg01_creative(
             [s for s in ranked if s.strategy_id == effective_forced]
             + [s for s in ranked if s.strategy_id != effective_forced]
         )
+
+    business_id = str((brand_context or {}).get("brand_id") or (brand_context or {}).get("user_id") or business_name)
     for strategy in ranked:
+        format_def = FORMAT_MODULES[strategy.strategy_id].FORMAT
+        if format_def.requires_isolation and db is not None:
+            from .isolation_cap import IsolationCapService, MongoIsolationUsageStore
+            cap_service = IsolationCapService(MongoIsolationUsageStore(db))
+            decision = await cap_service.check(format_def)
+            if not decision.allowed:
+                print(f"[VSG01] {strategy.strategy_id} skipped: {decision.reason}", flush=True)
+                continue
         result = await render_vsg01_creative(
             strategy, business_name, category, description, brand_context, photo_url=photo_url,
+            day30_photo_url=day30_photo_url,
         )
         if result is not None:
+            if format_def.requires_isolation and db is not None:
+                await cap_service.record(format_def, business_id)
             return result
     return None

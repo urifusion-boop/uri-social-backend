@@ -1009,6 +1009,7 @@ async def creative_from_upload(
     audience_segment: str = "", who_its_for: str = "", geo_pockets: Optional[list[str]] = None,
     destination_type: str = DEFAULT_DESTINATION.value, destination_cta: str = "",
     asset_attestation: Optional[str] = None, vsg01_format_id: Optional[str] = None,
+    day30_photo_url: Optional[str] = None,
 ) -> AdCreative:
     """SOURCE 2 — the user's own uploaded photo OR video (uploaded via
     /jane-ads/creative/upload, or the existing /upload-user-content flow) becomes
@@ -1039,7 +1040,7 @@ async def creative_from_upload(
         vsg01_result = await select_and_render_vsg01_creative(
             db, business_name, category, description, brand_context,
             photo_url=image_url, photo_attestation=asset_attestation,
-            forced_format_id=vsg01_format_id,
+            forced_format_id=vsg01_format_id, day30_photo_url=day30_photo_url,
         )
         if vsg01_result is not None:
             uploaded = await _upload_bytes_to_cloudinary(
