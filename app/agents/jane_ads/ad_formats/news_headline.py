@@ -283,18 +283,25 @@ def build_document(
             "font_size": 52, "font_weight": 700, "color": t["ink"],
         })
 
+    # The panel is now a dark, on-brand-tinted plate — not flat white —
+    # reusing the exact same brand-derived colour as the banner
+    # (_banner_colors) so the whole composition (banner top, panel
+    # bottom, vivid photo between) reads as one deliberately designed
+    # image sharing a palette, not "a photo with a caption card glued
+    # underneath it". Text flips to white/light since it now sits on a
+    # dark ground instead of a light one.
+    _panel_fill, _panel_text = _banner_colors(t)
     z += 1
     layers.append({
         "type": "shape", "z_index": z, "shape": "rect",
         "x": 0, "y": bar_y, "width": width, "height": bar_zone_height,
-        "fill_color": t["field"],
+        "fill_color": _panel_fill,
     })
 
-    # A slim accent-coloured rule at the very top of the bar — the one
-    # deliberate colour hit this otherwise plain bar carries, same "single
-    # accent edge" convention Us vs Them already uses. Purely decorative,
-    # not a masthead/logo (§2.8 point 2 still holds: no network-branded
-    # chrome), just enough to read as designed rather than a flat plate.
+    # A slim, brighter accent-coloured rule at the very top of the panel —
+    # the ORIGINAL (not darkened) accent, since this is a thin decorative
+    # line, not text needing its own contrast guarantee — separating photo
+    # from panel with a genuine pop of the brand's real colour.
     _ACCENT_RULE_H = 6
     z += 1
     layers.append({
@@ -307,7 +314,7 @@ def build_document(
     z += 1
     layers.append({
         "type": "text", "z_index": z, "content": "\n".join(headline_lines),
-        "x": _PADDING, "y": content_y, "font_size": _FONT_HEADLINE, "font_weight": 700, "color": t["ink"],
+        "x": _PADDING, "y": content_y, "font_size": _FONT_HEADLINE, "font_weight": 700, "color": _panel_text,
     })
     content_y += len(headline_lines) * _LINE_HEIGHT_HEADLINE + 24
 
@@ -315,19 +322,20 @@ def build_document(
         z += 1
         layers.append({
             "type": "text", "z_index": z, "content": "\n".join(secondary_lines),
-            "x": _PADDING, "y": content_y, "font_size": _FONT_SECONDARY, "color": t["ink"],
+            "x": _PADDING, "y": content_y, "font_size": _FONT_SECONDARY, "color": _panel_text,
         })
         content_y += len(secondary_lines) * _LINE_HEIGHT_SECONDARY + 24
 
     if date_stamp:
-        # Accent-coloured, not muted ink-quiet — reads as a considered
-        # highlight (like a date chip) rather than fine-print metadata,
-        # since for many announcements this is the single most actionable
-        # fact ("when does this happen") a reader takes away.
+        # Same panel text colour, not the raw accent — the raw accent is
+        # too close in hue to the darkened panel it would sit on to
+        # guarantee contrast (two shades of the same colour rarely
+        # contrast well with each other). Still reads as a highlight via
+        # bold weight, same as before.
         z += 1
         layers.append({
             "type": "text", "z_index": z, "content": date_stamp,
-            "x": _PADDING, "y": content_y, "font_size": _FONT_DATE, "font_weight": 700, "color": t["accent"],
+            "x": _PADDING, "y": content_y, "font_size": _FONT_DATE, "font_weight": 700, "color": _panel_text,
         })
 
     document = {
