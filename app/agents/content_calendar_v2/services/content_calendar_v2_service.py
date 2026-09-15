@@ -86,6 +86,10 @@ CANDIDATE_CHUNK_SIZE = 20    # concurrent chunks, mirrors the proven content-chu
 CONTENT_CHUNK_SIZE = 6       # ~5 chunks of 6 for final copy — v1's own 7-item cap is
                               # evidence larger single structured-JSON calls degrade
 
+MAX_VIDEO_FORMATS_PER_WEEK = 1   # user requirement: at most this many video-like items
+                                  # (video/product_video/ai_video) per 7-day calendar week
+_VIDEO_FORMATS = {"video", "product_video", "ai_video"}
+
 # PRD §26 — Ad Angle Library, derived from an item's own 27-value creative
 # angle (creative_framework.ANGLES), not from content_type (the old
 # _ANGLE_BY_CONTENT_TYPE only ever reached 4/7 of its declared values).
@@ -694,6 +698,31 @@ def _assign_format(concept: Dict[str, Any], brand: Dict[str, Any], existing_asse
     return result
 
 
+def _assign_formats(
+    dated: List[Dict[str, Any]], brand: Dict[str, Any], existing_assets_summary: str,
+) -> List[Dict[str, Any]]:
+    """Runs _assign_format across the whole plan, enforcing
+    MAX_VIDEO_FORMATS_PER_WEEK — user requirement. _assign_format decides
+    each item's format independently with no awareness of any other item, so
+    the weekly cap has to be enforced here: a running per-week counter,
+    downgrading to "image" once a week's video quota is already spent.
+    Assumes `dated` is already in day_index order (it is — _assign_dates
+    walks the plan sequentially)."""
+    video_count_by_week: Dict[int, int] = {}
+    result = []
+    for c in dated:
+        assigned = _assign_format(c, brand, existing_assets_summary)
+        week = c.get("day_index", 0) // 7
+        if assigned.get("format") in _VIDEO_FORMATS:
+            if video_count_by_week.get(week, 0) >= MAX_VIDEO_FORMATS_PER_WEEK:
+                assigned = {k: v for k, v in assigned.items() if k not in ("format", "carousel_slide_count")}
+                assigned["format"] = "image"
+            else:
+                video_count_by_week[week] = video_count_by_week.get(week, 0) + 1
+        result.append(assigned)
+    return result
+
+
 # ── Ad-opportunity scoring (rule-based, PRD §19 — performance-free) ─────────
 
 def _score_ad_opportunity(item: Dict[str, Any], near_holiday: bool, has_active_promo: bool) -> float:
@@ -1072,10 +1101,16 @@ must be impossible to copy-paste to a different brand.
         try:
             items = await _call_and_parse(prompt + correction_block)
         except Exception as exc:
+            # Confirmed live: this used to `raise` immediately when attempt 0's
+            # parse failed, skipping the second attempt entirely — one transient
+            # JSON glitch on the FIRST call for a chunk silently wiped out the
+            # whole chunk (a 6-item chunk failing here is exactly why 30-item
+            # plans were landing at 24). Now it gets the full 2 tries like the
+            # validation-failure retry path below already did.
+            print(f"[CalendarV2] final-copy chunk parse failed on attempt {attempt + 1}/2 ({exc})", flush=True)
             if attempt == 0:
-                raise
-            print(f"[CalendarV2] final-copy chunk retry failed to parse ({exc}) — using best-effort", flush=True)
-            break
+                continue
+            raise
 
         failures: Dict[int, List[str]] = {}
         for i, idea in enumerate(items):
@@ -1378,8 +1413,8 @@ async def _build_plan_doc(
     # Step 6 — assign dates
     dated = _assign_dates(selected, all_dates, holidays_by_date)
 
-    # Step 7 — assign format, dynamic 2-5 slide carousels
-    formatted = [_assign_format(c, brand, existing_assets_summary) for c in dated]
+    # Step 7 — assign format, dynamic 2-5 slide carousels, capped video/week
+    formatted = _assign_formats(dated, brand, existing_assets_summary)
 
     # Step 8+9 — final copy + creative direction, concurrently chunked
     # (same proven concurrency pattern this codebase already fixed a real
@@ -1405,6 +1440,27 @@ async def _build_plan_doc(
         raise RuntimeError("Content Calendar V2 generation failed for every chunk — no items produced.")
 
     items_by_index = {item["day_index"]: item for item in all_items}
+
+    # Backfill — one more shot at any day whose chunk still failed outright
+    # after _generate_final_copy's own 2 attempts (confirmed live: this is
+    # how a 30-item plan was landing at 24; the retry-inversion bug above was
+    # the main cause, this is the safety net for whatever still slips through
+    # — a stubborn chunk, or the retry's OWN second attempt also failing).
+    missing_indices = sorted(set(range(PLAN_DAYS)) - set(items_by_index.keys()))
+    if missing_indices:
+        print(f"[CalendarV2] backfilling {len(missing_indices)} missing item(s) at day_index={missing_indices}", flush=True)
+        backfill_concepts = [c for c in formatted if c["day_index"] in missing_indices]
+        try:
+            backfill_items = await _generate_final_copy(
+                brand=brand, concepts_chunk=backfill_concepts, platforms=platforms,
+                existing_assets_summary=existing_assets_summary, force=force,
+            )
+            for item in backfill_items:
+                items_by_index[item["day_index"]] = item
+            all_items = list(items_by_index.values())
+            print(f"[CalendarV2] backfill recovered {len(backfill_items)}/{len(missing_indices)} item(s)", flush=True)
+        except Exception as exc:
+            print(f"[CalendarV2] backfill pass failed ({exc}) — plan will ship with {len(all_items)}/{PLAN_DAYS} items", flush=True)
 
     # Step 11 — semantic/creative validation (deterministic hard rules were
     # already enforced per-chunk inside _generate_final_copy's retry loop)
