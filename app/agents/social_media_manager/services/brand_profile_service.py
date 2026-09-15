@@ -422,6 +422,20 @@ class BrandProfileService:
             "customer_needs":        profile.get("customer_needs") or [],
             "customer_objections":   profile.get("customer_objections") or [],
             "why_customers_choose_us": profile.get("why_customers_choose_us", ""),
+            # URI Content Calendar Generation addendum §1-4: customer psychology
+            # fields the addendum asks for that had no dedicated field yet, distinct
+            # from pain_points/needs/objections above. All optional/defensive —
+            # nothing currently writes these, so every caller (including
+            # to_brand_context's own consumers) must keep treating them as
+            # "may be empty" until the Brand Playbook UI collects them.
+            "customer_desires":       profile.get("customer_desires") or [],
+            "customer_fears":         profile.get("customer_fears") or [],
+            "customer_frustrations":  profile.get("customer_frustrations") or [],
+            "customer_aspirations":   profile.get("customer_aspirations") or [],
+            "customer_hesitations":   profile.get("customer_hesitations") or [],  # distinct from objections — reasons they stall, not reasons they refuse
+            "common_questions":       profile.get("common_questions") or [],
+            "buying_triggers":        profile.get("buying_triggers") or [],
+            "words_to_avoid":         profile.get("words_to_avoid") or [],
             "audience_age_range":   profile.get("audience_age_range", ""),
             "primary_goal":         profile.get("primary_goal", ""),
             "target_platforms":     profile.get("target_platforms") or [],

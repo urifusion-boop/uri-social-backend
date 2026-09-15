@@ -275,6 +275,81 @@ async def _get_existing_assets_summary(
     return "; ".join(parts)
 
 
+# ── URI Content Calendar Generation addendum §1-5 — Brand Playbook as a
+# primary input, not background. Both blocks are shared between candidate
+# generation (so ideas are grounded in real customer psychology from the
+# start, not decorated with it afterward — the addendum's own "do not
+# generate the calendar first and then add the brand" rule) and final copy
+# (so headlines/visuals execute against the same grounding). Every field is
+# read defensively — a brand that hasn't filled these in yet still gets a
+# normal prompt, just without this block; nothing here can crash or degrade
+# generation for a thin profile. ──────────────────────────────────────────
+
+def _customer_psychology_block(brand: Dict[str, Any]) -> str:
+    """Addendum §1-4: pain points/needs/desires/objections/etc — real
+    customer psychology from the Brand Playbook, not the brand's own product
+    description. Confirmed before this existed: the calendar's prompts only
+    ever read brand_name/industry/voice/audience-summary/USP/business_pulse
+    — customer_pain_points/needs/objections/why_customers_choose_us were
+    already stored on every brand profile (to_brand_context already returns
+    them) but never once reached either generation prompt."""
+    parts: List[str] = []
+    if brand.get("ideal_customer_profile"):
+        parts.append(f"Ideal customer profile: {brand['ideal_customer_profile']}")
+    for label, key in [
+        ("Pain points", "customer_pain_points"),
+        ("Needs", "customer_needs"),
+        ("Desires", "customer_desires"),
+        ("Fears", "customer_fears"),
+        ("Frustrations", "customer_frustrations"),
+        ("Aspirations", "customer_aspirations"),
+        ("Objections", "customer_objections"),
+        ("Reasons they hesitate", "customer_hesitations"),
+        ("Common questions", "common_questions"),
+        ("Buying triggers", "buying_triggers"),
+    ]:
+        vals = [str(v) for v in (brand.get(key) or []) if v]
+        if vals:
+            parts.append(f"{label}: " + "; ".join(vals))
+    if brand.get("why_customers_choose_us"):
+        parts.append(f"Why customers choose this business: {brand['why_customers_choose_us']}")
+    words_to_avoid = [str(w) for w in (brand.get("words_to_avoid") or []) if w]
+    if words_to_avoid:
+        parts.append("Words/phrases to avoid: " + ", ".join(words_to_avoid))
+    if not parts:
+        return ""
+    return (
+        "\n\nCUSTOMER PSYCHOLOGY (from this brand's Playbook — real customer reality, not a generic assumption):\n"
+        + "\n".join(f"- {p}" for p in parts)
+        + "\n\nEvery idea must clearly draw on ONE specific item above — a real pain point, need, "
+          "desire, objection, fear, or reason this audience chooses this business. Write for THIS "
+          "audience specifically — never for \"business owners\", \"customers\", \"people\", or "
+          "\"everyone\". Where a customer phrase or question is listed above, consider using it "
+          "close to verbatim rather than paraphrasing it into generic marketing language — see the "
+          "addendum's own example: \"I don't have time to cook\" becomes \"You don't hate cooking. "
+          "You hate deciding what to cook at 7:30pm,\" not \"5 Benefits of Meal Delivery.\""
+    )
+
+
+def _visual_guide_block(brand: Dict[str, Any]) -> str:
+    """Addendum §5: the client's selected Visual Guide is the design system
+    — the model must stop inventing a new visual style per post. Confirmed
+    before this existed: design_style/layout_direction were fully
+    open-ended per item ("a few words describing the visual design style"),
+    even though style_selections (the actual Visual Guide the client picked)
+    was already sitting on the brand profile, unused by this pipeline."""
+    styles = [str(s) for s in (brand.get("style_selections") or []) if s]
+    if not styles:
+        return ""
+    return (
+        f"\n\nVISUAL GUIDE (the client's selected design system — mandatory, not optional): "
+        f"{', '.join(styles)}. This is the ONE visual language for every item in this plan. "
+        f"The creative idea can and should change from post to post; design_style and "
+        f"layout_direction must stay recognisably within this visual language every time — "
+        f"do not invent a different design style per item."
+    )
+
+
 # ── Step 3 — Candidate concept pool (PRD §10, §36) ──────────────────────────
 
 async def _generate_candidate_concepts(
@@ -305,6 +380,7 @@ async def _generate_candidate_concepts(
         f"Business stage: {business_stage} — {_STAGE_GUIDANCE.get(business_stage, '')}"
         if business_stage else ""
     )
+    psychology_block = _customer_psychology_block(brand)
 
     territories_block = "\n".join(
         f"- {key} ({t['label']}): {t['description']} Example subjects: {', '.join(t['subjects'][:8])}"
@@ -355,7 +431,7 @@ async def _generate_candidate_concepts(
 CONCEPTS for {brand_name}, a {industry} business. Target audience: {audience}.
 Brand voice: {voice}. {f'What they do: {description}.' if description else ''}
 {f'USP: {usp}.' if usp else ''}
-{stage_note}{context_block}{assets_block}{avoid_block}
+{stage_note}{context_block}{assets_block}{avoid_block}{psychology_block}
 Platforms: {', '.join(platforms) if platforms else 'social media'}.
 
 Available Content Territories (draw from these freely — you don't need every one):
@@ -375,9 +451,14 @@ For each concept, return:
 - subject: one specific subject from that territory's list (or a close industry-specific variant)
 - angle: one angle label from the list above, exactly as written
 - creative_device: {{"category": one of story|visual|conversational|psychological|structural, "device": one device label from that category, exactly as written}}
-- format_hint: one of image|carousel|video|product_video|ai_video|text (best guess — a later stage may override it)
+- format_hint: one of image|carousel|video|product_video|ai_video|text — pick based on
+  what the IDEA needs, not habit: carousel for a sequence/steps/comparison/story/several
+  related insights; image for one single powerful idea, a statement, or a visual metaphor;
+  video only where demonstration, personality, movement, or spoken delivery genuinely
+  matters — not by default
 - objective: one of reach|engagement|leads|sales|awareness
-- audience_segment: which part of the audience this speaks to, 3-6 words
+- audience_segment: which part of the audience this speaks to, 3-6 words — specific
+  (e.g. "first-time buyers hesitant on price"), never "everyone" or "customers"
 - concept_name: a short 3-6 word internal name for this idea (e.g. "The Upfront Cost Trap")
 
 No two concepts in this batch may share the same territory+subject+angle combination.
@@ -842,22 +923,53 @@ def _rule_based_diversity_issues(items: List[Dict[str, Any]]) -> Dict[int, str]:
     return issues
 
 
-async def _llm_diversity_check(items: List[Dict[str, Any]]) -> List[int]:
-    """One extra LLM call across all items' titles/hooks asking which pairs
-    are substantially the same idea reworded — a cheap stand-in for
-    embedding-based semantic similarity (deferred as a fast-follow)."""
+async def _llm_diversity_check(items: List[Dict[str, Any]], brand: Optional[Dict[str, Any]] = None) -> List[int]:
+    """One LLM call across all items' titles/hooks doing two jobs at once —
+    kept as a single call deliberately, not split into two round-trips,
+    for the same latency reasons documented on _generate_final_copy (this
+    pipeline is already tight against the gateway timeout):
+
+    1. Duplication — which pairs are substantially the same idea reworded
+       (a cheap stand-in for embedding-based semantic similarity, deferred
+       as a fast-follow).
+    2. URI Content Calendar Generation addendum §19's "No Generic AI
+       Content" quality gate — the 3 questions here that genuinely need
+       semantic judgment (could this headline appear on 1,000 unrelated
+       pages; does the idea use something specific from this brand's
+       Playbook; would the actual customer recognise themselves). The
+       addendum's other 4 questions (text density, visual-communicates-
+       idea, visual-guide-compliance, scroll-stopping) are handled at
+       generation time via explicit prompt rules in _generate_final_copy
+       instead — better fixed at the source than re-judged after the fact."""
+    brand = brand or {}
+    brand_name = brand.get("brand_name") or "this business"
+    context_line = ""
+    psych_keys = ["customer_pain_points", "customer_needs", "customer_desires", "customer_objections"]
+    psych_bits = [str(v) for k in psych_keys for v in (brand.get(k) or [])][:6]
+    if psych_bits:
+        context_line = f"\n{brand_name}'s actual customer reality includes: " + "; ".join(psych_bits)
+
     listing = "\n".join(
         f"{i}: {it.get('title', '')} — {it.get('hook', '')}"
         for i, it in enumerate(items)
     )
-    prompt = f"""Below are {len(items)} social media post ideas for one business. Which
-indexes, if any, are substantially the SAME underlying idea reworded (not
-just sharing a territory — genuinely the same angle/message)?
+    prompt = f"""Below are {len(items)} social media post ideas for {brand_name}.{context_line}
 
 {listing}
 
-Return ONLY a JSON array of indexes that should be regenerated because they
-duplicate another idea in the list, e.g. [4, 11] or [] if none duplicate.
+Flag an index for regeneration if EITHER is true:
+A) DUPLICATE — substantially the SAME underlying idea reworded as another
+   index in the list (not just sharing a territory — genuinely the same
+   angle/message).
+B) GENERIC — the idea fails ANY of these: (1) this exact headline could
+   appear on 1,000 unrelated business pages with zero changes, (2) it does
+   not clearly draw on anything specific to this business's actual
+   customers (their real pain points, needs, objections, or reasons they
+   buy — not just the product category), (3) this business's actual
+   customer would not recognise themselves in it.
+
+Return ONLY a JSON array of indexes to regenerate, e.g. [4, 11] or [] if none
+qualify. Be conservative — only flag a clear case, not a borderline one.
 """
     try:
         ai_request = AIService.build_ai_model(
@@ -872,7 +984,7 @@ duplicate another idea in the list, e.g. [4, 11] or [] if none duplicate.
         parsed = _loads_lenient(raw)
         return [i for i in parsed if isinstance(i, int) and 0 <= i < len(items)]
     except Exception as exc:
-        print(f"[CalendarV2] LLM diversity check failed (non-fatal): {exc}", flush=True)
+        print(f"[CalendarV2] LLM diversity+quality check failed (non-fatal): {exc}", flush=True)
         return []
 
 
@@ -970,6 +1082,8 @@ async def _generate_final_copy(
     price_range = brand.get("price_range", "")
     business_pulse = brand.get("business_pulse") or {}
     business_pulse_updated_at = brand.get("business_pulse_updated_at")
+    psychology_block = _customer_psychology_block(brand)
+    visual_guide_block = _visual_guide_block(brand)
 
     bp_freshness = _business_pulse_freshness_str(business_pulse_updated_at)
     bp_lines = [v for v in [
@@ -1013,13 +1127,15 @@ async def _generate_final_copy(
     ]
     carousel_spec = ("\n" + "\n".join(carousel_spec_lines)) if carousel_spec_lines else ""
 
+    banned_phrases_str = ", ".join(f'"{p.split("{brand}")[0].strip()}..."' for p in ANTI_BORING_PHRASES if p)
+
     prompt = f"""You are a senior social media copywriter turning {n} ALREADY-APPROVED
 content concepts into publish-ready posts for {brand_name}{f' ("{tagline}")' if tagline else ''}.
 Industry: {industry}. {f'What they do: {description}.' if description else ''}
 Target audience: {audience}{f', {region} market' if region else ''}. Brand voice: {voice}.
 {f'USP: {usp}.' if usp else ''}
 {f'Price positioning: {price_range}.' if price_range else ''}
-{business_pulse_block}{assets_block}
+{business_pulse_block}{assets_block}{psychology_block}{visual_guide_block}
 Platforms: {platforms_str}
 {force_token}
 
@@ -1028,15 +1144,38 @@ creative device are FIXED. Your job is EXECUTION only: write the actual copy
 that brings this specific concept to life. Do NOT invent a different idea,
 switch the angle, or change what the post is fundamentally about.
 
+For each item, think in THIS order before writing anything: (1) the human/
+business INSIGHT the concept is built on, (2) the CREATIVE IDEA — the
+interesting way to express it, (3) the VISUAL CONCEPT — what the audience
+should actually see, (4) then the HEADLINE, (5) then supporting copy, (6)
+then the CTA. Do not start from "what text goes on the graphic."
+
 {concepts_block}
 {carousel_spec}
 
+HEADLINE STANDARD — every title/headline must create curiosity, tension,
+recognition, surprise, contrarian thinking, or real specificity. It should
+make the reader think "wait, what are they talking about?" — not read like
+generic advice. Ground it in the specific customer reality above (a real
+pain point, objection, or their own words), never a generic topic statement.
+Example of the shift required: instead of "5 Skincare Tips Everyone Needs,"
+write "Your skin isn't necessarily dry. Your routine may just be fighting
+itself." Avoid opening a headline with generic AI-sounding constructions —
+high-risk patterns to avoid: {banned_phrases_str}. These aren't hard-banned,
+but treat them as a strong signal to rewrite.
+
+TEXT DENSITY — use the visual to communicate the idea; use text to sharpen
+it, not explain it. Prefer one strong headline + one short supporting line
+over a headline plus a paragraph plus bullet points plus an explanation. For
+a carousel, each slide carries ONE idea — never compress an entire article
+across the slides; the story should read visually as the audience swipes.
+
 For EACH item, return ALL of these fields:
-- title: max 10 words, punchy, specific to this brand — must clearly reflect its concept's subject+angle
+- title: max 10 words, punchy, specific to this brand — must clearly reflect its concept's subject+angle and meet the HEADLINE STANDARD above
 - hook: exact opening line (1 sentence), executing the item's creative device
 - key_points: 2-5 concrete specific points
 - description: 2-3 sentences tying the idea together
-- caption_direction: 1-2 sentences of specific guidance for the caption
+- caption_direction: 1-2 sentences of specific guidance for the caption — necessary information only, not padding
 - keywords: 2-4 real keywords specific to this idea
 - cta: one specific call-to-action sentence
 - topic: 3-6 word plain-language topic label
@@ -1046,15 +1185,20 @@ For EACH item, return ALL of these fields:
 - video_idea: {{"format": one of talking_head|product_demo|testimonial|tutorial|behind_the_scenes|trend_based, "hook": "...", "talking_points": ["..."], "scenes": ["..."], "cta": "..."}}
 - holiday_reference: null unless a real, relevant holiday/observance genuinely
   falls on this item's date for {region or 'the audience region'} — never invent one
-- exact_copy: {{"headline": "publish-ready headline/first-line", "caption": "the FULL publish-ready caption text, ready to post as-is", "hashtags": ["2-5 relevant hashtags, no # symbol"]}}
+- exact_copy: {{"headline": "publish-ready headline/first-line — must meet the HEADLINE STANDARD above", "caption": "the FULL publish-ready caption text, ready to post as-is, respecting TEXT DENSITY above", "hashtags": ["2-5 relevant hashtags, no # symbol"]}}
 - carousel: null UNLESS this item's format is CAROUSEL (see the exact slide count required above), in which case:
-  {{"slides": [{{"slide_index": 0, "headline": "...", "body": "...", "visual_note": "..."}}, ...exactly the required number of slides...]}}
+  {{"slides": [{{"slide_index": 0, "headline": "...", "body": "one idea, kept short — see TEXT DENSITY", "visual_note": "..."}}, ...exactly the required number of slides...]}}
 - creative_concept_name: a short, final version of the concept name
-- central_visual_idea: 1 concrete sentence describing the central visual concept
-- design_style: a few words describing the visual design style
-- layout_direction: a few words on layout/composition
+- central_visual_idea: 1 concrete sentence describing the central visual concept — prioritise a human scene (a customer, founder, employee experiencing the problem or the outcome) or a symbolic visual (an object/environment/before-after/metaphor) over a generic product-interface shot; use actual product imagery only where the product itself is the point, and screenshots/UI only where the content genuinely needs them
+- design_style: a few words describing the visual design style{' — MUST stay within the Visual Guide given above, do not invent a different one' if visual_guide_block else ''}
+- layout_direction: a few words on layout/composition{' — consistent with the Visual Guide above' if visual_guide_block else ''}
 - visual_metaphor: the visual metaphor being used, or "" if none
-- ai_image_prompt: 1 concrete sentence describing the ideal AI-generated image (subject, style, mood) — usable directly as an image-gen prompt
+- ai_image_prompt: a concrete, literal description of a PHOTOGRAPH or IMAGE
+  to generate — subject, setting, lighting, composition, mood. This describes
+  the raw visual asset only. Do NOT ask for a "social media graphic," do NOT
+  include any headline text, caption text, or CTA in this prompt, and do NOT
+  mention typography, layout, or brand colours — that's a separate design
+  layer applied afterward. End the prompt with "no text, no logos."
 - required_assets: a short list of assets needed — prefer reusing anything listed as already available above over requesting new production
 - designer_execution_notes: 1-2 sentences of concrete guidance for whoever produces the visual
 - reasoning: 1-2 sentences on WHY this idea, for THIS day — reference something
@@ -1074,7 +1218,9 @@ index.
 
 Rules: no two titles share an opening word; vary emotional tone across items;
 be specific — real product/service names, real audience details; every item
-must be impossible to copy-paste to a different brand.
+must be impossible to copy-paste to a different brand. A useful test: if you
+removed the brand name, would this still be clearly written for THIS
+business's actual customers, not a generic reader?
 """
 
     async def _call_and_parse(full_prompt: str) -> List[Dict[str, Any]]:
@@ -1463,10 +1609,12 @@ async def _build_plan_doc(
             print(f"[CalendarV2] backfill pass failed ({exc}) — plan will ship with {len(all_items)}/{PLAN_DAYS} items", flush=True)
 
     # Step 11 — semantic/creative validation (deterministic hard rules were
-    # already enforced per-chunk inside _generate_final_copy's retry loop)
+    # already enforced per-chunk inside _generate_final_copy's retry loop).
+    # llm_flagged now also carries the addendum §19 "No Generic AI Content"
+    # gate's semantic-judgment questions — see _llm_diversity_check's docstring.
     rule_issues = _rule_based_diversity_issues(all_items)
-    llm_flagged = await _llm_diversity_check(all_items)
-    print(f"[CalendarV2] diversity check: rule_issues={len(rule_issues)} llm_flagged={len(llm_flagged)}", flush=True)
+    llm_flagged = await _llm_diversity_check(all_items, brand=brand)
+    print(f"[CalendarV2] diversity+quality check: rule_issues={len(rule_issues)} llm_flagged={len(llm_flagged)}", flush=True)
     if len(llm_flagged) > max(6, len(all_items) // 4):
         print(f"[CalendarV2] LLM diversity check flagged {len(llm_flagged)}/{len(all_items)} — implausible, discarding", flush=True)
         llm_flagged = []
