@@ -3208,6 +3208,38 @@ async def reorder_carousel_slides(
     )
 
 
+class TikTokAutoAddMusicRequest(BaseModel):
+    enabled: bool
+
+
+@router.patch("/drafts/{draft_id}/tiktok-auto-add-music")
+async def set_tiktok_auto_add_music(
+    draft_id: str,
+    request: TikTokAutoAddMusicRequest,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """Toggle TikTok's automatic background-music pick for a single-image or
+    carousel draft (Music PRD MUS-PRD-01 §2.2/§8, resolved 2026-09-15):
+    TikTok's Content Posting API exposes no way to choose a specific track
+    for photo/carousel posts — auto_add_music is the ONLY music control that
+    exists there, and it's TikTok's own algorithmic pick, not ours. This just
+    persists the user's yes/no; approval_workflow_service.py reads it at
+    publish time and only forwards it for non-video TikTok drafts (Outstand's
+    own docs: the field is "ignored for videos" anyway)."""
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    result = await db["content_drafts"].update_one(
+        {"id": draft_id, "user_id": user_id},
+        {"$set": {"tiktok_auto_add_music": request.enabled, "updated_at": datetime.utcnow()}},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Draft not found")
+    return {"status": True, "responseMessage": "Updated", "responseData": {"tiktok_auto_add_music": request.enabled}}
+
+
 @router.delete("/drafts/{draft_id}")
 async def delete_draft(
     draft_id: str,
