@@ -548,10 +548,16 @@ RULES FOR THIS EDIT:
             # Step 8: Call GPT-Image-2 Edit API
             print(f"[EDIT] Calling GPT-Image-2 edit API...")
 
-            # Get original image dimensions from draft specs
-            image_specs = draft.get("image_specs", {})
-            original_width = image_specs.get("width", 1024)
-            original_height = image_specs.get("height", 1024)
+            # Read the REAL current dimensions directly from the image bytes we just
+            # downloaded — draft.image_specs can be missing (older drafts predate this
+            # field, or the draft was created via a path that never set it) or stale,
+            # and width/height each independently falling back to 1024 turned every
+            # such edit into a square image, silently discarding whatever the original
+            # aspect ratio actually was. Live-confirmed: every edit in prod's logs
+            # showed "Original size: 1024x1024" regardless of the post's real shape.
+            # The downloaded bytes are always authoritative, unlike a database field.
+            from PIL import Image as _PILImageProbe
+            original_width, original_height = _PILImageProbe.open(io.BytesIO(image_bytes)).size
 
             # GPT-Image-2 requires dimensions divisible by 16
             # Round to nearest multiple of 16 to maintain aspect ratio
