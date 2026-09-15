@@ -80,6 +80,16 @@ class BrandProfileService:
             "customer_needs": [],
             "customer_objections": [],
             "why_customers_choose_us": "",
+            # URI Content Calendar Generation addendum §1-4 — see to_brand_context()
+            # for why these are distinct from pain_points/needs/objections above
+            "customer_desires": [],
+            "customer_fears": [],
+            "customer_frustrations": [],
+            "customer_aspirations": [],
+            "customer_hesitations": [],
+            "common_questions": [],
+            "buying_triggers": [],
+            "words_to_avoid": [],
             "content_pillars": [],
             "preferred_formats": [],
             "guardrails": {},
@@ -327,6 +337,10 @@ class BrandProfileService:
                 "customer_gender", "customer_location", "customer_occupation", "customer_income_level",
                 "customer_interests", "customer_pain_points", "customer_needs", "customer_objections",
                 "why_customers_choose_us",
+                # URI Content Calendar Generation addendum §1-4 — same evergreen-persona
+                # reasoning as the customer_* fields directly above
+                "customer_desires", "customer_fears", "customer_frustrations", "customer_aspirations",
+                "customer_hesitations", "common_questions", "buying_triggers", "words_to_avoid",
                 # Deliberately NOT business_pulse — one brand's active promotion is
                 # noise for a sibling agency brand, unlike the evergreen facts above.
             ]

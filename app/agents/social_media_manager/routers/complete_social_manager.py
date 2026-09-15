@@ -308,6 +308,16 @@ class BrandProfileRequest(BaseModel):
     customer_needs: Optional[List[str]] = None
     customer_objections: Optional[List[str]] = None
     why_customers_choose_us: Optional[str] = None
+    # URI Content Calendar Generation addendum §1-4 — customer psychology
+    # fields with no prior slot, distinct from pain_points/needs/objections above
+    customer_desires: Optional[List[str]] = None
+    customer_fears: Optional[List[str]] = None
+    customer_frustrations: Optional[List[str]] = None
+    customer_aspirations: Optional[List[str]] = None
+    customer_hesitations: Optional[List[str]] = None  # reasons they stall, distinct from objections (reasons they refuse)
+    common_questions: Optional[List[str]] = None
+    buying_triggers: Optional[List[str]] = None
+    words_to_avoid: Optional[List[str]] = None
     # Competitors
     competitor_handles: Optional[List[str]] = None
     # Scheduling
