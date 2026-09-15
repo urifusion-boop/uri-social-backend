@@ -88,6 +88,10 @@ class BrandProfileService:
         }
         if "style_selections" in data:
             doc["style_selections"] = data["style_selections"]
+        if "ad_format_selections" in data:
+            doc["ad_format_selections"] = data["ad_format_selections"]
+        if "ad_format_rotation_index" in data:
+            doc["ad_format_rotation_index"] = data["ad_format_rotation_index"]
         if "style_prompt_fragments" in data:
             doc["style_prompt_fragments"] = data["style_prompt_fragments"]
         if "font_style" in data:
@@ -411,6 +415,8 @@ class BrandProfileService:
             "posting_cadence":      profile.get("posting_cadence", ""),
             "style_selections":     profile.get("style_selections") or [],
             "style_rotation_index": int(profile.get("style_rotation_index") or 0),
+            "ad_format_selections":     profile.get("ad_format_selections") or [],
+            "ad_format_rotation_index": int(profile.get("ad_format_rotation_index") or 0),
             "cta_rotation_index":   int(profile.get("cta_rotation_index") or 0),
             "font_style":           profile.get("font_style", ""),
             "font_style_prompt":    profile.get("font_style_prompt", ""),
