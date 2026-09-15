@@ -1762,7 +1762,18 @@ class ApprovalWorkflowService:
                     # PUBLIC_TO_EVERYONE — the app's Content Posting API audit passed
                     # 2026-08-17; before that, TikTok's API only accepted SELF_ONLY for
                     # an unaudited app (see the identical fix in video_publish_service.py).
-                    platform_config = {"tiktok": {"postMode": "DIRECT_POST", "privacyLevel": "PUBLIC_TO_EVERYONE"}}
+                    tiktok_config = {"postMode": "DIRECT_POST", "privacyLevel": "PUBLIC_TO_EVERYONE"}
+                    # Music PRD (MUS-PRD-01) §2.2/§8, resolved: TikTok's Content Posting
+                    # API has NO track-selection field for photo/carousel posts (verified
+                    # against TikTok's own docs, 2026-09-15) — only this boolean, which
+                    # triggers TikTok's own automatic pick. Outstand's own docs confirm
+                    # it's "a photo-only option that is ignored for videos", so gating on
+                    # `not draft.get("video_url")` here is belt-and-suspenders, not load-
+                    # bearing — but it keeps the field meaning honest (never sent for a
+                    # video draft this endpoint is publishing).
+                    if not draft.get("video_url") and draft.get("tiktok_auto_add_music"):
+                        tiktok_config["autoAddMusic"] = True
+                    platform_config = {"tiktok": tiktok_config}
 
                 print(f"📤 Publishing via Outstand | account_id={connection.get('outstand_account_id')} platform={platform} has_image={bool(media_urls)} thread={bool(tweets and len(tweets) > 1)}")
                 result = await outstand.publish_post(
