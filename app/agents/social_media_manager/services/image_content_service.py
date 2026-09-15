@@ -43,6 +43,10 @@ class ImageContentService:
             "post_portrait": {"width": 1080, "height": 1350, "format": "portrait"},
             "story": {"width": 1080, "height": 1920, "format": "story"},
             "profile_image": {"width": 320, "height": 320, "format": "square"}
+        },
+        "tiktok": {
+            "post_image": {"width": 1080, "height": 1920, "format": "portrait"},
+            "profile_image": {"width": 200, "height": 200, "format": "square"}
         }
     }
 
