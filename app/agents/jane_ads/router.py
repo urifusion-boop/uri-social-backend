@@ -4243,157 +4243,65 @@ async def corpus_upload(
             os.unlink(tmp_path)
 
 
-@router.get("/debug/vsg01-news-headline-prompt", include_in_schema=False)
-async def _debug_vsg01_news_headline_prompt(
-    request: Request,
-    business_name: str = "Test Business",
-    category: str = "",
-    description: str = "",
-    brand_colors: str = "",
+@router.post("/admin/seed-vsg01-corpus", include_in_schema=False)
+async def _admin_seed_vsg01_corpus(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
 ) -> dict:
-    """TEMPORARY — returns the EXACT, real final prompt News Headline would
-    send to gpt-image-2 for a given brief, using a REAL content-model call
-    for announcement_subject (not a hand-picked example) — so it can be
-    handed to the user for a genuine side-by-side GPT comparison, same
-    rigor as the prompt already given earlier this session. Does NOT call
-    the image model itself (cheap/fast — just the content step + prompt
-    assembly). brand_colors: comma-separated hex, optional. Same secret-
-    gated pattern as this session's other diagnostics; remove after use."""
-    if request.headers.get("X-Bootstrap-Secret") != "vsg01-corpus-bootstrap-2026-dev-only":
-        raise HTTPException(status_code=404, detail="Not Found")
-    from .vsg01_orchestrator import _content_news_headline, _CANVAS_SIZE
-    from .ad_formats.news_headline import _scene_prompt
-    from .layer2_generation import COMPOSITION_DIRECTIVE, TYPOGRAPHY_DIRECTIVE, GLOBAL_NEGATIVE_PROMPT, _resolve_ratio_clause, brand_palette_clause
+    """ONE-OFF PRODUCTION BOOTSTRAP — mirrors migrations/seed_and_approve_vsg01_corpus.py
+    exactly, but runs inside the deployed app (using the same get_db_dependency every
+    real request uses) instead of needing direct network access to the DocumentDB
+    cluster, which is VPC-private and unreachable from outside. Idempotent — safe to
+    call more than once: records already ingested are left alone, and only records
+    not yet approved get approved.
 
-    content = await _content_news_headline(business_name, category, description)
-    if not content:
-        return {"success": False, "error": "content model returned nothing usable for this description"}
+    Gated by _require_ads_admin — a real authenticated caller whose own JWT email is
+    on JANE_ADS_ADMIN_EMAILS, the same allowlist the billing report above already
+    uses — not a shared static secret. approved_by is the caller's own verified
+    email (corpus.py's own rule: ingestion can never self-approve; this way it can
+    never be spoofed to a placeholder). Remove this endpoint once the corpus is
+    confirmed seeded and approved in prod."""
+    _require_ads_admin(token)
+    approved_by = ((token.get("claims", {}) or {}).get("email") or "").lower()
 
-    brand_context = {"brand_colors": [c.strip() for c in brand_colors.split(",") if c.strip()]} if brand_colors else None
-    scene = _scene_prompt(content["announcement_subject"], content["nigerian_setting"])
-    width, height = _CANVAS_SIZE
-    ratio_clause = _resolve_ratio_clause(f"{width}x{height}")
-    palette_clause = brand_palette_clause(brand_context)
-    fixed_suffix = (
-        f" {ratio_clause}"
-        f"{' ' + palette_clause if palette_clause else ''}"
-        f" {COMPOSITION_DIRECTIVE} {TYPOGRAPHY_DIRECTIVE} {GLOBAL_NEGATIVE_PROMPT}"
-    )
+    from .entities import StrategyStatus
+    from .store import MongoStrategyStore
+    from .vsg01_corpus_seed import build_vsg01_strategies
+
+    store = MongoStrategyStore(db)
+    await store.ensure_indexes()
+
+    strategies = build_vsg01_strategies()
+    to_ingest, to_approve, already_approved = [], [], []
+    for s in strategies:
+        existing = await store.get(s.strategy_id, s.version)
+        if existing is None:
+            to_ingest.append(s)
+            to_approve.append(s)
+        elif existing.status is StrategyStatus.APPROVED:
+            already_approved.append(s.strategy_id)
+        else:
+            to_approve.append(s)
+
+    for s in to_ingest:
+        await store.ingest(s)
+    for s in to_approve:
+        await store.approve(s.strategy_id, s.version, approved_by=approved_by)
+
+    approved = await store.fetch_approved()
+    vsg01_ids = {s.strategy_id for s in strategies}
+    live = sorted(r.strategy_id for r in approved if r.strategy_id in vsg01_ids)
+
     return {
         "success": True,
-        "content": content,
-        "full_prompt": f"{scene.strip()}{fixed_suffix}",
+        "approved_by": approved_by,
+        "newly_ingested": [s.strategy_id for s in to_ingest],
+        "newly_approved": [s.strategy_id for s in to_approve],
+        "already_approved_before_this_call": already_approved,
+        "total_live_now": len(live),
+        "total_expected": len(strategies),
+        "live_strategy_ids": live,
     }
-
-
-@router.get("/debug/vsg01-select-trace", include_in_schema=False)
-async def _debug_vsg01_select_trace(
-    request: Request,
-    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-    business_name: str = "Test Business",
-    category: str = "",
-    description: str = "",
-    forced_format_id: str = "",
-    render: bool = False,
-    brand_colors: str = "",
-) -> dict:
-    """TEMPORARY — trace exactly what select_ranked_ad_formats/
-    select_and_render_vsg01_creative do for a given description + optional
-    forced_format_id, WITHOUT going through the frontend's multi-step chat
-    state. render=true additionally does a REAL render via
-    select_and_render_vsg01_creative (the exact function the real chat flow
-    calls) and returns the image URL, to inspect the raw generated asset
-    directly — e.g. a live report that the photo itself has a large empty
-    gap the fixed scene-prompt wording was supposed to prevent. Same
-    secret-gated pattern as this session's other diagnostics; remove after
-    use."""
-    if request.headers.get("X-Bootstrap-Secret") != "vsg01-corpus-bootstrap-2026-dev-only":
-        raise HTTPException(status_code=404, detail="Not Found")
-    from .vsg01_orchestrator import (
-        VSG01_ISOLATED_AD_ACCOUNT, NO_PHOTO_FORMAT_IDS, select_and_render_vsg01_creative,
-        select_ranked_ad_formats,
-    )
-    ranked = await select_ranked_ad_formats(
-        db, isolated_ad_account=VSG01_ISOLATED_AD_ACCOUNT,
-        candidate_ids=NO_PHOTO_FORMAT_IDS, description=description,
-    )
-    result = {
-        "ranked_ids_in_order": [s.strategy_id for s in ranked],
-        "forced_format_id_would_be_honored": forced_format_id in {s.strategy_id for s in ranked} if forced_format_id else None,
-    }
-    if render:
-        import time
-        import traceback
-        from .creative import _upload_bytes_to_cloudinary
-        try:
-            brand_context = (
-                {"brand_colors": [c.strip() for c in brand_colors.split(",") if c.strip()]}
-                if brand_colors else None
-            )
-            vsg01_result = await select_and_render_vsg01_creative(
-                db, business_name, category, description,
-                brand_context=brand_context, forced_format_id=forced_format_id or None,
-            )
-            if vsg01_result is None:
-                result["render"] = {"success": False, "error": "select_and_render_vsg01_creative returned None"}
-            else:
-                image_url = await _upload_bytes_to_cloudinary(
-                    vsg01_result["png_bytes"], f"vsg01-trace-{int(time.time())}",
-                )
-                result["render"] = {"success": True, "format_id": vsg01_result["format_id"], "image_url": image_url}
-        except Exception as e:
-            result["render"] = {"success": False, "error": str(e), "traceback": traceback.format_exc()}
-    return result
-
-
-@router.get("/debug/organic-prompt-sample", include_in_schema=False)
-async def _debug_organic_prompt_sample(request: Request, style: str = "afro_glam") -> dict:
-    """TEMPORARY — call the EXISTING organic-content image-brief generator
-    (image_content_service.py's _generate_image_brief, the system already
-    used for regular social posts) with a realistic Nigerian brand context,
-    to produce one REAL example prompt for direct side-by-side comparison
-    against a VSG-01 ad prompt — same request that produced the VSG-01
-    sample, now asking to see the organic system's equivalent output
-    rather than a description of how it works. Same secret-gated pattern
-    as this session's other diagnostics; remove after use."""
-    if request.headers.get("X-Bootstrap-Secret") != "vsg01-corpus-bootstrap-2026-dev-only":
-        raise HTTPException(status_code=404, detail="Not Found")
-    from app.agents.social_media_manager.services.image_content_service import ImageContentService
-    from app.agents.social_media_manager.services.style_library import STYLES
-
-    style_entry = STYLES.get(style)
-    if style_entry is None:
-        return {"success": False, "error": f"unknown style {style!r}", "available": list(STYLES.keys())}
-
-    brand_context = {
-        "brand_name": "Naija Glow Cosmetics",
-        "industry": "beauty_wellness",
-        "tagline": "Glow that speaks your language",
-        "business_description": "We make natural, locally-sourced skincare and haircare for Nigerian skin and climate.",
-        "key_products_services": ["shea butter body cream", "black soap", "herbal hair pomade"],
-        "brand_colors": ["#CD1B78", "#F5A623", "#1A1A1A"],
-        "brand_voice": "warm, confident, proudly Nigerian",
-        "target_audience": "young Nigerian women aged 20-35 who care about natural beauty",
-        "ideal_customer_profile": "a Lagos professional who wants effective skincare rooted in local ingredients",
-        "audience_age_range": "20-35",
-        "primary_goal": "build a loyal, proud local beauty brand",
-        "region": "Lagos, Nigeria",
-    }
-    try:
-        result = await ImageContentService._generate_image_brief(
-            content="We're opening a new branch in Yaba on 1 October, tell people about it",
-            seed_content="new branch opening announcement",
-            platform="instagram",
-            brand_context=brand_context,
-            specs={"format": "square"},
-            style_fragment=style_entry["prompt_fragment"],
-        )
-        if result is None:
-            return {"success": False, "error": "_generate_image_brief returned None — check server logs"}
-        return {"success": True, "style_used": style_entry["name"], **result}
-    except Exception as e:
-        import traceback
-        return {"success": False, "error": str(e), "traceback": traceback.format_exc()}
 
 
 @router.get("/corpus/upload", response_class=HTMLResponse, include_in_schema=False)
