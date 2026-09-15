@@ -326,6 +326,12 @@ app.include_router(jane_router, prefix="/social-media", tags=["Jane's First Mess
 from app.agents.jane_ads.router import router as jane_ads_router
 app.include_router(jane_ads_router)
 
+# Content Calendar V2 (30-day content intelligence engine) — replaces v1 as the
+# visible Calendar tab; v1's own routes/service are untouched underneath (still
+# used directly by V2's service module, see content_calendar_v2_service.py).
+from app.agents.content_calendar_v2.routers.content_calendar_v2_router import router as content_calendar_v2_router
+app.include_router(content_calendar_v2_router, prefix="/social-media/content-calendar-v2", tags=["Content Calendar V2"])
+
 # Include multi-tenant routers (Enterprise/SDK features)
 app.include_router(client_router)
 app.include_router(workspace_router)
