@@ -216,6 +216,16 @@ class TeamMemberRequest(BaseModel):
     email: str
     role: str = "Editor"
 
+class BusinessPulseRequest(BaseModel):
+    """Time-sensitive 'what's happening right now' fields, saved as a unit from
+    their own dedicated panel/endpoint — see /brand-profile/business-pulse."""
+    current_period_goal: Optional[str] = None
+    current_promotions: Optional[List[str]] = None
+    current_campaigns: Optional[List[str]] = None
+    business_news_announcements: Optional[List[str]] = None
+    recent_milestones: Optional[List[str]] = None
+    new_products_services: Optional[List[str]] = None
+
 class BrandProfileRequest(BaseModel):
     # Basics
     brand_name: Optional[str] = None
@@ -224,6 +234,11 @@ class BrandProfileRequest(BaseModel):
     tagline: Optional[str] = None
     product_description: Optional[str] = None
     key_products_services: Optional[List[str]] = None
+    # Business Details
+    price_range: Optional[str] = None
+    unique_selling_proposition: Optional[str] = None
+    business_stage: Optional[str] = None  # "" | new | growing | established | market_leader
+    business_priorities: Optional[List[str]] = None
     # Identity
     logo_url: Optional[str] = None
     logo_position: Optional[str] = None  # top_left | top_center | top_right | bottom_left | bottom_center | bottom_right | center
@@ -248,6 +263,16 @@ class BrandProfileRequest(BaseModel):
     primary_goal: Optional[str] = None
     target_audience: Optional[str] = None
     ideal_customer_profile: Optional[str] = None
+    # Target Customer Detail — additive to target_audience/ideal_customer_profile above
+    customer_gender: Optional[str] = None
+    customer_location: Optional[str] = None
+    customer_occupation: Optional[str] = None
+    customer_income_level: Optional[str] = None
+    customer_interests: Optional[List[str]] = None
+    customer_pain_points: Optional[List[str]] = None
+    customer_needs: Optional[List[str]] = None
+    customer_objections: Optional[List[str]] = None
+    why_customers_choose_us: Optional[str] = None
     # Competitors
     competitor_handles: Optional[List[str]] = None
     # Scheduling
@@ -267,12 +292,26 @@ class BrandProfileRequest(BaseModel):
     region: Optional[str] = None
     # Meta
     onboarding_completed: Optional[bool] = False
+    # Onboarding save-and-resume — the step's NAME (e.g. "targetCustomerDetail"),
+    # not a numeric index; see BrandProfileService.save() for why.
+    onboarding_current_step: Optional[str] = None
     # Visual style
     style_selections: Optional[List[str]] = None
     style_prompt_fragments: Optional[List[str]] = None
     style_rotation_index: Optional[int] = None
+    ad_format_selections: Optional[List[str]] = None
+    ad_format_rotation_index: Optional[int] = None
     selected_custom_guides: Optional[List[str]] = None  # Custom visual guide V1 IDs (array)
     selected_custom_guides_v2: Optional[List[str]] = None  # Custom visual guide V2 IDs (array)
+    # Per-platform visual style overrides — additive, optional. A platform
+    # with no entry (or an empty list) falls back to the flat fields above
+    # unchanged; see _generate_image_bg for the resolution rule. Keyed by
+    # the same platform strings _generate_image_bg's own `platform` param
+    # receives (instagram/facebook/linkedin/twitter/...).
+    style_selections_by_platform: Optional[Dict[str, List[str]]] = None
+    selected_custom_guides_by_platform: Optional[Dict[str, List[str]]] = None
+    selected_custom_guides_v2_by_platform: Optional[Dict[str, List[str]]] = None
+    style_rotation_index_by_platform: Optional[Dict[str, int]] = None
     # Typography
     font_style: Optional[str] = None
     font_style_prompt: Optional[str] = None
@@ -5436,6 +5475,46 @@ async def save_brand_profile(
                 for tm in payload["team_members"]
             ]
         return await BrandProfileService.save(user_id, payload, db, brand_id=ctx["brand_id"])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/brand-profile/business-pulse")
+async def get_business_pulse(
+    ctx: dict = Depends(get_flexible_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """
+    Get just the Business Pulse fields (current promotions/campaigns/news/
+    milestones/new products) + freshness for the active brand — a separate,
+    higher-frequency surface from the main brand profile, see save_business_pulse.
+    """
+    try:
+        profile_result = await BrandProfileService.get(ctx["user_id"], db, brand_id=ctx["brand_id"])
+        profile = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
+        updated_at = (profile or {}).get("business_pulse_updated_at")
+        return UriResponse.get_single_data_response("business_pulse", {
+            **((profile or {}).get("business_pulse") or {}),
+            "updated_at": updated_at.isoformat() if updated_at else None,
+        })
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/brand-profile/business-pulse")
+async def save_business_pulse(
+    request: BusinessPulseRequest,
+    ctx: dict = Depends(get_flexible_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """
+    Save the Business Pulse panel. Only ever touches business_pulse.* — never
+    the other ~50 brand profile fields, since this is a separate, more
+    frequently-hit surface than the main onboarding wizard/Playbook save.
+    """
+    try:
+        payload = {"business_pulse": request.dict(exclude_none=True)}
+        return await BrandProfileService.save(ctx["user_id"], payload, db, brand_id=ctx["brand_id"])
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
