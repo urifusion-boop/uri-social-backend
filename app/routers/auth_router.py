@@ -267,6 +267,9 @@ async def google_auth(body: GoogleAuthRequest, db: AsyncIOMotorDatabase = Depend
             "lastName": last_name,
             "trial": trial_status,
             "is_new_user": is_new_user,
+            # A returning Google user may have since set a password via /forgot-password
+            # (a brand-new signup here never has one yet — password is None at insert).
+            "hasPassword": bool(existing.get("password")) if existing else False,
         },
     }
 
@@ -274,7 +277,10 @@ async def google_auth(body: GoogleAuthRequest, db: AsyncIOMotorDatabase = Depend
 @router.post("/login")
 async def login(body: LoginRequest, db: AsyncIOMotorDatabase = Depends(get_db_dependency)):
     user = await db["users"].find_one({"email": body.email})
-    if not user or not pwd_context.verify(body.password, user["password"]):
+    # Google-only accounts have password=None (never set one yet) — verify() would
+    # raise on a non-string hash instead of just failing the check, turning a normal
+    # "wrong credentials" case into a 500. Same "Invalid email or password" either way.
+    if not user or not user.get("password") or not pwd_context.verify(body.password, user["password"]):
         raise HTTPException(status_code=401, detail="Invalid email or password.")
 
     user_id = user.get("userId") or str(user["_id"])
@@ -351,6 +357,9 @@ async def login(body: LoginRequest, db: AsyncIOMotorDatabase = Depends(get_db_de
             "firstName": user.get("first_name", ""),
             "lastName": user.get("last_name", ""),
             "emailVerified": user.get("email_verified", False),
+            # Whether this account can log in with email+password at all — Google-only
+            # signups start with password=None and only gain one via /forgot-password.
+            "hasPassword": bool(user.get("password")),
         },
     }
 
@@ -564,12 +573,12 @@ async def forgot_password(body: ForgotPasswordRequest, db: AsyncIOMotorDatabase 
             "responseData": {},
         }
 
-    # Don't allow password reset for Google OAuth users
-    if user.get("auth_provider") == "google":
-        raise HTTPException(
-            status_code=400,
-            detail="This account uses Google sign-in. Please use Google to log in."
-        )
+    # Google-signup accounts have no password (auth_provider == "google", password is
+    # None) but this endpoint is exactly how they set one for the first time — it's
+    # the same email+code verification as any reset, just resulting in a password
+    # existing where none did before, rather than replacing one. This is the *only*
+    # path to a password for such an account, so it must not be blocked; they keep
+    # Google sign-in working too since nothing here touches auth_provider.
 
     # Generate 6-digit reset code
     reset_code = ''.join([str(random.randint(0, 9)) for _ in range(6)])
@@ -679,11 +688,16 @@ async def change_password(
     if not user:
         raise HTTPException(status_code=404, detail="User not found.")
 
-    # Don't allow password change for Google OAuth users
-    if user.get("auth_provider") == "google":
+    # "Change" requires an existing password to change FROM — a Google-signup account
+    # that has never set one (password is None) has to use /forgot-password instead
+    # (the only path that can create a first password for such an account). Once they
+    # do, this same account uses change-password normally from then on — gating on
+    # whether a password actually exists, not the static auth_provider set at signup,
+    # since Google sign-in keeps working either way.
+    if not user.get("password"):
         raise HTTPException(
             status_code=400,
-            detail="This account uses Google sign-in and doesn't have a password."
+            detail="This account doesn't have a password yet. Use 'Forgot password' to set one."
         )
 
     # Verify old password
