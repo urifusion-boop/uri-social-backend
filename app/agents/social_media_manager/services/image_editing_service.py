@@ -85,9 +85,16 @@ If you are uncertain whether something should change, DO NOT change it.
             Category: 'text_edit', 'style_edit', 'content_edit', or 'full_redesign'
         """
         try:
-            from app.domain.requests.ai_request import AIRequest
-
-            ai_request = AIRequest(
+            # AIService.build_ai_model + chat_completion is this codebase's actual
+            # interface (see e.g. content_calendar_service.py) — this previously
+            # imported a class/module (app.domain.requests.ai_request.AIRequest)
+            # that doesn't exist anywhere in the codebase, so every call landed in
+            # the except block below and silently returned 'content_edit' every
+            # time, regardless of what the user actually typed. That only stayed
+            # hidden because the quick-category buttons (Text/Colours/etc.) force
+            # their own category and skip the classifier entirely — only the
+            # free-text "Other" button ever depended on this actually working.
+            ai_request = AIService.build_ai_model(
                 model="gpt-4o-mini",
                 messages=[
                     {
