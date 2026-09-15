@@ -65,6 +65,10 @@ appear in the original image:
 - Background treatment (UNLESS the edit specifically targets background)
 - All decorative elements and design details
 - Margins and spacing between elements
+- The brand logo/badge exactly as it appears — do not remove, resize,
+  move, redraw, or replace it, and never invent or substitute a
+  different logo or business name anywhere in the image, even if the
+  edit touches nearby text
 
 Change ONLY what is explicitly requested below.
 
@@ -167,6 +171,13 @@ DO NOT PRESERVE TEXT - ALL TEXT MUST BE REPLACED:
 - This includes large prominent text, small text, top text, bottom text, side text
 - Do not keep any old text visible anywhere in the image
 - The text content is being completely updated
+
+EXCEPTION — THE BRAND LOGO/BADGE IS NOT TEXT TO REPLACE:
+- If a brand logo or badge (a small graphic mark, often in a corner)
+  appears in the image, leave it and any wordmark inside it completely
+  untouched — it is brand identity, not editable post copy
+- Never invent, substitute, or draw a different logo, business name,
+  or brand mark anywhere in the image
 
 NEW TEXT CONTENT (replace all existing text with this):
 
@@ -578,11 +589,35 @@ RULES FOR THIS EDIT:
             print(f"[EDIT] Original size: {original_width}x{original_height}")
             print(f"[EDIT] Target size (rounded to 16): {size}")
 
+            # The edit API sometimes redraws or hallucinates a different logo when
+            # it touches nearby elements (e.g. a text_edit rewriting a headline can
+            # sweep up the logo's wordmark too, live-confirmed producing a totally
+            # different brand's logo in the output) — PRESERVE_BLOCK/text-edit
+            # prompt now say not to, but that's advisory, not guaranteed. So, same
+            # as the original generation path, deterministically re-composite the
+            # REAL logo back on top after editing rather than trust the model drew
+            # it correctly. Scoped via the draft's own stamped brand_id (set at
+            # generation time by generate_content's per-brand isolation tagging)
+            # so this can never pull a different brand's logo onto this draft.
+            logo_url = logo_position = logo_size = None
+            try:
+                from .brand_profile_service import BrandProfileService
+                profile_result = await BrandProfileService.get(user_id, db, brand_id=draft.get("brand_id"))
+                profile = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
+                logo_url = (profile or {}).get("logo_url") or None
+                logo_position = (profile or {}).get("logo_position", "bottom_right")
+                logo_size = (profile or {}).get("logo_size", "small")
+            except Exception as e:
+                print(f"[EDIT] Could not fetch brand logo for re-composite: {e}")
+
             edited_image_url = await ImageEditingService._call_edit_api(
                 image_bytes=image_bytes,
                 prompt=edit_prompt,
                 size=size,
-                exact_dimensions=(original_width, original_height)
+                exact_dimensions=(original_width, original_height),
+                logo_url=logo_url,
+                logo_position=logo_position,
+                logo_size=logo_size,
             )
 
             if not edited_image_url:
@@ -681,7 +716,10 @@ RULES FOR THIS EDIT:
         image_bytes: bytes,
         prompt: str,
         size: str = "1024x1024",
-        exact_dimensions: Optional[tuple] = None
+        exact_dimensions: Optional[tuple] = None,
+        logo_url: Optional[str] = None,
+        logo_position: Optional[str] = None,
+        logo_size: Optional[str] = None,
     ) -> Optional[str]:
         """
         Call OpenAI images.edit API with GPT-Image-2
@@ -745,6 +783,22 @@ RULES FOR THIS EDIT:
                 if (edit_w, edit_h) != (exact_w, exact_h):
                     print(f"🔄 Resizing edited image from {edit_w}×{edit_h} to {exact_w}×{exact_h} (exact platform dimensions)")
                     edited_image = edited_image.resize((exact_w, exact_h), Image.LANCZOS)
+
+            # Deterministically re-composite the REAL brand logo on top, exactly
+            # like the original generation path does — never trust the edit model
+            # to have preserved (or correctly redrawn) it. See the caller for why.
+            if logo_url:
+                from app.agents.social_media_manager.services.image_content_service import ImageContentService
+                pre_logo_buffer = io.BytesIO()
+                edited_image.save(pre_logo_buffer, format="PNG")
+                pre_logo_b64 = base64.b64encode(pre_logo_buffer.getvalue()).decode()
+                relogo_b64 = await loop.run_in_executor(
+                    None,
+                    lambda: ImageContentService._overlay_logo(
+                        pre_logo_b64, logo_url, logo_position or "bottom_right", logo_size or "small"
+                    )
+                )
+                edited_image = Image.open(io.BytesIO(base64.b64decode(relogo_b64))).convert("RGB")
 
             webp_buffer = io.BytesIO()
             edited_image.save(webp_buffer, format="WEBP", quality=95, method=6)
