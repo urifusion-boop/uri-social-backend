@@ -381,6 +381,31 @@ ANTI_BORING_PHRASES: List[str] = [
     "looking for the best",
     "at {brand}, we believe",  # brand-name placeholder checked separately
     "we believe",
+    # URI Content Calendar Generation addendum §10 — the generic-AI-headline
+    # list, phrased as they'd actually appear opening a line rather than as
+    # bare single words (a bare "discover"/"master" would false-positive on
+    # completely ordinary sentences; these fragments stay tied to the
+    # specific pattern the addendum is calling out).
+    "unlock the",
+    "unlock your",
+    "discover the",
+    "discover how",
+    "learn how to",
+    "the ultimate guide to",
+    "everything you need to know",
+    "5 powerful ways",
+    "5 game-changing",
+    "here's why",
+    "why you need",
+    "the secret to",
+    "transform your",
+    "take your business to the next level",
+    "boost your",
+    "elevate your",
+    "master your",
+    "supercharge your",
+    "revolutionise your",
+    "revolutionize your",
 ]
 
 
