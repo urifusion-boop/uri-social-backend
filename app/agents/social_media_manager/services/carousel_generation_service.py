@@ -96,9 +96,15 @@ class CarouselGenerationService:
         platform: str,
         brand_context: Optional[Dict[str, Any]] = None,
         num_slides: int = 3,
+        force_num_slides: bool = False,
     ) -> Dict[str, Any]:
         """
         Generate carousel content for a single platform.
+
+        force_num_slides: skip the content-based slide-count detection and use
+        num_slides exactly (still capped 2-10). Calendar V2 sets this — its
+        pipeline already decided the slide count deterministically and the
+        draft must not silently expand a 3-slide idea into 7.
 
         Returns:
             {
@@ -113,22 +119,19 @@ class CarouselGenerationService:
         industry = bc.get("industry", "")
         target_audience = bc.get("target_audience", "")
 
-        # Analyze content to classify it as list/short/story — used below only
-        # to frame the prompt structure (numbered list vs. narrative build),
-        # never to override the caller's requested slide count.
+        # Analyze content to determine optimal slide count
         content_analysis = CarouselGenerationService.analyze_content_type(seed_content)
 
-        # Always honor the caller's requested slide count. This used to treat
-        # num_slides == 3 as a sentinel meaning "no preference, auto-detect
-        # optimal_slides instead" — but the only real caller
-        # (complete_social_manager.py, backing the UI's 2/3/4/5 slide-count
-        # picker) always sends an explicit, deliberate value, including 3,
-        # which is indistinguishable from that sentinel. Every genuine
-        # "3 slides" request was silently overridden by an auto-detected
-        # count (commonly 5 or 7 for narrative content) — confirmed live,
-        # reproducible for any user requesting exactly 3 slides on content
-        # long enough to hit the "story" detection path.
-        num_slides = max(2, min(10, num_slides))
+        # Override num_slides with intelligent detection (unless explicitly forced)
+        # If user explicitly requested a count, respect it. Otherwise use detected optimal.
+        if force_num_slides:
+            # Caller decided the count deliberately — respect it exactly.
+            num_slides = max(2, min(10, num_slides))
+        elif num_slides == 3:  # Default value, use intelligent detection
+            num_slides = content_analysis["optimal_slides"]
+        else:
+            # User specified custom count, but cap it
+            num_slides = max(2, min(10, num_slides))
 
         print(f"📊 Carousel analysis: type={content_analysis['type']}, optimal_slides={content_analysis['optimal_slides']}, using={num_slides}")
 
@@ -168,7 +171,9 @@ This is a {content_analysis['type'].upper()} carousel. Build a cohesive narrativ
             "Rules:\n"
             "- Each headline: ≤8 words, punchy and bold\n"
             "- Each body: ≤25 words, clear and scannable\n"
-            "- Overall caption: engaging hook + relevant hashtags, suitable for the platform\n"
+            "- Overall caption: engaging hook, suitable for the platform\n"
+            "- End the caption with 3-6 relevant, specific hashtags (not generic ones like #social "
+            "or #post) — always include hashtags, this is not optional\n"
             "- The carousel must tell a complete, cohesive story from slide 1 to slide N\n"
             "- Each slide must build on the previous slide\n"
             "- Return ONLY valid JSON — no markdown, no extra text\n\n"
@@ -196,8 +201,16 @@ This is a {content_analysis['type'].upper()} carousel. Build a cohesive narrativ
             raw = response.choices[0].message.content or "{}"
             data = json.loads(raw)
 
-            caption = data.get("caption", "")
+            caption_raw = data.get("caption", "")
             slides_raw = data.get("slides", [])
+
+            # Same convention as feed/story posts: hashtags live in their own
+            # field, not mixed into the displayed caption text. DraftCard only
+            # renders the hashtag pills from this separate list, so without
+            # this extraction step carousels silently showed no hashtags at
+            # all even when the model did include them in the caption string.
+            from .content_generation_service import ContentGenerationService
+            caption, hashtags = ContentGenerationService._extract_and_clean_hashtags(caption_raw, platform)
 
             # Normalise slides and add slide_number
             slides: List[Dict[str, str]] = []
@@ -218,6 +231,7 @@ This is a {content_analysis['type'].upper()} carousel. Build a cohesive narrativ
 
             return {
                 "caption": caption,
+                "hashtags": hashtags,
                 "slides": slides,
                 "content_analysis": content_analysis
             }
@@ -235,6 +249,7 @@ This is a {content_analysis['type'].upper()} carousel. Build a cohesive narrativ
             ]
             return {
                 "caption": seed_content[:200],
+                "hashtags": [],
                 "slides": slides,
                 "content_analysis": content_analysis
             }
@@ -284,6 +299,7 @@ This is a {content_analysis['type'].upper()} carousel. Build a cohesive narrativ
         brand_context: Optional[Dict[str, Any]] = None,
         num_slides: int = 3,
         db=None,
+        force_num_slides: bool = False,
     ) -> Dict[str, Any]:
         """
         Generate carousel content for multiple platforms and persist drafts to DB.
@@ -302,6 +318,7 @@ This is a {content_analysis['type'].upper()} carousel. Build a cohesive narrativ
                 platform=platform,
                 brand_context=brand_context,
                 num_slides=num_slides,
+                force_num_slides=force_num_slides,
             )
 
             draft_id = str(uuid.uuid4())
@@ -325,7 +342,7 @@ This is a {content_analysis['type'].upper()} carousel. Build a cohesive narrativ
                 "content": carousel_data["caption"],
                 "post_type": "carousel",
                 "slides": slides_with_specs,
-                "hashtags": [],
+                "hashtags": carousel_data.get("hashtags", []),
                 "status": "draft",
                 "approval_status": "pending",
                 "has_image": False,
