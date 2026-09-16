@@ -49,7 +49,7 @@ class FakeCollection:
 
 class FakeIdentityCollection:
     """A single cached doc, looked up by advertiser_id — mirrors the shape
-    _get_or_create_identity actually uses (jane_ads_tiktok_identity)."""
+    _get_authorized_identity actually uses (jane_ads_tiktok_identity)."""
 
     def __init__(self):
         self.doc: dict | None = None
@@ -109,13 +109,18 @@ def _adapter(db=None) -> TikTokAdsAdapter:
     return TikTokAdsAdapter(db or FakeDb(), advertiser_id="adv123", access_token="tok")
 
 
-# campaign, video upload, ad group, identity logo upload, identity create, ad — 6 calls total.
+# campaign(POST), video upload(POST), ad group(POST), identity lookup(GET), ad(POST)
+# — 5 calls total. Identity lookup replaced the old logo-upload+identity-create
+# POST pair after TikTok deprecated Custom Identity (see adapters/tiktok.py's
+# module comment) — now a single GET /identity/get/ call instead.
 _HAPPY_RESPONSES = [
     {"code": 0, "message": "OK", "data": {"campaign_id": "111"}},
     {"code": 0, "message": "OK", "data": [{"video_id": "vid_999"}]},
     {"code": 0, "message": "OK", "data": {"adgroup_id": "222"}},
-    {"code": 0, "message": "OK", "data": {"image_id": "img_888"}},
-    {"code": 0, "message": "OK", "data": {"identity_id": "identity_777"}},
+    {"code": 0, "message": "OK", "data": {"identity_list": [
+        {"identity_id": "identity_777", "available_status": "AVAILABLE",
+         "username": "uri.creative", "display_name": "uricreative"},
+    ]}},
     {"code": 0, "message": "OK", "data": {"ad_ids": ["333"]}},
 ]
 
@@ -143,7 +148,8 @@ def test_launch_campaign_happy_path_full_call_sequence():
     assert result.campaign_id == "111"
     assert result.ad_ids == {"b1": "333"}
     assert result.platforms == [Platform.TIKTOK]
-    assert mock_client.post.call_count == 6
+    assert mock_client.post.call_count == 4
+    assert mock_client.get.call_count == 1
 
     campaign_json = mock_client.post.call_args_list[0].kwargs["json"]
     assert campaign_json["operation_status"] == "DISABLE"
@@ -160,23 +166,19 @@ def test_launch_campaign_happy_path_full_call_sequence():
     assert adgroup_json["bid_type"] == "BID_TYPE_NO_BID"
     assert adgroup_json["pacing"] == "PACING_MODE_SMOOTH"
 
-    image_json = mock_client.post.call_args_list[3].kwargs["json"]
-    assert image_json["upload_type"] == "UPLOAD_BY_URL"
-    assert "image_url" in image_json
+    identity_params = mock_client.get.call_args_list[0].kwargs["params"]
+    assert identity_params["identity_type"] == "BC_AUTH_TT"
+    assert identity_params["advertiser_id"] == "adv123"
 
-    identity_json = mock_client.post.call_args_list[4].kwargs["json"]
-    assert identity_json["display_name"]
-    assert identity_json["image_uri"] == "img_888"
-
-    ad_json = mock_client.post.call_args_list[5].kwargs["json"]
+    ad_json = mock_client.post.call_args_list[3].kwargs["json"]
     assert ad_json["operation_status"] == "DISABLE"
     creative = ad_json["creatives"][0]
     assert creative["video_id"] == "vid_999"
     assert creative["landing_page_url"] == 'https://wa.me/2348031234567?text=Hi%21%20I%20saw%20your%20ad%20and%20I%27m%20interested%20%E2%80%94%20tell%20me%20more%3F'
     assert creative["identity_id"] == "identity_777"
-    assert creative["identity_type"] == "CUSTOMIZED_USER"
+    assert creative["identity_type"] == "BC_AUTH_TT"
 
-    # A second launch must reuse the cached identity — no repeat upload/create calls.
+    # A second launch must reuse the cached identity — no repeat lookup call.
     mock_client2 = _mock_client([
         {"code": 0, "message": "OK", "data": {"campaign_id": "444"}},
         {"code": 0, "message": "OK", "data": [{"video_id": "vid_000"}]},
@@ -187,6 +189,7 @@ def test_launch_campaign_happy_path_full_call_sequence():
         MockClient2.return_value.__aenter__.return_value = mock_client2
         _run(adapter.launch_campaign(_plan(business_id="b2"), _auth()))
     assert mock_client2.post.call_count == 4
+    assert mock_client2.get.call_count == 0
     ad_json_2 = mock_client2.post.call_args_list[3].kwargs["json"]
     assert ad_json_2["creatives"][0]["identity_id"] == "identity_777"
 
