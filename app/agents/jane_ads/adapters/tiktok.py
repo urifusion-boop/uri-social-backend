@@ -45,7 +45,7 @@ from __future__ import annotations
 import json
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Optional, Tuple
 
 import httpx
 
@@ -152,19 +152,23 @@ class TikTokAdsAdapter(AdPlatformAdapter):
         # "Authorization: Bearer", a real difference from both Meta and Google.
         return {"Access-Token": self._access_token, "Content-Type": "application/json"}
 
-    async def _get_authorized_identity(self, client: httpx.AsyncClient) -> str:
-        """Returns the identity_id of the real TikTok account linked in
-        Business Center and authorized for this advertiser account — every
-        ad creative needs one (see the module comment above for why this
-        replaced the old synthetic-identity creation flow). Looked up once
-        via GET /identity/get/ and cached in Mongo; the cache is keyed with
-        _IDENTITY_TYPE so a stale CUSTOMIZED_USER-era doc from before this
-        change is never mistaken for a valid BC_AUTH_TT identity."""
+    async def _get_authorized_identity(self, client: httpx.AsyncClient) -> Tuple[str, str]:
+        """Returns (identity_id, identity_authorized_bc_id) for the real
+        TikTok account linked in Business Center and authorized for this
+        advertiser account — every ad creative needs both (see the module
+        comment above for why this replaced the old synthetic-identity
+        creation flow). Confirmed live (2026-09-16): ad/create rejects a
+        BC_AUTH_TT creative with '"Identity_type" and "Identity_bc_ID" don't
+        match.' if identity_authorized_bc_id is omitted — it's not optional
+        the way it might look from the identity_id alone being unique.
+        Looked up once via GET /identity/get/ and cached in Mongo; the cache
+        is keyed with _IDENTITY_TYPE so a stale CUSTOMIZED_USER-era doc from
+        before this change is never mistaken for a valid BC_AUTH_TT identity."""
         cached = await self._db[_IDENTITY_COLLECTION].find_one(
             {"advertiser_id": self._advertiser_id, "identity_type": _IDENTITY_TYPE}
         )
-        if cached and cached.get("identity_id"):
-            return cached["identity_id"]
+        if cached and cached.get("identity_id") and cached.get("identity_authorized_bc_id"):
+            return cached["identity_id"], cached["identity_authorized_bc_id"]
 
         identity_resp = await client.get(
             f"{self._api_base}/identity/get/",
@@ -181,25 +185,27 @@ class TikTokAdsAdapter(AdPlatformAdapter):
         chosen = next((c for c in candidates if c.get("available_status") == "AVAILABLE"), None) or (
             candidates[0] if candidates else None
         )
-        if not chosen or not chosen.get("identity_id"):
+        if not chosen or not chosen.get("identity_id") or not chosen.get("identity_authorized_bc_id"):
             raise TikTokAdsAPIError(
                 "No TikTok account is linked and authorized for this advertiser account. "
                 "Link one in Business Center → Accounts → TikTok accounts, then authorize it "
                 "for this advertiser account (see the F.I.R.S.T. Presence flow)."
             )
         identity_id = chosen["identity_id"]
+        identity_bc_id = chosen["identity_authorized_bc_id"]
 
         await self._db[_IDENTITY_COLLECTION].update_one(
             {"advertiser_id": self._advertiser_id, "identity_type": _IDENTITY_TYPE},
             {"$set": {
                 "identity_id": identity_id,
+                "identity_authorized_bc_id": identity_bc_id,
                 "username": chosen.get("username"),
                 "display_name": chosen.get("display_name"),
                 "cached_at": datetime.now(timezone.utc),
             }},
             upsert=True,
         )
-        return identity_id
+        return identity_id, identity_bc_id
 
     async def launch_campaign(self, plan: CampaignPlan, auth: SpendAuthorization) -> LaunchResult:
         tiktok_plans = [p for p in plan.platforms if p.platform == Platform.TIKTOK]
@@ -262,7 +268,34 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                 )
                 video_data = video_resp.json()
                 _raise_for_error(video_data, "video upload")
-                video_id = video_data["data"][0]["video_id"] if isinstance(video_data["data"], list) else video_data["data"]["video_id"]
+                video_entry = video_data["data"][0] if isinstance(video_data["data"], list) else video_data["data"]
+                video_id = video_entry["video_id"]
+
+                # 2b. Cover image — confirmed live (2026-09-16): ad/create
+                # rejects a SINGLE_VIDEO creative with "You must upload an
+                # image." without an image_ids entry, even though the ad is
+                # purely a video. Re-upload the video's own auto-generated
+                # cover frame (video_cover_url, returned by the upload above)
+                # as an image asset rather than asking for a second creative
+                # input anywhere upstream — it's a required-but-cosmetic
+                # thumbnail, not a real second asset choice.
+                cover_url = video_entry.get("video_cover_url")
+                if not cover_url:
+                    raise TikTokAdsAPIError(f"video upload returned no video_cover_url: {video_entry}")
+                cover_resp = await client.post(
+                    f"{self._api_base}/file/image/ad/upload/",
+                    headers=self._headers(),
+                    json={
+                        "advertiser_id": self._advertiser_id,
+                        "upload_type": "UPLOAD_BY_URL",
+                        "image_url": cover_url,
+                        "file_name": f"jane-ads-{plan.business_id}-cover-{uuid.uuid4().hex[:8]}.jpg",
+                    },
+                )
+                cover_data = cover_resp.json()
+                _raise_for_error(cover_data, "cover image upload")
+                cover_entry = cover_data["data"][0] if isinstance(cover_data["data"], list) else cover_data["data"]
+                cover_image_id = cover_entry["image_id"]
 
                 # 3. Ad group — the real budget + targeting + schedule live here.
                 # PAUSED via operation_status="DISABLE", same as every other create
@@ -320,7 +353,7 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                 # (who it's posted "as") — the one linked-and-authorized TikTok
                 # account, looked up once (see module comment for the Custom
                 # Identity deprecation this replaced).
-                identity_id = await self._get_authorized_identity(client)
+                identity_id, identity_bc_id = await self._get_authorized_identity(client)
                 ad_resp = await client.post(
                     f"{self._api_base}/ad/create/",
                     headers=self._headers(),
@@ -337,8 +370,19 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                             "ad_name": f"JaneAds-{plan.business_id}-ad",
                             "ad_text": (plan.creative.primary_text or plan.creative.headline or "")[:100],
                             "video_id": video_id,
+                            # Confirmed live (2026-09-16): SINGLE_VIDEO still
+                            # requires a cover image or ad/create fails with
+                            # "You must upload an image." — cover_image_id from
+                            # step 2b (the video's own auto-generated cover
+                            # frame, re-uploaded as an image asset).
+                            "image_ids": [cover_image_id],
                             "identity_id": identity_id,
                             "identity_type": _IDENTITY_TYPE,
+                            # Confirmed live (2026-09-16): required alongside
+                            # identity_id for BC_AUTH_TT — ad/create rejects it
+                            # with '"Identity_type" and "Identity_bc_ID" don't
+                            # match.' without this.
+                            "identity_authorized_bc_id": identity_bc_id,
                             "landing_page_url": dest_link,
                             "call_to_action": "CONTACT_US",
                         }],

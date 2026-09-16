@@ -109,16 +109,20 @@ def _adapter(db=None) -> TikTokAdsAdapter:
     return TikTokAdsAdapter(db or FakeDb(), advertiser_id="adv123", access_token="tok")
 
 
-# campaign(POST), video upload(POST), ad group(POST), identity lookup(GET), ad(POST)
-# — 5 calls total. Identity lookup replaced the old logo-upload+identity-create
-# POST pair after TikTok deprecated Custom Identity (see adapters/tiktok.py's
-# module comment) — now a single GET /identity/get/ call instead.
+# campaign(POST), video upload(POST), cover image upload(POST), ad group(POST),
+# identity lookup(GET), ad(POST) — 6 calls total. Identity lookup replaced the
+# old logo-upload+identity-create POST pair after TikTok deprecated Custom
+# Identity (see adapters/tiktok.py's module comment) — now a single
+# GET /identity/get/ call. Cover image upload is new: confirmed live
+# (2026-09-16) ad/create rejects a SINGLE_VIDEO creative without an
+# image_ids entry ("You must upload an image."), even though it's video-only.
 _HAPPY_RESPONSES = [
     {"code": 0, "message": "OK", "data": {"campaign_id": "111"}},
-    {"code": 0, "message": "OK", "data": [{"video_id": "vid_999"}]},
+    {"code": 0, "message": "OK", "data": [{"video_id": "vid_999", "video_cover_url": "https://cdn.example.com/cover.jpg"}]},
+    {"code": 0, "message": "OK", "data": {"image_id": "img_888"}},
     {"code": 0, "message": "OK", "data": {"adgroup_id": "222"}},
     {"code": 0, "message": "OK", "data": {"identity_list": [
-        {"identity_id": "identity_777", "available_status": "AVAILABLE",
+        {"identity_id": "identity_777", "identity_authorized_bc_id": "bc_555", "available_status": "AVAILABLE",
          "username": "uri.creative", "display_name": "uricreative"},
     ]}},
     {"code": 0, "message": "OK", "data": {"ad_ids": ["333"]}},
@@ -148,7 +152,7 @@ def test_launch_campaign_happy_path_full_call_sequence():
     assert result.campaign_id == "111"
     assert result.ad_ids == {"b1": "333"}
     assert result.platforms == [Platform.TIKTOK]
-    assert mock_client.post.call_count == 4
+    assert mock_client.post.call_count == 5
     assert mock_client.get.call_count == 1
 
     campaign_json = mock_client.post.call_args_list[0].kwargs["json"]
@@ -159,7 +163,11 @@ def test_launch_campaign_happy_path_full_call_sequence():
     assert video_json["upload_type"] == "UPLOAD_BY_URL"
     assert video_json["video_url"] == "https://cdn.example.com/clip.mp4"
 
-    adgroup_json = mock_client.post.call_args_list[2].kwargs["json"]
+    cover_json = mock_client.post.call_args_list[2].kwargs["json"]
+    assert cover_json["upload_type"] == "UPLOAD_BY_URL"
+    assert cover_json["image_url"] == "https://cdn.example.com/cover.jpg"
+
+    adgroup_json = mock_client.post.call_args_list[3].kwargs["json"]
     assert adgroup_json["operation_status"] == "DISABLE"
     assert adgroup_json["budget"] == 70_000
     assert adgroup_json["campaign_id"] == "111"
@@ -170,28 +178,32 @@ def test_launch_campaign_happy_path_full_call_sequence():
     assert identity_params["identity_type"] == "BC_AUTH_TT"
     assert identity_params["advertiser_id"] == "adv123"
 
-    ad_json = mock_client.post.call_args_list[3].kwargs["json"]
+    ad_json = mock_client.post.call_args_list[4].kwargs["json"]
     assert ad_json["operation_status"] == "DISABLE"
     creative = ad_json["creatives"][0]
     assert creative["video_id"] == "vid_999"
+    assert creative["image_ids"] == ["img_888"]
     assert creative["landing_page_url"] == 'https://wa.me/2348031234567?text=Hi%21%20I%20saw%20your%20ad%20and%20I%27m%20interested%20%E2%80%94%20tell%20me%20more%3F'
     assert creative["identity_id"] == "identity_777"
     assert creative["identity_type"] == "BC_AUTH_TT"
+    assert creative["identity_authorized_bc_id"] == "bc_555"
 
     # A second launch must reuse the cached identity — no repeat lookup call.
     mock_client2 = _mock_client([
         {"code": 0, "message": "OK", "data": {"campaign_id": "444"}},
-        {"code": 0, "message": "OK", "data": [{"video_id": "vid_000"}]},
+        {"code": 0, "message": "OK", "data": [{"video_id": "vid_000", "video_cover_url": "https://cdn.example.com/cover2.jpg"}]},
+        {"code": 0, "message": "OK", "data": {"image_id": "img_000"}},
         {"code": 0, "message": "OK", "data": {"adgroup_id": "555"}},
         {"code": 0, "message": "OK", "data": {"ad_ids": ["666"]}},
     ])
     with patch("httpx.AsyncClient") as MockClient2:
         MockClient2.return_value.__aenter__.return_value = mock_client2
         _run(adapter.launch_campaign(_plan(business_id="b2"), _auth()))
-    assert mock_client2.post.call_count == 4
+    assert mock_client2.post.call_count == 5
     assert mock_client2.get.call_count == 0
-    ad_json_2 = mock_client2.post.call_args_list[3].kwargs["json"]
+    ad_json_2 = mock_client2.post.call_args_list[4].kwargs["json"]
     assert ad_json_2["creatives"][0]["identity_id"] == "identity_777"
+    assert ad_json_2["creatives"][0]["identity_authorized_bc_id"] == "bc_555"
 
     record = _run(db["jane_ads_tiktok_campaigns"].find_one({"campaign_id": "111"}))
     assert record["ad_id"] == "333"
@@ -243,12 +255,13 @@ def test_launch_campaign_raises_on_tiktok_error():
 
 def test_launch_campaign_rolls_back_partial_launch_on_failure_and_preserves_original_error():
     adapter = _adapter()
-    # Campaign + video upload succeed, ad group creation fails -> rollback should
-    # DELETE the already-created campaign, and the ORIGINAL error (not a rollback
-    # error) propagates.
+    # Campaign + video + cover image upload succeed, ad group creation fails ->
+    # rollback should DELETE the already-created campaign, and the ORIGINAL
+    # error (not a rollback error) propagates.
     responses = [
         {"code": 0, "message": "OK", "data": {"campaign_id": "111"}},
-        {"code": 0, "message": "OK", "data": [{"video_id": "vid_999"}]},
+        {"code": 0, "message": "OK", "data": [{"video_id": "vid_999", "video_cover_url": "https://cdn.example.com/cover.jpg"}]},
+        {"code": 0, "message": "OK", "data": {"image_id": "img_888"}},
         {"code": 40002, "message": "ad group rejected: invalid location_ids"},
         {"code": 0, "message": "OK"},  # the rollback's own DELETE-status call
     ]
@@ -258,7 +271,7 @@ def test_launch_campaign_rolls_back_partial_launch_on_failure_and_preserves_orig
         with pytest.raises(TikTokAdsAPIError, match="ad group rejected"):
             _run(adapter.launch_campaign(_plan(), _auth()))
 
-    rollback_json = mock_client.post.call_args_list[3].kwargs["json"]
+    rollback_json = mock_client.post.call_args_list[4].kwargs["json"]
     assert rollback_json["operation_status"] == "DELETE"
     assert rollback_json["campaign_ids"] == ["111"]
 
