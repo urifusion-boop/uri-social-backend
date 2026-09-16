@@ -1881,6 +1881,14 @@ class MetaLaunchFromMessageBody(BaseModel):
     # See CreativeForBrandBody's identical field — Day 1 -> Day 30 (SEED-078)
     # only, a second real photo of the same thing at a later point in time.
     reference_image_url_2: str = ""
+    # Explicit user platform choice — additive on top of Jane's own silent
+    # pick, never touching the existing Meta routing/gating. "" (default)
+    # keeps today's behaviour exactly as-is (Jane picks, TikTok only when
+    # she'd have picked it herself). "tiktok" asks for TikTok specifically —
+    # honoured only if TIKTOK_ADS_ADVERTISER_ID/ACCESS_TOKEN are configured
+    # and the creative is video (TikTok's hard requirement); otherwise an
+    # early_return explains why, same shape as every other early_return here.
+    preferred_platform: str = ""          # "" | "tiktok"
 
 
 class _PlanBuildResult(BaseModel):
@@ -2371,16 +2379,35 @@ async def _build_campaign_plan(
     # response for transparency, regardless of what actually launches.
     jane_platforms = [p.platform.value for p in plan.platforms]
     tiktok_ready = bool(settings.TIKTOK_ADS_ADVERTISER_ID and settings.TIKTOK_ADS_ACCESS_TOKEN)
-    jane_picked_tiktok = any(p.platform == Platform.TIKTOK for p in plan.platforms)
-    if jane_picked_tiktok and tiktok_ready:
-        plan.platforms = [p for p in plan.platforms if p.platform == Platform.TIKTOK]
+
+    if body.preferred_platform == "tiktok":
+        # Explicit "give me TikTok" request (MetaLaunchFromMessageBody.
+        # preferred_platform) — purely additive on top of Jane's own silent
+        # pick below; does not touch the Meta routing/gating in the else
+        # branch at all. jane_platforms above still reflects what Jane
+        # would have picked on her own, for the same transparency the
+        # forced_to_meta banner already gives.
+        if not tiktok_ready:
+            return {"early_return": {"stage": "tiktok_not_configured", "understood": parsed.model_dump(),
+                    "question": "TikTok Ads isn't connected yet — try again shortly, or drop the TikTok "
+                                 "request and I'll use what's available."}}
+        if not (plan.creative and plan.creative.has_video):
+            return {"early_return": {"stage": "tiktok_needs_video", "understood": parsed.model_dump(),
+                    "question": "TikTok only runs video ads. Upload or generate a video for this "
+                                 "campaign, then ask for TikTok again."}}
+        plan = apply_platform_override(plan, [Platform.TIKTOK])
         forced_to_meta = False
     else:
-        forced_to_meta = not any(p.platform == Platform.META for p in plan.platforms)
-        if forced_to_meta:
-            plan = apply_platform_override(plan, [Platform.META])
+        jane_picked_tiktok = any(p.platform == Platform.TIKTOK for p in plan.platforms)
+        if jane_picked_tiktok and tiktok_ready:
+            plan.platforms = [p for p in plan.platforms if p.platform == Platform.TIKTOK]
+            forced_to_meta = False
         else:
-            plan.platforms = [p for p in plan.platforms if p.platform == Platform.META]
+            forced_to_meta = not any(p.platform == Platform.META for p in plan.platforms)
+            if forced_to_meta:
+                plan = apply_platform_override(plan, [Platform.META])
+            else:
+                plan.platforms = [p for p in plan.platforms if p.platform == Platform.META]
 
     # 3. Geo refinement — prefer the consultant's own §7 judgment (which of own-radius/
     # watering-hole/mixed/non-local, and which named pockets), validated by real
@@ -2904,6 +2931,10 @@ async def _do_launch(built: _PlanBuildResult, body_message: str, body_business_n
             "status": "DISABLE" if is_tiktok else "PAUSED",
             "note": launch_note,
             "ads_manager_url": ads_manager_url,
+            # Additive — status already implied this (DISABLE vs PAUSED) but a
+            # named field is what the frontend actually needs for a platform
+            # badge, not string-sniffing an unrelated status value.
+            "platform": "tiktok" if is_tiktok else "meta",
         },
     }
 
