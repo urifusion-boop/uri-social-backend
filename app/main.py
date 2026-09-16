@@ -302,6 +302,15 @@ app.include_router(agency_router, prefix="/social-media", tags=["Agency"])
 from app.agents.jane_ads.router import router as jane_ads_router
 app.include_router(jane_ads_router)
 
+# Uri Market Intelligence (PRD v1.0, dev-only while in testing) — social
+# listening: collect, classify, score, and surface evidence-backed insights.
+# Mock-adapter only for now; real provider adapters register into
+# scan_runner.ADAPTER_REGISTRY as they land. Do NOT port this include to
+# aws/prod until the feature is ready — see the module's own docstrings for
+# current status.
+from app.agents.market_intelligence.router import router as market_intelligence_router
+app.include_router(market_intelligence_router, tags=["Market Intelligence"])
+
 # Include multi-tenant routers (Enterprise/SDK features)
 app.include_router(client_router)
 app.include_router(workspace_router)
