@@ -83,21 +83,24 @@ _BILLING_EVENT = "CPC"
 
 # Every TikTok ad creative must declare who it's posted "as" (their Identity
 # feature — like a Facebook Page for a Meta ad). Confirmed live (2026-08-31):
-# omitting it fails ad/create with "creatives.identity_id is required". We
-# don't have per-brand TikTok accounts (same shared-account architecture as
-# everywhere else in this adapter), so one shared CUSTOMIZED_USER identity is
-# created once and reused — see _get_or_create_identity. TikTok requires the
-# avatar to be a 1:1 square image.
+# omitting it fails ad/create with "creatives.identity_id is required".
+#
+# Was a synthetic CUSTOMIZED_USER identity (logo upload, no real TikTok
+# account behind it) — confirmed live (2026-09-15) TikTok rejected ad/create
+# with "Custom identities are no longer supported. Use an authorized TikTok
+# account." TikTok deprecated Custom Identity for ALL new campaigns, API
+# included, starting January 2026 (their own "F.I.R.S.T. Presence" framework:
+# https://ads.tiktok.com/business/en-US/blog/custom-identity-transition).
+#
+# Fixed the same way, not around it: one real TikTok account (@uri.creative)
+# linked once in Business Center → Accounts → TikTok accounts, authorized for
+# the advertiser account, "Only show as ads" permission — keeps the same
+# one-shared-identity architecture, just backed by a real linked account
+# instead of a synthetic one. _get_authorized_identity looks it up via
+# GET /identity/get/?identity_type=BC_AUTH_TT (confirmed live 2026-09-16,
+# after the app's Identity scope was approved) rather than creating anything.
 _IDENTITY_COLLECTION = "jane_ads_tiktok_identity"
-_IDENTITY_DISPLAY_NAME = "URI Social"
-# staging.urisocial.com is dead (renamed in the 2026-08-28 staging migration —
-# see reference_aws_staging memory); confirmed live (2026-09-11) TikTok's
-# fetch-by-URL failed with "Failed to fetch the URL: ... Bad Gateway" against
-# the old domain. uri-staging.urisocial.com serves the same asset (200).
-# NOTE: www.urisocial.com/images/uri-logo-1024.png 404s on prod's current S3
-# build — re-check this URL before this adapter goes prod, it isn't
-# guaranteed to carry over.
-_IDENTITY_LOGO_URL = "https://uri-staging.urisocial.com/images/uri-logo-1024.png"
+_IDENTITY_TYPE = "BC_AUTH_TT"
 
 # TikTok's operation_status values, translated to plain language for the campaign-
 # list view — same purpose as meta.py's own _DELIVERY_LABELS. An empty campaign/get/
@@ -149,50 +152,51 @@ class TikTokAdsAdapter(AdPlatformAdapter):
         # "Authorization: Bearer", a real difference from both Meta and Google.
         return {"Access-Token": self._access_token, "Content-Type": "application/json"}
 
-    async def _get_or_create_identity(self, client: httpx.AsyncClient) -> str:
-        """Returns the shared CUSTOMIZED_USER identity_id every ad creative
-        needs, creating it once (uploads the URI logo, creates the identity)
-        and caching it in Mongo — never recreated after the first successful
-        call, on this advertiser account or any other that reuses this DB."""
-        cached = await self._db[_IDENTITY_COLLECTION].find_one({"advertiser_id": self._advertiser_id})
+    async def _get_authorized_identity(self, client: httpx.AsyncClient) -> str:
+        """Returns the identity_id of the real TikTok account linked in
+        Business Center and authorized for this advertiser account — every
+        ad creative needs one (see the module comment above for why this
+        replaced the old synthetic-identity creation flow). Looked up once
+        via GET /identity/get/ and cached in Mongo; the cache is keyed with
+        _IDENTITY_TYPE so a stale CUSTOMIZED_USER-era doc from before this
+        change is never mistaken for a valid BC_AUTH_TT identity."""
+        cached = await self._db[_IDENTITY_COLLECTION].find_one(
+            {"advertiser_id": self._advertiser_id, "identity_type": _IDENTITY_TYPE}
+        )
         if cached and cached.get("identity_id"):
             return cached["identity_id"]
 
-        image_resp = await client.post(
-            f"{self._api_base}/file/image/ad/upload/",
+        identity_resp = await client.get(
+            f"{self._api_base}/identity/get/",
             headers=self._headers(),
-            json={
-                "advertiser_id": self._advertiser_id,
-                "upload_type": "UPLOAD_BY_URL",
-                "image_url": _IDENTITY_LOGO_URL,
-                "file_name": "uri-social-identity-logo.png",
-            },
-        )
-        image_data = image_resp.json()
-        _raise_for_error(image_data, "identity logo upload")
-        inner = image_data.get("data") or {}
-        image_id = inner[0]["image_id"] if isinstance(inner, list) else inner.get("image_id")
-        if not image_id:
-            raise TikTokAdsAPIError(f"image upload returned no image_id: {image_data}")
-
-        identity_resp = await client.post(
-            f"{self._api_base}/identity/create/",
-            headers=self._headers(),
-            json={
-                "advertiser_id": self._advertiser_id,
-                "display_name": _IDENTITY_DISPLAY_NAME,
-                "image_uri": image_id,
-            },
+            params={"advertiser_id": self._advertiser_id, "identity_type": _IDENTITY_TYPE},
         )
         identity_data = identity_resp.json()
-        _raise_for_error(identity_data, "identity creation")
-        identity_id = (identity_data.get("data") or {}).get("identity_id")
-        if not identity_id:
-            raise TikTokAdsAPIError(f"identity creation returned no identity_id: {identity_data}")
+        _raise_for_error(identity_data, "identity lookup")
+        candidates = (identity_data.get("data") or {}).get("identity_list") or []
+        # available_status confirmed live: "AVAILABLE" on a working linked
+        # account — prefer one, but fall back to the first entry rather than
+        # hard-require the field (TikTok's shape here isn't documented enough
+        # to be sure it's always present).
+        chosen = next((c for c in candidates if c.get("available_status") == "AVAILABLE"), None) or (
+            candidates[0] if candidates else None
+        )
+        if not chosen or not chosen.get("identity_id"):
+            raise TikTokAdsAPIError(
+                "No TikTok account is linked and authorized for this advertiser account. "
+                "Link one in Business Center → Accounts → TikTok accounts, then authorize it "
+                "for this advertiser account (see the F.I.R.S.T. Presence flow)."
+            )
+        identity_id = chosen["identity_id"]
 
         await self._db[_IDENTITY_COLLECTION].update_one(
-            {"advertiser_id": self._advertiser_id},
-            {"$set": {"identity_id": identity_id, "image_id": image_id, "created_at": datetime.now(timezone.utc)}},
+            {"advertiser_id": self._advertiser_id, "identity_type": _IDENTITY_TYPE},
+            {"$set": {
+                "identity_id": identity_id,
+                "username": chosen.get("username"),
+                "display_name": chosen.get("display_name"),
+                "cached_at": datetime.now(timezone.utc),
+            }},
             upsert=True,
         )
         return identity_id
@@ -313,9 +317,10 @@ class TikTokAdsAdapter(AdPlatformAdapter):
 
                 # 4. The ad itself — video creative + copy + the brand's destination
                 # as the landing page, paused. Every creative must declare an identity
-                # (who it's posted "as") — the one shared URI Social identity,
-                # created once.
-                identity_id = await self._get_or_create_identity(client)
+                # (who it's posted "as") — the one linked-and-authorized TikTok
+                # account, looked up once (see module comment for the Custom
+                # Identity deprecation this replaced).
+                identity_id = await self._get_authorized_identity(client)
                 ad_resp = await client.post(
                     f"{self._api_base}/ad/create/",
                     headers=self._headers(),
@@ -333,7 +338,7 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                             "ad_text": (plan.creative.primary_text or plan.creative.headline or "")[:100],
                             "video_id": video_id,
                             "identity_id": identity_id,
-                            "identity_type": "CUSTOMIZED_USER",
+                            "identity_type": _IDENTITY_TYPE,
                             "landing_page_url": dest_link,
                             "call_to_action": "CONTACT_US",
                         }],
