@@ -302,16 +302,26 @@ RULES FOR THIS EDIT:
         version_number: int,
         image_url: str,
         edit_category: str,
-        edit_feedback: str
+        edit_feedback: str,
+        slide_index: Optional[int] = None,
     ) -> None:
         """
         Save image version to version history
         PRD Section 5.2: Save Version Function
+
+        slide_index scopes this to one slide of a carousel draft — None (the
+        default) is the regular single-image path, unchanged. Mongo matches
+        {"slide_index": None} against both explicit nulls and the field being
+        absent entirely, so this stays backward-compatible with every version
+        document saved before carousels had per-slide history.
         """
         try:
-            # Mark all existing versions as not current
+            version_filter = {"draft_id": draft_id, "slide_index": slide_index}
+
+            # Mark all existing versions (of this slide, or of the whole draft
+            # for a regular post) as not current
             await db["image_versions"].update_many(
-                {"draft_id": draft_id},
+                version_filter,
                 {"$set": {"is_current": False}}
             )
 
@@ -319,6 +329,7 @@ RULES FOR THIS EDIT:
             version_doc = {
                 "id": str(uuid.uuid4()),
                 "draft_id": draft_id,
+                "slide_index": slide_index,
                 "version_number": version_number,
                 "image_url": image_url,
                 "edit_category": edit_category,
@@ -328,16 +339,20 @@ RULES FOR THIS EDIT:
             }
 
             await db["image_versions"].insert_one(version_doc)
-            print(f"[VERSION] Saved version {version_number} for draft {draft_id}")
+            suffix = f" slide {slide_index}" if slide_index is not None else ""
+            print(f"[VERSION] Saved version {version_number} for draft {draft_id}{suffix}")
 
         except Exception as e:
             print(f"[VERSION] Error saving version: {e}")
 
     @staticmethod
-    async def undo_image_edit(db, draft_id: str, user_id: str) -> Dict[str, Any]:
+    async def undo_image_edit(db, draft_id: str, user_id: str, slide_index: Optional[int] = None) -> Dict[str, Any]:
         """
         Restore previous version of image
         PRD Section 5.3: Undo Function
+
+        slide_index scopes this to one slide of a carousel draft — None (the
+        default) is the regular single-image path, unchanged.
         """
         try:
             # Get current draft
@@ -348,16 +363,24 @@ RULES FOR THIS EDIT:
             if not draft:
                 return UriResponse.error_response("Draft not found")
 
-            current_version = draft.get("image_version", 1)
+            if slide_index is not None:
+                slides = draft.get("slides") or []
+                if slide_index < 0 or slide_index >= len(slides):
+                    return UriResponse.error_response("Invalid slide index for this carousel draft")
+                current_version = slides[slide_index].get("image_version", 1)
+            else:
+                current_version = draft.get("image_version", 1)
 
             if current_version <= 1:
                 return UriResponse.get_single_data_response("undo_error", {
                     "message": "This is the original image. There's nothing to undo."
                 })
 
+            version_filter = {"draft_id": draft_id, "slide_index": slide_index}
+
             # Find previous version
             previous_version = await db["image_versions"].find_one({
-                "draft_id": draft_id,
+                **version_filter,
                 "version_number": current_version - 1
             })
 
@@ -365,7 +388,7 @@ RULES FOR THIS EDIT:
                 # Edge case: v1 was never saved (before the fix was deployed)
                 # Try to find ANY previous version, or inform user
                 all_versions = await db["image_versions"].find(
-                    {"draft_id": draft_id}
+                    version_filter
                 ).sort("version_number", -1).to_list(length=10)
 
                 if all_versions:
@@ -380,18 +403,27 @@ RULES FOR THIS EDIT:
                     })
 
             # Restore previous version
-            await db["content_drafts"].update_one(
-                {"$or": [{"id": draft_id}, {"draft_id": draft_id}]},
-                {"$set": {
+            if slide_index is not None:
+                restore_fields = {
+                    f"slides.{slide_index}.image_url": previous_version["image_url"],
+                    f"slides.{slide_index}.image_version": previous_version["version_number"],
+                    "updated_at": datetime.utcnow()
+                }
+            else:
+                restore_fields = {
                     "image_url": previous_version["image_url"],
                     "image_version": previous_version["version_number"],
                     "updated_at": datetime.utcnow()
-                }}
+                }
+
+            await db["content_drafts"].update_one(
+                {"$or": [{"id": draft_id}, {"draft_id": draft_id}]},
+                {"$set": restore_fields}
             )
 
             # Update version flags
             await db["image_versions"].update_many(
-                {"draft_id": draft_id},
+                version_filter,
                 {"$set": {"is_current": False}}
             )
             await db["image_versions"].update_one(
@@ -399,11 +431,13 @@ RULES FOR THIS EDIT:
                 {"$set": {"is_current": True}}
             )
 
-            print(f"[UNDO] Reverted draft {draft_id} from v{current_version} to v{previous_version['version_number']}")
+            suffix = f" (slide {slide_index})" if slide_index is not None else ""
+            print(f"[UNDO] Reverted draft {draft_id} from v{current_version} to v{previous_version['version_number']}{suffix}")
 
             return UriResponse.get_single_data_response("undo_complete", {
                 "image_url": previous_version["image_url"],
                 "version": previous_version["version_number"],
+                "slide_index": slide_index,
                 "message": "Done! I've reverted to the previous version. Here's what it looked like before the last edit."
             })
 
@@ -418,6 +452,7 @@ RULES FOR THIS EDIT:
         feedback: str,
         db,
         force_category: Optional[str] = None,
+        slide_index: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Edit image in-place using user feedback
@@ -431,6 +466,11 @@ RULES FOR THIS EDIT:
             user_id: User making the request
             feedback: User's edit request
             db: Database connection
+            slide_index: When editing one slide of a carousel draft, the
+                0-based index into draft["slides"] to read/write instead of
+                the draft's own top-level image_url/image_version/
+                content_edit_count. None (the default) is the regular
+                single-image path, entirely unchanged.
 
         Returns:
             UriResponse with edited image or error/warning
@@ -447,9 +487,13 @@ RULES FOR THIS EDIT:
             # Get the actual draft ID from the document (could be 'id', 'draft_id', or '_id')
             actual_draft_id = draft.get("id") or draft.get("draft_id") or str(draft.get("_id"))
 
+            slides = draft.get("slides") if slide_index is not None else None
+            if slide_index is not None and (not isinstance(slides, list) or slide_index < 0 or slide_index >= len(slides)):
+                return UriResponse.error_response("Invalid slide index for this carousel draft")
+
             # Step 2: Check if this is an undo request
             if ImageEditingService.is_undo_request(feedback):
-                return await ImageEditingService.undo_image_edit(db, actual_draft_id, user_id)
+                return await ImageEditingService.undo_image_edit(db, actual_draft_id, user_id, slide_index=slide_index)
 
             # Step 3: Classify the edit intent (or use forced category from quick buttons)
             if force_category and force_category in ['text_edit', 'style_edit', 'content_edit', 'full_redesign']:
@@ -459,8 +503,12 @@ RULES FOR THIS EDIT:
                 edit_category = await ImageEditingService.classify_edit_intent(feedback)
 
             # Step 4: Check credit implications
-            current_version = draft.get("image_version", 1)
-            content_edit_count = draft.get("content_edit_count", 0)
+            if slide_index is not None:
+                current_version = slides[slide_index].get("image_version", 1)
+                content_edit_count = slides[slide_index].get("content_edit_count", 0)
+            else:
+                current_version = draft.get("image_version", 1)
+                content_edit_count = draft.get("content_edit_count", 0)
 
             # Full redesign always costs 1 credit
             if edit_category == 'full_redesign':
@@ -521,6 +569,16 @@ RULES FOR THIS EDIT:
             elif edit_category == 'content_edit':
                 edit_prompt = ImageEditingService.build_content_edit_prompt(feedback)
             else:  # full_redesign
+                if slide_index is not None:
+                    # regenerate_image_for_draft only knows the draft's own
+                    # top-level image_url — running it here would overwrite the
+                    # WRONG field (or the wrong slide entirely) rather than this
+                    # one. Not yet wired for carousels; fail clearly instead of
+                    # silently corrupting the draft.
+                    return UriResponse.error_response(
+                        "Full redesign isn't available for individual carousel slides yet — "
+                        "try a text, style, or content edit on this slide instead."
+                    )
                 # Full redesign uses standard regeneration (not edit API)
                 from .image_content_service import ImageContentService
                 return await ImageContentService.regenerate_image_for_draft(
@@ -531,7 +589,10 @@ RULES FOR THIS EDIT:
                 )
 
             # Step 6: Validate we have the original image
-            current_image_url = draft.get("image_url")
+            if slide_index is not None:
+                current_image_url = slides[slide_index].get("image_url")
+            else:
+                current_image_url = draft.get("image_url")
             if not current_image_url:
                 return UriResponse.error_response("No current image found for this draft")
 
@@ -541,6 +602,7 @@ RULES FOR THIS EDIT:
                 # Check if v1 already exists in history
                 existing_v1 = await db["image_versions"].find_one({
                     "draft_id": actual_draft_id,
+                    "slide_index": slide_index,
                     "version_number": 1
                 })
 
@@ -553,7 +615,8 @@ RULES FOR THIS EDIT:
                         version_number=1,
                         image_url=current_image_url,
                         edit_category="initial",
-                        edit_feedback="Original generated image"
+                        edit_feedback="Original generated image",
+                        slide_index=slide_index,
                     )
 
             # Step 7: Download the current image
@@ -631,19 +694,29 @@ RULES FOR THIS EDIT:
                 version_number=new_version,
                 image_url=edited_image_url,
                 edit_category=edit_category,
-                edit_feedback=feedback
+                edit_feedback=feedback,
+                slide_index=slide_index,
             )
 
             # Step 10: Update draft with new image
-            update_data = {
-                "image_url": edited_image_url,
-                "image_version": new_version,
-                "updated_at": datetime.utcnow()
-            }
+            if slide_index is not None:
+                update_data = {
+                    f"slides.{slide_index}.image_url": edited_image_url,
+                    f"slides.{slide_index}.image_version": new_version,
+                    "updated_at": datetime.utcnow()
+                }
+                count_field = f"slides.{slide_index}.content_edit_count"
+            else:
+                update_data = {
+                    "image_url": edited_image_url,
+                    "image_version": new_version,
+                    "updated_at": datetime.utcnow()
+                }
+                count_field = "content_edit_count"
 
             # Increment content_edit_count if this is a content edit
             if edit_category == 'content_edit':
-                update_data["content_edit_count"] = content_edit_count + 1
+                update_data[count_field] = content_edit_count + 1
 
                 # Deduct credit if this is 2nd+ content edit
                 if content_edit_count >= 1:
@@ -667,6 +740,7 @@ RULES FOR THIS EDIT:
                 "image_url": edited_image_url,
                 "version": new_version,
                 "edit_category": edit_category,
+                "slide_index": slide_index,
                 "message": ImageEditingService.get_edit_confirmation_message(edit_category, feedback),
                 "credit_charged": credits_used > 0,
                 "credits_consumed": credits_used
