@@ -988,10 +988,11 @@ qualify. Be conservative — only flag a clear case, not a borderline one.
         return []
 
 
-def _anti_boring_check(items: List[Dict[str, Any]]) -> Dict[int, str]:
+def _anti_boring_check(items: List[Dict[str, Any]], brand_name: str = "") -> Dict[int, str]:
     """PRD §30 — flags generic AI phrasings for a creative-quality-review
     NOTE, never an auto-reject (the execution can still redeem a generic
     opener)."""
+    brand_lower = (brand_name or "").strip().lower()
     flagged: Dict[int, str] = {}
     for i, item in enumerate(items):
         text = " ".join([
@@ -999,7 +1000,19 @@ def _anti_boring_check(items: List[Dict[str, Any]]) -> Dict[int, str]:
             str((item.get("exact_copy") or {}).get("caption", "")),
         ]).lower()
         for phrase in ANTI_BORING_PHRASES:
-            check = phrase.split("{brand}")[0].strip() if "{brand}" in phrase else phrase
+            # Confirmed live: "at {brand}, we believe".split("{brand}")[0].strip()
+            # reduces to the bare word "at" — a substring present in nearly any
+            # English sentence ("later", "natural", "that", ...), so this fired
+            # on almost every item regardless of content. Substitute the real
+            # brand name and check for the actual resulting phrase; skip the
+            # check entirely (rather than false-positive on "at") when there's
+            # no brand name to substitute.
+            if "{brand}" in phrase:
+                if not brand_lower:
+                    continue
+                check = phrase.replace("{brand}", brand_lower)
+            else:
+                check = phrase
             if check and check in text:
                 flagged[i] = f'generic phrasing detected: "{phrase}" — verify the execution redeems it'
                 break
@@ -1127,7 +1140,12 @@ async def _generate_final_copy(
     ]
     carousel_spec = ("\n" + "\n".join(carousel_spec_lines)) if carousel_spec_lines else ""
 
-    banned_phrases_str = ", ".join(f'"{p.split("{brand}")[0].strip()}..."' for p in ANTI_BORING_PHRASES if p)
+    # Substitute the real brand name into {brand}-templated entries for display
+    # — truncating at the placeholder (the old approach) left phrases like
+    # "at {brand}, we" showing as the near-meaningless "at..." to the model.
+    banned_phrases_str = ", ".join(
+        f'"{p.replace("{brand}", brand_name).strip()}..."' for p in ANTI_BORING_PHRASES if p
+    )
 
     prompt = f"""You are a senior social media copywriter turning {n} ALREADY-APPROVED
 content concepts into publish-ready posts for {brand_name}{f' ("{tagline}")' if tagline else ''}.
@@ -1639,7 +1657,7 @@ async def _build_plan_doc(
         flagged_day_indices = sorted(set(rule_issues.keys()) | still_flagged)
 
     flagged_set = set(flagged_day_indices)
-    anti_boring_notes = _anti_boring_check(all_items)
+    anti_boring_notes = _anti_boring_check(all_items, brand_name=brand.get("brand_name", ""))
 
     # Step 10 — ad opportunity scoring + copy. Scoring is pure/fast; copy
     # generation is the one real LLM call here — fired concurrently for every

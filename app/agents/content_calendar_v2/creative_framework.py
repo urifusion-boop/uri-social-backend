@@ -379,7 +379,14 @@ ANTI_BORING_PHRASES: List[str] = [
     "we are excited to announce",
     "in today's fast-paced world",
     "looking for the best",
-    "at {brand}, we believe",  # brand-name placeholder checked separately
+    # The generic tell is the "At [Brand], we ___" opener itself, not
+    # specifically the verb "believe" — that's already its own entry below.
+    # {brand} gets substituted with the real brand name by _anti_boring_check;
+    # confirmed live: this used to be "at {brand}, we believe" and the naive
+    # check (splitting on "{brand}" and keeping only the text before it)
+    # reduced to the bare word "at", which false-positived on nearly every
+    # caption regardless of content.
+    "at {brand}, we",
     "we believe",
     # URI Content Calendar Generation addendum §10 — the generic-AI-headline
     # list, phrased as they'd actually appear opening a line rather than as
