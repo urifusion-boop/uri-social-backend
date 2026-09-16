@@ -2841,6 +2841,9 @@ async def edit_draft_image(
 
     # Optional: force_category parameter from quick buttons (bypasses classifier)
     force_category = body.get("force_category")
+    # Optional: which slide of a carousel draft this edit targets. Omitted (or
+    # None) for a regular single-image draft.
+    slide_index = body.get("slide_index")
 
     # Call the editing service
     result = await ImageEditingService.edit_image_for_draft(
@@ -2848,7 +2851,8 @@ async def edit_draft_image(
         user_id=user_id,
         feedback=feedback,
         db=db,
-        force_category=force_category
+        force_category=force_category,
+        slide_index=slide_index,
     )
 
     # Return the result (could be success, credit warning, or error)
@@ -2861,6 +2865,7 @@ async def edit_draft_image(
 @router.post("/drafts/{draft_id}/undo-image")
 async def undo_draft_image_edit(
     draft_id: str,
+    request: Request,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
     token: dict = Depends(JWTBearer())
 ):
@@ -2877,11 +2882,23 @@ async def undo_draft_image_edit(
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
+    # Optional JSON body: {"slide_index": N} for undoing one carousel slide.
+    # A plain-image undo sends no body at all, so a parse failure just means
+    # "regular draft, no slide" rather than an error.
+    slide_index = None
+    try:
+        body = await request.json()
+        if isinstance(body, dict):
+            slide_index = body.get("slide_index")
+    except Exception:
+        pass
+
     # Call undo service
     result = await ImageEditingService.undo_image_edit(
         db=db,
         draft_id=draft_id,
-        user_id=user_id
+        user_id=user_id,
+        slide_index=slide_index,
     )
 
     return JSONResponse(
