@@ -392,6 +392,64 @@ def meta_targeting_from_geo(geo: Optional[GeoPlan]) -> dict:
             if custom_locations else {"geo_locations": {"countries": ["NG"]}})
 
 
+async def meta_targeting_from_geo_named(
+    geo: Optional[GeoPlan], region: str = "", access_token: str = ""
+) -> dict:
+    """Same targeting as meta_targeting_from_geo, but with each pocket sent as Meta's
+    NAMED location wherever one can be verified — so Ads Manager reads "Ikeja, Lagos
+    State + 3 km" instead of "(6.6018, 3.3515) + 3 km".
+
+    Where a client's money goes is the thing they most want to check, and a raw
+    coordinate makes that unverifiable for them and for us.
+
+    A pocket only becomes a named target when Meta's own search returns a match IN THE
+    SAME REGION (see geo_names: "Yaba" resolves to Katsina State, 700km from the Lagos
+    district meant). Anything unverified — including pockets Meta has no key for, like
+    "Computer Village" — keeps its coordinates, because a tighter correct pin beats a
+    looser pretty one.
+
+    `region` is the state the campaign is in. Without it nothing can be verified, so
+    everything stays a pin; that is the same output this function's sync twin gives,
+    which is why calling it with no region is safe rather than broken.
+    """
+    from .geo_names import field_for_type, resolve_named_location
+
+    pins = [p for p in (geo.pins if geo else []) if p.lat is not None and p.lng is not None]
+    if not pins:
+        return {"geo_locations": {"countries": ["NG"]}}
+
+    geo_locations: dict = {}
+    custom_locations: list[dict] = []
+    for pin in pins:
+        named = None
+        if region:
+            try:
+                named = await resolve_named_location(pin.name, region, access_token)
+            except Exception as e:
+                print(f"[Geo] name lookup failed for {pin.name!r}: {e}", flush=True)
+        if named:
+            # NO radius on a named key. Meta rejects one outright — "The geographical
+            # radius that you've selected isn't within the specified bounds" for a
+            # city, an invalid-targeting-spec error for a neighbourhood — because a
+            # named location carries its own boundary. Live-verified 2026-09-17.
+            #
+            # Losing our radius costs nothing real: Meta's own delivery estimate
+            # barely responds to it. A 1km pin on Ikeja estimates 7.2M people and an
+            # 80km pin 9.7M, while the NAMED Ikeja estimates 5.5k — so the boundary
+            # constrains delivery far better than the radius ever did.
+            geo_locations.setdefault(field_for_type(named["type"]), []).append(
+                {"key": named["key"]}
+            )
+        else:
+            custom_locations.append({
+                "latitude": pin.lat, "longitude": pin.lng,
+                "radius": pin.radius_km, "distance_unit": "kilometer",
+            })
+    if custom_locations:
+        geo_locations["custom_locations"] = custom_locations
+    return {"geo_locations": geo_locations}
+
+
 def _explain(mode: GeoMode, city: str, pins: list[GeoPin]) -> str:
     names = ", ".join(p.name for p in pins)
     where = "where your customers gather" if mode == GeoMode.WATERING_HOLE \
