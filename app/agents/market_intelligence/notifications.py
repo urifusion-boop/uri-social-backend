@@ -52,6 +52,16 @@ def categorize_insight(insight: InsightVersion) -> Optional[NotificationCategory
     since "changed... or meaningful evidence change" is about the fact that
     something changed, not about what the insight currently looks like.
     Returns None for early_signal — PRD: 'Watchlist only,' no delivery."""
+    if insight.type == EvidenceType.REPUTATION_RISK:
+        # PRD §14: "High-consequence reputation claims require human review
+        # before an external alert. They remain available internally with
+        # an unverified label." No automated review workflow exists in this
+        # pilot, so the only safe interpretation is: never queue ANY outbox
+        # entry for this type — in-app visibility (already the baseline for
+        # every active insight) is all it gets until a human reviews it.
+        # This intentionally overrides even a revision bump.
+        return None
+
     if insight.revision > 1:
         return NotificationCategory.MATERIAL_UPDATE
 

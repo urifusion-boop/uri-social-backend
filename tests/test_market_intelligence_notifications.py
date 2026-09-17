@@ -70,6 +70,24 @@ def test_cooling_lifecycle_is_cooling_category():
     assert categorize_insight(insight) == NotificationCategory.COOLING
 
 
+def test_reputation_risk_never_queues_a_notification_even_when_urgent():
+    # Even an urgent, high-confidence, high-relevance reputation_risk finding
+    # must never auto-notify — PRD §14 requires human review first.
+    insight = _insight(
+        type=EvidenceType.REPUTATION_RISK,
+        urgency=UrgencyAssessment(is_urgent=True, reason="looks severe"),
+        confidence=_score(9), relevance=_score(9),
+    )
+    assert categorize_insight(insight) is None
+
+
+def test_reputation_risk_revision_bump_still_never_queues():
+    # A revision bump normally forces MATERIAL_UPDATE — reputation_risk
+    # overrides even that.
+    insight = _insight(type=EvidenceType.REPUTATION_RISK, revision=3)
+    assert categorize_insight(insight) is None
+
+
 def test_urgent_high_confidence_high_relevance_is_act_soon():
     insight = _insight(
         urgency=UrgencyAssessment(is_urgent=True, reason="deadline soon"),
