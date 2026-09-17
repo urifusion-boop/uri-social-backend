@@ -67,6 +67,15 @@ class ConfidenceBand(str, Enum):
     HIGH = "high"      # 8-10
 
 
+class ActionReadiness(str, Enum):
+    """PRD §7: 'Recommendations with missing fulfilment information are
+    labelled "Check suitability" rather than "Ready to act."' Derived from
+    relevance scoring's own fulfilment_feasibility component — never a
+    separate guess."""
+    READY_TO_ACT = "ready_to_act"
+    CHECK_SUITABILITY = "check_suitability"
+
+
 class InsightStatus(str, Enum):
     ACTIVE = "active"
     SUPERSEDED = "superseded"   # a newer revision replaced this one
@@ -303,6 +312,12 @@ class InsightVersion(BaseModel):
     # three languages without an evaluation set yet, never to change
     # classification itself.
     language: str = "en"
+
+    # PRD §7 — defaults to the cautious answer; scan_runner only ever
+    # upgrades this to READY_TO_ACT when relevance scoring's own
+    # fulfilment_feasibility component actually confirmed known stock/
+    # delivery facts, never the other way around.
+    action_readiness: ActionReadiness = ActionReadiness.CHECK_SUITABILITY
 
     first_seen: datetime
     last_updated: datetime
