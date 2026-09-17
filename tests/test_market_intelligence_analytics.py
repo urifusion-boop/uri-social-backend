@@ -162,6 +162,98 @@ def test_alert_sent_and_alert_suppressed_are_tracked():
     })
 
 
+def test_alert_failed_is_tracked_when_send_raises():
+    """PRD §24 'delivery failures' — previously only visible in mi_outbox's
+    failed_reason field, invisible to any dashboard until this event."""
+    from app.agents.market_intelligence import notification_delivery
+
+    class FakeCollection:
+        def __init__(self):
+            self.docs = []
+
+        def _matches(self, doc, query):
+            return all(doc.get(k) == v for k, v in query.items())
+
+        async def find_one(self, query):
+            for d in self.docs:
+                if self._matches(d, query):
+                    return dict(d)
+            return None
+
+        async def find(self, query=None):
+            return []
+
+        async def count_documents(self, query):
+            return 0
+
+        async def update_one(self, query, update, upsert=False):
+            for d in self.docs:
+                if self._matches(d, query):
+                    d.update(update.get("$set", {}))
+                    return
+
+    class FakeDb:
+        def __init__(self):
+            self._colls = {}
+
+        def __getitem__(self, name):
+            return self._colls.setdefault(name, FakeCollection())
+
+    db = FakeDb()
+    db["mi_insights"].docs.append({"id": "i1", "status": "active", "headline": "h", "observed_change": "oc", "suggested_next_step": "sns", "urgency": {"is_urgent": False}})
+    db["mi_preferences"].docs.append({
+        "user_id": "u1", "brand_id": "b1", "email_enabled": True, "timezone": "UTC",
+        "digest_hour_local": 8, "quiet_hours_start_local": 21, "quiet_hours_end_local": 8,
+        "urgent_override": False, "muted_topic_ids": [], "muted_categories": [], "snoozed_insight_ids": [],
+    })
+    db["users"].docs.append({"userId": "u1", "email": "u@example.com"})
+    entry = {
+        "id": "o1", "brand_id": "b1", "user_id": "u1", "topic_id": "t1", "insight_id": "i1",
+        "insight_revision": 1, "category": "act_soon", "delivery_mode": "immediate",
+        "dedupe_key": "k1", "status": "queued",
+    }
+    db["mi_outbox"].docs.append(entry)
+
+    from unittest.mock import AsyncMock
+    with patch.object(notification_delivery.email_service, "send_raw_email", new=AsyncMock(side_effect=RuntimeError("smtp down"))), \
+         patch.object(notification_delivery, "track_event") as mock_track:
+        result = _run(notification_delivery._process_one_immediate(db, entry, datetime(2024, 6, 1, 12, 0)))
+
+    assert result == "failed"
+    mock_track.assert_called_once_with("u1", "alert_failed", {
+        "brand_id": "b1", "insight_id": "i1", "category": "act_soon", "mode": "immediate", "reason": "smtp down",
+    })
+
+
+def test_scan_failed_is_tracked_when_pipeline_crashes():
+    """PRD §24 'run failure' — the execute_scan crash-safety wrapper marked
+    the run FAILED in the database already, but fired no event a dashboard
+    could chart until now."""
+    from app.agents.market_intelligence import scan_runner
+    from app.agents.market_intelligence.models import Topic
+
+    class FakeCollection:
+        async def update_one(self, query, update, upsert=False):
+            pass
+
+    class FakeDb:
+        def __getitem__(self, name):
+            return FakeCollection()
+
+    topic = Topic(id="t1", brand_id="b1", user_id="u1", question="why no sales?", keywords=["sales"], sources=[])
+
+    async def fake_pipeline(topic, run_id, db):
+        raise RuntimeError("adapter exploded")
+
+    with patch.object(scan_runner, "_run_scan_pipeline", new=fake_pipeline), \
+         patch.object(scan_runner, "track_event") as mock_track:
+        _run(scan_runner.execute_scan(topic, "run1", FakeDb()))
+
+    mock_track.assert_called_once_with("u1", "scan_failed", {
+        "brand_id": "b1", "topic_id": "t1", "scan_id": "run1", "error": "adapter exploded",
+    })
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))

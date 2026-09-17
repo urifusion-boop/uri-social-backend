@@ -20,6 +20,7 @@ from typing import Optional
 from pydantic import BaseModel
 
 from app.services.AIService import AIService
+from app.services.PostHogService import track_event
 from .models import (
     Classification,
     Cluster,
@@ -159,11 +160,23 @@ async def compose_insight(
 
     if output is None or validation_error:
         print(f"[MI][compose] validation failed, retrying once: {validation_error}")
+        # PRD §24 "unsupported claims" — every time the model tried to state
+        # a number that wasn't a real stored metric, previously only a log
+        # line. distinct_id is the brand, not a human, since this fires from
+        # a background scan with no acting user in scope.
+        track_event(cluster.brand_id, "insight_validation_retry", {
+            "brand_id": cluster.brand_id, "topic_id": cluster.topic_id, "cluster_id": cluster.id,
+            "reason": (validation_error or "")[:200],
+        })
         output = await _call_llm(prompt, error_context=validation_error)
         validation_error = _validate_numbers(output, cluster, confidence, relevance) if output else "no output returned on retry"
 
     if output is None or validation_error:
         print(f"[MI][compose] falling back to factual template after retry: {validation_error}")
+        track_event(cluster.brand_id, "insight_validation_fallback", {
+            "brand_id": cluster.brand_id, "topic_id": cluster.topic_id, "cluster_id": cluster.id,
+            "reason": (validation_error or "")[:200],
+        })
         output = _fallback_insight_text(cluster)
 
     now = datetime.utcnow()

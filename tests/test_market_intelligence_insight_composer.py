@@ -208,6 +208,49 @@ def test_compose_insight_falls_back_when_llm_call_raises(monkeypatch):
     assert "factual fallback" in result.business_implication
 
 
+# ── PRD §24 "unsupported claims" instrumentation ─────────────────────────────
+
+def test_retry_fires_insight_validation_retry_event(monkeypatch):
+    from unittest.mock import patch
+
+    from app.agents.market_intelligence import insight_composer
+
+    async def fake_call_llm(prompt, error_context=None):
+        if error_context is None:
+            return _output("Over 9000 accounts mentioned this!")
+        return _output("6 independent accounts across 3 threads mentioned this.")
+
+    monkeypatch.setattr(insight_composer, "_call_llm", fake_call_llm)
+    cluster = _cluster(accounts=6, threads=3)
+
+    with patch.object(insight_composer, "track_event") as mock_track:
+        _run(compose_insight(cluster, [], [], _score(), _score(), UrgencyAssessment(is_urgent=False, reason="none")))
+
+    mock_track.assert_called_once()
+    args, _ = mock_track.call_args
+    assert args[0] == "b1"
+    assert args[1] == "insight_validation_retry"
+    assert args[2]["cluster_id"] == "cl1"
+
+
+def test_fallback_fires_insight_validation_fallback_event(monkeypatch):
+    from unittest.mock import patch
+
+    from app.agents.market_intelligence import insight_composer
+
+    async def fake_call_llm(prompt, error_context=None):
+        return _output("999 accounts mentioned this!")
+
+    monkeypatch.setattr(insight_composer, "_call_llm", fake_call_llm)
+    cluster = _cluster(accounts=6, threads=3)
+
+    with patch.object(insight_composer, "track_event") as mock_track:
+        _run(compose_insight(cluster, [], [], _score(), _score(), UrgencyAssessment(is_urgent=False, reason="none")))
+
+    event_names = [call.args[1] for call in mock_track.call_args_list]
+    assert event_names == ["insight_validation_retry", "insight_validation_fallback"]
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
