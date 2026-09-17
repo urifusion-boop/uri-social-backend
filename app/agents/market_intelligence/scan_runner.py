@@ -40,6 +40,7 @@ from .noise_filter import deterministic_noise_reason
 from .notifications import queue_notification
 from app.services.PostHogService import track_event
 from .models import (
+    ActionReadiness,
     Classification,
     Cluster,
     CollectionRun,
@@ -51,6 +52,7 @@ from .models import (
     InsightVersion,
     Lifecycle,
     ScanStatus,
+    ScoreBreakdown,
     SourceCoveragePreview,
     Topic,
 )
@@ -80,11 +82,17 @@ CLUSTERED_TYPES = {
 
 
 async def _fetch_business_context(db: AsyncIOMotorDatabase, user_id: str, brand_id: str) -> dict:
-    """Only reads fields that already exist on brand_profiles — never invents
-    stock/delivery facts (PRD §7: 'unknown business facts remain unknown').
-    Fields this doesn't find (service_locations, stock_availability,
-    delivery_capability) simply stay absent, which scoring.py already treats
-    as unknown rather than crashing on."""
+    """Reads real fields from brand_profiles — never invents a fact the
+    business hasn't actually recorded (PRD §7: 'unknown business facts
+    remain unknown'). stock_availability/delivery_capability/lead_time/
+    budget_ceiling/margin_band are stored as empty string/None by default
+    (see BrandProfileService.save's DEFAULTS) until the business fills them
+    in via the Market Intelligence Settings panel — an empty value here
+    means "unknown," normalised to None so scoring.py's existing "unknown
+    -> 0" handling applies rather than treating "" as a real answer.
+    service_locations isn't its own brand_profiles field; `region` is the
+    closest existing fact and is reused here rather than inventing a
+    second, overlapping field."""
     from app.agents.social_media_manager.services.brand_profile_service import BrandProfileService
 
     try:
@@ -94,16 +102,19 @@ async def _fetch_business_context(db: AsyncIOMotorDatabase, user_id: str, brand_
         print(f"[MI][scan] could not load business context: {e}")
         profile = {}
 
+    region = profile.get("region") or None
+
     return {
         "brand_name": profile.get("brand_name"),
         "industry": profile.get("industry"),
         "key_products_services": profile.get("key_products_services") or [],
         "primary_goal": profile.get("primary_goal"),
-        # Not yet fields on brand_profiles — left absent deliberately rather
-        # than guessed, per PRD §7.
-        "service_locations": None,
-        "stock_availability": None,
-        "delivery_capability": None,
+        "service_locations": [region] if region else None,
+        "stock_availability": profile.get("stock_availability") or None,
+        "delivery_capability": profile.get("delivery_capability") or None,
+        "lead_time": profile.get("lead_time") or None,
+        "budget_ceiling": profile.get("budget_ceiling"),
+        "margin_band": profile.get("margin_band") or None,
     }
 
 
@@ -161,6 +172,17 @@ async def _dedupe_against_existing(db: AsyncIOMotorDatabase, topic_id: str, sour
     source_ids ALREADY stored for this topic, so the caller skips them."""
     cursor = db["mi_evidence"].find({"topic_id": topic_id, "source_id": {"$in": source_ids}}, {"source_id": 1})
     return {doc["source_id"] async for doc in cursor}
+
+
+def _action_readiness_from(relevance: ScoreBreakdown) -> ActionReadiness:
+    """PRD §7: 'Recommendations with missing fulfilment information are
+    labelled "Check suitability" rather than "Ready to act."' Reads
+    relevance scoring's own fulfilment_feasibility component rather than
+    re-deriving the same fact a second way."""
+    component = next((c for c in relevance.components if c.name == "fulfilment_feasibility"), None)
+    if component is not None and component.points > 0:
+        return ActionReadiness.READY_TO_ACT
+    return ActionReadiness.CHECK_SUITABILITY
 
 
 def _majority_language(evidence_list: list[Evidence]) -> str:
@@ -492,6 +514,7 @@ async def _run_scan_pipeline(topic: Topic, run_id: str, db: AsyncIOMotorDatabase
 
             insight = await compose_insight(cluster, member_evidence, member_classifications, confidence, relevance, urgency)
             insight.language = _majority_language(member_evidence)
+            insight.action_readiness = _action_readiness_from(relevance)
             if cluster.primary_type == EvidenceType.REPUTATION_RISK and not insight.coverage_note:
                 # PRD §14: "High-consequence reputation claims require human
                 # review before an external alert. They remain available
@@ -535,6 +558,7 @@ async def _run_scan_pipeline(topic: Topic, run_id: str, db: AsyncIOMotorDatabase
         )
         insight = await compose_insight(pseudo_cluster, [evidence], [classification], confidence, relevance, urgency)
         insight.language = evidence.language
+        insight.action_readiness = _action_readiness_from(relevance)
         insights.append(insight)
         await queue_notification(db, insight, topic)
         _track_insight_published(topic, insight)

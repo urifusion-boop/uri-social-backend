@@ -335,6 +335,14 @@ class BrandProfileRequest(BaseModel):
     # Localisation
     languages: Optional[List[str]] = None
     region: Optional[str] = None
+    # Fulfilment & operations (Uri Market Intelligence PRD §7) — feeds
+    # relevance scoring's fulfilment_feasibility component; left unset
+    # means "unknown," which scoring already treats as 0, never guessed.
+    stock_availability: Optional[str] = None   # e.g. "in_stock" | "low_stock" | "out_of_stock" | "made_to_order"
+    delivery_capability: Optional[str] = None  # free text, e.g. "same-day in Lagos, 3-5 days nationwide"
+    lead_time: Optional[str] = None            # e.g. "2-3 business days"
+    budget_ceiling: Optional[float] = None     # the business's own stated ceiling for acting on an opportunity
+    margin_band: Optional[str] = None          # "low" | "medium" | "high"
     # Meta
     onboarding_completed: Optional[bool] = False
     # Onboarding save-and-resume — the step's NAME (e.g. "targetCustomerDetail"),
