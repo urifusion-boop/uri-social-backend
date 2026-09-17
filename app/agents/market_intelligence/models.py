@@ -80,6 +80,17 @@ class FeedbackVerdict(str, Enum):
     INCORRECT = "incorrect"
 
 
+class DevelopmentStatus(str, Enum):
+    """PRD §13: 'Unknown dates are "Date to confirm," with no invented
+    countdown.' DATE_TO_CONFIRM is the honest default — SCHEDULED requires an
+    actual known event_date, never a guess."""
+    DATE_TO_CONFIRM = "date_to_confirm"
+    SCHEDULED = "scheduled"
+    POSTPONED = "postponed"
+    CANCELLED = "cancelled"
+    OCCURRED = "occurred"
+
+
 # ── Provenance / geography (PRD §11, §7) ───────────────────────────────────────
 
 class Geography(BaseModel):
@@ -271,6 +282,42 @@ class Topic(BaseModel):
     keep_updating: bool = False
     active: bool = True
     created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class Development(BaseModel):
+    """PRD §13 'Upcoming development workflow' + §19 Development entity.
+    One per originating evidence record — 'Postponement or cancellation
+    updates the SAME item' (§13), so this is never re-created, only PATCHed.
+    occurrence date (event_date) is kept explicitly separate from the
+    evidence's own published_at (publication date) — conflating the two is
+    exactly the mistake §13 calls out."""
+    id: str
+    brand_id: str
+    topic_id: str
+    evidence_id: str  # the original announcement this was extracted from
+
+    issuer: Optional[str] = None
+    headline: str
+    event_date: Optional[datetime] = None       # None -> DevelopmentStatus.DATE_TO_CONFIRM
+    event_date_range_end: Optional[datetime] = None
+    location: Optional[str] = None
+    registration_deadline: Optional[datetime] = None
+    preparation_action: Optional[str] = None    # PRD §12: "a business-relevant preparation action"
+    source_url: Optional[str] = None
+
+    status: DevelopmentStatus = DevelopmentStatus.DATE_TO_CONFIRM
+    verification_note: Optional[str] = None
+
+    first_seen: datetime
+    last_updated: datetime
+
+
+class DevelopmentUpdateRequest(BaseModel):
+    """PATCH body for postponement/cancellation/occurrence updates — PRD
+    §13: these revise the existing item, never create a new one."""
+    status: DevelopmentStatus
+    event_date: Optional[datetime] = None  # set when postponing to a new date
+    verification_note: Optional[str] = None
 
 
 class CollectionRun(BaseModel):

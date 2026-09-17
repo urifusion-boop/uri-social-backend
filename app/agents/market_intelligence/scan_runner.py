@@ -23,18 +23,22 @@ from .classification.classify import classify_evidence
 from .classification.scoring import (
     confidence_breakdown,
     is_concern_eligible,
+    is_development_eligible,
     is_inquiry_eligible,
     relevance_breakdown,
     urgency_for_concern,
     urgency_for_inquiry,
 )
 from .clustering import cluster_evidence
+from .development_extractor import extract_development
 from .insight_composer import compose_insight
 from .noise_filter import deterministic_noise_reason
 from .models import (
     Classification,
     Cluster,
     CollectionRun,
+    Development,
+    DevelopmentStatus,
     Evidence,
     EvidenceType,
     InsightVersion,
@@ -319,6 +323,47 @@ async def execute_scan(topic: Topic, run_id: str, db: AsyncIOMotorDatabase) -> N
 
     if insights:
         await db["mi_insights"].insert_many([i.dict() for i in insights])
+
+    # ── Upcoming developments (PRD §13 "Upcoming development workflow") ─────
+    developments: list[Development] = []
+    for evidence in all_new_evidence:
+        classification = classifications.get(evidence.id)
+        if classification is None or classification.primary_type != EvidenceType.UPCOMING_DEVELOPMENT:
+            continue
+
+        extraction = await extract_development(evidence, business_context)
+        if extraction is None:
+            gaps.append(f"development {evidence.source_id} could not be extracted — left for manual review")
+            continue
+
+        eligible, reason = is_development_eligible(
+            evidence, extraction.has_verifiable_source, extraction.event_date, extraction.preparation_action
+        )
+        if not eligible:
+            gaps.append(f"development {evidence.source_id} not surfaced: {reason}")
+            continue
+
+        now = datetime.utcnow()
+        developments.append(Development(
+            id=str(uuid.uuid4()),
+            brand_id=topic.brand_id,
+            topic_id=topic.id,
+            evidence_id=evidence.id,
+            issuer=extraction.issuer,
+            headline=extraction.headline,
+            event_date=extraction.event_date,
+            event_date_range_end=extraction.event_date_range_end,
+            location=extraction.location,
+            registration_deadline=extraction.registration_deadline,
+            preparation_action=extraction.preparation_action,
+            source_url=evidence.url,
+            status=DevelopmentStatus.SCHEDULED,
+            first_seen=now,
+            last_updated=now,
+        ))
+
+    if developments:
+        await db["mi_developments"].insert_many([d.dict() for d in developments])
 
     final_status = ScanStatus.PARTIAL if gaps else ScanStatus.COMPLETED
     await db["mi_scans"].update_one(

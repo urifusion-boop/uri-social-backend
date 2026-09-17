@@ -24,6 +24,7 @@ from app.domain.responses.uri_response import UriResponse
 from .models import (
     ActionBrief,
     BriefCreateRequest,
+    DevelopmentUpdateRequest,
     Evidence,
     FeedbackOutcome,
     FeedbackRequest,
@@ -55,6 +56,13 @@ async def _get_owned_insight(insight_id: str, brand_id: str, db: AsyncIOMotorDat
     if not insight_doc or insight_doc["brand_id"] != brand_id:
         raise HTTPException(status_code=404, detail="Insight not found")
     return insight_doc
+
+
+async def _get_owned_development(development_id: str, brand_id: str, db: AsyncIOMotorDatabase) -> dict:
+    dev_doc = await db["mi_developments"].find_one({"id": development_id})
+    if not dev_doc or dev_doc["brand_id"] != brand_id:
+        raise HTTPException(status_code=404, detail="Development not found")
+    return dev_doc
 
 
 @router.post("/topics")
@@ -255,3 +263,56 @@ async def create_brief(
     )
     await db["mi_briefs"].insert_one(brief.dict())
     return UriResponse.get_single_data_response("brief", brief.dict())
+
+
+@router.get("/developments")
+async def list_developments(
+    ctx: dict = Depends(get_flexible_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    # Soonest event first; undated ("date to confirm") items sort last rather
+    # than first — Mongo puts missing/null fields first in an ascending sort
+    # by default, which would otherwise bury dated, actionable items under
+    # undated ones.
+    cursor = (
+        db["mi_developments"]
+        .find({"brand_id": ctx["brand_id"]})
+        .sort([("event_date", 1), ("last_updated", -1)])
+    )
+    developments = [doc async for doc in cursor]
+    for d in developments:
+        d.pop("_id", None)
+    return UriResponse.get_list_data_response("development", developments)
+
+
+@router.get("/developments/{development_id}")
+async def get_development(
+    development_id: str,
+    ctx: dict = Depends(get_flexible_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    dev_doc = await _get_owned_development(development_id, ctx["brand_id"], db)
+    dev_doc.pop("_id", None)
+    return UriResponse.get_single_data_response("development", dev_doc)
+
+
+@router.patch("/developments/{development_id}")
+async def update_development(
+    development_id: str,
+    body: DevelopmentUpdateRequest,
+    ctx: dict = Depends(get_flexible_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """PRD §13: 'Postponement or cancellation updates the SAME item and any
+    linked preparation task' — this revises the existing Development record
+    in place, it never creates a new one."""
+    await _get_owned_development(development_id, ctx["brand_id"], db)
+    update_fields = {"status": body.status.value, "last_updated": datetime.utcnow()}
+    if body.event_date is not None:
+        update_fields["event_date"] = body.event_date
+    if body.verification_note is not None:
+        update_fields["verification_note"] = body.verification_note
+    await db["mi_developments"].update_one({"id": development_id}, {"$set": update_fields})
+    dev_doc = await _get_owned_development(development_id, ctx["brand_id"], db)
+    dev_doc.pop("_id", None)
+    return UriResponse.get_single_data_response("development", dev_doc)
