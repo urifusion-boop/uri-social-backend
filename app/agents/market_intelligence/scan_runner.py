@@ -163,6 +163,18 @@ async def _dedupe_against_existing(db: AsyncIOMotorDatabase, topic_id: str, sour
     return {doc["source_id"] async for doc in cursor}
 
 
+def _majority_language(evidence_list: list[Evidence]) -> str:
+    """Used only to gate auto-alerting (PRD §10/§14) — never to change
+    classification. Ties fall to whichever language sorts first, which is
+    an arbitrary but harmless choice among equally-represented languages."""
+    if not evidence_list:
+        return "en"
+    counts: dict[str, int] = {}
+    for e in evidence_list:
+        counts[e.language] = counts.get(e.language, 0) + 1
+    return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+
+
 def _track_insight_published(topic: Topic, insight: InsightVersion) -> None:
     """PRD §26 instrumentation. Deliberately excludes raw evidence/insight
     text — only ids, types and scores, matching §26's own "excluding raw
@@ -479,6 +491,7 @@ async def _run_scan_pipeline(topic: Topic, run_id: str, db: AsyncIOMotorDatabase
             member_classifications = await _resolve_classifications(db, member_evidence, classifications)
 
             insight = await compose_insight(cluster, member_evidence, member_classifications, confidence, relevance, urgency)
+            insight.language = _majority_language(member_evidence)
             if cluster.primary_type == EvidenceType.REPUTATION_RISK and not insight.coverage_note:
                 # PRD §14: "High-consequence reputation claims require human
                 # review before an external alert. They remain available
@@ -521,6 +534,7 @@ async def _run_scan_pipeline(topic: Topic, run_id: str, db: AsyncIOMotorDatabase
             lifecycle=Lifecycle.UNKNOWN,
         )
         insight = await compose_insight(pseudo_cluster, [evidence], [classification], confidence, relevance, urgency)
+        insight.language = evidence.language
         insights.append(insight)
         await queue_notification(db, insight, topic)
         _track_insight_published(topic, insight)
