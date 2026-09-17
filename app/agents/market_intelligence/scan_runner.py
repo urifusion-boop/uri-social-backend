@@ -265,6 +265,7 @@ async def execute_scan(topic: Topic, run_id: str, db: AsyncIOMotorDatabase) -> N
 
     all_new_evidence: list[Evidence] = []
     gaps: list[str] = []
+    provider_run_ids: dict[str, str] = {}
 
     for source in topic.sources:
         adapter = ADAPTER_REGISTRY.get(source.provider)
@@ -282,6 +283,17 @@ async def execute_scan(topic: Topic, run_id: str, db: AsyncIOMotorDatabase) -> N
 
         try:
             provider_run_id = await adapter.start_collection(topic.keywords, topic.excluded_keywords, since, until)
+        except Exception as e:
+            gaps.append(f"source '{source.provider}' collection failed: {e}")
+            continue
+
+        # PRD §17: "save the provider run ID before fetching results" — saved
+        # to the run doc immediately, not only held in memory, so it survives
+        # even if fetch_page below fails.
+        provider_run_ids[source.provider] = provider_run_id
+        await db["mi_scans"].update_one({"id": run_id}, {"$set": {f"provider_run_ids.{source.provider}": provider_run_id}})
+
+        try:
             page = await adapter.fetch_page(provider_run_id)
         except Exception as e:
             gaps.append(f"source '{source.provider}' collection failed: {e}")
@@ -299,6 +311,7 @@ async def execute_scan(topic: Topic, run_id: str, db: AsyncIOMotorDatabase) -> N
                 brand_id=topic.brand_id,
                 user_id=topic.user_id,
                 topic_id=topic.id,
+                collection_run_id=run_id,
             )
             all_new_evidence.append(evidence)
 

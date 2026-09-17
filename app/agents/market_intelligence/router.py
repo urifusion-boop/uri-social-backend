@@ -217,6 +217,54 @@ async def get_insight_evidence(
     return UriResponse.get_list_data_response("evidence", evidence)
 
 
+@router.get("/insights/{insight_id}/trace")
+async def get_insight_trace(
+    insight_id: str,
+    ctx: dict = Depends(get_flexible_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """PRD §16, P0-16: 'A finding can be traced to topic, collection,
+    evidence and model versions.' Walks the real chain stored on the
+    records themselves — evidence -> the scan(s) that collected it ->
+    provider run ids, and classification -> model/prompt versions — rather
+    than a separate log a change elsewhere could silently drift from."""
+    insight_doc = await _get_owned_insight(insight_id, ctx["brand_id"], db)
+
+    evidence_ids = insight_doc.get("evidence_ids", [])
+    evidence_docs = [
+        doc async for doc in db["mi_evidence"].find({"id": {"$in": evidence_ids}, "brand_id": ctx["brand_id"]})
+    ]
+    for e in evidence_docs:
+        e.pop("_id", None)
+
+    classification_docs = [
+        doc async for doc in db["mi_classifications"].find({"evidence_id": {"$in": evidence_ids}})
+    ]
+    for c in classification_docs:
+        c.pop("_id", None)
+
+    collection_run_ids = sorted({e.get("collection_run_id") for e in evidence_docs if e.get("collection_run_id")})
+    scan_docs = [doc async for doc in db["mi_scans"].find({"id": {"$in": collection_run_ids}})]
+    for s in scan_docs:
+        s.pop("_id", None)
+
+    model_versions = sorted({
+        f"{c.get('model_name')}@{c.get('prompt_version')}" for c in classification_docs if c.get("model_name")
+    })
+
+    trace = {
+        "insight_id": insight_id,
+        "insight_revision": insight_doc.get("revision"),
+        "topic_id": insight_doc.get("topic_id"),
+        "cluster_id": insight_doc.get("cluster_id"),
+        "evidence_ids": evidence_ids,
+        "collection_runs": scan_docs,
+        "classifications": classification_docs,
+        "model_versions": model_versions,
+    }
+    return UriResponse.get_single_data_response("trace", trace)
+
+
 @router.post("/insights/{insight_id}/feedback")
 async def submit_feedback(
     insight_id: str,
