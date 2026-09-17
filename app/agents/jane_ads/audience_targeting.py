@@ -114,6 +114,38 @@ async def _extract_hints(audience_text: str) -> dict:
 
 
 _PAREN_SUFFIX = re.compile(r"\s*\([^)]*\)\s*$")
+
+# Parentheticals that name a WORK OR A PERSON, not an ad category. Meta's search puts
+# both shapes side by side and the category preference below cannot tell them apart —
+# it only knows a parenthetical is present. Live-observed on a real launched ad set:
+# "Real Estate" resolved to "Real Estate (band)" and "Home Improvement" to "Home
+# Improvement (TV series)", so a home-services ad targeted fans of an indie band and a
+# 1990s sitcom, while the genuine "Home improvement (home and garden)" sat in the same
+# result list. Targeting a band's followers is not a narrower version of the audience;
+# it is a different one.
+_ENTITY_PARENTHETICALS = {
+    "band", "film", "movie", "tv series", "tv programme", "tv program", "album",
+    "song", "single", "musician", "singer", "rapper", "actor", "actress", "author",
+    "book", "magazine", "video game", "game", "artist", "composer", "athlete",
+    "politician", "public figure", "character", "fictional character", "tv channel",
+    "radio station", "podcast", "website", "app", "company", "brand",
+}
+
+# Meta's own topic for a hit. "News and entertainment" is what a band/series/film
+# carries, and it is the honest second signal when a parenthetical is absent or
+# unrecognised — a business audience is essentially never served by an entertainment
+# entity, whereas the real categories carry topics like "Business and industry" or
+# "Hobbies and activities".
+_ENTERTAINMENT_TOPIC = "news and entertainment"
+
+
+def _is_entity_hit(hit: dict) -> bool:
+    """Whether this search hit is a work/person page rather than a targetable category."""
+    name = hit.get("name") or ""
+    match = _PAREN_SUFFIX.search(name)
+    if match and match.group(0).strip(" ()").lower() in _ENTITY_PARENTHETICALS:
+        return True
+    return (hit.get("topic") or "").strip().lower() == _ENTERTAINMENT_TOPIC
 _WORD = re.compile(r"[a-z0-9]+")
 
 
@@ -167,6 +199,13 @@ async def _resolve_interest(client: httpx.AsyncClient, graph_base: str,
     # list from dragging in loosely-related interests — a keyword that resolves to
     # nothing merely leaves the ad broader, which is the safe direction.
     usable = [(s, h) for s, h in usable if s >= 2]
+    # Drop works and people before ranking, not after: a band scoring an exact name
+    # match would otherwise outrank the real category outright.
+    entity_names = [h.get("name") for _, h in usable if _is_entity_hit(h)]
+    usable = [(s, h) for s, h in usable if not _is_entity_hit(h)]
+    if entity_names:
+        print(f"[AudienceTargeting] ignored non-category matches for {keyword!r}: "
+              f"{entity_names}", flush=True)
     if not usable:
         if hits:
             print(f"[AudienceTargeting] no relevant interest for {keyword!r} — "
