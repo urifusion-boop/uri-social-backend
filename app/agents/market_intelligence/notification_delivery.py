@@ -23,6 +23,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from app.services.EmailService import email_service
+from app.services.PostHogService import track_event
 from .models import MINotificationPreferences, NotificationCategory, OutboxDeliveryMode, OutboxStatus
 
 DAILY_IMMEDIATE_EMAIL_CAP = 3   # PRD §14: "three per recipient per day"
@@ -110,10 +111,16 @@ async def process_outbox(db: AsyncIOMotorDatabase, now: Optional[datetime] = Non
     return {"sent": sent, "suppressed": suppressed, "failed": failed}
 
 
-async def _suppress(db: AsyncIOMotorDatabase, entry_id: str, reason: str) -> str:
+async def _suppress(db: AsyncIOMotorDatabase, entry: dict, reason: str) -> str:
     await db["mi_outbox"].update_one(
-        {"id": entry_id}, {"$set": {"status": OutboxStatus.SUPPRESSED.value, "suppression_reason": reason}}
+        {"id": entry["id"]}, {"$set": {"status": OutboxStatus.SUPPRESSED.value, "suppression_reason": reason}}
     )
+    # PRD §26 instrumentation: excludes raw insight/evidence content, just
+    # ids/category/reason — the same "no raw private content" rule §26
+    # names explicitly.
+    track_event(entry["user_id"], "alert_suppressed", {
+        "brand_id": entry["brand_id"], "insight_id": entry["insight_id"], "category": entry["category"], "reason": reason,
+    })
     return "suppressed"
 
 
@@ -122,29 +129,29 @@ async def _process_one_immediate(db: AsyncIOMotorDatabase, entry: dict, now: dat
 
     insight = await db["mi_insights"].find_one({"id": entry["insight_id"]})
     if insight is None:
-        return await _suppress(db, entry["id"], "insight no longer exists")
+        return await _suppress(db, entry, "insight no longer exists")
 
     # PRD §14: "Recheck expiry before delivery. Drop expired inquiries from
     # pending alerts."
     if entry["category"] == NotificationCategory.QUALIFIED_INQUIRY.value and not insight.get("urgency", {}).get(
         "is_urgent", False
     ):
-        return await _suppress(db, entry["id"], "inquiry expired before delivery")
+        return await _suppress(db, entry, "inquiry expired before delivery")
 
     if insight.get("status") != "active":
-        return await _suppress(db, entry["id"], f"insight status is {insight.get('status')}, not active")
+        return await _suppress(db, entry, f"insight status is {insight.get('status')}, not active")
 
     if entry["topic_id"] in prefs.get("muted_topic_ids", []):
-        return await _suppress(db, entry["id"], "topic muted")
+        return await _suppress(db, entry, "topic muted")
 
     if entry["category"] in prefs.get("muted_categories", []):
-        return await _suppress(db, entry["id"], "category muted")
+        return await _suppress(db, entry, "category muted")
 
     if entry["insight_id"] in prefs.get("snoozed_insight_ids", []):
-        return await _suppress(db, entry["id"], "insight snoozed")
+        return await _suppress(db, entry, "insight snoozed")
 
     if not prefs.get("email_enabled", False):
-        return await _suppress(db, entry["id"], "email not opted in — in-app only")
+        return await _suppress(db, entry, "email not opted in — in-app only")
 
     is_material_update = entry["category"] == NotificationCategory.MATERIAL_UPDATE.value
 
@@ -156,14 +163,14 @@ async def _process_one_immediate(db: AsyncIOMotorDatabase, entry: dict, now: dat
             "topic_id": entry["topic_id"], "status": OutboxStatus.SENT.value, "sent_at": {"$gte": cooldown_start},
         })
         if recent is not None:
-            return await _suppress(db, entry["id"], "topic cooldown active")
+            return await _suppress(db, entry, "topic cooldown active")
 
     # PRD §14: "quiet hours still apply unless the user has enabled an
     # urgent override" — this applies to material updates too, unlike the
     # topic cooldown above, which they bypass unconditionally.
     bypass_quiet_hours = is_material_update and prefs.get("urgent_override", False)
     if not bypass_quiet_hours and _in_quiet_hours(prefs, now):
-        return await _suppress(db, entry["id"], "quiet hours")
+        return await _suppress(db, entry, "quiet hours")
 
     # PRD §14: "Limit ordinary immediate emails to three per recipient per
     # day. Bundle additional eligible items into the digest."
@@ -199,6 +206,9 @@ async def _process_one_immediate(db: AsyncIOMotorDatabase, entry: dict, now: dat
 
     if ok:
         await db["mi_outbox"].update_one({"id": entry["id"]}, {"$set": {"status": OutboxStatus.SENT.value, "sent_at": now}})
+        track_event(entry["user_id"], "alert_sent", {
+            "brand_id": entry["brand_id"], "insight_id": entry["insight_id"], "category": entry["category"], "mode": "immediate",
+        })
         return "sent"
     await db["mi_outbox"].update_one(
         {"id": entry["id"]}, {"$set": {"status": OutboxStatus.FAILED.value, "failed_reason": "send_raw_email returned False"}}
@@ -243,7 +253,7 @@ async def send_daily_digests(db: AsyncIOMotorDatabase, now: Optional[datetime] =
 
         if not prefs.get("email_enabled", False):
             for entry in entries:
-                await _suppress(db, entry["id"], "email not opted in — in-app only")
+                await _suppress(db, entry, "email not opted in — in-app only")
             continue
 
         if not await _try_claim_daily_digest(db, user_id, now):
@@ -253,14 +263,14 @@ async def send_daily_digests(db: AsyncIOMotorDatabase, now: Optional[datetime] =
         for entry in entries:
             insight = await db["mi_insights"].find_one({"id": entry["insight_id"]})
             if insight is None or insight.get("status") != "active":
-                await _suppress(db, entry["id"], "insight no longer active by digest time")
+                await _suppress(db, entry, "insight no longer active by digest time")
                 continue
             if (
                 entry["topic_id"] in prefs.get("muted_topic_ids", [])
                 or entry["category"] in prefs.get("muted_categories", [])
                 or entry["insight_id"] in prefs.get("snoozed_insight_ids", [])
             ):
-                await _suppress(db, entry["id"], "muted or snoozed")
+                await _suppress(db, entry, "muted or snoozed")
                 continue
             eligible.append((entry, insight))
 
@@ -293,6 +303,10 @@ async def send_daily_digests(db: AsyncIOMotorDatabase, now: Optional[datetime] =
             else:
                 update["failed_reason"] = "send_raw_email returned False"
             await db["mi_outbox"].update_one({"id": entry["id"]}, {"$set": update})
+            if ok:
+                track_event(entry["user_id"], "alert_sent", {
+                    "brand_id": entry["brand_id"], "insight_id": entry["insight_id"], "category": entry["category"], "mode": "digest",
+                })
         if ok:
             sent += 1
 
