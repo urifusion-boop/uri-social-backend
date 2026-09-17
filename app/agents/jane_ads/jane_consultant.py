@@ -238,7 +238,12 @@ def _output_instructions() -> str:
         f'  "stated_behaviour": one of {sorted(_BEHAVIOURS)} or null,\n'
         '  "is_new_thing": bool, "has_existing_demand": bool, "has_video": bool,\n'
         '  "geo_mode": "own_radius"|"watering_hole"|"mixed"|"non_local",\n'
-        '  "geo_areas": [{"name": "...", "reason": "..."}],\n'
+        '  "geo_areas": [{"name": "...", "reason": "..."}] — TWO or THREE areas, never\n'
+        "     one. A single area leaves the audience too narrow for Meta to deliver\n"
+        "     against (its own warning, live-reported on a one-area ad set), and more\n"
+        "     than three splits a small budget so finely that none of them gets enough\n"
+        "     to learn from. If the client names a whole city, pick the two or three\n"
+        "     pockets inside it where their buyers actually concentrate,\n"
         '  "geo_explanation": "one sentence — why these areas/this mode",\n'
         '  "intermediary_note": "one sentence if an intermediary beats the end-user target, else '
         'empty string",\n'
