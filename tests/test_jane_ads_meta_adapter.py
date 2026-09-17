@@ -28,6 +28,22 @@ from app.agents.jane_ads.models import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _no_named_geo_by_default(monkeypatch):
+    """Default every test to coordinate pins.
+
+    launch_campaign now asks Meta to resolve each pocket to a NAMED location, so Ads
+    Manager shows "Ikeja, Lagos State" rather than "(6.6018, 3.3515)". That is a real
+    Graph call, and these tests mock httpx globally — without this it would eat a
+    response from each test's canned queue. The named path has its own tests below,
+    which override this.
+    """
+    async def _unresolved(name, expected_region, access_token="", timeout=8.0):
+        return None
+
+    monkeypatch.setattr("app.agents.jane_ads.geo_names.resolve_named_location", _unresolved)
+
+
 def _run(coro):
     return asyncio.get_event_loop().run_until_complete(coro)
 
@@ -681,3 +697,77 @@ def test_a_website_destination_never_goes_native():
     assert adset["optimization_goal"] == "LINK_CLICKS"
     assert "destination_type" not in adset
     assert spec["link_data"]["link"] == "https://example.com/shop"
+
+
+# ── Named locations (DASH: "show exact locations, not longitude and latitude") ──
+
+def test_a_verified_pocket_is_sent_as_a_named_location(monkeypatch):
+    """A raw coordinate makes the one thing a client most wants to check — where their
+    money is going — unreadable in Ads Manager. A pocket Meta can name is sent by key
+    so it renders as its real name plus the radius."""
+    async def _resolved(name, expected_region, access_token="", timeout=8.0):
+        return {"type": "city", "key": "1625140", "name": "Ikeja", "region": "Lagos State"}
+
+    monkeypatch.setattr("app.agents.jane_ads.geo_names.resolve_named_location", _resolved)
+    geo = GeoPlan(mode=GeoMode.OWN_RADIUS, city="Lagos", pins=[
+        GeoPin(name="Ikeja", lat=6.6018, lng=3.3515, radius_km=3.0),
+    ])
+    responses = [{"id": "cmp_1"}, {"id": "adset_1"}, {"id": "creative_1"}, {"id": "ad_1"}]
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client(responses)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        _run(_adapter().launch_campaign(_plan(geo=geo), _auth()))
+
+    geo_locations = mock_client.post.call_args_list[1].kwargs["json"]["targeting"]["geo_locations"]
+    # NO radius: Meta rejects a radius on a named key outright, because the named
+    # location carries its own boundary (live-verified 2026-09-17).
+    assert geo_locations == {"cities": [{"key": "1625140"}]}
+    assert "custom_locations" not in geo_locations
+
+
+def test_an_unresolvable_pocket_keeps_its_coordinates(monkeypatch):
+    """Our gazetteer carries pockets Meta has no key for at all ("Computer Village",
+    "Admiralty Way"), and a 1.5km pin on a commercial strip is deliberately tighter
+    than any named neighbourhood. Those must not be widened just to read nicely."""
+    async def _unresolved(name, expected_region, access_token="", timeout=8.0):
+        return None
+
+    monkeypatch.setattr("app.agents.jane_ads.geo_names.resolve_named_location", _unresolved)
+    geo = GeoPlan(mode=GeoMode.OWN_RADIUS, city="Lagos", pins=[
+        GeoPin(name="Computer Village", lat=6.5960, lng=3.3420, radius_km=1.5),
+    ])
+    responses = [{"id": "cmp_1"}, {"id": "adset_1"}, {"id": "creative_1"}, {"id": "ad_1"}]
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client(responses)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        _run(_adapter().launch_campaign(_plan(geo=geo), _auth()))
+
+    assert mock_client.post.call_args_list[1].kwargs["json"]["targeting"]["geo_locations"] == {
+        "custom_locations": [
+            {"latitude": 6.596, "longitude": 3.342, "radius": 1.5, "distance_unit": "kilometer"},
+        ]
+    }
+
+
+def test_named_and_unnamed_pockets_travel_together(monkeypatch):
+    """A plan mixes both. Resolving one must not drop the other — that would silently
+    shrink the targeted area."""
+    async def _resolve_only_ikeja(name, expected_region, access_token="", timeout=8.0):
+        if name == "Ikeja":
+            return {"type": "city", "key": "1625140", "name": "Ikeja", "region": "Lagos State"}
+        return None
+
+    monkeypatch.setattr("app.agents.jane_ads.geo_names.resolve_named_location", _resolve_only_ikeja)
+    geo = GeoPlan(mode=GeoMode.OWN_RADIUS, city="Lagos", pins=[
+        GeoPin(name="Ikeja", lat=6.6018, lng=3.3515, radius_km=3.0),
+        GeoPin(name="Computer Village", lat=6.5960, lng=3.3420, radius_km=1.5),
+    ])
+    responses = [{"id": "cmp_1"}, {"id": "adset_1"}, {"id": "creative_1"}, {"id": "ad_1"}]
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client(responses)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        _run(_adapter().launch_campaign(_plan(geo=geo), _auth()))
+
+    geo_locations = mock_client.post.call_args_list[1].kwargs["json"]["targeting"]["geo_locations"]
+    assert geo_locations["cities"] == [{"key": "1625140"}]
+    assert len(geo_locations["custom_locations"]) == 1
