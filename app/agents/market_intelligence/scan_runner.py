@@ -326,6 +326,12 @@ async def execute_scan(topic: Topic, run_id: str, db: AsyncIOMotorDatabase) -> N
                 "gaps": [f"scan failed unexpectedly: {e}"],
             }},
         )
+        # PRD §24 "run failure" — this crash path had zero visibility outside
+        # a DB row's gaps field until now; a dashboard can't chart what never
+        # fires an event.
+        track_event(topic.user_id, "scan_failed", {
+            "brand_id": topic.brand_id, "topic_id": topic.id, "scan_id": run_id, "error": str(e)[:200],
+        })
 
 
 async def _run_scan_pipeline(topic: Topic, run_id: str, db: AsyncIOMotorDatabase) -> None:
@@ -616,17 +622,25 @@ async def _run_scan_pipeline(topic: Topic, run_id: str, db: AsyncIOMotorDatabase
     reserved_amount = (run_doc or {}).get("estimated_cost_usd", 0.0)
     await reconcile_spend(db, topic.brand_id, reserved_amount, reserved_amount)
 
+    completed_at = datetime.utcnow()
     final_status = ScanStatus.PARTIAL if gaps else ScanStatus.COMPLETED
     await db["mi_scans"].update_one(
         {"id": run_id},
         {"$set": {
             "status": final_status.value,
-            "completed_at": datetime.utcnow(),
+            "completed_at": completed_at,
             "evidence_collected": len(all_new_evidence),
             "gaps": gaps,
         }},
     )
+    # PRD §24 "scheduler lag" / "spend" — duration and cost were already
+    # computed here for storage; attaching them as properties on the event
+    # that already fires means a dashboard can chart them with no new event
+    # to add later, just a breakdown on this one.
+    started_at = (run_doc or {}).get("started_at")
+    duration_seconds = (completed_at - started_at).total_seconds() if started_at else None
     track_event(topic.user_id, "scan_completed" if final_status == ScanStatus.COMPLETED else "scan_partial", {
         "brand_id": topic.brand_id, "topic_id": topic.id, "scan_id": run_id,
         "evidence_collected": len(all_new_evidence), "insights_count": len(insights), "gaps_count": len(gaps),
+        "gaps": gaps, "duration_seconds": duration_seconds, "estimated_cost_usd": reserved_amount,
     })

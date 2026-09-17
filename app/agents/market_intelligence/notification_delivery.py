@@ -124,6 +124,16 @@ async def _suppress(db: AsyncIOMotorDatabase, entry: dict, reason: str) -> str:
     return "suppressed"
 
 
+def _track_alert_failed(entry: dict, mode: str, reason: str) -> None:
+    """PRD §24 'delivery failures' — previously only visible as an mi_outbox
+    row's failed_reason, invisible to any dashboard until someone queried
+    the database directly."""
+    track_event(entry["user_id"], "alert_failed", {
+        "brand_id": entry["brand_id"], "insight_id": entry["insight_id"], "category": entry["category"],
+        "mode": mode, "reason": reason[:200],
+    })
+
+
 async def _process_one_immediate(db: AsyncIOMotorDatabase, entry: dict, now: datetime) -> str:
     prefs = await get_or_create_preferences(db, entry["user_id"], entry["brand_id"])
 
@@ -195,6 +205,7 @@ async def _process_one_immediate(db: AsyncIOMotorDatabase, entry: dict, now: dat
         await db["mi_outbox"].update_one(
             {"id": entry["id"]}, {"$set": {"status": OutboxStatus.FAILED.value, "failed_reason": "no email on file for recipient"}}
         )
+        _track_alert_failed(entry, "immediate", "no email on file for recipient")
         return "failed"
 
     subject, body = _render_email([(entry, insight)])
@@ -202,6 +213,7 @@ async def _process_one_immediate(db: AsyncIOMotorDatabase, entry: dict, now: dat
         ok = await email_service.send_raw_email(to_email, subject, body)
     except Exception as e:
         await db["mi_outbox"].update_one({"id": entry["id"]}, {"$set": {"status": OutboxStatus.FAILED.value, "failed_reason": str(e)}})
+        _track_alert_failed(entry, "immediate", str(e))
         return "failed"
 
     if ok:
@@ -213,6 +225,7 @@ async def _process_one_immediate(db: AsyncIOMotorDatabase, entry: dict, now: dat
     await db["mi_outbox"].update_one(
         {"id": entry["id"]}, {"$set": {"status": OutboxStatus.FAILED.value, "failed_reason": "send_raw_email returned False"}}
     )
+    _track_alert_failed(entry, "immediate", "send_raw_email returned False")
     return "failed"
 
 
@@ -284,6 +297,7 @@ async def send_daily_digests(db: AsyncIOMotorDatabase, now: Optional[datetime] =
                 await db["mi_outbox"].update_one(
                     {"id": entry["id"]}, {"$set": {"status": OutboxStatus.FAILED.value, "failed_reason": "no email on file"}}
                 )
+                _track_alert_failed(entry, "digest", "no email on file")
             continue
 
         subject, body = _render_email(eligible)
@@ -294,6 +308,7 @@ async def send_daily_digests(db: AsyncIOMotorDatabase, now: Optional[datetime] =
                 await db["mi_outbox"].update_one(
                     {"id": entry["id"]}, {"$set": {"status": OutboxStatus.FAILED.value, "failed_reason": str(e)}}
                 )
+                _track_alert_failed(entry, "digest", str(e))
             continue
 
         for entry, _ in eligible:
@@ -307,6 +322,8 @@ async def send_daily_digests(db: AsyncIOMotorDatabase, now: Optional[datetime] =
                 track_event(entry["user_id"], "alert_sent", {
                     "brand_id": entry["brand_id"], "insight_id": entry["insight_id"], "category": entry["category"], "mode": "digest",
                 })
+            else:
+                _track_alert_failed(entry, "digest", "send_raw_email returned False")
         if ok:
             sent += 1
 
