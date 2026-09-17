@@ -30,7 +30,7 @@ from .classification.scoring import (
     urgency_for_concern,
     urgency_for_inquiry,
 )
-from .clustering import cluster_evidence
+from .clustering import cluster_evidence, match_existing_cluster
 from .development_extractor import extract_development
 from .insight_composer import compose_insight
 from .noise_filter import deterministic_noise_reason
@@ -42,6 +42,7 @@ from .models import (
     DevelopmentStatus,
     Evidence,
     EvidenceType,
+    InsightStatus,
     InsightVersion,
     Lifecycle,
     ScanStatus,
@@ -147,6 +148,72 @@ async def _dedupe_against_existing(db: AsyncIOMotorDatabase, topic_id: str, sour
     source_ids ALREADY stored for this topic, so the caller skips them."""
     cursor = db["mi_evidence"].find({"topic_id": topic_id, "source_id": {"$in": source_ids}}, {"source_id": 1})
     return {doc["source_id"] async for doc in cursor}
+
+
+async def _merge_cluster(db: AsyncIOMotorDatabase, existing: Cluster, candidate: Cluster) -> Cluster:
+    """Combines a newly-clustered batch into an already-persisted cluster,
+    keeping the EXISTING id — PRD §11/§19: 'keep a stable cluster ID through
+    ordinary updates.' Counts are recomputed from the full (old + new)
+    membership read back from mi_evidence, not incrementally accumulated,
+    so they're always provably correct from source data rather than
+    drifting across repeated merges."""
+    merged_evidence_ids = list(dict.fromkeys(existing.evidence_ids + candidate.evidence_ids))
+    member_docs = [doc async for doc in db["mi_evidence"].find({"id": {"$in": merged_evidence_ids}})]
+    all_evidence = [Evidence(**{k: v for k, v in d.items() if k != "_id"}) for d in member_docs]
+
+    independent_accounts = len({e.author_handle for e in all_evidence if e.author_handle})
+    thread_ids = {e.parent_id for e in all_evidence if e.parent_id} or {e.source_id for e in all_evidence}
+    dated = [e.published_at for e in all_evidence if e.published_at]
+
+    return Cluster(
+        id=existing.id,
+        brand_id=existing.brand_id,
+        topic_id=existing.topic_id,
+        primary_type=existing.primary_type,
+        theme=candidate.theme,  # refresh the label toward the latest common terms
+        evidence_ids=merged_evidence_ids,
+        independent_account_count=independent_accounts,
+        original_thread_count=len(thread_ids),
+        first_seen=min([existing.first_seen] + ([min(dated)] if dated else [])),
+        last_updated=datetime.utcnow(),
+        lifecycle=existing.lifecycle,
+        embedding_centroid=candidate.embedding_centroid or existing.embedding_centroid,
+    )
+
+
+async def _resolve_classifications(
+    db: AsyncIOMotorDatabase, member_evidence: list[Evidence], in_memory: dict[str, Classification]
+) -> list[Classification]:
+    """A merged cluster's membership includes evidence from earlier scans
+    whose Classification isn't in this run's in-memory dict — fetched from
+    mi_classifications so compose_insight always sees every member's real
+    quote, not just this run's own slice."""
+    result: list[Classification] = []
+    missing_ids: list[str] = []
+    for e in member_evidence:
+        if e.id in in_memory:
+            result.append(in_memory[e.id])
+        else:
+            missing_ids.append(e.id)
+    if missing_ids:
+        async for doc in db["mi_classifications"].find({"evidence_id": {"$in": missing_ids}}):
+            doc.pop("_id", None)
+            result.append(Classification(**doc))
+    return result
+
+
+async def _apply_revision(db: AsyncIOMotorDatabase, cluster_id: str, insight: InsightVersion) -> InsightVersion:
+    """PRD §13: 'Keep every published insight revision immutable. Corrections
+    create a new revision, update the active view and preserve an audit
+    trail.' The previous ACTIVE revision for this cluster (if any) is marked
+    SUPERSEDED — never edited in place — and this new one becomes active."""
+    previous = await db["mi_insights"].find_one({"cluster_id": cluster_id, "status": InsightStatus.ACTIVE.value})
+    if previous is None:
+        return insight
+    await db["mi_insights"].update_one({"id": previous["id"]}, {"$set": {"status": InsightStatus.SUPERSEDED.value}})
+    insight.revision = previous.get("revision", 1) + 1
+    insight.first_seen = previous.get("first_seen", insight.first_seen)
+    return insight
 
 
 async def create_scan_run(topic: Topic, db: AsyncIOMotorDatabase) -> CollectionRun:
@@ -274,14 +341,42 @@ async def execute_scan(topic: Topic, run_id: str, db: AsyncIOMotorDatabase) -> N
     insights: list[InsightVersion] = []
 
     if clusterable_evidence:
-        clusters = await cluster_evidence(
+        candidate_clusters = await cluster_evidence(
             clusterable_evidence, topic_id=topic.id, brand_id=topic.brand_id, primary_types=primary_types
         )
-        if clusters:
-            await db["mi_clusters"].insert_many([c.dict() for c in clusters])
+
+        # Reconcile against clusters already persisted for this topic — merge
+        # into a matching one instead of always inserting a fresh row, so a
+        # recurring (e.g. scheduled) scan accumulates evidence onto the SAME
+        # cluster rather than spawning a lookalike every run.
+        candidate_types = {c.primary_type.value for c in candidate_clusters}
+        existing_docs = [
+            doc async for doc in db["mi_clusters"].find({"topic_id": topic.id, "primary_type": {"$in": list(candidate_types)}})
+        ]
+        existing_clusters = [Cluster(**{k: v for k, v in d.items() if k != "_id"}) for d in existing_docs]
+
+        clusters: list[Cluster] = []
+        for candidate in candidate_clusters:
+            match = match_existing_cluster(candidate, existing_clusters)
+            if match is not None:
+                merged = await _merge_cluster(db, match, candidate)
+                clusters.append(merged)
+                # A second new candidate in this same scan must not also
+                # match the pre-merge snapshot of the same existing cluster.
+                existing_clusters = [merged if c.id == match.id else c for c in existing_clusters]
+            else:
+                clusters.append(candidate)
+                existing_clusters.append(candidate)
 
         for cluster in clusters:
-            member_evidence = [e for e in clusterable_evidence if e.id in cluster.evidence_ids]
+            await db["mi_clusters"].replace_one({"id": cluster.id}, cluster.dict(), upsert=True)
+
+        for cluster in clusters:
+            # Full membership (old + new) — a merged cluster's evidence_ids
+            # include evidence from earlier scans that isn't in this scan's
+            # own clusterable_evidence list.
+            member_docs = [doc async for doc in db["mi_evidence"].find({"id": {"$in": cluster.evidence_ids}})]
+            member_evidence = [Evidence(**{k: v for k, v in d.items() if k != "_id"}) for d in member_docs]
 
             # PRD only specifies bespoke eligibility bars for concern/inquiry/
             # development explicitly (§12) — trend has its own bar the PRD
@@ -299,9 +394,10 @@ async def execute_scan(topic: Topic, run_id: str, db: AsyncIOMotorDatabase) -> N
 
             confidence = confidence_breakdown(member_evidence, cluster.original_thread_count)
             relevance = relevance_breakdown(member_evidence, business_context)
-            member_classifications = [classifications[e.id] for e in member_evidence if e.id in classifications]
+            member_classifications = await _resolve_classifications(db, member_evidence, classifications)
 
             insight = await compose_insight(cluster, member_evidence, member_classifications, confidence, relevance, urgency)
+            insight = await _apply_revision(db, cluster.id, insight)
             insights.append(insight)
 
     # ── Individual (non-clustered) inquiries ────────────────────────────────
