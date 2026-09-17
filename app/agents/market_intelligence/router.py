@@ -29,6 +29,7 @@ from .models import (
     FeedbackOutcome,
     FeedbackRequest,
     InsightVersion,
+    PreferencesUpdateRequest,
     ScanStatus,
     SourceConfig,
     Topic,
@@ -36,6 +37,7 @@ from .models import (
 )
 from .budget import get_or_create_budget
 from .deletion import delete_evidence_cascade
+from .notification_delivery import get_or_create_preferences
 from .scan_runner import create_scan_run, execute_scan, preview_topic_coverage
 
 router = APIRouter(prefix="/market-intelligence", tags=["Market Intelligence"])
@@ -338,3 +340,74 @@ async def update_development(
     dev_doc = await _get_owned_development(development_id, ctx["brand_id"], db)
     dev_doc.pop("_id", None)
     return UriResponse.get_single_data_response("development", dev_doc)
+
+
+@router.get("/preferences")
+async def get_preferences(
+    ctx: dict = Depends(get_flexible_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """PRD §14: 'Users can mute a topic or type, snooze an insight, change
+    sensitivity, disable channels.'"""
+    prefs = await get_or_create_preferences(db, ctx["user_id"], ctx["brand_id"])
+    prefs.pop("_id", None)
+    return UriResponse.get_single_data_response("preferences", prefs)
+
+
+@router.patch("/preferences")
+async def update_preferences(
+    body: PreferencesUpdateRequest,
+    ctx: dict = Depends(get_flexible_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    prefs = await get_or_create_preferences(db, ctx["user_id"], ctx["brand_id"])
+
+    update: dict = {"updated_at": datetime.utcnow()}
+    for field in (
+        "email_enabled", "timezone", "digest_hour_local",
+        "quiet_hours_start_local", "quiet_hours_end_local", "urgent_override",
+    ):
+        value = getattr(body, field)
+        if value is not None:
+            update[field] = value
+
+    muted_topics = set(prefs.get("muted_topic_ids", []))
+    if body.mute_topic_id:
+        muted_topics.add(body.mute_topic_id)
+    if body.unmute_topic_id:
+        muted_topics.discard(body.unmute_topic_id)
+    if body.mute_topic_id or body.unmute_topic_id:
+        update["muted_topic_ids"] = list(muted_topics)
+
+    muted_categories = set(prefs.get("muted_categories", []))
+    if body.mute_category:
+        muted_categories.add(body.mute_category.value)
+    if body.unmute_category:
+        muted_categories.discard(body.unmute_category.value)
+    if body.mute_category or body.unmute_category:
+        update["muted_categories"] = list(muted_categories)
+
+    await db["mi_preferences"].update_one({"user_id": ctx["user_id"], "brand_id": ctx["brand_id"]}, {"$set": update})
+    updated = await get_or_create_preferences(db, ctx["user_id"], ctx["brand_id"])
+    updated.pop("_id", None)
+    return UriResponse.get_single_data_response("preferences", updated)
+
+
+@router.post("/insights/{insight_id}/snooze")
+async def snooze_insight(
+    insight_id: str,
+    ctx: dict = Depends(get_flexible_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """PRD §16: 'Snoozing suppresses delivery, not evidence updates' — the
+    insight stays active and visible in-app, this only stops future outbox
+    entries for it from actually sending (see notification_delivery.py)."""
+    await _get_owned_insight(insight_id, ctx["brand_id"], db)
+    prefs = await get_or_create_preferences(db, ctx["user_id"], ctx["brand_id"])
+    snoozed = set(prefs.get("snoozed_insight_ids", []))
+    snoozed.add(insight_id)
+    await db["mi_preferences"].update_one(
+        {"user_id": ctx["user_id"], "brand_id": ctx["brand_id"]},
+        {"$set": {"snoozed_insight_ids": list(snoozed), "updated_at": datetime.utcnow()}},
+    )
+    return UriResponse.get_single_data_response("preferences", {"snoozed_insight_ids": list(snoozed)})

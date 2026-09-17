@@ -36,6 +36,7 @@ from .clustering import cluster_evidence, match_existing_cluster
 from .development_extractor import extract_development
 from .insight_composer import compose_insight
 from .noise_filter import deterministic_noise_reason
+from .notifications import queue_notification
 from .models import (
     Classification,
     Cluster,
@@ -415,6 +416,7 @@ async def execute_scan(topic: Topic, run_id: str, db: AsyncIOMotorDatabase) -> N
             insight = await compose_insight(cluster, member_evidence, member_classifications, confidence, relevance, urgency)
             insight = await _apply_revision(db, cluster.id, insight)
             insights.append(insight)
+            await queue_notification(db, insight, topic)
 
     # ── Individual (non-clustered) inquiries ────────────────────────────────
     for evidence in all_new_evidence:
@@ -445,6 +447,7 @@ async def execute_scan(topic: Topic, run_id: str, db: AsyncIOMotorDatabase) -> N
         )
         insight = await compose_insight(pseudo_cluster, [evidence], [classification], confidence, relevance, urgency)
         insights.append(insight)
+        await queue_notification(db, insight, topic)
 
     if insights:
         await db["mi_insights"].insert_many([i.dict() for i in insights])
