@@ -1915,6 +1915,12 @@ class _PlanBuildResult(BaseModel):
                                               # used, if any — surfaced back to the
                                               # client so the plan card can show which
                                               # audience it's for
+    # TEMP (2026-09-17, per explicit user request — revert when real TikTok testing
+    # is done): true when URI's 10% service fee was skipped for this plan. Only ever
+    # set when body.preferred_platform == "tiktok", so it can never affect a Meta
+    # plan. Threaded through so the wallet gate and the upfront charge at launch
+    # agree with what the plan was actually built (and shown to the client) against.
+    fee_bypassed: bool = False
 
 
 def _last_known_understood(saved: list[dict]) -> dict:
@@ -2172,7 +2178,13 @@ async def _build_campaign_plan(
     # campaign the wallet cannot fund, and the old model asked them to fund the fee on
     # top of the number they had just given.
     stated_budget_ngn = req.budget_ngn
-    req.budget_ngn = C.ad_spend_from_budget(stated_budget_ngn)
+    # TEMP (2026-09-17, per explicit user request — revert when real TikTok testing is
+    # done): skip URI's fee entirely for a TikTok-requested plan, so funding the wallet
+    # to clear TikTok's own real ad-group floor is all that's needed — no markup on
+    # top. Gated strictly on the user's own explicit toggle, never on what Jane herself
+    # would have picked, so this can never silently apply to a Meta plan.
+    fee_bypassed = (body.preferred_platform == "tiktok")
+    req.budget_ngn = stated_budget_ngn if fee_bypassed else C.ad_spend_from_budget(stated_budget_ngn)
 
     # 1.6. Now that the goal is actually known: a followers/engagement campaign never
     # routes off-platform, so step 0 above deliberately let ADS_NO_WHATSAPP through.
@@ -2787,10 +2799,11 @@ async def _build_campaign_plan(
         budget_estimate=budget_estimate, summary=summary_dump, thread_id=body.thread_id,
         variant_group_id=body.variant_group_id,
         selected_plan_variant=selected_variant.model_dump() if selected_variant else None,
+        fee_bypassed=fee_bypassed,
     )
 
 
-def _total_due_ngn(ad_spend_ngn: float) -> float:
+def _total_due_ngn(ad_spend_ngn: float, fee_bypassed: bool = False) -> float:
     """What the customer's wallet must cover for a campaign whose AD SPEND is
     `ad_spend_ngn` — which is the client's stated budget, since URI's fee was already
     taken out of it to arrive at that spend (constants.ad_spend_from_budget).
@@ -2800,11 +2813,20 @@ def _total_due_ngn(ad_spend_ngn: float) -> float:
     rather than just returning the stated budget keeps it in step with billing.py,
     which debits the wallet at ad_spend × markup as the campaign delivers — so the
     wallet empties precisely as Meta's budget is exhausted, with nothing left over and
-    nothing uncollected."""
+    nothing uncollected.
+
+    TEMP (2026-09-17, revert when real TikTok testing is done): `fee_bypassed` mirrors
+    _PlanBuildResult.fee_bypassed — when true, `ad_spend_ngn` already IS the full
+    stated budget (no fee was ever taken out of it), so the total due is exactly that,
+    with no markup applied on top."""
+    if fee_bypassed:
+        return round(ad_spend_ngn, 2)
     return round(ad_spend_ngn * C.AD_SPEND_MARKUP, 2)
 
 
-async def _wallet_status(db: AsyncIOMotorDatabase, business_id: str, budget_ngn: float) -> tuple[float, bool]:
+async def _wallet_status(
+    db: AsyncIOMotorDatabase, business_id: str, budget_ngn: float, fee_bypassed: bool = False,
+) -> tuple[float, bool]:
     """(balance, sufficient) — the real Mongo-backed balance vs. the total due. Takes
     AD SPEND, so the total due comes back out as the client's stated budget."""
     from .store import MongoWalletStore
@@ -2812,14 +2834,14 @@ async def _wallet_status(db: AsyncIOMotorDatabase, business_id: str, budget_ngn:
 
     wallet = WalletService(MongoWalletStore(db))
     balance = await wallet.get_balance(business_id)
-    return balance, balance >= _total_due_ngn(budget_ngn)
+    return balance, balance >= _total_due_ngn(budget_ngn, fee_bypassed)
 
 
-def _wallet_shortfall_message(balance: float, budget_ngn: float) -> str:
+def _wallet_shortfall_message(balance: float, budget_ngn: float, fee_bypassed: bool = False) -> str:
     """`budget_ngn` is AD SPEND; the client is told the one number that matters to
     them — the total leaving their wallet, which is the budget they stated. The fee is
     deliberately not itemised: it is inside that figure, not added to it."""
-    due = _total_due_ngn(budget_ngn)
+    due = _total_due_ngn(budget_ngn, fee_bypassed)
     return (
         f"Your ad wallet has ₦{balance:,.0f} — top up ₦{(due - balance):,.0f} more "
         f"before launching. This campaign costs ₦{due:,.0f}."
@@ -2973,9 +2995,10 @@ async def meta_launch_from_message(
     # Wallet gate — the ad wallet must actually have the money before anything
     # reaches Meta. Blocks with the exact shortfall rather than silently launching
     # a campaign whose real Meta daily budget got clamped to less than requested.
-    balance, sufficient = await _wallet_status(db, built.business_id, built.req.budget_ngn)
+    balance, sufficient = await _wallet_status(db, built.business_id, built.req.budget_ngn, built.fee_bypassed)
     if not sufficient:
-        raise HTTPException(status_code=400, detail=_wallet_shortfall_message(balance, built.req.budget_ngn))
+        raise HTTPException(status_code=400,
+                             detail=_wallet_shortfall_message(balance, built.req.budget_ngn, built.fee_bypassed))
 
     return await _do_launch(built, body.message, body.business_name, brand_ctx, db)
 
@@ -2998,7 +3021,7 @@ async def meta_plan_from_message(
     if isinstance(built, dict):
         return built["early_return"]
 
-    balance, sufficient = await _wallet_status(db, built.business_id, built.req.budget_ngn)
+    balance, sufficient = await _wallet_status(db, built.business_id, built.req.budget_ngn, built.fee_bypassed)
 
     plan_id = f"plan_{uuid.uuid4().hex[:16]}"
     now = datetime.now(timezone.utc)
@@ -3020,6 +3043,9 @@ async def meta_plan_from_message(
         "thread_id": built.thread_id,
         "variant_group_id": built.variant_group_id,
         "selected_plan_variant": built.selected_plan_variant,
+        # TEMP (2026-09-17, revert when real TikTok testing is done): carried through
+        # to the launch step below, which reloads this doc rather than built.
+        "fee_bypassed": built.fee_bypassed,
         "status": "pending",
         "created_at": now,
         "expires_at": now + timedelta(days=7),
@@ -3040,7 +3066,7 @@ async def meta_plan_from_message(
             # stated budget now, so itemising it invited the old "+ service fee" line
             # that asked them to fund more than the number they gave.
             "budget_ngn": built.req.budget_ngn,
-            "total_due_ngn": _total_due_ngn(built.req.budget_ngn),
+            "total_due_ngn": _total_due_ngn(built.req.budget_ngn, built.fee_bypassed),
             "sufficient": sufficient,
         },
     }
@@ -3178,16 +3204,20 @@ async def meta_launch_plan(
     if blocking:
         raise HTTPException(status_code=400, detail=f"Can't launch this ad — {blocking[0].guidance}")
 
-    balance, sufficient = await _wallet_status(db, doc["business_id"], req.budget_ngn)
+    # TEMP (2026-09-17, revert when real TikTok testing is done): carried over from
+    # /meta/plan-from-message via the pending-plan doc.
+    fee_bypassed = bool(doc.get("fee_bypassed", False))
+    balance, sufficient = await _wallet_status(db, doc["business_id"], req.budget_ngn, fee_bypassed)
     if not sufficient:
-        raise HTTPException(status_code=400, detail=_wallet_shortfall_message(balance, req.budget_ngn))
+        raise HTTPException(status_code=400,
+                             detail=_wallet_shortfall_message(balance, req.budget_ngn, fee_bypassed))
 
     built = _PlanBuildResult(
         business_id=doc["business_id"], req=req, plan=plan,
         jane_platforms=doc["jane_platforms"], forced_to_meta=doc["forced_to_meta"],
         geo_dump=doc.get("geo_dump"), understood=doc["understood"],
         budget_estimate=doc.get("budget_estimate"), summary=doc.get("summary"),
-        thread_id=doc.get("thread_id", ""),
+        thread_id=doc.get("thread_id", ""), fee_bypassed=fee_bypassed,
     )
     result = await _do_launch(built, doc["message"], doc["business_name"], brand_ctx, db)
 
@@ -3200,7 +3230,7 @@ async def meta_launch_plan(
     # charge this campaign again as it spends (it skips any record carrying
     # charged_upfront_ngn; without that the client would pay twice for the same ads).
     campaign_id = result["launch"]["campaign_id"]
-    due = _total_due_ngn(req.budget_ngn)
+    due = _total_due_ngn(req.budget_ngn, fee_bypassed)
     try:
         from .store import MongoWalletStore
         from .wallet import InsufficientFundsError, WalletService
