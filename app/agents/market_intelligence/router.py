@@ -23,6 +23,7 @@ from app.domain.responses.uri_response import UriResponse
 from app.services.PostHogService import track_event
 
 from .models import (
+    AccessGrantRequest,
     ActionBrief,
     BriefCreateRequest,
     DevelopmentUpdateRequest,
@@ -31,12 +32,15 @@ from .models import (
     FeedbackRequest,
     InsightVersion,
     KeywordSuggestionRequest,
+    MIAccessGrant,
+    MIAccessLevel,
     PreferencesUpdateRequest,
     ScanStatus,
     SourceConfig,
     Topic,
     TopicCreateRequest,
 )
+from .access import can_manage_mi_access, require_mi_write_access
 from .budget import get_or_create_budget
 from .deletion import delete_evidence_cascade
 from .notification_delivery import get_or_create_preferences
@@ -144,7 +148,7 @@ async def suggest_topic_keywords(
 @router.post("/topics")
 async def create_topic(
     body: TopicCreateRequest,
-    ctx: dict = Depends(get_flexible_brand_context),
+    ctx: dict = Depends(require_mi_write_access),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     # PRD §9: "Uri suggests keywords... the owner reviews them before
@@ -224,7 +228,7 @@ async def get_topic_coverage_preview(
 async def start_scan(
     topic_id: str,
     background_tasks: BackgroundTasks,
-    ctx: dict = Depends(get_flexible_brand_context),
+    ctx: dict = Depends(require_mi_write_access),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     topic_doc = await _get_owned_topic(topic_id, ctx["brand_id"], db)
@@ -359,7 +363,7 @@ async def get_insight_trace(
 async def submit_feedback(
     insight_id: str,
     body: FeedbackRequest,
-    ctx: dict = Depends(get_flexible_brand_context),
+    ctx: dict = Depends(require_mi_write_access),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     await _get_owned_insight(insight_id, ctx["brand_id"], db)
@@ -388,7 +392,7 @@ async def submit_feedback(
 @router.delete("/evidence/{evidence_id}")
 async def delete_evidence(
     evidence_id: str,
-    ctx: dict = Depends(get_flexible_brand_context),
+    ctx: dict = Depends(require_mi_write_access),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """PRD §21/§16, P0-14: 'removed evidence disappears from all serving
@@ -404,7 +408,7 @@ async def delete_evidence(
 async def create_brief(
     insight_id: str,
     body: BriefCreateRequest,
-    ctx: dict = Depends(get_flexible_brand_context),
+    ctx: dict = Depends(require_mi_write_access),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     insight_doc = await _get_owned_insight(insight_id, ctx["brand_id"], db)
@@ -435,7 +439,7 @@ async def create_brief(
 async def update_brief(
     insight_id: str,
     body: BriefCreateRequest,
-    ctx: dict = Depends(get_flexible_brand_context),
+    ctx: dict = Depends(require_mi_write_access),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """PRD §13: 'Where a destination module is unavailable, save an editable
@@ -491,7 +495,7 @@ async def get_development(
 async def update_development(
     development_id: str,
     body: DevelopmentUpdateRequest,
-    ctx: dict = Depends(get_flexible_brand_context),
+    ctx: dict = Depends(require_mi_write_access),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """PRD §13: 'Postponement or cancellation updates the SAME item and any
@@ -524,7 +528,7 @@ async def get_preferences(
 @router.patch("/preferences")
 async def update_preferences(
     body: PreferencesUpdateRequest,
-    ctx: dict = Depends(get_flexible_brand_context),
+    ctx: dict = Depends(require_mi_write_access),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     prefs = await get_or_create_preferences(db, ctx["user_id"], ctx["brand_id"])
@@ -563,7 +567,7 @@ async def update_preferences(
 @router.post("/insights/{insight_id}/snooze")
 async def snooze_insight(
     insight_id: str,
-    ctx: dict = Depends(get_flexible_brand_context),
+    ctx: dict = Depends(require_mi_write_access),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """PRD §16: 'Snoozing suppresses delivery, not evidence updates' — the
@@ -578,3 +582,49 @@ async def snooze_insight(
         {"$set": {"snoozed_insight_ids": list(snoozed), "updated_at": datetime.utcnow()}},
     )
     return UriResponse.get_single_data_response("preferences", {"snoozed_insight_ids": list(snoozed)})
+
+
+@router.get("/access")
+async def list_access_grants(
+    ctx: dict = Depends(get_flexible_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """PRD §21. Only an agency admin (for an agency-owned brand) or the
+    brand's own owner (for a personal brand) can see who's been
+    restricted — everyone else gets a plain 403, not a distinguishing
+    empty list."""
+    if not await can_manage_mi_access(db, ctx["brand_id"], ctx["user_id"]):
+        raise HTTPException(status_code=403, detail="Only the brand owner or an agency admin can manage access")
+    cursor = db["mi_access"].find({"brand_id": ctx["brand_id"]})
+    grants = [doc async for doc in cursor]
+    for g in grants:
+        g.pop("_id", None)
+    return UriResponse.get_list_data_response("access", grants)
+
+
+@router.post("/access")
+async def set_access_grant(
+    body: AccessGrantRequest,
+    ctx: dict = Depends(get_flexible_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """Setting level=FULL deletes any restriction rather than storing a
+    redundant row — FULL is simply what "no record" already means (see
+    access.py), so a grant document only ever exists to restrict someone."""
+    if not await can_manage_mi_access(db, ctx["brand_id"], ctx["user_id"]):
+        raise HTTPException(status_code=403, detail="Only the brand owner or an agency admin can manage access")
+
+    if body.level == MIAccessLevel.FULL:
+        await db["mi_access"].delete_one({"brand_id": ctx["brand_id"], "user_id": body.user_id})
+        return UriResponse.get_single_data_response("access", {"user_id": body.user_id, "level": "full"})
+
+    grant = MIAccessGrant(
+        id=str(uuid.uuid4()), brand_id=ctx["brand_id"], user_id=body.user_id,
+        level=body.level, granted_by=ctx["user_id"],
+    )
+    await db["mi_access"].update_one(
+        {"brand_id": ctx["brand_id"], "user_id": body.user_id},
+        {"$set": grant.dict()},
+        upsert=True,
+    )
+    return UriResponse.get_single_data_response("access", grant.dict())
