@@ -29,10 +29,12 @@ from .models import (
     FeedbackOutcome,
     FeedbackRequest,
     InsightVersion,
+    ScanStatus,
     SourceConfig,
     Topic,
     TopicCreateRequest,
 )
+from .budget import get_or_create_budget
 from .deletion import delete_evidence_cascade
 from .scan_runner import create_scan_run, execute_scan, preview_topic_coverage
 
@@ -100,6 +102,22 @@ async def list_topics(
     return UriResponse.get_list_data_response("topic", topics)
 
 
+@router.get("/budget")
+async def get_budget(
+    ctx: dict = Depends(get_flexible_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """PRD §23/§5 (G5): lets the business (or an operations analyst) see
+    this workspace's current monthly allowance, reservation and spend
+    before it becomes a surprise. Read-only — allowance changes aren't
+    exposed yet since role-based permissions (Owner vs Editor, PRD §21)
+    aren't implemented in this pilot, and letting any authenticated brand
+    member raise their own spending cap would defeat the control."""
+    budget = await get_or_create_budget(db, ctx["brand_id"])
+    budget.pop("_id", None)
+    return UriResponse.get_single_data_response("budget", budget)
+
+
 @router.get("/topics/{topic_id}/coverage-preview")
 async def get_topic_coverage_preview(
     topic_id: str,
@@ -129,7 +147,11 @@ async def start_scan(
     topic = Topic(**topic_doc)
 
     run = await create_scan_run(topic, db)
-    background_tasks.add_task(execute_scan, topic, run.id, db)
+    # PRD §23/P0-15: a run that couldn't reserve its estimated cost is
+    # recorded (visibly, as BUDGET_LIMITED) but never actually executed —
+    # nothing here spends against a reservation that was never granted.
+    if run.status != ScanStatus.BUDGET_LIMITED:
+        background_tasks.add_task(execute_scan, topic, run.id, db)
 
     return UriResponse.get_single_data_response("scan", run.dict())
 

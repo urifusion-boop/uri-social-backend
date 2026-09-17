@@ -106,6 +106,12 @@ class FakeCollection:
     def find(self, query, projection=None):
         return FakeCursor([])
 
+    async def find_one(self, query):
+        for d in self.inserted:
+            if all(d.get(k) == v for k, v in query.items()):
+                return dict(d)
+        return None
+
     async def insert_many(self, docs):
         self.inserted.extend(docs)
 
