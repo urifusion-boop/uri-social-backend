@@ -295,6 +295,15 @@ class InsightVersion(BaseModel):
 
     coverage_note: Optional[str] = None  # set when comparability/coverage is degraded
 
+    # PRD §10: "P0 covers English and a bounded Nigerian Pidgin evaluation
+    # set. Yoruba, Igbo and Hausa require their own quality gates before
+    # automatic high-priority alerts." The majority language among the
+    # insight's own evidence (set by scan_runner, not this model) — used by
+    # notifications.categorize_insight() to hold back auto-alerts for the
+    # three languages without an evaluation set yet, never to change
+    # classification itself.
+    language: str = "en"
+
     first_seen: datetime
     last_updated: datetime
 

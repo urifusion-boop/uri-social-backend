@@ -88,6 +88,36 @@ def test_reputation_risk_revision_bump_still_never_queues():
     assert categorize_insight(insight) is None
 
 
+def test_act_soon_is_downgraded_for_ungated_languages():
+    for lang in ("yo", "ig", "ha"):
+        insight = _insight(
+            urgency=UrgencyAssessment(is_urgent=True, reason="deadline soon"),
+            confidence=_score(9), relevance=_score(9), language=lang,
+        )
+        assert categorize_insight(insight) == NotificationCategory.USEFUL_PATTERN
+
+
+def test_act_soon_is_not_downgraded_for_english_or_gated_pidgin():
+    for lang in ("en", "pcm"):  # pcm = Nigerian Pidgin, PRD's own bounded evaluation set
+        insight = _insight(
+            urgency=UrgencyAssessment(is_urgent=True, reason="deadline soon"),
+            confidence=_score(9), relevance=_score(9), language=lang,
+        )
+        assert categorize_insight(insight) == NotificationCategory.ACT_SOON
+
+
+def test_material_update_is_also_downgraded_for_ungated_languages():
+    insight = _insight(revision=2, language="ha")
+    assert categorize_insight(insight) == NotificationCategory.USEFUL_PATTERN
+
+
+def test_qualified_inquiry_is_not_gated_by_language():
+    # A direct request isn't a "high-priority alert claim" the way
+    # act_soon/material_update are — deliberately ungated.
+    insight = _insight(type=EvidenceType.PURCHASE_INQUIRY, language="yo")
+    assert categorize_insight(insight) == NotificationCategory.QUALIFIED_INQUIRY
+
+
 def test_urgent_high_confidence_high_relevance_is_act_soon():
     insight = _insight(
         urgency=UrgencyAssessment(is_urgent=True, reason="deadline soon"),

@@ -44,24 +44,22 @@ _DELIVERY_MODE: dict[NotificationCategory, OutboxDeliveryMode] = {
 
 _HIGH_MEDIUM = {ConfidenceBand.HIGH, ConfidenceBand.MEDIUM}
 
+# PRD §10: "P0 covers English and a bounded Nigerian Pidgin evaluation set.
+# Yoruba, Igbo and Hausa require their own quality gates before automatic
+# high-priority alerts." No such evaluation set exists yet for these three,
+# so ACT_SOON/MATERIAL_UPDATE — the two categories PRD frames as high-
+# priority, immediate alerts — are downgraded to USEFUL_PATTERN (still
+# surfaced, still eventually notified via the digest, just never treated as
+# confidently urgent in a language this pilot hasn't quality-gated).
+# QUALIFIED_INQUIRY is deliberately NOT gated here: it's a direct request
+# that classify.py either resolved clearly or flagged uncertain, not a
+# claim whose language-quality matters the way a "high-priority alert"
+# claim's does.
+_UNGATED_LANGUAGES = {"yo", "ig", "ha"}
+_HIGH_PRIORITY_CATEGORIES = {NotificationCategory.ACT_SOON, NotificationCategory.MATERIAL_UPDATE}
 
-def categorize_insight(insight: InsightVersion) -> Optional[NotificationCategory]:
-    """PRD §14's table, applied in the order the PRD itself gives more
-    specific triggers priority over general ones: a revision bump always
-    means MATERIAL_UPDATE regardless of the insight's own type/scores,
-    since "changed... or meaningful evidence change" is about the fact that
-    something changed, not about what the insight currently looks like.
-    Returns None for early_signal — PRD: 'Watchlist only,' no delivery."""
-    if insight.type == EvidenceType.REPUTATION_RISK:
-        # PRD §14: "High-consequence reputation claims require human review
-        # before an external alert. They remain available internally with
-        # an unverified label." No automated review workflow exists in this
-        # pilot, so the only safe interpretation is: never queue ANY outbox
-        # entry for this type — in-app visibility (already the baseline for
-        # every active insight) is all it gets until a human reviews it.
-        # This intentionally overrides even a revision bump.
-        return None
 
+def _base_category(insight: InsightVersion) -> Optional[NotificationCategory]:
     if insight.revision > 1:
         return NotificationCategory.MATERIAL_UPDATE
 
@@ -85,6 +83,29 @@ def categorize_insight(insight: InsightVersion) -> Optional[NotificationCategory
         return NotificationCategory.USEFUL_PATTERN
 
     return None  # early_signal — insufficient evidence for a stronger conclusion
+
+
+def categorize_insight(insight: InsightVersion) -> Optional[NotificationCategory]:
+    """PRD §14's table, applied in the order the PRD itself gives more
+    specific triggers priority over general ones: a revision bump always
+    means MATERIAL_UPDATE regardless of the insight's own type/scores,
+    since "changed... or meaningful evidence change" is about the fact that
+    something changed, not about what the insight currently looks like.
+    Returns None for early_signal — PRD: 'Watchlist only,' no delivery."""
+    if insight.type == EvidenceType.REPUTATION_RISK:
+        # PRD §14: "High-consequence reputation claims require human review
+        # before an external alert. They remain available internally with
+        # an unverified label." No automated review workflow exists in this
+        # pilot, so the only safe interpretation is: never queue ANY outbox
+        # entry for this type — in-app visibility (already the baseline for
+        # every active insight) is all it gets until a human reviews it.
+        # This intentionally overrides even a revision bump.
+        return None
+
+    category = _base_category(insight)
+    if category in _HIGH_PRIORITY_CATEGORIES and insight.language in _UNGATED_LANGUAGES:
+        return NotificationCategory.USEFUL_PATTERN
+    return category
 
 
 async def queue_notification(db: AsyncIOMotorDatabase, insight: InsightVersion, topic: Topic) -> Optional[MIOutboxEntry]:
