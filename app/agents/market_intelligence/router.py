@@ -7,7 +7,7 @@ scan_runner.py or a direct Mongo read. No business logic lives here.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from motor.motor_asyncio import AsyncIOMotorDatabase
@@ -60,6 +60,44 @@ async def _get_owned_insight(insight_id: str, brand_id: str, db: AsyncIOMotorDat
     if not insight_doc or insight_doc["brand_id"] != brand_id:
         raise HTTPException(status_code=404, detail="Insight not found")
     return insight_doc
+
+
+STALE_SCAN_TIMEOUT_MINUTES = 10
+
+
+async def _self_heal_stale_scan(scan_doc: dict, db: AsyncIOMotorDatabase) -> dict:
+    """execute_scan()'s own crash-safety net (scan_runner.py) guarantees a
+    NEW scan always reaches a terminal status even if its pipeline raises —
+    but it can't help a run whose entire background task died some other
+    way (e.g. the worker process itself was killed or redeployed mid-run).
+    A caller polling GET /scans/{id} against a run that will genuinely
+    never change again would otherwise poll forever, which is exactly what
+    showed up as "scan is taking longer than expected" with nothing
+    actually running. Mirrors this codebase's existing self-heal-on-read
+    pattern for stale Jane Ads campaign status.
+
+    Deliberately does not cover a run stuck in QUEUED with no started_at at
+    all — that would mean the background task was scheduled but never
+    began, which realistically only happens if the process died in the gap
+    between accepting the request and starting the task; too rare to be
+    worth a second timestamp field for."""
+    non_terminal = {ScanStatus.QUEUED.value, ScanStatus.COLLECTING.value, ScanStatus.ANALYSING.value}
+    started_at = scan_doc.get("started_at")
+    if scan_doc.get("status") not in non_terminal or started_at is None:
+        return scan_doc
+    if datetime.utcnow() - started_at < timedelta(minutes=STALE_SCAN_TIMEOUT_MINUTES):
+        return scan_doc
+
+    healed_fields = {
+        "status": ScanStatus.FAILED.value,
+        "completed_at": datetime.utcnow(),
+        "gaps": (scan_doc.get("gaps") or []) + [
+            "scan did not complete within the expected time and was marked failed — please retry"
+        ],
+    }
+    await db["mi_scans"].update_one({"id": scan_doc["id"]}, {"$set": healed_fields})
+    scan_doc.update(healed_fields)
+    return scan_doc
 
 
 async def _get_owned_development(development_id: str, brand_id: str, db: AsyncIOMotorDatabase) -> dict:
@@ -167,6 +205,7 @@ async def get_scan(
     scan_doc = await db["mi_scans"].find_one({"id": scan_id})
     if not scan_doc or scan_doc["brand_id"] != ctx["brand_id"]:
         raise HTTPException(status_code=404, detail="Scan not found")
+    scan_doc = await _self_heal_stale_scan(scan_doc, db)
     scan_doc.pop("_id", None)
     return UriResponse.get_single_data_response("scan", scan_doc)
 

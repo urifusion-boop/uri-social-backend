@@ -251,10 +251,31 @@ async def create_scan_run(topic: Topic, db: AsyncIOMotorDatabase) -> CollectionR
 
 
 async def execute_scan(topic: Topic, run_id: str, db: AsyncIOMotorDatabase) -> None:
+    """Runs as a FastAPI background task — nothing here returns to an HTTP
+    caller, and nothing else ever calls this again for the same run_id, so
+    if the pipeline below raises anything unhandled, the run would
+    otherwise be stranded in COLLECTING/ANALYSING forever with no caller
+    left to notice or retry. This wrapper is the one place that guarantees
+    every run reaches a terminal status no matter what breaks inside —
+    PRD §9's own state list includes FAILED for exactly this reason."""
+    try:
+        await _run_scan_pipeline(topic, run_id, db)
+    except Exception as e:
+        print(f"[MI][scan] run {run_id} crashed and was marked failed: {e}")
+        await db["mi_scans"].update_one(
+            {"id": run_id},
+            {"$set": {
+                "status": ScanStatus.FAILED.value,
+                "completed_at": datetime.utcnow(),
+                "gaps": [f"scan failed unexpectedly: {e}"],
+            }},
+        )
+
+
+async def _run_scan_pipeline(topic: Topic, run_id: str, db: AsyncIOMotorDatabase) -> None:
     """The actual collection→classify→cluster→score→compose pipeline, updating
-    the run created by create_scan_run(). Runs as a background task — nothing
-    here returns to an HTTP caller, it only ever mutates `mi_scans`/`mi_evidence`/
-    etc, which the GET /scans/{id} endpoint polls."""
+    the run created by create_scan_run(). See execute_scan() for the crash
+    safety net wrapping this."""
     await db["mi_scans"].update_one(
         {"id": run_id}, {"$set": {"status": ScanStatus.COLLECTING.value, "started_at": datetime.utcnow()}}
     )
