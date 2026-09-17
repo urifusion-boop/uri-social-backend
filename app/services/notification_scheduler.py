@@ -162,6 +162,23 @@ def _job_jane_ads_billing():
     _run_async("jane_ads_billing", _run)
 
 
+def _job_market_intelligence_scheduled_scans():
+    """Uri Market Intelligence scheduled collection (PRD §18) — hourly check
+    of active keep_updating topics. Dev-only feature (see the module's own
+    docstrings); import-guarded so this job is a silent no-op rather than an
+    hourly error log anywhere the market_intelligence package doesn't exist."""
+    async def _run():
+        try:
+            from app.agents.market_intelligence.scheduler import run_scheduled_market_intelligence_scans
+        except ImportError:
+            return
+        from app.database import get_db
+        db = get_db()
+        result = await run_scheduled_market_intelligence_scans(db)
+        print(f"🔎 Market Intelligence scheduled scans: {result}")
+    _run_async("market_intelligence_scheduled_scans", _run)
+
+
 def _job_publish_scheduled_content():
     async def _run():
         from app.database import get_db
@@ -274,8 +291,18 @@ def start_notification_scheduler():
         **_JOB_DEFAULTS,
     )
 
+    # Uri Market Intelligence scheduled collection (PRD §18) — hourly,
+    # offset from the top of the hour. Dev-only feature; import-guarded
+    # inside the job itself (see _job_market_intelligence_scheduled_scans).
+    _scheduler.add_job(
+        _job_market_intelligence_scheduled_scans,
+        CronTrigger(minute=20),
+        id="market_intelligence_scheduled_scans",
+        **_JOB_DEFAULTS,
+    )
+
     _scheduler.start()
-    print("📅 Notification scheduler started with 9 jobs")
+    print("📅 Notification scheduler started with 10 jobs")
 
 
 def stop_notification_scheduler():
