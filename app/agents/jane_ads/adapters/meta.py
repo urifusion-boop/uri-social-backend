@@ -50,7 +50,7 @@ from app.core.config import settings
 from .base import AdPlatformAdapter
 from .. import constants as C
 from ..destination import DestinationType, link_for_plan
-from ..geo import meta_targeting_from_geo
+from ..geo import meta_targeting_from_geo, meta_targeting_from_geo_named
 from ..models import (
     CampaignPlan,
     ConversationDelivered,
@@ -343,7 +343,11 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                     # whole feature exists so the client's own audience choice is honoured.
                     # Flip to 1 only alongside changing what the card promises.
                     "targeting": {
-                        **meta_targeting_from_geo(plan.geo),
+                        **(await meta_targeting_from_geo_named(
+                            plan.geo,
+                            region=(plan.geo.city if plan.geo else ""),
+                            access_token=self._access_token,
+                        )),
                         **plan.audience_targeting,
                         "targeting_automation": {"advantage_audience": 0},
                     },
