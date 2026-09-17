@@ -67,6 +67,25 @@ class ConfidenceBand(str, Enum):
     HIGH = "high"      # 8-10
 
 
+class MIAccessLevel(str, Enum):
+    """PRD §21 role-based permissions, scoped entirely to Market
+    Intelligence — deliberately NOT built on AgencyRole or WorkspaceRole
+    (see access.py's own docstring for why). Absence of an MIAccessGrant
+    record means FULL: this can only ever RESTRICT a user below what the
+    underlying agency/brand system already grants them, never grant more."""
+    FULL = "full"
+    VIEW_ONLY = "view_only"
+
+
+class ActionReadiness(str, Enum):
+    """PRD §7: 'Recommendations with missing fulfilment information are
+    labelled "Check suitability" rather than "Ready to act."' Derived from
+    relevance scoring's own fulfilment_feasibility component — never a
+    separate guess."""
+    READY_TO_ACT = "ready_to_act"
+    CHECK_SUITABILITY = "check_suitability"
+
+
 class InsightStatus(str, Enum):
     ACTIVE = "active"
     SUPERSEDED = "superseded"   # a newer revision replaced this one
@@ -304,6 +323,12 @@ class InsightVersion(BaseModel):
     # classification itself.
     language: str = "en"
 
+    # PRD §7 — defaults to the cautious answer; scan_runner only ever
+    # upgrades this to READY_TO_ACT when relevance scoring's own
+    # fulfilment_feasibility component actually confirmed known stock/
+    # delivery facts, never the other way around.
+    action_readiness: ActionReadiness = ActionReadiness.CHECK_SUITABILITY
+
     first_seen: datetime
     last_updated: datetime
 
@@ -320,6 +345,12 @@ class SourceConfig(BaseModel):
     refresh_cadence_hours: int = 1
 
 
+class NotificationSensitivity(str, Enum):
+    LOW = "low"
+    NORMAL = "normal"
+    HIGH = "high"
+
+
 class Topic(BaseModel):
     id: str
     brand_id: str
@@ -333,6 +364,16 @@ class Topic(BaseModel):
     keep_updating: bool = False
     active: bool = True
     created_at: datetime = Field(default_factory=datetime.utcnow)
+
+    # PRD §9 "Advanced inputs": competitors, selected accounts, languages,
+    # negative keywords (excluded_keywords above already covered this one)
+    # and notification sensitivity. "Selected accounts" is deliberately not
+    # modelled — it only makes sense once a real adapter can search a
+    # specific handle, which none can yet (mock is the only registered
+    # provider).
+    competitors: list[str] = Field(default_factory=list)
+    languages: list[str] = Field(default_factory=lambda: ["en"])
+    notification_sensitivity: NotificationSensitivity = NotificationSensitivity.NORMAL
 
 
 class Development(BaseModel):
@@ -462,6 +503,23 @@ class PreferencesUpdateRequest(BaseModel):
     unmute_category: Optional[NotificationCategory] = None
 
 
+class MIAccessGrant(BaseModel):
+    """A record only ever exists here to RESTRICT someone to view-only —
+    there's no FULL row, since FULL is simply what "no record" already
+    means. See access.py."""
+    id: str
+    brand_id: str
+    user_id: str
+    level: MIAccessLevel
+    granted_by: str
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class AccessGrantRequest(BaseModel):
+    user_id: str
+    level: MIAccessLevel
+
+
 class FeedbackOutcome(BaseModel):
     id: str
     insight_id: str
@@ -481,6 +539,18 @@ class TopicCreateRequest(BaseModel):
     geographic_scope: Optional[str] = None
     requested_days: int = 30
     keep_updating: bool = False
+    competitors: list[str] = Field(default_factory=list)
+    languages: list[str] = Field(default_factory=lambda: ["en"])
+    notification_sensitivity: NotificationSensitivity = NotificationSensitivity.NORMAL
+
+
+class KeywordSuggestionRequest(BaseModel):
+    question: str
+
+
+class KeywordSuggestionResponse(BaseModel):
+    keywords: list[str]
+    excluded_keywords: list[str]
 
 
 class ScanRequest(BaseModel):

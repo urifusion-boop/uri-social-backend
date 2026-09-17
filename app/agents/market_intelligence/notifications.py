@@ -25,6 +25,7 @@ from .models import (
     Lifecycle,
     MIOutboxEntry,
     NotificationCategory,
+    NotificationSensitivity,
     OutboxDeliveryMode,
     Topic,
 )
@@ -59,7 +60,15 @@ _UNGATED_LANGUAGES = {"yo", "ig", "ha"}
 _HIGH_PRIORITY_CATEGORIES = {NotificationCategory.ACT_SOON, NotificationCategory.MATERIAL_UPDATE}
 
 
-def _base_category(insight: InsightVersion) -> Optional[NotificationCategory]:
+def _base_category(insight: InsightVersion, sensitivity: NotificationSensitivity) -> Optional[NotificationCategory]:
+    """PRD §9 lists 'notification sensitivity' as a per-topic advanced
+    input. HIGH loosens both bars (a MEDIUM band can now qualify where only
+    HIGH could before); LOW tightens the general-pattern bar to require
+    HIGH on both dimensions instead of MEDIUM+; NORMAL is the original,
+    unchanged behaviour. Never affects the type-driven categories above
+    (qualified_inquiry/prepare/cooling/material_update) — sensitivity is
+    about how confidently a PATTERN should be treated, not about whether an
+    inquiry or a dated development gets surfaced at all."""
     if insight.revision > 1:
         return NotificationCategory.MATERIAL_UPDATE
 
@@ -72,20 +81,32 @@ def _base_category(insight: InsightVersion) -> Optional[NotificationCategory]:
     if insight.lifecycle == Lifecycle.COOLING:
         return NotificationCategory.COOLING
 
-    if (
-        insight.urgency.is_urgent
-        and insight.confidence.band == ConfidenceBand.HIGH
-        and insight.relevance.band == ConfidenceBand.HIGH
-    ):
+    high_sensitivity = sensitivity == NotificationSensitivity.HIGH
+    act_soon_confidence_ok = insight.confidence.band == ConfidenceBand.HIGH or (
+        high_sensitivity and insight.confidence.band == ConfidenceBand.MEDIUM
+    )
+    act_soon_relevance_ok = insight.relevance.band == ConfidenceBand.HIGH or (
+        high_sensitivity and insight.relevance.band == ConfidenceBand.MEDIUM
+    )
+    if insight.urgency.is_urgent and act_soon_confidence_ok and act_soon_relevance_ok:
         return NotificationCategory.ACT_SOON
 
-    if insight.confidence.band in _HIGH_MEDIUM and insight.relevance.band in _HIGH_MEDIUM:
+    if sensitivity == NotificationSensitivity.LOW:
+        useful_pattern_ok = insight.confidence.band == ConfidenceBand.HIGH and insight.relevance.band == ConfidenceBand.HIGH
+    elif high_sensitivity:
+        useful_pattern_ok = insight.confidence.band in _HIGH_MEDIUM or insight.relevance.band in _HIGH_MEDIUM
+    else:
+        useful_pattern_ok = insight.confidence.band in _HIGH_MEDIUM and insight.relevance.band in _HIGH_MEDIUM
+
+    if useful_pattern_ok:
         return NotificationCategory.USEFUL_PATTERN
 
     return None  # early_signal — insufficient evidence for a stronger conclusion
 
 
-def categorize_insight(insight: InsightVersion) -> Optional[NotificationCategory]:
+def categorize_insight(
+    insight: InsightVersion, sensitivity: NotificationSensitivity = NotificationSensitivity.NORMAL
+) -> Optional[NotificationCategory]:
     """PRD §14's table, applied in the order the PRD itself gives more
     specific triggers priority over general ones: a revision bump always
     means MATERIAL_UPDATE regardless of the insight's own type/scores,
@@ -102,7 +123,7 @@ def categorize_insight(insight: InsightVersion) -> Optional[NotificationCategory
         # This intentionally overrides even a revision bump.
         return None
 
-    category = _base_category(insight)
+    category = _base_category(insight, sensitivity)
     if category in _HIGH_PRIORITY_CATEGORIES and insight.language in _UNGATED_LANGUAGES:
         return NotificationCategory.USEFUL_PATTERN
     return category
@@ -112,7 +133,7 @@ async def queue_notification(db: AsyncIOMotorDatabase, insight: InsightVersion, 
     """Queues at most one outbox entry per (insight, revision, category,
     recipient) — a duplicate call with the same dedupe_key (e.g. a retried
     scan step) is a no-op, not a second entry."""
-    category = categorize_insight(insight)
+    category = categorize_insight(insight, topic.notification_sensitivity)
     if category is None:
         return None
 

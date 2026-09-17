@@ -118,6 +118,39 @@ def test_qualified_inquiry_is_not_gated_by_language():
     assert categorize_insight(insight) == NotificationCategory.QUALIFIED_INQUIRY
 
 
+# ── notification_sensitivity ─────────────────────────────────────────────────
+
+def test_high_sensitivity_lets_medium_scores_reach_act_soon():
+    from app.agents.market_intelligence.models import NotificationSensitivity
+    insight = _insight(
+        urgency=UrgencyAssessment(is_urgent=True, reason="deadline soon"),
+        confidence=_score(6), relevance=_score(6),  # medium, medium — would be USEFUL_PATTERN at normal sensitivity
+    )
+    assert categorize_insight(insight, NotificationSensitivity.NORMAL) == NotificationCategory.USEFUL_PATTERN
+    assert categorize_insight(insight, NotificationSensitivity.HIGH) == NotificationCategory.ACT_SOON
+
+
+def test_low_sensitivity_requires_high_on_both_for_useful_pattern():
+    from app.agents.market_intelligence.models import NotificationSensitivity
+    insight = _insight(confidence=_score(6), relevance=_score(9))  # medium + high
+    assert categorize_insight(insight, NotificationSensitivity.NORMAL) == NotificationCategory.USEFUL_PATTERN
+    assert categorize_insight(insight, NotificationSensitivity.LOW) is None
+
+
+def test_high_sensitivity_only_needs_one_dimension_medium_for_useful_pattern():
+    from app.agents.market_intelligence.models import NotificationSensitivity
+    insight = _insight(confidence=_score(6), relevance=_score(2))  # medium + low
+    assert categorize_insight(insight, NotificationSensitivity.NORMAL) is None
+    assert categorize_insight(insight, NotificationSensitivity.HIGH) == NotificationCategory.USEFUL_PATTERN
+
+
+def test_sensitivity_never_affects_type_driven_categories():
+    from app.agents.market_intelligence.models import NotificationSensitivity
+    insight = _insight(type=EvidenceType.PURCHASE_INQUIRY, confidence=_score(1), relevance=_score(1))
+    assert categorize_insight(insight, NotificationSensitivity.LOW) == NotificationCategory.QUALIFIED_INQUIRY
+    assert categorize_insight(insight, NotificationSensitivity.HIGH) == NotificationCategory.QUALIFIED_INQUIRY
+
+
 def test_urgent_high_confidence_high_relevance_is_act_soon():
     insight = _insight(
         urgency=UrgencyAssessment(is_urgent=True, reason="deadline soon"),
