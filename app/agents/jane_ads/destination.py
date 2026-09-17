@@ -277,25 +277,30 @@ def image_cta(destination_type: DestinationType) -> str:
     return _IMAGE_CTAS.get(destination_type, _IMAGE_CTAS[DEFAULT_DESTINATION])
 
 
-# What Meta is told to optimise for, per destination. Every ad is a link ad, so this
-# is always link clicks — but naming the actual place is what makes the plan card
+# What the platform is told to optimise for, per destination. Every ad is a link ad, so
+# this is always link clicks — but naming the actual place is what makes the plan card
 # readable, and hard-coding WhatsApp here put "WhatsApp link clicks / most likely to
-# message you" on a website campaign. Live-reported.
+# message you" on a website campaign. Live-reported. The reason text is a %s template so
+# the actual delivering platform gets named (this used to say "Meta" unconditionally,
+# which read wrong on a TikTok-bound plan).
 _OPTIMIZATION = {
     DestinationType.WHATSAPP: ("WhatsApp link clicks",
-        "Meta optimises delivery toward people most likely to tap through and message you."),
+        "%s optimises delivery toward people most likely to tap through and message you."),
     DestinationType.WEBSITE: ("Website link clicks",
-        "Meta optimises delivery toward people most likely to tap through to your site."),
+        "%s optimises delivery toward people most likely to tap through to your site."),
     DestinationType.INSTAGRAM_DM: ("Instagram DM clicks",
-        "Meta optimises delivery toward people most likely to tap through and DM you."),
+        "%s optimises delivery toward people most likely to tap through and DM you."),
     DestinationType.CUSTOM: ("Link clicks",
-        "Meta optimises delivery toward people most likely to tap through to your link."),
+        "%s optimises delivery toward people most likely to tap through to your link."),
 }
 
 
-def optimization_for(destination_type: DestinationType) -> tuple[str, str]:
-    """The plan card's OPTIMIZATION row — its value and its reason."""
-    return _OPTIMIZATION.get(destination_type, _OPTIMIZATION[DEFAULT_DESTINATION])
+def optimization_for(destination_type: DestinationType, platform_label: str = "Meta") -> tuple[str, str]:
+    """The plan card's OPTIMIZATION row — its value and its reason. `platform_label` names
+    the platform actually delivering the ad (defaults to "Meta" so every pre-existing call
+    site keeps its exact wording unless it opts in to naming a different platform)."""
+    value, reason_template = _OPTIMIZATION.get(destination_type, _OPTIMIZATION[DEFAULT_DESTINATION])
+    return value, reason_template % platform_label
 
 
 def clicks_label(destination_type: DestinationType) -> str:
