@@ -165,3 +165,24 @@ def is_inquiry_eligible(evidence: Evidence, now: Optional[datetime] = None) -> t
     if not urgency.is_urgent:
         return False, f"expired — {urgency.reason}"
     return True, "eligible"
+
+
+def is_development_eligible(
+    evidence: Evidence,
+    has_verifiable_source: bool,
+    event_date: Optional[datetime],
+    preparation_action: Optional[str],
+) -> tuple[bool, str]:
+    """PRD §12: 'require a source, a verifiable event date or date range,
+    current status and a business-relevant preparation action. One original
+    authoritative announcement may qualify without high mention volume' —
+    unlike concern/trend, this never needs corroborating volume."""
+    if not evidence.url:
+        return False, "no source URL on the originating evidence"
+    if not has_verifiable_source:
+        return False, "extraction could not verify this as an original/sourced announcement"
+    if event_date is None:
+        return False, "no verifiable event date — stays 'date to confirm', not surfaced as a tracked development"
+    if not preparation_action:
+        return False, "no concrete business-relevant preparation action stated"
+    return True, "eligible"
