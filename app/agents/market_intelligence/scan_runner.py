@@ -21,6 +21,7 @@ from .adapters.base import AdapterCapabilities, SourceAdapter
 from .adapters.mock import MockSourceAdapter
 from .budget import reconcile_spend, reserve_budget
 from .classification.classify import classify_evidence
+from .classification_cache import get_cached_classification, store_classification_cache
 from .classification.scoring import (
     compute_lifecycle,
     confidence_breakdown,
@@ -37,6 +38,7 @@ from .development_extractor import extract_development
 from .insight_composer import compose_insight
 from .noise_filter import deterministic_noise_reason
 from .notifications import queue_notification
+from app.services.PostHogService import track_event
 from .models import (
     Classification,
     Cluster,
@@ -66,6 +68,14 @@ CLUSTERED_TYPES = {
     EvidenceType.UNMET_NEED,
     EvidenceType.EMERGING_TREND,
     EvidenceType.COMPETITOR_MOVEMENT,
+    # PRD §10 routes product_praise -> "Message and product insight" and
+    # reputation_risk -> "Risk review" — both need a surfaced insight like
+    # any other clusterable type. general_discussion is deliberately NOT
+    # here: its own PRD route is "Supporting evidence," meaning it enriches
+    # other insights rather than becoming a standalone card — that's the
+    # PRD's own intent, not an oversight.
+    EvidenceType.PRODUCT_PRAISE,
+    EvidenceType.REPUTATION_RISK,
 }
 
 
@@ -151,6 +161,30 @@ async def _dedupe_against_existing(db: AsyncIOMotorDatabase, topic_id: str, sour
     source_ids ALREADY stored for this topic, so the caller skips them."""
     cursor = db["mi_evidence"].find({"topic_id": topic_id, "source_id": {"$in": source_ids}}, {"source_id": 1})
     return {doc["source_id"] async for doc in cursor}
+
+
+def _majority_language(evidence_list: list[Evidence]) -> str:
+    """Used only to gate auto-alerting (PRD §10/§14) — never to change
+    classification. Ties fall to whichever language sorts first, which is
+    an arbitrary but harmless choice among equally-represented languages."""
+    if not evidence_list:
+        return "en"
+    counts: dict[str, int] = {}
+    for e in evidence_list:
+        counts[e.language] = counts.get(e.language, 0) + 1
+    return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+
+
+def _track_insight_published(topic: Topic, insight: InsightVersion) -> None:
+    """PRD §26 instrumentation. Deliberately excludes raw evidence/insight
+    text — only ids, types and scores, matching §26's own "excluding raw
+    private content from analytics.\""""
+    track_event(topic.user_id, "insight_published", {
+        "brand_id": topic.brand_id, "topic_id": topic.id, "insight_id": insight.id,
+        "type": insight.type.value, "revision": insight.revision,
+        "confidence_band": insight.confidence.band.value, "relevance_band": insight.relevance.band.value,
+        "is_urgent": insight.urgency.is_urgent,
+    })
 
 
 async def _merge_cluster(db: AsyncIOMotorDatabase, existing: Cluster, candidate: Cluster) -> Cluster:
@@ -251,10 +285,31 @@ async def create_scan_run(topic: Topic, db: AsyncIOMotorDatabase) -> CollectionR
 
 
 async def execute_scan(topic: Topic, run_id: str, db: AsyncIOMotorDatabase) -> None:
+    """Runs as a FastAPI background task — nothing here returns to an HTTP
+    caller, and nothing else ever calls this again for the same run_id, so
+    if the pipeline below raises anything unhandled, the run would
+    otherwise be stranded in COLLECTING/ANALYSING forever with no caller
+    left to notice or retry. This wrapper is the one place that guarantees
+    every run reaches a terminal status no matter what breaks inside —
+    PRD §9's own state list includes FAILED for exactly this reason."""
+    try:
+        await _run_scan_pipeline(topic, run_id, db)
+    except Exception as e:
+        print(f"[MI][scan] run {run_id} crashed and was marked failed: {e}")
+        await db["mi_scans"].update_one(
+            {"id": run_id},
+            {"$set": {
+                "status": ScanStatus.FAILED.value,
+                "completed_at": datetime.utcnow(),
+                "gaps": [f"scan failed unexpectedly: {e}"],
+            }},
+        )
+
+
+async def _run_scan_pipeline(topic: Topic, run_id: str, db: AsyncIOMotorDatabase) -> None:
     """The actual collection→classify→cluster→score→compose pipeline, updating
-    the run created by create_scan_run(). Runs as a background task — nothing
-    here returns to an HTTP caller, it only ever mutates `mi_scans`/`mi_evidence`/
-    etc, which the GET /scans/{id} endpoint polls."""
+    the run created by create_scan_run(). See execute_scan() for the crash
+    safety net wrapping this."""
     await db["mi_scans"].update_one(
         {"id": run_id}, {"$set": {"status": ScanStatus.COLLECTING.value, "started_at": datetime.utcnow()}}
     )
@@ -342,7 +397,16 @@ async def execute_scan(topic: Topic, run_id: str, db: AsyncIOMotorDatabase) -> N
             )
             continue
 
-        result = await classify_evidence(evidence, business_context)
+        # PRD §23: "Cache classification by content and model version" —
+        # checked/populated around the unchanged classify_evidence() call so
+        # an exact repost or syndicated copy already classified for this
+        # brand skips a second LLM call entirely.
+        result = await get_cached_classification(db, evidence.text, topic.brand_id)
+        if result is None:
+            result = await classify_evidence(evidence, business_context)
+            if result is not None:
+                await store_classification_cache(db, evidence.text, topic.brand_id, result)
+
         if result is None:
             gaps.append(f"evidence {evidence.source_id} could not be classified — left for manual review")
             continue
@@ -427,9 +491,20 @@ async def execute_scan(topic: Topic, run_id: str, db: AsyncIOMotorDatabase) -> N
             member_classifications = await _resolve_classifications(db, member_evidence, classifications)
 
             insight = await compose_insight(cluster, member_evidence, member_classifications, confidence, relevance, urgency)
+            insight.language = _majority_language(member_evidence)
+            if cluster.primary_type == EvidenceType.REPUTATION_RISK and not insight.coverage_note:
+                # PRD §14: "High-consequence reputation claims require human
+                # review before an external alert. They remain available
+                # internally with an unverified label." queue_notification()
+                # separately makes sure this never auto-triggers an alert;
+                # this note is the "unverified label" surfaced in the UI.
+                insight.coverage_note = (
+                    "Reputation-risk finding — unverified pending human review. Not yet suitable for any external claim or alert."
+                )
             insight = await _apply_revision(db, cluster.id, insight)
             insights.append(insight)
             await queue_notification(db, insight, topic)
+            _track_insight_published(topic, insight)
 
     # ── Individual (non-clustered) inquiries ────────────────────────────────
     for evidence in all_new_evidence:
@@ -459,8 +534,10 @@ async def execute_scan(topic: Topic, run_id: str, db: AsyncIOMotorDatabase) -> N
             lifecycle=Lifecycle.UNKNOWN,
         )
         insight = await compose_insight(pseudo_cluster, [evidence], [classification], confidence, relevance, urgency)
+        insight.language = evidence.language
         insights.append(insight)
         await queue_notification(db, insight, topic)
+        _track_insight_published(topic, insight)
 
     if insights:
         await db["mi_insights"].insert_many([i.dict() for i in insights])
@@ -525,3 +602,7 @@ async def execute_scan(topic: Topic, run_id: str, db: AsyncIOMotorDatabase) -> N
             "gaps": gaps,
         }},
     )
+    track_event(topic.user_id, "scan_completed" if final_status == ScanStatus.COMPLETED else "scan_partial", {
+        "brand_id": topic.brand_id, "topic_id": topic.id, "scan_id": run_id,
+        "evidence_collected": len(all_new_evidence), "insights_count": len(insights), "gaps_count": len(gaps),
+    })
