@@ -66,6 +66,14 @@ CLUSTERED_TYPES = {
     EvidenceType.UNMET_NEED,
     EvidenceType.EMERGING_TREND,
     EvidenceType.COMPETITOR_MOVEMENT,
+    # PRD §10 routes product_praise -> "Message and product insight" and
+    # reputation_risk -> "Risk review" — both need a surfaced insight like
+    # any other clusterable type. general_discussion is deliberately NOT
+    # here: its own PRD route is "Supporting evidence," meaning it enriches
+    # other insights rather than becoming a standalone card — that's the
+    # PRD's own intent, not an oversight.
+    EvidenceType.PRODUCT_PRAISE,
+    EvidenceType.REPUTATION_RISK,
 }
 
 
@@ -448,6 +456,15 @@ async def _run_scan_pipeline(topic: Topic, run_id: str, db: AsyncIOMotorDatabase
             member_classifications = await _resolve_classifications(db, member_evidence, classifications)
 
             insight = await compose_insight(cluster, member_evidence, member_classifications, confidence, relevance, urgency)
+            if cluster.primary_type == EvidenceType.REPUTATION_RISK and not insight.coverage_note:
+                # PRD §14: "High-consequence reputation claims require human
+                # review before an external alert. They remain available
+                # internally with an unverified label." queue_notification()
+                # separately makes sure this never auto-triggers an alert;
+                # this note is the "unverified label" surfaced in the UI.
+                insight.coverage_note = (
+                    "Reputation-risk finding — unverified pending human review. Not yet suitable for any external claim or alert."
+                )
             insight = await _apply_revision(db, cluster.id, insight)
             insights.append(insight)
             await queue_notification(db, insight, topic)
