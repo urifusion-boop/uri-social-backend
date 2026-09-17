@@ -32,6 +32,7 @@ from .models import (
     Topic,
     TopicCreateRequest,
 )
+from .deletion import delete_evidence_cascade
 from .scan_runner import create_scan_run, execute_scan, preview_topic_coverage
 
 router = APIRouter(prefix="/market-intelligence", tags=["Market Intelligence"])
@@ -209,6 +210,21 @@ async def submit_feedback(
         await db["mi_insights"].update_one({"id": insight_id}, {"$set": {"status": "dismissed"}})
 
     return UriResponse.get_single_data_response("feedback", feedback.dict())
+
+
+@router.delete("/evidence/{evidence_id}")
+async def delete_evidence(
+    evidence_id: str,
+    ctx: dict = Depends(get_flexible_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """PRD §21/§16, P0-14: 'removed evidence disappears from all serving
+    paths.' Cascades into classifications, clusters and insights — see
+    deletion.py for exactly what that means for each."""
+    result = await delete_evidence_cascade(evidence_id, ctx["brand_id"], db)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Evidence not found")
+    return UriResponse.get_single_data_response("deletion", result)
 
 
 @router.post("/insights/{insight_id}/briefs")
