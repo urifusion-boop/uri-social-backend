@@ -2391,10 +2391,14 @@ async def _build_campaign_plan(
             return {"early_return": {"stage": "tiktok_not_configured", "understood": parsed.model_dump(),
                     "question": "TikTok Ads isn't connected yet — try again shortly, or drop the TikTok "
                                  "request and I'll use what's available."}}
-        if not (plan.creative and plan.creative.has_video):
-            return {"early_return": {"stage": "tiktok_needs_video", "understood": parsed.model_dump(),
-                    "question": "TikTok only runs video ads. Upload or generate a video for this "
-                                 "campaign, then ask for TikTok again."}}
+        # The real video-or-not check happens further down, once the ACTUAL
+        # creative is built (creative.is_video) — plan.creative.has_video here
+        # is still only the NL parser's guess from the free-text message,
+        # exactly the same "guessed BEFORE the user actually chose upload/
+        # generate" gap the explanation-text patch below already works around
+        # for a different field. Checking it here rejected a real uploaded
+        # video every time, because parsing "promote my face oil" obviously
+        # never says "video" — confirmed live 2026-09-17.
         plan = apply_platform_override(plan, [Platform.TIKTOK])
         forced_to_meta = False
     else:
@@ -2664,6 +2668,18 @@ async def _build_campaign_plan(
             .replace("you have photos", "you have video")
             .replace("no creative is needed for search", "you have video")
         )
+
+    # TikTok's real video-or-not requirement, checked here (not up at the
+    # platform-decision point) for the exact same reason the explanation-text
+    # patch above exists: creative.is_video only reflects reality once the
+    # ACTUAL creative_source (upload/generate/draft/reuse) has run — checking
+    # any earlier value meant a genuinely uploaded video still got rejected,
+    # because the free-text message parse has no way to know about it.
+    # No-op for a Meta-bound plan.
+    if any(p.platform == Platform.TIKTOK for p in plan.platforms) and not creative.is_video:
+        return {"early_return": {"stage": "tiktok_needs_video", "understood": parsed.model_dump(),
+                "question": "TikTok only runs video ads. Upload or generate a video for this "
+                             "campaign, then ask for TikTok again."}}
 
     # 4.5. Policy gate — one bad ad can suspend the whole pooled ad account, so this
     # runs before a plan is ever shown as ready, not just right before launch.
