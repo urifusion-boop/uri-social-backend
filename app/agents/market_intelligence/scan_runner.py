@@ -38,6 +38,7 @@ from .development_extractor import extract_development
 from .insight_composer import compose_insight
 from .noise_filter import deterministic_noise_reason
 from .notifications import queue_notification
+from app.services.PostHogService import track_event
 from .models import (
     Classification,
     Cluster,
@@ -160,6 +161,18 @@ async def _dedupe_against_existing(db: AsyncIOMotorDatabase, topic_id: str, sour
     source_ids ALREADY stored for this topic, so the caller skips them."""
     cursor = db["mi_evidence"].find({"topic_id": topic_id, "source_id": {"$in": source_ids}}, {"source_id": 1})
     return {doc["source_id"] async for doc in cursor}
+
+
+def _track_insight_published(topic: Topic, insight: InsightVersion) -> None:
+    """PRD §26 instrumentation. Deliberately excludes raw evidence/insight
+    text — only ids, types and scores, matching §26's own "excluding raw
+    private content from analytics.\""""
+    track_event(topic.user_id, "insight_published", {
+        "brand_id": topic.brand_id, "topic_id": topic.id, "insight_id": insight.id,
+        "type": insight.type.value, "revision": insight.revision,
+        "confidence_band": insight.confidence.band.value, "relevance_band": insight.relevance.band.value,
+        "is_urgent": insight.urgency.is_urgent,
+    })
 
 
 async def _merge_cluster(db: AsyncIOMotorDatabase, existing: Cluster, candidate: Cluster) -> Cluster:
@@ -478,6 +491,7 @@ async def _run_scan_pipeline(topic: Topic, run_id: str, db: AsyncIOMotorDatabase
             insight = await _apply_revision(db, cluster.id, insight)
             insights.append(insight)
             await queue_notification(db, insight, topic)
+            _track_insight_published(topic, insight)
 
     # ── Individual (non-clustered) inquiries ────────────────────────────────
     for evidence in all_new_evidence:
@@ -509,6 +523,7 @@ async def _run_scan_pipeline(topic: Topic, run_id: str, db: AsyncIOMotorDatabase
         insight = await compose_insight(pseudo_cluster, [evidence], [classification], confidence, relevance, urgency)
         insights.append(insight)
         await queue_notification(db, insight, topic)
+        _track_insight_published(topic, insight)
 
     if insights:
         await db["mi_insights"].insert_many([i.dict() for i in insights])
@@ -573,3 +588,7 @@ async def _run_scan_pipeline(topic: Topic, run_id: str, db: AsyncIOMotorDatabase
             "gaps": gaps,
         }},
     )
+    track_event(topic.user_id, "scan_completed" if final_status == ScanStatus.COMPLETED else "scan_partial", {
+        "brand_id": topic.brand_id, "topic_id": topic.id, "scan_id": run_id,
+        "evidence_collected": len(all_new_evidence), "insights_count": len(insights), "gaps_count": len(gaps),
+    })

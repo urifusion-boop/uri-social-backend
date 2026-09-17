@@ -20,6 +20,7 @@ from app.dependencies import get_active_brand_context, get_db_dependency
 # already on dev) is the correct dependency here, not something to backport.
 get_flexible_brand_context = get_active_brand_context
 from app.domain.responses.uri_response import UriResponse
+from app.services.PostHogService import track_event
 
 from .models import (
     ActionBrief,
@@ -127,6 +128,10 @@ async def create_topic(
         keep_updating=body.keep_updating,
     )
     await db["mi_topics"].insert_one(topic.dict())
+    track_event(ctx["user_id"], "topic_created", {
+        "brand_id": ctx["brand_id"], "topic_id": topic.id, "source_count": len(topic.sources),
+        "requested_days": topic.requested_days, "keep_updating": topic.keep_updating,
+    })
     return UriResponse.get_single_data_response("topic", topic.dict())
 
 
@@ -193,6 +198,9 @@ async def start_scan(
     if run.status != ScanStatus.BUDGET_LIMITED:
         background_tasks.add_task(execute_scan, topic, run.id, db)
 
+    track_event(ctx["user_id"], "scan_requested", {
+        "brand_id": ctx["brand_id"], "topic_id": topic_id, "scan_id": run.id, "status": run.status.value,
+    })
     return UriResponse.get_single_data_response("scan", run.dict())
 
 
@@ -253,6 +261,9 @@ async def get_insight_evidence(
     evidence = [doc async for doc in cursor]
     for e in evidence:
         e.pop("_id", None)
+    track_event(ctx["user_id"], "evidence_opened", {
+        "brand_id": ctx["brand_id"], "insight_id": insight_id, "evidence_count": len(evidence),
+    })
     return UriResponse.get_list_data_response("evidence", evidence)
 
 
@@ -328,6 +339,9 @@ async def submit_feedback(
     if body.verdict.value == "not_relevant":
         await db["mi_insights"].update_one({"id": insight_id}, {"$set": {"status": "dismissed"}})
 
+    track_event(ctx["user_id"], "feedback_submitted", {
+        "brand_id": ctx["brand_id"], "insight_id": insight_id, "verdict": body.verdict.value,
+    })
     return UriResponse.get_single_data_response("feedback", feedback.dict())
 
 
@@ -373,7 +387,33 @@ async def create_brief(
         evidence_ids=insight_doc.get("evidence_ids", []),
     )
     await db["mi_briefs"].insert_one(brief.dict())
+    track_event(ctx["user_id"], "brief_created", {"brand_id": ctx["brand_id"], "insight_id": insight_id, "brief_id": brief.id})
     return UriResponse.get_single_data_response("brief", brief.dict())
+
+
+@router.patch("/insights/{insight_id}/briefs")
+async def update_brief(
+    insight_id: str,
+    body: BriefCreateRequest,
+    ctx: dict = Depends(get_flexible_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """PRD §13: 'Where a destination module is unavailable, save an editable
+    brief within Intelligence.' No real Jane Ads/content-calendar handoff
+    exists in this pilot yet (deliberately not rushed — the safe version of
+    that integration needs its own careful, separate work given the real
+    spend/publish risk either module carries), so this is that fallback
+    made complete: the brief this pilot DOES create must actually be
+    editable, not just create-once-and-done."""
+    await _get_owned_insight(insight_id, ctx["brand_id"], db)
+    existing = await db["mi_briefs"].find_one({"insight_id": insight_id})
+    if not existing:
+        raise HTTPException(status_code=404, detail="No brief exists for this insight yet")
+    if body.proposed_message is not None:
+        await db["mi_briefs"].update_one({"insight_id": insight_id}, {"$set": {"proposed_message": body.proposed_message}})
+        existing["proposed_message"] = body.proposed_message
+    existing.pop("_id", None)
+    return UriResponse.get_single_data_response("brief", existing)
 
 
 @router.get("/developments")
