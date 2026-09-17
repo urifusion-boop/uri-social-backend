@@ -233,6 +233,14 @@ class Cluster(BaseModel):
     # cluster ID through ordinary updates").
     embedding_centroid: Optional[list[float]] = None
 
+    # Internal lifecycle-tracking counters (PRD §12) — see
+    # classification/scoring.py's compute_lifecycle() docstring for exactly
+    # what each counts. Only meaningfully used for EMERGING_TREND clusters
+    # today; left at 0 for other clusterable types until they get their own
+    # eligibility bars.
+    eligible_evaluation_count: int = 0
+    consecutive_ineligible_count: int = 0
+
 
 # ── Insight (PRD §13, §19) ──────────────────────────────────────────────────────
 

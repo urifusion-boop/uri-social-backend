@@ -22,10 +22,12 @@ from .adapters.mock import MockSourceAdapter
 from .budget import reconcile_spend, reserve_budget
 from .classification.classify import classify_evidence
 from .classification.scoring import (
+    compute_lifecycle,
     confidence_breakdown,
     is_concern_eligible,
     is_development_eligible,
     is_inquiry_eligible,
+    is_trend_eligible,
     relevance_breakdown,
     urgency_for_concern,
     urgency_for_inquiry,
@@ -178,6 +180,8 @@ async def _merge_cluster(db: AsyncIOMotorDatabase, existing: Cluster, candidate:
         last_updated=datetime.utcnow(),
         lifecycle=existing.lifecycle,
         embedding_centroid=candidate.embedding_centroid or existing.embedding_centroid,
+        eligible_evaluation_count=existing.eligible_evaluation_count,
+        consecutive_ineligible_count=existing.consecutive_ineligible_count,
     )
 
 
@@ -369,24 +373,36 @@ async def execute_scan(topic: Topic, run_id: str, db: AsyncIOMotorDatabase) -> N
                 existing_clusters.append(candidate)
 
         for cluster in clusters:
-            await db["mi_clusters"].replace_one({"id": cluster.id}, cluster.dict(), upsert=True)
-
-        for cluster in clusters:
             # Full membership (old + new) — a merged cluster's evidence_ids
             # include evidence from earlier scans that isn't in this scan's
             # own clusterable_evidence list.
             member_docs = [doc async for doc in db["mi_evidence"].find({"id": {"$in": cluster.evidence_ids}})]
             member_evidence = [Evidence(**{k: v for k, v in d.items() if k != "_id"}) for d in member_docs]
 
-            # PRD only specifies bespoke eligibility bars for concern/inquiry/
-            # development explicitly (§12) — trend has its own bar the PRD
-            # describes but this pilot doesn't yet implement (scope note in
-            # models.py), and unmet_need/competitor_movement have none defined
-            # at all yet. All clusterable types reuse the concern bar for now
-            # rather than inventing unstated thresholds; tighten per-type once
-            # real eval data (PRD §26) shows this pilot default is wrong for a
-            # given type.
-            eligible, reason = is_concern_eligible(member_evidence, cluster.original_thread_count)
+            if cluster.primary_type == EvidenceType.EMERGING_TREND:
+                # PRD §12's trend bar, now meaningful because clusters persist
+                # full historical membership across scans (not just this
+                # scan's batch) — see clustering.match_existing_cluster.
+                eligible, reason = is_trend_eligible(member_evidence)
+                if eligible:
+                    cluster.eligible_evaluation_count += 1
+                    cluster.consecutive_ineligible_count = 0
+                else:
+                    cluster.consecutive_ineligible_count += 1
+                cluster.lifecycle = compute_lifecycle(
+                    cluster.lifecycle, eligible, cluster.eligible_evaluation_count, cluster.consecutive_ineligible_count
+                )
+            else:
+                # PRD only specifies bespoke eligibility bars for concern/
+                # inquiry/development/trend explicitly (§12) — unmet_need and
+                # competitor_movement have none defined at all yet, so they
+                # reuse the concern bar rather than inventing an unstated
+                # threshold; tighten per-type once real eval data (PRD §26)
+                # shows this pilot default is wrong for a given type.
+                eligible, reason = is_concern_eligible(member_evidence, cluster.original_thread_count)
+
+            await db["mi_clusters"].replace_one({"id": cluster.id}, cluster.dict(), upsert=True)
+
             if not eligible:
                 gaps.append(f"cluster '{cluster.theme}' not surfaced: {reason}")
                 continue
