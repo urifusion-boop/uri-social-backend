@@ -110,6 +110,12 @@ class BrandProfileService:
             "team_members": [],
             "languages": [],
             "region": "",
+            # Fulfilment & operations (Uri Market Intelligence PRD §7)
+            "stock_availability": "",
+            "delivery_capability": "",
+            "lead_time": "",
+            "budget_ceiling": None,
+            "margin_band": "",
             "onboarding_completed": False,
             "voice_sample_analysis": {},
         }
