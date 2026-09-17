@@ -67,6 +67,16 @@ class ConfidenceBand(str, Enum):
     HIGH = "high"      # 8-10
 
 
+class MIAccessLevel(str, Enum):
+    """PRD §21 role-based permissions, scoped entirely to Market
+    Intelligence — deliberately NOT built on AgencyRole or WorkspaceRole
+    (see access.py's own docstring for why). Absence of an MIAccessGrant
+    record means FULL: this can only ever RESTRICT a user below what the
+    underlying agency/brand system already grants them, never grant more."""
+    FULL = "full"
+    VIEW_ONLY = "view_only"
+
+
 class ActionReadiness(str, Enum):
     """PRD §7: 'Recommendations with missing fulfilment information are
     labelled "Check suitability" rather than "Ready to act."' Derived from
@@ -491,6 +501,23 @@ class PreferencesUpdateRequest(BaseModel):
     unmute_topic_id: Optional[str] = None
     mute_category: Optional[NotificationCategory] = None
     unmute_category: Optional[NotificationCategory] = None
+
+
+class MIAccessGrant(BaseModel):
+    """A record only ever exists here to RESTRICT someone to view-only —
+    there's no FULL row, since FULL is simply what "no record" already
+    means. See access.py."""
+    id: str
+    brand_id: str
+    user_id: str
+    level: MIAccessLevel
+    granted_by: str
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class AccessGrantRequest(BaseModel):
+    user_id: str
+    level: MIAccessLevel
 
 
 class FeedbackOutcome(BaseModel):
