@@ -130,11 +130,13 @@ def build_campaign_summary(
             reason="No specific area given, so we target broadly — tell me a city to focus the spend.",
         )
 
-    # Platforms — the resolved behaviour is why we landed here.
+    # Platforms — the resolved behaviour is why we landed here. The reason names the
+    # actual chosen platform's feed rather than assuming Meta, so a TikTok-bound plan
+    # doesn't read "Meta's feed placements fit best" right under a "TikTok" value.
     plat_label = ", ".join(_PLATFORM_LABELS.get(p.platform, p.platform.value) for p in plan.platforms)
     platforms = ReasonedValue(
         value=plat_label,
-        reason=(f"Your customers discover businesses like yours by scrolling, so Meta's feed "
+        reason=(f"Your customers discover businesses like yours by scrolling, so {plat_label}'s feed "
                 f"placements fit best." if plan.behaviour.value == "discover"
                 else f"Chosen for a '{plan.behaviour.value}' buying pattern."),
     )
@@ -153,20 +155,23 @@ def build_campaign_summary(
             reason=f"Your {_naira(total_budget)} is split across platforms by where it should work hardest.",
         )
 
-    # Duration — days, with the Meta daily-floor reasoning that set it.
+    # Duration — days, with the daily-floor reasoning that set it. Named after the actual
+    # delivering platform(s) rather than assuming Meta — a single-platform plan gets the
+    # cleaner singular phrasing that already shipped for this exact reason elsewhere.
     daily = total_budget / days if days else total_budget
     duration = ReasonedValue(
         value=f"{days} days",
-        reason=(f"Spreads {_naira(total_budget)} to about {_naira(daily)}/day — enough to clear Meta's "
-                f"minimum daily budget so the ad actually delivers, without stretching too thin."),
+        reason=(f"Spreads {_naira(total_budget)} to about {_naira(daily)}/day — enough to clear "
+                f"{plat_label}'s minimum daily budget so the ad actually delivers, without stretching too thin."),
     )
 
-    # Optimization — what Meta is told to get you, named after where the tap actually
-    # lands. Was hard-coded to WhatsApp, which read "WhatsApp link clicks / most likely
-    # to message you" on a campaign pointing at a website.
+    # Optimization — what the platform is told to get you, named after where the tap
+    # actually lands. Was hard-coded to WhatsApp, which read "WhatsApp link clicks / most
+    # likely to message you" on a campaign pointing at a website. platform_label keeps
+    # this from also hard-coding "Meta" when the plan is TikTok-bound.
     from .destination import clicks_label, coerce_type, optimization_for
     _dest = coerce_type(getattr(plan, "destination_type", "") or "")
-    _opt_value, _opt_reason = optimization_for(_dest)
+    _opt_value, _opt_reason = optimization_for(_dest, platform_label=plat_label)
     optimization = ReasonedValue(value=_opt_value, reason=_opt_reason)
 
     # Estimates. Audience size = Meta's addressable pool for the targeting (real data,
