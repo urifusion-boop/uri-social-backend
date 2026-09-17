@@ -168,7 +168,7 @@ async def cluster_evidence(
                 group_embeddings.append([item_embedding] if item_embedding is not None else [])
                 group_parents.append({item.parent_id} if item.parent_id else set())
 
-        for members, parents in zip(groups, group_parents):
+        for idx, (members, parents) in enumerate(zip(groups, group_parents)):
             independent_accounts = len({m.author_handle for m in members if m.author_handle})
             # A "thread" is either a real parent_id, or — for standalone posts with
             # no shared parent — each distinct post counts as its own original
@@ -190,10 +190,44 @@ async def cluster_evidence(
                     first_seen=min(dated) if dated else now,
                     last_updated=max(dated) if dated else now,
                     lifecycle=Lifecycle.UNKNOWN,
+                    embedding_centroid=_centroid(group_embeddings[idx]),
                 )
             )
 
     return clusters
+
+
+def _centroid(embeddings: list[list[float]]) -> Optional[list[float]]:
+    """Average vector of a cluster's own member embeddings — None (not a
+    zero vector) when no member had one, so callers never mistake "no
+    embedding available" for "embedding of all zeros"."""
+    if not embeddings:
+        return None
+    length = len(embeddings[0])
+    return [sum(vec[i] for vec in embeddings) / len(embeddings) for i in range(length)]
+
+
+def match_existing_cluster(candidate: Cluster, existing_clusters: list[Cluster]) -> Optional[Cluster]:
+    """Cross-scan continuation match (PRD §11/§19: 'keep a stable cluster ID
+    through ordinary updates') — compares a freshly-built candidate's
+    centroid against each existing PERSISTED cluster of the same
+    topic+type. Only considers clusters that actually have a stored
+    centroid; one that doesn't (e.g. every original embedding call failed)
+    is never matched by guesswork."""
+    if candidate.embedding_centroid is None:
+        return None
+    best: Optional[Cluster] = None
+    best_score = 0.0
+    for existing in existing_clusters:
+        if existing.topic_id != candidate.topic_id or existing.primary_type != candidate.primary_type:
+            continue
+        if existing.embedding_centroid is None:
+            continue
+        score = _cosine(candidate.embedding_centroid, existing.embedding_centroid)
+        if score >= EMBEDDING_SIMILARITY_THRESHOLD and score > best_score:
+            best = existing
+            best_score = score
+    return best
 
 
 def _theme_label(members: list[Evidence]) -> str:

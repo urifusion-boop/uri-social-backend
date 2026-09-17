@@ -226,6 +226,13 @@ class Cluster(BaseModel):
     last_updated: datetime
     lifecycle: Lifecycle = Lifecycle.UNKNOWN
 
+    # Internal — never shown to the frontend. The average embedding of this
+    # cluster's own members, kept so a LATER scan can recognize "this new
+    # batch of evidence is the same ongoing conversation" without re-fetching
+    # and re-embedding every old member's text (PRD §11/§19: "keep a stable
+    # cluster ID through ordinary updates").
+    embedding_centroid: Optional[list[float]] = None
+
 
 # ── Insight (PRD §13, §19) ──────────────────────────────────────────────────────
 
