@@ -81,6 +81,20 @@ Resolve ambiguity using context, not the keyword alone. A single word matching a
 sufficient evidence — read the whole sentence. If you cannot tell, set uncertain=true rather than guessing
 confidently.
 
+DISTINGUISH GENUINE CUSTOMER LANGUAGE FROM PROMOTIONAL LANGUAGE.
+A deterministic filter already removes obvious spam before this evidence reaches you, but promotional
+content that survives that filter still needs a careful read here:
+- Promotional/seller markers: "Do YOU need...?", "We offer...", "PM me for details", "DM for price",
+  "SALE now on", "Apply now", or any phrasing where the author is the one selling/offering, not the one
+  asking or experiencing something.
+- Genuine customer markers: "I need...", "Can someone help...", "Does anyone know...", first-person
+  accounts of an actual experience, need, or frustration.
+A post using promotional markers is evidence about how a seller (possibly a competitor) is marketing, not
+evidence of customer demand or sentiment — classify it as competitor_movement if it names/implies a
+competitor, otherwise noise. Be generous with genuine personal expression (including messy, informal, or
+emotional phrasing — that is normal for real customers) but ruthless with promotional content dressed up
+to look like a personal post.
+
 evidence_span MUST be copied verbatim from the evidence text — do not paraphrase or summarise it.
 
 Never invent facts, demographics, locations, or outcomes that are not present in the evidence text."""
