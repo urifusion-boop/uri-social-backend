@@ -173,6 +173,7 @@ class Evidence(RawEvidence):
     brand_id: str
     user_id: str
     topic_id: str
+    collection_run_id: Optional[str] = None  # PRD §16: traces a finding back to the scan that collected it
 
 
 class EvidenceSnapshot(BaseModel):
@@ -372,6 +373,10 @@ class CollectionRun(BaseModel):
     evidence_collected: int = 0
     gaps: list[str] = Field(default_factory=list)  # human-readable partial-coverage notes
     estimated_cost_usd: float = 0.0
+    # PRD §17: "save the provider run ID before fetching results." Keyed by
+    # source provider since one scan can span several sources, each with its
+    # own run id from the adapter.
+    provider_run_ids: dict[str, str] = Field(default_factory=dict)
 
 
 # ── Action handoff (PRD §13) ────────────────────────────────────────────────────
