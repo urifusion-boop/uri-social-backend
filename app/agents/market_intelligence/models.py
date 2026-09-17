@@ -516,7 +516,11 @@ class MIAccessGrant(BaseModel):
 
 
 class AccessGrantRequest(BaseModel):
-    user_id: str
+    """Identifies the target by email, not user_id — there's no existing
+    "team roster" a manager could pick a user_id from for a personal
+    (non-agency) brand, so this mirrors the workspace invite flow's own
+    pattern (workspace_member_router.py: resolve db.users by email)."""
+    email: str
     level: MIAccessLevel
 
 
