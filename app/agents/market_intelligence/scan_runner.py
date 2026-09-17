@@ -13,10 +13,11 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timedelta
+from typing import Optional
 
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
-from .adapters.base import SourceAdapter
+from .adapters.base import AdapterCapabilities, SourceAdapter
 from .adapters.mock import MockSourceAdapter
 from .classification.classify import classify_evidence
 from .classification.scoring import (
@@ -39,6 +40,7 @@ from .models import (
     InsightVersion,
     Lifecycle,
     ScanStatus,
+    SourceCoveragePreview,
     Topic,
 )
 
@@ -86,6 +88,55 @@ async def _fetch_business_context(db: AsyncIOMotorDatabase, user_id: str, brand_
     }
 
 
+def clamp_requested_days(requested_days: int, capability: AdapterCapabilities) -> tuple[int, Optional[str]]:
+    """PRD §9: 'A shorter available period must never silently replace the
+    requested one.' Never mutates the topic's own requested_days — returns
+    the days actually usable for this source plus a human-readable note
+    whenever that's less than what was asked for, so every caller (the
+    pre-scan preview endpoint AND execute_scan itself) is forced to surface
+    the reduction rather than just quietly using fewer days."""
+    if requested_days <= capability.verified_lookback_days:
+        return requested_days, None
+    note = (
+        f"requested {requested_days} days but '{capability.provider}' only verifies "
+        f"{capability.verified_lookback_days} days of lookback — using {capability.verified_lookback_days}"
+    )
+    return capability.verified_lookback_days, note
+
+
+async def preview_topic_coverage(topic: Topic) -> list[SourceCoveragePreview]:
+    """PRD §9: 'Before running, show the accessible period, limits, collection
+    scope and estimated usage.' Called by the router BEFORE a scan is
+    started — uses the exact same clamp_requested_days used inside
+    execute_scan, so the preview can never promise a different period than
+    what the scan actually ends up using."""
+    previews: list[SourceCoveragePreview] = []
+    for source in topic.sources:
+        adapter = ADAPTER_REGISTRY.get(source.provider)
+        if adapter is None:
+            previews.append(SourceCoveragePreview(
+                provider=source.provider,
+                requested_days=topic.requested_days,
+                accessible_days=0,
+                capped=True,
+                note=f"source '{source.provider}' has no registered adapter",
+            ))
+            continue
+
+        capability = adapter.capabilities()
+        accessible_days, note = clamp_requested_days(topic.requested_days, capability)
+        cost = await adapter.estimate_cost(topic.keywords, accessible_days)
+        previews.append(SourceCoveragePreview(
+            provider=source.provider,
+            requested_days=topic.requested_days,
+            accessible_days=accessible_days,
+            capped=note is not None,
+            note=note,
+            estimated_cost_usd=cost,
+        ))
+    return previews
+
+
 async def _dedupe_against_existing(db: AsyncIOMotorDatabase, topic_id: str, source_ids: list[str]) -> set[str]:
     """PRD §11: exact-record dedup by platform+source_id. Returns the set of
     source_ids ALREADY stored for this topic, so the caller skips them."""
@@ -122,7 +173,6 @@ async def execute_scan(topic: Topic, run_id: str, db: AsyncIOMotorDatabase) -> N
     business_context = await _fetch_business_context(db, topic.user_id, topic.brand_id)
 
     until = datetime.utcnow()
-    since = until - timedelta(days=topic.requested_days)
 
     all_new_evidence: list[Evidence] = []
     gaps: list[str] = []
@@ -132,6 +182,14 @@ async def execute_scan(topic: Topic, run_id: str, db: AsyncIOMotorDatabase) -> N
         if adapter is None:
             gaps.append(f"source '{source.provider}' has no registered adapter — skipped")
             continue
+
+        # PRD §9: a shorter available period must never silently replace the
+        # requested one — every clamp is recorded as a gap on THIS run, not
+        # just shown once at preview time and then forgotten.
+        accessible_days, coverage_note = clamp_requested_days(topic.requested_days, adapter.capabilities())
+        if coverage_note:
+            gaps.append(f"source '{source.provider}': {coverage_note}")
+        since = until - timedelta(days=accessible_days)
 
         try:
             provider_run_id = await adapter.start_collection(topic.keywords, topic.excluded_keywords, since, until)

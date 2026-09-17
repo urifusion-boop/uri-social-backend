@@ -32,7 +32,7 @@ from .models import (
     Topic,
     TopicCreateRequest,
 )
-from .scan_runner import create_scan_run, execute_scan
+from .scan_runner import create_scan_run, execute_scan, preview_topic_coverage
 
 router = APIRouter(prefix="/market-intelligence", tags=["Market Intelligence"])
 
@@ -89,6 +89,23 @@ async def list_topics(
     for t in topics:
         t.pop("_id", None)
     return UriResponse.get_list_data_response("topic", topics)
+
+
+@router.get("/topics/{topic_id}/coverage-preview")
+async def get_topic_coverage_preview(
+    topic_id: str,
+    ctx: dict = Depends(get_flexible_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """PRD §9: 'Before running, show the accessible period, limits, collection
+    scope and estimated usage.' Called by the frontend before POSTing a scan —
+    uses the same clamp_requested_days logic execute_scan itself uses, so this
+    can never promise a period the scan doesn't actually honor."""
+    topic_doc = await _get_owned_topic(topic_id, ctx["brand_id"], db)
+    topic_doc.pop("_id", None)
+    topic = Topic(**topic_doc)
+    previews = await preview_topic_coverage(topic)
+    return UriResponse.get_list_data_response("coverage", [p.dict() for p in previews])
 
 
 @router.post("/topics/{topic_id}/scans")

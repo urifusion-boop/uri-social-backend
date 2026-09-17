@@ -326,6 +326,20 @@ class ScanRequest(BaseModel):
     pass  # nothing required yet — budget/limit checks read from the topic + brand
 
 
+class SourceCoveragePreview(BaseModel):
+    """PRD §9: 'Before running, show the accessible period, limits, collection
+    scope and estimated usage. A shorter available period must never silently
+    replace the requested one.' One entry per configured source, computed
+    from that source's own AdapterCapabilities.verified_lookback_days —
+    never mutates the topic's own requested_days."""
+    provider: str
+    requested_days: int
+    accessible_days: int
+    capped: bool
+    note: Optional[str] = None
+    estimated_cost_usd: float = 0.0
+
+
 class FeedbackRequest(BaseModel):
     verdict: FeedbackVerdict
     reason: Optional[str] = None
