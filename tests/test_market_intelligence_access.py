@@ -73,6 +73,11 @@ class FakeDb:
     def __getitem__(self, name):
         return self._colls.setdefault(name, FakeCollection())
 
+    def __getattr__(self, name):
+        # router.py looks up db.users (attribute style) the same way the
+        # real motor database object supports both db["x"] and db.x.
+        return self[name]
+
 
 # ── get_mi_access_level ──────────────────────────────────────────────────────
 
@@ -166,10 +171,13 @@ def test_set_access_grant_restricts_a_user():
     from app.models.brand_account import BrandAccount
 
     personal_id = BrandAccount.personal_brand_id("owner")
-    db = FakeDb({"brand_accounts": [{"brand_id": personal_id, "owner_user_id": "owner", "agency_id": None}]})
+    db = FakeDb({
+        "brand_accounts": [{"brand_id": personal_id, "owner_user_id": "owner", "agency_id": None}],
+        "users": [{"userId": "teammate", "email": "teammate@example.com", "first_name": "Tee", "last_name": "Mate"}],
+    })
 
     _run(set_access_grant(
-        AccessGrantRequest(user_id="teammate", level=MIAccessLevel.VIEW_ONLY),
+        AccessGrantRequest(email="teammate@example.com", level=MIAccessLevel.VIEW_ONLY),
         ctx={"brand_id": personal_id, "user_id": "owner"}, db=db,
     ))
 
@@ -184,17 +192,68 @@ def test_set_access_grant_full_removes_restriction():
     personal_id = BrandAccount.personal_brand_id("owner")
     db = FakeDb({
         "brand_accounts": [{"brand_id": personal_id, "owner_user_id": "owner", "agency_id": None}],
+        "users": [{"userId": "teammate", "email": "teammate@example.com", "first_name": "Tee", "last_name": "Mate"}],
         "mi_access": [{"brand_id": personal_id, "user_id": "teammate", "level": "view_only"}],
     })
 
     _run(set_access_grant(
-        AccessGrantRequest(user_id="teammate", level=MIAccessLevel.FULL),
+        AccessGrantRequest(email="teammate@example.com", level=MIAccessLevel.FULL),
         ctx={"brand_id": personal_id, "user_id": "owner"}, db=db,
     ))
 
     level = _run(get_mi_access_level(db, personal_id, "teammate"))
     assert level == MIAccessLevel.FULL
     assert db["mi_access"].docs == []
+
+
+def test_set_access_grant_rejects_unknown_email():
+    from app.agents.market_intelligence.router import set_access_grant
+    from app.models.brand_account import BrandAccount
+
+    personal_id = BrandAccount.personal_brand_id("owner")
+    db = FakeDb({"brand_accounts": [{"brand_id": personal_id, "owner_user_id": "owner", "agency_id": None}]})
+
+    with pytest.raises(HTTPException) as exc_info:
+        _run(set_access_grant(
+            AccessGrantRequest(email="nobody@example.com", level=MIAccessLevel.VIEW_ONLY),
+            ctx={"brand_id": personal_id, "user_id": "owner"}, db=db,
+        ))
+    assert exc_info.value.status_code == 404
+
+
+def test_set_access_grant_blocks_self_restriction():
+    from app.agents.market_intelligence.router import set_access_grant
+    from app.models.brand_account import BrandAccount
+
+    personal_id = BrandAccount.personal_brand_id("owner")
+    db = FakeDb({
+        "brand_accounts": [{"brand_id": personal_id, "owner_user_id": "owner", "agency_id": None}],
+        "users": [{"userId": "owner", "email": "owner@example.com", "first_name": "O", "last_name": "Wner"}],
+    })
+
+    with pytest.raises(HTTPException) as exc_info:
+        _run(set_access_grant(
+            AccessGrantRequest(email="owner@example.com", level=MIAccessLevel.VIEW_ONLY),
+            ctx={"brand_id": personal_id, "user_id": "owner"}, db=db,
+        ))
+    assert exc_info.value.status_code == 400
+
+
+def test_list_access_grants_enriches_with_user_display_info():
+    from app.agents.market_intelligence.router import list_access_grants
+    from app.models.brand_account import BrandAccount
+
+    personal_id = BrandAccount.personal_brand_id("owner")
+    db = FakeDb({
+        "brand_accounts": [{"brand_id": personal_id, "owner_user_id": "owner", "agency_id": None}],
+        "users": [{"userId": "teammate", "email": "teammate@example.com", "first_name": "Tee", "last_name": "Mate"}],
+        "mi_access": [{"brand_id": personal_id, "user_id": "teammate", "level": "view_only"}],
+    })
+
+    res = _run(list_access_grants(ctx={"brand_id": personal_id, "user_id": "owner"}, db=db))
+    grants = res["responseData"]
+    assert grants[0]["email"] == "teammate@example.com"
+    assert grants[0]["user_name"] == "Tee Mate"
 
 
 if __name__ == "__main__":
