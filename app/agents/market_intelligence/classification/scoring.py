@@ -25,6 +25,7 @@ from ..models import (
     ComponentScore,
     Evidence,
     EvidenceType,
+    Lifecycle,
     ScoreBreakdown,
     UrgencyAssessment,
 )
@@ -36,6 +37,13 @@ CONCERN_MIN_ACCOUNTS = 5
 CONCERN_MIN_THREADS = 3
 CONCERN_WINDOW_DAYS = 7
 INQUIRY_FRESHNESS_HOURS = 48
+
+# PRD §12 trend eligibility bar (pilot defaults).
+TREND_MIN_LATEST_ACCOUNTS = 10
+TREND_MIN_BASELINE_PER_DAY = 3.0
+TREND_MIN_INCREASE = 5
+TREND_BASELINE_DAYS = 7
+TREND_DOMINANT_CASCADE_SHARE = 0.5  # a single account driving >50% of latest-day volume
 
 
 def _score(total: int, components: list[ComponentScore]) -> ScoreBreakdown:
@@ -165,6 +173,102 @@ def is_inquiry_eligible(evidence: Evidence, now: Optional[datetime] = None) -> t
     if not urgency.is_urgent:
         return False, f"expired — {urgency.reason}"
     return True, "eligible"
+
+
+def is_trend_eligible(cluster_evidence: list[Evidence], now: Optional[datetime] = None) -> tuple[bool, str]:
+    """PRD §12: 'at least ten independent accounts in the latest complete
+    24-hour window, a minimum baseline of three accounts per day, at least
+    twice the seven-day baseline, and an increase of at least five
+    accounts... a check for a single dominant repost cascade.' Requires the
+    cluster's FULL historical membership (not one scan's batch) — only
+    meaningful now that clusters persist evidence across scans."""
+    now = _naive_utc(now or datetime.utcnow())
+    latest_window_start = now - timedelta(hours=24)
+    baseline_start = now - timedelta(days=1 + TREND_BASELINE_DAYS)
+    baseline_end = latest_window_start
+
+    dated = [e for e in cluster_evidence if e.published_at is not None]
+    latest_evidence = [e for e in dated if _naive_utc(e.published_at) >= latest_window_start]
+    baseline_evidence = [e for e in dated if baseline_start <= _naive_utc(e.published_at) < baseline_end]
+
+    latest_accounts = {e.author_handle for e in latest_evidence if e.author_handle}
+    baseline_accounts = {e.author_handle for e in baseline_evidence if e.author_handle}
+    baseline_per_day = len(baseline_accounts) / TREND_BASELINE_DAYS
+
+    if len(latest_accounts) < TREND_MIN_LATEST_ACCOUNTS:
+        return False, (
+            f"only {len(latest_accounts)}/{TREND_MIN_LATEST_ACCOUNTS} independent accounts "
+            "in the latest complete 24h window"
+        )
+
+    if baseline_per_day < TREND_MIN_BASELINE_PER_DAY:
+        return False, (
+            f"baseline of {baseline_per_day:.1f} accounts/day is below the "
+            f"{TREND_MIN_BASELINE_PER_DAY:.0f}/day minimum needed to assess a trend"
+        )
+
+    if len(latest_accounts) < 2 * baseline_per_day:
+        return False, (
+            f"latest-day volume ({len(latest_accounts)}) is not at least twice "
+            f"the 7-day baseline ({baseline_per_day:.1f}/day)"
+        )
+
+    if (len(latest_accounts) - baseline_per_day) < TREND_MIN_INCREASE:
+        return False, (
+            f"increase of {len(latest_accounts) - baseline_per_day:.1f} accounts "
+            f"is below the minimum {TREND_MIN_INCREASE}"
+        )
+
+    if latest_evidence:
+        author_counts: dict[str, int] = {}
+        for e in latest_evidence:
+            if e.author_handle:
+                author_counts[e.author_handle] = author_counts.get(e.author_handle, 0) + 1
+        if author_counts:
+            dominant_share = max(author_counts.values()) / len(latest_evidence)
+            if dominant_share > TREND_DOMINANT_CASCADE_SHARE:
+                return False, (
+                    f"a single account accounts for {dominant_share:.0%} of latest-day volume "
+                    "— likely a repost cascade, not independent demand"
+                )
+
+    return True, "eligible"
+
+
+def compute_lifecycle(
+    current: Lifecycle, eligible_now: bool, eligible_evaluation_count: int, consecutive_ineligible_count: int
+) -> Lifecycle:
+    """Pilot interpretation of PRD §12's lifecycle rule, documented plainly
+    since the PRD itself leaves the exact counting scheme unspecified:
+
+    - Each call represents one DISTINCT evaluation where new evidence
+      actually merged into this cluster — callers must only invoke this
+      from that merge path, never on every scan regardless of whether
+      anything changed, so "rerunning identical data cannot qualify it"
+      holds structurally rather than by convention alone.
+    - EARLY: currently trend-eligible, fewer than 2 total eligible
+      evaluations so far.
+    - EMERGING: >=2 eligible evaluations (PRD: "two eligible evaluations
+      using a genuinely advanced evidence window").
+    - ESTABLISHED: >=3 eligible evaluations (PRD: "persistence across three
+      complete daily windows" — this pilot treats one evaluation as one
+      window rather than tracking calendar-day granularity separately).
+    - COOLING: was EMERGING/ESTABLISHED and has now had >=2 consecutive
+      evaluations that failed the trend bar (PRD: "two healthy complete
+      windows below the trend threshold").
+    - UNKNOWN is deliberately never returned here — it's reserved for real
+      collection gaps, which by definition never reach this function (no
+      evaluation happened), so the prior lifecycle is left untouched by the
+      caller instead."""
+    if eligible_now:
+        if eligible_evaluation_count >= 3:
+            return Lifecycle.ESTABLISHED
+        if eligible_evaluation_count >= 2:
+            return Lifecycle.EMERGING
+        return Lifecycle.EARLY
+    if current in (Lifecycle.EMERGING, Lifecycle.ESTABLISHED) and consecutive_ineligible_count >= 2:
+        return Lifecycle.COOLING
+    return current
 
 
 def is_development_eligible(
