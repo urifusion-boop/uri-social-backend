@@ -2770,8 +2770,12 @@ async def _build_campaign_plan(
                 # read, the SAME conversion+merge the real launch uses (adapters/meta.py),
                 # so the estimate shown here can never promise a tighter audience than
                 # what actually launches.
-                from .geo import meta_targeting_from_geo
-                targeting = {**meta_targeting_from_geo(plan.geo), **plan.audience_targeting}
+                from .geo import meta_targeting_from_geo_named
+                targeting = {
+                    **(await meta_targeting_from_geo_named(
+                        plan.geo, region=(plan.geo.city if plan.geo else ""))),
+                    **plan.audience_targeting,
+                }
                 estimate = await est_adapter.get_delivery_estimate(targeting)
             except Exception as e:
                 print(f"[oneshot] delivery estimate skipped: {e}", flush=True)
