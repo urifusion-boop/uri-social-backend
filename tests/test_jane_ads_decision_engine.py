@@ -169,6 +169,47 @@ def test_every_runnable_budget_produces_a_deliverable_daily_budget():
         assert daily >= C.META_MIN_DAILY_NGN, f"₦{budget} → ₦{daily:.0f}/day under floor"
 
 
+# ── TikTok daily-budget floor: same idea, TikTok's own (much higher) $20/day ────
+# floor, which _days_for used to ignore entirely — it only ever checked Meta's, so
+# a TikTok-bound plan sailed past Jane's own ₦50,000 useful-minimum gate with a
+# lifetime budget TikTok's real adgroup/create call would reject (e.g. ₦45,000
+# over the default 7 days is ₦6,429/day, nowhere near the ₦31,000 floor).
+
+def test_days_capped_so_tiktok_budget_clears_tiktok_daily_floor():
+    # ₦45,000 (a TikTok plan's typical post-fee ad spend at the ₦50,000 useful
+    # minimum) over the untouched default of 7 days is ₦6,429/day — under
+    # TikTok's ₦31,000 floor. Must shorten enough to clear it.
+    days = _days_for(45_000, [Platform.TIKTOK])
+    assert days == 1
+    assert 45_000 / days >= C.HARD_FLOOR_DAILY_NGN["tiktok"]
+
+
+def test_meta_days_unaffected_by_the_tiktok_floor_change():
+    # Passing platforms=[META] explicitly must reproduce the exact pre-existing
+    # numbers above — the TikTok-awareness is additive, not a behaviour change
+    # for Meta-only plans.
+    assert _days_for(5_000, [Platform.META]) == _days_for(5_000)
+    assert _days_for(10_000, [Platform.META]) == _days_for(10_000)
+    assert _days_for(20_000, [Platform.META]) == _days_for(20_000)
+
+
+def test_every_runnable_tiktok_budget_clears_tiktoks_own_floor():
+    # Any stated budget that could actually reach TikTok (≥ its ₦50,000 useful
+    # minimum, minus URI's fee) must yield a per-day equivalent at/above TikTok's
+    # real floor once duration is capped.
+    for ad_spend in (45_000, 50_000, 90_000, 135_000, 450_000):
+        days = _days_for(ad_spend, [Platform.TIKTOK])
+        daily = ad_spend / days
+        assert daily >= C.HARD_FLOOR_DAILY_NGN["tiktok"], f"₦{ad_spend} → ₦{daily:.0f}/day under floor"
+
+
+def test_google_only_plan_has_no_floor_to_shorten_against():
+    # Google's HARD_FLOOR_DAILY_NGN is 0 (CPC-driven, no hard floor) — a
+    # Google-only plan's duration should be untouched by any daily-floor logic.
+    assert _days_for(5_000, [Platform.GOOGLE]) == C.MIN_CAMPAIGN_DAYS
+    assert _days_for(20_000, [Platform.GOOGLE]) == C.MAX_CAMPAIGN_DAYS
+
+
 # ── Caps, explanation, trace ──────────────────────────────────────────────────
 
 def test_caps_attached():
