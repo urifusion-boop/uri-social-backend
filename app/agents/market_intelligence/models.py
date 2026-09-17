@@ -320,6 +320,12 @@ class SourceConfig(BaseModel):
     refresh_cadence_hours: int = 1
 
 
+class NotificationSensitivity(str, Enum):
+    LOW = "low"
+    NORMAL = "normal"
+    HIGH = "high"
+
+
 class Topic(BaseModel):
     id: str
     brand_id: str
@@ -333,6 +339,16 @@ class Topic(BaseModel):
     keep_updating: bool = False
     active: bool = True
     created_at: datetime = Field(default_factory=datetime.utcnow)
+
+    # PRD §9 "Advanced inputs": competitors, selected accounts, languages,
+    # negative keywords (excluded_keywords above already covered this one)
+    # and notification sensitivity. "Selected accounts" is deliberately not
+    # modelled — it only makes sense once a real adapter can search a
+    # specific handle, which none can yet (mock is the only registered
+    # provider).
+    competitors: list[str] = Field(default_factory=list)
+    languages: list[str] = Field(default_factory=lambda: ["en"])
+    notification_sensitivity: NotificationSensitivity = NotificationSensitivity.NORMAL
 
 
 class Development(BaseModel):
@@ -481,6 +497,18 @@ class TopicCreateRequest(BaseModel):
     geographic_scope: Optional[str] = None
     requested_days: int = 30
     keep_updating: bool = False
+    competitors: list[str] = Field(default_factory=list)
+    languages: list[str] = Field(default_factory=lambda: ["en"])
+    notification_sensitivity: NotificationSensitivity = NotificationSensitivity.NORMAL
+
+
+class KeywordSuggestionRequest(BaseModel):
+    question: str
+
+
+class KeywordSuggestionResponse(BaseModel):
+    keywords: list[str]
+    excluded_keywords: list[str]
 
 
 class ScanRequest(BaseModel):

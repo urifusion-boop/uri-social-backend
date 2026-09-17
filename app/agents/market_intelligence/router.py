@@ -30,6 +30,7 @@ from .models import (
     FeedbackOutcome,
     FeedbackRequest,
     InsightVersion,
+    KeywordSuggestionRequest,
     PreferencesUpdateRequest,
     ScanStatus,
     SourceConfig,
@@ -39,7 +40,8 @@ from .models import (
 from .budget import get_or_create_budget
 from .deletion import delete_evidence_cascade
 from .notification_delivery import get_or_create_preferences
-from .scan_runner import create_scan_run, execute_scan, preview_topic_coverage
+from .keyword_suggestion import suggest_keywords
+from .scan_runner import ADAPTER_REGISTRY, create_scan_run, execute_scan, preview_topic_coverage
 
 router = APIRouter(prefix="/market-intelligence", tags=["Market Intelligence"])
 
@@ -108,12 +110,47 @@ async def _get_owned_development(development_id: str, brand_id: str, db: AsyncIO
     return dev_doc
 
 
+@router.get("/sources")
+async def list_sources(
+    ctx: dict = Depends(get_flexible_brand_context),
+):
+    """PRD §8: 'The frontend obtains available controls from these
+    [capability] records' — real registered providers today, not a
+    hardcoded list the frontend has to keep in sync by hand. Grows
+    automatically the moment a real adapter is registered."""
+    sources = [adapter.capabilities().dict() for adapter in ADAPTER_REGISTRY.values()]
+    return UriResponse.get_list_data_response("source", sources)
+
+
+@router.post("/topics/suggest-keywords")
+async def suggest_topic_keywords(
+    body: KeywordSuggestionRequest,
+    ctx: dict = Depends(get_flexible_brand_context),
+):
+    """PRD §9: 'Uri suggests keywords, related phrases and exclusions. The
+    owner reviews them before starting collection.' Read-only — never
+    creates anything; the frontend shows these as editable chips before
+    POSTing the actual topic."""
+    result = await suggest_keywords(body.question)
+    if result is None:
+        # Fail-open with the same simple heuristic create_topic falls back
+        # to, rather than blocking the flow on an LLM hiccup — the owner is
+        # reviewing these anyway.
+        fallback_keywords = [w.strip() for w in body.question.split() if len(w.strip()) > 3]
+        return UriResponse.get_single_data_response("suggestion", {"keywords": fallback_keywords, "excluded_keywords": []})
+    return UriResponse.get_single_data_response("suggestion", {"keywords": result.keywords, "excluded_keywords": result.excluded_keywords})
+
+
 @router.post("/topics")
 async def create_topic(
     body: TopicCreateRequest,
     ctx: dict = Depends(get_flexible_brand_context),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
+    # PRD §9: "Uri suggests keywords... the owner reviews them before
+    # starting collection" — real suggestion now happens via
+    # POST /topics/suggest-keywords, reviewed client-side before this call;
+    # this fallback only fires if the caller genuinely sent nothing.
     keywords = body.keywords or [w.strip() for w in body.question.split() if len(w.strip()) > 3]
     topic = Topic(
         id=str(uuid.uuid4()),
@@ -126,6 +163,9 @@ async def create_topic(
         geographic_scope=body.geographic_scope,
         requested_days=body.requested_days,
         keep_updating=body.keep_updating,
+        competitors=body.competitors,
+        languages=body.languages,
+        notification_sensitivity=body.notification_sensitivity,
     )
     await db["mi_topics"].insert_one(topic.dict())
     track_event(ctx["user_id"], "topic_created", {
