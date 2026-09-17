@@ -19,6 +19,7 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from .adapters.base import AdapterCapabilities, SourceAdapter
 from .adapters.mock import MockSourceAdapter
+from .budget import reconcile_spend, reserve_budget
 from .classification.classify import classify_evidence
 from .classification.scoring import (
     confidence_breakdown,
@@ -149,17 +150,29 @@ async def _dedupe_against_existing(db: AsyncIOMotorDatabase, topic_id: str, sour
 
 
 async def create_scan_run(topic: Topic, db: AsyncIOMotorDatabase) -> CollectionRun:
-    """Inserts a QUEUED run and returns immediately — PRD §9: 'Return a job
+    """Inserts a run and returns immediately — PRD §9: 'Return a job
     identifier immediately, allow the user to leave and return.' The router
-    calls this synchronously, then schedules `execute_scan` (the actual work)
-    as a background task against the same run id, so a slow scan never holds
-    the HTTP request open."""
+    calls this synchronously, then (only if budget allowed it) schedules
+    `execute_scan` (the actual work) as a background task against the same
+    run id, so a slow scan never holds the HTTP request open.
+
+    PRD §23/P0-15: reserves the estimated cost from the brand's monthly
+    allowance BEFORE the run is ever queued. If reservation fails, the run
+    is still recorded — visibly, as BUDGET_LIMITED — rather than silently
+    dropped, but execute_scan is never scheduled for it (see the router)."""
+    previews = await preview_topic_coverage(topic)
+    total_estimated_cost = sum(p.estimated_cost_usd for p in previews)
+
+    reserved, reason = await reserve_budget(db, topic.brand_id, total_estimated_cost)
+
     run = CollectionRun(
         id=str(uuid.uuid4()),
         topic_id=topic.id,
         brand_id=topic.brand_id,
         source_provider=",".join(s.provider for s in topic.sources) or "none",
-        status=ScanStatus.QUEUED,
+        status=ScanStatus.QUEUED if reserved else ScanStatus.BUDGET_LIMITED,
+        estimated_cost_usd=total_estimated_cost,
+        gaps=[] if reserved else [f"budget limit reached: {reason}"],
     )
     await db["mi_scans"].insert_one(run.dict())
     return run
@@ -364,6 +377,15 @@ async def execute_scan(topic: Topic, run_id: str, db: AsyncIOMotorDatabase) -> N
 
     if developments:
         await db["mi_developments"].insert_many([d.dict() for d in developments])
+
+    # PRD §23: "reconcile actual charges and release unused reservation."
+    # This pilot's adapters only ever report an upfront estimate, not a
+    # metered actual cost, so the reserved amount IS the actual charge here —
+    # documented simplification, not a placeholder to silently forget about
+    # once a metered adapter exists.
+    run_doc = await db["mi_scans"].find_one({"id": run_id})
+    reserved_amount = (run_doc or {}).get("estimated_cost_usd", 0.0)
+    await reconcile_spend(db, topic.brand_id, reserved_amount, reserved_amount)
 
     final_status = ScanStatus.PARTIAL if gaps else ScanStatus.COMPLETED
     await db["mi_scans"].update_one(

@@ -373,6 +373,21 @@ class ScanRequest(BaseModel):
     pass  # nothing required yet — budget/limit checks read from the topic + brand
 
 
+class BrandBudget(BaseModel):
+    """PRD §23: 'Before a scan, reserve a conservative maximum cost from the
+    workspace allowance... reconcile actual charges and release unused
+    reservation.' Tracked per calendar month (period = 'YYYY-MM'), not a
+    rolling 30-day window — simpler and matches how a billing allowance is
+    normally understood. monthly_allowance_usd's pilot default is
+    deliberately small; this is a cost-control ceiling, not a spend target."""
+    brand_id: str
+    monthly_allowance_usd: float = 10.0
+    period: str  # "YYYY-MM"
+    reserved_usd: float = 0.0
+    spent_usd: float = 0.0
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+
 class SourceCoveragePreview(BaseModel):
     """PRD §9: 'Before running, show the accessible period, limits, collection
     scope and estimated usage. A shorter available period must never silently
