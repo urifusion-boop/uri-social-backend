@@ -21,6 +21,7 @@ from .adapters.base import AdapterCapabilities, SourceAdapter
 from .adapters.mock import MockSourceAdapter
 from .budget import reconcile_spend, reserve_budget
 from .classification.classify import classify_evidence
+from .classification_cache import get_cached_classification, store_classification_cache
 from .classification.scoring import (
     compute_lifecycle,
     confidence_breakdown,
@@ -371,7 +372,16 @@ async def _run_scan_pipeline(topic: Topic, run_id: str, db: AsyncIOMotorDatabase
             )
             continue
 
-        result = await classify_evidence(evidence, business_context)
+        # PRD §23: "Cache classification by content and model version" —
+        # checked/populated around the unchanged classify_evidence() call so
+        # an exact repost or syndicated copy already classified for this
+        # brand skips a second LLM call entirely.
+        result = await get_cached_classification(db, evidence.text, topic.brand_id)
+        if result is None:
+            result = await classify_evidence(evidence, business_context)
+            if result is not None:
+                await store_classification_cache(db, evidence.text, topic.brand_id, result)
+
         if result is None:
             gaps.append(f"evidence {evidence.source_id} could not be classified — left for manual review")
             continue
