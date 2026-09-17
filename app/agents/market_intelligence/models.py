@@ -80,6 +80,32 @@ class FeedbackVerdict(str, Enum):
     INCORRECT = "incorrect"
 
 
+class NotificationCategory(str, Enum):
+    """PRD §14's delivery-rules table. EARLY_SIGNAL deliberately never
+    produces an outbox entry (PRD: 'Watchlist only') — an early-signal
+    insight is already visible the moment the user opens Intelligence home,
+    so there's nothing additional to queue."""
+    ACT_SOON = "act_soon"
+    QUALIFIED_INQUIRY = "qualified_inquiry"
+    PREPARE = "prepare"
+    USEFUL_PATTERN = "useful_pattern"
+    EARLY_SIGNAL = "early_signal"
+    MATERIAL_UPDATE = "material_update"
+    COOLING = "cooling"
+
+
+class OutboxDeliveryMode(str, Enum):
+    IMMEDIATE = "immediate"
+    DIGEST = "digest"
+
+
+class OutboxStatus(str, Enum):
+    QUEUED = "queued"
+    SUPPRESSED = "suppressed"
+    SENT = "sent"
+    FAILED = "failed"
+
+
 class DevelopmentStatus(str, Enum):
     """PRD §13: 'Unknown dates are "Date to confirm," with no invented
     countdown.' DATE_TO_CONFIRM is the honest default — SCHEDULED requires an
@@ -361,6 +387,65 @@ class ActionBrief(BaseModel):
     destination: str = "market_intelligence"  # "campaign" once handoff is wired
     destination_ref_id: Optional[str] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class MIOutboxEntry(BaseModel):
+    """PRD §14 engineering note: 'Use an outbox written in the same database
+    transaction as the insight revision. A delivery worker applies recipient
+    preferences, quiet hours, caps and expiry at send time.' This row only
+    ever records WHAT should be considered for email delivery and WHY
+    (dedupe_key) — every eligibility decision (muted, snoozed, quiet hours,
+    daily cap, topic cooldown, expiry) is made later, at send time, by the
+    delivery worker, never here at write time. 'In-app' isn't a separate
+    entry: PRD's defaults section makes in-app availability the baseline
+    ("available by default") satisfied simply by the insight being active
+    and queryable — only the additive email channel needs this machinery."""
+    id: str
+    brand_id: str
+    user_id: str  # recipient — the topic's owner in this pilot
+    topic_id: str
+    insight_id: str
+    insight_revision: int
+    category: NotificationCategory
+    delivery_mode: OutboxDeliveryMode
+    dedupe_key: str  # tenant + insight + revision (material-change signature) + category + recipient
+    status: OutboxStatus = OutboxStatus.QUEUED
+    suppression_reason: Optional[str] = None
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    sent_at: Optional[datetime] = None
+    failed_reason: Optional[str] = None
+
+
+class MINotificationPreferences(BaseModel):
+    """PRD §14: 'Users manage their own notification preferences; workspace
+    policies set maximum delivery and spending limits.' Scoped per
+    (user_id, brand_id) since agency staff can hold different preferences
+    per client workspace."""
+    user_id: str
+    brand_id: str
+    email_enabled: bool = False  # PRD: "Email is opt-in per recipient"
+    timezone: str = "Africa/Lagos"  # PRD: "initialise Nigerian workspaces to Africa/Lagos"
+    digest_hour_local: int = 8  # PRD default: 08:00 workspace timezone
+    quiet_hours_start_local: int = 21
+    quiet_hours_end_local: int = 8
+    urgent_override: bool = False  # PRD: lets an explicit change bypass quiet hours too
+    muted_topic_ids: list[str] = Field(default_factory=list)
+    muted_categories: list[NotificationCategory] = Field(default_factory=list)
+    snoozed_insight_ids: list[str] = Field(default_factory=list)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class PreferencesUpdateRequest(BaseModel):
+    email_enabled: Optional[bool] = None
+    timezone: Optional[str] = None
+    digest_hour_local: Optional[int] = None
+    quiet_hours_start_local: Optional[int] = None
+    quiet_hours_end_local: Optional[int] = None
+    urgent_override: Optional[bool] = None
+    mute_topic_id: Optional[str] = None
+    unmute_topic_id: Optional[str] = None
+    mute_category: Optional[NotificationCategory] = None
+    unmute_category: Optional[NotificationCategory] = None
 
 
 class FeedbackOutcome(BaseModel):

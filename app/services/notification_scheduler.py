@@ -179,6 +179,38 @@ def _job_market_intelligence_scheduled_scans():
     _run_async("market_intelligence_scheduled_scans", _run)
 
 
+def _job_market_intelligence_outbox():
+    """Uri Market Intelligence immediate-notification delivery worker (PRD
+    §14) — drains queued immediate outbox entries every 15 minutes. Same
+    import-guard rationale as the scan job above."""
+    async def _run():
+        try:
+            from app.agents.market_intelligence.notification_delivery import process_outbox
+        except ImportError:
+            return
+        from app.database import get_db
+        db = get_db()
+        result = await process_outbox(db)
+        print(f"📬 Market Intelligence outbox: {result}")
+    _run_async("market_intelligence_outbox", _run)
+
+
+def _job_market_intelligence_digests():
+    """Uri Market Intelligence daily digest delivery (PRD §14) — runs
+    hourly and only actually sends for recipients whose configured digest
+    hour matches the current hour in their own timezone."""
+    async def _run():
+        try:
+            from app.agents.market_intelligence.notification_delivery import send_daily_digests
+        except ImportError:
+            return
+        from app.database import get_db
+        db = get_db()
+        result = await send_daily_digests(db)
+        print(f"📰 Market Intelligence digests: {result}")
+    _run_async("market_intelligence_digests", _run)
+
+
 def _job_publish_scheduled_content():
     async def _run():
         from app.database import get_db
@@ -301,8 +333,28 @@ def start_notification_scheduler():
         **_JOB_DEFAULTS,
     )
 
+    # Uri Market Intelligence immediate-notification delivery (PRD §14) —
+    # every 15 minutes, so an "act soon" or qualified-inquiry alert doesn't
+    # sit queued for up to an hour. Dev-only; import-guarded.
+    _scheduler.add_job(
+        _job_market_intelligence_outbox,
+        CronTrigger(minute="*/15"),
+        id="market_intelligence_outbox",
+        **_JOB_DEFAULTS,
+    )
+
+    # Uri Market Intelligence daily digests (PRD §14) — hourly; the job
+    # itself only sends for recipients whose digest hour matches now.
+    # Dev-only; import-guarded.
+    _scheduler.add_job(
+        _job_market_intelligence_digests,
+        CronTrigger(minute=45),
+        id="market_intelligence_digests",
+        **_JOB_DEFAULTS,
+    )
+
     _scheduler.start()
-    print("📅 Notification scheduler started with 10 jobs")
+    print("📅 Notification scheduler started with 12 jobs")
 
 
 def stop_notification_scheduler():
