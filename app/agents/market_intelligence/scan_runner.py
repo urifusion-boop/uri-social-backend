@@ -29,6 +29,7 @@ from .classification.scoring import (
 )
 from .clustering import cluster_evidence
 from .insight_composer import compose_insight
+from .noise_filter import deterministic_noise_reason
 from .models import (
     Classification,
     Cluster,
@@ -40,6 +41,9 @@ from .models import (
     ScanStatus,
     Topic,
 )
+
+NOISE_FILTER_MODEL_NAME = "deterministic-filter"
+NOISE_FILTER_PROMPT_VERSION = "mi-noise-filter-v1"
 
 # One adapter instance per provider — new real adapters register here.
 ADAPTER_REGISTRY: dict[str, SourceAdapter] = {
@@ -159,8 +163,25 @@ async def execute_scan(topic: Topic, run_id: str, db: AsyncIOMotorDatabase) -> N
     await db["mi_scans"].update_one({"id": run_id}, {"$set": {"status": ScanStatus.ANALYSING.value}})
 
     # ── Classify every new piece of evidence ────────────────────────────────
+    # Deterministic noise (promo/bot boilerplate) is filtered before the LLM
+    # call — PRD §23 cost control. A noise verdict here is still a real,
+    # queryable Classification record (not a discard), just stamped with a
+    # deterministic model_name instead of an LLM one.
     classifications: dict[str, Classification] = {}
     for evidence in all_new_evidence:
+        noise_reason = deterministic_noise_reason(evidence)
+        if noise_reason is not None:
+            classifications[evidence.id] = Classification(
+                evidence_id=evidence.id,
+                primary_type=EvidenceType.NOISE,
+                evidence_span=evidence.text[:200],
+                uncertain=False,
+                reasoning=f"Deterministic filter: {noise_reason}",
+                model_name=NOISE_FILTER_MODEL_NAME,
+                prompt_version=NOISE_FILTER_PROMPT_VERSION,
+            )
+            continue
+
         result = await classify_evidence(evidence, business_context)
         if result is None:
             gaps.append(f"evidence {evidence.source_id} could not be classified — left for manual review")
