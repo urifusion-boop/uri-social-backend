@@ -404,6 +404,22 @@ async def delete_evidence(
     return UriResponse.get_single_data_response("deletion", result)
 
 
+@router.get("/insights/{insight_id}/briefs")
+async def get_brief(
+    insight_id: str,
+    ctx: dict = Depends(get_flexible_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """Read-only existence check — lets the frontend show "Create brief" vs
+    the editable draft without a GET ever creating one as a side effect.
+    Open to viewers too, same as every other read endpoint."""
+    await _get_owned_insight(insight_id, ctx["brand_id"], db)
+    existing = await db["mi_briefs"].find_one({"insight_id": insight_id})
+    if existing:
+        existing.pop("_id", None)
+    return UriResponse.get_single_data_response("brief", existing)
+
+
 @router.post("/insights/{insight_id}/briefs")
 async def create_brief(
     insight_id: str,
