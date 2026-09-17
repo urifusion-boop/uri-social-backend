@@ -278,3 +278,34 @@ def test_prompt_asks_for_a_full_list_not_two_or_three():
     from app.agents.jane_ads.audience_targeting import _extraction_prompt
     lowered = _extraction_prompt("small business owners").lower()
     assert "6-10" in lowered
+
+
+# ── Works and people are not ad categories ───────────────────────────────────
+#
+# Live-observed on a real launched ad set: "Real Estate" resolved to "Real Estate
+# (band)" and "Home Improvement" to "Home Improvement (TV series)", so the campaign
+# targeted fans of an indie band and a 1990s sitcom. Both carry a parenthetical, which
+# is the signal the ranking uses to prefer Meta's genuine categories — so the
+# parenthetical alone cannot separate them.
+
+def test_a_band_is_never_chosen_over_the_real_category():
+    from app.agents.jane_ads.audience_targeting import _is_entity_hit
+    assert _is_entity_hit({"name": "Real Estate (band)"}) is True
+    assert _is_entity_hit({"name": "Home Improvement (TV series)"}) is True
+    assert _is_entity_hit({"name": "Barbershop (film)"}) is True
+
+
+def test_genuine_categories_are_kept():
+    from app.agents.jane_ads.audience_targeting import _is_entity_hit
+    for name in ("Home improvement (home and garden)", "Small business (business and finance)",
+                 "Cosmetics (personal care)", "Digital marketing (marketing)",
+                 "Real estate license"):
+        assert _is_entity_hit({"name": name}) is False, name
+
+
+def test_metas_own_topic_catches_entities_with_no_parenthetical():
+    """The second signal, for a hit whose parenthetical is absent or unrecognised: a
+    business audience is essentially never served by an entertainment entity."""
+    from app.agents.jane_ads.audience_targeting import _is_entity_hit
+    assert _is_entity_hit({"name": "Barbershop music", "topic": "News and entertainment"}) is True
+    assert _is_entity_hit({"name": "Small business", "topic": "Business and industry"}) is False
