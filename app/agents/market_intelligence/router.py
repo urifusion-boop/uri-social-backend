@@ -599,6 +599,13 @@ async def list_access_grants(
     grants = [doc async for doc in cursor]
     for g in grants:
         g.pop("_id", None)
+        # Best-effort display info only (same join workspace_member_router.py
+        # uses) — a grant is still fully functional without it, so a missing
+        # user doc never breaks the list.
+        user_doc = await db.users.find_one({"userId": g["user_id"]})
+        if user_doc:
+            g["email"] = user_doc.get("email")
+            g["user_name"] = f"{user_doc.get('first_name', '')} {user_doc.get('last_name', '')}".strip() or None
     return UriResponse.get_list_data_response("access", grants)
 
 
@@ -614,16 +621,23 @@ async def set_access_grant(
     if not await can_manage_mi_access(db, ctx["brand_id"], ctx["user_id"]):
         raise HTTPException(status_code=403, detail="Only the brand owner or an agency admin can manage access")
 
+    user_doc = await db.users.find_one({"email": body.email})
+    if not user_doc:
+        raise HTTPException(status_code=404, detail=f"No Uri account found for {body.email}")
+    target_user_id = user_doc["userId"]
+    if target_user_id == ctx["user_id"] and body.level == MIAccessLevel.VIEW_ONLY:
+        raise HTTPException(status_code=400, detail="You can't restrict your own access")
+
     if body.level == MIAccessLevel.FULL:
-        await db["mi_access"].delete_one({"brand_id": ctx["brand_id"], "user_id": body.user_id})
-        return UriResponse.get_single_data_response("access", {"user_id": body.user_id, "level": "full"})
+        await db["mi_access"].delete_one({"brand_id": ctx["brand_id"], "user_id": target_user_id})
+        return UriResponse.get_single_data_response("access", {"user_id": target_user_id, "level": "full"})
 
     grant = MIAccessGrant(
-        id=str(uuid.uuid4()), brand_id=ctx["brand_id"], user_id=body.user_id,
+        id=str(uuid.uuid4()), brand_id=ctx["brand_id"], user_id=target_user_id,
         level=body.level, granted_by=ctx["user_id"],
     )
     await db["mi_access"].update_one(
-        {"brand_id": ctx["brand_id"], "user_id": body.user_id},
+        {"brand_id": ctx["brand_id"], "user_id": target_user_id},
         {"$set": grant.dict()},
         upsert=True,
     )
