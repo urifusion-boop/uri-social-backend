@@ -117,3 +117,42 @@ def test_exploration_lands_near_the_target_share():
 def test_exploration_share_is_reported_so_a_shortfall_is_visible():
     records = [_rec(exploration=True)] + [_rec() for _ in range(9)]
     assert B.headline_metrics(records)["exploration_share"] == 0.1
+
+
+# ── Feeding it back (§4.4) — proposals only, never automatic ─────────────────
+
+def test_no_default_is_proposed_below_the_bias_threshold():
+    """30, not 10: biasing what every future client gets is heavier than putting a
+    number on an internal screen."""
+    records = [_rec(cost=400, fmt="SEED-A") for _ in range(20)]
+    out = B.propose_defaults(records)
+    assert out["proposal"] is None
+    assert "30 needed" in out["message"] or "30" in out["message"]
+
+
+def test_exploration_campaigns_cannot_set_the_default():
+    """They exist precisely because they are NOT what the bucket favours (§2.5)."""
+    records = ([_rec(cost=400, fmt="SEED-A", exploration=True) for _ in range(40)]
+               + [_rec(cost=900, fmt="SEED-B") for _ in range(5)])
+    out = B.propose_defaults(records)
+    assert out["proposal"] is None
+    assert out["campaigns"] == 5     # the 40 exploration records are excluded
+
+
+def test_a_clear_winner_is_proposed_but_still_needs_confirmation():
+    records = ([_rec(cost=400, fmt="SEED-A") for _ in range(20)]
+               + [_rec(cost=900, fmt="SEED-B") for _ in range(20)])
+    out = B.propose_defaults(records)
+    assert out["proposal"]["value"] == "SEED-A"
+    assert out["proposal"]["beats"] == "SEED-B"
+    assert out["requires_human_confirmation"] is True
+
+
+def test_a_narrow_margin_is_not_a_finding():
+    """Two options a few naira apart is a coin toss dressed as a finding, and acting
+    on it would churn the default."""
+    records = ([_rec(cost=500, fmt="SEED-A") for _ in range(20)]
+               + [_rec(cost=530, fmt="SEED-B") for _ in range(20)])
+    out = B.propose_defaults(records)
+    assert out["proposal"] is None
+    assert "too close" in out["message"]

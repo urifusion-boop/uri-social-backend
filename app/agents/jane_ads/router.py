@@ -3071,6 +3071,7 @@ async def meta_plan_update_creative(
         raise HTTPException(status_code=400, detail="reference_image_url is required — upload the footage via /creative/upload first.")
 
     plan = CampaignPlan.model_validate(doc["plan"])
+    previous_image = plan.creative.image_url if plan.creative else ""
     plan.creative = AdCreative(
         image_url=body.reference_image_url,
         is_video=body.is_video,
@@ -3082,6 +3083,15 @@ async def meta_plan_update_creative(
     )
     await db["jane_ads_pending_plans"].update_one(
         {"plan_id": plan_id}, {"$set": {"plan": plan.model_dump(mode="json")}},
+    )
+    # This path swaps the creative WITHOUT rebuilding the plan, so the rebuild diff
+    # never sees it — and a client replacing Jane's image with their own footage is
+    # exactly the correction §1.5 exists to count.
+    from .campaign_record import record_direct_modification
+
+    await record_direct_modification(
+        db, thread_id=doc.get("thread_id", ""), brand_id=brand_ctx.get("brand_id", ""),
+        field="creative", before=previous_image, after=body.reference_image_url,
     )
     return {"plan_id": plan_id, "creative": plan.creative.model_dump(mode="json")}
 
@@ -3636,6 +3646,72 @@ async def intelligence_bucket_explorer(
         "headline": B.headline_metrics(records),
         "comparison": B.compare(records, dimension),
     }
+
+
+class ConfirmDefaultBody(BaseModel):
+    business_category: str = ""
+    city: str = ""
+    budget_tier: str = ""
+    platform: str = "meta"
+    dimension: str = "creative_format"
+
+
+@router.get("/admin/intelligence/proposed-defaults")
+async def intelligence_proposed_defaults(
+    business_category: str = "",
+    city: str = "",
+    budget_tier: str = "",
+    platform: str = "meta",
+    dimension: str = "creative_format",
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+) -> dict:
+    """What a bucket suggests Jane's default should be (CI-SPEC-01 §4.4).
+
+    A PROPOSAL, never an applied change. The bar is 30 campaigns and a real margin —
+    biasing what every future client gets is heavier than putting a number on an
+    internal screen, and two options a few naira apart is a coin toss dressed as a
+    finding.
+    """
+    from . import buckets as B
+
+    _require_ads_admin(token)
+    records = await B.load_bucket(
+        db, business_category=business_category, city=city,
+        budget_tier=budget_tier, platform=platform,
+    )
+    return B.propose_defaults(records, dimension)
+
+
+@router.post("/admin/intelligence/confirm-default")
+async def intelligence_confirm_default(
+    body: ConfirmDefaultBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+) -> dict:
+    """Adopt a proposed default — the human confirmation §4.4 requires.
+
+    Re-derives the proposal server-side rather than trusting one posted in: a default
+    must be adopted on evidence that exists at the moment of confirmation, not on a
+    figure a caller supplies.
+    """
+    from . import buckets as B
+
+    _require_ads_admin(token)
+    bucket = {"business_category": body.business_category, "city": body.city,
+              "budget_tier": body.budget_tier, "platform": body.platform}
+    records = await B.load_bucket(db, **bucket)
+    proposed = B.propose_defaults(records, body.dimension)
+    if not proposed.get("proposal"):
+        raise HTTPException(
+            status_code=409,
+            detail=proposed.get("message") or "No proposal qualifies for this bucket yet.",
+        )
+    actor = ((token.get("claims", {}) or {}).get("email") or "unknown").lower()
+    stored = await B.confirm_default(db, bucket=bucket, proposal=proposed["proposal"],
+                                     confirmed_by=actor)
+    return {"confirmed": bool(stored), "default": stored.get("value"),
+            "evidence": proposed["proposal"]}
 
 
 @router.get("/admin/intelligence/digest")
