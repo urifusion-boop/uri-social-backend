@@ -2319,11 +2319,26 @@ async def _build_campaign_plan(
             print(f"[oneshot] plan variants skipped: {e}", flush=True)
         if variant_set and len(variant_set.variants) > 1:
             import uuid as _uuid
+            group_id = body.variant_group_id or f"vgrp_{_uuid.uuid4().hex[:16]}"
+            # Persist EVERY variant now, while they all still exist. By launch only
+            # the chosen one is in hand, and the rejected ones are the comparison —
+            # a plan Jane ranks first that clients keep declining is only visible if
+            # the ones they declined were kept (CI-SPEC-01 §1.2).
+            from .campaign_record import save_generated_variants
+
+            dumped = [v.model_dump(mode="json") for v in variant_set.variants]
+            await save_generated_variants(
+                db, variant_group_id=group_id,
+                brand_id=brand_ctx.get("brand_id", ""),
+                business_id=business_id,
+                variants=dumped,
+                recommended_rank=next((v.get("rank") for v in dumped if v.get("recommended")), None),
+            )
             return {"early_return": {
                 "stage": "choose_plan_variant",
                 "understood": parsed.model_dump(),
                 "plan_variants": variant_set.model_dump(),
-                "variant_group_id": body.variant_group_id or f"vgrp_{_uuid.uuid4().hex[:16]}",
+                "variant_group_id": group_id,
             }}
         # Only ever 0 or 1 genuinely distinct audience exists — nothing to choose
         # between, so fall straight through with Jane's own single read (unchanged
@@ -3244,6 +3259,21 @@ async def meta_launch_plan(
         )
         await db["jane_ads_meta_campaigns"].update_one(
             {"campaign_id": campaign_id}, {"$set": {"charged_upfront_ngn": due}},
+        )
+        # The decision record (CI-SPEC-01 Part 1). Written here because this is the
+        # moment every input still exists together — the understanding, the ranked
+        # plans, the corpus citations and what was actually charged. Best-effort: it
+        # never raises, so it cannot cost a launch the client has just paid for.
+        from .campaign_record import write_campaign_record
+
+        await write_campaign_record(
+            db, campaign_id=campaign_id,
+            brand_id=brand_ctx.get("brand_id", ""),
+            business_id=doc["business_id"],
+            plan_doc=doc,
+            stated_budget_ngn=due,
+            ad_spend_ngn=req.budget_ngn,
+            service_fee_ngn=round(due - req.budget_ngn, 2),
         )
         result["wallet"] = {
             "charged_ngn": due,
