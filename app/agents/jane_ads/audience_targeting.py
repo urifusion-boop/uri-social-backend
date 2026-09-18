@@ -45,6 +45,9 @@ from app.core.config import settings
 # keyword (_match_score) and anything Meta marks invalid, so a longer list cannot
 # smuggle in junk.
 _MAX_INTERESTS = 10
+# Behaviours are far coarser than interests — a handful is plenty, and each one Meta
+# cannot resolve simply leaves the ad broader on this axis.
+_MAX_BEHAVIOURS = 4
 # Meta's own floor for any ads audience; also keeps a stray "13" from the model
 # (a plausible-sounding minimum a human might type, but usually meaning "everyone
 # old enough to buy this") from narrowing an ad only the youngest end wants.
@@ -65,7 +68,13 @@ def _extraction_prompt(audience_text: str) -> str:
         '  "interest_keywords": [<6-10 short phrases you would type into Meta\'s own\n'
         "     interest-targeting search box to reach this audience — real, searchable\n"
         "     interest/industry/behaviour terms, e.g. \"Small business\", \"Online\n"
-        "     shopping\", \"Skincare\" — never a restatement of the sentence itself>]\n"
+        "     shopping\", \"Skincare\" — never a restatement of the sentence itself>],\n"
+        '  "behaviour_keywords": [<0-4 phrases describing what this audience DOES or IS,\n'
+        "     which Meta tracks as a behaviour or demographic rather than an interest —\n"
+        "     e.g. \"Small business owners\", \"Facebook Page admins\",\n"
+        "     \"Frequent travellers\", \"New parents\". These are a DIFFERENT targeting\n"
+        "     axis from interests: an interest is what someone likes, a behaviour is\n"
+        "     something they actually do. Empty list if the text implies none>]\n"
         "}\n\n"
         "Most audience descriptions ('small businesses launching their first online "
         "campaign', 'homeowners in new estates') imply NO age or gender skew — leave "
@@ -105,6 +114,38 @@ async def _extract_hints(audience_text: str) -> dict:
 
 
 _PAREN_SUFFIX = re.compile(r"\s*\([^)]*\)\s*$")
+
+# Parentheticals that name a WORK OR A PERSON, not an ad category. Meta's search puts
+# both shapes side by side and the category preference below cannot tell them apart —
+# it only knows a parenthetical is present. Live-observed on a real launched ad set:
+# "Real Estate" resolved to "Real Estate (band)" and "Home Improvement" to "Home
+# Improvement (TV series)", so a home-services ad targeted fans of an indie band and a
+# 1990s sitcom, while the genuine "Home improvement (home and garden)" sat in the same
+# result list. Targeting a band's followers is not a narrower version of the audience;
+# it is a different one.
+_ENTITY_PARENTHETICALS = {
+    "band", "film", "movie", "tv series", "tv programme", "tv program", "album",
+    "song", "single", "musician", "singer", "rapper", "actor", "actress", "author",
+    "book", "magazine", "video game", "game", "artist", "composer", "athlete",
+    "politician", "public figure", "character", "fictional character", "tv channel",
+    "radio station", "podcast", "website", "app", "company", "brand",
+}
+
+# Meta's own topic for a hit. "News and entertainment" is what a band/series/film
+# carries, and it is the honest second signal when a parenthetical is absent or
+# unrecognised — a business audience is essentially never served by an entertainment
+# entity, whereas the real categories carry topics like "Business and industry" or
+# "Hobbies and activities".
+_ENTERTAINMENT_TOPIC = "news and entertainment"
+
+
+def _is_entity_hit(hit: dict) -> bool:
+    """Whether this search hit is a work/person page rather than a targetable category."""
+    name = hit.get("name") or ""
+    match = _PAREN_SUFFIX.search(name)
+    if match and match.group(0).strip(" ()").lower() in _ENTITY_PARENTHETICALS:
+        return True
+    return (hit.get("topic") or "").strip().lower() == _ENTERTAINMENT_TOPIC
 _WORD = re.compile(r"[a-z0-9]+")
 
 
@@ -158,6 +199,13 @@ async def _resolve_interest(client: httpx.AsyncClient, graph_base: str,
     # list from dragging in loosely-related interests — a keyword that resolves to
     # nothing merely leaves the ad broader, which is the safe direction.
     usable = [(s, h) for s, h in usable if s >= 2]
+    # Drop works and people before ranking, not after: a band scoring an exact name
+    # match would otherwise outrank the real category outright.
+    entity_names = [h.get("name") for _, h in usable if _is_entity_hit(h)]
+    usable = [(s, h) for s, h in usable if not _is_entity_hit(h)]
+    if entity_names:
+        print(f"[AudienceTargeting] ignored non-category matches for {keyword!r}: "
+              f"{entity_names}", flush=True)
     if not usable:
         if hits:
             print(f"[AudienceTargeting] no relevant interest for {keyword!r} — "
@@ -175,6 +223,49 @@ async def _resolve_interest(client: httpx.AsyncClient, graph_base: str,
 
     _, hit = max(usable, key=_rank)
     return {"id": hit["id"], "name": hit["name"]}
+
+
+# Which flexible_spec field each of Meta's targeting-search types belongs in. Meta
+# rejects an id filed under the wrong key, so this mapping is part of the contract.
+_BEHAVIOUR_FIELD_FOR_TYPE = {
+    "behaviors": "behaviors",
+    "work_positions": "work_positions",
+    "work_employers": "work_employers",
+    "industries": "industries",
+    "life_events": "life_events",
+    "education_statuses": "education_statuses",
+    "income": "income",
+    "family_statuses": "family_statuses",
+}
+
+
+async def _resolve_behaviour(client: httpx.AsyncClient, graph_base: str,
+                             access_token: str, keyword: str) -> Optional[dict]:
+    """A real Meta behaviour/demographic id for `keyword`, or None to leave it out.
+
+    Uses `type=adTargetingCategory` with class=behaviors/demographics, which is the
+    only way to get a valid id — the same reasoning as _resolve_interest: Meta rejects
+    an invented id, and these names and ids change over time.
+
+    Matching is as strict as the interest path (score >= 2, every word of the keyword
+    present) for the same reason: a dropped behaviour just leaves the ad broader on
+    this axis, while a wrong one spends the budget on the wrong people.
+    """
+    for klass in ("behaviors", "demographics"):
+        resp = await client.get(
+            f"{graph_base}/search",
+            params={"type": "adTargetingCategory", "class": klass, "q": keyword,
+                    "limit": 15, "access_token": access_token},
+        )
+        hits = [h for h in (resp.json().get("data") or []) if h.get("id")]
+        usable = [(_match_score(keyword, h.get("name", "")), h) for h in hits if
+                  _BEHAVIOUR_FIELD_FOR_TYPE.get(h.get("type", ""))]
+        usable = [(sc, h) for sc, h in usable if sc >= 2]
+        if usable:
+            _, hit = max(usable, key=lambda sh: (sh[0], -len(sh[1].get("name", ""))))
+            return {"id": hit["id"], "name": hit["name"],
+                    "_field": _BEHAVIOUR_FIELD_FOR_TYPE[hit["type"]]}
+    return None
 
 
 async def _drop_invalid_interests(client: httpx.AsyncClient, graph_base: str,
@@ -251,7 +342,38 @@ async def resolve_audience_targeting(audience_text: str, access_token: str) -> d
             interests = await _drop_invalid_interests(client, graph_base, access_token, interests)
     except Exception as e:
         print(f"[AudienceTargeting] interest resolution skipped: {e}", flush=True)
+    # Behaviours/demographics are a SEPARATE axis from interests, and one the ad sets
+    # never used: a real hand-built ad set for the same audience carried the behaviour
+    # "Small business owners" alongside its interests, which no generated one ever had.
+    # An interest is what someone likes; a behaviour is something they actually do, so
+    # it reaches buyers no interest list finds.
+    behaviours: list[dict] = []
+    behaviour_words = [str(k).strip() for k in (hints.get("behaviour_keywords") or []) if str(k).strip()]
+    if behaviour_words:
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                for keyword in behaviour_words[:_MAX_BEHAVIOURS]:
+                    try:
+                        hit = await _resolve_behaviour(client, graph_base, access_token, keyword)
+                    except Exception as e:
+                        print(f"[AudienceTargeting] behaviour lookup skipped for {keyword!r}: {e}", flush=True)
+                        continue
+                    if hit:
+                        behaviours.append(hit)
+        except Exception as e:
+            print(f"[AudienceTargeting] behaviour resolution skipped: {e}", flush=True)
+
+    # One flexible_spec entry, so Meta ORs everything inside it — interests and
+    # behaviours WIDEN each other rather than intersecting. Two separate entries would
+    # AND them together ("likes small business AND is a small business owner"), which
+    # is a far smaller audience than intended and the opposite of what these add.
+    spec: dict = {}
     if interests:
-        targeting["flexible_spec"] = [{"interests": interests}]
+        spec["interests"] = interests
+    if behaviours:
+        for hit in behaviours:
+            spec.setdefault(hit["_field"], []).append({"id": hit["id"], "name": hit["name"]})
+    if spec:
+        targeting["flexible_spec"] = [spec]
 
     return targeting

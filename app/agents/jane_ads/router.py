@@ -1846,6 +1846,12 @@ class MetaLaunchFromMessageBody(BaseModel):
                                           # that specific audience rather than the one
                                           # Jane would've picked silently. None → present
                                           # the ranked options instead of proceeding.
+    # Why the client asked for another creative (§1.3 — too_busy | wrong_feel |
+    # product_wrong | wrong_words | wrong_person | other). The highest-value creative
+    # field in the spec and the cheapest to collect: it says which formats produce
+    # rejected output, on every creative, including ones that never run. Optional, so
+    # the backend captures it the moment the UI starts asking.
+    regeneration_reason: str = ""
     target_audience: str = ""             # the client's OWN audience, in their words
                                           # ("gym owners in Lekki aged 25-40") — the
                                           # "none of these" answer to the plan picker.
@@ -2319,11 +2325,26 @@ async def _build_campaign_plan(
             print(f"[oneshot] plan variants skipped: {e}", flush=True)
         if variant_set and len(variant_set.variants) > 1:
             import uuid as _uuid
+            group_id = body.variant_group_id or f"vgrp_{_uuid.uuid4().hex[:16]}"
+            # Persist EVERY variant now, while they all still exist. By launch only
+            # the chosen one is in hand, and the rejected ones are the comparison —
+            # a plan Jane ranks first that clients keep declining is only visible if
+            # the ones they declined were kept (CI-SPEC-01 §1.2).
+            from .campaign_record import save_generated_variants
+
+            dumped = [v.model_dump(mode="json") for v in variant_set.variants]
+            await save_generated_variants(
+                db, variant_group_id=group_id,
+                brand_id=brand_ctx.get("brand_id", ""),
+                business_id=business_id,
+                variants=dumped,
+                recommended_rank=next((v.get("rank") for v in dumped if v.get("recommended")), None),
+            )
             return {"early_return": {
                 "stage": "choose_plan_variant",
                 "understood": parsed.model_dump(),
                 "plan_variants": variant_set.model_dump(),
-                "variant_group_id": body.variant_group_id or f"vgrp_{_uuid.uuid4().hex[:16]}",
+                "variant_group_id": group_id,
             }}
         # Only ever 0 or 1 genuinely distinct audience exists — nothing to choose
         # between, so fall straight through with Jane's own single read (unchanged
@@ -3029,6 +3050,25 @@ async def meta_plan_from_message(
 
     plan_id = f"plan_{uuid.uuid4().hex[:16]}"
     now = datetime.now(timezone.utc)
+    # A rebuild in the same thread IS the client editing a plan-card line, so diff
+    # this build against the previous one and accumulate what changed (§1.5). Doing it
+    # here needs no UI change: whatever they edited, the next build carries it.
+    if built.thread_id:
+        from .campaign_record import record_plan_revision
+
+        previous = await db["jane_ads_pending_plans"].find_one(
+            {"thread_id": built.thread_id, "status": "pending"},
+            {"_id": 0, "plan": 1, "req": 1},
+            sort=[("created_at", -1)],
+        )
+        await record_plan_revision(
+            db, thread_id=built.thread_id, brand_id=brand_ctx.get("brand_id", ""),
+            previous=previous or {},
+            current={"plan": built.plan.model_dump(mode="json"),
+                     "req": built.req.model_dump(mode="json")},
+            regeneration_reason=(body.regeneration_reason or "").strip(),
+        )
+
     await db["jane_ads_pending_plans"].insert_one({
         "plan_id": plan_id,
         "business_id": built.business_id,
@@ -3104,6 +3144,7 @@ async def meta_plan_update_creative(
         raise HTTPException(status_code=400, detail="reference_image_url is required — upload the footage via /creative/upload first.")
 
     plan = CampaignPlan.model_validate(doc["plan"])
+    previous_image = plan.creative.image_url if plan.creative else ""
     plan.creative = AdCreative(
         image_url=body.reference_image_url,
         is_video=body.is_video,
@@ -3115,6 +3156,15 @@ async def meta_plan_update_creative(
     )
     await db["jane_ads_pending_plans"].update_one(
         {"plan_id": plan_id}, {"$set": {"plan": plan.model_dump(mode="json")}},
+    )
+    # This path swaps the creative WITHOUT rebuilding the plan, so the rebuild diff
+    # never sees it — and a client replacing Jane's image with their own footage is
+    # exactly the correction §1.5 exists to count.
+    from .campaign_record import record_direct_modification
+
+    await record_direct_modification(
+        db, thread_id=doc.get("thread_id", ""), brand_id=brand_ctx.get("brand_id", ""),
+        field="creative", before=previous_image, after=body.reference_image_url,
     )
     return {"plan_id": plan_id, "creative": plan.creative.model_dump(mode="json")}
 
@@ -3254,6 +3304,21 @@ async def meta_launch_plan(
                               else "jane_ads_meta_campaigns")
         await db[charged_collection].update_one(
             {"campaign_id": campaign_id}, {"$set": {"charged_upfront_ngn": due}},
+        )
+        # The decision record (CI-SPEC-01 Part 1). Written here because this is the
+        # moment every input still exists together — the understanding, the ranked
+        # plans, the corpus citations and what was actually charged. Best-effort: it
+        # never raises, so it cannot cost a launch the client has just paid for.
+        from .campaign_record import write_campaign_record
+
+        await write_campaign_record(
+            db, campaign_id=campaign_id,
+            brand_id=brand_ctx.get("brand_id", ""),
+            business_id=doc["business_id"],
+            plan_doc=doc,
+            stated_budget_ngn=due,
+            ad_spend_ngn=req.budget_ngn,
+            service_fee_ngn=round(due - req.budget_ngn, 2),
         )
         result["wallet"] = {
             "charged_ngn": due,
@@ -3577,6 +3642,239 @@ async def dashboard_home(
 
     await D.mark_seen(db, brand_id)
     return result
+
+
+@router.get("/admin/intelligence/campaign/{campaign_id}")
+async def intelligence_campaign_inspector(
+    campaign_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+) -> dict:
+    """Campaign Inspector (CI-SPEC-01 §4.1) — one campaign's full decision history.
+
+    Answers "why did this campaign do what it did?" without reading logs: what Jane
+    decided, every plan she generated including the ones the client rejected, which
+    corpus records shaped it at what version, what the client changed, and the results.
+
+    Admin-only and NOT client-facing (§4.5): it carries the reasoning behind a plan,
+    which is fine to explain to a client in words but is not a surface to hand them.
+    """
+    from .campaign_record import RECORDS
+
+    _require_ads_admin(token)
+    record = await db[RECORDS].find_one({"campaign_id": campaign_id}, {"_id": 0})
+    if not record:
+        raise HTTPException(
+            status_code=404,
+            detail="No decision record — this campaign ran before capture shipped, "
+                   "or its record was never written.",
+        )
+    return record
+
+
+@router.post("/admin/intelligence/backfill-results")
+async def intelligence_backfill_results(
+    limit: int = 200,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+) -> dict:
+    """Pull results from Meta for every record that has none (CI-SPEC-01 §1.6).
+
+    This is the retroactive half: campaigns that ran before capture shipped can still
+    be completed from the API, which is exactly why decisions were urgent and results
+    were not. Safe to re-run — it writes `results` and touches nothing else, so the
+    decisions stay immutable.
+    """
+    from app.core.config import settings
+
+    from .adapters.meta import MetaAdPlatformAdapter
+    from .campaign_record import backfill_all_missing
+
+    _require_ads_admin(token)
+    if not (settings.META_AD_ACCOUNT_ID and settings.META_ADS_ACCESS_TOKEN):
+        raise HTTPException(status_code=400, detail="Meta ads not configured")
+    adapter = MetaAdPlatformAdapter(db, access_token=settings.META_ADS_ACCESS_TOKEN)
+    return await backfill_all_missing(db, adapter, limit=limit)
+
+
+@router.get("/admin/intelligence/bucket")
+async def intelligence_bucket_explorer(
+    business_category: str = "",
+    city: str = "",
+    budget_tier: str = "",
+    platform: str = "meta",
+    dimension: str = "creative_format",
+    include_exploration: bool = True,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+) -> dict:
+    """Bucket Explorer (CI-SPEC-01 §4.2) — what the data says for one bucket.
+
+    The sample-size rules are enforced in buckets.compare(), not here and not in a
+    frontend: below ten campaigns it returns counts and NO ranking at all. §2.4 is
+    explicit that a claim below threshold must be impossible to surface rather than
+    discouraged, and a ranking shipped with a warning attached is still a ranking on
+    screen.
+
+    Admin-only, and deliberately unreachable from any client surface (§4.5) — it holds
+    other businesses' performance data.
+    """
+    from . import buckets as B
+
+    _require_ads_admin(token)
+    records = await B.load_bucket(
+        db, business_category=business_category, city=city,
+        budget_tier=budget_tier, platform=platform,
+        include_exploration=include_exploration,
+    )
+    return {
+        "bucket": {"business_category": business_category, "city": city,
+                   "budget_tier": budget_tier, "platform": platform},
+        "headline": B.headline_metrics(records),
+        "comparison": B.compare(records, dimension),
+    }
+
+
+class ConfirmDefaultBody(BaseModel):
+    business_category: str = ""
+    city: str = ""
+    budget_tier: str = ""
+    platform: str = "meta"
+    dimension: str = "creative_format"
+
+
+@router.get("/admin/intelligence/proposed-defaults")
+async def intelligence_proposed_defaults(
+    business_category: str = "",
+    city: str = "",
+    budget_tier: str = "",
+    platform: str = "meta",
+    dimension: str = "creative_format",
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+) -> dict:
+    """What a bucket suggests Jane's default should be (CI-SPEC-01 §4.4).
+
+    A PROPOSAL, never an applied change. The bar is 30 campaigns and a real margin —
+    biasing what every future client gets is heavier than putting a number on an
+    internal screen, and two options a few naira apart is a coin toss dressed as a
+    finding.
+    """
+    from . import buckets as B
+
+    _require_ads_admin(token)
+    records = await B.load_bucket(
+        db, business_category=business_category, city=city,
+        budget_tier=budget_tier, platform=platform,
+    )
+    return B.propose_defaults(records, dimension)
+
+
+@router.post("/admin/intelligence/confirm-default")
+async def intelligence_confirm_default(
+    body: ConfirmDefaultBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+) -> dict:
+    """Adopt a proposed default — the human confirmation §4.4 requires.
+
+    Re-derives the proposal server-side rather than trusting one posted in: a default
+    must be adopted on evidence that exists at the moment of confirmation, not on a
+    figure a caller supplies.
+    """
+    from . import buckets as B
+
+    _require_ads_admin(token)
+    bucket = {"business_category": body.business_category, "city": body.city,
+              "budget_tier": body.budget_tier, "platform": body.platform}
+    records = await B.load_bucket(db, **bucket)
+    proposed = B.propose_defaults(records, body.dimension)
+    if not proposed.get("proposal"):
+        raise HTTPException(
+            status_code=409,
+            detail=proposed.get("message") or "No proposal qualifies for this bucket yet.",
+        )
+    actor = ((token.get("claims", {}) or {}).get("email") or "unknown").lower()
+    stored = await B.confirm_default(db, bucket=bucket, proposal=proposed["proposal"],
+                                     confirmed_by=actor)
+    return {"confirmed": bool(stored), "default": stored.get("value"),
+            "evidence": proposed["proposal"]}
+
+
+@router.get("/admin/intelligence/digest")
+async def intelligence_weekly_digest(
+    days: int = 7,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+) -> dict:
+    """Weekly Intelligence Digest (CI-SPEC-01 §4.3) — only what actually changed.
+
+    Nobody opens the Bucket Explorer weekly, so this brings the few things that moved.
+    It reports ONLY items that crossed a threshold or diverged materially: §4.3 is
+    explicit that a digest firing every week regardless gets ignored within a month,
+    the same precision discipline as client-facing alerts. An empty digest is the
+    correct output for a quiet week.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from . import buckets as B
+    from .campaign_record import RECORDS
+
+    _require_ads_admin(token)
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    try:
+        recent = await db[RECORDS].find({"created_at": {"$gte": since}}, {"_id": 0}).to_list(length=2000)
+    except Exception as e:
+        print(f"[Digest] query failed: {e}", flush=True)
+        recent = []
+
+    items: list[dict] = []
+
+    # Defaults that look wrong — a field most clients in a category edit.
+    edits: dict[tuple, int] = {}
+    totals: dict[str, int] = {}
+    for r in recent:
+        category = (r.get("context") or {}).get("business_category") or "other"
+        totals[category] = totals.get(category, 0) + 1
+        for mod in (r.get("modifications") or []):
+            edits[(category, mod.get("field"))] = edits.get((category, mod.get("field")), 0) + 1
+    for (category, field), count in edits.items():
+        seen = totals.get(category, 0)
+        if seen >= 5 and count / seen >= 0.5:
+            items.append({
+                "kind": "default_looks_wrong",
+                "text": f"{round(100 * count / seen)}% of {category} clients changed the "
+                        f"{field} — the default is likely wrong for this category.",
+            })
+
+    # Buckets approaching a threshold, so a claim can be anticipated rather than
+    # discovered after the fact.
+    counts: dict[tuple, int] = {}
+    for r in recent:
+        ctx = r.get("context") or {}
+        counts[(ctx.get("business_category"), ctx.get("city"), ctx.get("budget_tier"))] = (
+            counts.get((ctx.get("business_category"), ctx.get("city"), ctx.get("budget_tier")), 0) + 1
+        )
+    for (category, city, tier), count in counts.items():
+        if B.OBSERVE_MIN <= count < B.BIAS_MIN:
+            items.append({
+                "kind": "approaching_threshold",
+                "text": f"{category} / {city} / {tier}: {count} campaigns. "
+                        f"{B.BIAS_MIN - count} more to bias defaults.",
+            })
+
+    # Exploration reserve (§2.5) — without it the system finds a local optimum in
+    # about three months and stays there.
+    if recent:
+        share = sum(1 for r in recent if r.get("exploration")) / len(recent)
+        if share < 0.10:
+            items.append({
+                "kind": "exploration_low",
+                "text": f"{round(100 * share)}% of campaigns were exploration — "
+                        f"below the 15% target, so the data is narrowing.",
+            })
+
+    return {"window_days": days, "campaigns": len(recent), "items": items}
 
 
 class CampaignStatusBody(BaseModel):

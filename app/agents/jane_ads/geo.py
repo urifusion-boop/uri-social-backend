@@ -41,6 +41,13 @@ _WATERING_HOLE_KEYWORDS = {
 }
 
 
+# How many pockets one campaign targets. A single pocket is too narrow for Meta to
+# deliver against (its own "your audience is very narrow" warning, live-reported on a
+# one-pocket ad set), and more than three splits a small Nigerian SME budget so finely
+# that no pocket gets enough to learn from. Two or three is the working range.
+_MAX_POCKETS = 3
+
+
 def decide_geo_mode(category: str, description: str = "") -> GeoMode:
     text = f"{category} {description}".lower()
     words = set(text.replace(",", " ").replace("/", " ").split())
@@ -137,7 +144,7 @@ class LLMPinProposer(PinProposer):
         prompt = (
             f"You are a Lagos media buyer choosing ad targeting for '{business_name}' "
             f"(a {category or 'local business'}) in {city}.\n{mode_hint}\n"
-            "Name 2–4 SPECIFIC, REAL, well-known micro-locations (named streets, estates, "
+            "Name 2–3 SPECIFIC, REAL, well-known micro-locations (named streets, estates, "
             "or pockets) inside the area — never invent a place; only name ones you are "
             "confident exist. For each give a short reason.\n"
             'Return JSON: {"pins":[{"name":"...","reason":"..."}]}'
@@ -269,7 +276,11 @@ async def geo_plan_from_named_areas(
         return None
     geocoder = geocoder or CompositeGeocoder()
     pins: list[GeoPin] = []
-    for a in areas[:4]:
+    # Three pockets, not four. Client feedback after the first live campaigns: one
+    # pocket leaves the audience too narrow for Meta to deliver ("your audience is
+    # very narrow"), while four spreads a small budget thin enough that none of them
+    # gets a real share. Two or three is the working range, so three is the ceiling.
+    for a in areas[:_MAX_POCKETS]:
         name = (a.get("name") or "").strip()
         if not name:
             continue
@@ -314,7 +325,7 @@ async def build_geo_plan(
     geocoder: Geocoder,
     goal: Goal = Goal.MESSAGES,
     description: str = "",
-    max_pins: int = 4,
+    max_pins: int = _MAX_POCKETS,
     fallback_proposer: Optional[PinProposer] = None,
 ) -> GeoPlan:
     """AI proposes named pockets → geocoder validates each → keep only validated pins.
