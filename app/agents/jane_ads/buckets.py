@@ -180,3 +180,118 @@ def headline_metrics(records: list[dict]) -> dict:
         "exploration_share": round(
             sum(1 for r in records if r.get("exploration")) / n, 3) if n else None,
     }
+
+
+# ── Feeding it back (§4.4) — proposals only, never automatic ─────────────────
+
+DEFAULTS = "jane_ads_learned_defaults"
+
+
+def propose_defaults(records: list[dict], dimension: str = "creative_format") -> dict:
+    """What this bucket suggests Jane's default should be — as a PROPOSAL.
+
+    §4.4 is explicit that nothing here changes a default automatically, and the
+    threshold is 30 campaigns, not 10: biasing what every future client gets is a
+    heavier act than showing a number on an internal screen. Below it this returns no
+    proposal at all rather than a weak one, for the same reason compare() returns no
+    ranking below ten.
+
+    Exploration campaigns are excluded from the evidence (§2.5). They exist precisely
+    because they are NOT what the bucket favours, so letting them set the default
+    would defeat the reserve.
+    """
+    measurable = [r for r in records if not r.get("exploration")]
+    n = len(measurable)
+    if n < BIAS_MIN:
+        return {
+            "proposal": None,
+            "campaigns": n,
+            "threshold_state": threshold_state(n),
+            "message": f"{n} campaigns after excluding exploration — "
+                       f"{BIAS_MIN} needed before a default may be biased.",
+        }
+
+    comparison = compare(measurable, dimension)
+    usable = [r for r in comparison["rows"]
+              if r["sufficient"] and r["median_cost_per_conversation_ngn"] is not None]
+    if len(usable) < 2:
+        return {
+            "proposal": None,
+            "campaigns": n,
+            "threshold_state": threshold_state(n),
+            "message": "Not enough distinct options with results to compare.",
+        }
+
+    best, runner_up = usable[0], usable[1]
+    # A proposal needs a MARGIN, not just an ordering. Two options a few naira apart
+    # is a coin toss dressed as a finding, and acting on it would churn the default.
+    margin = (runner_up["median_cost_per_conversation_ngn"]
+              - best["median_cost_per_conversation_ngn"])
+    relative = margin / runner_up["median_cost_per_conversation_ngn"]
+    if relative < 0.15:
+        return {
+            "proposal": None,
+            "campaigns": n,
+            "threshold_state": threshold_state(n),
+            "message": f"{best['value']} leads but only by {round(100 * relative)}% — "
+                       f"too close to call.",
+        }
+
+    return {
+        "proposal": {
+            "dimension": dimension,
+            "value": best["value"],
+            "median_cost_per_conversation_ngn": best["median_cost_per_conversation_ngn"],
+            "campaigns_behind_it": best["campaigns"],
+            "beats": runner_up["value"],
+            "by_percent": round(100 * relative),
+        },
+        "campaigns": n,
+        "threshold_state": threshold_state(n),
+        "requires_human_confirmation": True,
+    }
+
+
+async def confirm_default(db, *, bucket: dict, proposal: dict, confirmed_by: str) -> dict:
+    """Record a human's decision to adopt a proposed default.
+
+    Stored rather than applied silently: who confirmed it and on what evidence is the
+    part that makes a learned default auditable months later, when nobody remembers
+    why Jane started preferring a format.
+    """
+    from datetime import datetime, timezone
+
+    if db is None or not proposal or not confirmed_by:
+        return {}
+    doc = {
+        "bucket": bucket,
+        "dimension": proposal.get("dimension"),
+        "value": proposal.get("value"),
+        "evidence": proposal,
+        "confirmed_by": confirmed_by,
+        "confirmed_at": datetime.now(timezone.utc),
+        "active": True,
+    }
+    try:
+        await db[DEFAULTS].update_one(
+            {"bucket": bucket, "dimension": proposal.get("dimension")},
+            {"$set": doc}, upsert=True,
+        )
+    except Exception as e:
+        print(f"[Buckets] default not stored: {e}", flush=True)
+        return {}
+    return doc
+
+
+async def active_default(db, *, dimension: str, **bucket) -> Optional[str]:
+    """The confirmed default for a bucket, or None. Read by generation; never written
+    by it."""
+    if db is None:
+        return None
+    try:
+        doc = await db[DEFAULTS].find_one(
+            {"bucket": bucket, "dimension": dimension, "active": True}, {"_id": 0, "value": 1},
+        )
+    except Exception:
+        return None
+    return (doc or {}).get("value")

@@ -156,6 +156,30 @@ async def record_plan_revision(
         print(f"[CampaignRecord] revision not recorded for {thread_id}: {e}", flush=True)
 
 
+async def record_direct_modification(
+    db, *, thread_id: str, brand_id: str, field: str, before: Any, after: Any,
+) -> None:
+    """Record a change made WITHOUT rebuilding the plan.
+
+    diff_plans only sees edits that cause a rebuild, which is most of them. Swapping
+    the creative on a pending plan (POST /meta/plan/{id}/creative) does not rebuild,
+    so it would otherwise be invisible — and a client replacing Jane's image with
+    their own footage is exactly the kind of correction §1.5 exists to count.
+    """
+    if db is None or not thread_id or before == after:
+        return
+    try:
+        await db[REVISIONS].update_one(
+            {"thread_id": thread_id},
+            {"$setOnInsert": {"thread_id": thread_id, "brand_id": brand_id},
+             "$push": {"modifications": {
+                 "field": field, "from": before, "to": after, "changed_at": _now()}}},
+            upsert=True,
+        )
+    except Exception as e:
+        print(f"[CampaignRecord] direct modification not recorded: {e}", flush=True)
+
+
 async def _load_revisions(db, thread_id: str) -> dict:
     if db is None or not thread_id:
         return {}
@@ -369,7 +393,52 @@ async def backfill_results(db, adapter, campaign_id: str) -> dict:
     except Exception as e:
         print(f"[CampaignRecord] results not stored for {campaign_id}: {e}", flush=True)
         return {}
+
+    # Close the corpus loop (§4.4, ASC-SPEC-01 §15). learning.record_campaign_outcome
+    # has existed and been reachable by nothing — the records that shaped a campaign
+    # were never credited when it finished, so no record could ever accumulate the
+    # deployments a promotion needs. Crediting happens ONCE, on the completing pull.
+    #
+    # This only counts deployments and outcomes. It never promotes: confirmed_locally
+    # grants evidence grade A, and a record promoted automatically on a handful of
+    # campaigns is noise wearing the authority of local evidence.
+    if results["completed_normally"]:
+        await _credit_corpus_records(db, campaign_id)
     return results
+
+
+async def _credit_corpus_records(db, campaign_id: str) -> None:
+    """Credit the corpus records cited by this campaign, exactly once."""
+    try:
+        record = await db[RECORDS].find_one(
+            {"campaign_id": campaign_id},
+            {"_id": 0, "strategy.corpus_records_cited": 1, "results": 1, "corpus_credited": 1},
+        ) or {}
+        if record.get("corpus_credited"):
+            return
+        cited = ((record.get("strategy") or {}).get("corpus_records_cited")) or []
+        if not cited:
+            return
+
+        from .learning import record_campaign_outcome
+        from .store import MongoStrategyStore
+
+        # Self-reported outcomes are deliberately NOT passed: §3.3 keeps them out of
+        # anything that grades evidence. Deployments count; unverified wins do not.
+        touched = await record_campaign_outcome(
+            MongoStrategyStore(db), db,
+            {"strategy_record_ids": [
+                {"id": c.get("strategy_id") or c.get("id"), "version": c.get("version", 1)}
+                for c in cited
+            ], "outcomes": {}},
+        )
+        await db[RECORDS].update_one(
+            {"campaign_id": campaign_id}, {"$set": {"corpus_credited": True}},
+        )
+        if touched:
+            print(f"[CampaignRecord] credited corpus records for {campaign_id}: {touched}", flush=True)
+    except Exception as e:
+        print(f"[CampaignRecord] corpus credit skipped for {campaign_id}: {e}", flush=True)
 
 
 async def backfill_all_missing(db, adapter, limit: int = 200) -> dict:
