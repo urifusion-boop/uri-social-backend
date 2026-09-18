@@ -3242,7 +3242,17 @@ async def meta_launch_plan(
         await WalletService(MongoWalletStore(db)).charge_ad_spend(
             doc["business_id"], due, campaign_id=campaign_id,
         )
-        await db["jane_ads_meta_campaigns"].update_one(
+        # Bug (pre-existing, surfaced by TikTok campaigns first existing at all):
+        # this always wrote to jane_ads_meta_campaigns regardless of which collection
+        # the campaign actually lives in. Harmless while every launch was Meta, but
+        # for a TikTok campaign it silently stamped a DIFFERENT (non-matching) row,
+        # leaving the real jane_ads_tiktok_campaigns record without
+        # charged_upfront_ngn — so stated_budget_from_record() fell through to the
+        # ad_spend × LEGACY_AD_SPEND_MARKUP reconstruction and showed the wrong
+        # BUDGET on the campaign card (e.g. ₦35,000 charged displayed as ₦38,500).
+        charged_collection = ("jane_ads_tiktok_campaigns" if result["launch"].get("platform") == "tiktok"
+                              else "jane_ads_meta_campaigns")
+        await db[charged_collection].update_one(
             {"campaign_id": campaign_id}, {"$set": {"charged_upfront_ngn": due}},
         )
         result["wallet"] = {
