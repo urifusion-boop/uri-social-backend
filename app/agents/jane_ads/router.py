@@ -3557,6 +3557,28 @@ async def dashboard_home(
     return result
 
 
+@router.get("/admin/intelligence/records")
+async def intelligence_records(
+    limit: int = 50,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+) -> dict:
+    """Recent decision records, newest first — the list the Inspector opens from.
+
+    Admin-only and never client-facing (§4.5): these carry other businesses'
+    reasoning and performance.
+    """
+    from .campaign_record import RECORDS
+
+    _require_ads_admin(token)
+    try:
+        records = await db[RECORDS].find({}, {"_id": 0}).sort("created_at", -1).to_list(length=limit)
+    except Exception as e:
+        print(f"[Intelligence] record list failed: {e}", flush=True)
+        records = []
+    return {"records": records}
+
+
 @router.get("/admin/intelligence/campaign/{campaign_id}")
 async def intelligence_campaign_inspector(
     campaign_id: str,
