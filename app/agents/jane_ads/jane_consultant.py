@@ -238,7 +238,12 @@ def _output_instructions() -> str:
         f'  "stated_behaviour": one of {sorted(_BEHAVIOURS)} or null,\n'
         '  "is_new_thing": bool, "has_existing_demand": bool, "has_video": bool,\n'
         '  "geo_mode": "own_radius"|"watering_hole"|"mixed"|"non_local",\n'
-        '  "geo_areas": [{"name": "...", "reason": "..."}],\n'
+        '  "geo_areas": [{"name": "...", "reason": "..."}] — TWO or THREE areas, never\n'
+        "     one. A single area leaves the audience too narrow for Meta to deliver\n"
+        "     against (its own warning, live-reported on a one-area ad set), and more\n"
+        "     than three splits a small budget so finely that none of them gets enough\n"
+        "     to learn from. If the client names a whole city, pick the two or three\n"
+        "     pockets inside it where their buyers actually concentrate,\n"
         '  "geo_explanation": "one sentence — why these areas/this mode",\n'
         '  "intermediary_note": "one sentence if an intermediary beats the end-user target, else '
         'empty string",\n'
@@ -563,6 +568,20 @@ def _budget_grounded(amount: Optional[float], known_budget: Optional[float],
     return needle in last_assistant.replace(",", "") and _client_gave_affirmative(message)
 
 
+# How many times Jane may ask for the same thing before the repetition itself is the
+# bigger problem. Asking twice reads as careful; asking a third time reads as broken,
+# and a client who has answered and is asked again typically leaves.
+_MAX_REPEATED_ASKS = 2
+
+
+def _times_already_asked(history: list[dict], needle: str) -> int:
+    """How many of Jane's own past turns asked about `needle` (e.g. "budget")."""
+    return sum(
+        1 for turn in history
+        if turn.get("role") == "assistant" and needle in (turn.get("content") or "").lower()
+    )
+
+
 def _enforce_hard_requirements(brief: ConsultantBrief, message: str, history: list[dict],
                                known_budget: Optional[float]) -> ConsultantBrief:
     """A real media buyer never guesses or skips the budget and the area — enforced HERE,
@@ -570,8 +589,35 @@ def _enforce_hard_requirements(brief: ConsultantBrief, message: str, history: li
     once: treating a remembered past-campaign spend as this campaign's confirmed budget,
     and skipping geography/area entirely. If the model's "ready" claim doesn't actually
     satisfy both, downgrade it back to "ask" for exactly the missing one."""
+    # RECOVER A BUDGET THE CLIENT ACTUALLY TYPED. The model sometimes returns
+    # budget_ngn=null for a message that plainly names one ("my budget for this new
+    # campaign is 8000 naira"), and the guard below can then only ask for it again —
+    # live-reproduced three times in a row, each time re-asking for a figure that was
+    # in the very message being read. stated_budget_ngn() has existed for exactly this
+    # and was never called: the requirement was enforced by prompt wording alone, and
+    # prompt wording is not a guarantee.
+    #
+    # Only used when the model gave nothing. A figure it DID extract is left alone, so
+    # this can never overwrite a considered answer with a stray number.
+    if brief.budget_ngn is None:
+        typed = stated_budget_ngn(message)
+        if typed:
+            brief = brief.model_copy(update={"budget_ngn": typed})
+            print(f"[Consultant] recovered a stated budget of {typed} the model left null",
+                  flush=True)
+
     if brief.missing or brief.clarify:
         return brief   # already an "ask" — nothing to enforce
+
+    # A budget that is present but ungrounded, asked for repeatedly, is a loop. After
+    # two asks, take the figure at face value rather than asking a third time: a
+    # remembered-spend carry-over costs one wrong budget the client can correct, while
+    # a third identical question costs the client.
+    if (brief.budget_ngn and _times_already_asked(history, "budget") >= _MAX_REPEATED_ASKS
+            and not _budget_grounded(brief.budget_ngn, known_budget, message, history)):
+        print(f"[Consultant] accepting budget {brief.budget_ngn} after "
+              f"{_MAX_REPEATED_ASKS} asks rather than looping", flush=True)
+        return brief
 
     if not (brief.desired_conversions or _budget_grounded(brief.budget_ngn, known_budget, message, history)):
         return ConsultantBrief(

@@ -326,3 +326,60 @@ def test_no_stated_audience_leaves_the_prompt_untouched():
             consult("promote my gym kit", business_name="FitCo", category="fitness")
         )
     assert "SPECIFIED this campaign's target audience" not in create.call_args.kwargs["messages"][-1]["content"]
+
+
+# ── A stated budget must never be asked for again ────────────────────────────
+#
+# Live-reproduced three times in a row: the client typed "my budget for this new
+# campaign is 8000 naira" and Jane asked for the budget anyway, because the model
+# returned budget_ngn=null and the requirement was enforced by prompt wording alone.
+
+def test_a_budget_the_client_typed_is_recovered_when_the_model_misses_it():
+    from app.agents.jane_ads.jane_consultant import ConsultantBrief, _enforce_hard_requirements
+
+    brief = ConsultantBrief(business_name="X", category="Home goods", goal="sales",
+                            budget_ngn=None, geo_mode="own_radius", city="Lagos")
+    out = _enforce_hard_requirements(
+        brief, "My budget for this new campaign is 8000 naira. I sell furniture in Lagos.",
+        [], None,
+    )
+    assert out.budget_ngn == 8000.0
+    assert not out.clarify          # and so it does NOT ask again
+
+
+def test_an_ambiguous_message_still_asks_rather_than_guessing():
+    """Two figures in one reply is genuinely ambiguous — asking is correct there."""
+    from app.agents.jane_ads.jane_consultant import ConsultantBrief, _enforce_hard_requirements
+
+    brief = ConsultantBrief(business_name="X", category="Home goods", goal="sales",
+                            budget_ngn=None, geo_mode="own_radius", city="Lagos")
+    out = _enforce_hard_requirements(brief, "20k for ads, 5k for design", [], None)
+    assert out.budget_ngn is None
+    assert "budget" in (out.clarify or "").lower()
+
+
+def test_a_model_supplied_budget_is_never_overwritten_by_a_stray_number():
+    from app.agents.jane_ads.jane_consultant import ConsultantBrief, _enforce_hard_requirements
+
+    brief = ConsultantBrief(business_name="X", category="Home goods", goal="sales",
+                            budget_ngn=25_000.0, geo_mode="own_radius", city="Lagos")
+    out = _enforce_hard_requirements(brief, "I have 3000 followers on instagram", [], None)
+    assert out.budget_ngn == 25_000.0
+
+
+def test_jane_stops_asking_for_the_budget_after_two_attempts():
+    """A remembered-spend carry-over costs one budget the client can correct; a third
+    identical question costs the client."""
+    from app.agents.jane_ads.jane_consultant import ConsultantBrief, _enforce_hard_requirements
+
+    history = [
+        {"role": "assistant", "content": "What budget would you like for this campaign?"},
+        {"role": "user", "content": "same as before"},
+        {"role": "assistant", "content": "Just to confirm the budget — the same amount?"},
+        {"role": "user", "content": "yes"},
+    ]
+    brief = ConsultantBrief(business_name="X", category="Home goods", goal="sales",
+                            budget_ngn=6000.0, geo_mode="own_radius", city="Lagos")
+    out = _enforce_hard_requirements(brief, "ok", history, known_budget=6000.0)
+    assert out.budget_ngn == 6000.0
+    assert not out.clarify
