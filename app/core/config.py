@@ -64,8 +64,9 @@ class Settings(BaseSettings):
     # manual 60-day refresh the old user token needed no longer applies. Scopes:
     # ads_management, business_management, pages_show_list, pages_read_engagement,
     # pages_manage_ads. This is URI's OWN token, used to run every ad-account write
-    # for every brand. It has Page access but NOT Instagram: the IG account is not
-    # claimed by META_BUSINESS_MANAGER_ID, which is why IG placements get dropped.
+    # for every brand. It has no instagram_basic, so it cannot READ IG metadata via
+    # the Graph API — but that does not affect delivery: Meta resolves the IG
+    # identity from the Page, and IG placements do serve (confirmed in insights).
     META_ADS_ACCESS_TOKEN: str = ""
     # URI's own Facebook Page — every brand's ads run from this one Page (the
     # intended architecture: what distinguishes one brand's ads from another's is
