@@ -140,9 +140,15 @@ DESTINATION_OPTIONS: list[dict] = [
         # number needs whatsapp_business_management, which our token doesn't hold.
         "input_note": "Must match the number linked to your Facebook Page in Meta.",
         "placeholder": "0803 123 4567",
-        # Was False while WhatsApp used Meta's native WHATSAPP_MESSAGE button. It's a
-        # plain link ad now, so its button is chooseable like any other destination's.
-        "takes_cta": True,
+        # FALSE again, and it must stay false while native Click-to-WhatsApp is used.
+        # Meta rejects any CTA other than WHATSAPP_MESSAGE on a native CTWA ad set —
+        # "The ad's creative is incompatible with the objective of the campaign"
+        # (live-verified 2026-09-19) — so the adapter overrides whatever was picked.
+        #
+        # A live client picked "Shop Now" and got an ad reading "Send WhatsApp
+        # message". Offering a choice that cannot be honoured is worse than offering
+        # none: it tells the client they decided something they did not.
+        "takes_cta": False,
     },
     {
         "value": DestinationType.WEBSITE.value,

@@ -255,12 +255,29 @@ def test_picker_offers_exactly_the_destination_types_that_exist():
     assert {o["value"] for o in DESTINATION_OPTIONS} == {d.value for d in DestinationType}
 
 
-def test_every_destination_offers_the_button_picker():
-    # Was: WhatsApp hid the picker, because Meta rendered its own native button there.
-    # It ships a plain link ad now, so its button is as chooseable as any other's and
-    # hiding the picker would just make it unchangeable.
-    from app.agents.jane_ads.destination import DESTINATION_OPTIONS
-    assert all(o["takes_cta"] for o in DESTINATION_OPTIONS)
+def test_whatsapp_does_not_offer_a_button_picker():
+    """A live client picked "Shop Now" and got an ad reading "Send WhatsApp message".
+
+    Native Click-to-WhatsApp only accepts WHATSAPP_MESSAGE — Meta rejects anything
+    else on that ad set with "The ad's creative is incompatible with the objective of
+    the campaign" (live-verified 2026-09-19) — so the adapter overrides whatever was
+    chosen. Offering a choice that cannot be honoured is worse than offering none: it
+    tells the client they decided something they did not.
+    """
+    from app.agents.jane_ads.destination import DESTINATION_OPTIONS, DestinationType
+
+    by_value = {o["value"]: o for o in DESTINATION_OPTIONS}
+    assert by_value[DestinationType.WHATSAPP.value]["takes_cta"] is False
+
+
+def test_every_other_destination_still_offers_it():
+    """Only WhatsApp is constrained — a website or Instagram ad is a plain link ad
+    whose button genuinely is the client's to choose."""
+    from app.agents.jane_ads.destination import DESTINATION_OPTIONS, DestinationType
+
+    for opt in DESTINATION_OPTIONS:
+        if opt["value"] != DestinationType.WHATSAPP.value:
+            assert opt["takes_cta"], opt["value"]
 
 
 def test_options_carry_the_copy_a_picker_needs():
