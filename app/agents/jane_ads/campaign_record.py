@@ -473,19 +473,28 @@ async def backfill_all_missing(db, adapter, limit: int = 200) -> dict:
     try:
         cursor = db[RECORDS].find(
             {"$or": [{"results": None}, {"results": {"$exists": False}}]},
-            {"_id": 0, "campaign_id": 1},
+            {"_id": 0, "campaign_id": 1, "context.platform": 1},
         ).sort("created_at", -1).limit(limit)
         pending = await cursor.to_list(length=limit)
     except Exception as e:
         print(f"[CampaignRecord] backfill scan failed: {e}", flush=True)
         return {"filled": 0, "failed": 0}
 
-    filled = failed = 0
+    filled = failed = skipped = 0
     for row in pending:
+        # The Meta adapter cannot fetch a TikTok campaign — live-observed failing with
+        # "Object with ID '1876668166519953' does not exist" on a TikTok record, which
+        # reads like a deleted campaign and is really the wrong platform's API. Skip
+        # rather than fail: a TikTok record is not broken, it just needs its own
+        # adapter, and counting it as a failure hides real ones.
+        if (row.get("context") or {}).get("platform", "meta") != "meta":
+            skipped += 1
+            continue
         got = await backfill_results(db, adapter, row.get("campaign_id", ""))
         if got:
             filled += 1
         else:
             failed += 1
-    print(f"[CampaignRecord] backfill: {filled} filled, {failed} failed", flush=True)
-    return {"filled": filled, "failed": failed}
+    print(f"[CampaignRecord] backfill: {filled} filled, {failed} failed, "
+          f"{skipped} skipped (not Meta)", flush=True)
+    return {"filled": filled, "failed": failed, "skipped": skipped}
