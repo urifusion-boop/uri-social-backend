@@ -52,12 +52,13 @@ class Settings(BaseSettings):
     META_ADS_SYSTEM_USER_ID: str = ""
     # Numeric id only, no "act_" prefix (the Marketing API adds that itself).
     META_AD_ACCOUNT_ID: str = ""
-    # Working credential for real ad-account calls. A long-lived USER access token
-    # (~60 day expiry) obtained via /connect/facebook-ads OAuth consent — confirmed
-    # live to work where a system-user-generated token (META_SYSTEM_TOKEN) did not,
-    # for reasons not yet root-caused. Needs periodic manual refresh until that's
-    # sorted out. This is URI's OWN token, used to run every ad-account write for
-    # every brand.
+    # Working credential for real ad-account calls. Now a SYSTEM USER token for the
+    # "Jane" system user (META_ADS_SYSTEM_USER_ID) — it does not expire, so the
+    # manual 60-day refresh the old user token needed no longer applies. Scopes:
+    # ads_management, business_management, pages_show_list, pages_read_engagement,
+    # pages_manage_ads. This is URI's OWN token, used to run every ad-account write
+    # for every brand. It has Page access but NOT Instagram: the IG account is not
+    # claimed by META_BUSINESS_MANAGER_ID, which is why IG placements get dropped.
     META_ADS_ACCESS_TOKEN: str = ""
     # URI's own Facebook Page — every brand's ads run from this one Page (the
     # intended architecture: what distinguishes one brand's ads from another's is
