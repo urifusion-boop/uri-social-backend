@@ -212,15 +212,35 @@ async def _validated_locations(
     return pins, rejected
 
 
+def _resolved_interests(targeting: dict) -> dict[str, dict]:
+    """The interests already on the plan, keyed by the name the UI displays."""
+    found: dict[str, dict] = {}
+    for entry in targeting.get("flexible_spec") or []:
+        for value in entry.values():
+            for item in value or []:
+                name = (item or {}).get("name")
+                if name and item.get("id"):
+                    found[name.strip().lower()] = {"id": item["id"], "name": name}
+    return found
+
+
 async def _validated_interests(
-    names: list[str], access_token: str
+    names: list[str], access_token: str, already: Optional[dict[str, dict]] = None
 ) -> tuple[list[dict], list[str]]:
-    """Resolve each label to a real Meta interest id, dropping what does not exist."""
+    """Resolve each label to a real Meta interest id, dropping what does not exist.
+
+    Anything already on the plan is kept by its stored id WITHOUT re-searching. Meta
+    hands back display names carrying their category — "Marketing (business and
+    finance)" — and its own search cannot find that string again, so re-resolving an
+    untouched interest would delete it. Live-caught: a client edited one field and the
+    save reported five interests they had never touched as untargetable.
+    """
     import httpx
 
     from app.core.config import settings
     from .audience_targeting import _resolve_interest
 
+    already = already or {}
     kept: list[dict] = []
     rejected: list[str] = []
     graph_base = f"https://graph.facebook.com/{settings.FACEBOOK_API_VERSION}"
@@ -228,6 +248,10 @@ async def _validated_interests(
         for raw in names[:MAX_INTERESTS]:
             name = (raw or "").strip()
             if not name:
+                continue
+            existing = already.get(name.lower())
+            if existing:
+                kept.append(existing)
                 continue
             try:
                 hit = await _resolve_interest(client, graph_base, access_token, name)
@@ -300,7 +324,8 @@ async def apply_edits(
             targeting.pop("flexible_spec", None)
             applied.append("interests")
         else:
-            kept, bad = await _validated_interests(names, access_token)
+            kept, bad = await _validated_interests(
+                names, access_token, _resolved_interests(plan.audience_targeting or {}))
             rejections += bad
             if kept:
                 # ONE flexible_spec entry: Meta ORs within an entry and ANDs across

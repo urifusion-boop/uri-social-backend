@@ -370,3 +370,87 @@ def test_patch_refuses_a_plan_that_already_launched():
         _run(meta_plan_edit_fields("plan_x", PlanFieldsBody(edits={"caption": "x"}),
                                    db=db, brand_ctx={"brand_id": "brand_1"}))
     assert e.value.status_code == 409
+
+
+def test_saving_an_untouched_interest_does_not_destroy_it(monkeypatch):
+    """Live-caught: a client changed one field and the save reported five interests
+    they had never touched as untargetable, wiping them.
+
+    Meta's display names carry their category — "Marketing (business and finance)" —
+    and Meta's OWN search cannot find that string again. So anything already on the
+    plan must be kept by its stored id rather than re-resolved."""
+    async def _never_resolves(client, base, token, keyword):
+        return None  # exactly what Meta does with its own display names
+
+    monkeypatch.setattr("app.agents.jane_ads.audience_targeting._resolve_interest", _never_resolves)
+    plan = _plan(audience_targeting={"flexible_spec": [{"interests": [
+        {"id": "6003", "name": "Marketing (business and finance)"},
+        {"id": "6004", "name": "Retail (industry)"},
+    ]}]})
+    out, _, applied, rejected = _run(apply_edits(
+        plan, _req(),
+        {"interests": ["Marketing (business and finance)", "Retail (industry)"]}))
+    assert rejected == []
+    assert applied == ["interests"]
+    assert out.audience_targeting["flexible_spec"][0]["interests"] == [
+        {"id": "6003", "name": "Marketing (business and finance)"},
+        {"id": "6004", "name": "Retail (industry)"},
+    ]
+
+
+def test_a_genuinely_new_interest_is_still_checked_against_meta(monkeypatch):
+    """Keeping known ones must not turn into trusting anything the client types."""
+    async def _resolve(client, base, token, keyword):
+        return {"id": "77", "name": "Bread"} if keyword == "Bread" else None
+
+    monkeypatch.setattr("app.agents.jane_ads.audience_targeting._resolve_interest", _resolve)
+    plan = _plan(audience_targeting={"flexible_spec": [{"interests": [
+        {"id": "6003", "name": "Marketing (business and finance)"},
+    ]}]})
+    out, _, applied, rejected = _run(apply_edits(
+        plan, _req(),
+        {"interests": ["Marketing (business and finance)", "Bread", "Not A Real Thing"]}))
+    assert any("Not A Real Thing" in r for r in rejected)
+    names = [i["name"] for i in out.audience_targeting["flexible_spec"][0]["interests"]]
+    assert names == ["Marketing (business and finance)", "Bread"]
+
+
+def test_dropping_an_interest_from_the_list_removes_it(monkeypatch):
+    """Keeping known interests must not mean they can never be deleted."""
+    async def _never(client, base, token, keyword):
+        return None
+
+    monkeypatch.setattr("app.agents.jane_ads.audience_targeting._resolve_interest", _never)
+    plan = _plan(audience_targeting={"flexible_spec": [{"interests": [
+        {"id": "1", "name": "Keep me"}, {"id": "2", "name": "Drop me"},
+    ]}]})
+    out, _, applied, _ = _run(apply_edits(plan, _req(), {"interests": ["Keep me"]}))
+    assert applied == ["interests"]
+    assert [i["name"] for i in out.audience_targeting["flexible_spec"][0]["interests"]] == ["Keep me"]
+
+
+def test_the_save_returns_what_the_plan_card_above_needs_to_stop_lying():
+    """Jane's plan card renders from the planning payload. Without refreshed numbers
+    it keeps showing her original budget and duration after the client changed them —
+    two contradictory answers to 'what is about to launch'. Live-reported."""
+    from app.agents.jane_ads.router import PlanFieldsBody, meta_plan_edit_fields
+
+    db = _FakeDb(_pending_doc())
+    out = _run(meta_plan_edit_fields(
+        "plan_x", PlanFieldsBody(edits={"budget_ngn": 9000, "days": 3}),
+        db=db, brand_ctx={"brand_id": "brand_1"},
+    ))
+    assert out["plan_edited"] is True
+    assert out["plan"]["platforms"][0]["budget_ngn"] == 9000
+    assert out["plan"]["platforms"][0]["days"] == 3
+
+
+def test_a_save_that_changed_nothing_does_not_claim_the_plan_was_edited():
+    from app.agents.jane_ads.router import PlanFieldsBody, meta_plan_edit_fields
+
+    db = _FakeDb(_pending_doc())
+    out = _run(meta_plan_edit_fields(
+        "plan_x", PlanFieldsBody(edits={"age_min": 9}),
+        db=db, brand_ctx={"brand_id": "brand_1"},
+    ))
+    assert out["plan_edited"] is False
