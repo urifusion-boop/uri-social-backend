@@ -863,6 +863,27 @@ async def update_access_code(
     return updated
 
 
+@router.delete("/access-codes/{code}")
+async def delete_access_code(
+    code: str,
+    admin_user: dict = Depends(verify_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Permanently remove a code — for cleaning up a mistake or a test
+    code, not the everyday "stop this" action (that's revoke, which keeps
+    the code around for its audit trail). Claws back anyone currently
+    benefiting from it first, same as a revoke would, so deleting the code
+    can never leave a dangling active grant behind. Redemption records are
+    kept for audit even though the code itself is gone."""
+    code = code.strip().upper()
+    existing = await db["access_codes"].find_one({"code": code})
+    if not existing:
+        raise HTTPException(status_code=404, detail=f"Code '{code}' not found")
+    revoked_user_ids = await credit_service.revoke_comp_grants_for_code(code)
+    await db["access_codes"].delete_one({"code": code})
+    return {"deleted": True, "code": code, "revoked_active_users": len(revoked_user_ids)}
+
+
 @router.post("/access-codes/{code}/send-email")
 async def send_access_code_email(
     code: str,
