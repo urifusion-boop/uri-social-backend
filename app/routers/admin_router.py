@@ -7,6 +7,7 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 from pydantic import BaseModel, Field
 from typing import List, Optional
 from datetime import datetime
+import asyncio
 import secrets
 import string
 import secrets
@@ -16,6 +17,7 @@ from app.core.config import settings
 from app.database import get_db
 from app.services.CreditService import credit_service
 from app.services.TrialService import trial_service
+from app.services.EmailService import email_service
 from app.domain.models.billing_models import (
     AccessCode,
     CreateAccessCodeRequest,
@@ -698,6 +700,25 @@ def _generate_code(length: int = 8) -> str:
     return "".join(secrets.choice(alphabet) for _ in range(length))
 
 
+def _send_access_code_email(to_email: str, code: str, tier: dict, duration_days: int, label: str) -> None:
+    """Fire-and-forget — a mail failure must never block the admin's request
+    or a redemption flow. Only ever called for an ASSIGNED code, so the
+    email's "this code is reserved for you" framing is always accurate."""
+    app_url = (settings.WEB_APP_URL or "https://www.urisocial.com").strip("'\"")
+    asyncio.ensure_future(email_service.send_email(
+        to_email=to_email,
+        subject=f"Your free {tier.get('name', tier.get('tier_id', 'plan'))} access code — URI Social",
+        template_name="coupon_code",
+        template_vars={
+            "code": code,
+            "plan_name": tier.get("name", tier.get("tier_id", "")),
+            "duration_days": duration_days,
+            "label": label or None,
+            "app_url": app_url,
+        },
+    ))
+
+
 @router.post("/access-codes")
 async def create_access_code(
     body: CreateAccessCodeRequest,
@@ -737,6 +758,15 @@ async def create_access_code(
         assigned_user = await db["users"].find_one({"email": assigned_to_email}, {"first_name": 1, "last_name": 1})
         result["assigned_to_name"] = _display_name(assigned_user)
         result["status"] = "pending"
+        if body.send_email:
+            try:
+                _send_access_code_email(assigned_to_email, code, tier, body.duration_days, body.label)
+                result["email_sent"] = True
+            except Exception as e:
+                print(f"⚠️ Access code email failed to queue for {assigned_to_email}: {e}")
+                result["email_sent"] = False
+        else:
+            result["email_sent"] = False
     else:
         result["status"] = "unassigned"
     return result
@@ -822,3 +852,29 @@ async def update_access_code(
         updated["assigned_to_name"] = None
         updated["status"] = "unassigned"
     return updated
+
+
+@router.post("/access-codes/{code}/send-email")
+async def send_access_code_email(
+    code: str,
+    admin_user: dict = Depends(verify_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """(Re)send the code to whoever it's currently assigned to — for a code
+    created with the email skipped, or to nudge someone who hasn't redeemed
+    it yet. Only works on an assigned code; a shared code has no single
+    recipient to send it to."""
+    code = code.strip().upper()
+    access_code = await db["access_codes"].find_one({"code": code}, {"_id": 0})
+    if not access_code:
+        raise HTTPException(status_code=404, detail=f"Code '{code}' not found")
+    assigned_to_email = access_code.get("assigned_to_email")
+    if not assigned_to_email:
+        raise HTTPException(status_code=400, detail="This code isn't assigned to anyone — set an email first")
+    tier = await db["subscription_tiers"].find_one({"tier_id": access_code["plan_tier_id"]})
+    if not tier:
+        raise HTTPException(status_code=500, detail=f"Plan '{access_code['plan_tier_id']}' no longer exists")
+    _send_access_code_email(
+        assigned_to_email, code, tier, access_code["duration_days"], access_code.get("label", "")
+    )
+    return {"sent": True, "to": assigned_to_email}

@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>You've got free access to URI Social 🎁</h1>
+<p>{{ label | default("Someone", true) }} gave you a code for <strong>{{ duration_days }} days</strong> of free access to the <strong>{{ plan_name }}</strong> plan{% if label %} ({{ label }}){% endif %} — no card required.</p>
+<div style="margin:24px 0; padding:18px; background:rgba(205,27,120,.06); border:1.5px dashed rgba(205,27,120,.4); border-radius:10px;">
+  <div style="font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.06em; color:#AD1457; margin-bottom:6px;">Your code</div>
+  <div style="font-size:28px; font-weight:800; letter-spacing:.08em; color:#111827; font-family:'Courier New',monospace;">{{ code }}</div>
+</div>
+<p>Log in to your account (or create one with this email address), open <strong>Billing &amp; Credits</strong>, click <strong>"Have a code?"</strong>, and enter it. Your {{ duration_days }}-day access window starts the moment you redeem it — not before.</p>
+<a href="{{ app_url }}/login/" class="cta">Redeem Your Code →</a>
+<p style="font-size:13px; color:#9CA3AF; margin-top:12px;">This code is reserved for this email address only.</p>
+{% endblock %}

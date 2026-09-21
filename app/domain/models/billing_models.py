@@ -527,6 +527,9 @@ class CreateAccessCodeRequest(BaseModel):
     assigned_to_email: Optional[str] = Field(
         default=None, description="Reserve this code for one specific person — omit for a shared code anyone can redeem"
     )
+    send_email: bool = Field(
+        default=True, description="If assigned_to_email is set, email them the code immediately after creation"
+    )
 
 
 class UpdateAccessCodeRequest(BaseModel):
