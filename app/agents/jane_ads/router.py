@@ -3364,6 +3364,17 @@ async def meta_plan_edit_fields(
         "applied": applied,
         "rejected": rejections,
         "fields": describe(new_plan, new_req),
+        # Jane's own plan card sits ABOVE this panel and renders from the payload the
+        # planning call returned. Without these it keeps showing her original budget,
+        # duration and pockets after the client has changed them — two contradictory
+        # answers to "what is about to launch", which is exactly the confusion this
+        # whole step exists to remove. Live-reported.
+        "plan_edited": bool(applied),
+        "plan": {
+            "platforms": [pl.model_dump(mode="json") for pl in new_plan.platforms],
+            "geo": new_plan.geo.model_dump(mode="json") if new_plan.geo else None,
+        },
+        "creative": new_plan.creative.model_dump(mode="json") if new_plan.creative else None,
     }
 
 
