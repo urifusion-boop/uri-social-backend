@@ -3261,6 +3261,112 @@ async def meta_launch_plan(
     return result
 
 
+# ── Review step — the plan as fields the client can edit before it launches ───
+
+class PlanFieldsBody(BaseModel):
+    edits: dict = Field(default_factory=dict)   # {field_key: new value}
+
+
+async def _load_pending_plan(db, plan_id: str, brand_id: str) -> dict:
+    doc = await db["jane_ads_pending_plans"].find_one({"plan_id": plan_id})
+    if not doc or doc.get("brand_id") != brand_id:
+        raise HTTPException(status_code=404, detail="Plan not found")
+    if doc.get("status") != "pending":
+        raise HTTPException(
+            status_code=409,
+            detail=f"This plan is already {doc['status']} — describe a new campaign to Jane to plan another.",
+        )
+    return doc
+
+
+@router.get("/meta/plan/{plan_id}/fields")
+async def meta_plan_fields(
+    plan_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """The plan as editable lines — what the review step renders.
+
+    Sits between "here is the plan" and "launch it", so the client changes the ad
+    before their money moves rather than discovering it afterwards in Ads Manager.
+    """
+    from .plan_fields import describe
+
+    doc = await _load_pending_plan(db, plan_id, brand_ctx.get("brand_id"))
+    plan = CampaignPlan.model_validate(doc["plan"])
+    req = CampaignRequest.model_validate(doc["req"])
+    return {"plan_id": plan_id, "fields": describe(plan, req)}
+
+
+@router.patch("/meta/plan/{plan_id}/fields")
+async def meta_plan_edit_fields(
+    plan_id: str,
+    body: PlanFieldsBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Save the client's edits onto the pending plan.
+
+    Every edit is validated against the same machinery the launch uses — Meta's own
+    location and interest catalogues, the policy scan, the brand's spend cap — so an
+    edit accepted here cannot fail at launch. Rejections come back per field and do
+    not discard the edits that were fine.
+
+    The launch endpoint reloads this document, so what is saved here is exactly what
+    becomes the ad.
+    """
+    from datetime import datetime, timezone
+
+    from app.core.config import settings
+
+    from .plan_fields import apply_edits, describe
+
+    brand_id = brand_ctx.get("brand_id")
+    doc = await _load_pending_plan(db, plan_id, brand_id)
+    if not body.edits:
+        raise HTTPException(status_code=400, detail="No edits supplied.")
+
+    plan = CampaignPlan.model_validate(doc["plan"])
+    req = CampaignRequest.model_validate(doc["req"])
+    new_plan, new_req, applied, rejections = await apply_edits(
+        plan, req, body.edits, settings.META_ADS_ACCESS_TOKEN,
+    )
+
+    if applied:
+        await db["jane_ads_pending_plans"].update_one(
+            {"plan_id": plan_id},
+            {"$set": {
+                "plan": new_plan.model_dump(mode="json"),
+                "req": new_req.model_dump(mode="json"),
+                "edited_by_client": True,
+                "client_edits": [*(doc.get("client_edits") or []), {
+                    "fields": applied,
+                    "at": datetime.now(timezone.utc),
+                }],
+            }},
+        )
+        # The record of what Jane decided must also carry what the CLIENT decided —
+        # otherwise the intelligence layer learns from a plan nobody actually ran.
+        try:
+            from .campaign_record import record_plan_revision
+            await record_plan_revision(
+                db, thread_id=doc.get("thread_id", ""), brand_id=brand_id,
+                previous={"plan": doc["plan"], "req": doc["req"]},
+                current={"plan": new_plan.model_dump(mode="json"),
+                         "req": new_req.model_dump(mode="json")},
+                regeneration_reason=f"client edited: {', '.join(applied)}",
+            )
+        except Exception as e:
+            print(f"[PlanFields] revision not recorded: {e}", flush=True)
+
+    return {
+        "plan_id": plan_id,
+        "applied": applied,
+        "rejected": rejections,
+        "fields": describe(new_plan, new_req),
+    }
+
+
 # ── Plan Defence — Jane can explain/defend a plan she already built ───────────
 
 class PlanAskBody(BaseModel):
