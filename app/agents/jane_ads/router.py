@@ -1924,6 +1924,10 @@ class _PlanBuildResult(BaseModel):
     variant_group_id: str = ""                # Multi-Plan Audience Variants — ties this
                                               # build to sibling builds from the same
                                               # variant-choice session, if any (spec §7)
+    audience_text: str = ""                   # the words the audience targeting was
+                                              # resolved FROM — replayed when a client
+                                              # edits the plan, so the rebuilt summary
+                                              # describes the same audience Jane did
     selected_plan_variant: Optional[dict] = None  # the PlanVariant this build actually
                                               # used, if any — surfaced back to the
                                               # client so the plan card can show which
@@ -2837,7 +2841,7 @@ async def _build_campaign_plan(
         business_id=business_id, req=req, plan=plan, jane_platforms=jane_platforms,
         forced_to_meta=forced_to_meta, geo_dump=geo_dump, understood=parsed.model_dump(),
         budget_estimate=budget_estimate, summary=summary_dump, thread_id=body.thread_id,
-        variant_group_id=body.variant_group_id,
+        audience_text=audience_text, variant_group_id=body.variant_group_id,
         selected_plan_variant=selected_variant.model_dump() if selected_variant else None,
         fee_bypassed=fee_bypassed,
     )
@@ -2920,6 +2924,7 @@ def _plan_response_dict(built: _PlanBuildResult) -> dict:
         # the group tag linking it to any sibling builds from the same variant choice
         # (spec §7 — one creative per selected plan, shown/launched as a set).
         "variant_group_id": built.variant_group_id,
+        "audience_text": built.audience_text,
         "selected_plan_variant": built.selected_plan_variant,
     }
 
@@ -3411,7 +3416,7 @@ async def meta_plan_edit_fields(
 
     from app.core.config import settings
 
-    from .plan_fields import apply_edits, describe
+    from .plan_fields import apply_edits, describe, rebuild_summary
 
     brand_id = brand_ctx.get("brand_id")
     doc = await _load_pending_plan(db, plan_id, brand_id)
@@ -3424,12 +3429,20 @@ async def meta_plan_edit_fields(
         plan, req, body.edits, settings.META_ADS_ACCESS_TOKEN,
     )
 
+    rebuilt_summary = None
     if applied:
+        # Rebuild Jane's reasoning from the edited plan before persisting, so what is
+        # stored and what is shown describe the same campaign. Her prose names the
+        # budget, duration, pockets and interests, so patching the numbers alone left
+        # the card arguing for choices the client had already overruled.
+        rebuilt_summary = await rebuild_summary(
+            db, new_plan, new_req, doc.get("audience_text", ""))
         await db["jane_ads_pending_plans"].update_one(
             {"plan_id": plan_id},
             {"$set": {
                 "plan": new_plan.model_dump(mode="json"),
                 "req": new_req.model_dump(mode="json"),
+                **({"summary": rebuilt_summary} if rebuilt_summary else {}),
                 "edited_by_client": True,
                 "client_edits": [*(doc.get("client_edits") or []), {
                     "fields": applied,
@@ -3462,6 +3475,10 @@ async def meta_plan_edit_fields(
         # answers to "what is about to launch", which is exactly the confusion this
         # whole step exists to remove. Live-reported.
         "plan_edited": bool(applied),
+        # Rebuilt from the edited plan — reach, cost per result and every sentence of
+        # Jane's reasoning re-derived, not patched. None when it could not be rebuilt,
+        # and the caller keeps the one it had.
+        "summary": rebuilt_summary,
         "plan": {
             "platforms": [pl.model_dump(mode="json") for pl in new_plan.platforms],
             "geo": new_plan.geo.model_dump(mode="json") if new_plan.geo else None,

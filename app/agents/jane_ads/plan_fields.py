@@ -435,3 +435,52 @@ def _as_float(value: Any) -> Optional[float]:
         return float(str(value).strip().replace(",", ""))
     except (TypeError, ValueError):
         return None
+
+
+async def rebuild_summary(db, plan: CampaignPlan, req: CampaignRequest,
+                          audience_text: str = "") -> Optional[dict]:
+    """Re-derive Jane's reasoning block from the EDITED plan.
+
+    Without this a save left the client with two descriptions of one campaign: the
+    panel showing what they chose, and Jane's prose above still arguing for the budget,
+    duration, pockets and interests she originally picked. Patching the numbers alone
+    was not enough — the sentences name them too.
+
+    The reach estimate is re-fetched rather than carried over, because changing the
+    locations, interests, age, gender or placement is exactly what moves it. Reusing
+    the old figure would quietly attach Jane's original audience size to the client's
+    narrower one.
+
+    Returns None if it cannot be rebuilt, and the caller keeps what it had — a stale
+    summary is worse than a fresh one but far better than none.
+    """
+    from app.core.config import settings
+
+    from .adapters.meta import MetaAdPlatformAdapter
+    from .geo import meta_targeting_from_geo_named
+    from .models import Platform
+    from .summary import build_campaign_summary
+
+    estimate = None
+    if plan.platforms and plan.platforms[0].platform == Platform.META:
+        try:
+            adapter = MetaAdPlatformAdapter(db, access_token=settings.META_ADS_ACCESS_TOKEN)
+            # The SAME conversion + merge the real launch uses, so the estimate can
+            # never promise a different audience from the one that actually ships.
+            targeting = {
+                **(await meta_targeting_from_geo_named(
+                    plan.geo, region=(plan.geo.city if plan.geo else ""),
+                    access_token=settings.META_ADS_ACCESS_TOKEN)),
+                **plan.audience_targeting,
+            }
+            estimate = await adapter.get_delivery_estimate(targeting)
+        except Exception as e:
+            print(f"[PlanFields] reach estimate skipped on rebuild: {e}", flush=True)
+
+    try:
+        summary = build_campaign_summary(
+            plan, req, delivery_estimate=estimate, audience_text=audience_text)
+        return summary.model_dump(mode="json")
+    except Exception as e:
+        print(f"[PlanFields] summary rebuild failed: {e}", flush=True)
+        return None
