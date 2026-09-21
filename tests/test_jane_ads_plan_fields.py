@@ -194,3 +194,179 @@ def test_clearing_every_interest_goes_broad_rather_than_erroring():
     assert applied == ["interests"]
     assert rejected == []
     assert "flexible_spec" not in plan.audience_targeting
+
+
+# ── Placement and the daily floor ─────────────────────────────────────────────
+
+def test_placement_defaults_to_automatic_when_meta_was_left_to_choose():
+    fields = {f["key"]: f for f in describe(_plan(), _req())}
+    assert fields["placement"]["value"] == "automatic"
+    assert "instagram_only" in fields["placement"]["options"]
+
+
+def test_instagram_only_pins_the_ad_to_instagram():
+    """Automatic delivery also spends on Audience Network. A client who wants only
+    Instagram must be able to say so and have it actually hold."""
+    plan, _, applied, rejected = _run(apply_edits(_plan(), _req(), {"placement": "instagram_only"}))
+    assert applied == ["placement"]
+    assert rejected == []
+    assert plan.audience_targeting["publisher_platforms"] == ["instagram"]
+
+
+def test_going_back_to_automatic_clears_the_restriction():
+    """Unset, not an empty list — Meta reads an empty publisher_platforms as invalid
+    rather than as 'anywhere'."""
+    plan = _plan(audience_targeting={"publisher_platforms": ["instagram"]})
+    plan, _, applied, _ = _run(apply_edits(plan, _req(), {"placement": "automatic"}))
+    assert applied == ["placement"]
+    assert "publisher_platforms" not in plan.audience_targeting
+
+
+def test_facebook_and_instagram_keeps_both_and_drops_audience_network():
+    plan, _, _, _ = _run(apply_edits(_plan(), _req(), {"placement": "facebook_and_instagram"}))
+    assert sorted(plan.audience_targeting["publisher_platforms"]) == ["facebook", "instagram"]
+
+
+def test_an_unknown_placement_is_refused():
+    _, _, applied, rejected = _run(apply_edits(_plan(), _req(), {"placement": "tiktok"}))
+    assert applied == []
+    assert rejected
+
+
+def test_a_duration_that_drops_daily_spend_under_metas_floor_is_refused():
+    """₦20,000 over 40 days is ₦500/day. Meta refuses the ad set outright (subcode
+    1885272), so this has to be caught while the client can still change it."""
+    _, _, applied, rejected = _run(apply_edits(_plan(), _req(), {"days": 40}))
+    assert applied == []
+    assert "minimum" in rejected[0]
+    assert "12 days or fewer" in rejected[0]
+
+
+def test_lowering_the_budget_alone_can_break_the_floor_too():
+    """The floor is about the pair, not either number — a budget that is fine over
+    2 days is not fine over the 5 already stored."""
+    _, _, applied, rejected = _run(apply_edits(_plan(), _req(), {"budget_ngn": 3000}))
+    assert applied == []
+    assert "a day" in rejected[0]
+
+
+def test_shortening_the_run_is_a_valid_way_to_clear_the_floor():
+    """Validating budget and duration separately would refuse this, even though the
+    pair is exactly what Meta wants."""
+    plan, req, applied, rejected = _run(apply_edits(
+        _plan(), _req(), {"budget_ngn": 4000, "days": 2}))
+    assert rejected == []
+    assert sorted(applied) == ["budget_ngn", "days"]
+    assert req.budget_ngn == 4000
+    assert plan.platforms[0].days == 2
+
+
+def test_duration_is_not_pinned_to_the_default():
+    """'It mustn't always be 7 days' — any duration that clears the daily floor and
+    the 1-90 bound is accepted, not just Jane's default."""
+    for days in (2, 3, 9, 12):
+        plan, _, applied, rejected = _run(apply_edits(_plan(), _req(), {"days": days}))
+        assert rejected == [], f"{days} days rejected: {rejected}"
+        assert plan.platforms[0].days == days
+
+
+# ── The endpoints themselves ──────────────────────────────────────────────────
+
+class _FakeCollection:
+    def __init__(self, doc):
+        self.doc = doc
+        self.updates = []
+
+    async def find_one(self, *a, **k):
+        return self.doc
+
+    async def update_one(self, query, update, **k):
+        self.updates.append(update)
+        self.doc.update(update.get("$set", {}))
+        return None
+
+
+class _FakeDb:
+    def __init__(self, doc):
+        self.plans = _FakeCollection(doc)
+
+    def __getitem__(self, name):
+        return self.plans
+
+
+def _pending_doc():
+    return {
+        "plan_id": "plan_x", "brand_id": "brand_1", "status": "pending",
+        "thread_id": "t1",
+        "plan": _plan().model_dump(mode="json"),
+        "req": _req().model_dump(mode="json"),
+    }
+
+
+def test_get_fields_endpoint_returns_the_editable_lines():
+    from app.agents.jane_ads.router import meta_plan_fields
+
+    db = _FakeDb(_pending_doc())
+    out = _run(meta_plan_fields("plan_x", db=db, brand_ctx={"brand_id": "brand_1"}))
+    keys = [f["key"] for f in out["fields"]]
+    assert out["plan_id"] == "plan_x"
+    assert {"caption", "locations", "interests", "gender", "placement", "budget_ngn"} <= set(keys)
+
+
+def test_get_fields_refuses_another_brands_plan():
+    """These carry a business's targeting and copy — a wrong brand_id must 404, not
+    leak someone else's campaign."""
+    from fastapi import HTTPException
+
+    from app.agents.jane_ads.router import meta_plan_fields
+
+    db = _FakeDb(_pending_doc())
+    with pytest.raises(HTTPException) as e:
+        _run(meta_plan_fields("plan_x", db=db, brand_ctx={"brand_id": "someone_else"}))
+    assert e.value.status_code == 404
+
+
+def test_patch_endpoint_persists_the_edit_onto_the_plan_the_launch_reloads(monkeypatch):
+    """The launch endpoint re-reads this document. If the edit does not land in
+    doc['plan'], the client's change is cosmetic and the old ad launches."""
+    from app.agents.jane_ads.router import PlanFieldsBody, meta_plan_edit_fields
+
+    db = _FakeDb(_pending_doc())
+    out = _run(meta_plan_edit_fields(
+        "plan_x", PlanFieldsBody(edits={"caption": "Edited by the client."}),
+        db=db, brand_ctx={"brand_id": "brand_1"},
+    ))
+    assert out["applied"] == ["caption"]
+    assert db.plans.doc["plan"]["creative"]["primary_text"] == "Edited by the client."
+    assert db.plans.doc["edited_by_client"] is True
+
+
+def test_patch_endpoint_does_not_persist_when_everything_was_rejected(monkeypatch):
+    """A save that changed nothing must leave the stored plan untouched, rather than
+    rewriting it with the same values and claiming an edit happened."""
+    from app.agents.jane_ads.router import PlanFieldsBody, meta_plan_edit_fields
+
+    db = _FakeDb(_pending_doc())
+    out = _run(meta_plan_edit_fields(
+        "plan_x", PlanFieldsBody(edits={"age_min": 9}),
+        db=db, brand_ctx={"brand_id": "brand_1"},
+    ))
+    assert out["applied"] == []
+    assert out["rejected"]
+    assert db.plans.updates == []
+
+
+def test_patch_refuses_a_plan_that_already_launched():
+    """Editing a launched plan would silently do nothing — the campaign is already on
+    Meta. Say so instead."""
+    from fastapi import HTTPException
+
+    from app.agents.jane_ads.router import PlanFieldsBody, meta_plan_edit_fields
+
+    doc = _pending_doc()
+    doc["status"] = "launched"
+    db = _FakeDb(doc)
+    with pytest.raises(HTTPException) as e:
+        _run(meta_plan_edit_fields("plan_x", PlanFieldsBody(edits={"caption": "x"}),
+                                   db=db, brand_ctx={"brand_id": "brand_1"}))
+    assert e.value.status_code == 409
