@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-FRAMEWORK_VERSION = "2026-09-v1"
+FRAMEWORK_VERSION = "2026-09-v2"  # v2: added SERIES_TEMPLATES (PRD §21)
 
 
 # ── Layer 1 — Content Territories (PRD §5, Territories A-L) ────────────────
@@ -348,6 +348,23 @@ STRUCTURAL_DEVICE_SLIDE_HINT: Dict[str, int] = {
 }
 
 
+# ── Content Series Library (PRD §21) — recurring branded formats. Not
+# built at all before this pass (the item schema had series_id/series_name
+# fields that were always hardcoded null). Kept as plain labeled templates,
+# same versioned-config pattern as everything else here — the engine picks
+# which ones (if any) fit a business, it doesn't need to use every one. ────
+SERIES_TEMPLATES: List[Dict[str, str]] = [
+    {"key": "nobody_tells_you", "name": "What Nobody Tells You", "fits_angle": "nobody_tells_you"},
+    {"key": "founder_truths", "name": "Founder Truths", "fits_angle": "the_founder_perspective"},
+    {"key": "inside_the_process", "name": "Inside the Process", "fits_territory": "G_PROCESS"},
+    {"key": "before_you_buy", "name": "Before You Buy", "fits_angle": "before_you_buy"},
+    {"key": "ask_the_brand", "name": "Ask [Brand]", "fits_device": "customer_question"},
+    {"key": "would_you_choose", "name": "Would You Choose This?", "fits_angle": "what_would_you_choose"},
+    {"key": "customer_question_of_the_week", "name": "Customer Question of the Week", "fits_angle": "the_customers_question"},
+    {"key": "industry_myth", "name": "The [Industry] Myth", "fits_angle": "the_myth"},
+]
+
+
 # ── Validation rules (PRD §14-15, §28) — deterministic, code-enforced ──────
 VALIDATION_RULES: Dict[str, Any] = {
     "item_count": 30,
@@ -436,4 +453,5 @@ def get_creative_framework(industry: str) -> Dict[str, Any]:
         "angles": ANGLES,
         "creative_devices": CREATIVE_DEVICES,
         "validation_rules": VALIDATION_RULES,
+        "series_templates": SERIES_TEMPLATES,
     }
