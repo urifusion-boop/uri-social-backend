@@ -636,6 +636,27 @@ async def redeem_access_code(
     existing_wallet = await credit_service.get_user_wallet(user_id)
     previous_tier = existing_wallet.subscription_tier if existing_wallet else None
 
+    # No stacking: a comp grant is a one-time allocation, not a top-up, so
+    # redeeming a second code while the first is still in effect would
+    # silently overwrite (not add to) subscription_credits — discarding
+    # whatever was left unused. A real PAID subscription is deliberately
+    # NOT blocked here — a comp code overriding it is intended behavior.
+    if (
+        existing_wallet
+        and existing_wallet.subscription_source == "access_code"
+        and existing_wallet.subscription_tier
+        and (existing_wallet.end_date is None or existing_wallet.end_date > datetime.utcnow())
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"You already have an active comp {existing_wallet.subscription_tier} plan with "
+                f"{existing_wallet.credits_remaining} credit(s) remaining"
+                + (f", valid until {existing_wallet.end_date.date()}" if existing_wallet.end_date else "")
+                + ". It has to end or run out before you can redeem another code."
+            ),
+        )
+
     await credit_service.user_credits_collection.update_one(
         {"user_id": user_id},
         {
