@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from . import constants as C
 from .models import CampaignPlan, CampaignRequest, GeoMode, GeoPin, GeoPlan, PinSource
 
 # Meta's own bounds. Sending outside these fails the ad set create outright.
@@ -37,9 +38,37 @@ _CODES_TO_GENDER = {(): "all", (1,): "men", (2,): "women"}
 MAX_LOCATIONS = 3
 MAX_INTERESTS = 6
 
+# Where the ad is allowed to show. Leaving publisher_platforms unset is Meta's
+# "automatic" — Facebook, Instagram, Audience Network and Messenger — which is the
+# best-delivering default but also the one that spends on Audience Network, where
+# lifetime numbers put the cost per impression far above Facebook's. A client who
+# only wants Instagram must be able to say so.
+_PLACEMENTS = {
+    "automatic": None,
+    "facebook_and_instagram": ["facebook", "instagram"],
+    "instagram_only": ["instagram"],
+    "facebook_only": ["facebook"],
+}
+_PLACEMENT_LABELS = {
+    "automatic": "Let Meta choose (includes Audience Network)",
+    "facebook_and_instagram": "Facebook and Instagram",
+    "instagram_only": "Instagram only",
+    "facebook_only": "Facebook only",
+}
+
 
 def _gender_of(targeting: dict) -> str:
     return _CODES_TO_GENDER.get(tuple(targeting.get("genders") or []), "all")
+
+
+def _placement_of(targeting: dict) -> str:
+    current = targeting.get("publisher_platforms")
+    if not current:
+        return "automatic"
+    for key, value in _PLACEMENTS.items():
+        if value and sorted(value) == sorted(current):
+            return key
+    return "automatic"
 
 
 def _interest_names(targeting: dict) -> list[str]:
@@ -104,6 +133,15 @@ def describe(plan: CampaignPlan, req: CampaignRequest) -> list[dict[str, Any]]:
             "help": "Who sees it. 'All' is usually right unless the product is gendered.",
         },
         {
+            "key": "placement", "label": "Where it shows", "type": "select",
+            "value": _placement_of(targeting),
+            "options": list(_PLACEMENTS.keys()),
+            "option_labels": _PLACEMENT_LABELS,
+            "editable": True,
+            "help": "Automatic delivers best but also spends on Audience Network. "
+                    "Pick a platform to keep it off everything else.",
+        },
+        {
             "key": "age_min", "label": "Minimum age", "type": "number",
             "value": targeting.get("age_min", MIN_AGE),
             "min": MIN_AGE, "max": MAX_AGE, "editable": True,
@@ -122,12 +160,16 @@ def describe(plan: CampaignPlan, req: CampaignRequest) -> list[dict[str, Any]]:
             "key": "days", "label": "Duration (days)", "type": "number",
             "value": (platform.days if platform else 0),
             "min": 1, "max": 90, "editable": True,
+            "help": "However long you want — Jane's default is only a starting point. "
+                    "Shorter means more spend per day, which is how a small budget "
+                    "clears Meta's daily minimum.",
         },
         {
             "key": "daily_spend", "label": "Daily spend", "type": "derived",
             "value": round(req.budget_ngn / platform.days, 2) if platform and platform.days else None,
             "editable": False, "prefix": "₦",
-            "help": "Budget divided by duration — change either of those to move it.",
+            "help": f"Budget divided by duration. Meta refuses anything under "
+                    f"₦{C.META_MIN_DAILY_NGN:,.0f} a day — change either of those to move it.",
         },
         {
             "key": "destination", "label": "Where taps go", "type": "derived",
@@ -279,6 +321,19 @@ async def apply_edits(
                 targeting.pop("genders", None)
             applied.append("gender")
 
+    # ── placement ─────────────────────────────────────────────────────────────
+    if "placement" in edits:
+        choice = str(edits.get("placement") or "").strip().lower()
+        if choice not in _PLACEMENTS:
+            rejections.append(f"Placement must be one of: {', '.join(_PLACEMENTS)}.")
+        else:
+            platforms = _PLACEMENTS[choice]
+            if platforms:
+                targeting["publisher_platforms"] = platforms
+            else:
+                targeting.pop("publisher_platforms", None)
+            applied.append("placement")
+
     # ── age ───────────────────────────────────────────────────────────────────
     if {"age_min", "age_max"} & edits.keys():
         lo = _as_int(edits.get("age_min", targeting.get("age_min", MIN_AGE)))
@@ -294,32 +349,46 @@ async def apply_edits(
             applied += [k for k in ("age_min", "age_max") if k in edits]
 
     # ── budget and duration ───────────────────────────────────────────────────
-    if "budget_ngn" in edits:
-        budget = _as_float(edits.get("budget_ngn"))
-        if budget is None or budget <= 0:
+    # Judged TOGETHER, because what Meta actually rejects is the daily figure they
+    # produce between them. Halving the duration is a valid way to clear the floor,
+    # so validating either one alone would refuse edits that are in fact fine — and
+    # would let a legal-looking pair through that the launch then fails on
+    # ("Budget is too low", subcode 1885272).
+    if {"budget_ngn", "days"} & edits.keys():
+        current_days = plan.platforms[0].days if plan.platforms else C.DEFAULT_CAMPAIGN_DAYS
+        budget = _as_float(edits["budget_ngn"]) if "budget_ngn" in edits else req.budget_ngn
+        days = _as_int(edits["days"]) if "days" in edits else current_days
+
+        if "budget_ngn" in edits and (budget is None or budget <= 0):
             rejections.append("Budget must be a number greater than zero.")
-        elif plan.per_business_cap_ngn and budget > plan.per_business_cap_ngn:
+        elif "days" in edits and (days is None or not (1 <= days <= 90)):
+            rejections.append("Duration must be a whole number of days between 1 and 90.")
+        elif budget is not None and plan.per_business_cap_ngn and budget > plan.per_business_cap_ngn:
             rejections.append(
                 f"₦{budget:,.0f} is over this brand's cap of ₦{plan.per_business_cap_ngn:,.0f}."
             )
+        elif budget is None or days is None:
+            rejections.append("Budget and duration must both be numbers.")
+        elif budget / days < C.META_MIN_DAILY_NGN:
+            longest = int(budget // C.META_MIN_DAILY_NGN)
+            rejections.append(
+                f"₦{budget:,.0f} over {days} days is ₦{budget / days:,.0f} a day, under Meta's "
+                f"₦{C.META_MIN_DAILY_NGN:,.0f} minimum — Meta refuses the ad set outright. "
+                + (f"Run it over {longest} days or fewer, or raise the budget."
+                   if longest >= 1 else
+                   f"You would need at least ₦{C.META_MIN_DAILY_NGN:,.0f} for a single day.")
+            )
         else:
-            req_update["budget_ngn"] = budget
+            if "budget_ngn" in edits:
+                req_update["budget_ngn"] = budget
+                applied.append("budget_ngn")
+            if "days" in edits:
+                applied.append("days")
             if plan.platforms:
                 plan_update["platforms"] = [
-                    plan.platforms[0].model_copy(update={"budget_ngn": budget}),
+                    plan.platforms[0].model_copy(update={"budget_ngn": budget, "days": days}),
                     *plan.platforms[1:],
                 ]
-            applied.append("budget_ngn")
-
-    if "days" in edits:
-        days = _as_int(edits.get("days"))
-        if days is None or not (1 <= days <= 90):
-            rejections.append("Duration must be a whole number of days between 1 and 90.")
-        elif plan.platforms:
-            first = (plan_update.get("platforms") or plan.platforms)[0]
-            rest = (plan_update.get("platforms") or plan.platforms)[1:]
-            plan_update["platforms"] = [first.model_copy(update={"days": days}), *rest]
-            applied.append("days")
 
     if targeting != (plan.audience_targeting or {}):
         plan_update["audience_targeting"] = targeting
