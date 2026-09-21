@@ -1,16 +1,17 @@
 """
 Jane + Ads — turning a pin into a location Meta will show by NAME.
 
-geo.py resolves every targeted pocket to coordinates, and meta_targeting_from_geo
-sends them as `custom_locations` (lat/lng + radius). That targets correctly, but Meta
-has no name for an arbitrary coordinate, so Ads Manager renders the ad set's location
-as "(6.6018, 3.3515) + 3 km". Neither we nor a client opening Ads Manager can tell
-whether that is Ikeja or a car park, which makes the one part of the ad a client most
-wants to check — where their money is being spent — unreadable.
+geo.py resolves every targeted pocket to coordinates. Sent to Meta as they are, they
+become `custom_locations` (lat/lng + radius), and Meta has no name for an arbitrary
+coordinate, so Ads Manager renders the ad set's location as "(6.6018, 3.3515) + 3 km".
+Neither we nor a client opening Ads Manager can tell whether that is Ikeja or a car
+park, which makes the one part of the ad a client most wants to check — where their
+money is being spent — unreadable. So we never send one.
 
 Meta's `adgeolocation` search returns typed KEYS (city / neighborhood / subcity /
-region) which, sent as `geo_locations.cities` etc., render with their real names and
-a radius. This module resolves a pin's name to such a key when it can.
+region) which, sent as `geo_locations.cities` etc., render with their real names.
+This module resolves a pin's name to such a key, and a campaign's city or state to a
+broader key for the fallback.
 
 Two rules, both learned from what the search actually returns:
 
@@ -18,17 +19,17 @@ Two rules, both learned from what the search actually returns:
 "Yaba, Katsina State" as its top hit — a different place ~700km away. Accepting that
 blindly would move a Lagos campaign's budget to northern Nigeria and still look
 correct in the UI. So a candidate is only accepted when its region matches the
-campaign's, and anything unmatched stays a coordinate pin.
+campaign's, and anything unmatched is discarded rather than guessed at.
 
-**Precision beats readability when they conflict.** Our gazetteer carries pockets
-Meta has no key for at all — "Computer Village", "Admiralty Way" — and a 1.5km pin on
-a commercial strip is deliberately tighter than any named neighbourhood. Those keep
-their coordinates rather than being widened to the nearest named area just to look
-nicer.
+**A location we cannot name is not targeted at all.** Our gazetteer carries pockets
+Meta has no key for — "Computer Village", "Admiralty Way" — and those used to be sent
+as raw coordinates. They are now dropped instead: a client opening Ads Manager must
+never be shown "(6.5960, 3.3420) + 1.5 km", because a coordinate is unverifiable to
+them and to us, and unverifiable is worse than broader. meta_targeting_from_geo_named
+falls back to the campaign's own city or state — both named — when no pocket resolves.
 
-Everything here fails open: any error, timeout, or unconvincing match returns None
-and the caller keeps the pin it already had. A nicer label is never worth risking the
-targeting.
+Everything here fails open: any error, timeout, or unconvincing match returns None.
+The caller then widens to a named area rather than narrowing to a coordinate.
 """
 from __future__ import annotations
 
@@ -78,7 +79,7 @@ def _region_matches(hit_region: str, expected_region: str) -> bool:
 async def resolve_named_location(
     name: str, expected_region: str, access_token: str = "", timeout: float = 8.0
 ) -> Optional[dict]:
-    """Meta's named key for `name`, or None to keep using coordinates.
+    """Meta's named key for `name`, or None if it cannot be named confidently.
 
     Returns {"type": ..., "key": ..., "name": ..., "region": ...} on a confident,
     region-verified match.
@@ -142,3 +143,57 @@ async def resolve_named_location(
 
 def field_for_type(location_type: str) -> str:
     return _FIELD_FOR_TYPE.get(location_type, "cities")
+
+
+async def resolve_region(
+    region_name: str, access_token: str = "", timeout: float = 8.0
+) -> Optional[dict]:
+    """Meta's `region` key for a state — the last named fallback before the country.
+
+    Only reached when no pocket in the plan could be named. Broader than anything the
+    planner chose, and deliberately so: a named state is auditable in Ads Manager
+    where a coordinate is not, and being able to read where the money went matters
+    more than a tighter box nobody can verify.
+    """
+    region_name = (region_name or "").strip()
+    if not region_name:
+        return None
+    token = access_token or settings.META_ADS_ACCESS_TOKEN
+    if not token:
+        return None
+
+    cache_key = ("__region__", _norm(region_name))
+    if cache_key in _cache:
+        return _cache[cache_key]
+
+    graph = f"https://graph.facebook.com/{settings.FACEBOOK_API_VERSION}"
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.get(
+                f"{graph}/search",
+                params={
+                    "type": "adgeolocation",
+                    "q": region_name,
+                    "country_code": "NG",
+                    "location_types": json.dumps(["region"]),
+                    "limit": 10,
+                    "access_token": token,
+                },
+            )
+        hits = (resp.json() or {}).get("data") or []
+    except Exception as e:
+        print(f"[GeoNames] region lookup failed for {region_name!r}: {e}", flush=True)
+        _cache[cache_key] = None
+        return None
+
+    wanted = _norm(region_name).removesuffix(" state")
+    result = None
+    for hit in hits:
+        if hit.get("type") != "region":
+            continue
+        if _norm(hit.get("name", "")).removesuffix(" state") == wanted:
+            result = {"type": "region", "key": hit["key"],
+                      "name": hit.get("name", ""), "region": hit.get("name", "")}
+            break
+    _cache[cache_key] = result
+    return result

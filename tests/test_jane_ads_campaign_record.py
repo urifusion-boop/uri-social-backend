@@ -184,3 +184,27 @@ def test_the_record_is_immutable_once_written():
     rec = db[RECORDS].docs["c1"]
     assert rec["budget"]["stated_ngn"] == 20_000.0
     assert rec["strategy"]["plan_selected"]["rank"] == 2
+
+
+# ── Fields read from the wrong place (caught on the first real record) ───────
+
+def test_duration_is_read_from_the_platform_plan_not_the_root():
+    """days lives on PlatformPlan. Reading the plan root returned 0 on every record —
+    a duration no campaign has ever had."""
+    doc = _plan_doc()
+    doc["plan"]["platforms"] = [{"platform": "meta", "days": 5, "budget_ngn": 7200.0}]
+    rec = _write(FakeDb(), doc)
+    assert rec["budget"]["duration_days"] == 5
+
+
+def test_corpus_citations_are_read_from_the_creative():
+    """Coverage is on the plan, the cited records are on the creative. Reading both
+    off the plan produced an empty list beside a "full" coverage label — worse than
+    either alone, because it says the corpus reached this campaign and names nothing."""
+    doc = _plan_doc()
+    doc["plan"]["corpus_citations"] = []
+    doc["plan"]["creative"]["corpus_coverage"] = "full"
+    doc["plan"]["creative"]["corpus_citations"] = [{"strategy_id": "SEED-044", "version": 2}]
+    rec = _write(FakeDb(), doc)
+    assert rec["strategy"]["corpus_coverage"] == "full"
+    assert rec["strategy"]["corpus_records_cited"][0]["strategy_id"] == "SEED-044"
