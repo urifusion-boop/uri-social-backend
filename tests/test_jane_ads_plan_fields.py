@@ -454,3 +454,83 @@ def test_a_save_that_changed_nothing_does_not_claim_the_plan_was_edited():
         db=db, brand_ctx={"brand_id": "brand_1"},
     ))
     assert out["plan_edited"] is False
+
+
+# ── Rebuilding Jane's reasoning from the edited plan ──────────────────────────
+
+def test_saving_rebuilds_janes_reasoning_from_the_edited_plan(monkeypatch):
+    """Her prose NAMES the budget, duration, pockets and interests. Patching the
+    numbers alone left the card arguing for choices the client had overruled."""
+    from app.agents.jane_ads import plan_fields
+    from app.agents.jane_ads.router import PlanFieldsBody, meta_plan_edit_fields
+
+    async def _no_meta(db, plan, req, audience_text=""):
+        from app.agents.jane_ads.summary import build_campaign_summary
+        return build_campaign_summary(plan, req, audience_text=audience_text).model_dump(mode="json")
+
+    monkeypatch.setattr(plan_fields, "rebuild_summary", _no_meta)
+
+    db = _FakeDb(_pending_doc())
+    out = _run(meta_plan_edit_fields(
+        "plan_x", PlanFieldsBody(edits={"budget_ngn": 9000, "days": 3}),
+        db=db, brand_ctx={"brand_id": "brand_1"},
+    ))
+    assert out["summary"] is not None
+    # The rebuilt prose must carry the CLIENT's numbers, not Jane's originals.
+    blob = str(out["summary"])
+    assert "9,000" in blob or "9000" in blob
+    assert "3 days" in blob
+    # And it must be what got stored, or the launch and the card disagree again.
+    assert db.plans.doc["summary"] == out["summary"]
+
+
+def test_a_failed_rebuild_keeps_the_previous_summary_rather_than_blanking_it(monkeypatch):
+    """A stale summary is worse than a fresh one and far better than none — losing the
+    whole reasoning block because Meta's estimate endpoint blipped is not acceptable."""
+    from app.agents.jane_ads.router import PlanFieldsBody, meta_plan_edit_fields
+
+    async def _fails(db, plan, req, audience_text=""):
+        return None
+
+    monkeypatch.setattr("app.agents.jane_ads.plan_fields.rebuild_summary", _fails)
+    doc = _pending_doc()
+    doc["summary"] = {"objective": {"value": "the original", "reason": "r"}}
+    db = _FakeDb(doc)
+    out = _run(meta_plan_edit_fields(
+        "plan_x", PlanFieldsBody(edits={"caption": "new words"}),
+        db=db, brand_ctx={"brand_id": "brand_1"},
+    ))
+    assert out["applied"] == ["caption"]
+    assert out["summary"] is None
+    assert db.plans.doc["summary"] == {"objective": {"value": "the original", "reason": "r"}}
+
+
+def test_the_reach_estimate_is_refetched_not_carried_over(monkeypatch):
+    """Changing locations, interests, age, gender or placement is exactly what moves
+    reach. Reusing the old figure would attach Jane's audience size to the client's."""
+    from app.agents.jane_ads import plan_fields
+
+    calls = {"n": 0}
+
+    class _Adapter:
+        def __init__(self, *a, **k):
+            pass
+
+        async def get_delivery_estimate(self, targeting):
+            calls["n"] += 1
+            calls["targeting"] = targeting
+            return {"users_lower_bound": 100, "users_upper_bound": 200}
+
+    monkeypatch.setattr("app.agents.jane_ads.adapters.meta.MetaAdPlatformAdapter", _Adapter)
+
+    async def _named(geo, region="", access_token=""):
+        return {"geo_locations": {"cities": [{"key": "1"}]}}
+
+    monkeypatch.setattr("app.agents.jane_ads.geo.meta_targeting_from_geo_named", _named)
+    plan = _plan(audience_targeting={"genders": [1]})
+    out = _run(plan_fields.rebuild_summary(None, plan, _req(), "shoppers"))
+    assert calls["n"] == 1
+    # The estimate must use the SAME merged shape the launch sends.
+    assert calls["targeting"]["genders"] == [1]
+    assert "cities" in calls["targeting"]["geo_locations"]
+    assert out is not None
