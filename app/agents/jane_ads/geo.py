@@ -387,50 +387,33 @@ def place_named_in(text: str) -> Optional[str]:
     return None
 
 
-def meta_targeting_from_geo(geo: Optional[GeoPlan]) -> dict:
-    """A GeoPlan's pins as Meta's `targeting.geo_locations` shape — the ONE place this
-    conversion happens, so the real ad set and the delivery-estimate preview can never
-    disagree on where an ad actually targets. Falls back to all of Nigeria when there
-    are no valid pins (a brand new enough that geocoding found nothing), same as
-    before pins existed."""
-    custom_locations = [
-        {"latitude": pin.lat, "longitude": pin.lng,
-         "radius": pin.radius_km, "distance_unit": "kilometer"}
-        for pin in (geo.pins if geo else [])
-        if pin.lat is not None and pin.lng is not None
-    ]
-    return ({"geo_locations": {"custom_locations": custom_locations}}
-            if custom_locations else {"geo_locations": {"countries": ["NG"]}})
-
-
 async def meta_targeting_from_geo_named(
     geo: Optional[GeoPlan], region: str = "", access_token: str = ""
 ) -> dict:
-    """Same targeting as meta_targeting_from_geo, but with each pocket sent as Meta's
-    NAMED location wherever one can be verified — so Ads Manager reads "Ikeja, Lagos
-    State + 3 km" instead of "(6.6018, 3.3515) + 3 km".
+    """Targeting built ONLY from locations Meta can name — never a coordinate.
 
-    Where a client's money goes is the thing they most want to check, and a raw
-    coordinate makes that unverifiable for them and for us.
+    Ads Manager renders a `custom_location` as "(6.6018, 3.3515) + 3 km". That is the
+    one part of the ad a client most wants to check — where their money goes — and a
+    raw coordinate makes it unverifiable to them and to us. So this function has no
+    path that emits one, by construction rather than by preference.
 
-    A pocket only becomes a named target when Meta's own search returns a match IN THE
-    SAME REGION (see geo_names: "Yaba" resolves to Katsina State, 700km from the Lagos
-    district meant). Anything unverified — including pockets Meta has no key for, like
-    "Computer Village" — keeps its coordinates, because a tighter correct pin beats a
-    looser pretty one.
+    A pocket becomes a target only when Meta's own search returns a match IN THE SAME
+    REGION (see geo_names: "Yaba" resolves to Katsina State, 700km from the Lagos
+    district meant). A pocket Meta has no key for — "Computer Village", "Admiralty
+    Way" — is dropped, not pinned.
 
-    `region` is the state the campaign is in. Without it nothing can be verified, so
-    everything stays a pin; that is the same output this function's sync twin gives,
-    which is why calling it with no region is safe rather than broken.
+    Dropping every pocket would leave no geo_locations at all, which Meta rejects, so
+    the fallback widens through named steps: the campaign's city, then its state, then
+    Nigeria. Each is broader than the planner intended and each is legible, which is
+    the trade this function exists to make.
     """
-    from .geo_names import field_for_type, resolve_named_location
+    from .geo_names import field_for_type, resolve_named_location, resolve_region
 
     pins = [p for p in (geo.pins if geo else []) if p.lat is not None and p.lng is not None]
-    if not pins:
-        return {"geo_locations": {"countries": ["NG"]}}
+    city = (geo.city if geo else "") or region
 
     geo_locations: dict = {}
-    custom_locations: list[dict] = []
+    dropped: list[str] = []
     for pin in pins:
         named = None
         if region:
@@ -452,13 +435,38 @@ async def meta_targeting_from_geo_named(
                 {"key": named["key"]}
             )
         else:
-            custom_locations.append({
-                "latitude": pin.lat, "longitude": pin.lng,
-                "radius": pin.radius_km, "distance_unit": "kilometer",
-            })
-    if custom_locations:
-        geo_locations["custom_locations"] = custom_locations
-    return {"geo_locations": geo_locations}
+            dropped.append(pin.name)
+
+    if dropped:
+        print(f"[Geo] unnameable, dropped from targeting: {', '.join(dropped)}", flush=True)
+
+    if geo_locations:
+        return {"geo_locations": geo_locations}
+
+    # Nothing resolved. Widen to the city itself, which is usually nameable even when
+    # its districts are not — `city` doubles as its own expected region here so the
+    # Yaba/Katsina guard still applies.
+    if city:
+        try:
+            named_city = await resolve_named_location(city, city, access_token)
+        except Exception as e:
+            print(f"[Geo] city fallback failed for {city!r}: {e}", flush=True)
+            named_city = None
+        if named_city:
+            print(f"[Geo] no pocket could be named — widened to {named_city['name']}", flush=True)
+            return {"geo_locations": {field_for_type(named_city["type"]): [{"key": named_city["key"]}]}}
+
+        try:
+            named_region = await resolve_region(city, access_token)
+        except Exception as e:
+            print(f"[Geo] region fallback failed for {city!r}: {e}", flush=True)
+            named_region = None
+        if named_region:
+            print(f"[Geo] no pocket or city could be named — widened to {named_region['name']}", flush=True)
+            return {"geo_locations": {"regions": [{"key": named_region["key"]}]}}
+
+    print("[Geo] nothing nameable — falling back to country-wide NG", flush=True)
+    return {"geo_locations": {"countries": ["NG"]}}
 
 
 def _explain(mode: GeoMode, city: str, pins: list[GeoPin]) -> str:

@@ -50,7 +50,7 @@ from app.core.config import settings
 from .base import AdPlatformAdapter
 from .. import constants as C
 from ..destination import DestinationType, link_for_plan
-from ..geo import meta_targeting_from_geo, meta_targeting_from_geo_named
+from ..geo import meta_targeting_from_geo_named
 from ..models import (
     CampaignPlan,
     ConversationDelivered,
