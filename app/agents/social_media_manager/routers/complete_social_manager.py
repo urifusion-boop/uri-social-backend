@@ -1973,6 +1973,18 @@ async def instagram_direct_initiate(source: Optional[str] = Query("settings")):
         "scope": ",".join(scopes),
         "response_type": "code",
         "state": source or "settings",
+        # Live-reported 2026-09-21: on mobile Chrome (not an embedded/in-app
+        # browser), some users never reach our redirect_uri at all — this dialog
+        # is Facebook's own (Instagram uses Facebook Login), so it's exposed to
+        # the same known mobile behavior: when the Facebook app is installed, the
+        # OS can intercept the navigation as an App Link and hand off to the
+        # native app instead of rendering the web dialog, landing the user on
+        # their normal Facebook feed with no consent screen and no return trip to
+        # us. `display=page` explicitly requests the full-page WEB dialog — the
+        # correct mode for a server-side redirect flow like this one — instead of
+        # leaving Facebook/the OS to auto-detect, which is what invites the
+        # native-app handoff. NOT yet confirmed against a live affected device.
+        "display": "page",
     }
     auth_url = "https://www.facebook.com/v20.0/dialog/oauth?" + urllib.parse.urlencode(params)
     return RedirectResponse(auth_url)
