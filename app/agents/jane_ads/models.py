@@ -326,6 +326,14 @@ class AdCreative(BaseModel):
     DRAFT and RECOMPOSITE can carry either — `is_video` says which."""
     image_url: str = ""             # final creative media URL, hosted on Cloudinary
     is_video: bool = False           # True when image_url is actually a video
+    # TikTok-only, additive: 2+ extra photos for a Carousel Ad (TikTok's real image-ad
+    # format — a single bare static image isn't a valid TikTok ad unit at all, per
+    # TikTok's own Carousel Ads docs). Empty for every Meta plan and every TikTok video
+    # plan; only ever populated when the user explicitly attached multiple photos while
+    # TikTok was toggled. `image_url`/`is_video` above stay the single-asset source of
+    # truth everywhere else — this is a carousel-specific side channel, not a
+    # replacement for them.
+    carousel_image_urls: list[str] = Field(default_factory=list)
     # Which corpus records shaped this copy, pinned at version. Without this there is
     # no way to tell from the outside whether the corpus reached the creative stage or
     # was silently ignored — the position the first live test left us in.
