@@ -451,6 +451,17 @@ class AccessCode(BaseModel):
     is_active: bool = Field(default=True, description="Admin can deactivate a code early without deleting it")
     expires_at: Optional[datetime] = Field(default=None, description="Code's own redeem-by deadline; None = open-ended")
     label: str = Field(default="", description="Human-readable note, e.g. 'Africa SME Assembly partnership'")
+    # Two distinct modes, both real: a SHARED code (assigned_to_email=None) is
+    # handed to a firm and anyone who has it can redeem it, up to
+    # max_redemptions times. An ASSIGNED code is reserved for one specific
+    # person from creation — visible as "who this is for" in the admin panel
+    # immediately, not just discoverable after they redeem — and enforced at
+    # redemption time (see billing_router.py's redeem_access_code): only a
+    # matching email can ever successfully redeem it, not first-come-first-
+    # served. Normalized lowercase; matching is case-insensitive.
+    assigned_to_email: Optional[str] = Field(
+        default=None, description="If set, ONLY this email can redeem this code — a personal invite, not a shared code"
+    )
     created_by: str = Field(..., description="Admin email who created this code")
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
@@ -493,8 +504,14 @@ class CreateAccessCodeRequest(BaseModel):
     max_redemptions: Optional[int] = Field(default=None, gt=0)
     expires_at: Optional[datetime] = None
     label: str = ""
+    assigned_to_email: Optional[str] = Field(
+        default=None, description="Reserve this code for one specific person — omit for a shared code anyone can redeem"
+    )
 
 
 class UpdateAccessCodeRequest(BaseModel):
     is_active: Optional[bool] = None
     label: Optional[str] = None
+    assigned_to_email: Optional[str] = Field(
+        default=None, description="Reassign an existing code, or set on a code that was created unassigned"
+    )

@@ -178,6 +178,92 @@ def test_list_redemptions_joins_email():
     assert result["redemptions"][0]["email"] == "partner@example.com"
 
 
+# ── Assigned (personal invite) codes ────────────────────────────────────────
+
+def test_create_with_assigned_email_is_visible_immediately():
+    """The whole point of this mode: the admin sees who a code is for
+    BEFORE that person ever redeems it, not just discoverable afterward."""
+    from app.routers.admin_router import create_access_code
+
+    db = _db_with_starter_tier()
+    db["users"].docs.append({"email": "partner@example.com", "first_name": "Ada", "last_name": "Obi"})
+    body = CreateAccessCodeRequest(
+        code="ASA-ADA", plan_tier_id="starter", duration_days=60, assigned_to_email="Partner@Example.com",
+    )
+    result = _run(create_access_code(body, admin_user=_admin(), db=db))
+    assert result["assigned_to_email"] == "partner@example.com"  # normalized lowercase
+    assert result["assigned_to_name"] == "Ada Obi"
+    assert result["status"] == "pending"
+
+
+def test_create_assigned_to_email_with_no_account_yet_shows_email_only():
+    """A real invite use case: the person hasn't signed up yet. Should not
+    error — just no name to resolve."""
+    from app.routers.admin_router import create_access_code
+
+    db = _db_with_starter_tier()
+    body = CreateAccessCodeRequest(
+        code="ASA-NEW", plan_tier_id="starter", duration_days=60, assigned_to_email="future-partner@example.com",
+    )
+    result = _run(create_access_code(body, admin_user=_admin(), db=db))
+    assert result["assigned_to_email"] == "future-partner@example.com"
+    assert result["assigned_to_name"] is None
+    assert result["status"] == "pending"
+
+
+def test_create_without_assigned_email_is_unassigned():
+    from app.routers.admin_router import create_access_code
+
+    db = _db_with_starter_tier()
+    body = CreateAccessCodeRequest(code="ASA26", plan_tier_id="starter", duration_days=60)
+    result = _run(create_access_code(body, admin_user=_admin(), db=db))
+    assert result["assigned_to_email"] is None
+    assert result["status"] == "unassigned"
+
+
+def test_list_shows_redeemed_status_once_someone_has_redeemed():
+    from app.routers.admin_router import create_access_code, list_access_codes
+
+    db = _db_with_starter_tier()
+    _run(create_access_code(
+        CreateAccessCodeRequest(code="ASA26", plan_tier_id="starter", duration_days=60, assigned_to_email="p@example.com"),
+        admin_user=_admin(), db=db,
+    ))
+    db["access_codes"].docs[0]["redemption_count"] = 1  # simulate a completed redemption
+
+    result = _run(list_access_codes(admin_user=_admin(), db=db))
+    assert result["codes"][0]["status"] == "redeemed"
+
+
+def test_update_can_reassign_to_a_different_email():
+    from app.routers.admin_router import create_access_code, update_access_code
+
+    db = _db_with_starter_tier()
+    _run(create_access_code(CreateAccessCodeRequest(code="ASA26", plan_tier_id="starter", duration_days=60), admin_user=_admin(), db=db))
+
+    updated = _run(update_access_code(
+        "ASA26", UpdateAccessCodeRequest(assigned_to_email="new-partner@example.com"), admin_user=_admin(), db=db,
+    ))
+    assert updated["assigned_to_email"] == "new-partner@example.com"
+    assert updated["status"] == "pending"
+
+
+def test_update_can_clear_an_assignment():
+    """Passing an empty string clears it — distinct from omitting the field
+    entirely, which leaves the existing assignment untouched."""
+    from app.routers.admin_router import create_access_code, update_access_code
+
+    db = _db_with_starter_tier()
+    _run(create_access_code(
+        CreateAccessCodeRequest(code="ASA26", plan_tier_id="starter", duration_days=60, assigned_to_email="p@example.com"),
+        admin_user=_admin(), db=db,
+    ))
+
+    updated = _run(update_access_code("ASA26", UpdateAccessCodeRequest(assigned_to_email=""), admin_user=_admin(), db=db))
+    assert updated["assigned_to_email"] is None
+    assert updated["status"] == "unassigned"
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))

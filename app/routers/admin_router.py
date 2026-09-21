@@ -720,6 +720,7 @@ async def create_access_code(
             code = _generate_code()
 
     acting_email = (admin_user.get("claims", {}) or {}).get("email", "unknown")
+    assigned_to_email = body.assigned_to_email.strip().lower() if body.assigned_to_email else None
     access_code = AccessCode(
         code=code,
         plan_tier_id=body.plan_tier_id,
@@ -727,10 +728,25 @@ async def create_access_code(
         max_redemptions=body.max_redemptions,
         expires_at=body.expires_at,
         label=body.label,
+        assigned_to_email=assigned_to_email,
         created_by=acting_email,
     )
     await db["access_codes"].insert_one(access_code.dict())
-    return access_code.dict()
+    result = access_code.dict()
+    if assigned_to_email:
+        assigned_user = await db["users"].find_one({"email": assigned_to_email}, {"first_name": 1, "last_name": 1})
+        result["assigned_to_name"] = _display_name(assigned_user)
+        result["status"] = "pending"
+    else:
+        result["status"] = "unassigned"
+    return result
+
+
+def _display_name(user_doc: Optional[dict]) -> Optional[str]:
+    if not user_doc:
+        return None
+    name = f"{user_doc.get('first_name', '')} {user_doc.get('last_name', '')}".strip()
+    return name or None
 
 
 @router.get("/access-codes")
@@ -738,8 +754,23 @@ async def list_access_codes(
     admin_user: dict = Depends(verify_admin),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
+    """Every code, each enriched with WHO it's assigned to (if anyone) and a
+    computed status — this is what makes an assignment visible immediately
+    in the panel, not just discoverable after the person redeems:
+    - unassigned: a shared code, anyone with it can redeem
+    - pending: assigned to a specific email, not yet redeemed
+    - redeemed: assigned, and that person has already redeemed it
+    """
     codes = []
     async for doc in db["access_codes"].find({}, {"_id": 0}).sort("created_at", -1):
+        assigned_email = doc.get("assigned_to_email")
+        if assigned_email:
+            assigned_user = await db["users"].find_one({"email": assigned_email}, {"first_name": 1, "last_name": 1})
+            doc["assigned_to_name"] = _display_name(assigned_user)
+            doc["status"] = "redeemed" if doc.get("redemption_count", 0) > 0 else "pending"
+        else:
+            doc["assigned_to_name"] = None
+            doc["status"] = "unassigned"
         codes.append(doc)
     return {"codes": codes, "count": len(codes)}
 
@@ -767,15 +798,27 @@ async def update_access_code(
     admin_user: dict = Depends(verify_admin),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
-    """Revoke a code early (is_active=False) or edit its label. Does not
+    """Revoke a code early (is_active=False), edit its label, or (re)assign
+    it to a specific email — or clear an assignment by passing "". Does not
     touch duration_days/plan_tier_id — those are snapshotted onto each
     redemption at redeem time, so editing them here never retroactively
     changes access someone already has."""
     updates = {k: v for k, v in body.dict(exclude_none=True).items()}
     if not updates:
         raise HTTPException(status_code=400, detail="No fields to update")
+    if "assigned_to_email" in updates:
+        normalized = updates["assigned_to_email"].strip().lower()
+        updates["assigned_to_email"] = normalized or None
     result = await db["access_codes"].update_one({"code": code.strip().upper()}, {"$set": updates})
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail=f"Code '{code}' not found")
     updated = await db["access_codes"].find_one({"code": code.strip().upper()}, {"_id": 0})
+    assigned_email = updated.get("assigned_to_email")
+    if assigned_email:
+        assigned_user = await db["users"].find_one({"email": assigned_email}, {"first_name": 1, "last_name": 1})
+        updated["assigned_to_name"] = _display_name(assigned_user)
+        updated["status"] = "redeemed" if updated.get("redemption_count", 0) > 0 else "pending"
+    else:
+        updated["assigned_to_name"] = None
+        updated["status"] = "unassigned"
     return updated

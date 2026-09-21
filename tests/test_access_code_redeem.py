@@ -87,9 +87,11 @@ def fake_db(monkeypatch):
     credit_service._db = None
 
 
-def _redeem(code: str, user_id: str):
+def _redeem(code: str, user_id: str, user_email: str | None = None):
     from app.routers.billing_router import redeem_access_code
-    return _run(redeem_access_code(RedeemAccessCodeRequest(code=code), user_id=user_id))
+    return _run(redeem_access_code(
+        RedeemAccessCodeRequest(code=code), user_id=user_id, user_email=user_email or f"{user_id}@example.com",
+    ))
 
 
 def test_successful_redemption_grants_the_plan(fake_db):
@@ -174,6 +176,30 @@ def test_previous_subscription_tier_is_recorded_for_audit(fake_db):
     assert redemption["previous_subscription_tier"] == "pro"
     # The comp grant overrides the prior tier outright.
     assert fake_db["user_credits"].docs[0]["subscription_tier"] == "starter"
+
+
+# ── Assigned (personal invite) codes ────────────────────────────────────────
+
+def test_assigned_code_redeemable_by_the_right_person(fake_db):
+    fake_db["access_codes"].docs[0]["assigned_to_email"] = "partner@example.com"
+    result = _redeem("ASA26", "user-1", user_email="Partner@Example.com")  # case-insensitive match
+    assert result["status"] is True
+
+
+def test_assigned_code_rejected_for_wrong_person(fake_db):
+    fake_db["access_codes"].docs[0]["assigned_to_email"] = "partner@example.com"
+    with pytest.raises(HTTPException) as exc_info:
+        _redeem("ASA26", "user-2", user_email="someone-else@example.com")
+    assert exc_info.value.status_code == 403
+    assert "reserved" in exc_info.value.detail.lower()
+    # Nothing granted — the rejected attempt must not touch the wallet.
+    assert fake_db["user_credits"].docs == []
+
+
+def test_unassigned_code_still_redeemable_by_anyone(fake_db):
+    # assigned_to_email stays unset (default) — the existing shared-code path.
+    result = _redeem("ASA26", "user-1", user_email="whoever@example.com")
+    assert result["status"] is True
 
 
 if __name__ == "__main__":
