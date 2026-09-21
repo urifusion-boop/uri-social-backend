@@ -29,6 +29,7 @@ from app.routers.bug_report_router import router as bug_report_router
 from app.routers.client_router import router as client_router
 from app.routers.workspace_router import router as workspace_router
 from app.routers.workspace_member_router import router as workspace_member_router
+from app.routers.admin_router import router as admin_router
 from app.agents.social_media_manager.routers.blog_router import router as blog_router
 from app.routers.agency_router import router as agency_router
 
@@ -315,6 +316,7 @@ app.include_router(market_intelligence_router, tags=["Market Intelligence"])
 app.include_router(client_router)
 app.include_router(workspace_router)
 app.include_router(workspace_member_router)
+app.include_router(admin_router)
 
 # Serve generated images directly from backend (avoids third-party CDN like imgBB)
 _BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

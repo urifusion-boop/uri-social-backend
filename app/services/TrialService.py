@@ -19,6 +19,7 @@ from app.domain.models.billing_models import (
     UserTrial,
     TrialStatusResponse,
     CreditTransaction,
+    UserCreditWallet,
 )
 
 # Trial configuration constants (PRD Section 2)
@@ -49,6 +50,36 @@ class TrialService:
     @property
     def credit_transactions_collection(self):
         return self.db["credit_transactions"]
+
+    @property
+    def user_credits_collection(self):
+        return self.db["user_credits"]
+
+    async def _ensure_wallet_on_trial_expiry(self, user_id: str) -> None:
+        """
+        Create a credit wallet with 0 credits when trial expires.
+        This ensures users without subscriptions are properly blocked.
+        """
+        existing_wallet = await self.user_credits_collection.find_one({"user_id": user_id})
+        if existing_wallet:
+            return  # User already has a wallet, no need to create
+
+        now = datetime.utcnow()
+        wallet = UserCreditWallet(
+            user_id=user_id,
+            bonus_credits=0,
+            subscription_credits=0,
+            total_credits=0,
+            credits_used=0,
+            credits_remaining=0,
+            subscription_tier=None,
+            next_renewal=None,
+            created_at=now,
+            updated_at=now
+        )
+
+        await self.user_credits_collection.insert_one(wallet.dict(exclude_none=True))
+        print(f"[TrialService] Created 0-credit wallet for user {user_id} after trial expiry")
 
     # ==================== PRD 5.1: Trial Activation ====================
 
@@ -257,6 +288,84 @@ class TrialService:
         """PRD 8: Check if user has already used their trial (abuse prevention)."""
         trial_doc = await self.trials_collection.find_one({"user_id": user_id})
         return trial_doc is not None
+
+    async def admin_adjust_trial_credits(
+        self, user_id: str, amount: int, notes: Optional[str] = None
+    ) -> TrialStatusResponse:
+        """
+        Signed delta to a trial's credits_remaining, floored at 0. Logs a
+        credit_transactions entry with type="admin_adjustment" — the auditable,
+        in-app replacement for editing user_trials by hand in Mongo.
+        """
+        trial_doc = await self.trials_collection.find_one({"user_id": user_id})
+        if not trial_doc:
+            raise ValueError(f"No trial found for user {user_id}")
+
+        now = datetime.utcnow()
+        current = trial_doc["credits_remaining"]
+        new_remaining = max(0, current + amount)
+        applied_amount = new_remaining - current  # what actually changed, after flooring
+
+        updated = await self.trials_collection.find_one_and_update(
+            {"user_id": user_id},
+            {"$set": {"credits_remaining": new_remaining}},
+            return_document=ReturnDocument.AFTER,
+        )
+
+        await self.credit_transactions_collection.insert_one(
+            CreditTransaction(
+                user_id=user_id,
+                type="admin_adjustment",
+                amount=applied_amount,
+                balance_before=current,
+                balance_after=new_remaining,
+                reason="admin_adjustment",
+                notes=notes,
+                created_at=now,
+            ).dict(exclude_none=True)
+        )
+
+        if new_remaining == 0:
+            await self._ensure_wallet_on_trial_expiry(user_id)
+
+        return await self._build_status(updated)
+
+    async def admin_expire_trial(self, user_id: str, notes: Optional[str] = None) -> TrialStatusResponse:
+        """
+        Force-expire a trial: credits_remaining=0, trial_used=True. The exact
+        manual edit that used to require a raw Mongo write, now a named,
+        logged code path.
+        """
+        trial_doc = await self.trials_collection.find_one({"user_id": user_id})
+        if not trial_doc:
+            raise ValueError(f"No trial found for user {user_id}")
+
+        now = datetime.utcnow()
+        current = trial_doc["credits_remaining"]
+
+        updated = await self.trials_collection.find_one_and_update(
+            {"user_id": user_id},
+            {"$set": {"credits_remaining": 0, "trial_used": True}},
+            return_document=ReturnDocument.AFTER,
+        )
+
+        if current != 0:
+            await self.credit_transactions_collection.insert_one(
+                CreditTransaction(
+                    user_id=user_id,
+                    type="admin_adjustment",
+                    amount=-current,
+                    balance_before=current,
+                    balance_after=0,
+                    reason="admin_adjustment",
+                    notes=notes or "Trial force-expired by admin",
+                    created_at=now,
+                ).dict(exclude_none=True)
+            )
+
+        await self._ensure_wallet_on_trial_expiry(user_id)
+
+        return await self._build_status(updated)
 
 
 # Module-level singleton

@@ -96,13 +96,14 @@ class CreditTransaction(BaseModel):
     Tracks all credit movements
     """
     user_id: str = Field(..., description="User who performed action")
-    type: Literal["allocation", "deduction", "bonus", "refund", "trial"] = Field(..., description="Transaction type")
+    type: Literal["allocation", "deduction", "bonus", "refund", "trial", "admin_adjustment"] = Field(..., description="Transaction type")
     amount: int = Field(..., description="Credit amount (negative for deduction)")
     balance_before: int = Field(..., description="Credit balance before transaction")
     balance_after: int = Field(..., description="Credit balance after transaction")
-    reason: Literal["subscription", "retry", "campaign_generation", "refund", "bonus", "trial", "whatsapp_content_generation", "whatsapp_graphic_generation", "upload_user_content", "custom_credit_purchase", "video_editing"] = Field(..., description="Why credits changed")
+    reason: Literal["subscription", "retry", "campaign_generation", "refund", "bonus", "trial", "whatsapp_content_generation", "whatsapp_graphic_generation", "upload_user_content", "custom_credit_purchase", "video_editing", "admin_adjustment"] = Field(..., description="Why credits changed")
     campaign_id: Optional[str] = Field(default=None, description="Reference to content_requests if applicable")
     retry_count: Optional[int] = Field(default=0, description="Retry number if applicable")
+    notes: Optional[str] = Field(default=None, description="Free-text context — e.g. an admin's stated reason for a manual credit/trial adjustment, distinct from the fixed `reason` category")
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
     class Config:
@@ -390,6 +391,10 @@ class CreditBalanceResponse(BaseModel):
     end_date: Optional[datetime] = Field(default=None, description="Subscription end date")
     next_renewal: Optional[datetime] = None
     low_credit_warning: bool = Field(default=False, description="True if credits <= 3 (PRD 7.3)")
+    trial_credits_included: int = Field(
+        default=0,
+        description="Portion of credits_remaining/total_credits coming from an unexpired trial, not the subscription/bonus wallet. Not yet populated by get_credit_balance on this branch — always 0 today, kept as a real field so admin_router.py's tier-labeling logic has something safe to read rather than erroring.",
+    )
 
     class Config:
         schema_extra = {
@@ -428,3 +433,68 @@ class SubscriptionResponse(BaseModel):
                 "next_renewal": "2026-05-06T00:00:00Z"
             }
         }
+
+
+# ==================== ACCESS CODES ====================
+# Admin-generated partner/comp codes — e.g. "ASA26" for the Africa SME
+# Assembly partnership. Generic and reusable: any admin can create a new
+# code at any time, for any plan, any duration, handed to anybody. Each
+# redeemer gets their own access window starting from THEIR redemption
+# date, not a shared expiry tied to the code itself.
+
+class AccessCode(BaseModel):
+    code: str = Field(..., description="Normalized uppercase, e.g. 'ASA26'")
+    plan_tier_id: str = Field(..., description="subscription_tiers.tier_id to grant, e.g. 'starter'")
+    duration_days: int = Field(..., description="How many days of access from each user's own redemption date")
+    max_redemptions: Optional[int] = Field(default=None, description="None = unlimited redemptions")
+    redemption_count: int = Field(default=0, description="How many times this code has been redeemed so far")
+    is_active: bool = Field(default=True, description="Admin can deactivate a code early without deleting it")
+    expires_at: Optional[datetime] = Field(default=None, description="Code's own redeem-by deadline; None = open-ended")
+    label: str = Field(default="", description="Human-readable note, e.g. 'Africa SME Assembly partnership'")
+    created_by: str = Field(..., description="Admin email who created this code")
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+    class Config:
+        schema_extra = {
+            "example": {
+                "code": "ASA26",
+                "plan_tier_id": "starter",
+                "duration_days": 60,
+                "max_redemptions": None,
+                "redemption_count": 3,
+                "is_active": True,
+                "expires_at": None,
+                "label": "Africa SME Assembly partnership",
+                "created_by": "admin@urisocial.com",
+            }
+        }
+
+
+class AccessCodeRedemption(BaseModel):
+    code: str
+    user_id: str = Field(..., description="The billing id (users.userId) that redeemed this code")
+    plan_tier_id: str = Field(..., description="Snapshot of the plan granted — survives a later edit to the code")
+    access_start: datetime
+    access_end: datetime
+    previous_subscription_tier: Optional[str] = Field(
+        default=None, description="What the user had before redeeming, for support/audit visibility"
+    )
+    redeemed_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class RedeemAccessCodeRequest(BaseModel):
+    code: str = Field(..., min_length=1, description="The code to redeem, case-insensitive")
+
+
+class CreateAccessCodeRequest(BaseModel):
+    code: Optional[str] = Field(default=None, description="Omit to auto-generate a random code")
+    plan_tier_id: str
+    duration_days: int = Field(..., gt=0)
+    max_redemptions: Optional[int] = Field(default=None, gt=0)
+    expires_at: Optional[datetime] = None
+    label: str = ""
+
+
+class UpdateAccessCodeRequest(BaseModel):
+    is_active: Optional[bool] = None
+    label: Optional[str] = None
