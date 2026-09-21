@@ -217,12 +217,20 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                 f"CampaignPlan has no usable destination link for destination_type="
                 f"'{plan.destination_type}' — a TikTok ad needs a landing page URL"
             )
-        if not plan.creative or not plan.creative.image_url or not plan.creative.is_video:
-            # decision_engine.py's video-only gate (PRD C1) means a TikTok plan should
-            # never reach here without real video creative — asserted explicitly
-            # rather than trusted silently, same discipline as Meta's hard creative
-            # requirement.
-            raise ValueError("TikTok requires video creative (plan.creative.is_video)")
+        is_carousel = bool(plan.creative and len(plan.creative.carousel_image_urls) >= 2)
+        if not plan.creative or not (
+            (plan.creative.image_url and plan.creative.is_video) or is_carousel
+        ):
+            # router.py's tiktok_needs_video gate means a TikTok plan should never
+            # reach here without either real video creative OR 2+ carousel photos —
+            # asserted explicitly rather than trusted silently, same discipline as
+            # Meta's hard creative requirement. TikTok has no single-static-image ad
+            # unit at all (video or Carousel Ads only), which is why this isn't just
+            # "is there an image_url".
+            raise ValueError(
+                "TikTok requires either video creative (plan.creative.is_video) or "
+                "2+ carousel photos (plan.creative.carousel_image_urls)"
+            )
 
         platform_plan = tiktok_plans[0]
         total_budget_ngn = min(platform_plan.budget_ngn, auth.funded_amount_ngn)
@@ -243,7 +251,14 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                     headers=self._headers(),
                     json={
                         "advertiser_id": self._advertiser_id,
-                        "campaign_name": f"JaneAds-{plan.business_id}-{plan.goal.value}",
+                        # Live-caught 2026-09-21: TikTok rejects campaign/create with
+                        # "Campaign name already exists" once a business launches a
+                        # second campaign with the same goal — this name had no
+                        # uniqueness suffix at all, unlike every other name/file_name
+                        # in this adapter (ad_name, adgroup_name, video/image
+                        # file_name), which all already append a random hex suffix for
+                        # exactly this reason.
+                        "campaign_name": f"JaneAds-{plan.business_id}-{plan.goal.value}-{uuid.uuid4().hex[:8]}",
                         "objective_type": "TRAFFIC",
                         "budget_mode": "BUDGET_MODE_INFINITE",
                         "operation_status": "DISABLE",
@@ -253,49 +268,78 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                 _raise_for_error(campaign_data, "campaign creation")
                 campaign_id = str(campaign_data["data"]["campaign_id"])
 
-                # 2. Video upload — UPLOAD_BY_URL lets TikTok fetch the hosted file
-                # directly (same "server fetches it, no re-streaming needed here"
-                # shape as Meta's /advideos file_url).
-                video_resp = await client.post(
-                    f"{self._api_base}/file/video/ad/upload/",
-                    headers=self._headers(),
-                    json={
-                        "advertiser_id": self._advertiser_id,
-                        "upload_type": "UPLOAD_BY_URL",
-                        "video_url": plan.creative.image_url,
-                        "file_name": f"jane-ads-{plan.business_id}-{uuid.uuid4().hex[:8]}.mp4",
-                    },
-                )
-                video_data = video_resp.json()
-                _raise_for_error(video_data, "video upload")
-                video_entry = video_data["data"][0] if isinstance(video_data["data"], list) else video_data["data"]
-                video_id = video_entry["video_id"]
+                video_id = ""
+                image_ids_for_ad: list[str] = []   # cover image (video path) or every
+                                                    # carousel slide (carousel path)
+                if not is_carousel:
+                    # 2. Video upload — UPLOAD_BY_URL lets TikTok fetch the hosted file
+                    # directly (same "server fetches it, no re-streaming needed here"
+                    # shape as Meta's /advideos file_url).
+                    video_resp = await client.post(
+                        f"{self._api_base}/file/video/ad/upload/",
+                        headers=self._headers(),
+                        json={
+                            "advertiser_id": self._advertiser_id,
+                            "upload_type": "UPLOAD_BY_URL",
+                            "video_url": plan.creative.image_url,
+                            "file_name": f"jane-ads-{plan.business_id}-{uuid.uuid4().hex[:8]}.mp4",
+                        },
+                    )
+                    video_data = video_resp.json()
+                    _raise_for_error(video_data, "video upload")
+                    video_entry = video_data["data"][0] if isinstance(video_data["data"], list) else video_data["data"]
+                    video_id = video_entry["video_id"]
 
-                # 2b. Cover image — confirmed live (2026-09-16): ad/create
-                # rejects a SINGLE_VIDEO creative with "You must upload an
-                # image." without an image_ids entry, even though the ad is
-                # purely a video. Re-upload the video's own auto-generated
-                # cover frame (video_cover_url, returned by the upload above)
-                # as an image asset rather than asking for a second creative
-                # input anywhere upstream — it's a required-but-cosmetic
-                # thumbnail, not a real second asset choice.
-                cover_url = video_entry.get("video_cover_url")
-                if not cover_url:
-                    raise TikTokAdsAPIError(f"video upload returned no video_cover_url: {video_entry}")
-                cover_resp = await client.post(
-                    f"{self._api_base}/file/image/ad/upload/",
-                    headers=self._headers(),
-                    json={
-                        "advertiser_id": self._advertiser_id,
-                        "upload_type": "UPLOAD_BY_URL",
-                        "image_url": cover_url,
-                        "file_name": f"jane-ads-{plan.business_id}-cover-{uuid.uuid4().hex[:8]}.jpg",
-                    },
-                )
-                cover_data = cover_resp.json()
-                _raise_for_error(cover_data, "cover image upload")
-                cover_entry = cover_data["data"][0] if isinstance(cover_data["data"], list) else cover_data["data"]
-                cover_image_id = cover_entry["image_id"]
+                    # 2b. Cover image — confirmed live (2026-09-16): ad/create
+                    # rejects a SINGLE_VIDEO creative with "You must upload an
+                    # image." without an image_ids entry, even though the ad is
+                    # purely a video. Re-upload the video's own auto-generated
+                    # cover frame (video_cover_url, returned by the upload above)
+                    # as an image asset rather than asking for a second creative
+                    # input anywhere upstream — it's a required-but-cosmetic
+                    # thumbnail, not a real second asset choice.
+                    cover_url = video_entry.get("video_cover_url")
+                    if not cover_url:
+                        raise TikTokAdsAPIError(f"video upload returned no video_cover_url: {video_entry}")
+                    cover_resp = await client.post(
+                        f"{self._api_base}/file/image/ad/upload/",
+                        headers=self._headers(),
+                        json={
+                            "advertiser_id": self._advertiser_id,
+                            "upload_type": "UPLOAD_BY_URL",
+                            "image_url": cover_url,
+                            "file_name": f"jane-ads-{plan.business_id}-cover-{uuid.uuid4().hex[:8]}.jpg",
+                        },
+                    )
+                    cover_data = cover_resp.json()
+                    _raise_for_error(cover_data, "cover image upload")
+                    cover_entry = cover_data["data"][0] if isinstance(cover_data["data"], list) else cover_data["data"]
+                    image_ids_for_ad = [cover_entry["image_id"]]
+                else:
+                    # 2-carousel. Carousel Ads (TikTok's real image-ad format — there is
+                    # no single-static-image ad unit) need every slide uploaded as its
+                    # own image asset, same UPLOAD_BY_URL call the video path's cover
+                    # image already uses, once per photo. NOT yet verified live — first
+                    # real attempt; if TikTok's ad/create rejects this for a missing
+                    # music_infos/music_id (their own docs say Carousel Ads require
+                    # music, no silent carousels), that's the next thing to add here,
+                    # discovered the same way every other TikTok requirement in this
+                    # file was (see the "Confirmed live" comments throughout).
+                    for i, url in enumerate(plan.creative.carousel_image_urls):
+                        img_resp = await client.post(
+                            f"{self._api_base}/file/image/ad/upload/",
+                            headers=self._headers(),
+                            json={
+                                "advertiser_id": self._advertiser_id,
+                                "upload_type": "UPLOAD_BY_URL",
+                                "image_url": url,
+                                "file_name": f"jane-ads-{plan.business_id}-carousel-{i}-{uuid.uuid4().hex[:8]}.jpg",
+                            },
+                        )
+                        img_data = img_resp.json()
+                        _raise_for_error(img_data, f"carousel image {i} upload")
+                        img_entry = img_data["data"][0] if isinstance(img_data["data"], list) else img_data["data"]
+                        image_ids_for_ad.append(img_entry["image_id"])
 
                 # 3. Ad group — the real budget + targeting + schedule live here.
                 # PAUSED via operation_status="DISABLE", same as every other create
@@ -354,38 +398,46 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                 # account, looked up once (see module comment for the Custom
                 # Identity deprecation this replaced).
                 identity_id, identity_bc_id = await self._get_authorized_identity(client)
+                creative_fields: dict = {
+                    # Confirmed live (2026-09-11): ad/create rejects the
+                    # creative with "Missing required field(s): 'ad_format'"
+                    # without this.
+                    "ad_format": "CAROUSEL_ADS" if is_carousel else "SINGLE_VIDEO",
+                    "ad_name": f"JaneAds-{plan.business_id}-ad",
+                    "ad_text": (plan.creative.primary_text or plan.creative.headline or "")[:100],
+                    "identity_id": identity_id,
+                    "identity_type": _IDENTITY_TYPE,
+                    # Confirmed live (2026-09-16): required alongside
+                    # identity_id for BC_AUTH_TT — ad/create rejects it
+                    # with '"Identity_type" and "Identity_bc_ID" don't
+                    # match.' without this.
+                    "identity_authorized_bc_id": identity_bc_id,
+                    "landing_page_url": dest_link,
+                    "call_to_action": "CONTACT_US",
+                }
+                if is_carousel:
+                    # NOT yet verified live. image_ids as every uploaded slide, in the
+                    # order the user attached them — no video_id at all for this
+                    # format. TikTok's own Carousel Ads docs say music is mandatory
+                    # (no silent carousels); if ad/create rejects this for a missing
+                    # music field, that's the very next thing to add here, the same
+                    # "confirmed live" way every other requirement in this file was.
+                    creative_fields["image_ids"] = image_ids_for_ad
+                else:
+                    creative_fields["video_id"] = video_id
+                    # Confirmed live (2026-09-16): SINGLE_VIDEO still requires a
+                    # cover image or ad/create fails with "You must upload an
+                    # image." — image_ids_for_ad here is the video's own
+                    # auto-generated cover frame, re-uploaded as an image asset.
+                    creative_fields["image_ids"] = image_ids_for_ad
+
                 ad_resp = await client.post(
                     f"{self._api_base}/ad/create/",
                     headers=self._headers(),
                     json={
                         "advertiser_id": self._advertiser_id,
                         "adgroup_id": adgroup_id,
-                        "creatives": [{
-                            # Confirmed live (2026-09-11): ad/create rejects the
-                            # creative with "Missing required field(s): 'ad_format'"
-                            # without this. SINGLE_VIDEO is the only shape this
-                            # adapter ever builds (video_id is always set — Phase 1
-                            # is video-only, see the module docstring).
-                            "ad_format": "SINGLE_VIDEO",
-                            "ad_name": f"JaneAds-{plan.business_id}-ad",
-                            "ad_text": (plan.creative.primary_text or plan.creative.headline or "")[:100],
-                            "video_id": video_id,
-                            # Confirmed live (2026-09-16): SINGLE_VIDEO still
-                            # requires a cover image or ad/create fails with
-                            # "You must upload an image." — cover_image_id from
-                            # step 2b (the video's own auto-generated cover
-                            # frame, re-uploaded as an image asset).
-                            "image_ids": [cover_image_id],
-                            "identity_id": identity_id,
-                            "identity_type": _IDENTITY_TYPE,
-                            # Confirmed live (2026-09-16): required alongside
-                            # identity_id for BC_AUTH_TT — ad/create rejects it
-                            # with '"Identity_type" and "Identity_bc_ID" don't
-                            # match.' without this.
-                            "identity_authorized_bc_id": identity_bc_id,
-                            "landing_page_url": dest_link,
-                            "call_to_action": "CONTACT_US",
-                        }],
+                        "creatives": [creative_fields],
                         "operation_status": "DISABLE",
                     },
                 )
