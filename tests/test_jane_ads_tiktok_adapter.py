@@ -211,6 +211,94 @@ def test_launch_campaign_happy_path_full_call_sequence():
     assert record["last_click_count"] == 0
 
 
+# ── Carousel Ads (image-only path, no video) ────────────────────────────────────────
+# TikTok has no single-static-image ad unit — a photo-only business reaches TikTok via
+# a Carousel Ad (2+ images) instead. campaign(POST), image upload x2(POST), ad
+# group(POST), identity lookup(GET), ad(POST) — same 5 POST/1 GET shape as the video
+# happy path, since carousel's 2 image uploads replace video's video+cover uploads.
+_CAROUSEL_RESPONSES = [
+    {"code": 0, "message": "OK", "data": {"campaign_id": "111"}},
+    {"code": 0, "message": "OK", "data": {"image_id": "img_a"}},
+    {"code": 0, "message": "OK", "data": {"image_id": "img_b"}},
+    {"code": 0, "message": "OK", "data": {"adgroup_id": "222"}},
+    {"code": 0, "message": "OK", "data": {"identity_list": [
+        {"identity_id": "identity_777", "identity_authorized_bc_id": "bc_555", "available_status": "AVAILABLE",
+         "username": "uri.creative", "display_name": "uricreative"},
+    ]}},
+    {"code": 0, "message": "OK", "data": {"ad_ids": ["333"]}},
+]
+
+
+def _carousel_plan(**kw) -> CampaignPlan:
+    kw.setdefault(
+        "creative",
+        AdCreative(
+            image_url="", is_video=False,
+            carousel_image_urls=["https://cdn.example.com/a.jpg", "https://cdn.example.com/b.jpg"],
+            headline="Fresh Cuts Daily", primary_text="Book on WhatsApp today",
+        ),
+    )
+    return _plan(**kw)
+
+
+def test_launch_campaign_carousel_happy_path():
+    adapter = _adapter()
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client(list(_CAROUSEL_RESPONSES))
+        MockClient.return_value.__aenter__.return_value = mock_client
+        result = _run(adapter.launch_campaign(_carousel_plan(), _auth()))
+
+    assert result.campaign_id == "111"
+    assert mock_client.post.call_count == 5
+    assert mock_client.get.call_count == 1
+
+    img1_json = mock_client.post.call_args_list[1].kwargs["json"]
+    assert img1_json["image_url"] == "https://cdn.example.com/a.jpg"
+    img2_json = mock_client.post.call_args_list[2].kwargs["json"]
+    assert img2_json["image_url"] == "https://cdn.example.com/b.jpg"
+
+    ad_json = mock_client.post.call_args_list[4].kwargs["json"]
+    creative = ad_json["creatives"][0]
+    assert creative["ad_format"] == "CAROUSEL_ADS"
+    assert creative["image_ids"] == ["img_a", "img_b"]
+    assert "video_id" not in creative
+
+
+def test_launch_campaign_single_carousel_image_still_raises():
+    # TikTok's Carousel Ads need 2+ images — one lone photo is exactly the case
+    # neither the video path nor the carousel path can serve.
+    adapter = _adapter()
+    plan = _carousel_plan(creative=AdCreative(
+        image_url="", is_video=False, carousel_image_urls=["https://cdn.example.com/a.jpg"],
+    ))
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client(list(_CAROUSEL_RESPONSES))
+        MockClient.return_value.__aenter__.return_value = mock_client
+        with pytest.raises(ValueError):
+            _run(adapter.launch_campaign(plan, _auth()))
+    assert mock_client.post.call_count == 0
+
+
+def test_campaign_name_is_unique_across_launches_with_the_same_business_and_goal():
+    # Live-caught 2026-09-21: TikTok rejected a second launch with "Campaign name
+    # already exists" because the name had no uniqueness suffix at all.
+    adapter = _adapter()
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client(list(_HAPPY_RESPONSES))
+        MockClient.return_value.__aenter__.return_value = mock_client
+        _run(adapter.launch_campaign(_plan(), _auth()))
+    name_1 = mock_client.post.call_args_list[0].kwargs["json"]["campaign_name"]
+
+    with patch("httpx.AsyncClient") as MockClient2:
+        mock_client_2 = _mock_client(list(_HAPPY_RESPONSES))
+        MockClient2.return_value.__aenter__.return_value = mock_client_2
+        _run(adapter.launch_campaign(_plan(), _auth()))
+    name_2 = mock_client_2.post.call_args_list[0].kwargs["json"]["campaign_name"]
+
+    assert name_1 != name_2
+    assert name_1.startswith("JaneAds-b1-")
+
+
 def test_launch_campaign_missing_whatsapp_raises_before_any_http_call():
     adapter = _adapter()
     plan = _plan(whatsapp_number="")

@@ -1829,6 +1829,13 @@ class MetaLaunchFromMessageBody(BaseModel):
     reference_image_url: str = ""         # required for creative_source=upload/recomposite (from
                                           # /creative/upload)
     is_video: bool = False                # is reference_image_url a video?
+    # TikTok-only, additive: 2+ extra photos for a TikTok Carousel Ad, alongside (never
+    # instead of) reference_image_url/is_video above — a lone static image isn't a valid
+    # TikTok ad unit at all (TikTok is video OR carousel, never single-image), so this is
+    # how a photo-only business can still reach TikTok without shooting a video. Ignored
+    # entirely for a Meta-bound plan; ignored here too unless there are 2+ URLs (see the
+    # tiktok_needs_video gate in _build_campaign_plan).
+    carousel_image_urls: list[str] = []
     draft_id: str = ""                    # required for creative_source=draft (from /creative/drafts)
     reuse_image_url: str = ""             # a refinement — keep the prior plan's image instead of
                                           # regenerating (a targeting/budget tweak shouldn't burn a
@@ -2709,10 +2716,18 @@ async def _build_campaign_plan(
     # any earlier value meant a genuinely uploaded video still got rejected,
     # because the free-text message parse has no way to know about it.
     # No-op for a Meta-bound plan.
-    if any(p.platform == Platform.TIKTOK for p in plan.platforms) and not creative.is_video:
+    #
+    # A TikTok Carousel Ad (2+ photos) is the other real way in — TikTok has no
+    # single-static-image ad unit at all, so "attach one more photo" is a genuine
+    # alternative to shooting a video, not a downgrade. body.carousel_image_urls
+    # carries those, kept separate from reference_image_url/is_video above.
+    has_carousel = len(body.carousel_image_urls) >= 2
+    if any(p.platform == Platform.TIKTOK for p in plan.platforms) and not creative.is_video and not has_carousel:
         return {"early_return": {"stage": "tiktok_needs_video", "understood": parsed.model_dump(),
-                "question": "TikTok only runs video ads. Upload or generate a video for this "
-                             "campaign, then ask for TikTok again."}}
+                "question": "TikTok needs either a video, or at least 2 photos for a carousel ad. "
+                             "Attach one of those for this campaign, then ask for TikTok again."}}
+    if has_carousel:
+        creative.carousel_image_urls = body.carousel_image_urls
 
     # 4.5. Policy gate — one bad ad can suspend the whole pooled ad account, so this
     # runs before a plan is ever shown as ready, not just right before launch.
