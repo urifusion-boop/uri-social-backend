@@ -261,6 +261,13 @@ class Settings(BaseSettings):
     # (all-users ad spend / margin). Overridable by the env var of the same name;
     # the default seeds the current admins so the report works without server config.
     JANE_ADS_ADMIN_EMAILS: str = "shorekoya@gmail.com,urisocialingsight@gmail.com"
+    # Comma-separated emails with global admin access (admin_router.py) — the
+    # bootstrap allowlist, always valid regardless of DB state. A user's own
+    # is_admin Mongo flag (grantable from the admin UI itself) is the other,
+    # DB-driven path in; either grants access. Ported from aws/prod, which
+    # never had this env var either — same default-seed convention as
+    # JANE_ADS_ADMIN_EMAILS above, so the panel works without server config.
+    ADMIN_EMAILS: str = "urisocialingsight@gmail.com,ujahnaomi104@gmail.com"
 
     # Sentry (optional)
     SENTRY_DSN: Optional[str] = None
