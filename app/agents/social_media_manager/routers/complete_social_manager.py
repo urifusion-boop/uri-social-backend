@@ -602,6 +602,19 @@ async def generate_content(
 
         if post_type == "carousel":
             from ..services.carousel_generation_service import CarouselGenerationService
+            # force_num_slides=True — this is the interactive "Create Post" flow
+            # (ContentGeneratorForm.tsx), which always sends a real, deliberate
+            # value (2-5, defaulting to 3 if untouched — see num_slides above).
+            # Without this flag, generate()'s own default value (also 3) is
+            # indistinguishable from "user explicitly picked 3," so picking 3
+            # silently fell through to content-based auto-detection instead —
+            # confirmed live: a caption mentioning "5 tips" produced 7 slides
+            # (5 + hook + CTA) when the user had picked 3. Every other explicit
+            # value (2/4/5) was already respected correctly; only 3 collided
+            # with the sentinel. Auto-generate (AutoGenerateTab) never reaches
+            # this call at all, and the separate v1-calendar draft-from-day
+            # carousel path deliberately still omits this flag — it relies on
+            # auto-detection since it has no slide-count picker of its own.
             result = await CarouselGenerationService.generate_multi_platform(
                 user_id=user_id,
                 seed_content=request.seed_content,
@@ -609,6 +622,7 @@ async def generate_content(
                 brand_context=brand_context_dict,
                 num_slides=num_slides,
                 db=db,
+                force_num_slides=True,
             )
         else:
             # story uses standard text gen but we tag it after; feed is unchanged
