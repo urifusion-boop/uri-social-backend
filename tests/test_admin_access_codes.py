@@ -7,7 +7,7 @@ tests/test_access_code_redeem.py; this file only covers the admin side:
 generating a code, listing codes, and inspecting who redeemed one.
 """
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 from fastapi import HTTPException
@@ -187,6 +187,81 @@ def test_list_redemptions_joins_email():
     result = _run(list_access_code_redemptions("asa26", admin_user=_admin(), db=db))
     assert result["count"] == 1
     assert result["redemptions"][0]["email"] == "partner@example.com"
+
+
+# ── effective_status: the code's own is_active and a redemption's revoked_at
+# are two DIFFERENT things, and displaying either one alone (or naively
+# assuming they always agree) is what produced the "shows Active and
+# Revoked at the same time" confusion — effective_status is the one field
+# that tells the truth about a SPECIFIC redemption regardless of what else
+# may have happened to the user's wallet since.
+
+def _redemption(**overrides):
+    now = datetime.utcnow()
+    base = {
+        "code": "ASA26", "user_id": "u1", "plan_tier_id": "starter",
+        "access_start": now, "access_end": now + timedelta(days=60),
+        "previous_subscription_tier": None, "redeemed_at": now,
+        "revoked_at": None, "revocation_reason": None,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_effective_status_active_when_still_the_current_grant():
+    from app.routers.admin_router import list_access_code_redemptions
+
+    db = FakeDb({
+        "access_code_redemptions": [_redemption()],
+        "user_credits": [{"user_id": "u1", "subscription_tier": "starter", "subscription_source": "access_code"}],
+    })
+    result = _run(list_access_code_redemptions("ASA26", admin_user=_admin(), db=db))
+    assert result["redemptions"][0]["effective_status"] == "active"
+
+
+def test_effective_status_revoked_takes_priority():
+    from app.routers.admin_router import list_access_code_redemptions
+
+    db = FakeDb({
+        "access_code_redemptions": [_redemption(revoked_at=datetime.utcnow(), revocation_reason="admin_revoked")],
+        "user_credits": [{"user_id": "u1", "subscription_tier": "starter", "subscription_source": "access_code"}],
+    })
+    result = _run(list_access_code_redemptions("ASA26", admin_user=_admin(), db=db))
+    assert result["redemptions"][0]["effective_status"] == "revoked"
+
+
+def test_effective_status_lapsed_when_access_end_passed():
+    from app.routers.admin_router import list_access_code_redemptions
+
+    db = FakeDb({
+        "access_code_redemptions": [_redemption(access_end=datetime.utcnow() - timedelta(days=1))],
+        "user_credits": [{"user_id": "u1", "subscription_tier": "starter", "subscription_source": "access_code"}],
+    })
+    result = _run(list_access_code_redemptions("ASA26", admin_user=_admin(), db=db))
+    assert result["redemptions"][0]["effective_status"] == "lapsed"
+
+
+def test_effective_status_superseded_when_wallet_moved_on_without_a_tracked_revoke():
+    """The exact bug report: this redemption was never marked revoked_at and
+    hasn't lapsed by date, but the wallet now reflects a DIFFERENT grant
+    (e.g. a later code redeemed before the no-stacking guard existed, or a
+    real subscription taken out some other way) — must not read as "Active"."""
+    from app.routers.admin_router import list_access_code_redemptions
+
+    db = FakeDb({
+        "access_code_redemptions": [_redemption()],  # plan_tier_id="starter", not revoked, not lapsed
+        "user_credits": [{"user_id": "u1", "subscription_tier": "pro", "subscription_source": "access_code"}],
+    })
+    result = _run(list_access_code_redemptions("ASA26", admin_user=_admin(), db=db))
+    assert result["redemptions"][0]["effective_status"] == "superseded"
+
+
+def test_effective_status_superseded_when_no_wallet_at_all():
+    from app.routers.admin_router import list_access_code_redemptions
+
+    db = FakeDb({"access_code_redemptions": [_redemption()]})  # no user_credits doc for u1
+    result = _run(list_access_code_redemptions("ASA26", admin_user=_admin(), db=db))
+    assert result["redemptions"][0]["effective_status"] == "superseded"
 
 
 # ── Assigned (personal invite) codes ────────────────────────────────────────

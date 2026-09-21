@@ -812,12 +812,41 @@ async def list_access_code_redemptions(
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """Who redeemed this code and when their access window started/ends —
-    joined against the users collection for a human-readable email per row."""
+    joined against the users collection for a human-readable email per row.
+
+    Each row also gets an `effective_status`, computed here rather than
+    trusting `revoked_at` alone: a redemption can stop being someone's
+    actual current grant WITHOUT ever being marked revoked_at — e.g. this
+    code was superseded before the no-double-redeeming guard existed, or
+    the person has since moved to a real paid subscription some other way.
+    Without this, the admin panel can show a code as "Revoked" while a
+    redemption of it still reads "Active" (or the reverse), which is
+    confusing/wrong even though each field is individually accurate."""
     code = code.strip().upper()
+    now = datetime.utcnow()
     redemptions = []
     async for r in db["access_code_redemptions"].find({"code": code}, {"_id": 0}).sort("redeemed_at", -1):
         user = await db["users"].find_one({"userId": r["user_id"]}, {"email": 1})
-        redemptions.append({**r, "email": (user or {}).get("email")})
+        wallet = await db["user_credits"].find_one(
+            {"user_id": r["user_id"]}, {"subscription_tier": 1, "subscription_source": 1}
+        )
+        is_current_grant = bool(
+            wallet
+            and wallet.get("subscription_source") == "access_code"
+            and wallet.get("subscription_tier") == r.get("plan_tier_id")
+        )
+        if r.get("revoked_at"):
+            effective_status = "revoked"
+        elif r.get("access_end") and r["access_end"] <= now:
+            effective_status = "lapsed"
+        elif not is_current_grant:
+            # Not revoked, not lapsed by date, yet no longer what's actually
+            # governing this person's wallet — something else took over
+            # without going through a tracked revoke/exhaustion path.
+            effective_status = "superseded"
+        else:
+            effective_status = "active"
+        redemptions.append({**r, "email": (user or {}).get("email"), "effective_status": effective_status})
     return {"code": code, "redemptions": redemptions, "count": len(redemptions)}
 
 
