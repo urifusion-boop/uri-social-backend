@@ -96,6 +96,9 @@ class CreditService:
             credits_used=wallet.credits_used,
             credits_remaining=wallet.credits_remaining,
             subscription_tier=wallet.subscription_tier,
+            subscription_source=wallet.subscription_source,
+            start_date=wallet.start_date,
+            end_date=wallet.end_date,
             next_renewal=wallet.next_renewal,
             low_credit_warning=low_credit_warning
         )
@@ -358,7 +361,46 @@ class CreditService:
             transaction.dict(exclude_none=True)
         )
 
+        if balance_after <= 0 and updated.get("subscription_source") == "access_code" and updated.get("subscription_tier"):
+            await self._revoke_exhausted_comp_grant(user_id)
+
         return True
+
+    async def _revoke_exhausted_comp_grant(self, user_id: str) -> None:
+        """
+        A comp grant (redeemed access code) ends whichever comes first:
+        end_date, or running out of credits — it never refills mid-window
+        the way a real paid subscription does (that's the whole point of
+        subscription_source='access_code': it was granted once, deliberately
+        not on a renewal cycle). This is the "runs out of credits" half of
+        that rule, mirrored on the redemption record for auditability so an
+        admin looking at Access Codes sees WHY access ended, not just that
+        it did.
+        """
+        await self.user_credits_collection.update_one(
+            {"user_id": user_id},
+            {"$set": {
+                "subscription_tier": None,
+                "subscription_credits": 0,
+                "subscription_source": None,
+                "start_date": None,
+                "end_date": None,
+                "updated_at": datetime.utcnow(),
+            }},
+        )
+        # Most recent unrevoked redemption specifically — a user could have
+        # redeemed an earlier code that already lapsed by end_date (which
+        # never sets revoked_at, only this early-exhaustion path does), so a
+        # bare "revoked_at: None" match without picking the newest one could
+        # hit a stale record instead of the grant that was actually just spent.
+        current = await self.db["access_code_redemptions"].find_one(
+            {"user_id": user_id, "revoked_at": None}, sort=[("redeemed_at", -1)],
+        )
+        if current:
+            await self.db["access_code_redemptions"].update_one(
+                {"user_id": user_id, "code": current["code"], "redeemed_at": current["redeemed_at"]},
+                {"$set": {"revoked_at": datetime.utcnow(), "revocation_reason": "credits_exhausted"}},
+            )
 
     # ==================== PRD 6.3: Payment Flow - Credit Allocation ====================
 

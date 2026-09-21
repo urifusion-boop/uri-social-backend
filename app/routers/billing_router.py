@@ -642,6 +642,7 @@ async def redeem_access_code(
             "$set": {
                 "subscription_tier": tier_id,
                 "subscription_credits": tier.get("credits_monthly", tier.get("credits", 0)),
+                "subscription_source": "access_code",  # flags this for the credits-exhausted auto-revoke rule
                 "billing_cycle": "monthly",
                 "start_date": now,
                 "end_date": access_end,

@@ -65,6 +65,18 @@ class UserCreditWallet(BaseModel):
     end_date: Optional[datetime] = Field(default=None, description="Subscription end date (auto-expire after this)")
     next_renewal: Optional[datetime] = Field(default=None, description="Next billing cycle date")
 
+    # Distinguishes a real paid subscription from an access-code comp grant.
+    # A comp grant gets its credits_monthly allocation ONCE at redemption,
+    # deliberately never refilled (next_renewal stays None so it can never
+    # auto-charge) — so unlike a paid subscription, running out of credits
+    # before end_date means the grant is genuinely spent, not just due for
+    # its next monthly top-up. CreditService.deduct_credit checks this flag
+    # to auto-revoke the tier the moment credits hit 0, rather than leaving
+    # a hollow "Starter" badge with nothing usable behind it until end_date.
+    subscription_source: Optional[str] = Field(
+        default=None, description="'access_code' if subscription_tier came from a redeemed comp code, else None (paid)"
+    )
+
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
@@ -386,6 +398,7 @@ class CreditBalanceResponse(BaseModel):
     credits_used: int
     credits_remaining: int
     subscription_tier: Optional[str] = None
+    subscription_source: Optional[str] = Field(default=None, description="'access_code' if this tier is a comp grant, else None (paid)")
     billing_cycle: Optional[str] = Field(default="monthly", description="monthly|3_months|6_months|12_months")
     start_date: Optional[datetime] = Field(default=None, description="Subscription start date")
     end_date: Optional[datetime] = Field(default=None, description="Subscription end date")
@@ -491,6 +504,13 @@ class AccessCodeRedemption(BaseModel):
         default=None, description="What the user had before redeeming, for support/audit visibility"
     )
     redeemed_at: datetime = Field(default_factory=datetime.utcnow)
+    # Set the moment CreditService.deduct_credit sees this grant's credits
+    # hit 0 — a comp grant ends whichever comes first: end_date, or running
+    # out of credits. None while access is still live (whether still active
+    # or naturally lapsed by end_date via the daily expiry sweep, which
+    # doesn't touch these two fields — only genuine early exhaustion does).
+    revoked_at: Optional[datetime] = None
+    revocation_reason: Optional[str] = Field(default=None, description="e.g. 'credits_exhausted'")
 
 
 class RedeemAccessCodeRequest(BaseModel):
