@@ -189,6 +189,19 @@ async def _load_revisions(db, thread_id: str) -> dict:
         return {}
 
 
+def _duration_days(plan: dict, req: dict) -> int:
+    """How many days the campaign runs.
+
+    The figure is on the per-platform plan (PlatformPlan.days), not the plan root —
+    reading the root returned 0 on every record, a duration no campaign has ever had.
+    """
+    for entry in (plan.get("platforms") or []):
+        days = entry.get("days")
+        if days:
+            return int(days)
+    return int(plan.get("days") or req.get("days") or 0)
+
+
 def _bucket_context(understood: dict, plan: dict, req: dict, stated_budget_ngn: float) -> dict:
     """The keys every future comparison is sliced by (CI-SPEC-01 §2.2).
 
@@ -304,8 +317,13 @@ async def write_campaign_record(
                     recommended and selected
                     and recommended.get("rank") != selected.get("rank")
                 ),
-                "corpus_coverage": plan.get("corpus_coverage") or creative.get("corpus_coverage") or "none",
-                "corpus_records_cited": plan.get("corpus_citations") or [],
+                # Citations live on the CREATIVE, not the plan root — the plan carries
+                # coverage, the creative carries the records that shaped the copy.
+                # Reading them off the plan silently produced an empty list beside a
+                # "full" coverage label, which is worse than either alone: it says the
+                # corpus reached this campaign and names nothing.
+                "corpus_coverage": creative.get("corpus_coverage") or plan.get("corpus_coverage") or "none",
+                "corpus_records_cited": creative.get("corpus_citations") or plan.get("corpus_citations") or [],
             },
 
             "creative": {
@@ -321,7 +339,9 @@ async def write_campaign_record(
                 "stated_ngn": stated_budget_ngn,
                 "effective_spend_ngn": ad_spend_ngn,
                 "service_fee_ngn": service_fee_ngn,
-                "duration_days": plan.get("days") or req.get("days") or 0,
+                # days lives on the per-platform plan, not the plan root. Reading the
+                # root gave 0 on every record — a duration no campaign has ever had.
+                "duration_days": _duration_days(plan, req),
                 "budget_tier": _bucket_context(understood, plan, req, stated_budget_ngn)["budget_tier"],
                 "budget_source": "user_stated" if req.get("budget_ngn") else "derived_from_goal",
                 "goal_stated": understood.get("desired_conversions"),
@@ -453,19 +473,28 @@ async def backfill_all_missing(db, adapter, limit: int = 200) -> dict:
     try:
         cursor = db[RECORDS].find(
             {"$or": [{"results": None}, {"results": {"$exists": False}}]},
-            {"_id": 0, "campaign_id": 1},
+            {"_id": 0, "campaign_id": 1, "context.platform": 1},
         ).sort("created_at", -1).limit(limit)
         pending = await cursor.to_list(length=limit)
     except Exception as e:
         print(f"[CampaignRecord] backfill scan failed: {e}", flush=True)
         return {"filled": 0, "failed": 0}
 
-    filled = failed = 0
+    filled = failed = skipped = 0
     for row in pending:
+        # The Meta adapter cannot fetch a TikTok campaign — live-observed failing with
+        # "Object with ID '1876668166519953' does not exist" on a TikTok record, which
+        # reads like a deleted campaign and is really the wrong platform's API. Skip
+        # rather than fail: a TikTok record is not broken, it just needs its own
+        # adapter, and counting it as a failure hides real ones.
+        if (row.get("context") or {}).get("platform", "meta") != "meta":
+            skipped += 1
+            continue
         got = await backfill_results(db, adapter, row.get("campaign_id", ""))
         if got:
             filled += 1
         else:
             failed += 1
-    print(f"[CampaignRecord] backfill: {filled} filled, {failed} failed", flush=True)
-    return {"filled": filled, "failed": failed}
+    print(f"[CampaignRecord] backfill: {filled} filled, {failed} failed, "
+          f"{skipped} skipped (not Meta)", flush=True)
+    return {"filled": filled, "failed": failed, "skipped": skipped}
