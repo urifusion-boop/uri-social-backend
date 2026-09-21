@@ -55,7 +55,6 @@ from app.services.AIService import AIService
 
 from app.agents.social_media_manager.services.holiday_calendar_service import HolidayCalendarService
 from app.agents.social_media_manager.services.cultural_moment_service import CulturalMomentService
-from app.agents.social_media_manager.services.industry_trend_service import IndustryTrendService
 
 # Pure, stateless helpers reused directly from v1 — see module docstring.
 from app.agents.social_media_manager.services.content_calendar_service import (
@@ -209,18 +208,26 @@ def _as_creative_device(v: Any) -> Dict[str, str]:
 async def _fetch_creative_memory(scope: Dict[str, Any], db: AsyncIOMotorDatabase) -> Dict[str, Any]:
     """Remembers WHAT was used before, never how it performed — the exact
     line PRD §20 draws ('we already used X' is fine; 'X performed well, make
-    another' is not). Extends the prior titles/key_points-only lookback to
-    also track territory/subject/angle/device/format/concept-name, still via
-    the same 2-most-recent-plans query — no new collection needed."""
+    another' is not). Tracks territory/subject/angle/device/format/concept-
+    name/hook/cta/visual-concept — 8 of PRD §20's 9 listed dimensions (the
+    9th, content series, has its own history once a series is actually
+    assigned — see series_names below), still via the same 2-most-recent-
+    plans query, no new collection needed.
+
+    hooks/ctas/visual_concepts were the 3 PRD §20 dimensions missing before
+    this pass — a repeated hook or CTA is what a real reader actually
+    notices, more than an internal territory/angle key repeating."""
     memory: Dict[str, Any] = {
         "titles": [], "key_points": [], "territories": [], "subjects": [],
         "angles": [], "devices": [], "formats": [], "concept_names": [],
+        "hooks": [], "ctas": [], "visual_concepts": [], "series_names": [],
     }
     async for past in db[COLLECTION].find(
         {**scope},
         {"_id": 0, "items.title": 1, "items.key_points": 1, "items.territory": 1,
          "items.subject": 1, "items.creative_angle": 1, "items.creative_device": 1,
-         "items.format": 1, "items.creative_concept_name": 1},
+         "items.format": 1, "items.creative_concept_name": 1, "items.hook": 1,
+         "items.cta": 1, "items.creative_direction": 1, "items.series_name": 1},
     ).sort("created_at", -1).limit(2):
         for it in past.get("items", []):
             if it.get("title"):
@@ -239,6 +246,15 @@ async def _fetch_creative_memory(scope: Dict[str, Any], db: AsyncIOMotorDatabase
                 memory["formats"].append(it["format"])
             if it.get("creative_concept_name"):
                 memory["concept_names"].append(it["creative_concept_name"])
+            if it.get("hook"):
+                memory["hooks"].append(it["hook"])
+            if it.get("cta"):
+                memory["ctas"].append(it["cta"])
+            visual_idea = (it.get("creative_direction") or {}).get("central_visual_idea")
+            if visual_idea:
+                memory["visual_concepts"].append(visual_idea)
+            if it.get("series_name"):
+                memory["series_names"].append(it["series_name"])
     return memory
 
 
@@ -358,8 +374,7 @@ async def _generate_candidate_concepts(
     existing_assets_summary: str,
     creative_memory: Dict[str, Any],
     platforms: List[str],
-    cultural_moments: Optional[List[Any]] = None,  # entries are strings today (CulturalMomentService.get_trending_topics)
-    industry_best_practices: Optional[Any] = None,
+    cultural_moments: Optional[List[Any]] = None,  # real dated events only — CulturalMomentService.get_cultural_moments()
     target_count: int = CANDIDATE_POOL_SIZE,
 ) -> List[Dict[str, Any]]:
     """Generates 80-150 structured CONCEPTS — territory/subject/angle/
@@ -368,7 +383,14 @@ async def _generate_candidate_concepts(
     WHAT to say, not yet writing exactly how to say it'). NEVER receives
     performance or trend_keywords — that's the concrete enforcement of
     PRD §2, not just a prompt instruction: those objects simply don't exist
-    in this function's argument list."""
+    in this function's argument list.
+
+    industry_best_practices was deliberately removed from this signature —
+    IndustryTrendService.get_industry_best_practices() returns fabricated
+    engagement statistics ("Educational content drives 2.3x more engagement
+    in tech") presented as fact. That's PRD §2's very first banned input
+    (historical engagement performance) and a §31 fabrication violation at
+    the same time, and it was being injected straight into this prompt."""
     brand_name = brand.get("brand_name") or "the brand"
     industry = brand.get("industry") or "business"
     audience = brand.get("target_audience") or "general audience"
@@ -391,17 +413,19 @@ async def _generate_candidate_concepts(
         f"- {cat}: " + ", ".join(d["label"] for d in devices)
         for cat, devices in framework["creative_devices"].items()
     )
+    series_templates = framework.get("series_templates") or []
+    series_block = "\n".join(f'- "{s["name"]}"' for s in series_templates)
+    prior_series = creative_memory.get("series_names") or []
+    prior_series_block = (
+        "\nSeries already used for this business — prefer reusing one of these over starting a new one, "
+        "so it actually recurs recognizably: " + ", ".join(dict.fromkeys(prior_series))
+    ) if prior_series else ""
 
     context_lines = []
-    if industry_best_practices:
-        context_lines.append(f"Industry best practices: {industry_best_practices}")
     if cultural_moments:
-        # CulturalMomentService.get_trending_topics() (what generate_plan_v2
-        # actually calls this list from) always returns List[str] — a
-        # SEPARATE method, get_cultural_moments(), returns List[Dict] with a
-        # "name" key. Handle both shapes defensively rather than assume one
-        # (confirmed live: assuming dicts crashed every real call, since
-        # trending_topics is what's actually wired in).
+        # Real dated events only (CulturalMomentService.get_cultural_moments)
+        # — List[Dict] with a "name" key. String entries handled too, kept
+        # defensive since this list is built from an external service.
         names = [
             (m.get("name") or m.get("topic") or str(m)) if isinstance(m, dict) else str(m)
             for m in cultural_moments[:5]
@@ -409,13 +433,33 @@ async def _generate_candidate_concepts(
         context_lines.append(f"Relevant cultural moments this period: {', '.join(names)}")
     context_block = ("\n" + "\n".join(context_lines)) if context_lines else ""
 
-    avoid_block = ""
+    avoid_parts = []
     if creative_memory.get("concept_names"):
-        avoid_block = (
-            "\nAlready explored recently — do not repeat these concept names or their "
+        avoid_parts.append(
+            "Already explored recently — do not repeat these concept names or their "
             "underlying territory+subject+angle combination:\n"
             + "\n".join(f"- {c}" for c in creative_memory["concept_names"][:30])
         )
+    # PRD §20's other 2 remembered dimensions besides concept/territory/subject/
+    # angle — a repeated hook or CTA is what a real reader actually notices.
+    if creative_memory.get("hooks"):
+        avoid_parts.append(
+            "Already-used hooks — do not reuse or closely rephrase these:\n"
+            + "\n".join(f"- {h}" for h in creative_memory["hooks"][:30])
+        )
+    if creative_memory.get("ctas"):
+        distinct_ctas = list(dict.fromkeys(creative_memory["ctas"]))[:10]
+        if distinct_ctas:
+            avoid_parts.append(
+                "Recently-used CTAs — vary the call to action, don't default back to these every time:\n"
+                + "\n".join(f"- {c}" for c in distinct_ctas)
+            )
+    if creative_memory.get("visual_concepts"):
+        avoid_parts.append(
+            "Already-used central visual ideas — do not repeat these:\n"
+            + "\n".join(f"- {v}" for v in creative_memory["visual_concepts"][:30])
+        )
+    avoid_block = ("\n" + "\n".join(avoid_parts)) if avoid_parts else ""
 
     assets_block = f"\nExisting assets available: {existing_assets_summary}" if existing_assets_summary else ""
 
@@ -442,6 +486,10 @@ Available Angles: {angles_block}
 Available Creative Devices:
 {devices_block}
 
+Recurring content series available (PRD §21) — recognizable branded formats
+that build audience familiarity over time:
+{series_block}{prior_series_block}
+
 Generate exactly {n} DISTINCT candidate concepts. This is IDEATION only —
 DO NOT write titles, hooks, captions, or any final copy. Just decide WHAT
 each idea is, not HOW to say it yet.
@@ -460,13 +508,18 @@ For each concept, return:
 - audience_segment: which part of the audience this speaks to, 3-6 words — specific
   (e.g. "first-time buyers hesitant on price"), never "everyone" or "customers"
 - concept_name: a short 3-6 word internal name for this idea (e.g. "The Upfront Cost Trap")
+- series_name: OPTIONAL, null for most concepts. Only set this when the idea genuinely
+  fits one of the series above (use its exact name). Across this whole batch, use at
+  most 2-3 distinct series total, and only if you can genuinely assign the SAME series
+  name to several different concepts — a series used exactly once isn't recurring,
+  don't invent one just to fill this field.
 
 No two concepts in this batch may share the same territory+subject+angle combination.
 Never rely on historical engagement, trending topics, or search data — these
 concepts must come purely from business/audience/brand/creative-framework
 reasoning (nothing else exists in this task).
 
-Return ONLY a valid JSON array of exactly {n} objects with exactly these 7 keys, nothing else."""
+Return ONLY a valid JSON array of exactly {n} objects with exactly these 8 keys, nothing else."""
         # One retry on parse failure — was a bare try/except with no retry at
         # all, so a single malformed response silently dropped the whole
         # chunk (confirmed live: a framework-config bug made this fail
@@ -904,9 +957,22 @@ def _rule_based_diversity_issues(items: List[Dict[str, Any]]) -> Dict[int, str]:
     run because devices/angles legitimately recur across 30 days), and
     genuinely repeated territory+subject+angle on adjacent days (a much
     stronger, more specific signal than the old content_type+format pair
-    the earlier version compared)."""
+    the earlier version compared).
+
+    Also covers 2 of PRD §14's checks that had no implementation before this
+    pass: repeated CTAs and repeated visual concepts/metaphors. Both are
+    deliberately looser than the title/territory checks above, for the same
+    reason hooks were dropped from strict adjacent-pair comparison — a CTA
+    like "Shop Now" or "Send Message" legitimately recurring isn't a defect
+    on its own, PRD §14 calls out CTAs being *overused* specifically. So CTA
+    repetition only flags when one CTA dominates the whole batch (>40% of
+    items) rather than any two-in-a-row match, while visual concepts (long,
+    specific sentences — much lower legitimate-recurrence risk than a short
+    CTA) reuse the same adjacent-opening-words check as titles."""
     issues: Dict[int, str] = {}
     seen_openings: Dict[str, int] = {}
+    seen_visual_openings: Dict[str, int] = {}
+    cta_counts: Dict[str, int] = {}
     for i, item in enumerate(items):
         title = str(item.get("title") or "").strip().lower()
         opening = " ".join(title.split()[:5])
@@ -920,6 +986,22 @@ def _rule_based_diversity_issues(items: List[Dict[str, Any]]) -> Dict[int, str]:
                     and item.get("subject") == prev.get("subject")
                     and item.get("angle") == prev.get("angle")):
                 issues[i] = issues.get(i, "") + "; repeats prior day's territory+subject+angle"
+        visual_idea = str((item.get("creative_direction") or {}).get("central_visual_idea") or "").strip().lower()
+        visual_opening = " ".join(visual_idea.split()[:6])
+        if visual_opening and visual_opening in seen_visual_openings:
+            issues[i] = issues.get(i, "") + f"; visual concept repeats day {seen_visual_openings[visual_opening]}"
+        elif visual_opening:
+            seen_visual_openings[visual_opening] = i
+        cta = str(item.get("cta") or "").strip().lower()
+        if cta:
+            cta_counts[cta] = cta_counts.get(cta, 0) + 1
+
+    if items:
+        dominant_cta, dominant_count = max(cta_counts.items(), key=lambda kv: kv[1], default=(None, 0))
+        if dominant_cta and dominant_count > max(3, int(len(items) * 0.4)):
+            for i, item in enumerate(items):
+                if str(item.get("cta") or "").strip().lower() == dominant_cta:
+                    issues[i] = issues.get(i, "") + f'; CTA "{item.get("cta")}" overused ({dominant_count}/{len(items)} items)'
     return issues
 
 
@@ -1544,22 +1626,28 @@ async def _build_plan_doc(
     existing_assets_summary = await _get_existing_assets_summary(user_id, brand_id, db)
     has_active_promo = bool((brand.get("business_pulse") or {}).get("current_promotions"))
 
-    # Date/holiday/cultural signals — still valid, non-performance inputs (PRD §18)
+    # Date/holiday/cultural signals — real dated events only, non-performance
+    # inputs (PRD §18). get_cultural_moments() (not get_trending_topics(),
+    # which only ever returns a hardcoded SIMULATED_TRENDS placeholder dict
+    # of fake industry buzzwords — the exact "trending topics" PRD §2 bans,
+    # confirmed live never even used the date it was passed) — this is the
+    # real, dated-proximity-filtered event list §18 actually asks for.
     all_dates = [(period_start + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(PLAN_DAYS)]
     holidays_by_date: Dict[str, Dict[str, Any]] = {}
-    cultural_moments_all: List[Any] = []  # strings (CulturalMomentService.get_trending_topics), not dicts
+    cultural_moments_all: List[Any] = []
     for chunk_start_idx in range(0, PLAN_DAYS, 7):
         chunk_week_start = all_dates[chunk_start_idx]
         for h in HolidayCalendarService.get_upcoming_holidays(chunk_week_start, region, industry) or []:
             holidays_by_date[h["date"]] = h
-        cultural_moments_all += CulturalMomentService.get_trending_topics(industry, region, chunk_week_start) or []
-    industry_best_practices = IndustryTrendService.get_industry_best_practices(industry)
+        cultural_moments_all += CulturalMomentService.get_cultural_moments(chunk_week_start, region) or []
 
-    # Step 3 — candidate pool (never receives performance/trend data)
+    # Step 3 — candidate pool (never receives performance/trend data).
+    # industry_best_practices deliberately no longer sourced or passed here —
+    # see _generate_candidate_concepts's own docstring for why.
     candidates = await _generate_candidate_concepts(
         brand=brand, framework=framework, existing_assets_summary=existing_assets_summary,
         creative_memory=creative_memory, platforms=platforms,
-        cultural_moments=cultural_moments_all, industry_best_practices=industry_best_practices,
+        cultural_moments=cultural_moments_all,
     )
     if not candidates:
         raise RuntimeError("Content Calendar V2 generation failed — no candidate concepts produced.")
@@ -1680,6 +1768,10 @@ async def _build_plan_doc(
     ]) if candidate_indices else []
     ad_copy_by_index = dict(zip(candidate_indices, ad_copies))
 
+    # PRD §21 — every item sharing a series_name within this plan gets the
+    # same series_id, so the frontend can group/highlight a recurring series
+    # as one thing rather than N unrelated items that happen to share a label.
+    series_ids_by_name: Dict[str, str] = {}
     items_out: List[Dict[str, Any]] = []
     for i, idea in enumerate(all_items):
         day_index = idea.get("day_index", i)
@@ -1767,8 +1859,11 @@ async def _build_plan_doc(
             "ad_opportunity": ad_opportunity,
             "primary_kpi": idea.get("primary_kpi", "engagement"),
             "selection_score": idea.get("selection_score", {}),
-            "series_id": None,
-            "series_name": None,
+            "series_id": (
+                series_ids_by_name.setdefault(idea["series_name"], str(uuid.uuid4()))
+                if idea.get("series_name") else None
+            ),
+            "series_name": idea.get("series_name"),
             "creative_quality_review_note": anti_boring_notes.get(day_index),
             "diversity_check": {
                 "passed": day_index not in flagged_set,
@@ -1812,7 +1907,6 @@ async def _build_plan_doc(
         "intelligence_snapshot": {
             "holidays": list(holidays_by_date.values()),
             "cultural_moments": cultural_moments_all[:10],
-            "industry_best_practices": industry_best_practices,
         },
         "territory_mix": {k: round(v / n_items, 2) for k, v in territory_counts.items()},
         "content_mix": {k: round(v / n_items, 2) for k, v in content_type_counts.items()},
