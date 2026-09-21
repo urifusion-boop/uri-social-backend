@@ -27,12 +27,14 @@ def _run(coro):
 class FakeCollection:
     def __init__(self, docs=None):
         self.docs: list[dict] = docs or []
+        self._next_id = 1
 
-    async def find_one(self, query):
-        for d in self.docs:
-            if all(d.get(k) == v for k, v in query.items()):
-                return dict(d)
-        return None
+    async def find_one(self, query, sort=None):
+        matches = [d for d in self.docs if all(d.get(k) == v for k, v in query.items())]
+        if sort:
+            key, direction = sort[0]
+            matches.sort(key=lambda d: d.get(key), reverse=(direction == -1))
+        return dict(matches[0]) if matches else None
 
     async def insert_one(self, doc):
         self.docs.append(dict(doc))
@@ -50,6 +52,8 @@ class FakeCollection:
             new_doc.update(update.get("$set", {}))
             for k, v in (update.get("$inc") or {}).items():
                 new_doc[k] = new_doc.get(k, 0) + v
+            new_doc.setdefault("_id", f"fake-id-{self._next_id}")  # real Mongo always assigns one on insert
+            self._next_id += 1
             self.docs.append(new_doc)
 
 
@@ -200,6 +204,73 @@ def test_unassigned_code_still_redeemable_by_anyone(fake_db):
     # assigned_to_email stays unset (default) — the existing shared-code path.
     result = _redeem("ASA26", "user-1", user_email="whoever@example.com")
     assert result["status"] is True
+
+
+# ── No stacking: one comp grant in effect at a time ─────────────────────────
+
+def _second_code(fake_db, code="OTHER1", tier_id="starter", duration_days=30):
+    fake_db["access_codes"].docs.append({
+        "code": code, "plan_tier_id": tier_id, "duration_days": duration_days,
+        "max_redemptions": None, "redemption_count": 0, "is_active": True,
+        "expires_at": None, "label": "", "created_by": "admin@urisocial.com",
+        "created_at": datetime.utcnow(),
+    })
+
+
+def test_cannot_redeem_a_new_code_while_a_comp_grant_is_still_active(fake_db):
+    _second_code(fake_db)
+    _redeem("ASA26", "user-1")  # grants the first comp plan, 20 credits, ~60 days
+
+    with pytest.raises(HTTPException) as exc_info:
+        _redeem("OTHER1", "user-1")
+    assert exc_info.value.status_code == 400
+    assert "already have an active comp" in exc_info.value.detail.lower()
+    # Untouched — the rejected attempt must not overwrite the existing grant.
+    wallet = fake_db["user_credits"].docs[0]
+    assert wallet["subscription_tier"] == "starter"
+    assert wallet["subscription_credits"] == 20
+
+
+def test_can_redeem_a_new_code_once_the_first_comp_grant_was_exhausted(fake_db):
+    _second_code(fake_db)
+    _redeem("ASA26", "user-1")
+    # Simulate CreditService's own auto-revoke-on-exhaustion having already run.
+    fake_db["user_credits"].docs[0].update({
+        "subscription_tier": None, "subscription_source": None,
+        "subscription_credits": 0, "end_date": None,
+    })
+
+    result = _redeem("OTHER1", "user-1")
+    assert result["status"] is True
+    assert fake_db["user_credits"].docs[0]["subscription_tier"] == "starter"
+
+
+def test_can_redeem_a_new_code_once_the_first_comp_grant_naturally_expired(fake_db):
+    _second_code(fake_db)
+    _redeem("ASA26", "user-1")
+    # Simulate the daily expire_subscriptions() sweep not having run YET —
+    # end_date is in the past, but the wallet fields haven't been cleared.
+    # The guard must go by end_date itself, not wait for that sweep.
+    fake_db["user_credits"].docs[0]["end_date"] = datetime.utcnow() - timedelta(days=1)
+
+    result = _redeem("OTHER1", "user-1")
+    assert result["status"] is True
+
+
+def test_stacking_guard_does_not_block_overriding_an_active_paid_subscription(fake_db):
+    _second_code(fake_db)
+    fake_db["user_credits"].docs.append({
+        "_id": "fake-object-id", "user_id": "user-1", "subscription_tier": "pro",
+        "subscription_source": None, "bonus_credits": 0, "subscription_credits": 40,
+        "frozen_credits": 0, "credits_used": 0, "total_credits": 40, "credits_remaining": 40,
+        "end_date": datetime.utcnow() + timedelta(days=20),
+    })
+    # A real paid subscriber redeeming a comp code is intended to override it
+    # outright (see redeem's own "previous_subscription_tier" audit trail) —
+    # only comp-on-comp stacking is blocked, never comp-over-paid.
+    result = _redeem("ASA26", "user-1")
+    assert result["status"] is True
+    assert fake_db["user_credits"].docs[0]["subscription_tier"] == "starter"
 
 
 if __name__ == "__main__":

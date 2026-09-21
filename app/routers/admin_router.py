@@ -839,10 +839,18 @@ async def update_access_code(
     if "assigned_to_email" in updates:
         normalized = updates["assigned_to_email"].strip().lower()
         updates["assigned_to_email"] = normalized or None
-    result = await db["access_codes"].update_one({"code": code.strip().upper()}, {"$set": updates})
+    code = code.strip().upper()
+    result = await db["access_codes"].update_one({"code": code}, {"$set": updates})
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail=f"Code '{code}' not found")
-    updated = await db["access_codes"].find_one({"code": code.strip().upper()}, {"_id": 0})
+
+    revoked_user_ids: List[str] = []
+    if updates.get("is_active") is False:
+        # A deliberate revoke means "stop this now" — cut off anyone
+        # CURRENTLY benefiting from it too, not just future redemptions.
+        revoked_user_ids = await credit_service.revoke_comp_grants_for_code(code)
+
+    updated = await db["access_codes"].find_one({"code": code}, {"_id": 0})
     assigned_email = updated.get("assigned_to_email")
     if assigned_email:
         assigned_user = await db["users"].find_one({"email": assigned_email}, {"first_name": 1, "last_name": 1})
@@ -851,6 +859,7 @@ async def update_access_code(
     else:
         updated["assigned_to_name"] = None
         updated["status"] = "unassigned"
+    updated["revoked_active_users"] = len(revoked_user_ids)
     return updated
 
 
