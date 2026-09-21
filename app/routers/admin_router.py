@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from pydantic import BaseModel, Field
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 import asyncio
 import secrets
 import string
@@ -848,6 +848,81 @@ async def list_access_code_redemptions(
             effective_status = "active"
         redemptions.append({**r, "email": (user or {}).get("email"), "effective_status": effective_status})
     return {"code": code, "redemptions": redemptions, "count": len(redemptions)}
+
+
+@router.post("/access-codes/{code}/redemptions/{user_id}/restore")
+async def restore_access_code_redemption(
+    code: str,
+    user_id: str,
+    admin_user: dict = Depends(verify_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """The counterpart to revoke, but for ONE specific redeemer rather than
+    the whole code — for when an admin decides a revoke (or an exhaustion)
+    was a mistake, or wants to give someone a fresh window. Grants a full
+    duration_days allocation of the code's plan starting now (not a resumed
+    countdown from the old access_end) and clears this redemption's
+    revoked_at/revocation_reason. Blocked if the person currently has a
+    DIFFERENT comp grant still active — that has to end first, same rule
+    as redeeming a fresh code."""
+    code = code.strip().upper()
+    access_code = await db["access_codes"].find_one({"code": code})
+    if not access_code:
+        raise HTTPException(status_code=404, detail=f"Code '{code}' not found")
+    redemption = await db["access_code_redemptions"].find_one({"code": code, "user_id": user_id})
+    if not redemption:
+        raise HTTPException(status_code=404, detail="No redemption of this code by this user")
+
+    tier = await db["subscription_tiers"].find_one({"tier_id": access_code["plan_tier_id"]})
+    if not tier:
+        raise HTTPException(status_code=500, detail=f"Plan '{access_code['plan_tier_id']}' no longer exists")
+
+    wallet = await db["user_credits"].find_one({"user_id": user_id})
+    has_different_active_comp_grant = (
+        wallet
+        and wallet.get("subscription_source") == "access_code"
+        and wallet.get("subscription_tier")
+        and wallet.get("subscription_tier") != access_code["plan_tier_id"]
+        and (not wallet.get("end_date") or wallet["end_date"] > datetime.utcnow())
+    )
+    if has_different_active_comp_grant:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"This person has a different active comp {wallet.get('subscription_tier')} plan — "
+                "that has to end or run out before you can restore this one."
+            ),
+        )
+
+    now = datetime.utcnow()
+    access_end = now + timedelta(days=access_code["duration_days"])
+    await db["user_credits"].update_one(
+        {"user_id": user_id},
+        {
+            "$set": {
+                "subscription_tier": access_code["plan_tier_id"],
+                "subscription_credits": tier.get("credits_monthly", tier.get("credits", 0)),
+                "subscription_source": "access_code",
+                "billing_cycle": "monthly",
+                "start_date": now,
+                "end_date": access_end,
+                "next_renewal": None,
+                "updated_at": now,
+            },
+            "$setOnInsert": {
+                "user_id": user_id, "bonus_credits": 0, "frozen_credits": 0, "credits_used": 0, "created_at": now,
+            },
+        },
+        upsert=True,
+    )
+    await db["access_code_redemptions"].update_one(
+        {"code": code, "user_id": user_id},
+        {"$set": {
+            "revoked_at": None, "revocation_reason": None,
+            "access_start": now, "access_end": access_end,
+        }},
+    )
+    return {"restored": True, "user_id": user_id, "access_end": access_end.isoformat()}
 
 
 @router.patch("/access-codes/{code}")

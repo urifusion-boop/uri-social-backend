@@ -474,6 +474,82 @@ def test_delete_claws_back_active_redeemers_first(monkeypatch):
     assert db["user_credits"].docs[0]["subscription_tier"] is None
 
 
+# ── Restoring one person's revoked/lapsed access ────────────────────────────
+# The counterpart to revoke, but scoped to a single redeemer — for when an
+# admin decides a revoke (or exhaustion) was a mistake, without having to
+# mint a whole new code just to give that person access again.
+
+def test_restore_regrants_full_access_and_clears_revocation(monkeypatch):
+    from app.routers.admin_router import create_access_code, restore_access_code_redemption
+
+    db = _db_with_starter_tier()
+    _run(create_access_code(CreateAccessCodeRequest(code="ASA26", plan_tier_id="starter", duration_days=60), admin_user=_admin(), db=db))
+    db["user_credits"].docs.append({
+        "user_id": "u1", "subscription_tier": None, "subscription_source": None,
+        "subscription_credits": 0, "bonus_credits": 0, "credits_used": 20,
+    })
+    db["access_code_redemptions"].docs.append({
+        "code": "ASA26", "user_id": "u1", "plan_tier_id": "starter",
+        "redeemed_at": datetime.utcnow() - timedelta(days=10), "revoked_at": datetime.utcnow() - timedelta(days=1),
+        "revocation_reason": "admin_revoked",
+    })
+
+    result = _run(restore_access_code_redemption("asa26", "u1", admin_user=_admin(), db=db))
+    assert result["restored"] is True
+
+    wallet = db["user_credits"].docs[0]
+    assert wallet["subscription_tier"] == "starter"
+    assert wallet["subscription_source"] == "access_code"
+    assert wallet["subscription_credits"] == 20  # a fresh allocation, not the drained amount
+
+    redemption = db["access_code_redemptions"].docs[0]
+    assert redemption["revoked_at"] is None
+    assert redemption["revocation_reason"] is None
+
+
+def test_restore_rejects_a_different_active_comp_grant(monkeypatch):
+    from app.routers.admin_router import create_access_code, restore_access_code_redemption
+
+    db = _db_with_starter_tier()
+    _run(create_access_code(CreateAccessCodeRequest(code="ASA26", plan_tier_id="starter", duration_days=60), admin_user=_admin(), db=db))
+    db["user_credits"].docs.append({
+        "user_id": "u1", "subscription_tier": "pro", "subscription_source": "access_code",
+        "subscription_credits": 40, "bonus_credits": 0, "credits_used": 0,
+        "end_date": datetime.utcnow() + timedelta(days=30),
+    })
+    db["access_code_redemptions"].docs.append({
+        "code": "ASA26", "user_id": "u1", "plan_tier_id": "starter",
+        "redeemed_at": datetime.utcnow() - timedelta(days=10), "revoked_at": datetime.utcnow() - timedelta(days=1),
+        "revocation_reason": "admin_revoked",
+    })
+
+    with pytest.raises(HTTPException) as exc_info:
+        _run(restore_access_code_redemption("ASA26", "u1", admin_user=_admin(), db=db))
+    assert exc_info.value.status_code == 400
+    # Untouched — the rejected attempt must not clobber their other grant.
+    assert db["user_credits"].docs[0]["subscription_tier"] == "pro"
+
+
+def test_restore_unknown_code_404():
+    from app.routers.admin_router import restore_access_code_redemption
+
+    db = FakeDb()
+    with pytest.raises(HTTPException) as exc_info:
+        _run(restore_access_code_redemption("NOTREAL", "u1", admin_user=_admin(), db=db))
+    assert exc_info.value.status_code == 404
+
+
+def test_restore_unknown_redemption_404():
+    from app.routers.admin_router import create_access_code, restore_access_code_redemption
+
+    db = _db_with_starter_tier()
+    _run(create_access_code(CreateAccessCodeRequest(code="ASA26", plan_tier_id="starter", duration_days=60), admin_user=_admin(), db=db))
+
+    with pytest.raises(HTTPException) as exc_info:
+        _run(restore_access_code_redemption("ASA26", "nobody-redeemed-as-this-user", admin_user=_admin(), db=db))
+    assert exc_info.value.status_code == 404
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
