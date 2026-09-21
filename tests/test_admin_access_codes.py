@@ -61,6 +61,13 @@ class FakeCollection:
             self.docs.append({**query, **update.get("$set", {})})
         return type("Result", (), {"matched_count": 0})()
 
+    async def delete_one(self, query):
+        for i, d in enumerate(self.docs):
+            if all(d.get(k) == v for k, v in query.items()):
+                del self.docs[i]
+                return type("Result", (), {"deleted_count": 1})()
+        return type("Result", (), {"deleted_count": 0})()
+
 
 class FakeDb:
     def __init__(self, collections: dict[str, list[dict]] | None = None):
@@ -332,6 +339,64 @@ def test_revoke_does_not_touch_a_different_code_or_user(monkeypatch):
     wallet = db["user_credits"].docs[0]
     assert wallet["subscription_tier"] == "starter"
     assert db["access_code_redemptions"].docs[0]["revoked_at"] is None
+
+
+# ── Deleting a code entirely ─────────────────────────────────────────────
+# Distinct from revoking: revoke keeps the code around (is_active: False) for
+# its audit trail; delete removes the code document outright, for cleaning
+# up a mistake or a test code. Redemption history is kept either way.
+
+def test_delete_removes_the_code(monkeypatch):
+    from app.routers.admin_router import create_access_code, delete_access_code
+    from app.services.CreditService import credit_service
+
+    db = _db_with_starter_tier()
+    monkeypatch.setattr(credit_service, "_db", db)
+    _run(create_access_code(CreateAccessCodeRequest(code="ASA26", plan_tier_id="starter", duration_days=60), admin_user=_admin(), db=db))
+
+    result = _run(delete_access_code("asa26", admin_user=_admin(), db=db))
+    assert result == {"deleted": True, "code": "ASA26", "revoked_active_users": 0}
+    assert db["access_codes"].docs == []
+
+
+def test_delete_unknown_code_404():
+    from app.routers.admin_router import delete_access_code
+
+    db = FakeDb()
+    with pytest.raises(HTTPException) as exc_info:
+        _run(delete_access_code("NOTREAL", admin_user=_admin(), db=db))
+    assert exc_info.value.status_code == 404
+
+
+def test_delete_claws_back_active_redeemers_first(monkeypatch):
+    from app.routers.admin_router import create_access_code, delete_access_code
+    from app.services.CreditService import credit_service
+
+    db = _db_with_starter_tier()
+    monkeypatch.setattr(credit_service, "_db", db)
+    _run(create_access_code(CreateAccessCodeRequest(code="ASA26", plan_tier_id="starter", duration_days=60), admin_user=_admin(), db=db))
+
+    redeemed_at = datetime.utcnow()
+    db["user_credits"].docs.append({
+        "user_id": "user-1", "subscription_tier": "starter", "subscription_source": "access_code",
+        "subscription_credits": 15, "bonus_credits": 0, "credits_used": 5,
+        "total_credits": 15, "credits_remaining": 15, "end_date": redeemed_at,
+    })
+    db["access_code_redemptions"].docs.append({
+        "code": "ASA26", "user_id": "user-1", "plan_tier_id": "starter",
+        "redeemed_at": redeemed_at, "revoked_at": None, "revocation_reason": None,
+    })
+
+    result = _run(delete_access_code("ASA26", admin_user=_admin(), db=db))
+    assert result["revoked_active_users"] == 1
+    assert db["access_codes"].docs == []
+
+    # The code doc is gone, but the redemption record survives for audit,
+    # now correctly marked as no longer in effect.
+    redemption = db["access_code_redemptions"].docs[0]
+    assert redemption["revoked_at"] is not None
+    assert redemption["revocation_reason"] == "admin_revoked"
+    assert db["user_credits"].docs[0]["subscription_tier"] is None
 
 
 if __name__ == "__main__":
