@@ -226,6 +226,39 @@ class TikTokAdsAdapter(AdPlatformAdapter):
         )
         return identity_id, identity_bc_id
 
+    async def _get_carousel_music_id(self, client: httpx.AsyncClient) -> str:
+        """A usable music_id for a Carousel Ad — required by TikTok whenever
+        ad_format is CAROUSEL_ADS and the ad is a Standard Carousel Non-Spark Ad
+        (our exact scenario; confirmed against TikTok's own /ad/create/ API
+        reference 2026-09-22, and the "source of this post is invalid" error this
+        replaces was TikTok's actual live rejection of a carousel submitted without
+        one). Nothing about this ad is meant to be about the music, so this just
+        picks the first result of a generic keyword search via GET
+        /file/music/get/ (music_scene=CAROUSEL_ADS, search_type=SEARCH_BY_KEYWORD)
+        rather than asking the user to choose a track. NOT yet verified live —
+        first real attempt at this specific call; if the keyword below returns no
+        results on the real account, that's the next thing to adjust here."""
+        resp = await client.get(
+            f"{self._api_base}/file/music/get/",
+            headers=self._headers(),
+            params={
+                "advertiser_id": self._advertiser_id,
+                "music_scene": "CAROUSEL_ADS",
+                "search_type": "SEARCH_BY_KEYWORD",
+                "filtering": json.dumps({"keyword": "upbeat"}),
+            },
+        )
+        data = resp.json()
+        _raise_for_error(data, "carousel music lookup")
+        musics = (data.get("data") or {}).get("musics") or []
+        if not musics or not musics[0].get("music_id"):
+            raise TikTokAdsAPIError(
+                "No usable TikTok music found for a Carousel Ad (searched keyword "
+                "'upbeat', music_scene=CAROUSEL_ADS). TikTok requires a music_id for "
+                "every Carousel Ad; try again shortly or use a video ad instead."
+            )
+        return str(musics[0]["music_id"])
+
     async def launch_campaign(self, plan: CampaignPlan, auth: SpendAuthorization) -> LaunchResult:
         tiktok_plans = [p for p in plan.platforms if p.platform == Platform.TIKTOK]
         if not tiktok_plans:
@@ -435,13 +468,15 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                     "call_to_action": "CONTACT_US",
                 }
                 if is_carousel:
-                    # NOT yet verified live. image_ids as every uploaded slide, in the
-                    # order the user attached them — no video_id at all for this
-                    # format. TikTok's own Carousel Ads docs say music is mandatory
-                    # (no silent carousels); if ad/create rejects this for a missing
-                    # music field, that's the very next thing to add here, the same
-                    # "confirmed live" way every other requirement in this file was.
+                    # Confirmed live 2026-09-22: ad/create rejected the carousel with
+                    # "The source of this post is invalid" — TikTok's own API
+                    # reference confirms music_id is REQUIRED for
+                    # "ad_format: CAROUSEL_ADS ... Standard Carousel Non-Spark Ads"
+                    # (our exact scenario). Fetched via GET /file/music/get/
+                    # (music_scene=CAROUSEL_ADS) rather than asking the user to pick
+                    # one — nothing about this ad is meant to be about the music.
                     creative_fields["image_ids"] = image_ids_for_ad
+                    creative_fields["music_id"] = await self._get_carousel_music_id(client)
                 else:
                     creative_fields["video_id"] = video_id
                     # Confirmed live (2026-09-16): SINGLE_VIDEO still requires a
