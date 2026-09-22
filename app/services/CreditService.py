@@ -96,6 +96,9 @@ class CreditService:
             credits_used=wallet.credits_used,
             credits_remaining=wallet.credits_remaining,
             subscription_tier=wallet.subscription_tier,
+            subscription_source=wallet.subscription_source,
+            start_date=wallet.start_date,
+            end_date=wallet.end_date,
             next_renewal=wallet.next_renewal,
             low_credit_warning=low_credit_warning
         )
@@ -358,7 +361,81 @@ class CreditService:
             transaction.dict(exclude_none=True)
         )
 
+        if balance_after <= 0 and updated.get("subscription_source") == "access_code" and updated.get("subscription_tier"):
+            await self._revoke_comp_grant(user_id, reason="credits_exhausted")
+
         return True
+
+    async def _revoke_comp_grant(self, user_id: str, reason: str, code: Optional[str] = None) -> bool:
+        """
+        A comp grant (redeemed access code) ends whichever comes first:
+        end_date, or running out of credits — it never refills mid-window
+        the way a real paid subscription does (that's the whole point of
+        subscription_source='access_code': it was granted once, deliberately
+        not on a renewal cycle). This clears the wallet and marks the
+        redemption record for auditability so an admin looking at Access
+        Codes sees WHY access ended, not just that it did.
+
+        If `code` is given, only acts when THAT code is the one currently in
+        effect for this user (an admin revoking one specific code must never
+        clobber a different, unrelated grant the user has since moved to);
+        otherwise targets whichever redemption is currently the active,
+        unrevoked one for this user (the "ran out of credits" path, where
+        there's exactly one such grant by construction — see
+        redeem_access_code's no-stacking guard).
+
+        Returns whether a grant was actually revoked.
+        """
+        wallet = await self.user_credits_collection.find_one({"user_id": user_id})
+        if not wallet or wallet.get("subscription_source") != "access_code":
+            return False
+
+        # Most recent unrevoked redemption specifically — a user could have
+        # redeemed an earlier code that already lapsed by end_date (which
+        # never sets revoked_at, only an explicit revoke does), so a bare
+        # "revoked_at: None" match without picking the newest one could hit
+        # a stale record instead of the grant actually in effect.
+        query = {"user_id": user_id, "revoked_at": None}
+        if code:
+            query["code"] = code
+        current = await self.db["access_code_redemptions"].find_one(query, sort=[("redeemed_at", -1)])
+        if not current:
+            return False
+        if code and wallet.get("subscription_tier") != current.get("plan_tier_id"):
+            # The wallet's current tier no longer matches this redemption —
+            # it's been superseded by something else; nothing to revoke here.
+            return False
+
+        await self.user_credits_collection.update_one(
+            {"user_id": user_id},
+            {"$set": {
+                "subscription_tier": None,
+                "subscription_credits": 0,
+                "subscription_source": None,
+                "start_date": None,
+                "end_date": None,
+                "updated_at": datetime.utcnow(),
+            }},
+        )
+        await self.db["access_code_redemptions"].update_one(
+            {"user_id": user_id, "code": current["code"], "redeemed_at": current["redeemed_at"]},
+            {"$set": {"revoked_at": datetime.utcnow(), "revocation_reason": reason}},
+        )
+        return True
+
+    async def revoke_comp_grants_for_code(self, code: str) -> List[str]:
+        """
+        Called when an admin revokes a code (is_active -> False): unlike
+        letting it just lapse (which only stops FUTURE redemptions), a
+        deliberate revoke means "stop this now" — immediately cut off
+        everyone currently benefiting from it, not only new redeemers.
+        Returns the user_ids actually revoked.
+        """
+        revoked_user_ids = []
+        async for r in self.db["access_code_redemptions"].find({"code": code, "revoked_at": None}):
+            if await self._revoke_comp_grant(r["user_id"], reason="admin_revoked", code=code):
+                revoked_user_ids.append(r["user_id"])
+        return revoked_user_ids
 
     # ==================== PRD 6.3: Payment Flow - Credit Allocation ====================
 
@@ -594,6 +671,84 @@ class CreditService:
         )
 
         return True
+
+    async def admin_adjust_credits(self, user_id: str, amount: int, notes: Optional[str] = None) -> UserCreditWallet:
+        """
+        Signed delta to bonus_credits, floored at 0 — never negative (an admin
+        correcting an over-grant reduces to zero, not into debt). Logs a real
+        credit_transactions entry with type="admin_adjustment" so this is
+        auditable exactly like every other balance change, unlike a raw DB edit.
+        Distinct from add_bonus_credits (always-positive, reason from a fixed
+        set) — this accepts a signed amount and a free-text admin note.
+        """
+        wallet = await self.get_user_wallet(user_id)
+
+        if not wallet:
+            new_bonus = max(0, amount)
+            new_wallet = UserCreditWallet(
+                user_id=user_id,
+                bonus_credits=new_bonus,
+                subscription_credits=0,
+                frozen_credits=0,
+                total_credits=new_bonus,
+                credits_used=0,
+                credits_remaining=new_bonus,
+                subscription_tier=None,
+                next_renewal=None,
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow()
+            )
+            await self.user_credits_collection.insert_one(new_wallet.dict(exclude_none=True))
+
+            await self.credit_transactions_collection.insert_one(
+                CreditTransaction(
+                    user_id=user_id,
+                    type="admin_adjustment",
+                    amount=new_bonus,  # actual amount applied, may differ from `amount` if floored
+                    balance_before=0,
+                    balance_after=new_bonus,
+                    reason="admin_adjustment",
+                    notes=notes,
+                    created_at=datetime.utcnow()
+                ).dict(exclude_none=True)
+            )
+            return new_wallet
+
+        current_bonus = getattr(wallet, 'bonus_credits', 0)
+        new_bonus = max(0, current_bonus + amount)
+        new_total = new_bonus + getattr(wallet, 'subscription_credits', 0)
+        new_remaining = new_total - wallet.credits_used
+        applied_amount = new_bonus - current_bonus  # what actually changed, after flooring
+
+        await self.user_credits_collection.update_one(
+            {"user_id": user_id},
+            {
+                "$set": {
+                    "bonus_credits": new_bonus,
+                    "total_credits": new_total,
+                    "credits_remaining": new_remaining,
+                    "updated_at": datetime.utcnow()
+                }
+            }
+        )
+
+        await self.credit_transactions_collection.insert_one(
+            CreditTransaction(
+                user_id=user_id,
+                type="admin_adjustment",
+                amount=applied_amount,
+                balance_before=wallet.credits_remaining,
+                balance_after=new_remaining,
+                reason="admin_adjustment",
+                notes=notes,
+                created_at=datetime.utcnow()
+            ).dict(exclude_none=True)
+        )
+
+        wallet.bonus_credits = new_bonus
+        wallet.total_credits = new_total
+        wallet.credits_remaining = new_remaining
+        return wallet
 
 
 # Singleton instance

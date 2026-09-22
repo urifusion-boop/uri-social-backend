@@ -409,7 +409,10 @@ async def meta_targeting_from_geo_named(
     """
     from .geo_names import field_for_type, resolve_named_location, resolve_region
 
-    pins = [p for p in (geo.pins if geo else []) if p.lat is not None and p.lng is not None]
+    # A pin now needs a NAME, not coordinates: targeting is resolved by name and a
+    # coordinate is never sent. Requiring lat/lng here would silently drop a location
+    # the client typed themselves in the review step, which has no coordinates at all.
+    pins = [p for p in (geo.pins if geo else []) if (p.name or "").strip()]
     city = (geo.city if geo else "") or region
 
     geo_locations: dict = {}
