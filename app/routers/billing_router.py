@@ -605,13 +605,13 @@ async def redeem_access_code(
     expires_at = access_code.get("expires_at")
     if expires_at and datetime.utcnow() > expires_at:
         raise HTTPException(status_code=400, detail="This code has expired")
-    # Assigned codes are a personal invite, not a shared code — enforced
-    # here, not just hidden in the UI, so this can't be bypassed by anyone
-    # who gets hold of the code string. Case-insensitive to match how it
-    # was normalized on creation.
-    assigned_to = access_code.get("assigned_to_email")
-    if assigned_to and assigned_to.lower() != user_email.lower():
-        raise HTTPException(status_code=403, detail="This code is reserved for a specific person")
+    # An assigned code is a roster of personal invites, not a shared code —
+    # enforced here, not just hidden in the UI, so this can't be bypassed by
+    # anyone who gets hold of the code string. Case-insensitive to match how
+    # each address was normalized on creation/update.
+    assigned_emails = access_code.get("assigned_emails") or []
+    if assigned_emails and user_email.lower() not in [e.lower() for e in assigned_emails]:
+        raise HTTPException(status_code=403, detail="This code is reserved for specific people")
     max_redemptions = access_code.get("max_redemptions")
     if max_redemptions is not None and access_code.get("redemption_count", 0) >= max_redemptions:
         raise HTTPException(status_code=400, detail="This code has reached its redemption limit")

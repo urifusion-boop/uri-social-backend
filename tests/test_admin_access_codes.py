@@ -264,90 +264,201 @@ def test_effective_status_superseded_when_no_wallet_at_all():
     assert result["redemptions"][0]["effective_status"] == "superseded"
 
 
-# ── Assigned (personal invite) codes ────────────────────────────────────────
+# ── Assigned (personal invite roster) codes ─────────────────────────────────
 
-def test_create_with_assigned_email_is_visible_immediately():
-    """The whole point of this mode: the admin sees who a code is for
-    BEFORE that person ever redeems it, not just discoverable afterward."""
-    from app.routers.admin_router import create_access_code
-
-    db = _db_with_starter_tier()
-    db["users"].docs.append({"email": "partner@example.com", "first_name": "Ada", "last_name": "Obi"})
-    body = CreateAccessCodeRequest(
-        code="ASA-ADA", plan_tier_id="starter", duration_days=60, assigned_to_email="Partner@Example.com",
-    )
-    result = _run(create_access_code(body, admin_user=_admin(), db=db))
-    assert result["assigned_to_email"] == "partner@example.com"  # normalized lowercase
-    assert result["assigned_to_name"] == "Ada Obi"
-    assert result["status"] == "pending"
-
-
-def test_create_assigned_to_email_with_no_account_yet_shows_email_only():
-    """A real invite use case: the person hasn't signed up yet. Should not
-    error — just no name to resolve."""
+def test_create_with_assigned_emails_is_visible_immediately():
+    """The whole point of this mode: the admin sees the whole invite roster
+    BEFORE anyone on it redeems, not just discoverable afterward."""
     from app.routers.admin_router import create_access_code
 
     db = _db_with_starter_tier()
     body = CreateAccessCodeRequest(
-        code="ASA-NEW", plan_tier_id="starter", duration_days=60, assigned_to_email="future-partner@example.com",
+        code="ASA-ADA", plan_tier_id="starter", duration_days=60,
+        assigned_emails=["Partner@Example.com", "second@example.com", "partner@example.com"],  # dup, different case
     )
     result = _run(create_access_code(body, admin_user=_admin(), db=db))
-    assert result["assigned_to_email"] == "future-partner@example.com"
-    assert result["assigned_to_name"] is None
+    assert result["assigned_emails"] == ["partner@example.com", "second@example.com"]  # normalized, deduped
+    assert result["assigned_count"] == 2
     assert result["status"] == "pending"
 
 
-def test_create_without_assigned_email_is_unassigned():
+def test_create_without_assigned_emails_is_unassigned():
     from app.routers.admin_router import create_access_code
 
     db = _db_with_starter_tier()
     body = CreateAccessCodeRequest(code="ASA26", plan_tier_id="starter", duration_days=60)
     result = _run(create_access_code(body, admin_user=_admin(), db=db))
-    assert result["assigned_to_email"] is None
+    assert result["assigned_emails"] == []
     assert result["status"] == "unassigned"
 
 
-def test_list_shows_redeemed_status_once_someone_has_redeemed():
+def test_list_status_reflects_partial_and_full_roster_redemption():
     from app.routers.admin_router import create_access_code, list_access_codes
 
     db = _db_with_starter_tier()
     _run(create_access_code(
-        CreateAccessCodeRequest(code="ASA26", plan_tier_id="starter", duration_days=60, assigned_to_email="p@example.com"),
+        CreateAccessCodeRequest(
+            code="ASA26", plan_tier_id="starter", duration_days=60,
+            assigned_emails=["a@example.com", "b@example.com"],
+        ),
         admin_user=_admin(), db=db,
     ))
-    db["access_codes"].docs[0]["redemption_count"] = 1  # simulate a completed redemption
+    db["access_codes"].docs[0]["redemption_count"] = 1  # one of two redeemed
 
     result = _run(list_access_codes(admin_user=_admin(), db=db))
-    assert result["codes"][0]["status"] == "redeemed"
+    assert result["codes"][0]["status"] == "partially_redeemed"
+
+    db["access_codes"].docs[0]["redemption_count"] = 2  # both redeemed
+    result = _run(list_access_codes(admin_user=_admin(), db=db))
+    assert result["codes"][0]["status"] == "fully_redeemed"
 
 
-def test_update_can_reassign_to_a_different_email():
+def test_update_can_replace_the_whole_roster():
     from app.routers.admin_router import create_access_code, update_access_code
 
     db = _db_with_starter_tier()
     _run(create_access_code(CreateAccessCodeRequest(code="ASA26", plan_tier_id="starter", duration_days=60), admin_user=_admin(), db=db))
 
     updated = _run(update_access_code(
-        "ASA26", UpdateAccessCodeRequest(assigned_to_email="new-partner@example.com"), admin_user=_admin(), db=db,
+        "ASA26", UpdateAccessCodeRequest(assigned_emails=["New-Partner@Example.com"]), admin_user=_admin(), db=db,
     ))
-    assert updated["assigned_to_email"] == "new-partner@example.com"
+    assert updated["assigned_emails"] == ["new-partner@example.com"]
     assert updated["status"] == "pending"
 
 
-def test_update_can_clear_an_assignment():
-    """Passing an empty string clears it — distinct from omitting the field
-    entirely, which leaves the existing assignment untouched."""
+def test_update_can_clear_the_roster():
+    """Passing an empty list clears it back to a shared/open code — distinct
+    from omitting the field entirely, which leaves the roster untouched."""
     from app.routers.admin_router import create_access_code, update_access_code
 
     db = _db_with_starter_tier()
     _run(create_access_code(
-        CreateAccessCodeRequest(code="ASA26", plan_tier_id="starter", duration_days=60, assigned_to_email="p@example.com"),
+        CreateAccessCodeRequest(code="ASA26", plan_tier_id="starter", duration_days=60, assigned_emails=["p@example.com"]),
         admin_user=_admin(), db=db,
     ))
 
-    updated = _run(update_access_code("ASA26", UpdateAccessCodeRequest(assigned_to_email=""), admin_user=_admin(), db=db))
-    assert updated["assigned_to_email"] is None
+    updated = _run(update_access_code("ASA26", UpdateAccessCodeRequest(assigned_emails=[]), admin_user=_admin(), db=db))
+    assert updated["assigned_emails"] == []
     assert updated["status"] == "unassigned"
+
+
+def test_list_redemptions_includes_not_yet_redeemed_roster_members():
+    """The roster is visible in full from creation — assigned people who
+    haven't redeemed yet show up as their own row, not just the subset who
+    happened to redeem already."""
+    from app.routers.admin_router import create_access_code, list_access_code_redemptions
+
+    db = _db_with_starter_tier()
+    _run(create_access_code(
+        CreateAccessCodeRequest(
+            code="ASA26", plan_tier_id="starter", duration_days=60,
+            assigned_emails=["redeemed@example.com", "pending@example.com"],
+        ),
+        admin_user=_admin(), db=db,
+    ))
+    db["access_code_redemptions"].docs.append({
+        "code": "ASA26", "user_id": "u1", "plan_tier_id": "starter",
+        "access_start": datetime.utcnow(), "access_end": datetime.utcnow() + timedelta(days=60),
+        "previous_subscription_tier": None, "redeemed_at": datetime.utcnow(),
+        "revoked_at": None, "revocation_reason": None,
+    })
+    db["users"].docs.append({"userId": "u1", "email": "redeemed@example.com"})
+    db["user_credits"].docs.append({"user_id": "u1", "subscription_tier": "starter", "subscription_source": "access_code"})
+
+    result = _run(list_access_code_redemptions("ASA26", admin_user=_admin(), db=db))
+    assert result["count"] == 2
+    by_email = {r["email"]: r for r in result["redemptions"]}
+    assert by_email["redeemed@example.com"]["effective_status"] == "active"
+    assert by_email["pending@example.com"]["effective_status"] == "not_redeemed"
+    assert by_email["pending@example.com"]["user_id"] is None
+
+
+def test_list_redemptions_on_deleted_code_still_returns_audit_history():
+    """delete_access_code keeps redemption records for audit even after the
+    code itself is gone — this endpoint must not 404 just because the code
+    doc is missing."""
+    from app.routers.admin_router import list_access_code_redemptions
+
+    db = FakeDb({
+        "access_code_redemptions": [{
+            "code": "GONE", "user_id": "u1", "plan_tier_id": "starter",
+            "access_start": datetime.utcnow(), "access_end": datetime.utcnow() + timedelta(days=60),
+            "previous_subscription_tier": None, "redeemed_at": datetime.utcnow(),
+            "revoked_at": datetime.utcnow(), "revocation_reason": "admin_revoked",
+        }],
+    })
+    result = _run(list_access_code_redemptions("GONE", admin_user=_admin(), db=db))
+    assert result["count"] == 1
+    assert result["redemptions"][0]["effective_status"] == "revoked"
+
+
+# ── Revoking ONE redeemer without touching the code or anyone else ──────────
+
+def test_revoke_one_redemption_clears_only_that_users_wallet(monkeypatch):
+    from app.routers.admin_router import create_access_code, revoke_access_code_redemption
+    from app.services.CreditService import credit_service
+
+    db = _db_with_starter_tier()
+    monkeypatch.setattr(credit_service, "_db", db)
+    _run(create_access_code(
+        CreateAccessCodeRequest(code="ASA26", plan_tier_id="starter", duration_days=60), admin_user=_admin(), db=db,
+    ))
+    now = datetime.utcnow()
+    db["access_code_redemptions"].docs.append({
+        "code": "ASA26", "user_id": "u1", "plan_tier_id": "starter",
+        "access_start": now, "access_end": now + timedelta(days=60),
+        "previous_subscription_tier": None, "redeemed_at": now,
+        "revoked_at": None, "revocation_reason": None,
+    })
+    db["user_credits"].docs.append({
+        "user_id": "u1", "subscription_tier": "starter", "subscription_source": "access_code",
+        "subscription_credits": 20, "start_date": now, "end_date": now + timedelta(days=60),
+    })
+
+    result = _run(revoke_access_code_redemption("ASA26", "u1", admin_user=_admin(), db=db))
+    assert result["revoked"] is True
+
+    wallet = db["user_credits"].docs[0]
+    assert wallet["subscription_source"] is None
+    assert wallet["subscription_tier"] is None
+
+    redemption = db["access_code_redemptions"].docs[0]
+    assert redemption["revoked_at"] is not None
+    assert redemption["revocation_reason"] == "admin_revoked"
+
+    code_doc = db["access_codes"].docs[0]
+    assert code_doc["is_active"] is True  # the code itself is untouched
+
+
+def test_revoke_one_redemption_unknown_user_404():
+    from app.routers.admin_router import create_access_code, revoke_access_code_redemption
+
+    db = _db_with_starter_tier()
+    _run(create_access_code(
+        CreateAccessCodeRequest(code="ASA26", plan_tier_id="starter", duration_days=60), admin_user=_admin(), db=db,
+    ))
+    with pytest.raises(HTTPException) as exc_info:
+        _run(revoke_access_code_redemption("ASA26", "nobody", admin_user=_admin(), db=db))
+    assert exc_info.value.status_code == 404
+
+
+def test_revoke_one_redemption_already_revoked_400():
+    from app.routers.admin_router import create_access_code, revoke_access_code_redemption
+
+    db = _db_with_starter_tier()
+    _run(create_access_code(
+        CreateAccessCodeRequest(code="ASA26", plan_tier_id="starter", duration_days=60), admin_user=_admin(), db=db,
+    ))
+    now = datetime.utcnow()
+    db["access_code_redemptions"].docs.append({
+        "code": "ASA26", "user_id": "u1", "plan_tier_id": "starter",
+        "access_start": now, "access_end": now + timedelta(days=60),
+        "previous_subscription_tier": None, "redeemed_at": now,
+        "revoked_at": now, "revocation_reason": "admin_revoked",
+    })
+    with pytest.raises(HTTPException) as exc_info:
+        _run(revoke_access_code_redemption("ASA26", "u1", admin_user=_admin(), db=db))
+    assert exc_info.value.status_code == 400
 
 
 # ── Revoking a code claws back anyone currently redeeming it ────────────────

@@ -433,9 +433,20 @@ class CreditService:
         """
         revoked_user_ids = []
         async for r in self.db["access_code_redemptions"].find({"code": code, "revoked_at": None}):
-            if await self._revoke_comp_grant(r["user_id"], reason="admin_revoked", code=code):
+            if await self.revoke_one_redemption(code, r["user_id"]):
                 revoked_user_ids.append(r["user_id"])
         return revoked_user_ids
+
+    async def revoke_one_redemption(self, code: str, user_id: str) -> bool:
+        """
+        Admin action: revoke ONE specific redeemer's access to `code`,
+        without touching the code itself or anyone else redeemed on it —
+        the counterpart to the admin restore endpoint. Thin public wrapper
+        around _revoke_comp_grant, scoped by code the same way a whole-code
+        revoke is, so it can never clobber a different grant this person
+        has since moved to.
+        """
+        return await self._revoke_comp_grant(user_id, reason="admin_revoked", code=code)
 
     # ==================== PRD 6.3: Payment Flow - Credit Allocation ====================
 
