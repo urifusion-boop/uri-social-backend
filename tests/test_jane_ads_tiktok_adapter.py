@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from app.agents.jane_ads.adapters.tiktok import TikTokAdsAdapter, TikTokAdsAPIError
+from app.agents.jane_ads.adapters.tiktok import TikTokAdsAdapter, TikTokAdsAPIError, _force_jpg_delivery
 from app.agents.jane_ads.models import (
     ABTestScope,
     AdCreative,
@@ -264,6 +264,45 @@ def test_launch_campaign_carousel_happy_path():
     assert "video_id" not in creative
 
 
+def test_launch_campaign_carousel_forces_jpg_on_cloudinary_urls():
+    # Live-caught 2026-09-22: a real WEBP upload got "Invalid params: image cannot
+    # be decoded" from TikTok, which only accepts JPG/PNG for Carousel Ads. Every
+    # slide's URL sent to TikTok must carry Cloudinary's f_jpg delivery
+    # transformation, regardless of the stored file's real format.
+    adapter = _adapter()
+    plan = _carousel_plan(
+        creative=AdCreative(
+            image_url="",
+            is_video=False,
+            carousel_image_urls=[
+                "https://res.cloudinary.com/demo/image/upload/v1700000000/uri-ads/a.webp",
+                "https://res.cloudinary.com/demo/image/upload/v1700000000/uri-ads/b.webp",
+            ],
+        )
+    )
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client(list(_CAROUSEL_RESPONSES))
+        MockClient.return_value.__aenter__.return_value = mock_client
+        _run(adapter.launch_campaign(plan, _auth()))
+
+    img1_json = mock_client.post.call_args_list[1].kwargs["json"]
+    assert img1_json["image_url"] == "https://res.cloudinary.com/demo/image/upload/f_jpg/v1700000000/uri-ads/a.webp"
+    img2_json = mock_client.post.call_args_list[2].kwargs["json"]
+    assert img2_json["image_url"] == "https://res.cloudinary.com/demo/image/upload/f_jpg/v1700000000/uri-ads/b.webp"
+
+
+def test_force_jpg_delivery_inserts_transformation_on_cloudinary_urls():
+    assert _force_jpg_delivery("https://res.cloudinary.com/demo/image/upload/v1/uri-ads/x.webp") == (
+        "https://res.cloudinary.com/demo/image/upload/f_jpg/v1/uri-ads/x.webp"
+    )
+
+
+def test_force_jpg_delivery_is_a_noop_on_non_cloudinary_urls():
+    # Must never raise or mangle a URL shape it doesn't recognise.
+    assert _force_jpg_delivery("https://cdn.example.com/a.jpg") == "https://cdn.example.com/a.jpg"
+    assert _force_jpg_delivery("") == ""
+
+
 def test_launch_campaign_single_carousel_image_still_raises():
     # TikTok's Carousel Ads need 2+ images — one lone photo is exactly the case
     # neither the video path nor the carousel path can serve.
@@ -362,6 +401,13 @@ def test_launch_campaign_rolls_back_partial_launch_on_failure_and_preserves_orig
     rollback_json = mock_client.post.call_args_list[4].kwargs["json"]
     assert rollback_json["operation_status"] == "DELETE"
     assert rollback_json["campaign_ids"] == ["111"]
+    # Live-caught 2026-09-22: the URL itself had campaign/update/status/ — a real
+    # TikTok 404, since the correct path is campaign/status/update/ (confirmed live
+    # earlier this session deleting real diagnostic campaigns). The JSON-body
+    # assertions above would pass against either path, which is exactly how this
+    # shipped unnoticed — assert the actual URL too.
+    rollback_url = mock_client.post.call_args_list[4].args[0]
+    assert rollback_url.endswith("/campaign/status/update/")
 
 
 # ── fetch_per_ad_spend ──────────────────────────────────────────────────────────

@@ -130,6 +130,25 @@ def _raise_for_error(data: dict, context: str) -> None:
         raise TikTokAdsAPIError(f"{context}: {data.get('message', 'unknown error')}", code=code)
 
 
+def _force_jpg_delivery(image_url: str) -> str:
+    """Live-caught 2026-09-22: TikTok's file/image/ad/upload/ rejected a real photo
+    with "Invalid params: image cannot be decoded" — the user had uploaded a WEBP,
+    which TikTok's own Carousel Ads spec explicitly excludes (JPG/PNG only; Meta and
+    our own upload picker both happily accept WEBP, so this mismatch is invisible
+    everywhere except TikTok's decoder). Rather than reject the upload upstream (a
+    WEBP dropped in from drafts/reuse would hit the same wall later), force Cloudinary
+    to deliver JPG regardless of the stored format via its f_jpg transformation —
+    standard Cloudinary delivery-URL syntax, inserted right after '/upload/'. A no-op,
+    unchanged URL for anything not hosted on Cloudinary (nothing else is, today, but
+    this must never raise on an unexpected shape)."""
+    marker = "/image/upload/"
+    idx = image_url.find(marker)
+    if idx == -1:
+        return image_url
+    insert_at = idx + len(marker)
+    return image_url[:insert_at] + "f_jpg/" + image_url[insert_at:]
+
+
 class TikTokAdsAdapter(AdPlatformAdapter):
     """One instance per request/job. advertiser_id/access_token are ALWAYS
     caller-supplied (never read from settings inside this class) — Phase 1 callers
@@ -332,7 +351,7 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                             json={
                                 "advertiser_id": self._advertiser_id,
                                 "upload_type": "UPLOAD_BY_URL",
-                                "image_url": url,
+                                "image_url": _force_jpg_delivery(url),
                                 "file_name": f"jane-ads-{plan.business_id}-carousel-{i}-{uuid.uuid4().hex[:8]}.jpg",
                             },
                         )
@@ -479,7 +498,14 @@ class TikTokAdsAdapter(AdPlatformAdapter):
         try:
             async with httpx.AsyncClient(timeout=15) as client:
                 resp = await client.post(
-                    f"{self._api_base}/campaign/update/status/",
+                    # Live-caught 2026-09-22: this path's segments were swapped —
+                    # TikTok's real endpoint is campaign/status/update/ (confirmed
+                    # live earlier this session, deleting the 10 diagnostic test
+                    # campaigns through the exact same call shape). The wrong path
+                    # 404s, which is exactly what turned every rollback attempt into
+                    # a real orphaned campaign in the live account instead of a
+                    # cleaned-up one.
+                    f"{self._api_base}/campaign/status/update/",
                     headers=self._headers(),
                     json={
                         "advertiser_id": self._advertiser_id,
