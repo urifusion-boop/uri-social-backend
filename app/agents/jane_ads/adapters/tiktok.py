@@ -357,13 +357,36 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                     # 2. Video upload — UPLOAD_BY_URL lets TikTok fetch the hosted file
                     # directly (same "server fetches it, no re-streaming needed here"
                     # shape as Meta's /advideos file_url).
+                    tiktok_video_url = _force_tiktok_video_ratio(plan.creative.image_url)
+                    # Live-caught 2026-09-22: "video upload: Failed to fetch url data."
+                    # Cloudinary generates a video transformation ON DEMAND on its
+                    # first request — unlike images this is a real transcode, which
+                    # can take longer than TikTok's own URL-fetch timeout for a
+                    # derivative nobody has ever requested before (every brand-new
+                    # upload's first launch attempt). Warm the EXACT SAME transformed
+                    # URL ourselves first (generous timeout — a real transcode, not a
+                    # quick API call) so Cloudinary already has it cached by the time
+                    # TikTok's own fetch hits it moments later. Best-effort: if the
+                    # warm-up itself times out, still attempt the real upload — the
+                    # transcode may finish server-side moments after our request gives
+                    # up, and TikTok's own fetch could still land on the now-cached
+                    # result.
+                    if tiktok_video_url != plan.creative.image_url:
+                        # Only when a transformation was actually applied (a real
+                        # Cloudinary derivative to warm) — for anything not hosted on
+                        # Cloudinary, the URL is unchanged and there's no cold-cache
+                        # concern to pre-empt.
+                        try:
+                            await client.head(tiktok_video_url, timeout=90)
+                        except Exception as e:
+                            print(f"[TikTokAdsAdapter] video warm-up failed, continuing anyway: {e}", flush=True)
                     video_resp = await client.post(
                         f"{self._api_base}/file/video/ad/upload/",
                         headers=self._headers(),
                         json={
                             "advertiser_id": self._advertiser_id,
                             "upload_type": "UPLOAD_BY_URL",
-                            "video_url": _force_tiktok_video_ratio(plan.creative.image_url),
+                            "video_url": tiktok_video_url,
                             "file_name": f"jane-ads-{plan.business_id}-{uuid.uuid4().hex[:8]}.mp4",
                         },
                     )
