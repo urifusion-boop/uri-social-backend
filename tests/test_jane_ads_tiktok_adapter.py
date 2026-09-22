@@ -214,8 +214,11 @@ def test_launch_campaign_happy_path_full_call_sequence():
 # ── Carousel Ads (image-only path, no video) ────────────────────────────────────────
 # TikTok has no single-static-image ad unit — a photo-only business reaches TikTok via
 # a Carousel Ad (2+ images) instead. campaign(POST), image upload x2(POST), ad
-# group(POST), identity lookup(GET), ad(POST) — same 5 POST/1 GET shape as the video
-# happy path, since carousel's 2 image uploads replace video's video+cover uploads.
+# group(POST), identity lookup(GET), music lookup(GET), ad(POST) — same 5 POST as the
+# video happy path (carousel's 2 image uploads replace video's video+cover uploads),
+# plus a 2nd GET: TikTok's own /ad/create/ reference confirms music_id is REQUIRED
+# for a Standard Carousel Non-Spark Ad (our exact scenario) — live-caught 2026-09-22
+# as "The source of this post is invalid" before this was added.
 _CAROUSEL_RESPONSES = [
     {"code": 0, "message": "OK", "data": {"campaign_id": "111"}},
     {"code": 0, "message": "OK", "data": {"image_id": "img_a"}},
@@ -225,6 +228,7 @@ _CAROUSEL_RESPONSES = [
         {"identity_id": "identity_777", "identity_authorized_bc_id": "bc_555", "available_status": "AVAILABLE",
          "username": "uri.creative", "display_name": "uricreative"},
     ]}},
+    {"code": 0, "message": "OK", "data": {"musics": [{"music_id": "music_999", "name": "Upbeat Track"}]}},
     {"code": 0, "message": "OK", "data": {"ad_ids": ["333"]}},
 ]
 
@@ -250,17 +254,22 @@ def test_launch_campaign_carousel_happy_path():
 
     assert result.campaign_id == "111"
     assert mock_client.post.call_count == 5
-    assert mock_client.get.call_count == 1
+    assert mock_client.get.call_count == 2  # identity lookup + music lookup
 
     img1_json = mock_client.post.call_args_list[1].kwargs["json"]
     assert img1_json["image_url"] == "https://cdn.example.com/a.jpg"
     img2_json = mock_client.post.call_args_list[2].kwargs["json"]
     assert img2_json["image_url"] == "https://cdn.example.com/b.jpg"
 
+    music_params = mock_client.get.call_args_list[1].kwargs["params"]
+    assert music_params["music_scene"] == "CAROUSEL_ADS"
+    assert music_params["advertiser_id"] == "adv123"
+
     ad_json = mock_client.post.call_args_list[4].kwargs["json"]
     creative = ad_json["creatives"][0]
     assert creative["ad_format"] == "CAROUSEL_ADS"
     assert creative["image_ids"] == ["img_a", "img_b"]
+    assert creative["music_id"] == "music_999"
     assert "video_id" not in creative
 
 
@@ -301,6 +310,17 @@ def test_force_jpg_delivery_is_a_noop_on_non_cloudinary_urls():
     # Must never raise or mangle a URL shape it doesn't recognise.
     assert _force_jpg_delivery("https://cdn.example.com/a.jpg") == "https://cdn.example.com/a.jpg"
     assert _force_jpg_delivery("") == ""
+
+
+def test_launch_campaign_carousel_raises_clearly_when_no_music_found():
+    adapter = _adapter()
+    responses = list(_CAROUSEL_RESPONSES)
+    responses[5] = {"code": 0, "message": "OK", "data": {"musics": []}}  # the music lookup, empty
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client(responses)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        with pytest.raises(TikTokAdsAPIError, match="No usable TikTok music found"):
+            _run(adapter.launch_campaign(_carousel_plan(), _auth()))
 
 
 def test_launch_campaign_single_carousel_image_still_raises():
