@@ -14,7 +14,12 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from app.agents.jane_ads.adapters.tiktok import TikTokAdsAdapter, TikTokAdsAPIError, _force_jpg_delivery
+from app.agents.jane_ads.adapters.tiktok import (
+    TikTokAdsAdapter,
+    TikTokAdsAPIError,
+    _force_jpg_delivery,
+    _force_tiktok_video_ratio,
+)
 from app.agents.jane_ads.models import (
     ABTestScope,
     AdCreative,
@@ -310,6 +315,41 @@ def test_force_jpg_delivery_is_a_noop_on_non_cloudinary_urls():
     # Must never raise or mangle a URL shape it doesn't recognise.
     assert _force_jpg_delivery("https://cdn.example.com/a.jpg") == "https://cdn.example.com/a.jpg"
     assert _force_jpg_delivery("") == ""
+
+
+def test_force_tiktok_video_ratio_inserts_transformation_on_cloudinary_urls():
+    assert _force_tiktok_video_ratio("https://res.cloudinary.com/demo/video/upload/v1/uri-ads/clip.mp4") == (
+        "https://res.cloudinary.com/demo/video/upload/c_fill,ar_9:16,g_auto/v1/uri-ads/clip.mp4"
+    )
+
+
+def test_force_tiktok_video_ratio_is_a_noop_on_non_cloudinary_urls():
+    # Must never raise or mangle a URL shape it doesn't recognise.
+    assert _force_tiktok_video_ratio("https://cdn.example.com/clip.mp4") == "https://cdn.example.com/clip.mp4"
+    assert _force_tiktok_video_ratio("") == ""
+
+
+def test_launch_campaign_forces_tiktok_ratio_on_cloudinary_video():
+    # Live-caught 2026-09-22: a real uploaded video (480x848 - close to but not
+    # exactly 9:16) got "Cannot be delivered to TikTok: Video ratio must be
+    # 16:9/1:1/9:16" in TikTok Ads Manager, even though the ad itself was created
+    # successfully. The video URL sent to TikTok must carry Cloudinary's
+    # c_fill,ar_9:16,g_auto delivery transformation, regardless of the source
+    # file's real dimensions.
+    adapter = _adapter()
+    plan = _plan(creative=AdCreative(
+        image_url="https://res.cloudinary.com/demo/video/upload/v1700000000/uri-ads/clip.mp4",
+        is_video=True, headline="Fresh Cuts Daily", primary_text="Book on WhatsApp today",
+    ))
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client(list(_HAPPY_RESPONSES))
+        MockClient.return_value.__aenter__.return_value = mock_client
+        _run(adapter.launch_campaign(plan, _auth()))
+
+    video_json = mock_client.post.call_args_list[1].kwargs["json"]
+    assert video_json["video_url"] == (
+        "https://res.cloudinary.com/demo/video/upload/c_fill,ar_9:16,g_auto/v1700000000/uri-ads/clip.mp4"
+    )
 
 
 def test_launch_campaign_carousel_raises_clearly_when_no_music_found():
