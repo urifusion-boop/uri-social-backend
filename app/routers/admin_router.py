@@ -734,7 +734,7 @@ async def create_access_code(
             code = _generate_code()
 
     acting_email = (admin_user.get("claims", {}) or {}).get("email", "unknown")
-    assigned_to_email = body.assigned_to_email.strip().lower() if body.assigned_to_email else None
+    assigned_emails = sorted({e.strip().lower() for e in (body.assigned_emails or []) if e.strip()})
     access_code = AccessCode(
         code=code,
         plan_tier_id=body.plan_tier_id,
@@ -742,34 +742,24 @@ async def create_access_code(
         max_redemptions=body.max_redemptions,
         expires_at=body.expires_at,
         label=body.label,
-        assigned_to_email=assigned_to_email,
+        assigned_emails=assigned_emails,
         created_by=acting_email,
     )
     await db["access_codes"].insert_one(access_code.dict())
     result = access_code.dict()
-    if assigned_to_email:
-        assigned_user = await db["users"].find_one({"email": assigned_to_email}, {"first_name": 1, "last_name": 1})
-        result["assigned_to_name"] = _display_name(assigned_user)
-        result["status"] = "pending"
-        if body.send_email:
+    result["assigned_count"] = len(assigned_emails)
+    result["redeemed_count"] = 0
+    result["status"] = "pending" if assigned_emails else "unassigned"
+    emails_sent = 0
+    if assigned_emails and body.send_email:
+        for target in assigned_emails:
             try:
-                _send_access_code_email(assigned_to_email, code, tier, body.duration_days, body.label)
-                result["email_sent"] = True
+                _send_access_code_email(target, code, tier, body.duration_days, body.label)
+                emails_sent += 1
             except Exception as e:
-                print(f"⚠️ Access code email failed to queue for {assigned_to_email}: {e}")
-                result["email_sent"] = False
-        else:
-            result["email_sent"] = False
-    else:
-        result["status"] = "unassigned"
+                print(f"⚠️ Access code email failed to queue for {target}: {e}")
+    result["emails_sent"] = emails_sent
     return result
-
-
-def _display_name(user_doc: Optional[dict]) -> Optional[str]:
-    if not user_doc:
-        return None
-    name = f"{user_doc.get('first_name', '')} {user_doc.get('last_name', '')}".strip()
-    return name or None
 
 
 @router.get("/access-codes")
@@ -777,23 +767,28 @@ async def list_access_codes(
     admin_user: dict = Depends(verify_admin),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
-    """Every code, each enriched with WHO it's assigned to (if anyone) and a
-    computed status — this is what makes an assignment visible immediately
-    in the panel, not just discoverable after the person redeems:
+    """Every code, each enriched with a computed status — this is what makes
+    an assignment's progress visible at a glance, not just discoverable by
+    opening the code's detail panel:
     - unassigned: a shared code, anyone with it can redeem
-    - pending: assigned to a specific email, not yet redeemed
-    - redeemed: assigned, and that person has already redeemed it
+    - pending: assigned to a roster, nobody on it has redeemed yet
+    - partially_redeemed: some but not all of the roster has redeemed
+    - fully_redeemed: everyone on the roster has redeemed
     """
     codes = []
     async for doc in db["access_codes"].find({}, {"_id": 0}).sort("created_at", -1):
-        assigned_email = doc.get("assigned_to_email")
-        if assigned_email:
-            assigned_user = await db["users"].find_one({"email": assigned_email}, {"first_name": 1, "last_name": 1})
-            doc["assigned_to_name"] = _display_name(assigned_user)
-            doc["status"] = "redeemed" if doc.get("redemption_count", 0) > 0 else "pending"
-        else:
-            doc["assigned_to_name"] = None
+        assigned_emails = doc.get("assigned_emails") or []
+        redeemed_count = doc.get("redemption_count", 0)
+        doc["assigned_count"] = len(assigned_emails)
+        doc["redeemed_count"] = redeemed_count
+        if not assigned_emails:
             doc["status"] = "unassigned"
+        elif redeemed_count == 0:
+            doc["status"] = "pending"
+        elif redeemed_count < len(assigned_emails):
+            doc["status"] = "partially_redeemed"
+        else:
+            doc["status"] = "fully_redeemed"
         codes.append(doc)
     return {"codes": codes, "count": len(codes)}
 
@@ -806,20 +801,33 @@ async def list_access_code_redemptions(
 ):
     """Who redeemed this code and when their access window started/ends —
     joined against the users collection for a human-readable email per row.
+    ALSO includes one synthetic row per assigned email that hasn't redeemed
+    yet (effective_status "not_redeemed", no user_id) — so an assigned
+    roster of 20 shows as 20 rows from the moment it's created, not just
+    the subset who happened to redeem already.
 
-    Each row also gets an `effective_status`, computed here rather than
-    trusting `revoked_at` alone: a redemption can stop being someone's
-    actual current grant WITHOUT ever being marked revoked_at — e.g. this
-    code was superseded before the no-double-redeeming guard existed, or
-    the person has since moved to a real paid subscription some other way.
-    Without this, the admin panel can show a code as "Revoked" while a
-    redemption of it still reads "Active" (or the reverse), which is
-    confusing/wrong even though each field is individually accurate."""
+    Each real redemption's row also gets an `effective_status`, computed
+    here rather than trusting `revoked_at` alone: a redemption can stop
+    being someone's actual current grant WITHOUT ever being marked
+    revoked_at — e.g. this code was superseded before the no-double-
+    redeeming guard existed, or the person has since moved to a real paid
+    subscription some other way. Without this, the admin panel can show a
+    code as "Revoked" while a redemption of it still reads "Active" (or the
+    reverse), which is confusing/wrong even though each field is
+    individually accurate."""
     code = code.strip().upper()
+    # Not a 404 when missing: a deleted code's redemptions stay queryable
+    # for audit (see delete_access_code) — just nothing to merge a roster
+    # from in that case.
+    access_code = await db["access_codes"].find_one({"code": code}, {"_id": 0}) or {}
     now = datetime.utcnow()
     redemptions = []
+    redeemed_emails_lower = set()
     async for r in db["access_code_redemptions"].find({"code": code}, {"_id": 0}).sort("redeemed_at", -1):
         user = await db["users"].find_one({"userId": r["user_id"]}, {"email": 1})
+        email = (user or {}).get("email")
+        if email:
+            redeemed_emails_lower.add(email.lower())
         wallet = await db["user_credits"].find_one(
             {"user_id": r["user_id"]}, {"subscription_tier": 1, "subscription_source": 1}
         )
@@ -839,7 +847,23 @@ async def list_access_code_redemptions(
             effective_status = "superseded"
         else:
             effective_status = "active"
-        redemptions.append({**r, "email": (user or {}).get("email"), "effective_status": effective_status})
+        redemptions.append({**r, "email": email, "effective_status": effective_status})
+
+    for assigned_email in access_code.get("assigned_emails") or []:
+        if assigned_email.lower() not in redeemed_emails_lower:
+            redemptions.append({
+                "code": code,
+                "user_id": None,
+                "email": assigned_email,
+                "plan_tier_id": access_code["plan_tier_id"],
+                "access_start": None,
+                "access_end": None,
+                "previous_subscription_tier": None,
+                "redeemed_at": None,
+                "revoked_at": None,
+                "revocation_reason": None,
+                "effective_status": "not_redeemed",
+            })
     return {"code": code, "redemptions": redemptions, "count": len(redemptions)}
 
 
@@ -918,6 +942,36 @@ async def restore_access_code_redemption(
     return {"restored": True, "user_id": user_id, "access_end": access_end.isoformat()}
 
 
+@router.post("/access-codes/{code}/redemptions/{user_id}/revoke")
+async def revoke_access_code_redemption(
+    code: str,
+    user_id: str,
+    admin_user: dict = Depends(verify_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """The counterpart to restore, and to a whole-code revoke — this cuts
+    off ONE specific redeemer while leaving the code itself active and
+    everyone else redeemed on it untouched. For a shared code's abuse case
+    or an assigned roster where one person needs to be pulled without
+    disturbing the rest."""
+    code = code.strip().upper()
+    access_code = await db["access_codes"].find_one({"code": code})
+    if not access_code:
+        raise HTTPException(status_code=404, detail=f"Code '{code}' not found")
+    redemption = await db["access_code_redemptions"].find_one({"code": code, "user_id": user_id})
+    if not redemption:
+        raise HTTPException(status_code=404, detail="No redemption of this code by this user")
+    if redemption.get("revoked_at"):
+        raise HTTPException(status_code=400, detail="Already revoked")
+    revoked = await credit_service.revoke_one_redemption(code, user_id)
+    if not revoked:
+        raise HTTPException(
+            status_code=400,
+            detail="This redemption is no longer the user's active grant — nothing to revoke",
+        )
+    return {"revoked": True, "user_id": user_id}
+
+
 @router.patch("/access-codes/{code}")
 async def update_access_code(
     code: str,
@@ -925,17 +979,18 @@ async def update_access_code(
     admin_user: dict = Depends(verify_admin),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
-    """Revoke a code early (is_active=False), edit its label, or (re)assign
-    it to a specific email — or clear an assignment by passing "". Does not
-    touch duration_days/plan_tier_id — those are snapshotted onto each
-    redemption at redeem time, so editing them here never retroactively
-    changes access someone already has."""
+    """Revoke a code early (is_active=False), edit its label, or replace its
+    whole assigned roster (pass [] to clear it back to a shared/open code).
+    Does not touch duration_days/plan_tier_id — those are snapshotted onto
+    each redemption at redeem time, so editing them here never retroactively
+    changes access someone already has. Removing someone from the roster
+    only blocks FUTURE redemption by that email — it does not revoke access
+    they've already redeemed; use the per-user revoke endpoint for that."""
     updates = {k: v for k, v in body.dict(exclude_none=True).items()}
     if not updates:
         raise HTTPException(status_code=400, detail="No fields to update")
-    if "assigned_to_email" in updates:
-        normalized = updates["assigned_to_email"].strip().lower()
-        updates["assigned_to_email"] = normalized or None
+    if "assigned_emails" in updates:
+        updates["assigned_emails"] = sorted({e.strip().lower() for e in updates["assigned_emails"] if e.strip()})
     code = code.strip().upper()
     result = await db["access_codes"].update_one({"code": code}, {"$set": updates})
     if result.matched_count == 0:
@@ -948,14 +1003,18 @@ async def update_access_code(
         revoked_user_ids = await credit_service.revoke_comp_grants_for_code(code)
 
     updated = await db["access_codes"].find_one({"code": code}, {"_id": 0})
-    assigned_email = updated.get("assigned_to_email")
-    if assigned_email:
-        assigned_user = await db["users"].find_one({"email": assigned_email}, {"first_name": 1, "last_name": 1})
-        updated["assigned_to_name"] = _display_name(assigned_user)
-        updated["status"] = "redeemed" if updated.get("redemption_count", 0) > 0 else "pending"
-    else:
-        updated["assigned_to_name"] = None
+    assigned_emails = updated.get("assigned_emails") or []
+    redeemed_count = updated.get("redemption_count", 0)
+    updated["assigned_count"] = len(assigned_emails)
+    updated["redeemed_count"] = redeemed_count
+    if not assigned_emails:
         updated["status"] = "unassigned"
+    elif redeemed_count == 0:
+        updated["status"] = "pending"
+    elif redeemed_count < len(assigned_emails):
+        updated["status"] = "partially_redeemed"
+    else:
+        updated["status"] = "fully_redeemed"
     updated["revoked_active_users"] = len(revoked_user_ids)
     return updated
 
@@ -984,24 +1043,32 @@ async def delete_access_code(
 @router.post("/access-codes/{code}/send-email")
 async def send_access_code_email(
     code: str,
+    email: Optional[str] = None,
     admin_user: dict = Depends(verify_admin),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
-    """(Re)send the code to whoever it's currently assigned to — for a code
-    created with the email skipped, or to nudge someone who hasn't redeemed
-    it yet. Only works on an assigned code; a shared code has no single
-    recipient to send it to."""
+    """(Re)send the code to its assigned roster — for a code created with
+    emails skipped, or to nudge people who haven't redeemed yet. Pass
+    `email` to resend to just that one person on the roster; omit it to
+    resend to everyone on the roster at once. Only works on an assigned
+    code; a shared/open code has no roster to send it to."""
     code = code.strip().upper()
     access_code = await db["access_codes"].find_one({"code": code}, {"_id": 0})
     if not access_code:
         raise HTTPException(status_code=404, detail=f"Code '{code}' not found")
-    assigned_to_email = access_code.get("assigned_to_email")
-    if not assigned_to_email:
-        raise HTTPException(status_code=400, detail="This code isn't assigned to anyone — set an email first")
+    assigned_emails = access_code.get("assigned_emails") or []
+    if not assigned_emails:
+        raise HTTPException(status_code=400, detail="This code isn't assigned to anyone — add emails first")
+    if email:
+        target = email.strip().lower()
+        if target not in [e.lower() for e in assigned_emails]:
+            raise HTTPException(status_code=400, detail="That email isn't on this code's assigned list")
+        targets = [target]
+    else:
+        targets = assigned_emails
     tier = await db["subscription_tiers"].find_one({"tier_id": access_code["plan_tier_id"]})
     if not tier:
         raise HTTPException(status_code=500, detail=f"Plan '{access_code['plan_tier_id']}' no longer exists")
-    _send_access_code_email(
-        assigned_to_email, code, tier, access_code["duration_days"], access_code.get("label", "")
-    )
-    return {"sent": True, "to": assigned_to_email}
+    for target in targets:
+        _send_access_code_email(target, code, tier, access_code["duration_days"], access_code.get("label", ""))
+    return {"sent": True, "to": targets}
