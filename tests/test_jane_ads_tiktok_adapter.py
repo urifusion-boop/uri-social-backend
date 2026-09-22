@@ -107,6 +107,9 @@ def _mock_client(responses):
 
     client.post = AsyncMock(side_effect=_next)
     client.get = AsyncMock(side_effect=_next)
+    # Separate from the sequenced POST/GET responses above — the video-warm-up
+    # HEAD call doesn't consume from that list, its return value is never read.
+    client.head = AsyncMock(return_value=AsyncMock())
     return client
 
 
@@ -163,6 +166,10 @@ def test_launch_campaign_happy_path_full_call_sequence():
     campaign_json = mock_client.post.call_args_list[0].kwargs["json"]
     assert campaign_json["operation_status"] == "DISABLE"
     assert campaign_json["objective_type"] == "TRAFFIC"
+
+    # No transformation applies to this non-Cloudinary URL, so there's nothing to
+    # warm up — the HEAD pre-fetch must not fire needlessly.
+    assert mock_client.head.call_count == 0
 
     video_json = mock_client.post.call_args_list[1].kwargs["json"]
     assert video_json["upload_type"] == "UPLOAD_BY_URL"
@@ -346,10 +353,39 @@ def test_launch_campaign_forces_tiktok_ratio_on_cloudinary_video():
         MockClient.return_value.__aenter__.return_value = mock_client
         _run(adapter.launch_campaign(plan, _auth()))
 
+    # Live-caught 2026-09-22, part 2: TikTok's own fetch then failed with "video
+    # upload: Failed to fetch url data" — Cloudinary transcodes a video
+    # transformation on its first request, which can outrun TikTok's fetch
+    # timeout for a derivative nobody has requested before. The adapter must warm
+    # the EXACT SAME transformed URL itself first, before TikTok ever sees it.
+    assert mock_client.head.call_count == 1
+    warmed_url = mock_client.head.call_args_list[0].args[0]
+    assert warmed_url == "https://res.cloudinary.com/demo/video/upload/c_fill,ar_9:16,g_auto/v1700000000/uri-ads/clip.mp4"
+
     video_json = mock_client.post.call_args_list[1].kwargs["json"]
     assert video_json["video_url"] == (
         "https://res.cloudinary.com/demo/video/upload/c_fill,ar_9:16,g_auto/v1700000000/uri-ads/clip.mp4"
     )
+
+
+def test_launch_campaign_video_warm_up_timeout_does_not_block_the_launch():
+    # Best-effort: a slow/failed warm-up must not sink an otherwise-real launch —
+    # TikTok's own fetch may still land on a transcode that finished moments later.
+    import httpx as httpx_module
+
+    adapter = _adapter()
+    plan = _plan(creative=AdCreative(
+        image_url="https://res.cloudinary.com/demo/video/upload/v1700000000/uri-ads/clip.mp4",
+        is_video=True, headline="Fresh Cuts Daily", primary_text="Book on WhatsApp today",
+    ))
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client(list(_HAPPY_RESPONSES))
+        mock_client.head = AsyncMock(side_effect=httpx_module.TimeoutException("timed out"))
+        MockClient.return_value.__aenter__.return_value = mock_client
+        result = _run(adapter.launch_campaign(plan, _auth()))
+
+    assert result.campaign_id == "111"
+    assert mock_client.head.call_count == 1
 
 
 def test_launch_campaign_carousel_raises_clearly_when_no_music_found():
