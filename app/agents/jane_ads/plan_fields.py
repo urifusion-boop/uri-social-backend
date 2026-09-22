@@ -212,6 +212,21 @@ async def _validated_locations(
     return pins, rejected
 
 
+def _other_flex_fields(targeting: dict) -> dict[str, list]:
+    """Everything in flexible_spec that is not an interest.
+
+    Meta files each targeting type under its own key and rejects an id placed under the
+    wrong one, so these travel alongside the interests rather than merged into them.
+    """
+    other: dict[str, list] = {}
+    for entry in targeting.get("flexible_spec") or []:
+        for key, value in entry.items():
+            if key == "interests" or not value:
+                continue
+            other.setdefault(key, []).extend(value)
+    return other
+
+
 def _resolved_interests(targeting: dict) -> dict[str, dict]:
     """The interests already on the plan, keyed by the name the UI displays."""
     found: dict[str, dict] = {}
@@ -330,7 +345,16 @@ async def apply_edits(
             if kept:
                 # ONE flexible_spec entry: Meta ORs within an entry and ANDs across
                 # entries, and an AND of interests is a near-empty audience.
-                targeting["flexible_spec"] = [{"interests": kept}]
+                #
+                # Everything in that entry which is NOT an interest — life_events,
+                # behaviors, work_positions, industries — is carried over untouched.
+                # Meta rejects an id filed under the wrong key, so these cannot simply
+                # be folded in with the interests, and dropping them would silently
+                # narrow an audience the client never asked to change. Live-caught on a
+                # real ad set carrying 7 interests and 1 life_event.
+                entry = {k: v for k, v in _other_flex_fields(plan.audience_targeting or {}).items()}
+                entry["interests"] = kept
+                targeting["flexible_spec"] = [entry]
                 applied.append("interests")
 
     # ── gender ────────────────────────────────────────────────────────────────

@@ -217,3 +217,41 @@ def test_another_brands_campaign_is_not_editable(monkeypatch):
         _run(edit_live_targeting("c1", LiveTargetingBody(edits={"gender": "men"}),
                                  db=_Db(_record()), brand_ctx={"brand_id": "someone_else"}))
     assert e.value.status_code == 404
+
+
+def test_live_locations_are_read_from_the_ad_sets_own_geo(monkeypatch):
+    """Meta returns place NAMES inline on geo_locations. Showing "—" for a campaign
+    that really targets Ikeja G.R.A would tell the client their ad runs nowhere.
+    Live-caught against a real ad set."""
+    from app.agents.jane_ads.live_edit import live_location_names
+
+    targeting = {**BASE, "geo_locations": {
+        "location_types": ["home"],
+        "neighborhoods": [
+            {"key": "2891285", "name": "Ikeja G.R.A", "region": "Lagos State"},
+            {"key": "2891329", "name": "Lekki Peninsula", "region": "Lagos State"},
+        ],
+        "cities": [{"key": "1", "name": "Lagos"}],
+    }}
+    assert live_location_names(targeting) == ["Ikeja G.R.A", "Lekki Peninsula", "Lagos"]
+    shown = {f["key"]: f["value"] for f in describe_live(targeting)}
+    assert shown["locations"] == ["Ikeja G.R.A", "Lekki Peninsula", "Lagos"]
+
+
+def test_editing_interests_keeps_behaviours_and_life_events(monkeypatch):
+    """Live-caught on a real ad set carrying 7 interests and 1 life_event. Meta rejects
+    an id filed under the wrong key, so these cannot be folded in with the interests —
+    and dropping them silently narrows an audience the client never touched."""
+    async def _resolve(client, base, token, keyword):
+        return {"id": "new", "name": keyword}
+
+    monkeypatch.setattr("app.agents.jane_ads.audience_targeting._resolve_interest", _resolve)
+    current = {**BASE, "flexible_spec": [{
+        "interests": [{"id": "1", "name": "Fashion"}],
+        "life_events": [{"id": "6003", "name": "Newly engaged (1 year)"}],
+    }]}
+    targeting, applied, _ = _run(build_targeting_edit(current, {"interests": ["Shoes"]}, "Lagos"))
+    assert applied == ["interests"]
+    entry = targeting["flexible_spec"][0]
+    assert [i["name"] for i in entry["interests"]] == ["Shoes"]
+    assert entry["life_events"] == [{"id": "6003", "name": "Newly engaged (1 year)"}]

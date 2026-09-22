@@ -58,12 +58,34 @@ def targeting_fingerprint(targeting: dict) -> str:
     ).hexdigest()[:16]
 
 
+# Meta files named places under one key per type, and each entry carries its own name.
+_GEO_NAME_FIELDS = ("neighborhoods", "subcities", "cities", "regions")
+
+
+def live_location_names(targeting: dict) -> list[str]:
+    """The place names an ad set currently targets.
+
+    Meta returns the names inline on geo_locations, so this needs no extra lookup —
+    and reading them matters: showing "—" beside Locations for a campaign that really
+    does target Ikeja G.R.A tells the client their ad is running nowhere.
+    """
+    names: list[str] = []
+    geo = (targeting or {}).get("geo_locations") or {}
+    for field in _GEO_NAME_FIELDS:
+        for entry in geo.get(field) or []:
+            name = (entry or {}).get("name")
+            if name and name not in names:
+                names.append(name)
+    return names
+
+
 def describe_live(targeting: dict) -> list[dict[str, Any]]:
     """The live ad set's targeting as the same editable lines the review panel uses,
     minus everything that is not editable after launch."""
     from .plan_fields import describe
     from .models import (ABTestScope, CampaignPlan, CampaignRequest, CreativeContext,
-                         Goal, Platform, PlatformPlan, PurchaseBehaviour)
+                         GeoMode, GeoPin, GeoPlan, Goal, Platform, PlatformPlan,
+                         PurchaseBehaviour)
 
     # describe() reads a plan, so give it a minimal one carrying this targeting. Reusing
     # it keeps the live editor and the pre-launch panel from drifting into two different
@@ -73,6 +95,8 @@ def describe_live(targeting: dict) -> list[dict[str, Any]]:
         platforms=[PlatformPlan(platform=Platform.META, budget_ngn=1, days=1,
                                 variants=1, test_scope=ABTestScope.NONE)],
         per_business_cap_ngn=0, account_cap_ngn=0, audience_targeting=targeting or {},
+        geo=GeoPlan(mode=GeoMode.OWN_RADIUS,
+                    pins=[GeoPin(name=n) for n in live_location_names(targeting)]),
     )
     req = CampaignRequest(business_id="", budget_ngn=1, creative=CreativeContext())
     return [f for f in describe(stub, req) if f["key"] in EDITABLE]
