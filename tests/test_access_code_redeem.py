@@ -182,16 +182,16 @@ def test_previous_subscription_tier_is_recorded_for_audit(fake_db):
     assert fake_db["user_credits"].docs[0]["subscription_tier"] == "starter"
 
 
-# ── Assigned (personal invite) codes ────────────────────────────────────────
+# ── Assigned (personal invite roster) codes ─────────────────────────────────
 
-def test_assigned_code_redeemable_by_the_right_person(fake_db):
-    fake_db["access_codes"].docs[0]["assigned_to_email"] = "partner@example.com"
+def test_assigned_code_redeemable_by_someone_on_the_roster(fake_db):
+    fake_db["access_codes"].docs[0]["assigned_emails"] = ["partner@example.com", "second@example.com"]
     result = _redeem("ASA26", "user-1", user_email="Partner@Example.com")  # case-insensitive match
     assert result["status"] is True
 
 
-def test_assigned_code_rejected_for_wrong_person(fake_db):
-    fake_db["access_codes"].docs[0]["assigned_to_email"] = "partner@example.com"
+def test_assigned_code_rejected_for_someone_off_the_roster(fake_db):
+    fake_db["access_codes"].docs[0]["assigned_emails"] = ["partner@example.com", "second@example.com"]
     with pytest.raises(HTTPException) as exc_info:
         _redeem("ASA26", "user-2", user_email="someone-else@example.com")
     assert exc_info.value.status_code == 403
@@ -200,8 +200,16 @@ def test_assigned_code_rejected_for_wrong_person(fake_db):
     assert fake_db["user_credits"].docs == []
 
 
+def test_assigned_code_second_roster_member_can_also_redeem_independently(fake_db):
+    """The core point of a roster over 20 separate codes: each assigned
+    person redeems the SAME code string, independently of the others."""
+    fake_db["access_codes"].docs[0]["assigned_emails"] = ["partner@example.com", "second@example.com"]
+    result = _redeem("ASA26", "user-2", user_email="Second@Example.com")
+    assert result["status"] is True
+
+
 def test_unassigned_code_still_redeemable_by_anyone(fake_db):
-    # assigned_to_email stays unset (default) — the existing shared-code path.
+    # assigned_emails stays empty (default) — the existing shared-code path.
     result = _redeem("ASA26", "user-1", user_email="whoever@example.com")
     assert result["status"] is True
 
