@@ -383,3 +383,51 @@ def test_jane_stops_asking_for_the_budget_after_two_attempts():
     out = _enforce_hard_requirements(brief, "ok", history, known_budget=6000.0)
     assert out.budget_ngn == 6000.0
     assert not out.clarify
+
+
+# ── A geo_mode on its own is not an answer ────────────────────────────────────
+# Live-reported: Jane never asked where the campaign should run, and the plan card
+# showed no locations at all. The model had returned a geo_mode with no city and no
+# areas, which satisfied the old `not geo_mode and not city` check and then produced
+# a GeoPlan with zero pins.
+
+def _ready(**over):
+    base = dict(business_name="Uri Social", category="software", goal="bookings",
+                budget_ngn=10000.0)
+    base.update(over)
+    return ConsultantBrief(**base)
+
+
+def test_a_mode_with_no_place_still_asks_for_the_area():
+    b = _enforce_hard_requirements(
+        _ready(geo_mode="own_radius"), "yes 10000", [], 10000.0)
+    assert b.clarify
+    assert "area or city" in b.clarify
+
+
+def test_a_mode_with_named_areas_is_accepted():
+    b = _enforce_hard_requirements(
+        _ready(geo_mode="watering_hole", geo_areas=[{"name": "Ikeja", "reason": "offices"}]),
+        "yes 10000", [], 10000.0)
+    assert not b.clarify
+    assert b.geo_areas == [{"name": "Ikeja", "reason": "offices"}]
+
+
+def test_a_city_alone_is_accepted():
+    b = _enforce_hard_requirements(
+        _ready(geo_mode="own_radius", city="Lagos"), "yes 10000", [], 10000.0)
+    assert not b.clarify
+
+
+def test_non_local_needs_no_place_because_that_is_the_answer():
+    """'Location is not really relevant for this business' is a real answer, not a
+    gap — an online-only shop delivering nationwide has no pocket to pin."""
+    b = _enforce_hard_requirements(
+        _ready(geo_mode="non_local"), "yes 10000 — we ship nationwide", [], 10000.0)
+    assert not b.clarify
+
+
+def test_nothing_at_all_still_asks():
+    b = _enforce_hard_requirements(_ready(), "yes 10000", [], 10000.0)
+    assert b.clarify
+    assert "area or city" in b.clarify
