@@ -4,6 +4,7 @@ Strictly aligned with PRICING PRD V1
 
 Endpoints:
 - POST /billing/initialize-payment - Start SQUAD checkout (PRD 6.3)
+- POST /billing/credits/purchase-custom - Buy N bonus credits at ₦800/credit
 - POST /billing/verify-payment - Verify transaction (PRD 6.3)
 - POST /billing/webhook - SQUAD callback (PRD 6.3)
 - GET /billing/credits/balance - Get current balance (PRD 7.1)
@@ -14,14 +15,18 @@ Endpoints:
 """
 from fastapi import APIRouter, Depends, HTTPException, Request, Header
 from typing import Optional, List
+from datetime import datetime, timedelta
 from app.core.auth_bearer import JWTBearer
 from app.domain.models.billing_models import (
     InitializePaymentRequest,
     InitializePaymentResponse,
     VerifyPaymentRequest,
+    PurchaseCustomCreditsRequest,
     CreditBalanceResponse,
     SubscriptionResponse,
-    SubscriptionTier
+    SubscriptionTier,
+    RedeemAccessCodeRequest,
+    AccessCodeRedemption,
 )
 from app.services.CreditService import credit_service
 from app.services.SubscriptionService import subscription_service
@@ -74,8 +79,34 @@ async def initialize_payment(
             tier_id=body.tier_id,
             user_email=user_email,
             billing_cycle=body.billing_cycle,  # PRD 8.1: Pass billing cycle
+            currency=body.currency,  # Multi-currency support (NGN or USD)
             test_amount=body.test_amount,
             test_credits=body.test_credits
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Payment initialization failed: {str(e)}")
+
+
+@router.post("/credits/purchase-custom", response_model=InitializePaymentResponse)
+async def purchase_custom_credits(
+    body: PurchaseCustomCreditsRequest,
+    user_id: str = Depends(get_user_id),
+    user_email: str = Depends(get_user_email)
+):
+    """
+    Buy an arbitrary quantity of bonus credits (₦800/credit, NGN only).
+    Credits are added as bonus_credits (never expire) once payment verifies —
+    see PaymentService.initialize_custom_credit_payment / _complete_custom_credit_purchase.
+    Reuses the same SQUAD checkout + verify/webhook flow as subscription payments.
+    """
+    try:
+        result = await payment_service.initialize_custom_credit_payment(
+            user_id=user_id,
+            user_email=user_email,
+            quantity=body.quantity
         )
         return result
     except ValueError as e:
@@ -540,3 +571,141 @@ async def trial_can_generate(user_id: str = Depends(get_user_id)):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to check trial: {str(e)}")
+
+
+# ==================== Access Codes: partner/comp redemption ====================
+# Admin-generated codes (e.g. "ASA26" for a partnership) — see admin_router.py
+# for creation/management. This is the one user-facing endpoint: redeeming a
+# code grants the code's plan for its duration_days, starting from THIS
+# user's own redemption moment, not a shared expiry tied to the code.
+
+@router.post("/access-code/redeem")
+async def redeem_access_code(
+    body: RedeemAccessCodeRequest,
+    user_id: str = Depends(get_user_id),
+    user_email: str = Depends(get_user_email),
+):
+    """
+    Grants free access by writing the exact same wallet fields a real
+    purchase would (subscription_tier/start_date/end_date), then leaves
+    expiry entirely to the existing daily subscription_service.expire_subscriptions()
+    sweep — no new expiry logic needed, and since next_renewal stays None,
+    SQUAD is never involved and no charge can ever fire for this grant.
+    """
+    from app.database import get_db
+
+    db = get_db()
+    code = body.code.strip().upper()
+
+    access_code = await db["access_codes"].find_one({"code": code})
+    if not access_code:
+        raise HTTPException(status_code=404, detail=f"'{code}' is not a valid code")
+    if not access_code.get("is_active", True):
+        raise HTTPException(status_code=400, detail="This code is no longer active")
+    expires_at = access_code.get("expires_at")
+    if expires_at and datetime.utcnow() > expires_at:
+        raise HTTPException(status_code=400, detail="This code has expired")
+    # Assigned codes are a personal invite, not a shared code — enforced
+    # here, not just hidden in the UI, so this can't be bypassed by anyone
+    # who gets hold of the code string. Case-insensitive to match how it
+    # was normalized on creation.
+    assigned_to = access_code.get("assigned_to_email")
+    if assigned_to and assigned_to.lower() != user_email.lower():
+        raise HTTPException(status_code=403, detail="This code is reserved for a specific person")
+    max_redemptions = access_code.get("max_redemptions")
+    if max_redemptions is not None and access_code.get("redemption_count", 0) >= max_redemptions:
+        raise HTTPException(status_code=400, detail="This code has reached its redemption limit")
+
+    # One redemption per user per code — otherwise the same user could keep
+    # re-redeeming to indefinitely restart their own access window.
+    existing_redemption = await db["access_code_redemptions"].find_one({"code": code, "user_id": user_id})
+    if existing_redemption:
+        raise HTTPException(status_code=400, detail="You've already redeemed this code")
+
+    tier_id = access_code["plan_tier_id"]
+    tier = await db["subscription_tiers"].find_one({"tier_id": tier_id})
+    if not tier:
+        # The code outlived its plan (e.g. a tier was removed/renamed) —
+        # fail loudly rather than silently granting access to nothing.
+        raise HTTPException(status_code=500, detail=f"Code's plan '{tier_id}' no longer exists — contact support")
+
+    duration_days = access_code["duration_days"]
+    now = datetime.utcnow()
+    access_end = now + timedelta(days=duration_days)
+
+    existing_wallet = await credit_service.get_user_wallet(user_id)
+    previous_tier = existing_wallet.subscription_tier if existing_wallet else None
+
+    # No stacking: a comp grant is a one-time allocation, not a top-up, so
+    # redeeming a second code while the first is still in effect would
+    # silently overwrite (not add to) subscription_credits — discarding
+    # whatever was left unused. A real PAID subscription is deliberately
+    # NOT blocked here — a comp code overriding it is intended behavior.
+    if (
+        existing_wallet
+        and existing_wallet.subscription_source == "access_code"
+        and existing_wallet.subscription_tier
+        and (existing_wallet.end_date is None or existing_wallet.end_date > datetime.utcnow())
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"You already have an active comp {existing_wallet.subscription_tier} plan with "
+                f"{existing_wallet.credits_remaining} credit(s) remaining"
+                + (f", valid until {existing_wallet.end_date.date()}" if existing_wallet.end_date else "")
+                + ". It has to end or run out before you can redeem another code."
+            ),
+        )
+
+    await credit_service.user_credits_collection.update_one(
+        {"user_id": user_id},
+        {
+            "$set": {
+                "subscription_tier": tier_id,
+                "subscription_credits": tier.get("credits_monthly", tier.get("credits", 0)),
+                "subscription_source": "access_code",  # flags this for the credits-exhausted auto-revoke rule
+                "billing_cycle": "monthly",
+                "start_date": now,
+                "end_date": access_end,
+                "next_renewal": None,  # comped access never auto-renews or charges
+                "updated_at": now,
+            },
+            "$setOnInsert": {
+                "user_id": user_id,
+                "bonus_credits": 0,
+                "frozen_credits": 0,
+                "credits_used": 0,
+                "created_at": now,
+            },
+        },
+        upsert=True,
+    )
+    # total_credits/credits_remaining are recomputed from source fields by
+    # get_user_wallet/get_credit_balance on every read — no need to set them
+    # here too (see CreditService.get_user_wallet's own recompute comment).
+
+    await db["access_code_redemptions"].insert_one(
+        AccessCodeRedemption(
+            code=code,
+            user_id=user_id,
+            plan_tier_id=tier_id,
+            access_start=now,
+            access_end=access_end,
+            previous_subscription_tier=previous_tier,
+            redeemed_at=now,
+        ).dict()
+    )
+    await db["access_codes"].update_one({"code": code}, {"$inc": {"redemption_count": 1}})
+
+    return {
+        "status": True,
+        "responseCode": 200,
+        "responseMessage": f"Code redeemed — {tier.get('name', tier_id)} access active for {duration_days} days",
+        "responseData": {
+            "plan_tier_id": tier_id,
+            "plan_name": tier.get("name", tier_id),
+            "access_start": now.isoformat(),
+            "access_end": access_end.isoformat(),
+            "duration_days": duration_days,
+        },
+    }
