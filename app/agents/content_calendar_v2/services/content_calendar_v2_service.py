@@ -366,6 +366,18 @@ def _visual_guide_block(brand: Dict[str, Any]) -> str:
     )
 
 
+def _resolve_series_name(name: Optional[str], brand_name: str, industry: str) -> Optional[str]:
+    """SERIES_TEMPLATES keeps a couple of names as literal placeholders
+    ("Ask [Brand]", "The [Industry] Myth") — confirmed live: a generated plan
+    shipped "The [Industry] Myth" verbatim, because nothing ever substituted
+    the bracket before the name reached the model or the final item. Applied
+    both when building the prompt's series list (so the model is never shown
+    an unresolved bracket to copy) and again defensively on the final item."""
+    if not name:
+        return name
+    return name.replace("[Brand]", brand_name).replace("[Industry]", industry)
+
+
 # ── Step 3 — Candidate concept pool (PRD §10, §36) ──────────────────────────
 
 async def _generate_candidate_concepts(
@@ -414,7 +426,9 @@ async def _generate_candidate_concepts(
         for cat, devices in framework["creative_devices"].items()
     )
     series_templates = framework.get("series_templates") or []
-    series_block = "\n".join(f'- "{s["name"]}"' for s in series_templates)
+    series_block = "\n".join(
+        f'- "{_resolve_series_name(s["name"], brand_name, industry)}"' for s in series_templates
+    )
     prior_series = creative_memory.get("series_names") or []
     prior_series_block = (
         "\nSeries already used for this business — prefer reusing one of these over starting a new one, "
@@ -1123,7 +1137,62 @@ def _clamp_carousel(idea: Dict[str, Any], target: int) -> None:
     carousel["slides"] = trimmed
 
 
-def _validate_item_v2(idea: Dict[str, Any], is_carousel: bool, expected_slides: int = 3) -> List[str]:
+_TEXT_FIELDS_FOR_SCANNING = (
+    "title", "hook", "description", "caption_direction", "cta", "topic",
+    "promised_business_outcome", "creative_concept_name", "central_visual_idea",
+    "design_style", "layout_direction", "visual_metaphor", "designer_execution_notes",
+    "reasoning",
+)
+
+
+def _collect_item_text(idea: Dict[str, Any]) -> str:
+    """Flattens every copy-bearing field of a generated item into one string
+    — used both for the words-to-avoid guardrail check and could serve any
+    future whole-item text scan. Deliberately excludes structural fields
+    (territory/format/etc.) that aren't shown to the end reader."""
+    parts = [str(idea.get(k) or "") for k in _TEXT_FIELDS_FOR_SCANNING]
+    parts.extend(str(p) for p in (idea.get("key_points") or []))
+    parts.extend(str(k) for k in (idea.get("keywords") or []))
+    video_idea = idea.get("video_idea") or {}
+    if isinstance(video_idea, dict):
+        parts.append(str(video_idea.get("hook") or ""))
+        parts.append(str(video_idea.get("cta") or ""))
+        parts.extend(str(p) for p in (video_idea.get("talking_points") or []))
+        parts.extend(str(s) for s in (video_idea.get("scenes") or []))
+    exact_copy = idea.get("exact_copy") or {}
+    if isinstance(exact_copy, dict):
+        parts.append(str(exact_copy.get("headline") or ""))
+        parts.append(str(exact_copy.get("caption") or ""))
+        parts.extend(str(h) for h in (exact_copy.get("hashtags") or []))
+    carousel = idea.get("carousel") or {}
+    if isinstance(carousel, dict):
+        for slide in (carousel.get("slides") or []):
+            if isinstance(slide, dict):
+                parts.append(str(slide.get("headline") or ""))
+                parts.append(str(slide.get("body") or ""))
+    return " \n ".join(p for p in parts if p)
+
+
+def _find_banned_words(idea: Dict[str, Any], words_to_avoid: List[str]) -> List[str]:
+    """The brand's words_to_avoid was only ever a prompt instruction (soft
+    guidance the model can and does ignore under pressure to hit other
+    requirements) — confirmed live: "guaranteed" survived into a caption for
+    a brand that explicitly banned it. Per the PRD's own rule (§53 — code
+    enforces hard constraints, the LLM handles creative judgment), this
+    makes it a deterministic, case-insensitive check instead, wired into the
+    same validation-failure → regenerate loop everything else here uses."""
+    if not words_to_avoid:
+        return []
+    haystack = _collect_item_text(idea).lower()
+    return [str(w).strip() for w in words_to_avoid if str(w).strip() and str(w).strip().lower() in haystack]
+
+
+def _validate_item_v2(
+    idea: Dict[str, Any],
+    is_carousel: bool,
+    expected_slides: int = 3,
+    words_to_avoid: Optional[List[str]] = None,
+) -> List[str]:
     """Extends v1's _validate_day (hard deterministic rules, PRD §28) with
     V2's own required fields. Carousel check enforces the PRD's HARD 2-5
     rule (§28), not the exact per-concept target — the target is a hint for
@@ -1142,6 +1211,11 @@ def _validate_item_v2(idea: Dict[str, Any], is_carousel: bool, expected_slides: 
         slides = ((idea.get("carousel") or {}).get("slides")) or []
         if not (2 <= len(slides) <= 5):
             issues.append(f"carousel must have 2-5 slides (PRD hard rule), got {len(slides)}")
+    banned_hits = _find_banned_words(idea, words_to_avoid or [])
+    if banned_hits:
+        issues.append(
+            f"uses word(s)/phrase(s) the brand asked to avoid: {', '.join(banned_hits)} — rewrite without them"
+        )
     return issues
 
 
@@ -1364,7 +1438,10 @@ business's actual customers, not a generic reader?
             expected_slides = concepts_chunk[i].get("carousel_slide_count", 3)
             if is_carousel:
                 _clamp_carousel(idea, expected_slides)  # deterministically enforce the 2-5 hard rule
-            issues = _validate_item_v2(idea, is_carousel=is_carousel, expected_slides=expected_slides)
+            issues = _validate_item_v2(
+                idea, is_carousel=is_carousel, expected_slides=expected_slides,
+                words_to_avoid=brand.get("words_to_avoid"),
+            )
             if issues:
                 failures[i] = issues
         if not failures:
@@ -1860,10 +1937,15 @@ async def _build_plan_doc(
             "primary_kpi": idea.get("primary_kpi", "engagement"),
             "selection_score": idea.get("selection_score", {}),
             "series_id": (
-                series_ids_by_name.setdefault(idea["series_name"], str(uuid.uuid4()))
+                series_ids_by_name.setdefault(
+                    _resolve_series_name(idea["series_name"], brand.get("brand_name") or "the brand", industry or "business"),
+                    str(uuid.uuid4()),
+                )
                 if idea.get("series_name") else None
             ),
-            "series_name": idea.get("series_name"),
+            "series_name": _resolve_series_name(
+                idea.get("series_name"), brand.get("brand_name") or "the brand", industry or "business"
+            ),
             "creative_quality_review_note": anti_boring_notes.get(day_index),
             "diversity_check": {
                 "passed": day_index not in flagged_set,
