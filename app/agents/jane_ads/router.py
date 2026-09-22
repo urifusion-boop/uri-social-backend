@@ -3960,6 +3960,154 @@ class CampaignStatusBody(BaseModel):
     active: bool
 
 
+class LiveTargetingBody(BaseModel):
+    edits: dict = Field(default_factory=dict)
+    # The fingerprint of the targeting the client was looking at. A mismatch means
+    # somebody changed the ad set in between, and their change is not ours to discard.
+    baseline: str = ""
+
+
+async def _live_campaign(db, campaign_id: str, brand_id: str) -> dict:
+    record = await db["jane_ads_meta_campaigns"].find_one({"campaign_id": campaign_id})
+    if not record or record.get("brand_id") != brand_id:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    return record
+
+
+@router.get("/meta/campaigns/{campaign_id}/targeting")
+async def get_live_targeting(
+    campaign_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Who a LIVE campaign is currently targeting, read fresh from Meta.
+
+    Campaign Management PRD §19, "Audience or geography edit" — the only row of that
+    action matrix implemented here.
+    """
+    from app.core.config import settings
+
+    from .adapters.meta import MetaAdPlatformAdapter, MetaAPIError
+    from .live_edit import LEARNING_WARNING, describe_live, targeting_fingerprint
+
+    await _live_campaign(db, campaign_id, brand_ctx.get("brand_id"))
+    adapter = MetaAdPlatformAdapter(db, access_token=settings.META_ADS_ACCESS_TOKEN)
+    try:
+        live = await adapter.fetch_adset_targeting(campaign_id)
+    except MetaAPIError as e:
+        raise HTTPException(status_code=502, detail=f"Could not read the campaign from Meta: {e}")
+
+    delivering = (live.get("effective_status") or "").upper() == "ACTIVE"
+    return {
+        "campaign_id": campaign_id,
+        "adset_id": live["adset_id"],
+        "effective_status": live.get("effective_status"),
+        "fields": describe_live(live["targeting"]),
+        # What the edit must be built on. Sent back with the PATCH.
+        "baseline": targeting_fingerprint(live["targeting"]),
+        "delivering": delivering,
+        "learning_warning": LEARNING_WARNING if delivering else "",
+    }
+
+
+@router.patch("/meta/campaigns/{campaign_id}/targeting")
+async def edit_live_targeting(
+    campaign_id: str,
+    body: LiveTargetingBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Change who a LIVE campaign targets.
+
+    The sequence is fixed and every step earns its place (PRD §20):
+
+    1. Re-read Meta's CURRENT targeting and check it still matches the baseline the
+       client was shown. A mismatch is 409 — someone edited it in Ads Manager and we do
+       not overwrite people's work (D45/CM17).
+    2. Validate the edit against Meta without changing anything.
+    3. Write it.
+    4. Re-read and report from what Meta actually holds. An ack is not an effect (CM13).
+
+    Only interests, age, gender, placement and locations. Budget, schedule, objective
+    and bid strategy are separate action families and are refused here.
+    """
+    from datetime import datetime, timezone
+
+    from app.core.config import settings
+
+    from .adapters.meta import MetaAdPlatformAdapter, MetaAPIError
+    from .live_edit import build_targeting_edit, describe_live, targeting_fingerprint
+
+    brand_id = brand_ctx.get("brand_id")
+    record = await _live_campaign(db, campaign_id, brand_id)
+    if not body.edits:
+        raise HTTPException(status_code=400, detail="No edits supplied.")
+
+    adapter = MetaAdPlatformAdapter(db, access_token=settings.META_ADS_ACCESS_TOKEN)
+    try:
+        live = await adapter.fetch_adset_targeting(campaign_id)
+    except MetaAPIError as e:
+        raise HTTPException(status_code=502, detail=f"Could not read the campaign from Meta: {e}")
+
+    current = live["targeting"]
+    fingerprint = targeting_fingerprint(current)
+    if body.baseline and body.baseline != fingerprint:
+        raise HTTPException(
+            status_code=409,
+            detail="This campaign's targeting was changed somewhere else since you "
+                   "opened it. Reload to see the current settings before editing.",
+        )
+
+    region = (record.get("geo_city") or "") or (record.get("city") or "")
+    targeting, applied, rejections = await build_targeting_edit(
+        current, body.edits, region, settings.META_ADS_ACCESS_TOKEN)
+    if not applied or targeting is None:
+        return {"campaign_id": campaign_id, "applied": [], "rejected": rejections,
+                "fields": describe_live(current), "baseline": fingerprint}
+
+    try:
+        await adapter.update_adset_targeting(live["adset_id"], targeting, validate_only=True)
+    except MetaAPIError as e:
+        return {"campaign_id": campaign_id, "applied": [], "fields": describe_live(current),
+                "baseline": fingerprint, "rejected": [*rejections, f"Meta rejected the change: {e}"]}
+
+    try:
+        result = await adapter.update_adset_targeting(live["adset_id"], targeting)
+    except MetaAPIError as e:
+        # The write may well have landed — a lost response is not a failed write. Re-read
+        # rather than retry, because retrying an unknown mutation is how duplicates happen.
+        try:
+            after = await adapter.fetch_adset_targeting(campaign_id)
+            settled = targeting_fingerprint(after["targeting"]) == targeting_fingerprint(targeting)
+        except MetaAPIError:
+            after, settled = None, False
+        raise HTTPException(
+            status_code=502 if not settled else 200,
+            detail=(f"Meta did not confirm the change ({e}). "
+                    + ("Reading it back shows it did apply — reload to confirm."
+                       if settled else
+                       "Reading it back shows it did NOT apply. Nothing was changed twice; "
+                       "check the campaign in Ads Manager before trying again.")),
+        )
+
+    confirmed = result.get("targeting") or {}
+    await db["jane_ads_live_targeting_edits"].insert_one({
+        "campaign_id": campaign_id, "brand_id": brand_id, "adset_id": live["adset_id"],
+        "fields": applied, "before": current, "after": confirmed,
+        "was_delivering": (live.get("effective_status") or "").upper() == "ACTIVE",
+        "edited_at": datetime.now(timezone.utc),
+    })
+    return {
+        "campaign_id": campaign_id,
+        "applied": applied,
+        "rejected": rejections,
+        # Reported from what Meta HOLDS, not from what we sent.
+        "fields": describe_live(confirmed),
+        "baseline": targeting_fingerprint(confirmed),
+        "verified": True,
+    }
+
+
 @router.post("/meta/campaigns/{campaign_id}/status")
 async def set_meta_campaign_status(
     campaign_id: str,
