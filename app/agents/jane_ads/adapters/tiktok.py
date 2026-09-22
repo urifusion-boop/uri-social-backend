@@ -149,6 +149,36 @@ def _force_jpg_delivery(image_url: str) -> str:
     return image_url[:insert_at] + "f_jpg/" + image_url[insert_at:]
 
 
+def _force_tiktok_video_ratio(video_url: str) -> str:
+    """Live-caught 2026-09-22: TikTok flagged an uploaded video ("WhatsApp Video
+    2026-0...") with "Cannot be delivered to TikTok: Video ratio must be
+    16:9/1:1/9:16" — its real dimensions (480x848) are close to but not exactly
+    9:16, which is enough for TikTok to reject delivery outright even though the ad
+    itself was created successfully. Our own upload endpoint (creative_upload in
+    router.py) applies zero video transformation — whatever the source file's real
+    dimensions are is exactly what gets sent to TikTok, and phone/WhatsApp-exported
+    video is routinely a few pixels off a clean ratio.
+
+    Rather than reject uploads with the wrong ratio (most user-shot vertical video
+    for a mobile-first platform like TikTok is ALREADY close to 9:16, just not
+    exact — asking the user to re-export is real friction for something we can fix
+    transparently), force Cloudinary to deliver a clean 9:16 crop via its standard
+    c_fill,ar_9:16,g_auto transformation — g_auto is Cloudinary's content-aware
+    gravity, so it crops toward the visually important part of the frame rather
+    than a blind centre-crop. A no-op, unchanged URL for anything not hosted on
+    Cloudinary (nothing else is, today, but this must never raise on an unexpected
+    shape). Applied unconditionally rather than only when the ratio is already
+    wrong — re-encoding an already-9:16 video through this transformation is a
+    harmless no-op, and detecting the source ratio first would mean an extra
+    Cloudinary metadata call for no real benefit."""
+    marker = "/video/upload/"
+    idx = video_url.find(marker)
+    if idx == -1:
+        return video_url
+    insert_at = idx + len(marker)
+    return video_url[:insert_at] + "c_fill,ar_9:16,g_auto/" + video_url[insert_at:]
+
+
 class TikTokAdsAdapter(AdPlatformAdapter):
     """One instance per request/job. advertiser_id/access_token are ALWAYS
     caller-supplied (never read from settings inside this class) — Phase 1 callers
@@ -333,7 +363,7 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                         json={
                             "advertiser_id": self._advertiser_id,
                             "upload_type": "UPLOAD_BY_URL",
-                            "video_url": plan.creative.image_url,
+                            "video_url": _force_tiktok_video_ratio(plan.creative.image_url),
                             "file_name": f"jane-ads-{plan.business_id}-{uuid.uuid4().hex[:8]}.mp4",
                         },
                     )
