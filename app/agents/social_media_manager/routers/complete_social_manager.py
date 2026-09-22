@@ -6088,6 +6088,7 @@ async def _generate_image_bg(
                 "brand_name": brand_context.get("brand_name", ""),
                 "logo_url": brand_context.get("logo_url", ""),
                 "logo_position": brand_context.get("logo_position", "bottom_right"),
+                "logo_size": brand_context.get("logo_size", "small"),
                 "logo_description": brand_context.get("logo_description", "brand logo"),
                 "brand_colors": brand_context.get("brand_colors") or [],
                 "font_style": brand_context.get("font_style") or brand_context.get("primary_font", ""),
@@ -9259,6 +9260,7 @@ async def _add_brand_overlay(
     brand_name: str = "",
     brand_color: str = "#CD1B78",
     video_width: Optional[int] = None,
+    logo_size: str = "small",
 ) -> Optional[str]:
     """Download a finished video, burn a logo (or, if none on file, a text
     wordmark of the brand name) plus an optional short contact line into it, and
@@ -9335,7 +9337,14 @@ async def _add_brand_overlay(
             ffmpeg_inputs += ["-i", logo_tmp]
             xy = _LOGO_POSITIONS.get(logo_position, _LOGO_POSITIONS["bottom_right"])
             clause = _overlay_timing_clause(logo_timing, duration)
-            filters.append(f"[{input_idx}:v]scale=120:trunc(ow/a/2)*2,format=rgba[logo]")
+            # Same small/medium/large -> % of frame width mapping as the
+            # image-overlay path (ImageContentService._overlay_logo) — this
+            # was hardcoded to a fixed 120px regardless of logo_size, which
+            # is why a brand's "large" logo choice never showed up any
+            # bigger in a video than "small" did.
+            logo_size_pct = {"small": 0.08, "medium": 0.12, "large": 0.16}.get(logo_size, 0.08)
+            logo_target_w = max(40, int(actual_width * logo_size_pct))
+            filters.append(f"[{input_idx}:v]scale={logo_target_w}:trunc(ow/a/2)*2,format=rgba[logo]")
             filters.append(f"[{cur}][logo]overlay={xy}{clause}[v1]")
             cur = "v1"
             input_idx += 1
@@ -9424,13 +9433,14 @@ async def _resolve_brand_overlay_context(
     drift. Fails soft to an all-empty result; the caller's own try/except
     (or _add_brand_overlay's own no-op-when-nothing-to-burn guard) handles
     that gracefully."""
-    result = {"logo_url": None, "contact_text": None, "brand_name": "", "brand_color": "#CD1B78"}
+    result = {"logo_url": None, "logo_size": "small", "contact_text": None, "brand_name": "", "brand_color": "#CD1B78"}
     try:
         active_brand_id = ctx["brand_id"]
         profile_result = await BrandProfileService.get(user_id, db, brand_id=active_brand_id)
         profile_data = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
         brand_ctx = BrandProfileService.to_brand_context(profile_data)
         result["logo_url"] = brand_ctx.get("logo_url") or None
+        result["logo_size"] = brand_ctx.get("logo_size") or "small"
         result["brand_name"] = brand_ctx.get("brand_name") or ""
         colors = brand_ctx.get("brand_colors") or []
         result["brand_color"] = colors[0] if colors else "#CD1B78"
@@ -9501,6 +9511,7 @@ async def video_brand_overlay_adjust(
         brand_name=resolved["brand_name"],
         brand_color=resolved["brand_color"],
         video_width=job.get("video_width"),
+        logo_size=resolved["logo_size"],
     )
     if not overlaid_url:
         raise HTTPException(status_code=502, detail="Could not apply the overlay — please try again.")
@@ -10060,6 +10071,7 @@ async def zapcap_produce(
     brand_overlay_logo_url = brand_overlay_contact_text = None
     brand_overlay_name = ""
     brand_overlay_color = "#CD1B78"
+    brand_overlay_logo_size = "small"
     if enable_brand_overlay.lower() == "true":
         resolved = await _resolve_brand_overlay_context(
             user_id, db, ctx, contact_source, custom_contact_text
@@ -10068,6 +10080,7 @@ async def zapcap_produce(
         brand_overlay_contact_text = resolved["contact_text"]
         brand_overlay_name = resolved["brand_name"]
         brand_overlay_color = resolved["brand_color"]
+        brand_overlay_logo_size = resolved["logo_size"]
 
     # Persist job
     await db["zapcap_jobs"].insert_one({
@@ -10094,6 +10107,7 @@ async def zapcap_produce(
         "brand_overlay_contact_text": brand_overlay_contact_text,
         "brand_overlay_name": brand_overlay_name,
         "brand_overlay_color": brand_overlay_color,
+        "brand_overlay_logo_size": brand_overlay_logo_size,
         "logo_position": logo_position,
         "logo_timing": logo_timing,
         "contact_position": contact_position,
@@ -10402,6 +10416,7 @@ async def zapcap_job_status(
                     brand_name=job.get("brand_overlay_name") or "",
                     brand_color=job.get("brand_overlay_color") or "#CD1B78",
                     video_width=job.get("video_width"),
+                    logo_size=job.get("brand_overlay_logo_size") or "small",
                 )
                 if overlaid_url:
                     output_url = overlaid_url
@@ -10621,6 +10636,7 @@ async def zapcap_job_status(
                     brand_name=job.get("brand_overlay_name") or "",
                     brand_color=job.get("brand_overlay_color") or "#CD1B78",
                     video_width=job.get("video_width"),
+                    logo_size=job.get("brand_overlay_logo_size") or "small",
                 )
                 if overlaid_url:
                     await db["zapcap_jobs"].update_one(
