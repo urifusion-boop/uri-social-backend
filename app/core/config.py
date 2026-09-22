@@ -233,7 +233,7 @@ class Settings(BaseSettings):
     # security posture rather than silently locking everyone out until a .env
     # change ships — extend via env var for additional admins, never widen this
     # default to something guessable.
-    ADMIN_EMAILS: str = "urisocialingsight@gmail.com"
+    ADMIN_EMAILS: str = "urisocialingsight@gmail.com,ujahnaomi104@gmail.com"
     # Set to 'reap' | 'opusclip' | 'vizard' after Phase 0 Pidgin test picks a winner
     CLIPPING_API_PROVIDER: str = "reap"
 

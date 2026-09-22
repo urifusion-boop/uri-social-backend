@@ -16,6 +16,7 @@ from typing import Optional, Dict
 from datetime import datetime
 from bson import ObjectId
 from motor.motor_asyncio import AsyncIOMotorDatabase
+from pymongo import ReturnDocument
 from app.database import get_db
 from app.domain.models.billing_models import (
     PaymentTransaction,
@@ -32,6 +33,11 @@ class PaymentService:
     Payment processing via SQUAD gateway
     PRD Section 6: Billing System Requirements
     """
+
+    # Fixed price for the "buy N custom credits" flow — a one-off bonus-credit
+    # top-up, separate from the subscription tiers. NGN only (no USD pricing
+    # requested for this flow).
+    CUSTOM_CREDIT_PRICE_NGN = 800
 
     def __init__(self):
         self._db: Optional[AsyncIOMotorDatabase] = None
@@ -52,7 +58,7 @@ class PaymentService:
         # route is its own folder (/workspace/index.html) — a request without
         # the slash 404s outright instead of loading the app (this is exactly
         # what broke a real customer's post-payment redirect).
-        web_app_url = getattr(settings, 'WEB_APP_URL', 'https://www.urisocial.com')
+        web_app_url = (getattr(settings, 'WEB_APP_URL', '') or 'https://www.urisocial.com').strip("'\"")
         self.callback_url = f'{web_app_url}/workspace/?tab=billing'
 
     async def _get_current_mode(self) -> str:
@@ -97,17 +103,18 @@ class PaymentService:
         tier_id: str,
         user_email: str,
         billing_cycle: str = "monthly",
+        currency: str = "NGN",
         test_amount: int = None,
         test_credits: int = None
     ) -> InitializePaymentResponse:
         """
-        Initialize SQUAD payment checkout with billing cycle support
+        Initialize SQUAD payment checkout with billing cycle and currency support
         PRD: Subscription Plan Upgrade (Multi-Duration with 5% Bulk Discount)
-        Sections 6.3 & 8.2: Payment Flow + Payment Logic
+        Sections 6.3 & 8.2: Payment Flow + Payment Logic + Multi-currency
 
-        1. User selects plan and billing cycle
+        1. User selects plan, billing cycle, and currency
         2. Calculate price with 5% discount for multi-month
-        3. Payment processed via SQUAD
+        3. Payment processed via SQUAD in selected currency (NGN or USD)
         4. On success: Assign credits, Activate subscription
 
         Args:
@@ -115,17 +122,20 @@ class PaymentService:
             tier_id: Subscription tier to purchase
             user_email: User email for payment
             billing_cycle: "monthly"|"3_months"|"6_months"|"12_months"
+            currency: "NGN" or "USD" (default: "NGN")
             test_amount: Custom test amount (only for tier_id='test')
             test_credits: Custom test credits (only for tier_id='test')
         """
         # Handle test tier with custom amounts (temporary testing feature)
         if tier_id == 'test':
-            print(f"🧪 TEST PAYMENT: amount={test_amount}, credits={test_credits}, user={user_id}")
+            print(f"🧪 TEST PAYMENT: amount={test_amount}, credits={test_credits}, currency={currency}, user={user_id}")
             if not test_amount or not test_credits:
                 raise ValueError(f"test_amount and test_credits required for test tier (received: amount={test_amount}, credits={test_credits})")
 
             amount = test_amount
             credits = test_credits
+            currency_symbol = "$" if currency == "USD" else "₦"
+            print(f"💰 Test Payment: {currency_symbol}{amount:,} {currency} ({credits} credits)")
         else:
             # Validate tier
             validation = await subscription_service.validate_tier_purchase(user_id, tier_id)
@@ -134,21 +144,27 @@ class PaymentService:
 
             tier = validation["tier"]
 
-            # Calculate price and credits based on billing cycle (PRD Section 6 & 8.2)
-            amount = subscription_service.calculate_price(tier.price_ngn_monthly, billing_cycle)
+            # Calculate price and credits based on billing cycle and currency (PRD Section 6 & 8.2)
+            if currency == "USD":
+                base_price = tier.price_usd_monthly
+            else:
+                base_price = tier.price_ngn_monthly
+
+            amount = subscription_service.calculate_price(base_price, billing_cycle)
             credits = subscription_service.calculate_credits(tier.credits_monthly, billing_cycle)
 
-            print(f"💰 Payment: {tier.name} - {billing_cycle} - ₦{amount:,} ({credits} credits)")
+            currency_symbol = "$" if currency == "USD" else "₦"
+            print(f"💰 Payment: {tier.name} - {billing_cycle} - {currency_symbol}{amount:,} {currency} ({credits} credits)")
 
         # Generate unique transaction reference
-        transaction_ref = f"URI_{user_id[:8]}_{tier_id.upper()}_{billing_cycle.upper()}_{int(datetime.utcnow().timestamp())}"
+        transaction_ref = f"URI_{user_id[:8]}_{tier_id.upper()}_{billing_cycle.upper()}_{currency}_{int(datetime.utcnow().timestamp())}"
 
         # Create pending payment transaction (PRD Section 8.1 & 8.2)
         payment = PaymentTransaction(
             user_id=user_id,
             transaction_ref=transaction_ref,
             amount=amount,
-            currency="NGN",
+            currency=currency,
             status="pending",
             gateway="squad",
             subscription_tier=tier_id,
@@ -175,12 +191,12 @@ class PaymentService:
 
                 # SQUAD API payload structure (per official docs)
                 # Note: Sandbox doesn't accept "meta" field, only live does
-                # IMPORTANT: SQUAD expects amount in KOBO (smallest unit), not Naira
-                # 1 Naira = 100 Kobo, so ₦15,000 = 1,500,000 kobo
+                # IMPORTANT: SQUAD expects amount in smallest unit (Kobo for NGN, Cents for USD)
+                # 1 Naira = 100 Kobo, 1 Dollar = 100 Cents
                 payload = {
                     "email": user_email,
-                    "amount": amount * 100,  # Convert Naira to Kobo (multiply by 100)
-                    "currency": "NGN",
+                    "amount": amount * 100,  # Convert to smallest unit (Kobo/Cents)
+                    "currency": currency,  # NGN or USD
                     "initiate_type": "inline",  # Required: opens payment modal
                     "transaction_ref": transaction_ref,
                     "callback_url": self.callback_url
@@ -209,11 +225,111 @@ class PaymentService:
                         transaction_ref=transaction_ref,
                         amount=amount,
                         email=user_email,
-                        currency="NGN",
+                        currency=currency,
                         public_key=creds['public_key']
                     )
                 else:
                     # PRD 6.4: Failure Handling
+                    await self._mark_payment_failed(transaction_ref, response_data)
+                    raise Exception(f"SQUAD initialization failed: {response_data.get('message')}")
+
+        except httpx.RequestError as e:
+            await self._mark_payment_failed(transaction_ref, {"error": str(e)})
+            raise Exception(f"Payment gateway connection failed: {str(e)}")
+
+    # ==================== Custom Credit Purchase (pay-per-credit top-up) ====================
+
+    async def initialize_custom_credit_payment(
+        self,
+        user_id: str,
+        user_email: str,
+        quantity: int
+    ) -> InitializePaymentResponse:
+        """
+        Initialize a SQUAD checkout for an arbitrary quantity of bonus credits
+        at a fixed price (CUSTOM_CREDIT_PRICE_NGN per credit). NGN only.
+
+        Unlike initialize_payment (subscription tiers), this isn't tied to a
+        tier/billing_cycle — it's a one-off top-up that adds `quantity`
+        bonus_credits to the wallet on completion (see
+        _complete_custom_credit_purchase). Reuses the same SQUAD
+        initiate/verify/webhook plumbing as the subscription flow, disambiguated
+        via `purchase_type` on the PaymentTransaction doc.
+        """
+        if quantity < 1:
+            raise ValueError("quantity must be at least 1")
+
+        amount = quantity * self.CUSTOM_CREDIT_PRICE_NGN
+        currency = "NGN"
+        print(f"💰 Custom credit purchase: {quantity} credits × ₦{self.CUSTOM_CREDIT_PRICE_NGN} = ₦{amount:,} (user={user_id})")
+
+        # Generate unique transaction reference (CREDITS-prefixed so it's
+        # visually distinguishable from subscription refs in payment history/logs)
+        transaction_ref = f"URI_CREDITS_{user_id[:8]}_{quantity}_{int(datetime.utcnow().timestamp())}"
+
+        # Create pending payment transaction
+        payment = PaymentTransaction(
+            user_id=user_id,
+            transaction_ref=transaction_ref,
+            amount=amount,
+            currency=currency,
+            status="pending",
+            gateway="squad",
+            purchase_type="custom_credits",
+            credit_quantity=quantity,
+            created_at=datetime.utcnow()
+        )
+
+        await self.payment_transactions_collection.insert_one(
+            payment.dict(exclude_none=True)
+        )
+
+        # Get current Squad credentials (dynamic mode switching)
+        creds = await self._get_squad_credentials()
+        print(f"💳 Initializing custom credit payment in {creds['mode'].upper()} mode")
+
+        # Initialize SQUAD payment (same payload shape/flow as initialize_payment)
+        try:
+            async with httpx.AsyncClient() as client:
+                headers = {
+                    "Authorization": f"Bearer {creds['secret_key']}",
+                    "Content-Type": "application/json"
+                }
+
+                payload = {
+                    "email": user_email,
+                    "amount": amount * 100,  # Kobo
+                    "currency": currency,
+                    "initiate_type": "inline",
+                    "transaction_ref": transaction_ref,
+                    "callback_url": self.callback_url
+                }
+
+                response = await client.post(
+                    f"{creds['api_url']}/transaction/initiate",
+                    json=payload,
+                    headers=headers,
+                    timeout=30.0
+                )
+
+                response_data = response.json()
+
+                if response.status_code == 200 and response_data.get("success"):
+                    data = response_data.get("data", {})
+                    checkout_url = data.get("checkout_url") or data.get("authorization_url")
+
+                    if not checkout_url:
+                        raise Exception(f"SQUAD response missing checkout_url: {response_data}")
+
+                    return InitializePaymentResponse(
+                        payment_url=checkout_url,
+                        transaction_ref=transaction_ref,
+                        amount=amount,
+                        email=user_email,
+                        currency=currency,
+                        public_key=creds['public_key']
+                    )
+                else:
                     await self._mark_payment_failed(transaction_ref, response_data)
                     raise Exception(f"SQUAD initialization failed: {response_data.get('message')}")
 
@@ -263,13 +379,21 @@ class PaymentService:
                     transaction_status = transaction_data.get("transaction_status")
 
                     if transaction_status == "success":
-                        # Payment successful - activate subscription
-                        await self._complete_payment(
-                            transaction_ref=transaction_ref,
-                            user_id=payment_doc["user_id"],
-                            tier_id=payment_doc["subscription_tier"],
-                            squad_response=response_data
-                        )
+                        # Payment successful - route by purchase type
+                        if payment_doc.get("purchase_type") == "custom_credits":
+                            await self._complete_custom_credit_purchase(
+                                transaction_ref=transaction_ref,
+                                user_id=payment_doc["user_id"],
+                                quantity=payment_doc.get("credit_quantity") or 0,
+                                squad_response=response_data
+                            )
+                        else:
+                            await self._complete_payment(
+                                transaction_ref=transaction_ref,
+                                user_id=payment_doc["user_id"],
+                                tier_id=payment_doc.get("subscription_tier"),
+                                squad_response=response_data
+                            )
                         return True
                     elif transaction_status in ["failed", "cancelled"]:
                         await self._mark_payment_failed(transaction_ref, response_data)
@@ -295,28 +419,39 @@ class PaymentService:
 
         IMPORTANT: Preserves trial credits as bonus credits when trial user subscribes
         """
-        # Get payment transaction to retrieve billing cycle and credits
-        payment_doc = await self.payment_transactions_collection.find_one(
-            {"transaction_ref": transaction_ref}
-        )
-
-        if not payment_doc:
-            raise ValueError(f"Payment transaction not found: {transaction_ref}")
-
-        billing_cycle = payment_doc.get("billing_cycle", "monthly")
-        credits_allocated = payment_doc.get("credits_allocated")
-
-        # Update payment status
-        await self.payment_transactions_collection.update_one(
-            {"transaction_ref": transaction_ref},
+        # Atomically claim this transaction for completion. verify_payment
+        # (frontend poll) and handle_webhook (SQUAD callback) can both race to
+        # complete the same transaction_ref — a plain find_one check followed
+        # by a separate update_one (the previous approach) leaves a window
+        # where both callers can read "not yet completed" and both proceed to
+        # re-allocate credits. Folding the check into the update's filter
+        # makes only the first caller actually match and get a document back;
+        # the loser gets None and returns without touching credits.
+        payment_doc = await self.payment_transactions_collection.find_one_and_update(
+            {"transaction_ref": transaction_ref, "status": {"$ne": "completed"}},
             {
                 "$set": {
                     "status": "completed",
                     "completed_at": datetime.utcnow(),
                     "squad_response": squad_response
                 }
-            }
+            },
+            return_document=ReturnDocument.BEFORE,
         )
+
+        if not payment_doc:
+            # Either this transaction_ref doesn't exist, or another caller
+            # already completed it — check which, purely to raise the right
+            # error; the correctness guard above already closed the race.
+            existing = await self.payment_transactions_collection.find_one(
+                {"transaction_ref": transaction_ref}
+            )
+            if not existing:
+                raise ValueError(f"Payment transaction not found: {transaction_ref}")
+            return
+
+        billing_cycle = payment_doc.get("billing_cycle", "monthly")
+        credits_allocated = payment_doc.get("credits_allocated")
 
         # Check if user has remaining trial credits - preserve them as bonus credits
         trial_status = await trial_service.get_trial_status(user_id)
@@ -386,6 +521,55 @@ class PaymentService:
 
         print(f"✅ Subscription activated successfully")
 
+    async def _complete_custom_credit_purchase(
+        self,
+        transaction_ref: str,
+        user_id: str,
+        quantity: int,
+        squad_response: Dict
+    ) -> None:
+        """
+        Complete a custom credit purchase: mark the payment completed and add
+        `quantity` bonus credits (never expire) to the user's wallet.
+
+        Idempotent — verify_payment (frontend poll) and handle_webhook (SQUAD
+        server callback) can both race to complete the same transaction_ref.
+        Atomically claim the transaction via the update's own filter (rather
+        than a separate find_one check + update_one) so only the first caller
+        to actually match gets a document back — the loser gets None and
+        returns without re-crediting, closing the same race
+        _complete_payment() is guarded against.
+        """
+        payment_doc = await self.payment_transactions_collection.find_one_and_update(
+            {"transaction_ref": transaction_ref, "status": {"$ne": "completed"}},
+            {
+                "$set": {
+                    "status": "completed",
+                    "completed_at": datetime.utcnow(),
+                    "squad_response": squad_response
+                }
+            },
+            return_document=ReturnDocument.BEFORE,
+        )
+
+        if not payment_doc:
+            existing = await self.payment_transactions_collection.find_one(
+                {"transaction_ref": transaction_ref}
+            )
+            if not existing:
+                raise ValueError(f"Payment transaction not found: {transaction_ref}")
+            # Already completed by the other racer — nothing to do.
+            return
+
+        if quantity > 0:
+            await credit_service.add_bonus_credits(
+                user_id=user_id,
+                bonus_amount=quantity,
+                reason="custom_credit_purchase"
+            )
+
+        print(f"✅ Custom credit purchase completed: +{quantity} bonus credits for user {user_id}")
+
     async def _mark_payment_failed(
         self,
         transaction_ref: str,
@@ -453,12 +637,20 @@ class PaymentService:
 
         # Handle based on status
         if transaction_status == "success":
-            await self._complete_payment(
-                transaction_ref=transaction_ref,
-                user_id=payment_doc["user_id"],
-                tier_id=payment_doc["subscription_tier"],
-                squad_response=payload
-            )
+            if payment_doc.get("purchase_type") == "custom_credits":
+                await self._complete_custom_credit_purchase(
+                    transaction_ref=transaction_ref,
+                    user_id=payment_doc["user_id"],
+                    quantity=payment_doc.get("credit_quantity") or 0,
+                    squad_response=payload
+                )
+            else:
+                await self._complete_payment(
+                    transaction_ref=transaction_ref,
+                    user_id=payment_doc["user_id"],
+                    tier_id=payment_doc.get("subscription_tier"),
+                    squad_response=payload
+                )
             return True
         elif transaction_status in ["failed", "cancelled"]:
             await self._mark_payment_failed(transaction_ref, payload)

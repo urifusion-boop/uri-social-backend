@@ -6,12 +6,21 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from pydantic import BaseModel, Field
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, timedelta
+import asyncio
+import secrets
+import string
 from app.core.auth_bearer import JWTBearer
 from app.core.config import settings
 from app.database import get_db
 from app.services.CreditService import credit_service
 from app.services.TrialService import trial_service
+from app.services.EmailService import email_service
+from app.domain.models.billing_models import (
+    AccessCode,
+    CreateAccessCodeRequest,
+    UpdateAccessCodeRequest,
+)
 
 router = APIRouter(
     prefix="/api/admin",
@@ -669,3 +678,330 @@ async def brand_profile_integrity_scan(
         "shared_content_groups": shared_content_groups,
         "shared_content_group_count": len(shared_content_groups),
     }
+
+
+# ── Access codes — admin-generated partner/comp codes (e.g. "ASA26") ──────────
+# Generic and reusable: an admin can create a new code for any plan/duration
+# at any time and hand it to anybody. Each redeemer gets their own 60-day (or
+# whatever duration_days the code specifies) access window starting from
+# THEIR OWN redemption date — see billing_router.py's redeem endpoint for
+# where that actually gets granted. This section only creates/lists/manages
+# the codes themselves.
+
+def _generate_code(length: int = 8) -> str:
+    alphabet = string.ascii_uppercase + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+
+def _send_access_code_email(to_email: str, code: str, tier: dict, duration_days: int, label: str) -> None:
+    """Fire-and-forget — a mail failure must never block the admin's request
+    or a redemption flow. Only ever called for an ASSIGNED code, so the
+    email's "this code is reserved for you" framing is always accurate."""
+    app_url = (settings.WEB_APP_URL or "https://www.urisocial.com").strip("'\"")
+    asyncio.ensure_future(email_service.send_email(
+        to_email=to_email,
+        subject=f"Your free {tier.get('name', tier.get('tier_id', 'plan'))} access code — URI Social",
+        template_name="coupon_code",
+        template_vars={
+            "code": code,
+            "plan_name": tier.get("name", tier.get("tier_id", "")),
+            "duration_days": duration_days,
+            "label": label or None,
+            "app_url": app_url,
+        },
+    ))
+
+
+@router.post("/access-codes")
+async def create_access_code(
+    body: CreateAccessCodeRequest,
+    admin_user: dict = Depends(verify_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Create a new redeemable access code. Rejects a duplicate explicit
+    code; auto-generates a unique one if none was given."""
+    tier = await db["subscription_tiers"].find_one({"tier_id": body.plan_tier_id})
+    if not tier:
+        raise HTTPException(status_code=404, detail=f"No subscription tier '{body.plan_tier_id}'")
+
+    if body.code:
+        code = body.code.strip().upper()
+        if await db["access_codes"].find_one({"code": code}):
+            raise HTTPException(status_code=409, detail=f"Code '{code}' already exists")
+    else:
+        code = _generate_code()
+        while await db["access_codes"].find_one({"code": code}):
+            code = _generate_code()
+
+    acting_email = (admin_user.get("claims", {}) or {}).get("email", "unknown")
+    assigned_to_email = body.assigned_to_email.strip().lower() if body.assigned_to_email else None
+    access_code = AccessCode(
+        code=code,
+        plan_tier_id=body.plan_tier_id,
+        duration_days=body.duration_days,
+        max_redemptions=body.max_redemptions,
+        expires_at=body.expires_at,
+        label=body.label,
+        assigned_to_email=assigned_to_email,
+        created_by=acting_email,
+    )
+    await db["access_codes"].insert_one(access_code.dict())
+    result = access_code.dict()
+    if assigned_to_email:
+        assigned_user = await db["users"].find_one({"email": assigned_to_email}, {"first_name": 1, "last_name": 1})
+        result["assigned_to_name"] = _display_name(assigned_user)
+        result["status"] = "pending"
+        if body.send_email:
+            try:
+                _send_access_code_email(assigned_to_email, code, tier, body.duration_days, body.label)
+                result["email_sent"] = True
+            except Exception as e:
+                print(f"⚠️ Access code email failed to queue for {assigned_to_email}: {e}")
+                result["email_sent"] = False
+        else:
+            result["email_sent"] = False
+    else:
+        result["status"] = "unassigned"
+    return result
+
+
+def _display_name(user_doc: Optional[dict]) -> Optional[str]:
+    if not user_doc:
+        return None
+    name = f"{user_doc.get('first_name', '')} {user_doc.get('last_name', '')}".strip()
+    return name or None
+
+
+@router.get("/access-codes")
+async def list_access_codes(
+    admin_user: dict = Depends(verify_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Every code, each enriched with WHO it's assigned to (if anyone) and a
+    computed status — this is what makes an assignment visible immediately
+    in the panel, not just discoverable after the person redeems:
+    - unassigned: a shared code, anyone with it can redeem
+    - pending: assigned to a specific email, not yet redeemed
+    - redeemed: assigned, and that person has already redeemed it
+    """
+    codes = []
+    async for doc in db["access_codes"].find({}, {"_id": 0}).sort("created_at", -1):
+        assigned_email = doc.get("assigned_to_email")
+        if assigned_email:
+            assigned_user = await db["users"].find_one({"email": assigned_email}, {"first_name": 1, "last_name": 1})
+            doc["assigned_to_name"] = _display_name(assigned_user)
+            doc["status"] = "redeemed" if doc.get("redemption_count", 0) > 0 else "pending"
+        else:
+            doc["assigned_to_name"] = None
+            doc["status"] = "unassigned"
+        codes.append(doc)
+    return {"codes": codes, "count": len(codes)}
+
+
+@router.get("/access-codes/{code}/redemptions")
+async def list_access_code_redemptions(
+    code: str,
+    admin_user: dict = Depends(verify_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Who redeemed this code and when their access window started/ends —
+    joined against the users collection for a human-readable email per row.
+
+    Each row also gets an `effective_status`, computed here rather than
+    trusting `revoked_at` alone: a redemption can stop being someone's
+    actual current grant WITHOUT ever being marked revoked_at — e.g. this
+    code was superseded before the no-double-redeeming guard existed, or
+    the person has since moved to a real paid subscription some other way.
+    Without this, the admin panel can show a code as "Revoked" while a
+    redemption of it still reads "Active" (or the reverse), which is
+    confusing/wrong even though each field is individually accurate."""
+    code = code.strip().upper()
+    now = datetime.utcnow()
+    redemptions = []
+    async for r in db["access_code_redemptions"].find({"code": code}, {"_id": 0}).sort("redeemed_at", -1):
+        user = await db["users"].find_one({"userId": r["user_id"]}, {"email": 1})
+        wallet = await db["user_credits"].find_one(
+            {"user_id": r["user_id"]}, {"subscription_tier": 1, "subscription_source": 1}
+        )
+        is_current_grant = bool(
+            wallet
+            and wallet.get("subscription_source") == "access_code"
+            and wallet.get("subscription_tier") == r.get("plan_tier_id")
+        )
+        if r.get("revoked_at"):
+            effective_status = "revoked"
+        elif r.get("access_end") and r["access_end"] <= now:
+            effective_status = "lapsed"
+        elif not is_current_grant:
+            # Not revoked, not lapsed by date, yet no longer what's actually
+            # governing this person's wallet — something else took over
+            # without going through a tracked revoke/exhaustion path.
+            effective_status = "superseded"
+        else:
+            effective_status = "active"
+        redemptions.append({**r, "email": (user or {}).get("email"), "effective_status": effective_status})
+    return {"code": code, "redemptions": redemptions, "count": len(redemptions)}
+
+
+@router.post("/access-codes/{code}/redemptions/{user_id}/restore")
+async def restore_access_code_redemption(
+    code: str,
+    user_id: str,
+    admin_user: dict = Depends(verify_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """The counterpart to revoke, but for ONE specific redeemer rather than
+    the whole code — for when an admin decides a revoke (or an exhaustion)
+    was a mistake, or wants to give someone a fresh window. Grants a full
+    duration_days allocation of the code's plan starting now (not a resumed
+    countdown from the old access_end) and clears this redemption's
+    revoked_at/revocation_reason. Blocked if the person currently has a
+    DIFFERENT comp grant still active — that has to end first, same rule
+    as redeeming a fresh code."""
+    code = code.strip().upper()
+    access_code = await db["access_codes"].find_one({"code": code})
+    if not access_code:
+        raise HTTPException(status_code=404, detail=f"Code '{code}' not found")
+    redemption = await db["access_code_redemptions"].find_one({"code": code, "user_id": user_id})
+    if not redemption:
+        raise HTTPException(status_code=404, detail="No redemption of this code by this user")
+
+    tier = await db["subscription_tiers"].find_one({"tier_id": access_code["plan_tier_id"]})
+    if not tier:
+        raise HTTPException(status_code=500, detail=f"Plan '{access_code['plan_tier_id']}' no longer exists")
+
+    wallet = await db["user_credits"].find_one({"user_id": user_id})
+    has_different_active_comp_grant = (
+        wallet
+        and wallet.get("subscription_source") == "access_code"
+        and wallet.get("subscription_tier")
+        and wallet.get("subscription_tier") != access_code["plan_tier_id"]
+        and (not wallet.get("end_date") or wallet["end_date"] > datetime.utcnow())
+    )
+    if has_different_active_comp_grant:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"This person has a different active comp {wallet.get('subscription_tier')} plan — "
+                "that has to end or run out before you can restore this one."
+            ),
+        )
+
+    now = datetime.utcnow()
+    access_end = now + timedelta(days=access_code["duration_days"])
+    await db["user_credits"].update_one(
+        {"user_id": user_id},
+        {
+            "$set": {
+                "subscription_tier": access_code["plan_tier_id"],
+                "subscription_credits": tier.get("credits_monthly", tier.get("credits", 0)),
+                "subscription_source": "access_code",
+                "billing_cycle": "monthly",
+                "start_date": now,
+                "end_date": access_end,
+                "next_renewal": None,
+                "updated_at": now,
+            },
+            "$setOnInsert": {
+                "user_id": user_id, "bonus_credits": 0, "frozen_credits": 0, "credits_used": 0, "created_at": now,
+            },
+        },
+        upsert=True,
+    )
+    await db["access_code_redemptions"].update_one(
+        {"code": code, "user_id": user_id},
+        {"$set": {
+            "revoked_at": None, "revocation_reason": None,
+            "access_start": now, "access_end": access_end,
+        }},
+    )
+    return {"restored": True, "user_id": user_id, "access_end": access_end.isoformat()}
+
+
+@router.patch("/access-codes/{code}")
+async def update_access_code(
+    code: str,
+    body: UpdateAccessCodeRequest,
+    admin_user: dict = Depends(verify_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Revoke a code early (is_active=False), edit its label, or (re)assign
+    it to a specific email — or clear an assignment by passing "". Does not
+    touch duration_days/plan_tier_id — those are snapshotted onto each
+    redemption at redeem time, so editing them here never retroactively
+    changes access someone already has."""
+    updates = {k: v for k, v in body.dict(exclude_none=True).items()}
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields to update")
+    if "assigned_to_email" in updates:
+        normalized = updates["assigned_to_email"].strip().lower()
+        updates["assigned_to_email"] = normalized or None
+    code = code.strip().upper()
+    result = await db["access_codes"].update_one({"code": code}, {"$set": updates})
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail=f"Code '{code}' not found")
+
+    revoked_user_ids: List[str] = []
+    if updates.get("is_active") is False:
+        # A deliberate revoke means "stop this now" — cut off anyone
+        # CURRENTLY benefiting from it too, not just future redemptions.
+        revoked_user_ids = await credit_service.revoke_comp_grants_for_code(code)
+
+    updated = await db["access_codes"].find_one({"code": code}, {"_id": 0})
+    assigned_email = updated.get("assigned_to_email")
+    if assigned_email:
+        assigned_user = await db["users"].find_one({"email": assigned_email}, {"first_name": 1, "last_name": 1})
+        updated["assigned_to_name"] = _display_name(assigned_user)
+        updated["status"] = "redeemed" if updated.get("redemption_count", 0) > 0 else "pending"
+    else:
+        updated["assigned_to_name"] = None
+        updated["status"] = "unassigned"
+    updated["revoked_active_users"] = len(revoked_user_ids)
+    return updated
+
+
+@router.delete("/access-codes/{code}")
+async def delete_access_code(
+    code: str,
+    admin_user: dict = Depends(verify_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Permanently remove a code — for cleaning up a mistake or a test
+    code, not the everyday "stop this" action (that's revoke, which keeps
+    the code around for its audit trail). Claws back anyone currently
+    benefiting from it first, same as a revoke would, so deleting the code
+    can never leave a dangling active grant behind. Redemption records are
+    kept for audit even though the code itself is gone."""
+    code = code.strip().upper()
+    existing = await db["access_codes"].find_one({"code": code})
+    if not existing:
+        raise HTTPException(status_code=404, detail=f"Code '{code}' not found")
+    revoked_user_ids = await credit_service.revoke_comp_grants_for_code(code)
+    await db["access_codes"].delete_one({"code": code})
+    return {"deleted": True, "code": code, "revoked_active_users": len(revoked_user_ids)}
+
+
+@router.post("/access-codes/{code}/send-email")
+async def send_access_code_email(
+    code: str,
+    admin_user: dict = Depends(verify_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """(Re)send the code to whoever it's currently assigned to — for a code
+    created with the email skipped, or to nudge someone who hasn't redeemed
+    it yet. Only works on an assigned code; a shared code has no single
+    recipient to send it to."""
+    code = code.strip().upper()
+    access_code = await db["access_codes"].find_one({"code": code}, {"_id": 0})
+    if not access_code:
+        raise HTTPException(status_code=404, detail=f"Code '{code}' not found")
+    assigned_to_email = access_code.get("assigned_to_email")
+    if not assigned_to_email:
+        raise HTTPException(status_code=400, detail="This code isn't assigned to anyone — set an email first")
+    tier = await db["subscription_tiers"].find_one({"tier_id": access_code["plan_tier_id"]})
+    if not tier:
+        raise HTTPException(status_code=500, detail=f"Plan '{access_code['plan_tier_id']}' no longer exists")
+    _send_access_code_email(
+        assigned_to_email, code, tier, access_code["duration_days"], access_code.get("label", "")
+    )
+    return {"sent": True, "to": assigned_to_email}
