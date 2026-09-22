@@ -55,7 +55,6 @@ from app.services.AIService import AIService
 
 from app.agents.social_media_manager.services.holiday_calendar_service import HolidayCalendarService
 from app.agents.social_media_manager.services.cultural_moment_service import CulturalMomentService
-from app.agents.social_media_manager.services.industry_trend_service import IndustryTrendService
 
 # Pure, stateless helpers reused directly from v1 — see module docstring.
 from app.agents.social_media_manager.services.content_calendar_service import (
@@ -85,6 +84,10 @@ CANDIDATE_POOL_SIZE = 80     # PRD §10's own stated floor (recommended range 80
 CANDIDATE_CHUNK_SIZE = 20    # concurrent chunks, mirrors the proven content-chunking pattern
 CONTENT_CHUNK_SIZE = 6       # ~5 chunks of 6 for final copy — v1's own 7-item cap is
                               # evidence larger single structured-JSON calls degrade
+
+MAX_VIDEO_FORMATS_PER_WEEK = 1   # user requirement: at most this many video-like items
+                                  # (video/product_video/ai_video) per 7-day calendar week
+_VIDEO_FORMATS = {"video", "product_video", "ai_video"}
 
 # PRD §26 — Ad Angle Library, derived from an item's own 27-value creative
 # angle (creative_framework.ANGLES), not from content_type (the old
@@ -205,18 +208,26 @@ def _as_creative_device(v: Any) -> Dict[str, str]:
 async def _fetch_creative_memory(scope: Dict[str, Any], db: AsyncIOMotorDatabase) -> Dict[str, Any]:
     """Remembers WHAT was used before, never how it performed — the exact
     line PRD §20 draws ('we already used X' is fine; 'X performed well, make
-    another' is not). Extends the prior titles/key_points-only lookback to
-    also track territory/subject/angle/device/format/concept-name, still via
-    the same 2-most-recent-plans query — no new collection needed."""
+    another' is not). Tracks territory/subject/angle/device/format/concept-
+    name/hook/cta/visual-concept — 8 of PRD §20's 9 listed dimensions (the
+    9th, content series, has its own history once a series is actually
+    assigned — see series_names below), still via the same 2-most-recent-
+    plans query, no new collection needed.
+
+    hooks/ctas/visual_concepts were the 3 PRD §20 dimensions missing before
+    this pass — a repeated hook or CTA is what a real reader actually
+    notices, more than an internal territory/angle key repeating."""
     memory: Dict[str, Any] = {
         "titles": [], "key_points": [], "territories": [], "subjects": [],
         "angles": [], "devices": [], "formats": [], "concept_names": [],
+        "hooks": [], "ctas": [], "visual_concepts": [], "series_names": [],
     }
     async for past in db[COLLECTION].find(
         {**scope},
         {"_id": 0, "items.title": 1, "items.key_points": 1, "items.territory": 1,
          "items.subject": 1, "items.creative_angle": 1, "items.creative_device": 1,
-         "items.format": 1, "items.creative_concept_name": 1},
+         "items.format": 1, "items.creative_concept_name": 1, "items.hook": 1,
+         "items.cta": 1, "items.creative_direction": 1, "items.series_name": 1},
     ).sort("created_at", -1).limit(2):
         for it in past.get("items", []):
             if it.get("title"):
@@ -235,6 +246,15 @@ async def _fetch_creative_memory(scope: Dict[str, Any], db: AsyncIOMotorDatabase
                 memory["formats"].append(it["format"])
             if it.get("creative_concept_name"):
                 memory["concept_names"].append(it["creative_concept_name"])
+            if it.get("hook"):
+                memory["hooks"].append(it["hook"])
+            if it.get("cta"):
+                memory["ctas"].append(it["cta"])
+            visual_idea = (it.get("creative_direction") or {}).get("central_visual_idea")
+            if visual_idea:
+                memory["visual_concepts"].append(visual_idea)
+            if it.get("series_name"):
+                memory["series_names"].append(it["series_name"])
     return memory
 
 
@@ -271,6 +291,93 @@ async def _get_existing_assets_summary(
     return "; ".join(parts)
 
 
+# ── URI Content Calendar Generation addendum §1-5 — Brand Playbook as a
+# primary input, not background. Both blocks are shared between candidate
+# generation (so ideas are grounded in real customer psychology from the
+# start, not decorated with it afterward — the addendum's own "do not
+# generate the calendar first and then add the brand" rule) and final copy
+# (so headlines/visuals execute against the same grounding). Every field is
+# read defensively — a brand that hasn't filled these in yet still gets a
+# normal prompt, just without this block; nothing here can crash or degrade
+# generation for a thin profile. ──────────────────────────────────────────
+
+def _customer_psychology_block(brand: Dict[str, Any]) -> str:
+    """Addendum §1-4: pain points/needs/desires/objections/etc — real
+    customer psychology from the Brand Playbook, not the brand's own product
+    description. Confirmed before this existed: the calendar's prompts only
+    ever read brand_name/industry/voice/audience-summary/USP/business_pulse
+    — customer_pain_points/needs/objections/why_customers_choose_us were
+    already stored on every brand profile (to_brand_context already returns
+    them) but never once reached either generation prompt."""
+    parts: List[str] = []
+    if brand.get("ideal_customer_profile"):
+        parts.append(f"Ideal customer profile: {brand['ideal_customer_profile']}")
+    for label, key in [
+        ("Pain points", "customer_pain_points"),
+        ("Needs", "customer_needs"),
+        ("Desires", "customer_desires"),
+        ("Fears", "customer_fears"),
+        ("Frustrations", "customer_frustrations"),
+        ("Aspirations", "customer_aspirations"),
+        ("Objections", "customer_objections"),
+        ("Reasons they hesitate", "customer_hesitations"),
+        ("Common questions", "common_questions"),
+        ("Buying triggers", "buying_triggers"),
+    ]:
+        vals = [str(v) for v in (brand.get(key) or []) if v]
+        if vals:
+            parts.append(f"{label}: " + "; ".join(vals))
+    if brand.get("why_customers_choose_us"):
+        parts.append(f"Why customers choose this business: {brand['why_customers_choose_us']}")
+    words_to_avoid = [str(w) for w in (brand.get("words_to_avoid") or []) if w]
+    if words_to_avoid:
+        parts.append("Words/phrases to avoid: " + ", ".join(words_to_avoid))
+    if not parts:
+        return ""
+    return (
+        "\n\nCUSTOMER PSYCHOLOGY (from this brand's Playbook — real customer reality, not a generic assumption):\n"
+        + "\n".join(f"- {p}" for p in parts)
+        + "\n\nEvery idea must clearly draw on ONE specific item above — a real pain point, need, "
+          "desire, objection, fear, or reason this audience chooses this business. Write for THIS "
+          "audience specifically — never for \"business owners\", \"customers\", \"people\", or "
+          "\"everyone\". Where a customer phrase or question is listed above, consider using it "
+          "close to verbatim rather than paraphrasing it into generic marketing language — see the "
+          "addendum's own example: \"I don't have time to cook\" becomes \"You don't hate cooking. "
+          "You hate deciding what to cook at 7:30pm,\" not \"5 Benefits of Meal Delivery.\""
+    )
+
+
+def _visual_guide_block(brand: Dict[str, Any]) -> str:
+    """Addendum §5: the client's selected Visual Guide is the design system
+    — the model must stop inventing a new visual style per post. Confirmed
+    before this existed: design_style/layout_direction were fully
+    open-ended per item ("a few words describing the visual design style"),
+    even though style_selections (the actual Visual Guide the client picked)
+    was already sitting on the brand profile, unused by this pipeline."""
+    styles = [str(s) for s in (brand.get("style_selections") or []) if s]
+    if not styles:
+        return ""
+    return (
+        f"\n\nVISUAL GUIDE (the client's selected design system — mandatory, not optional): "
+        f"{', '.join(styles)}. This is the ONE visual language for every item in this plan. "
+        f"The creative idea can and should change from post to post; design_style and "
+        f"layout_direction must stay recognisably within this visual language every time — "
+        f"do not invent a different design style per item."
+    )
+
+
+def _resolve_series_name(name: Optional[str], brand_name: str, industry: str) -> Optional[str]:
+    """SERIES_TEMPLATES keeps a couple of names as literal placeholders
+    ("Ask [Brand]", "The [Industry] Myth") — confirmed live: a generated plan
+    shipped "The [Industry] Myth" verbatim, because nothing ever substituted
+    the bracket before the name reached the model or the final item. Applied
+    both when building the prompt's series list (so the model is never shown
+    an unresolved bracket to copy) and again defensively on the final item."""
+    if not name:
+        return name
+    return name.replace("[Brand]", brand_name).replace("[Industry]", industry)
+
+
 # ── Step 3 — Candidate concept pool (PRD §10, §36) ──────────────────────────
 
 async def _generate_candidate_concepts(
@@ -279,8 +386,7 @@ async def _generate_candidate_concepts(
     existing_assets_summary: str,
     creative_memory: Dict[str, Any],
     platforms: List[str],
-    cultural_moments: Optional[List[Any]] = None,  # entries are strings today (CulturalMomentService.get_trending_topics)
-    industry_best_practices: Optional[Any] = None,
+    cultural_moments: Optional[List[Any]] = None,  # real dated events only — CulturalMomentService.get_cultural_moments()
     target_count: int = CANDIDATE_POOL_SIZE,
 ) -> List[Dict[str, Any]]:
     """Generates 80-150 structured CONCEPTS — territory/subject/angle/
@@ -289,7 +395,14 @@ async def _generate_candidate_concepts(
     WHAT to say, not yet writing exactly how to say it'). NEVER receives
     performance or trend_keywords — that's the concrete enforcement of
     PRD §2, not just a prompt instruction: those objects simply don't exist
-    in this function's argument list."""
+    in this function's argument list.
+
+    industry_best_practices was deliberately removed from this signature —
+    IndustryTrendService.get_industry_best_practices() returns fabricated
+    engagement statistics ("Educational content drives 2.3x more engagement
+    in tech") presented as fact. That's PRD §2's very first banned input
+    (historical engagement performance) and a §31 fabrication violation at
+    the same time, and it was being injected straight into this prompt."""
     brand_name = brand.get("brand_name") or "the brand"
     industry = brand.get("industry") or "business"
     audience = brand.get("target_audience") or "general audience"
@@ -301,6 +414,7 @@ async def _generate_candidate_concepts(
         f"Business stage: {business_stage} — {_STAGE_GUIDANCE.get(business_stage, '')}"
         if business_stage else ""
     )
+    psychology_block = _customer_psychology_block(brand)
 
     territories_block = "\n".join(
         f"- {key} ({t['label']}): {t['description']} Example subjects: {', '.join(t['subjects'][:8])}"
@@ -311,17 +425,21 @@ async def _generate_candidate_concepts(
         f"- {cat}: " + ", ".join(d["label"] for d in devices)
         for cat, devices in framework["creative_devices"].items()
     )
+    series_templates = framework.get("series_templates") or []
+    series_block = "\n".join(
+        f'- "{_resolve_series_name(s["name"], brand_name, industry)}"' for s in series_templates
+    )
+    prior_series = creative_memory.get("series_names") or []
+    prior_series_block = (
+        "\nSeries already used for this business — prefer reusing one of these over starting a new one, "
+        "so it actually recurs recognizably: " + ", ".join(dict.fromkeys(prior_series))
+    ) if prior_series else ""
 
     context_lines = []
-    if industry_best_practices:
-        context_lines.append(f"Industry best practices: {industry_best_practices}")
     if cultural_moments:
-        # CulturalMomentService.get_trending_topics() (what generate_plan_v2
-        # actually calls this list from) always returns List[str] — a
-        # SEPARATE method, get_cultural_moments(), returns List[Dict] with a
-        # "name" key. Handle both shapes defensively rather than assume one
-        # (confirmed live: assuming dicts crashed every real call, since
-        # trending_topics is what's actually wired in).
+        # Real dated events only (CulturalMomentService.get_cultural_moments)
+        # — List[Dict] with a "name" key. String entries handled too, kept
+        # defensive since this list is built from an external service.
         names = [
             (m.get("name") or m.get("topic") or str(m)) if isinstance(m, dict) else str(m)
             for m in cultural_moments[:5]
@@ -329,13 +447,33 @@ async def _generate_candidate_concepts(
         context_lines.append(f"Relevant cultural moments this period: {', '.join(names)}")
     context_block = ("\n" + "\n".join(context_lines)) if context_lines else ""
 
-    avoid_block = ""
+    avoid_parts = []
     if creative_memory.get("concept_names"):
-        avoid_block = (
-            "\nAlready explored recently — do not repeat these concept names or their "
+        avoid_parts.append(
+            "Already explored recently — do not repeat these concept names or their "
             "underlying territory+subject+angle combination:\n"
             + "\n".join(f"- {c}" for c in creative_memory["concept_names"][:30])
         )
+    # PRD §20's other 2 remembered dimensions besides concept/territory/subject/
+    # angle — a repeated hook or CTA is what a real reader actually notices.
+    if creative_memory.get("hooks"):
+        avoid_parts.append(
+            "Already-used hooks — do not reuse or closely rephrase these:\n"
+            + "\n".join(f"- {h}" for h in creative_memory["hooks"][:30])
+        )
+    if creative_memory.get("ctas"):
+        distinct_ctas = list(dict.fromkeys(creative_memory["ctas"]))[:10]
+        if distinct_ctas:
+            avoid_parts.append(
+                "Recently-used CTAs — vary the call to action, don't default back to these every time:\n"
+                + "\n".join(f"- {c}" for c in distinct_ctas)
+            )
+    if creative_memory.get("visual_concepts"):
+        avoid_parts.append(
+            "Already-used central visual ideas — do not repeat these:\n"
+            + "\n".join(f"- {v}" for v in creative_memory["visual_concepts"][:30])
+        )
+    avoid_block = ("\n" + "\n".join(avoid_parts)) if avoid_parts else ""
 
     assets_block = f"\nExisting assets available: {existing_assets_summary}" if existing_assets_summary else ""
 
@@ -351,7 +489,7 @@ async def _generate_candidate_concepts(
 CONCEPTS for {brand_name}, a {industry} business. Target audience: {audience}.
 Brand voice: {voice}. {f'What they do: {description}.' if description else ''}
 {f'USP: {usp}.' if usp else ''}
-{stage_note}{context_block}{assets_block}{avoid_block}
+{stage_note}{context_block}{assets_block}{avoid_block}{psychology_block}
 Platforms: {', '.join(platforms) if platforms else 'social media'}.
 
 Available Content Territories (draw from these freely — you don't need every one):
@@ -362,6 +500,10 @@ Available Angles: {angles_block}
 Available Creative Devices:
 {devices_block}
 
+Recurring content series available (PRD §21) — recognizable branded formats
+that build audience familiarity over time:
+{series_block}{prior_series_block}
+
 Generate exactly {n} DISTINCT candidate concepts. This is IDEATION only —
 DO NOT write titles, hooks, captions, or any final copy. Just decide WHAT
 each idea is, not HOW to say it yet.
@@ -371,17 +513,27 @@ For each concept, return:
 - subject: one specific subject from that territory's list (or a close industry-specific variant)
 - angle: one angle label from the list above, exactly as written
 - creative_device: {{"category": one of story|visual|conversational|psychological|structural, "device": one device label from that category, exactly as written}}
-- format_hint: one of image|carousel|video|product_video|ai_video|text (best guess — a later stage may override it)
+- format_hint: one of image|carousel|video|product_video|ai_video|text — pick based on
+  what the IDEA needs, not habit: carousel for a sequence/steps/comparison/story/several
+  related insights; image for one single powerful idea, a statement, or a visual metaphor;
+  video only where demonstration, personality, movement, or spoken delivery genuinely
+  matters — not by default
 - objective: one of reach|engagement|leads|sales|awareness
-- audience_segment: which part of the audience this speaks to, 3-6 words
+- audience_segment: which part of the audience this speaks to, 3-6 words — specific
+  (e.g. "first-time buyers hesitant on price"), never "everyone" or "customers"
 - concept_name: a short 3-6 word internal name for this idea (e.g. "The Upfront Cost Trap")
+- series_name: OPTIONAL, null for most concepts. Only set this when the idea genuinely
+  fits one of the series above (use its exact name). Across this whole batch, use at
+  most 2-3 distinct series total, and only if you can genuinely assign the SAME series
+  name to several different concepts — a series used exactly once isn't recurring,
+  don't invent one just to fill this field.
 
 No two concepts in this batch may share the same territory+subject+angle combination.
 Never rely on historical engagement, trending topics, or search data — these
 concepts must come purely from business/audience/brand/creative-framework
 reasoning (nothing else exists in this task).
 
-Return ONLY a valid JSON array of exactly {n} objects with exactly these 7 keys, nothing else."""
+Return ONLY a valid JSON array of exactly {n} objects with exactly these 8 keys, nothing else."""
         # One retry on parse failure — was a bare try/except with no retry at
         # all, so a single malformed response silently dropped the whole
         # chunk (confirmed live: a framework-config bug made this fail
@@ -694,6 +846,31 @@ def _assign_format(concept: Dict[str, Any], brand: Dict[str, Any], existing_asse
     return result
 
 
+def _assign_formats(
+    dated: List[Dict[str, Any]], brand: Dict[str, Any], existing_assets_summary: str,
+) -> List[Dict[str, Any]]:
+    """Runs _assign_format across the whole plan, enforcing
+    MAX_VIDEO_FORMATS_PER_WEEK — user requirement. _assign_format decides
+    each item's format independently with no awareness of any other item, so
+    the weekly cap has to be enforced here: a running per-week counter,
+    downgrading to "image" once a week's video quota is already spent.
+    Assumes `dated` is already in day_index order (it is — _assign_dates
+    walks the plan sequentially)."""
+    video_count_by_week: Dict[int, int] = {}
+    result = []
+    for c in dated:
+        assigned = _assign_format(c, brand, existing_assets_summary)
+        week = c.get("day_index", 0) // 7
+        if assigned.get("format") in _VIDEO_FORMATS:
+            if video_count_by_week.get(week, 0) >= MAX_VIDEO_FORMATS_PER_WEEK:
+                assigned = {k: v for k, v in assigned.items() if k not in ("format", "carousel_slide_count")}
+                assigned["format"] = "image"
+            else:
+                video_count_by_week[week] = video_count_by_week.get(week, 0) + 1
+        result.append(assigned)
+    return result
+
+
 # ── Ad-opportunity scoring (rule-based, PRD §19 — performance-free) ─────────
 
 def _score_ad_opportunity(item: Dict[str, Any], near_holiday: bool, has_active_promo: bool) -> float:
@@ -794,9 +971,22 @@ def _rule_based_diversity_issues(items: List[Dict[str, Any]]) -> Dict[int, str]:
     run because devices/angles legitimately recur across 30 days), and
     genuinely repeated territory+subject+angle on adjacent days (a much
     stronger, more specific signal than the old content_type+format pair
-    the earlier version compared)."""
+    the earlier version compared).
+
+    Also covers 2 of PRD §14's checks that had no implementation before this
+    pass: repeated CTAs and repeated visual concepts/metaphors. Both are
+    deliberately looser than the title/territory checks above, for the same
+    reason hooks were dropped from strict adjacent-pair comparison — a CTA
+    like "Shop Now" or "Send Message" legitimately recurring isn't a defect
+    on its own, PRD §14 calls out CTAs being *overused* specifically. So CTA
+    repetition only flags when one CTA dominates the whole batch (>40% of
+    items) rather than any two-in-a-row match, while visual concepts (long,
+    specific sentences — much lower legitimate-recurrence risk than a short
+    CTA) reuse the same adjacent-opening-words check as titles."""
     issues: Dict[int, str] = {}
     seen_openings: Dict[str, int] = {}
+    seen_visual_openings: Dict[str, int] = {}
+    cta_counts: Dict[str, int] = {}
     for i, item in enumerate(items):
         title = str(item.get("title") or "").strip().lower()
         opening = " ".join(title.split()[:5])
@@ -810,25 +1000,72 @@ def _rule_based_diversity_issues(items: List[Dict[str, Any]]) -> Dict[int, str]:
                     and item.get("subject") == prev.get("subject")
                     and item.get("angle") == prev.get("angle")):
                 issues[i] = issues.get(i, "") + "; repeats prior day's territory+subject+angle"
+        visual_idea = str((item.get("creative_direction") or {}).get("central_visual_idea") or "").strip().lower()
+        visual_opening = " ".join(visual_idea.split()[:6])
+        if visual_opening and visual_opening in seen_visual_openings:
+            issues[i] = issues.get(i, "") + f"; visual concept repeats day {seen_visual_openings[visual_opening]}"
+        elif visual_opening:
+            seen_visual_openings[visual_opening] = i
+        cta = str(item.get("cta") or "").strip().lower()
+        if cta:
+            cta_counts[cta] = cta_counts.get(cta, 0) + 1
+
+    if items:
+        dominant_cta, dominant_count = max(cta_counts.items(), key=lambda kv: kv[1], default=(None, 0))
+        if dominant_cta and dominant_count > max(3, int(len(items) * 0.4)):
+            for i, item in enumerate(items):
+                if str(item.get("cta") or "").strip().lower() == dominant_cta:
+                    issues[i] = issues.get(i, "") + f'; CTA "{item.get("cta")}" overused ({dominant_count}/{len(items)} items)'
     return issues
 
 
-async def _llm_diversity_check(items: List[Dict[str, Any]]) -> List[int]:
-    """One extra LLM call across all items' titles/hooks asking which pairs
-    are substantially the same idea reworded — a cheap stand-in for
-    embedding-based semantic similarity (deferred as a fast-follow)."""
+async def _llm_diversity_check(items: List[Dict[str, Any]], brand: Optional[Dict[str, Any]] = None) -> List[int]:
+    """One LLM call across all items' titles/hooks doing two jobs at once —
+    kept as a single call deliberately, not split into two round-trips,
+    for the same latency reasons documented on _generate_final_copy (this
+    pipeline is already tight against the gateway timeout):
+
+    1. Duplication — which pairs are substantially the same idea reworded
+       (a cheap stand-in for embedding-based semantic similarity, deferred
+       as a fast-follow).
+    2. URI Content Calendar Generation addendum §19's "No Generic AI
+       Content" quality gate — the 3 questions here that genuinely need
+       semantic judgment (could this headline appear on 1,000 unrelated
+       pages; does the idea use something specific from this brand's
+       Playbook; would the actual customer recognise themselves). The
+       addendum's other 4 questions (text density, visual-communicates-
+       idea, visual-guide-compliance, scroll-stopping) are handled at
+       generation time via explicit prompt rules in _generate_final_copy
+       instead — better fixed at the source than re-judged after the fact."""
+    brand = brand or {}
+    brand_name = brand.get("brand_name") or "this business"
+    context_line = ""
+    psych_keys = ["customer_pain_points", "customer_needs", "customer_desires", "customer_objections"]
+    psych_bits = [str(v) for k in psych_keys for v in (brand.get(k) or [])][:6]
+    if psych_bits:
+        context_line = f"\n{brand_name}'s actual customer reality includes: " + "; ".join(psych_bits)
+
     listing = "\n".join(
         f"{i}: {it.get('title', '')} — {it.get('hook', '')}"
         for i, it in enumerate(items)
     )
-    prompt = f"""Below are {len(items)} social media post ideas for one business. Which
-indexes, if any, are substantially the SAME underlying idea reworded (not
-just sharing a territory — genuinely the same angle/message)?
+    prompt = f"""Below are {len(items)} social media post ideas for {brand_name}.{context_line}
 
 {listing}
 
-Return ONLY a JSON array of indexes that should be regenerated because they
-duplicate another idea in the list, e.g. [4, 11] or [] if none duplicate.
+Flag an index for regeneration if EITHER is true:
+A) DUPLICATE — substantially the SAME underlying idea reworded as another
+   index in the list (not just sharing a territory — genuinely the same
+   angle/message).
+B) GENERIC — the idea fails ANY of these: (1) this exact headline could
+   appear on 1,000 unrelated business pages with zero changes, (2) it does
+   not clearly draw on anything specific to this business's actual
+   customers (their real pain points, needs, objections, or reasons they
+   buy — not just the product category), (3) this business's actual
+   customer would not recognise themselves in it.
+
+Return ONLY a JSON array of indexes to regenerate, e.g. [4, 11] or [] if none
+qualify. Be conservative — only flag a clear case, not a borderline one.
 """
     try:
         ai_request = AIService.build_ai_model(
@@ -843,14 +1080,15 @@ duplicate another idea in the list, e.g. [4, 11] or [] if none duplicate.
         parsed = _loads_lenient(raw)
         return [i for i in parsed if isinstance(i, int) and 0 <= i < len(items)]
     except Exception as exc:
-        print(f"[CalendarV2] LLM diversity check failed (non-fatal): {exc}", flush=True)
+        print(f"[CalendarV2] LLM diversity+quality check failed (non-fatal): {exc}", flush=True)
         return []
 
 
-def _anti_boring_check(items: List[Dict[str, Any]]) -> Dict[int, str]:
+def _anti_boring_check(items: List[Dict[str, Any]], brand_name: str = "") -> Dict[int, str]:
     """PRD §30 — flags generic AI phrasings for a creative-quality-review
     NOTE, never an auto-reject (the execution can still redeem a generic
     opener)."""
+    brand_lower = (brand_name or "").strip().lower()
     flagged: Dict[int, str] = {}
     for i, item in enumerate(items):
         text = " ".join([
@@ -858,7 +1096,19 @@ def _anti_boring_check(items: List[Dict[str, Any]]) -> Dict[int, str]:
             str((item.get("exact_copy") or {}).get("caption", "")),
         ]).lower()
         for phrase in ANTI_BORING_PHRASES:
-            check = phrase.split("{brand}")[0].strip() if "{brand}" in phrase else phrase
+            # Confirmed live: "at {brand}, we believe".split("{brand}")[0].strip()
+            # reduces to the bare word "at" — a substring present in nearly any
+            # English sentence ("later", "natural", "that", ...), so this fired
+            # on almost every item regardless of content. Substitute the real
+            # brand name and check for the actual resulting phrase; skip the
+            # check entirely (rather than false-positive on "at") when there's
+            # no brand name to substitute.
+            if "{brand}" in phrase:
+                if not brand_lower:
+                    continue
+                check = phrase.replace("{brand}", brand_lower)
+            else:
+                check = phrase
             if check and check in text:
                 flagged[i] = f'generic phrasing detected: "{phrase}" — verify the execution redeems it'
                 break
@@ -887,7 +1137,62 @@ def _clamp_carousel(idea: Dict[str, Any], target: int) -> None:
     carousel["slides"] = trimmed
 
 
-def _validate_item_v2(idea: Dict[str, Any], is_carousel: bool, expected_slides: int = 3) -> List[str]:
+_TEXT_FIELDS_FOR_SCANNING = (
+    "title", "hook", "description", "caption_direction", "cta", "topic",
+    "promised_business_outcome", "creative_concept_name", "central_visual_idea",
+    "design_style", "layout_direction", "visual_metaphor", "designer_execution_notes",
+    "reasoning",
+)
+
+
+def _collect_item_text(idea: Dict[str, Any]) -> str:
+    """Flattens every copy-bearing field of a generated item into one string
+    — used both for the words-to-avoid guardrail check and could serve any
+    future whole-item text scan. Deliberately excludes structural fields
+    (territory/format/etc.) that aren't shown to the end reader."""
+    parts = [str(idea.get(k) or "") for k in _TEXT_FIELDS_FOR_SCANNING]
+    parts.extend(str(p) for p in (idea.get("key_points") or []))
+    parts.extend(str(k) for k in (idea.get("keywords") or []))
+    video_idea = idea.get("video_idea") or {}
+    if isinstance(video_idea, dict):
+        parts.append(str(video_idea.get("hook") or ""))
+        parts.append(str(video_idea.get("cta") or ""))
+        parts.extend(str(p) for p in (video_idea.get("talking_points") or []))
+        parts.extend(str(s) for s in (video_idea.get("scenes") or []))
+    exact_copy = idea.get("exact_copy") or {}
+    if isinstance(exact_copy, dict):
+        parts.append(str(exact_copy.get("headline") or ""))
+        parts.append(str(exact_copy.get("caption") or ""))
+        parts.extend(str(h) for h in (exact_copy.get("hashtags") or []))
+    carousel = idea.get("carousel") or {}
+    if isinstance(carousel, dict):
+        for slide in (carousel.get("slides") or []):
+            if isinstance(slide, dict):
+                parts.append(str(slide.get("headline") or ""))
+                parts.append(str(slide.get("body") or ""))
+    return " \n ".join(p for p in parts if p)
+
+
+def _find_banned_words(idea: Dict[str, Any], words_to_avoid: List[str]) -> List[str]:
+    """The brand's words_to_avoid was only ever a prompt instruction (soft
+    guidance the model can and does ignore under pressure to hit other
+    requirements) — confirmed live: "guaranteed" survived into a caption for
+    a brand that explicitly banned it. Per the PRD's own rule (§53 — code
+    enforces hard constraints, the LLM handles creative judgment), this
+    makes it a deterministic, case-insensitive check instead, wired into the
+    same validation-failure → regenerate loop everything else here uses."""
+    if not words_to_avoid:
+        return []
+    haystack = _collect_item_text(idea).lower()
+    return [str(w).strip() for w in words_to_avoid if str(w).strip() and str(w).strip().lower() in haystack]
+
+
+def _validate_item_v2(
+    idea: Dict[str, Any],
+    is_carousel: bool,
+    expected_slides: int = 3,
+    words_to_avoid: Optional[List[str]] = None,
+) -> List[str]:
     """Extends v1's _validate_day (hard deterministic rules, PRD §28) with
     V2's own required fields. Carousel check enforces the PRD's HARD 2-5
     rule (§28), not the exact per-concept target — the target is a hint for
@@ -906,6 +1211,11 @@ def _validate_item_v2(idea: Dict[str, Any], is_carousel: bool, expected_slides: 
         slides = ((idea.get("carousel") or {}).get("slides")) or []
         if not (2 <= len(slides) <= 5):
             issues.append(f"carousel must have 2-5 slides (PRD hard rule), got {len(slides)}")
+    banned_hits = _find_banned_words(idea, words_to_avoid or [])
+    if banned_hits:
+        issues.append(
+            f"uses word(s)/phrase(s) the brand asked to avoid: {', '.join(banned_hits)} — rewrite without them"
+        )
     return issues
 
 
@@ -941,6 +1251,8 @@ async def _generate_final_copy(
     price_range = brand.get("price_range", "")
     business_pulse = brand.get("business_pulse") or {}
     business_pulse_updated_at = brand.get("business_pulse_updated_at")
+    psychology_block = _customer_psychology_block(brand)
+    visual_guide_block = _visual_guide_block(brand)
 
     bp_freshness = _business_pulse_freshness_str(business_pulse_updated_at)
     bp_lines = [v for v in [
@@ -984,13 +1296,20 @@ async def _generate_final_copy(
     ]
     carousel_spec = ("\n" + "\n".join(carousel_spec_lines)) if carousel_spec_lines else ""
 
+    # Substitute the real brand name into {brand}-templated entries for display
+    # — truncating at the placeholder (the old approach) left phrases like
+    # "at {brand}, we" showing as the near-meaningless "at..." to the model.
+    banned_phrases_str = ", ".join(
+        f'"{p.replace("{brand}", brand_name).strip()}..."' for p in ANTI_BORING_PHRASES if p
+    )
+
     prompt = f"""You are a senior social media copywriter turning {n} ALREADY-APPROVED
 content concepts into publish-ready posts for {brand_name}{f' ("{tagline}")' if tagline else ''}.
 Industry: {industry}. {f'What they do: {description}.' if description else ''}
 Target audience: {audience}{f', {region} market' if region else ''}. Brand voice: {voice}.
 {f'USP: {usp}.' if usp else ''}
 {f'Price positioning: {price_range}.' if price_range else ''}
-{business_pulse_block}{assets_block}
+{business_pulse_block}{assets_block}{psychology_block}{visual_guide_block}
 Platforms: {platforms_str}
 {force_token}
 
@@ -999,15 +1318,38 @@ creative device are FIXED. Your job is EXECUTION only: write the actual copy
 that brings this specific concept to life. Do NOT invent a different idea,
 switch the angle, or change what the post is fundamentally about.
 
+For each item, think in THIS order before writing anything: (1) the human/
+business INSIGHT the concept is built on, (2) the CREATIVE IDEA — the
+interesting way to express it, (3) the VISUAL CONCEPT — what the audience
+should actually see, (4) then the HEADLINE, (5) then supporting copy, (6)
+then the CTA. Do not start from "what text goes on the graphic."
+
 {concepts_block}
 {carousel_spec}
 
+HEADLINE STANDARD — every title/headline must create curiosity, tension,
+recognition, surprise, contrarian thinking, or real specificity. It should
+make the reader think "wait, what are they talking about?" — not read like
+generic advice. Ground it in the specific customer reality above (a real
+pain point, objection, or their own words), never a generic topic statement.
+Example of the shift required: instead of "5 Skincare Tips Everyone Needs,"
+write "Your skin isn't necessarily dry. Your routine may just be fighting
+itself." Avoid opening a headline with generic AI-sounding constructions —
+high-risk patterns to avoid: {banned_phrases_str}. These aren't hard-banned,
+but treat them as a strong signal to rewrite.
+
+TEXT DENSITY — use the visual to communicate the idea; use text to sharpen
+it, not explain it. Prefer one strong headline + one short supporting line
+over a headline plus a paragraph plus bullet points plus an explanation. For
+a carousel, each slide carries ONE idea — never compress an entire article
+across the slides; the story should read visually as the audience swipes.
+
 For EACH item, return ALL of these fields:
-- title: max 10 words, punchy, specific to this brand — must clearly reflect its concept's subject+angle
+- title: max 10 words, punchy, specific to this brand — must clearly reflect its concept's subject+angle and meet the HEADLINE STANDARD above
 - hook: exact opening line (1 sentence), executing the item's creative device
 - key_points: 2-5 concrete specific points
 - description: 2-3 sentences tying the idea together
-- caption_direction: 1-2 sentences of specific guidance for the caption
+- caption_direction: 1-2 sentences of specific guidance for the caption — necessary information only, not padding
 - keywords: 2-4 real keywords specific to this idea
 - cta: one specific call-to-action sentence
 - topic: 3-6 word plain-language topic label
@@ -1017,15 +1359,20 @@ For EACH item, return ALL of these fields:
 - video_idea: {{"format": one of talking_head|product_demo|testimonial|tutorial|behind_the_scenes|trend_based, "hook": "...", "talking_points": ["..."], "scenes": ["..."], "cta": "..."}}
 - holiday_reference: null unless a real, relevant holiday/observance genuinely
   falls on this item's date for {region or 'the audience region'} — never invent one
-- exact_copy: {{"headline": "publish-ready headline/first-line", "caption": "the FULL publish-ready caption text, ready to post as-is", "hashtags": ["2-5 relevant hashtags, no # symbol"]}}
+- exact_copy: {{"headline": "publish-ready headline/first-line — must meet the HEADLINE STANDARD above", "caption": "the FULL publish-ready caption text, ready to post as-is, respecting TEXT DENSITY above", "hashtags": ["2-5 relevant hashtags, no # symbol"]}}
 - carousel: null UNLESS this item's format is CAROUSEL (see the exact slide count required above), in which case:
-  {{"slides": [{{"slide_index": 0, "headline": "...", "body": "...", "visual_note": "..."}}, ...exactly the required number of slides...]}}
+  {{"slides": [{{"slide_index": 0, "headline": "...", "body": "one idea, kept short — see TEXT DENSITY", "visual_note": "..."}}, ...exactly the required number of slides...]}}
 - creative_concept_name: a short, final version of the concept name
-- central_visual_idea: 1 concrete sentence describing the central visual concept
-- design_style: a few words describing the visual design style
-- layout_direction: a few words on layout/composition
+- central_visual_idea: 1 concrete sentence describing the central visual concept — prioritise a human scene (a customer, founder, employee experiencing the problem or the outcome) or a symbolic visual (an object/environment/before-after/metaphor) over a generic product-interface shot; use actual product imagery only where the product itself is the point, and screenshots/UI only where the content genuinely needs them
+- design_style: a few words describing the visual design style{' — MUST stay within the Visual Guide given above, do not invent a different one' if visual_guide_block else ''}
+- layout_direction: a few words on layout/composition{' — consistent with the Visual Guide above' if visual_guide_block else ''}
 - visual_metaphor: the visual metaphor being used, or "" if none
-- ai_image_prompt: 1 concrete sentence describing the ideal AI-generated image (subject, style, mood) — usable directly as an image-gen prompt
+- ai_image_prompt: a concrete, literal description of a PHOTOGRAPH or IMAGE
+  to generate — subject, setting, lighting, composition, mood. This describes
+  the raw visual asset only. Do NOT ask for a "social media graphic," do NOT
+  include any headline text, caption text, or CTA in this prompt, and do NOT
+  mention typography, layout, or brand colours — that's a separate design
+  layer applied afterward. End the prompt with "no text, no logos."
 - required_assets: a short list of assets needed — prefer reusing anything listed as already available above over requesting new production
 - designer_execution_notes: 1-2 sentences of concrete guidance for whoever produces the visual
 - reasoning: 1-2 sentences on WHY this idea, for THIS day — reference something
@@ -1045,7 +1392,9 @@ index.
 
 Rules: no two titles share an opening word; vary emotional tone across items;
 be specific — real product/service names, real audience details; every item
-must be impossible to copy-paste to a different brand.
+must be impossible to copy-paste to a different brand. A useful test: if you
+removed the brand name, would this still be clearly written for THIS
+business's actual customers, not a generic reader?
 """
 
     async def _call_and_parse(full_prompt: str) -> List[Dict[str, Any]]:
@@ -1072,10 +1421,16 @@ must be impossible to copy-paste to a different brand.
         try:
             items = await _call_and_parse(prompt + correction_block)
         except Exception as exc:
+            # Confirmed live: this used to `raise` immediately when attempt 0's
+            # parse failed, skipping the second attempt entirely — one transient
+            # JSON glitch on the FIRST call for a chunk silently wiped out the
+            # whole chunk (a 6-item chunk failing here is exactly why 30-item
+            # plans were landing at 24). Now it gets the full 2 tries like the
+            # validation-failure retry path below already did.
+            print(f"[CalendarV2] final-copy chunk parse failed on attempt {attempt + 1}/2 ({exc})", flush=True)
             if attempt == 0:
-                raise
-            print(f"[CalendarV2] final-copy chunk retry failed to parse ({exc}) — using best-effort", flush=True)
-            break
+                continue
+            raise
 
         failures: Dict[int, List[str]] = {}
         for i, idea in enumerate(items):
@@ -1083,7 +1438,10 @@ must be impossible to copy-paste to a different brand.
             expected_slides = concepts_chunk[i].get("carousel_slide_count", 3)
             if is_carousel:
                 _clamp_carousel(idea, expected_slides)  # deterministically enforce the 2-5 hard rule
-            issues = _validate_item_v2(idea, is_carousel=is_carousel, expected_slides=expected_slides)
+            issues = _validate_item_v2(
+                idea, is_carousel=is_carousel, expected_slides=expected_slides,
+                words_to_avoid=brand.get("words_to_avoid"),
+            )
             if issues:
                 failures[i] = issues
         if not failures:
@@ -1345,22 +1703,28 @@ async def _build_plan_doc(
     existing_assets_summary = await _get_existing_assets_summary(user_id, brand_id, db)
     has_active_promo = bool((brand.get("business_pulse") or {}).get("current_promotions"))
 
-    # Date/holiday/cultural signals — still valid, non-performance inputs (PRD §18)
+    # Date/holiday/cultural signals — real dated events only, non-performance
+    # inputs (PRD §18). get_cultural_moments() (not get_trending_topics(),
+    # which only ever returns a hardcoded SIMULATED_TRENDS placeholder dict
+    # of fake industry buzzwords — the exact "trending topics" PRD §2 bans,
+    # confirmed live never even used the date it was passed) — this is the
+    # real, dated-proximity-filtered event list §18 actually asks for.
     all_dates = [(period_start + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(PLAN_DAYS)]
     holidays_by_date: Dict[str, Dict[str, Any]] = {}
-    cultural_moments_all: List[Any] = []  # strings (CulturalMomentService.get_trending_topics), not dicts
+    cultural_moments_all: List[Any] = []
     for chunk_start_idx in range(0, PLAN_DAYS, 7):
         chunk_week_start = all_dates[chunk_start_idx]
         for h in HolidayCalendarService.get_upcoming_holidays(chunk_week_start, region, industry) or []:
             holidays_by_date[h["date"]] = h
-        cultural_moments_all += CulturalMomentService.get_trending_topics(industry, region, chunk_week_start) or []
-    industry_best_practices = IndustryTrendService.get_industry_best_practices(industry)
+        cultural_moments_all += CulturalMomentService.get_cultural_moments(chunk_week_start, region) or []
 
-    # Step 3 — candidate pool (never receives performance/trend data)
+    # Step 3 — candidate pool (never receives performance/trend data).
+    # industry_best_practices deliberately no longer sourced or passed here —
+    # see _generate_candidate_concepts's own docstring for why.
     candidates = await _generate_candidate_concepts(
         brand=brand, framework=framework, existing_assets_summary=existing_assets_summary,
         creative_memory=creative_memory, platforms=platforms,
-        cultural_moments=cultural_moments_all, industry_best_practices=industry_best_practices,
+        cultural_moments=cultural_moments_all,
     )
     if not candidates:
         raise RuntimeError("Content Calendar V2 generation failed — no candidate concepts produced.")
@@ -1378,8 +1742,8 @@ async def _build_plan_doc(
     # Step 6 — assign dates
     dated = _assign_dates(selected, all_dates, holidays_by_date)
 
-    # Step 7 — assign format, dynamic 2-5 slide carousels
-    formatted = [_assign_format(c, brand, existing_assets_summary) for c in dated]
+    # Step 7 — assign format, dynamic 2-5 slide carousels, capped video/week
+    formatted = _assign_formats(dated, brand, existing_assets_summary)
 
     # Step 8+9 — final copy + creative direction, concurrently chunked
     # (same proven concurrency pattern this codebase already fixed a real
@@ -1406,11 +1770,34 @@ async def _build_plan_doc(
 
     items_by_index = {item["day_index"]: item for item in all_items}
 
+    # Backfill — one more shot at any day whose chunk still failed outright
+    # after _generate_final_copy's own 2 attempts (confirmed live: this is
+    # how a 30-item plan was landing at 24; the retry-inversion bug above was
+    # the main cause, this is the safety net for whatever still slips through
+    # — a stubborn chunk, or the retry's OWN second attempt also failing).
+    missing_indices = sorted(set(range(PLAN_DAYS)) - set(items_by_index.keys()))
+    if missing_indices:
+        print(f"[CalendarV2] backfilling {len(missing_indices)} missing item(s) at day_index={missing_indices}", flush=True)
+        backfill_concepts = [c for c in formatted if c["day_index"] in missing_indices]
+        try:
+            backfill_items = await _generate_final_copy(
+                brand=brand, concepts_chunk=backfill_concepts, platforms=platforms,
+                existing_assets_summary=existing_assets_summary, force=force,
+            )
+            for item in backfill_items:
+                items_by_index[item["day_index"]] = item
+            all_items = list(items_by_index.values())
+            print(f"[CalendarV2] backfill recovered {len(backfill_items)}/{len(missing_indices)} item(s)", flush=True)
+        except Exception as exc:
+            print(f"[CalendarV2] backfill pass failed ({exc}) — plan will ship with {len(all_items)}/{PLAN_DAYS} items", flush=True)
+
     # Step 11 — semantic/creative validation (deterministic hard rules were
-    # already enforced per-chunk inside _generate_final_copy's retry loop)
+    # already enforced per-chunk inside _generate_final_copy's retry loop).
+    # llm_flagged now also carries the addendum §19 "No Generic AI Content"
+    # gate's semantic-judgment questions — see _llm_diversity_check's docstring.
     rule_issues = _rule_based_diversity_issues(all_items)
-    llm_flagged = await _llm_diversity_check(all_items)
-    print(f"[CalendarV2] diversity check: rule_issues={len(rule_issues)} llm_flagged={len(llm_flagged)}", flush=True)
+    llm_flagged = await _llm_diversity_check(all_items, brand=brand)
+    print(f"[CalendarV2] diversity+quality check: rule_issues={len(rule_issues)} llm_flagged={len(llm_flagged)}", flush=True)
     if len(llm_flagged) > max(6, len(all_items) // 4):
         print(f"[CalendarV2] LLM diversity check flagged {len(llm_flagged)}/{len(all_items)} — implausible, discarding", flush=True)
         llm_flagged = []
@@ -1435,7 +1822,7 @@ async def _build_plan_doc(
         flagged_day_indices = sorted(set(rule_issues.keys()) | still_flagged)
 
     flagged_set = set(flagged_day_indices)
-    anti_boring_notes = _anti_boring_check(all_items)
+    anti_boring_notes = _anti_boring_check(all_items, brand_name=brand.get("brand_name", ""))
 
     # Step 10 — ad opportunity scoring + copy. Scoring is pure/fast; copy
     # generation is the one real LLM call here — fired concurrently for every
@@ -1458,6 +1845,10 @@ async def _build_plan_doc(
     ]) if candidate_indices else []
     ad_copy_by_index = dict(zip(candidate_indices, ad_copies))
 
+    # PRD §21 — every item sharing a series_name within this plan gets the
+    # same series_id, so the frontend can group/highlight a recurring series
+    # as one thing rather than N unrelated items that happen to share a label.
+    series_ids_by_name: Dict[str, str] = {}
     items_out: List[Dict[str, Any]] = []
     for i, idea in enumerate(all_items):
         day_index = idea.get("day_index", i)
@@ -1545,8 +1936,16 @@ async def _build_plan_doc(
             "ad_opportunity": ad_opportunity,
             "primary_kpi": idea.get("primary_kpi", "engagement"),
             "selection_score": idea.get("selection_score", {}),
-            "series_id": None,
-            "series_name": None,
+            "series_id": (
+                series_ids_by_name.setdefault(
+                    _resolve_series_name(idea["series_name"], brand.get("brand_name") or "the brand", industry or "business"),
+                    str(uuid.uuid4()),
+                )
+                if idea.get("series_name") else None
+            ),
+            "series_name": _resolve_series_name(
+                idea.get("series_name"), brand.get("brand_name") or "the brand", industry or "business"
+            ),
             "creative_quality_review_note": anti_boring_notes.get(day_index),
             "diversity_check": {
                 "passed": day_index not in flagged_set,
@@ -1590,7 +1989,6 @@ async def _build_plan_doc(
         "intelligence_snapshot": {
             "holidays": list(holidays_by_date.values()),
             "cultural_moments": cultural_moments_all[:10],
-            "industry_best_practices": industry_best_practices,
         },
         "territory_mix": {k: round(v / n_items, 2) for k, v in territory_counts.items()},
         "content_mix": {k: round(v / n_items, 2) for k, v in content_type_counts.items()},
