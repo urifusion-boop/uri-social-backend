@@ -65,6 +65,18 @@ class UserCreditWallet(BaseModel):
     end_date: Optional[datetime] = Field(default=None, description="Subscription end date (auto-expire after this)")
     next_renewal: Optional[datetime] = Field(default=None, description="Next billing cycle date")
 
+    # Distinguishes a real paid subscription from an access-code comp grant.
+    # A comp grant gets its credits_monthly allocation ONCE at redemption,
+    # deliberately never refilled (next_renewal stays None so it can never
+    # auto-charge) — so unlike a paid subscription, running out of credits
+    # before end_date means the grant is genuinely spent, not just due for
+    # its next monthly top-up. CreditService.deduct_credit checks this flag
+    # to auto-revoke the tier the moment credits hit 0, rather than leaving
+    # a hollow "Starter" badge with nothing usable behind it until end_date.
+    subscription_source: Optional[str] = Field(
+        default=None, description="'access_code' if subscription_tier came from a redeemed comp code, else None (paid)"
+    )
+
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
@@ -96,13 +108,14 @@ class CreditTransaction(BaseModel):
     Tracks all credit movements
     """
     user_id: str = Field(..., description="User who performed action")
-    type: Literal["allocation", "deduction", "bonus", "refund", "trial"] = Field(..., description="Transaction type")
+    type: Literal["allocation", "deduction", "bonus", "refund", "trial", "admin_adjustment"] = Field(..., description="Transaction type")
     amount: int = Field(..., description="Credit amount (negative for deduction)")
     balance_before: int = Field(..., description="Credit balance before transaction")
     balance_after: int = Field(..., description="Credit balance after transaction")
-    reason: Literal["subscription", "retry", "campaign_generation", "refund", "bonus", "trial", "whatsapp_content_generation", "whatsapp_graphic_generation", "upload_user_content", "custom_credit_purchase", "video_editing"] = Field(..., description="Why credits changed")
+    reason: Literal["subscription", "retry", "campaign_generation", "refund", "bonus", "trial", "whatsapp_content_generation", "whatsapp_graphic_generation", "upload_user_content", "custom_credit_purchase", "video_editing", "admin_adjustment"] = Field(..., description="Why credits changed")
     campaign_id: Optional[str] = Field(default=None, description="Reference to content_requests if applicable")
     retry_count: Optional[int] = Field(default=0, description="Retry number if applicable")
+    notes: Optional[str] = Field(default=None, description="Free-text context — e.g. an admin's stated reason for a manual credit/trial adjustment, distinct from the fixed `reason` category")
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
     class Config:
@@ -385,11 +398,16 @@ class CreditBalanceResponse(BaseModel):
     credits_used: int
     credits_remaining: int
     subscription_tier: Optional[str] = None
+    subscription_source: Optional[str] = Field(default=None, description="'access_code' if this tier is a comp grant, else None (paid)")
     billing_cycle: Optional[str] = Field(default="monthly", description="monthly|3_months|6_months|12_months")
     start_date: Optional[datetime] = Field(default=None, description="Subscription start date")
     end_date: Optional[datetime] = Field(default=None, description="Subscription end date")
     next_renewal: Optional[datetime] = None
     low_credit_warning: bool = Field(default=False, description="True if credits <= 3 (PRD 7.3)")
+    trial_credits_included: int = Field(
+        default=0,
+        description="Portion of credits_remaining/total_credits coming from an unexpired trial, not the subscription/bonus wallet. Not yet populated by get_credit_balance on this branch — always 0 today, kept as a real field so admin_router.py's tier-labeling logic has something safe to read rather than erroring.",
+    )
 
     class Config:
         schema_extra = {
@@ -428,3 +446,95 @@ class SubscriptionResponse(BaseModel):
                 "next_renewal": "2026-05-06T00:00:00Z"
             }
         }
+
+
+# ==================== ACCESS CODES ====================
+# Admin-generated partner/comp codes — e.g. "ASA26" for the Africa SME
+# Assembly partnership. Generic and reusable: any admin can create a new
+# code at any time, for any plan, any duration, handed to anybody. Each
+# redeemer gets their own access window starting from THEIR redemption
+# date, not a shared expiry tied to the code itself.
+
+class AccessCode(BaseModel):
+    code: str = Field(..., description="Normalized uppercase, e.g. 'ASA26'")
+    plan_tier_id: str = Field(..., description="subscription_tiers.tier_id to grant, e.g. 'starter'")
+    duration_days: int = Field(..., description="How many days of access from each user's own redemption date")
+    max_redemptions: Optional[int] = Field(default=None, description="None = unlimited redemptions")
+    redemption_count: int = Field(default=0, description="How many times this code has been redeemed so far")
+    is_active: bool = Field(default=True, description="Admin can deactivate a code early without deleting it")
+    expires_at: Optional[datetime] = Field(default=None, description="Code's own redeem-by deadline; None = open-ended")
+    label: str = Field(default="", description="Human-readable note, e.g. 'Africa SME Assembly partnership'")
+    # Two distinct modes, both real: a SHARED code (assigned_to_email=None) is
+    # handed to a firm and anyone who has it can redeem it, up to
+    # max_redemptions times. An ASSIGNED code is reserved for one specific
+    # person from creation — visible as "who this is for" in the admin panel
+    # immediately, not just discoverable after they redeem — and enforced at
+    # redemption time (see billing_router.py's redeem_access_code): only a
+    # matching email can ever successfully redeem it, not first-come-first-
+    # served. Normalized lowercase; matching is case-insensitive.
+    assigned_to_email: Optional[str] = Field(
+        default=None, description="If set, ONLY this email can redeem this code — a personal invite, not a shared code"
+    )
+    created_by: str = Field(..., description="Admin email who created this code")
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+    class Config:
+        schema_extra = {
+            "example": {
+                "code": "ASA26",
+                "plan_tier_id": "starter",
+                "duration_days": 60,
+                "max_redemptions": None,
+                "redemption_count": 3,
+                "is_active": True,
+                "expires_at": None,
+                "label": "Africa SME Assembly partnership",
+                "created_by": "admin@urisocial.com",
+            }
+        }
+
+
+class AccessCodeRedemption(BaseModel):
+    code: str
+    user_id: str = Field(..., description="The billing id (users.userId) that redeemed this code")
+    plan_tier_id: str = Field(..., description="Snapshot of the plan granted — survives a later edit to the code")
+    access_start: datetime
+    access_end: datetime
+    previous_subscription_tier: Optional[str] = Field(
+        default=None, description="What the user had before redeeming, for support/audit visibility"
+    )
+    redeemed_at: datetime = Field(default_factory=datetime.utcnow)
+    # Set the moment CreditService.deduct_credit sees this grant's credits
+    # hit 0 — a comp grant ends whichever comes first: end_date, or running
+    # out of credits. None while access is still live (whether still active
+    # or naturally lapsed by end_date via the daily expiry sweep, which
+    # doesn't touch these two fields — only genuine early exhaustion does).
+    revoked_at: Optional[datetime] = None
+    revocation_reason: Optional[str] = Field(default=None, description="e.g. 'credits_exhausted'")
+
+
+class RedeemAccessCodeRequest(BaseModel):
+    code: str = Field(..., min_length=1, description="The code to redeem, case-insensitive")
+
+
+class CreateAccessCodeRequest(BaseModel):
+    code: Optional[str] = Field(default=None, description="Omit to auto-generate a random code")
+    plan_tier_id: str
+    duration_days: int = Field(..., gt=0)
+    max_redemptions: Optional[int] = Field(default=None, gt=0)
+    expires_at: Optional[datetime] = None
+    label: str = ""
+    assigned_to_email: Optional[str] = Field(
+        default=None, description="Reserve this code for one specific person — omit for a shared code anyone can redeem"
+    )
+    send_email: bool = Field(
+        default=True, description="If assigned_to_email is set, email them the code immediately after creation"
+    )
+
+
+class UpdateAccessCodeRequest(BaseModel):
+    is_active: Optional[bool] = None
+    label: Optional[str] = None
+    assigned_to_email: Optional[str] = Field(
+        default=None, description="Reassign an existing code, or set on a code that was created unassigned"
+    )

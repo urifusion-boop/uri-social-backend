@@ -915,9 +915,10 @@ Do NOT style it as a button or banner."""
             # Step 5: Overlay logo on generated image
             logo_url = brand_context.get("logo_url")
             logo_position = brand_context.get("logo_position", "bottom_right")
+            logo_size = brand_context.get("logo_size", "small")
 
             if logo_url:
-                print(f"[V2] Overlaying logo at position: {logo_position}")
+                print(f"[V2] Overlaying logo at position: {logo_position}, size: {logo_size}")
 
                 # Handle data URLs (base64) vs regular URLs
                 import base64
@@ -943,6 +944,7 @@ Do NOT style it as a button or banner."""
                     b64=base64_image,
                     logo_url=logo_url,
                     position=logo_position,
+                    logo_size=logo_size,
                 )
 
                 # Upload final image with logo to Cloudinary

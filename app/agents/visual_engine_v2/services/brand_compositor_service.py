@@ -280,11 +280,19 @@ class BrandCompositorService:
         image_path = (imagery_layers[0].metadata.get("path", "both") if is_carousel
                       else imagery_layer.metadata.get("path", "both"))  # "A", "B", or "both"
 
-        # Logo control: "agent" (default) lets Orshot place the logo natively in
-        # the template's own logo slot; "user" means Orshot renders WITHOUT a
-        # logo and we composite it afterward at the user's exact chosen
-        # position — set via the V2-only brand prefs, never the shared profile.
-        logo_control_mode = brand_data.get("logo_control_mode") or "agent"
+        # Logo is ALWAYS self-composited now (never handed to the template
+        # vendor to place natively), regardless of logo_control_mode. Confirmed
+        # live: Orshot/Placid's "modifications"/layer system only sets content
+        # for named layers a template's own designer created — there is no
+        # generic "resize this image layer by X%" mechanism, so a brand's
+        # logo_size (small/medium/large) silently did nothing whenever
+        # logo_control_mode was "agent" (the default every brand starts on),
+        # while the logo still rendered at whatever fixed size that specific
+        # template's logo slot happened to be designed at. Self-compositing via
+        # ImageContentService._overlay_logo (below) is the only path that
+        # actually reads and honors logo_size. logo_control_mode/
+        # logo_manual_position are kept only as the POSITION source when set —
+        # not read for whether to composite at all anymore.
         logo_url = brand_data.get("logo_url") or ""
         logo_size = brand_data.get("logo_size") or "small"
         logo_position = brand_data.get("logo_manual_position") or brand_data.get("logo_position", "bottom_right")
@@ -303,8 +311,12 @@ class BrandCompositorService:
         # consistency rule: "all slides in one carousel share the same
         # template family and brand values."
         brand_fields = {
-            "logo_url": logo_url if logo_control_mode == "agent" else "",
-            "logo_position": logo_position if logo_control_mode == "agent" else "",
+            # Never sent to the template vendor — it can't honor logo_size (see
+            # comment above), so the logo is always stamped on afterward
+            # ourselves instead. Kept out of the render request entirely so a
+            # template with its own logo slot doesn't double-place one.
+            "logo_url": "",
+            "logo_position": "",
             "logo_size": logo_size,
             "primary_color": brand_data.get("primary_color", "#000000"),
             "secondary_color": brand_data.get("secondary_color", "#FFFFFF"),
@@ -379,16 +391,16 @@ class BrandCompositorService:
                 for _ in range(max(carousel_count, 1))
             ]
 
-        # User-controlled logo mode: the template above rendered WITHOUT a logo
-        # (see template_data above), so stamp it on now at the user's exact
-        # chosen position. Skipped on the placeholder-fallback path — a
+        # The template above always rendered WITHOUT a logo (see brand_fields
+        # above), so stamp it on now ourselves — the only path that honors
+        # logo_size. Skipped on the placeholder-fallback path — a
         # needs-attention render already gets a human look before it can post.
-        if logo_control_mode == "user" and logo_url and not needs_attention:
+        if logo_url and not needs_attention:
             rendered_urls = [
                 await self._composite_user_logo(url, logo_url, logo_position, logo_size)
                 for url in rendered_urls
             ]
-            print(f"✓ User-controlled logo composited at '{logo_position}' on {len(rendered_urls)} render(s)")
+            print(f"✓ Logo composited at '{logo_position}' (size={logo_size}) on {len(rendered_urls)} render(s)")
 
         # PRD Section 11: cost model — a fallback placeholder never actually reached
         # a paid vendor, so it costs nothing; a real render costs once per output image.
