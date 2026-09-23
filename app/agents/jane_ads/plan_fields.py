@@ -26,7 +26,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from . import constants as C
-from .models import CampaignPlan, CampaignRequest, GeoMode, GeoPin, GeoPlan, PinSource
+from .models import CampaignPlan, CampaignRequest, GeoMode, GeoPin, GeoPlan, PinSource, Platform, PlatformPlan
 
 # Meta's own bounds. Sending outside these fails the ad set create outright.
 MIN_AGE, MAX_AGE = 18, 65
@@ -71,6 +71,18 @@ def _placement_of(targeting: dict) -> str:
     return "automatic"
 
 
+def _daily_floor_for(platform: Optional[PlatformPlan]) -> float:
+    """The real daily-spend floor for whichever platform this plan is on — was
+    hardcoded to Meta's ₦1,610 everywhere in this module (both the help text and,
+    more seriously, the budget/duration validation itself), which is wrong for
+    TikTok's real ₦31,000 floor. C.HARD_FLOOR_DAILY_NGN already carries every
+    platform's real number; this just looks it up by the plan's own platform
+    instead of assuming Meta."""
+    if not platform:
+        return C.META_MIN_DAILY_NGN
+    return C.HARD_FLOOR_DAILY_NGN.get(platform.platform.value, C.META_MIN_DAILY_NGN)
+
+
 def _interest_names(targeting: dict) -> list[str]:
     """The interest/behaviour labels out of Meta's flexible_spec.
 
@@ -94,13 +106,26 @@ def describe(plan: CampaignPlan, req: CampaignRequest) -> list[dict[str, Any]]:
     `editable: False` lines are shown but not changeable — they are derived from other
     fields (the daily split) or fixed by the connection (the Page), and pretending
     otherwise would invite an edit we would have to silently ignore.
+
+    Live-caught 2026-09-23: every targeting-shaped field here (locations, interests,
+    gender, placement, age) used to render unconditionally, Meta-labelled, on a TikTok
+    plan too — but adapters/tiktok.py never reads plan.geo or plan.audience_targeting
+    at all when it builds the ad group; every TikTok campaign today targets "all adults
+    in Nigeria" regardless of what got saved here. Showing those fields as editable on
+    a TikTok plan meant a client could change one, see "applied," and have it do
+    nothing — exactly the "system says yes and then does something else" bug class
+    this whole module exists to prevent (see module docstring). They're left out for
+    TikTok, with one honest line in their place, rather than shown as if they worked.
     """
     targeting = plan.audience_targeting or {}
     creative = plan.creative
     platform = plan.platforms[0] if plan.platforms else None
     geo = plan.geo
+    is_tiktok = bool(platform and platform.platform == Platform.TIKTOK)
+    floor = _daily_floor_for(platform)
+    platform_name = "TikTok" if is_tiktok else "Meta"
 
-    return [
+    fields: list[dict[str, Any]] = [
         {
             "key": "headline", "label": "Headline", "type": "text",
             "value": (creative.headline if creative else ""),
@@ -113,44 +138,61 @@ def describe(plan: CampaignPlan, req: CampaignRequest) -> list[dict[str, Any]]:
             "editable": True, "max_length": 500,
             "help": "The body of the ad — what the reader actually reads.",
         },
-        {
-            "key": "locations", "label": "Locations", "type": "list",
-            "value": [p.name for p in (geo.pins if geo else [])],
-            "editable": True, "max_items": MAX_LOCATIONS,
-            "help": f"Up to {MAX_LOCATIONS} areas. Each must be somewhere Meta can name — "
-                    "we never target raw coordinates.",
-        },
-        {
-            "key": "interests", "label": "Interests and behaviours", "type": "list",
-            "value": _interest_names(targeting),
-            "editable": True, "max_items": MAX_INTERESTS,
-            "help": "Checked against Meta's own targeting catalogue when you save.",
-        },
-        {
-            "key": "gender", "label": "Gender", "type": "select",
-            "value": _gender_of(targeting),
-            "options": ["all", "men", "women"], "editable": True,
-            "help": "Who sees it. 'All' is usually right unless the product is gendered.",
-        },
-        {
-            "key": "placement", "label": "Where it shows", "type": "select",
-            "value": _placement_of(targeting),
-            "options": list(_PLACEMENTS.keys()),
-            "option_labels": _PLACEMENT_LABELS,
-            "editable": True,
-            "help": "Automatic delivers best but also spends on Audience Network. "
-                    "Pick a platform to keep it off everything else.",
-        },
-        {
-            "key": "age_min", "label": "Minimum age", "type": "number",
-            "value": targeting.get("age_min", MIN_AGE),
-            "min": MIN_AGE, "max": MAX_AGE, "editable": True,
-        },
-        {
-            "key": "age_max", "label": "Maximum age", "type": "number",
-            "value": targeting.get("age_max", MAX_AGE),
-            "min": MIN_AGE, "max": MAX_AGE, "editable": True,
-        },
+    ]
+
+    if is_tiktok:
+        fields.append({
+            "key": "tiktok_audience_note", "label": "Audience", "type": "derived",
+            "value": "All adults in Nigeria",
+            "editable": False,
+            "help": "TikTok campaigns don't yet support location, interest, age or "
+                    "gender targeting in Jane — every campaign reaches everyone in "
+                    "your country. That's coming later; for now this line is here so "
+                    "it isn't a silent gap.",
+        })
+    else:
+        fields += [
+            {
+                "key": "locations", "label": "Locations", "type": "list",
+                "value": [p.name for p in (geo.pins if geo else [])],
+                "editable": True, "max_items": MAX_LOCATIONS,
+                "help": f"Up to {MAX_LOCATIONS} areas. Each must be somewhere Meta can name — "
+                        "we never target raw coordinates.",
+            },
+            {
+                "key": "interests", "label": "Interests and behaviours", "type": "list",
+                "value": _interest_names(targeting),
+                "editable": True, "max_items": MAX_INTERESTS,
+                "help": "Checked against Meta's own targeting catalogue when you save.",
+            },
+            {
+                "key": "gender", "label": "Gender", "type": "select",
+                "value": _gender_of(targeting),
+                "options": ["all", "men", "women"], "editable": True,
+                "help": "Who sees it. 'All' is usually right unless the product is gendered.",
+            },
+            {
+                "key": "placement", "label": "Where it shows", "type": "select",
+                "value": _placement_of(targeting),
+                "options": list(_PLACEMENTS.keys()),
+                "option_labels": _PLACEMENT_LABELS,
+                "editable": True,
+                "help": "Automatic delivers best but also spends on Audience Network. "
+                        "Pick a platform to keep it off everything else.",
+            },
+            {
+                "key": "age_min", "label": "Minimum age", "type": "number",
+                "value": targeting.get("age_min", MIN_AGE),
+                "min": MIN_AGE, "max": MAX_AGE, "editable": True,
+            },
+            {
+                "key": "age_max", "label": "Maximum age", "type": "number",
+                "value": targeting.get("age_max", MAX_AGE),
+                "min": MIN_AGE, "max": MAX_AGE, "editable": True,
+            },
+        ]
+
+    fields += [
         {
             "key": "budget_ngn", "label": "Budget", "type": "number",
             "value": req.budget_ngn, "min": 1, "editable": True, "prefix": "₦",
@@ -161,15 +203,15 @@ def describe(plan: CampaignPlan, req: CampaignRequest) -> list[dict[str, Any]]:
             "value": (platform.days if platform else 0),
             "min": 1, "max": 90, "editable": True,
             "help": "However long you want — Jane's default is only a starting point. "
-                    "Shorter means more spend per day, which is how a small budget "
-                    "clears Meta's daily minimum.",
+                    f"Shorter means more spend per day, which is how a small budget "
+                    f"clears {platform_name}'s daily minimum.",
         },
         {
             "key": "daily_spend", "label": "Daily spend", "type": "derived",
             "value": round(req.budget_ngn / platform.days, 2) if platform and platform.days else None,
             "editable": False, "prefix": "₦",
-            "help": f"Budget divided by duration. Meta refuses anything under "
-                    f"₦{C.META_MIN_DAILY_NGN:,.0f} a day — change either of those to move it.",
+            "help": f"Budget divided by duration. {platform_name} refuses anything under "
+                    f"₦{floor:,.0f} a day — change either of those to move it.",
         },
         {
             "key": "destination", "label": "Where taps go", "type": "derived",
@@ -178,6 +220,7 @@ def describe(plan: CampaignPlan, req: CampaignRequest) -> list[dict[str, Any]]:
             "help": "Set by your connection, not by this plan.",
         },
     ]
+    return fields
 
 
 async def _validated_locations(
@@ -299,6 +342,9 @@ async def apply_edits(
     targeting = dict(plan.audience_targeting or {})
     plan_update: dict[str, Any] = {}
     req_update: dict[str, Any] = {}
+    platform = plan.platforms[0] if plan.platforms else None
+    is_tiktok = bool(platform and platform.platform == Platform.TIKTOK)
+    platform_name = "TikTok" if is_tiktok else "Meta"
 
     # ── ad copy ───────────────────────────────────────────────────────────────
     if plan.creative is not None and ({"headline", "caption"} & edits.keys()):
@@ -319,94 +365,114 @@ async def apply_edits(
                 )
                 applied += [k for k in ("headline", "caption") if k in edits]
 
-    # ── locations ─────────────────────────────────────────────────────────────
-    if "locations" in edits:
-        names = [str(n) for n in (edits.get("locations") or [])]
-        region = (plan.geo.city if plan.geo else "") or req.geo
-        pins, bad = await _validated_locations(names, region, access_token)
-        rejections += bad
-        if pins:
-            base = plan.geo or GeoPlan(mode=GeoMode.OWN_RADIUS, city=region)
-            plan_update["geo"] = base.model_copy(update={"pins": pins})
-            applied.append("locations")
-        elif names:
-            rejections.append("No location was changed — none of those could be named by Meta.")
-
-    # ── interests ─────────────────────────────────────────────────────────────
-    if "interests" in edits:
-        names = [str(n) for n in (edits.get("interests") or [])]
-        if not names:
-            targeting.pop("flexible_spec", None)
-            applied.append("interests")
-        else:
-            kept, bad = await _validated_interests(
-                names, access_token, _resolved_interests(plan.audience_targeting or {}))
+    # ── targeting fields (locations, interests, gender, placement, age) ────────
+    # TikTok-only guard, live-caught 2026-09-23: adapters/tiktok.py never reads
+    # plan.geo or plan.audience_targeting when it launches, so accepting any of
+    # these on a TikTok plan would save happily and change nothing — the exact
+    # bug this module's docstring says it exists to prevent. describe() no longer
+    # offers these fields for a TikTok plan, so this branch is defence-in-depth
+    # for a direct API call, not something the review panel itself can trigger.
+    _targeting_keys = {"locations", "interests", "gender", "placement", "age_min", "age_max"}
+    if is_tiktok and (_targeting_keys & edits.keys()):
+        rejections.append(
+            "TikTok campaigns don't support location, interest, age or gender "
+            "targeting in Jane yet — every campaign reaches all adults in Nigeria."
+        )
+    if not is_tiktok:
+        # ── locations ─────────────────────────────────────────────────────────
+        if "locations" in edits:
+            names = [str(n) for n in (edits.get("locations") or [])]
+            region = (plan.geo.city if plan.geo else "") or req.geo
+            pins, bad = await _validated_locations(names, region, access_token)
             rejections += bad
-            if kept:
-                # ONE flexible_spec entry: Meta ORs within an entry and ANDs across
-                # entries, and an AND of interests is a near-empty audience.
-                #
-                # Everything in that entry which is NOT an interest — life_events,
-                # behaviors, work_positions, industries — is carried over untouched.
-                # Meta rejects an id filed under the wrong key, so these cannot simply
-                # be folded in with the interests, and dropping them would silently
-                # narrow an audience the client never asked to change. Live-caught on a
-                # real ad set carrying 7 interests and 1 life_event.
-                entry = {k: v for k, v in _other_flex_fields(plan.audience_targeting or {}).items()}
-                entry["interests"] = kept
-                targeting["flexible_spec"] = [entry]
+            if pins:
+                base = plan.geo or GeoPlan(mode=GeoMode.OWN_RADIUS, city=region)
+                plan_update["geo"] = base.model_copy(update={"pins": pins})
+                applied.append("locations")
+            elif names:
+                rejections.append("No location was changed — none of those could be named by Meta.")
+
+        # ── interests ─────────────────────────────────────────────────────────
+        if "interests" in edits:
+            names = [str(n) for n in (edits.get("interests") or [])]
+            if not names:
+                targeting.pop("flexible_spec", None)
                 applied.append("interests")
-
-    # ── gender ────────────────────────────────────────────────────────────────
-    if "gender" in edits:
-        choice = str(edits.get("gender") or "").strip().lower()
-        if choice not in _GENDER_TO_CODES:
-            rejections.append(f"Gender must be one of: {', '.join(_GENDER_TO_CODES)}.")
-        else:
-            codes = _GENDER_TO_CODES[choice]
-            if codes:
-                targeting["genders"] = codes
             else:
-                targeting.pop("genders", None)
-            applied.append("gender")
+                kept, bad = await _validated_interests(
+                    names, access_token, _resolved_interests(plan.audience_targeting or {}))
+                rejections += bad
+                if kept:
+                    # ONE flexible_spec entry: Meta ORs within an entry and ANDs across
+                    # entries, and an AND of interests is a near-empty audience.
+                    #
+                    # Everything in that entry which is NOT an interest — life_events,
+                    # behaviors, work_positions, industries — is carried over untouched.
+                    # Meta rejects an id filed under the wrong key, so these cannot simply
+                    # be folded in with the interests, and dropping them would silently
+                    # narrow an audience the client never asked to change. Live-caught on a
+                    # real ad set carrying 7 interests and 1 life_event.
+                    entry = {k: v for k, v in _other_flex_fields(plan.audience_targeting or {}).items()}
+                    entry["interests"] = kept
+                    targeting["flexible_spec"] = [entry]
+                    applied.append("interests")
 
-    # ── placement ─────────────────────────────────────────────────────────────
-    if "placement" in edits:
-        choice = str(edits.get("placement") or "").strip().lower()
-        if choice not in _PLACEMENTS:
-            rejections.append(f"Placement must be one of: {', '.join(_PLACEMENTS)}.")
-        else:
-            platforms = _PLACEMENTS[choice]
-            if platforms:
-                targeting["publisher_platforms"] = platforms
+        # ── gender ────────────────────────────────────────────────────────────
+        if "gender" in edits:
+            choice = str(edits.get("gender") or "").strip().lower()
+            if choice not in _GENDER_TO_CODES:
+                rejections.append(f"Gender must be one of: {', '.join(_GENDER_TO_CODES)}.")
             else:
-                targeting.pop("publisher_platforms", None)
-            applied.append("placement")
+                codes = _GENDER_TO_CODES[choice]
+                if codes:
+                    targeting["genders"] = codes
+                else:
+                    targeting.pop("genders", None)
+                applied.append("gender")
 
-    # ── age ───────────────────────────────────────────────────────────────────
-    if {"age_min", "age_max"} & edits.keys():
-        lo = _as_int(edits.get("age_min", targeting.get("age_min", MIN_AGE)))
-        hi = _as_int(edits.get("age_max", targeting.get("age_max", MAX_AGE)))
-        if lo is None or hi is None:
-            rejections.append("Ages must be whole numbers.")
-        elif not (MIN_AGE <= lo < hi <= MAX_AGE):
-            rejections.append(
-                f"Age range must sit between {MIN_AGE} and {MAX_AGE}, with the minimum below the maximum."
-            )
-        else:
-            targeting["age_min"], targeting["age_max"] = lo, hi
-            applied += [k for k in ("age_min", "age_max") if k in edits]
+        # ── placement ─────────────────────────────────────────────────────────
+        if "placement" in edits:
+            choice = str(edits.get("placement") or "").strip().lower()
+            if choice not in _PLACEMENTS:
+                rejections.append(f"Placement must be one of: {', '.join(_PLACEMENTS)}.")
+            else:
+                placements = _PLACEMENTS[choice]
+                if placements:
+                    targeting["publisher_platforms"] = placements
+                else:
+                    targeting.pop("publisher_platforms", None)
+                applied.append("placement")
+
+        # ── age ───────────────────────────────────────────────────────────────
+        if {"age_min", "age_max"} & edits.keys():
+            lo = _as_int(edits.get("age_min", targeting.get("age_min", MIN_AGE)))
+            hi = _as_int(edits.get("age_max", targeting.get("age_max", MAX_AGE)))
+            if lo is None or hi is None:
+                rejections.append("Ages must be whole numbers.")
+            elif not (MIN_AGE <= lo < hi <= MAX_AGE):
+                rejections.append(
+                    f"Age range must sit between {MIN_AGE} and {MAX_AGE}, with the minimum below the maximum."
+                )
+            else:
+                targeting["age_min"], targeting["age_max"] = lo, hi
+                applied += [k for k in ("age_min", "age_max") if k in edits]
 
     # ── budget and duration ───────────────────────────────────────────────────
-    # Judged TOGETHER, because what Meta actually rejects is the daily figure they
-    # produce between them. Halving the duration is a valid way to clear the floor,
-    # so validating either one alone would refuse edits that are in fact fine — and
-    # would let a legal-looking pair through that the launch then fails on
-    # ("Budget is too low", subcode 1885272).
+    # Judged TOGETHER, because what the platform actually rejects is the daily
+    # figure they produce between them. Halving the duration is a valid way to
+    # clear the floor, so validating either one alone would refuse edits that are
+    # in fact fine — and would let a legal-looking pair through that the launch
+    # then fails on ("Budget is too low", subcode 1885272 on Meta).
+    #
+    # Live-caught 2026-09-23: this floor was hardcoded to C.META_MIN_DAILY_NGN
+    # (₦1,610) regardless of platform — a TikTok edit could pass this check at,
+    # say, ₦5,000/day and then fail for real at TikTok launch, which is under its
+    # real ₦31,000 floor. Now looked up per the plan's own platform.
     if {"budget_ngn", "days"} & edits.keys():
         current_days = plan.platforms[0].days if plan.platforms else C.DEFAULT_CAMPAIGN_DAYS
         budget = _as_float(edits["budget_ngn"]) if "budget_ngn" in edits else req.budget_ngn
         days = _as_int(edits["days"]) if "days" in edits else current_days
+        floor = _daily_floor_for(platform)
 
         if "budget_ngn" in edits and (budget is None or budget <= 0):
             rejections.append("Budget must be a number greater than zero.")
@@ -418,14 +484,15 @@ async def apply_edits(
             )
         elif budget is None or days is None:
             rejections.append("Budget and duration must both be numbers.")
-        elif budget / days < C.META_MIN_DAILY_NGN:
-            longest = int(budget // C.META_MIN_DAILY_NGN)
+        elif budget / days < floor:
+            longest = int(budget // floor)
             rejections.append(
-                f"₦{budget:,.0f} over {days} days is ₦{budget / days:,.0f} a day, under Meta's "
-                f"₦{C.META_MIN_DAILY_NGN:,.0f} minimum — Meta refuses the ad set outright. "
+                f"₦{budget:,.0f} over {days} days is ₦{budget / days:,.0f} a day, under "
+                f"{platform_name}'s ₦{floor:,.0f} minimum — {platform_name} refuses the "
+                "campaign outright. "
                 + (f"Run it over {longest} days or fewer, or raise the budget."
                    if longest >= 1 else
-                   f"You would need at least ₦{C.META_MIN_DAILY_NGN:,.0f} for a single day.")
+                   f"You would need at least ₦{floor:,.0f} for a single day.")
             )
         else:
             if "budget_ngn" in edits:

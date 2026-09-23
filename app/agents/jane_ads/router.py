@@ -3385,6 +3385,22 @@ async def _load_pending_plan(db, plan_id: str, brand_id: str) -> dict:
     return doc
 
 
+def _preferred_platform_for_challenge(plan: CampaignPlan) -> str:
+    """What to pin the rebuild to when a Plan Defence "challenge" corrects a plan.
+
+    Live-caught 2026-09-23: the challenge rebuild used to construct its synthetic
+    MetaLaunchFromMessageBody with no preferred_platform at all, so a TikTok plan
+    (chosen via an explicit override, not Jane's own silent pick) went back
+    through Jane's own platform decision on any follow-up correction — a client
+    correcting their budget on a TikTok plan could get a Meta plan back, with
+    their platform choice quietly overturned by an unrelated question. Re-reads
+    the platform straight off the plan being corrected, matching what the
+    original launch request pinned."""
+    if plan.platforms and plan.platforms[0].platform == Platform.TIKTOK:
+        return "tiktok"
+    return ""
+
+
 @router.get("/meta/plan/{plan_id}/fields")
 async def meta_plan_fields(
     plan_id: str,
@@ -3578,12 +3594,15 @@ async def meta_plan_ask(
         # correction into the flattened brief the SAME way consult() already reads it,
         # and reuse the existing creative image (no new content credit, no image churn)
         # since a foundation-fact correction is about targeting/budget, not the visual.
+        # preferred_platform keeps a TikTok plan pinned — see
+        # _preferred_platform_for_challenge's docstring for the live bug this fixes.
         synthetic_body = MetaLaunchFromMessageBody(
             message=f"{doc['message']} {body.question}".strip(),
             business_name=doc.get("business_name", ""),
             category=req.category,
             reuse_image_url=plan.creative.image_url if plan.creative else "",
             thread_id=doc.get("thread_id", ""),
+            preferred_platform=_preferred_platform_for_challenge(plan),
         )
         rebuilt = await _build_campaign_plan(synthetic_body, brand_ctx, db)
         if isinstance(rebuilt, dict):

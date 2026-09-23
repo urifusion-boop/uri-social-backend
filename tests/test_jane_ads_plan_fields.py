@@ -261,6 +261,79 @@ def test_shortening_the_run_is_a_valid_way_to_clear_the_floor():
     assert plan.platforms[0].days == 2
 
 
+def _tiktok_plan(**over):
+    over.setdefault("platforms", [PlatformPlan(
+        platform=Platform.TIKTOK, budget_ngn=100000, days=5, variants=1,
+        test_scope=ABTestScope.NONE)])
+    return _plan(**over)
+
+
+# ── TikTok: targeting fields don't apply, must not pretend to ───────────────
+# Live-caught 2026-09-23: adapters/tiktok.py never reads plan.geo or
+# plan.audience_targeting at all — every TikTok campaign targets all adults in
+# Nigeria regardless of what got saved here. These fields used to render anyway,
+# Meta-labelled, letting a client "successfully" edit something with zero effect
+# on the actual launch.
+
+def test_describe_hides_meta_only_targeting_fields_for_a_tiktok_plan():
+    fields = {f["key"]: f for f in describe(_tiktok_plan(), _req())}
+    for key in ("locations", "interests", "gender", "placement", "age_min", "age_max"):
+        assert key not in fields
+    assert fields["tiktok_audience_note"]["value"] == "All adults in Nigeria"
+    assert fields["tiktok_audience_note"]["editable"] is False
+    # Still real, still shown: TikTok's ad_text/budget/schedule are genuinely used.
+    assert "caption" in fields
+    assert "budget_ngn" in fields
+
+
+def test_describe_still_shows_all_meta_targeting_fields_for_a_meta_plan():
+    # Regression: the TikTok branch must not have narrowed Meta's own fields.
+    fields = {f["key"]: f for f in describe(_plan(), _req())}
+    for key in ("locations", "interests", "gender", "placement", "age_min", "age_max"):
+        assert key in fields
+    assert "tiktok_audience_note" not in fields
+
+
+def test_daily_spend_help_names_tiktoks_own_floor_not_metas():
+    fields = {f["key"]: f for f in describe(_tiktok_plan(), _req())}
+    assert "TikTok" in fields["daily_spend"]["help"]
+    assert "31,000" in fields["daily_spend"]["help"]
+    assert "Meta" not in fields["daily_spend"]["help"]
+
+
+def test_apply_edits_rejects_targeting_edits_on_a_tiktok_plan_without_calling_meta():
+    # No monkeypatch on the Meta lookups here — if this reached _validated_interests
+    # it would try a real network call and the test would hang/error, which is
+    # itself proof the gate works.
+    plan, req, applied, rejected = _run(apply_edits(
+        _tiktok_plan(), _req(), {"interests": ["Fashion"], "gender": "women"}))
+    assert applied == []
+    assert len(rejected) == 1
+    assert "TikTok" in rejected[0]
+    assert plan.audience_targeting == _tiktok_plan().audience_targeting
+
+
+def test_apply_edits_uses_tiktoks_daily_floor_not_metas():
+    # ₦100,000 / 10 days = ₦10,000/day — clears Meta's ₦1,610 floor easily, but sits
+    # well under TikTok's real ₦31,000 floor. Must be refused for a TikTok plan.
+    plan, req, applied, rejected = _run(apply_edits(
+        _tiktok_plan(), _req(), {"days": 10}))
+    assert applied == []
+    assert "TikTok" in rejected[0]
+    assert "31,000" in rejected[0]
+
+
+def test_apply_edits_accepts_a_budget_days_pair_that_clears_tiktoks_real_floor():
+    # ₦45,000 / 1 day = ₦45,000/day — clears TikTok's ₦31,000 floor and stays under
+    # the fixture's ₦50,000 brand cap. Uses a req whose budget matches (the default
+    # _req() carries the unrelated ₦20,000 base fixture value).
+    plan, req, applied, rejected = _run(apply_edits(
+        _tiktok_plan(), _req(budget_ngn=45000), {"days": 1}))
+    assert rejected == []
+    assert applied == ["days"]
+    assert plan.platforms[0].days == 1
+
+
 def test_duration_is_not_pinned_to_the_default():
     """'It mustn't always be 7 days' — any duration that clears the daily floor and
     the 1-90 bound is accepted, not just Jane's default."""
