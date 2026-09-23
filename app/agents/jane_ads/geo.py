@@ -407,7 +407,8 @@ async def meta_targeting_from_geo_named(
     Nigeria. Each is broader than the planner intended and each is legible, which is
     the trade this function exists to make.
     """
-    from .geo_names import field_for_type, resolve_named_location, resolve_region
+    from .geo_names import (field_for_type, region_for, resolve_named_location,
+                            resolve_region)
 
     # A pin now needs a NAME, not coordinates: targeting is resolved by name and a
     # coordinate is never sent. Requiring lat/lng here would silently drop a location
@@ -415,13 +416,25 @@ async def meta_targeting_from_geo_named(
     pins = [p for p in (geo.pins if geo else []) if (p.name or "").strip()]
     city = (geo.city if geo else "") or region
 
+    # Callers pass the campaign's CITY, but Meta reports every hit's region as the
+    # STATE — so matching pockets against "Ikeja" rejected Opebi and Alausa, both real
+    # targetable locations, and dropped the campaign to nationwide. Live-reported.
+    # Resolve the state once and guard on that. Falls back to the city itself, which
+    # is already correct when the city IS a state ("Lagos").
+    expected = region
+    if region:
+        try:
+            expected = await region_for(region, access_token) or region
+        except Exception as e:
+            print(f"[Geo] could not resolve the state for {region!r}: {e}", flush=True)
+
     geo_locations: dict = {}
     dropped: list[str] = []
     for pin in pins:
         named = None
-        if region:
+        if expected:
             try:
-                named = await resolve_named_location(pin.name, region, access_token)
+                named = await resolve_named_location(pin.name, expected, access_token)
             except Exception as e:
                 print(f"[Geo] name lookup failed for {pin.name!r}: {e}", flush=True)
         if named:
@@ -451,7 +464,7 @@ async def meta_targeting_from_geo_named(
     # Yaba/Katsina guard still applies.
     if city:
         try:
-            named_city = await resolve_named_location(city, city, access_token)
+            named_city = await resolve_named_location(city, expected or city, access_token)
         except Exception as e:
             print(f"[Geo] city fallback failed for {city!r}: {e}", flush=True)
             named_city = None
