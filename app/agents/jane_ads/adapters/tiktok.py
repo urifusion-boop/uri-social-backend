@@ -848,7 +848,12 @@ class TikTokAdsAdapter(AdPlatformAdapter):
         updated: dict[str, bool] = {}
         async with httpx.AsyncClient(timeout=30) as client:
             campaign_resp = await client.post(
-                f"{self._api_base}/campaign/update/status/",
+                # Same segment-order bug as _rollback_partial_launch had (see its
+                # comment) — TikTok's real endpoint is campaign/status/update/,
+                # not campaign/update/status/. The wrong path 404s, which is
+                # exactly why activating a TikTok campaign from Jane's own toggle
+                # silently failed and had to be done manually in Ads Manager.
+                f"{self._api_base}/campaign/status/update/",
                 headers=self._headers(),
                 json={
                     "advertiser_id": self._advertiser_id,
@@ -863,7 +868,9 @@ class TikTokAdsAdapter(AdPlatformAdapter):
             adgroup_id = record.get("adgroup_id", "")
             if adgroup_id:
                 adgroup_resp = await client.post(
-                    f"{self._api_base}/adgroup/update/status/",
+                    # Same bug, same fix: adgroup/status/update/, not
+                    # adgroup/update/status/.
+                    f"{self._api_base}/adgroup/status/update/",
                     headers=self._headers(),
                     json={
                         "advertiser_id": self._advertiser_id,

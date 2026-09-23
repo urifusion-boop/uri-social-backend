@@ -678,14 +678,25 @@ def test_set_delivery_enable_cascades_to_campaign_adgroup_and_ad():
     assert result["updated"] == {"campaign": True, "adgroup": True, "ad": True}
     assert mock_client.post.call_count == 3
 
+    # Live-caught 2026-09-23: campaign and adgroup status updates had the same
+    # swapped-segment bug already found (and fixed) in the rollback path —
+    # .../update/status/ 404s, the real endpoint is .../status/update/. Assert
+    # the URLs directly so a regression here fails loudly instead of just
+    # silently 404ing against a real account again.
+    campaign_url = mock_client.post.call_args_list[0].args[0]
+    assert campaign_url.endswith("/campaign/status/update/")
     campaign_json = mock_client.post.call_args_list[0].kwargs["json"]
     assert campaign_json["campaign_ids"] == ["111"]
     assert campaign_json["operation_status"] == "ENABLE"
 
+    adgroup_url = mock_client.post.call_args_list[1].args[0]
+    assert adgroup_url.endswith("/adgroup/status/update/")
     adgroup_json = mock_client.post.call_args_list[1].kwargs["json"]
     assert adgroup_json["adgroup_ids"] == ["222"]
     assert adgroup_json["operation_status"] == "ENABLE"
 
+    ad_url = mock_client.post.call_args_list[2].args[0]
+    assert ad_url.endswith("/ad/status/update/")
     ad_json = mock_client.post.call_args_list[2].kwargs["json"]
     assert ad_json["ad_ids"] == ["333"]
     assert ad_json["adgroup_id"] == "222"
