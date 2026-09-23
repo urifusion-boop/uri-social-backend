@@ -145,20 +145,28 @@ def test_full_test_at_large_budget():
     assert res.plan.platforms[0].test_scope == ABTestScope.AUDIENCE_AND_CREATIVE
 
 
-# ── Meta daily-budget floor: duration is capped so total/days clears it ────────
+# ── Duration follows the daily spend, not a budget tier ───────────────────────
 
-def test_days_capped_so_small_budget_clears_meta_daily_floor():
-    # ₦5,000 over the default 4 days = ₦1,250/day, under Meta's ₦1,610 floor →
-    # Meta rejects the ad set (subcode 1885272). Duration must shorten to 3 days.
-    assert _days_for(5_000) == 3
-    assert 5_000 / _days_for(5_000) >= C.META_MIN_DAILY_NGN
+def test_duration_targets_the_default_daily_spend():
+    """The daily figure governs whether a Meta ad delivers at all, so it is chosen
+    first and the length follows — rather than picking a duration by budget tier and
+    finding out the daily number afterwards."""
+    assert _days_for(10_000) == 4          # ₦2,500/day
+    assert _days_for(5_000) == 2           # ₦2,500/day
+    assert _days_for(7_500) == 3           # ₦2,500/day
 
 
-def test_days_unchanged_when_budget_already_clears_floor():
-    # ₦10,000 over 5 days = ₦2,000/day (clears the floor) — unchanged.
-    assert _days_for(10_000) == C.DEFAULT_CAMPAIGN_DAYS
-    # ₦20,000+ still gets the full 7-day run.
+def test_no_meta_plan_ever_falls_below_the_minimum_daily_spend():
+    """₦2,000/day is the point below which spending is not worth doing — stricter than
+    Meta's own ₦1,610 floor, and the reason a small budget runs shorter."""
+    for budget in (3_000, 5_000, 7_500, 10_000, 15_000, 20_000, 50_000):
+        assert budget / _days_for(budget) >= C.MIN_DAILY_SPEND_NGN, budget
+
+
+def test_a_large_budget_still_gets_the_full_run():
+    # ₦20,000+ would work out longer than a week at ₦2,500/day; the cap holds.
     assert _days_for(20_000) == C.MAX_CAMPAIGN_DAYS
+    assert _days_for(100_000) == C.MAX_CAMPAIGN_DAYS
 
 
 def test_every_runnable_budget_produces_a_deliverable_daily_budget():

@@ -73,14 +73,26 @@ def _placement_of(targeting: dict) -> str:
 
 def _daily_floor_for(platform: Optional[PlatformPlan]) -> float:
     """The real daily-spend floor for whichever platform this plan is on — was
-    hardcoded to Meta's ₦1,610 everywhere in this module (both the help text and,
-    more seriously, the budget/duration validation itself), which is wrong for
-    TikTok's real ₦31,000 floor. C.HARD_FLOOR_DAILY_NGN already carries every
-    platform's real number; this just looks it up by the plan's own platform
-    instead of assuming Meta."""
+    hardcoded to Meta's own floor everywhere in this module (both the help text
+    and, more seriously, the budget/duration/daily-spend validation itself),
+    which is wrong for TikTok's real ₦31,000 floor.
+
+    Mirrors decision_engine.py's own _days_for exactly, so this module and the
+    decision engine can never disagree about what "too thin to run" means for a
+    given platform: Meta uses MIN_DAILY_SPEND_NGN (₦2,000 — Jane's own quality
+    floor, deliberately above Meta's raw ₦1,610 platform floor, since a campaign
+    sitting on the platform minimum delivers too thinly to learn anything); every
+    other platform uses its own real HARD_FLOOR_DAILY_NGN, since Jane has no
+    equivalent quality-floor policy defined for TikTok/Google yet and TikTok's
+    real floor (₦31,000) is already far above any reasonable quality floor
+    anyway. Google's is 0 (CPC-driven, no hard floor) — deliberately preserved
+    as 0 here rather than falling back to Meta's number, so a Google-only plan's
+    budget/days validation stays unconstrained, matching decision_engine.py."""
     if not platform:
-        return C.META_MIN_DAILY_NGN
-    return C.HARD_FLOOR_DAILY_NGN.get(platform.platform.value, C.META_MIN_DAILY_NGN)
+        return C.MIN_DAILY_SPEND_NGN
+    if platform.platform == Platform.META:
+        return max(C.HARD_FLOOR_DAILY_NGN.get("meta", 0), C.MIN_DAILY_SPEND_NGN)
+    return C.HARD_FLOOR_DAILY_NGN.get(platform.platform.value, C.MIN_DAILY_SPEND_NGN)
 
 
 def _interest_names(targeting: dict) -> list[str]:
@@ -203,15 +215,17 @@ def describe(plan: CampaignPlan, req: CampaignRequest) -> list[dict[str, Any]]:
             "value": (platform.days if platform else 0),
             "min": 1, "max": 90, "editable": True,
             "help": "However long you want — Jane's default is only a starting point. "
-                    f"Shorter means more spend per day, which is how a small budget "
-                    f"clears {platform_name}'s daily minimum.",
+                    f"Shorter means more spend per day, and the daily figure cannot go "
+                    f"below ₦{floor:,.0f} on {platform_name}.",
         },
         {
-            "key": "daily_spend", "label": "Daily spend", "type": "derived",
+            "key": "daily_spend", "label": "Daily spend", "type": "number",
             "value": round(req.budget_ngn / platform.days, 2) if platform and platform.days else None,
-            "editable": False, "prefix": "₦",
-            "help": f"Budget divided by duration. {platform_name} refuses anything under "
-                    f"₦{floor:,.0f} a day — change either of those to move it.",
+            "min": floor, "editable": True, "prefix": "₦",
+            "help": f"How much goes out each day. At least ₦{floor:,.0f} on {platform_name} — "
+                    f"below that an ad delivers too thinly to learn anything (or, on TikTok, "
+                    f"is under the platform's own floor). Setting this changes how many days "
+                    f"the budget lasts.",
         },
         {
             "key": "destination", "label": "Where taps go", "type": "derived",
@@ -457,22 +471,41 @@ async def apply_edits(
                 targeting["age_min"], targeting["age_max"] = lo, hi
                 applied += [k for k in ("age_min", "age_max") if k in edits]
 
-    # ── budget and duration ───────────────────────────────────────────────────
+    # ── budget, duration and daily spend ────────────────────────────────────────
     # Judged TOGETHER, because what the platform actually rejects is the daily
-    # figure they produce between them. Halving the duration is a valid way to
-    # clear the floor, so validating either one alone would refuse edits that are
-    # in fact fine — and would let a legal-looking pair through that the launch
-    # then fails on ("Budget is too low", subcode 1885272 on Meta).
+    # figure they produce between them. Halving the duration (or raising the daily
+    # spend directly) is a valid way to clear the floor, so validating any one of
+    # the three alone would refuse edits that are in fact fine — and would let a
+    # legal-looking combination through that the launch then fails on ("Budget is
+    # too low", subcode 1885272 on Meta).
     #
-    # Live-caught 2026-09-23: this floor was hardcoded to C.META_MIN_DAILY_NGN
-    # (₦1,610) regardless of platform — a TikTok edit could pass this check at,
-    # say, ₦5,000/day and then fail for real at TikTok launch, which is under its
-    # real ₦31,000 floor. Now looked up per the plan's own platform.
-    if {"budget_ngn", "days"} & edits.keys():
+    # Live-caught 2026-09-23: the floor here was hardcoded to a single constant
+    # regardless of platform (first C.META_MIN_DAILY_NGN, then, when daily_spend
+    # became directly editable in the same window, C.MIN_DAILY_SPEND_NGN) — a
+    # TikTok edit could pass this check well under TikTok's real ₦31,000 floor and
+    # then fail for real at launch. Now looked up per the plan's own platform via
+    # _daily_floor_for, which mirrors decision_engine.py's own logic exactly:
+    # Meta uses the ₦2,000 product-quality floor, TikTok its real ₦31,000 floor.
+    if {"budget_ngn", "days", "daily_spend"} & edits.keys():
         current_days = plan.platforms[0].days if plan.platforms else C.DEFAULT_CAMPAIGN_DAYS
         budget = _as_float(edits["budget_ngn"]) if "budget_ngn" in edits else req.budget_ngn
         days = _as_int(edits["days"]) if "days" in edits else current_days
         floor = _daily_floor_for(platform)
+
+        # Setting the daily spend decides the DURATION, not the budget: the budget is
+        # what the client agreed to pay and is not ours to move on their behalf. An
+        # explicit `days` in the same save wins, since they said it outright.
+        daily_accepted = False
+        if "daily_spend" in edits and "days" not in edits:
+            daily = _as_float(edits["daily_spend"])
+            if daily is None or daily < floor:
+                rejections.append(
+                    f"Daily spend must be at least ₦{floor:,.0f} on {platform_name} — below "
+                    f"that an ad delivers too thinly to learn anything."
+                )
+            elif budget is not None and budget > 0:
+                days = max(1, round(budget / daily))
+                daily_accepted = True
 
         if "budget_ngn" in edits and (budget is None or budget <= 0):
             rejections.append("Budget must be a number greater than zero.")
@@ -484,12 +517,13 @@ async def apply_edits(
             )
         elif budget is None or days is None:
             rejections.append("Budget and duration must both be numbers.")
-        elif budget / days < floor:
+        elif floor > 0 and budget / days < floor:
             longest = int(budget // floor)
             rejections.append(
                 f"₦{budget:,.0f} over {days} days is ₦{budget / days:,.0f} a day, under "
-                f"{platform_name}'s ₦{floor:,.0f} minimum — {platform_name} refuses the "
-                "campaign outright. "
+                f"{platform_name}'s ₦{floor:,.0f} minimum — an ad spending less than that "
+                "either delivers too thinly to learn anything or is under the platform's own "
+                "floor. "
                 + (f"Run it over {longest} days or fewer, or raise the budget."
                    if longest >= 1 else
                    f"You would need at least ₦{floor:,.0f} for a single day.")
@@ -500,6 +534,8 @@ async def apply_edits(
                 applied.append("budget_ngn")
             if "days" in edits:
                 applied.append("days")
+            if daily_accepted:
+                applied.append("daily_spend")
             if plan.platforms:
                 plan_update["platforms"] = [
                     plan.platforms[0].model_copy(update={"budget_ngn": budget, "days": days}),
