@@ -850,6 +850,60 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                 updated[label] = bool(data.get("success"))
         return {"status": status, "updated": updated}
 
+    async def fetch_adset_schedule(self, campaign_id: str) -> dict:
+        """When this campaign runs and what it spends a day — read fresh from Meta.
+
+        `daily_budget` comes back in kobo, like every other Meta money field.
+        """
+        record = await self._get_campaign_record(campaign_id)
+        adset_id = record.get("adset_id")
+        if not adset_id:
+            raise MetaAPIError(f"campaign {campaign_id} has no ad set recorded")
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(
+                f"{self._graph_base}/{adset_id}",
+                params={"access_token": self._access_token,
+                        "fields": "id,status,effective_status,daily_budget,lifetime_budget,"
+                                  "start_time,end_time"},
+            )
+            data = resp.json()
+            _raise_for_error(data, "adset schedule read")
+        return {
+            "adset_id": adset_id,
+            "ad_id": record.get("ad_id", ""),
+            "status": data.get("status"),
+            "effective_status": data.get("effective_status"),
+            "daily_ngn": round(float(data.get("daily_budget") or 0) / 100, 2),
+            "lifetime_ngn": round(float(data.get("lifetime_budget") or 0) / 100, 2),
+            "start_time": data.get("start_time"),
+            "end_time": data.get("end_time"),
+        }
+
+    async def extend_adset(self, adset_id: str, new_end_time: datetime) -> dict:
+        """Push an ad set's end date out, then READ IT BACK.
+
+        Meta answering 200 means accepted, not applied, so the caller is told what Meta
+        actually holds afterwards — the same rule the targeting editor follows. This is
+        the whole mechanism behind "keep it running": an ad set that has already ended
+        resumes delivering once its end_time is in the future again, keeping the
+        campaign id, the creative and everything Meta has learned about who responds.
+        """
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"{self._graph_base}/{adset_id}",
+                params={"access_token": self._access_token},
+                json={"end_time": new_end_time.isoformat()},
+            )
+            data = resp.json()
+            _raise_for_error(data, "adset extend")
+            confirm = await client.get(
+                f"{self._graph_base}/{adset_id}",
+                params={"access_token": self._access_token, "fields": "id,end_time"},
+            )
+            confirmed = confirm.json()
+            _raise_for_error(confirmed, "adset extend readback")
+        return {"end_time": confirmed.get("end_time")}
+
     async def fetch_adset_targeting(self, campaign_id: str) -> dict:
         """The ad set's CURRENT targeting, read fresh from Meta.
 
