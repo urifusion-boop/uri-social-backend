@@ -110,7 +110,19 @@ def budget_tier_for(total_budget_ngn: float) -> str:
 
 
 def _days_for(total_budget: float, platforms: list[Platform] | None = None) -> int:
-    if total_budget >= C.AB_FULL_TEST_NGN:
+    plats_for_days = platforms or [Platform.META]
+    if Platform.META in plats_for_days:
+        # Aim for DEFAULT_DAILY_SPEND_NGN a day and let that decide the length, rather
+        # than picking a duration by budget tier and discovering the daily figure
+        # afterwards. On Meta the daily number is what governs whether an ad delivers
+        # at all, so it is the one worth choosing deliberately.
+        days = min(max(1, round(total_budget / C.DEFAULT_DAILY_SPEND_NGN)),
+                   C.MAX_CAMPAIGN_DAYS)
+        if total_budget >= C.AB_FULL_TEST_NGN:
+            days = C.MAX_CAMPAIGN_DAYS
+    elif total_budget >= C.AB_FULL_TEST_NGN:
+        # Google is CPC-driven with no daily floor, so a Meta-shaped daily target has
+        # no meaning there — those plans keep the budget-tier duration.
         days = C.MAX_CAMPAIGN_DAYS
     elif total_budget <= C.USEFUL_MIN_NGN["meta"]:
         days = C.MIN_CAMPAIGN_DAYS
@@ -131,7 +143,12 @@ def _days_for(total_budget: float, platforms: list[Platform] | None = None) -> i
     # useful-minimum gate had already said yes.
     plats = platforms or [Platform.META]
     per_platform_budget = total_budget / len(plats)
-    floors = [f for f in (C.HARD_FLOOR_DAILY_NGN.get(p.value, C.META_MIN_DAILY_NGN) for p in plats) if f > 0]
+    # MIN_DAILY_SPEND_NGN, not Meta's raw floor: the product minimum is the stricter of
+    # the two, and shortening the run to honour it is exactly how a small budget stays
+    # deliverable.
+    floors = [f for f in (max(C.HARD_FLOOR_DAILY_NGN.get(p.value, 0), C.MIN_DAILY_SPEND_NGN)
+                          if p == Platform.META else C.HARD_FLOOR_DAILY_NGN.get(p.value, 0)
+                          for p in plats) if f > 0]
     # Google's floor is 0 (CPC-driven, no hard floor per constants.py) — a plan of
     # only such platforms has nothing here to shorten against.
     max_days = int(per_platform_budget // max(floors)) if floors else days
