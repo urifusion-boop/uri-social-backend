@@ -47,10 +47,19 @@ def quote(daily_ngn: float, days: int, markup: float) -> dict:
         raise ExtendError(
             f"Choose between {MIN_EXTEND_DAYS} and {MAX_EXTEND_DAYS} more days."
         )
-    if daily_ngn < C.MIN_DAILY_SPEND_NGN:
+    # Meta's OWN floor, not the ₦2,000 product minimum.
+    #
+    # ₦2,000 governs what a client may SET on a new plan. Applying it here would mean a
+    # campaign launched before that rule existed — ₦1,800/day, running happily — could
+    # never be continued, which punishes exactly the long-running campaigns this
+    # feature is for. Live-caught against a real ad set. Continuing an ad Meta is
+    # already delivering is not the moment to enforce a rule about new ones; the only
+    # question that matters here is whether Meta will keep serving it.
+    if daily_ngn < C.META_MIN_DAILY_NGN:
         raise ExtendError(
-            f"This campaign spends ₦{daily_ngn:,.0f} a day, under the "
-            f"₦{C.MIN_DAILY_SPEND_NGN:,.0f} minimum — it cannot be extended as it is."
+            f"This campaign spends ₦{daily_ngn:,.0f} a day, under Meta's "
+            f"₦{C.META_MIN_DAILY_NGN:,.0f} floor — Meta will not deliver it. "
+            f"Start a new campaign instead."
         )
     ad_spend = round(daily_ngn * days, 2)
     return {

@@ -42,11 +42,20 @@ def test_an_absurd_length_is_refused():
         quote(2500, MAX_EXTEND_DAYS + 1, 1.1)
 
 
-def test_a_campaign_below_the_daily_minimum_cannot_be_extended_as_is():
-    """Extending must not be a way around the floor a fresh plan has to clear."""
+def test_a_campaign_predating_the_new_minimum_can_still_be_extended():
+    """Live-caught: a real ad set runs ₦1,800/day, launched before the ₦2,000 minimum
+    existed. Refusing to continue it would punish exactly the long-running campaigns
+    this feature is for — ₦2,000 governs what may be SET on a new plan, not whether an
+    ad Meta is already delivering may carry on."""
+    q = quote(daily_ngn=1800, days=3, markup=1.1)
+    assert q["ad_spend_ngn"] == 5400
+
+
+def test_a_campaign_meta_will_not_deliver_cannot_be_extended():
+    """Below Meta's own floor there is nothing to continue — Meta refuses the ad set."""
     with pytest.raises(ExtendError) as e:
-        quote(daily_ngn=1500, days=7, markup=1.1)
-    assert "minimum" in str(e.value)
+        quote(daily_ngn=1000, days=7, markup=1.1)
+    assert "floor" in str(e.value)
 
 
 # ── Where the new end date lands ──────────────────────────────────────────────
@@ -215,3 +224,24 @@ def test_the_extension_is_recorded_on_the_campaign(monkeypatch):
     update = db.c.updates[0]
     assert update["$inc"]["charged_upfront_ngn"] == 13750.0
     assert update["$push"]["extensions"]["days"] == 5
+
+
+def test_a_deleted_campaign_says_what_to_do_instead(monkeypatch):
+    """Meta refuses to edit a deleted ad set at all (subcode 1487056) — only its name.
+    Live-caught. There is nothing to continue, so the client is told to start a new
+    campaign rather than shown a raw platform error."""
+    from app.agents.jane_ads.adapters.meta import MetaAPIError
+    from app.agents.jane_ads.router import ExtendBody, extend_campaign
+
+    class _Deleted(_Adapter):
+        async def extend_adset(self, adset_id, ends_at):
+            raise MetaAPIError("adset extend: Deleted ad sets can't be edited (code=100, subcode=1487056)")
+
+    adapter, wallet = _Deleted(), _Wallet()
+    _patch(monkeypatch, adapter, wallet)
+    with pytest.raises(HTTPException) as e:
+        _run(extend_campaign("c1", ExtendBody(days=3, confirm=True),
+                             db=_Db(_record()), brand_ctx={"brand_id": "b1"}))
+    assert e.value.status_code == 409
+    assert "deleted" in e.value.detail.lower()
+    assert wallet.charges == []
