@@ -179,6 +179,26 @@ def _force_tiktok_video_ratio(video_url: str) -> str:
     return video_url[:insert_at] + "c_fill,ar_9:16,g_auto/" + video_url[insert_at:]
 
 
+def _video_thumbnail_url(video_url: str) -> str:
+    """Live-caught 2026-09-23: TikTok video campaigns showed no thumbnail at all in
+    Jane's own Campaign Manager list (unlike carousel/Meta cards, which render
+    fine) — router.py's campaign-record write stores plan.creative.image_url
+    verbatim as the display image_url, but for a video ad that field IS the raw
+    .mp4 URL, and a plain <img> tag silently renders nothing for a video file.
+    Cloudinary can derive a JPG poster frame straight from a hosted video by
+    requesting the exact same delivery URL with its extension swapped to .jpg —
+    no separate upload, no extra API call, same "delivery-URL trick" pattern as
+    _force_jpg_delivery/_force_tiktok_video_ratio above. A no-op, unchanged URL
+    for anything not hosted on Cloudinary or with no file extension to swap."""
+    if "/video/upload/" not in video_url:
+        return video_url
+    head, slash, last_segment = video_url.rpartition("/")
+    if not slash or "." not in last_segment:
+        return video_url
+    stem, _, _ext = last_segment.rpartition(".")
+    return f"{head}/{stem}.jpg"
+
+
 class TikTokAdsAdapter(AdPlatformAdapter):
     """One instance per request/job. advertiser_id/access_token are ALWAYS
     caller-supplied (never read from settings inside this class) — Phase 1 callers

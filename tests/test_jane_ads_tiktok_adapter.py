@@ -19,6 +19,7 @@ from app.agents.jane_ads.adapters.tiktok import (
     TikTokAdsAPIError,
     _force_jpg_delivery,
     _force_tiktok_video_ratio,
+    _video_thumbnail_url,
 )
 from app.agents.jane_ads.models import (
     ABTestScope,
@@ -334,6 +335,21 @@ def test_force_tiktok_video_ratio_is_a_noop_on_non_cloudinary_urls():
     # Must never raise or mangle a URL shape it doesn't recognise.
     assert _force_tiktok_video_ratio("https://cdn.example.com/clip.mp4") == "https://cdn.example.com/clip.mp4"
     assert _force_tiktok_video_ratio("") == ""
+
+
+def test_video_thumbnail_url_swaps_extension_to_jpg_on_cloudinary_urls():
+    assert _video_thumbnail_url("https://res.cloudinary.com/demo/video/upload/v1/uri-ads/clip.mp4") == (
+        "https://res.cloudinary.com/demo/video/upload/v1/uri-ads/clip.jpg"
+    )
+
+
+def test_video_thumbnail_url_is_a_noop_on_non_cloudinary_or_extensionless_urls():
+    # Must never raise or mangle a URL shape it doesn't recognise.
+    assert _video_thumbnail_url("https://cdn.example.com/clip.mp4") == "https://cdn.example.com/clip.mp4"
+    assert _video_thumbnail_url("https://res.cloudinary.com/demo/video/upload/v1/uri-ads/clip") == (
+        "https://res.cloudinary.com/demo/video/upload/v1/uri-ads/clip"
+    )
+    assert _video_thumbnail_url("") == ""
 
 
 def test_launch_campaign_forces_tiktok_ratio_on_cloudinary_video():

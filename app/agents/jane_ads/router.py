@@ -2937,7 +2937,7 @@ async def _do_launch(built: _PlanBuildResult, body_message: str, body_business_n
     credentials are configured (see the forcing logic in _build_campaign_plan)."""
     from app.core.config import settings
     from .adapters.meta import MetaAdPlatformAdapter, MetaAPIError
-    from .adapters.tiktok import TikTokAdsAdapter, TikTokAdsAPIError
+    from .adapters.tiktok import TikTokAdsAdapter, TikTokAdsAPIError, _video_thumbnail_url
     from .wallet import WalletService
     from .store import MongoWalletStore
 
@@ -2962,6 +2962,15 @@ async def _do_launch(built: _PlanBuildResult, body_message: str, body_business_n
         raise HTTPException(status_code=400, detail=str(e))
 
     campaign_collection = "jane_ads_tiktok_campaigns" if is_tiktok else "jane_ads_meta_campaigns"
+    # TikTok-only (see _video_thumbnail_url docstring): for a video ad,
+    # plan.creative.image_url IS the raw .mp4 URL, which the campaign list's
+    # plain <img> tag can't render — swap in a Cloudinary-derived poster frame
+    # for display only, purely additive, leaves Meta's own image_url untouched.
+    display_image_url = (
+        _video_thumbnail_url(plan.creative.image_url)
+        if is_tiktok and plan.creative.is_video
+        else plan.creative.image_url
+    )
     # Enrich the stored campaign record with display fields so the campaign-list
     # view can render name/creative/budget without re-deriving them.
     await db[campaign_collection].update_one(
@@ -2973,7 +2982,7 @@ async def _do_launch(built: _PlanBuildResult, body_message: str, body_business_n
             "category": req.category,
             "headline": plan.creative.headline,
             "primary_text": plan.creative.primary_text,
-            "image_url": plan.creative.image_url,
+            "image_url": display_image_url,
             "budget_ngn": req.budget_ngn,
             "goal": plan.goal.value,
             "city": req.geo,
