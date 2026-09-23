@@ -4073,6 +4073,15 @@ async def extend_campaign(
     try:
         confirmed = await adapter.extend_adset(sched["adset_id"], ends_at)
     except MetaAPIError as e:
+        # A deleted/archived ad set cannot be edited at all (subcode 1487056) — Meta
+        # says only the name may change. There is nothing to continue, so say what to
+        # do instead rather than surfacing a raw platform error. Live-caught.
+        if "1487056" in str(e) or "deleted" in str(e).lower():
+            raise HTTPException(
+                status_code=409,
+                detail="This campaign has been deleted on Meta, so it cannot be "
+                       "continued. Describe it to Jane again to run a new one.",
+            )
         raise HTTPException(status_code=502, detail=f"Meta did not accept the new end date: {e}")
 
     # Only now. Meta has confirmed the campaign runs longer, so the client is paying
