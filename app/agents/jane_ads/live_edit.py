@@ -61,6 +61,9 @@ def targeting_fingerprint(targeting: dict) -> str:
 # Meta files named places under one key per type, and each entry carries its own name.
 _GEO_NAME_FIELDS = ("neighborhoods", "subcities", "cities", "regions")
 
+# Only the markets Jane runs in; an unknown code falls back to the code itself.
+_COUNTRY_NAMES = {"NG": "Nigeria", "GH": "Ghana", "KE": "Kenya", "ZA": "South Africa"}
+
 
 def live_location_names(targeting: dict) -> list[str]:
     """The place names an ad set currently targets.
@@ -76,7 +79,13 @@ def live_location_names(targeting: dict) -> list[str]:
             name = (entry or {}).get("name")
             if name and name not in names:
                 names.append(name)
-    return names
+    if names:
+        return names
+    # Country targeting is a bare code list, not named entries. Reporting "—" for an
+    # ad set running across a whole country is the most misleading thing this panel
+    # could say: the client reads it as "nowhere" when it means "everywhere".
+    countries = geo.get("countries") or []
+    return [f"{_COUNTRY_NAMES.get(c, c)} (nationwide)" for c in countries]
 
 
 def describe_live(targeting: dict) -> list[dict[str, Any]]:

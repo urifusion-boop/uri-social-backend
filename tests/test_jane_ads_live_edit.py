@@ -255,3 +255,25 @@ def test_editing_interests_keeps_behaviours_and_life_events(monkeypatch):
     entry = targeting["flexible_spec"][0]
     assert [i["name"] for i in entry["interests"]] == ["Shoes"]
     assert entry["life_events"] == [{"id": "6003", "name": "Newly engaged (1 year)"}]
+
+
+def test_country_wide_targeting_is_named_not_shown_as_nothing():
+    """An ad set running across a whole country showed "—", which a client reads as
+    "nowhere" when it means "everywhere". Live-reported on a campaign that had fallen
+    back to countries:["NG"]."""
+    from app.agents.jane_ads.live_edit import live_location_names
+
+    assert live_location_names({"geo_locations": {"countries": ["NG"]}}) == ["Nigeria (nationwide)"]
+    shown = {f["key"]: f["value"] for f in describe_live({"geo_locations": {"countries": ["NG"]}})}
+    assert shown["locations"] == ["Nigeria (nationwide)"]
+
+
+def test_named_places_win_over_the_country_fallback():
+    """A country code sits alongside the named entries in Meta's payload; showing both
+    would imply the ad runs nationwide AND in one neighbourhood."""
+    from app.agents.jane_ads.live_edit import live_location_names
+
+    assert live_location_names({"geo_locations": {
+        "countries": ["NG"],
+        "neighborhoods": [{"key": "1", "name": "Surulere"}],
+    }}) == ["Surulere"]
