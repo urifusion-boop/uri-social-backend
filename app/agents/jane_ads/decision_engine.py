@@ -109,20 +109,49 @@ def budget_tier_for(total_budget_ngn: float) -> str:
     return "starter"
 
 
-def _days_for(total_budget: float) -> int:
-    if total_budget >= C.AB_FULL_TEST_NGN:
+def _days_for(total_budget: float, platforms: list[Platform] | None = None) -> int:
+    plats_for_days = platforms or [Platform.META]
+    if Platform.META in plats_for_days:
+        # Aim for DEFAULT_DAILY_SPEND_NGN a day and let that decide the length, rather
+        # than picking a duration by budget tier and discovering the daily figure
+        # afterwards. On Meta the daily number is what governs whether an ad delivers
+        # at all, so it is the one worth choosing deliberately.
+        days = min(max(1, round(total_budget / C.DEFAULT_DAILY_SPEND_NGN)),
+                   C.MAX_CAMPAIGN_DAYS)
+        if total_budget >= C.AB_FULL_TEST_NGN:
+            days = C.MAX_CAMPAIGN_DAYS
+    elif total_budget >= C.AB_FULL_TEST_NGN:
+        # Google is CPC-driven with no daily floor, so a Meta-shaped daily target has
+        # no meaning there — those plans keep the budget-tier duration.
         days = C.MAX_CAMPAIGN_DAYS
     elif total_budget <= C.USEFUL_MIN_NGN["meta"]:
         days = C.MIN_CAMPAIGN_DAYS
     else:
         days = C.DEFAULT_CAMPAIGN_DAYS
-    # Meta rejects an ad set whose daily budget (total ÷ days) is below its floor,
-    # so a small budget spread over the default number of days would fail to launch
-    # (e.g. ₦5,000 over 4 days = ₦1,250/day, under the ₦1,610 floor). Shorten the
-    # run so each day clears the floor — a delivered 3-day campaign beats a rejected
-    # 4-day one. Never below 1 day; the useful-minimum gate keeps total ≥ ₦5,000, so
-    # at least one day always clears.
-    max_days = int(total_budget // C.META_MIN_DAILY_NGN)
+    # Each platform rejects a budget/days split under its OWN real daily floor
+    # (HARD_FLOOR_DAILY_NGN) — Meta's ad set, TikTok's ad group (lifetime budget ÷
+    # days, per TikTok's own docs: min $20/day). Shorten the run so every funded
+    # platform's slice clears its own floor — a delivered short campaign beats a
+    # rejected long one. `platforms` defaults to [META] so the original, single
+    # call site's exact numbers are unchanged for any plan that doesn't pass this.
+    #
+    # This used to hard-code META_MIN_DAILY_NGN regardless of which platform(s) the
+    # plan actually funds. Harmless for Meta (same ₦1,610 value either way) but it
+    # silently let a TikTok-bound plan through with a lifetime budget far under
+    # TikTok's real ₦31,000/day floor — e.g. ₦45,000 over 7 days is ₦6,429/day,
+    # which TikTok's adgroup/create rejects live, well after Jane's own ₦50,000
+    # useful-minimum gate had already said yes.
+    plats = platforms or [Platform.META]
+    per_platform_budget = total_budget / len(plats)
+    # MIN_DAILY_SPEND_NGN, not Meta's raw floor: the product minimum is the stricter of
+    # the two, and shortening the run to honour it is exactly how a small budget stays
+    # deliverable.
+    floors = [f for f in (max(C.HARD_FLOOR_DAILY_NGN.get(p.value, 0), C.MIN_DAILY_SPEND_NGN)
+                          if p == Platform.META else C.HARD_FLOOR_DAILY_NGN.get(p.value, 0)
+                          for p in plats) if f > 0]
+    # Google's floor is 0 (CPC-driven, no hard floor per constants.py) — a plan of
+    # only such platforms has nothing here to shorten against.
+    max_days = int(per_platform_budget // max(floors)) if floors else days
     return max(1, min(days, max_days))
 
 
