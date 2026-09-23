@@ -42,6 +42,14 @@ TIKTOK_REQUIRES_VIDEO: bool = True
 # FB hard floor already noted in HARD_FLOOR_DAILY_NGN.
 META_MIN_DAILY_NGN: float = 1_610.0
 
+# What a CLIENT may set as their daily spend, and what Jane aims for when she picks a
+# duration herself. Deliberately above Meta's own ₦1,610 floor: a campaign sitting on
+# the platform minimum delivers so thinly that it teaches the client nothing and burns
+# the budget learning. The floor is the point below which Meta refuses; this is the
+# point below which spending is not worth doing.
+MIN_DAILY_SPEND_NGN: float = 2_000.0
+DEFAULT_DAILY_SPEND_NGN: float = 2_500.0
+
 # ── Campaign duration (PRD C: 4–7 days) ──────────────────────────────────────
 MIN_CAMPAIGN_DAYS: int = 4
 MAX_CAMPAIGN_DAYS: int = 7
