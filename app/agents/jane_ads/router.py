@@ -4080,6 +4080,156 @@ class CampaignStatusBody(BaseModel):
     active: bool
 
 
+class ExtendBody(BaseModel):
+    days: int = 7
+    # Extending an ad set that has already ended resumes SPENDING. Never implied.
+    confirm: bool = False
+
+
+@router.get("/meta/campaigns/{campaign_id}/extend-quote")
+async def extend_quote(
+    campaign_id: str,
+    days: int = 7,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """What keeping this campaign running would cost — before anything is charged."""
+    from app.core.config import settings
+
+    from .adapters.meta import MetaAdPlatformAdapter, MetaAPIError
+    from .extend import ExtendError, new_end_time, quote
+    from .store import MongoWalletStore
+    from .wallet import WalletService
+
+    brand_id = brand_ctx.get("brand_id")
+    record = await db["jane_ads_meta_campaigns"].find_one({"campaign_id": campaign_id})
+    if not record or record.get("brand_id") != brand_id:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    adapter = MetaAdPlatformAdapter(db, access_token=settings.META_ADS_ACCESS_TOKEN)
+    try:
+        sched = await adapter.fetch_adset_schedule(campaign_id)
+    except MetaAPIError as e:
+        raise HTTPException(status_code=502, detail=f"Could not read the campaign from Meta: {e}")
+
+    markup = float(record.get("ad_spend_markup") or C.LEGACY_AD_SPEND_MARKUP)
+    try:
+        q = quote(sched["daily_ngn"], days, markup)
+    except ExtendError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    balance = await WalletService(MongoWalletStore(db)).get_balance(record["business_id"])
+    return {
+        **q,
+        "campaign_id": campaign_id,
+        "current_end_time": sched["end_time"],
+        "new_end_time": new_end_time(sched["end_time"], days).isoformat(),
+        "has_ended": (sched.get("effective_status") or "").upper() in
+                     ("CAMPAIGN_PAUSED", "ADSET_PAUSED", "PAUSED", "COMPLETED"),
+        "wallet_balance_ngn": balance,
+        "affordable": balance >= q["total_due_ngn"],
+    }
+
+
+@router.post("/meta/campaigns/{campaign_id}/extend")
+async def extend_campaign(
+    campaign_id: str,
+    body: ExtendBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Keep a campaign running past the date it was set to end.
+
+    Keeps the campaign id, the ad set, the creative and everything Meta has learned
+    about who responds — only the end date moves. Starting a replacement campaign
+    instead throws that learning away, which is worst for exactly the campaigns worth
+    continuing.
+
+    Order matters and mirrors the launch: the wallet is checked first so the common
+    failure is a clean refusal, Meta is extended next, and the client is charged only
+    once Meta has confirmed the new end date. Nobody pays for delivery they did not get.
+    """
+    from datetime import datetime, timezone
+
+    from app.core.config import settings
+
+    from .adapters.meta import MetaAdPlatformAdapter, MetaAPIError
+    from .extend import ExtendError, new_end_time, quote
+    from .store import MongoWalletStore
+    from .wallet import InsufficientFundsError, WalletService
+
+    brand_id = brand_ctx.get("brand_id")
+    record = await db["jane_ads_meta_campaigns"].find_one({"campaign_id": campaign_id})
+    if not record or record.get("brand_id") != brand_id:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if not body.confirm:
+        raise HTTPException(
+            status_code=400,
+            detail="Extending restarts spending on this campaign — confirm to go ahead.",
+        )
+
+    adapter = MetaAdPlatformAdapter(db, access_token=settings.META_ADS_ACCESS_TOKEN)
+    wallet = WalletService(MongoWalletStore(db))
+    try:
+        sched = await adapter.fetch_adset_schedule(campaign_id)
+    except MetaAPIError as e:
+        raise HTTPException(status_code=502, detail=f"Could not read the campaign from Meta: {e}")
+
+    markup = float(record.get("ad_spend_markup") or C.LEGACY_AD_SPEND_MARKUP)
+    try:
+        q = quote(sched["daily_ngn"], body.days, markup)
+    except ExtendError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    balance = await wallet.get_balance(record["business_id"])
+    if balance < q["total_due_ngn"]:
+        raise HTTPException(
+            status_code=402,
+            detail=f"₦{q['total_due_ngn']:,.0f} needed to run {body.days} more day(s) at "
+                   f"₦{q['daily_ngn']:,.0f}/day — your wallet has ₦{balance:,.0f}. Top up first.",
+        )
+
+    ends_at = new_end_time(sched["end_time"], body.days)
+    try:
+        confirmed = await adapter.extend_adset(sched["adset_id"], ends_at)
+    except MetaAPIError as e:
+        raise HTTPException(status_code=502, detail=f"Meta did not accept the new end date: {e}")
+
+    # Only now. Meta has confirmed the campaign runs longer, so the client is paying
+    # for delivery that exists.
+    try:
+        await wallet.charge_ad_spend(record["business_id"], q["total_due_ngn"],
+                                     campaign_id=campaign_id)
+    except InsufficientFundsError:
+        # The balance moved between the check and here. The campaign IS extended, so
+        # say so plainly rather than pretending nothing happened — the alternative is
+        # a client who sees delivery they were never billed for and cannot explain.
+        raise HTTPException(
+            status_code=402,
+            detail="The campaign was extended but your wallet could not cover it — "
+                   "top up now, or pause the campaign to stop it spending.",
+        )
+
+    await db["jane_ads_meta_campaigns"].update_one(
+        {"campaign_id": campaign_id},
+        {"$inc": {"charged_upfront_ngn": q["total_due_ngn"]},
+         "$push": {"extensions": {
+             "days": body.days, "daily_ngn": q["daily_ngn"],
+             "charged_ngn": q["total_due_ngn"], "new_end_time": ends_at.isoformat(),
+             "at": datetime.now(timezone.utc),
+         }}},
+    )
+    return {
+        "campaign_id": campaign_id,
+        "extended_by_days": body.days,
+        "charged_ngn": q["total_due_ngn"],
+        "end_time": confirmed.get("end_time"),
+        "wallet_balance_ngn": await wallet.get_balance(record["business_id"]),
+        "note": "Same campaign, same creative — it keeps everything Meta has learned. "
+                "It runs until this date unless you pause it.",
+    }
+
+
 class LiveTargetingBody(BaseModel):
     edits: dict = Field(default_factory=dict)
     # The fingerprint of the targeting the client was looking at. A mismatch means
