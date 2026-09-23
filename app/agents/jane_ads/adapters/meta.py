@@ -439,6 +439,41 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                     )
                     adset_data = adset_resp.json()
 
+                # Named areas carry their REAL boundaries, which are far smaller than
+                # the radius pins they replaced — a named neighbourhood estimates
+                # thousands where a 2km pin estimated hundreds of thousands. Three of
+                # those plus a detailed interest list can leave an audience Meta simply
+                # refuses to serve: "The configured audience is not valid — Broaden your
+                # audience" (code=100, subcode=2446395). Live-reported on a plan for
+                # Opebi + Allen Avenue + Ogba that estimated a reach of 1,000.
+                #
+                # Widen one rung at a time and re-ask, rather than failing the launch or
+                # jumping straight to nationwide. The campaign then lands at the tightest
+                # geography Meta will actually deliver to, which is the honest answer to
+                # "where should this run" — and each attempt builds a NEW payload, since
+                # httpx holds a reference to what was already sent.
+                widened_to = ""
+                while (adset_data.get("error") or {}).get("error_subcode") == 2446395:
+                    from ..geo import widen_targeting
+
+                    broader = await widen_targeting(
+                        adset_payload["targeting"],
+                        (plan.geo.city if plan.geo else ""),
+                        self._access_token,
+                    )
+                    if broader is None:
+                        break
+                    widened_to = json.dumps(broader.get("geo_locations"))
+                    print(f"[MetaAds] audience too narrow to deliver — widening to {widened_to}",
+                          flush=True)
+                    adset_payload = {**adset_payload, "targeting": broader}
+                    adset_resp = await client.post(
+                        f"{self._graph_base}/act_{self._ad_account_id}/adsets",
+                        params={"access_token": self._access_token},
+                        json=adset_payload,
+                    )
+                    adset_data = adset_resp.json()
+
                 _raise_for_error(adset_data, "ad set creation")
                 adset_id = adset_data["id"]
 

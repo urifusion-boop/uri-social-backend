@@ -871,3 +871,67 @@ def test_a_city_is_resolved_to_its_state_before_pockets_are_matched(monkeypatch)
     assert seen["guards"] == ["Lagos State", "Lagos State"]   # the STATE guarded
     assert geo_locations["neighborhoods"] == [{"key": "k_Opebi"}, {"key": "k_Alausa"}]
     assert "countries" not in geo_locations         # never silently nationwide
+
+
+# ── An audience Meta will not deliver to ──────────────────────────────────────
+
+def test_a_too_narrow_audience_widens_instead_of_failing_the_launch(monkeypatch):
+    """Live-reported: Opebi + Allen Avenue + Ogba as NAMED neighbourhoods estimated a
+    reach of 1,000 and Meta refused the ad set outright (subcode 2446395). Named areas
+    carry their real boundaries, far smaller than the radius pins they replaced."""
+    async def _region_for(place, access_token="", timeout=8.0):
+        return "Lagos State"
+
+    async def _resolve(name, expected_region, access_token="", timeout=8.0):
+        kind = "city" if name == "Ikeja" else "neighborhood"
+        return {"type": kind, "key": f"k_{name}", "name": name, "region": "Lagos State"}
+
+    monkeypatch.setattr("app.agents.jane_ads.geo_names.region_for", _region_for)
+    monkeypatch.setattr("app.agents.jane_ads.geo_names.resolve_named_location", _resolve)
+
+    geo = GeoPlan(mode=GeoMode.OWN_RADIUS, city="Ikeja",
+                  pins=[GeoPin(name="Opebi"), GeoPin(name="Ogba")])
+    too_narrow = {"error": {"code": 100, "error_subcode": 2446395,
+                            "message": "The configured audience is not valid"}}
+    responses = [{"id": "cmp_1"}, too_narrow, {"id": "adset_1"},
+                 {"id": "creative_1"}, {"id": "ad_1"}]
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client(responses)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        out = _run(_adapter().launch_campaign(_plan(geo=geo), _auth()))
+
+    assert out.campaign_id == "cmp_1"          # the launch SUCCEEDS
+    first = mock_client.post.call_args_list[1].kwargs["json"]["targeting"]["geo_locations"]
+    second = mock_client.post.call_args_list[2].kwargs["json"]["targeting"]["geo_locations"]
+    assert "neighborhoods" in first            # tried the tight pockets first
+    assert second == {"cities": [{"key": "k_Ikeja"}]}   # widened one rung, not to NG
+
+
+def test_widening_keeps_everything_that_is_not_geography(monkeypatch):
+    """Only the geography widens. Losing the interests or the age range while chasing
+    reach would change the audience the client actually approved."""
+    from app.agents.jane_ads.geo import widen_targeting
+
+    async def _region_for(place, access_token="", timeout=8.0):
+        return "Lagos State"
+
+    async def _resolve(name, expected_region, access_token="", timeout=8.0):
+        return {"type": "city", "key": "k_city", "name": name, "region": "Lagos State"}
+
+    monkeypatch.setattr("app.agents.jane_ads.geo_names.region_for", _region_for)
+    monkeypatch.setattr("app.agents.jane_ads.geo_names.resolve_named_location", _resolve)
+    out = _run(widen_targeting(
+        {"geo_locations": {"neighborhoods": [{"key": "1"}]},
+         "age_min": 25, "genders": [2], "flexible_spec": [{"interests": [{"id": "9"}]}]},
+        "Ikeja"))
+    assert out["age_min"] == 25
+    assert out["genders"] == [2]
+    assert out["flexible_spec"] == [{"interests": [{"id": "9"}]}]
+    assert out["geo_locations"] == {"cities": [{"key": "k_city"}]}
+
+
+def test_widening_stops_at_the_country(monkeypatch):
+    """Nothing is broader than nationwide, so it must give up rather than loop."""
+    from app.agents.jane_ads.geo import widen_targeting
+
+    assert _run(widen_targeting({"geo_locations": {"countries": ["NG"]}}, "Ikeja")) is None

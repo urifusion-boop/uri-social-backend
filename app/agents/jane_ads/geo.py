@@ -493,3 +493,51 @@ def _explain(mode: GeoMode, city: str, pins: list[GeoPin]) -> str:
     return (f"I'm pinning {names} in {city} — {lead}. "
             f"Tight pins like these concentrate your budget on the people who matter "
             f"instead of the whole {city}.")
+
+
+async def widen_targeting(targeting: dict, city: str, access_token: str = "") -> Optional[dict]:
+    """The next-broader geography for an audience Meta refuses to deliver to.
+
+    Named areas carry their real boundaries, which are far smaller than the radius pins
+    they replaced — a named neighbourhood estimates thousands where a 2km pin estimated
+    hundreds of thousands. Stack three of those against a detailed interest list and
+    Meta rejects the ad set outright: "The configured audience is not valid — Broaden
+    your audience" (code=100, subcode=2446395). Live-reported.
+
+    Widens one rung at a time — neighbourhoods/subcities give way to the city, the city
+    to its state, the state to the country — so the campaign lands at the tightest
+    geography Meta will actually serve rather than the tightest one we can name.
+
+    Returns None when there is nothing broader left to try.
+    """
+    from .geo_names import field_for_type, region_for, resolve_named_location, resolve_region
+
+    geo = dict((targeting or {}).get("geo_locations") or {})
+    rest = {k: v for k, v in (targeting or {}).items() if k != "geo_locations"}
+
+    if geo.get("countries"):
+        return None   # already as broad as geography goes
+
+    narrow = any(geo.get(f) for f in ("neighborhoods", "subcities"))
+    if narrow and city:
+        expected = ""
+        try:
+            expected = await region_for(city, access_token) or city
+        except Exception:
+            expected = city
+        hit = await resolve_named_location(city, expected, access_token)
+        if hit:
+            return {**rest, "geo_locations": {field_for_type(hit["type"]): [{"key": hit["key"]}]}}
+
+    if (geo.get("cities") or narrow) and city:
+        hit = await resolve_region(city, access_token)
+        if not hit:
+            try:
+                state = await region_for(city, access_token)
+            except Exception:
+                state = ""
+            hit = await resolve_region(state, access_token) if state else None
+        if hit:
+            return {**rest, "geo_locations": {"regions": [{"key": hit["key"]}]}}
+
+    return {**rest, "geo_locations": {"countries": ["NG"]}}
