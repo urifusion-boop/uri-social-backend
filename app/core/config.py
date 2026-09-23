@@ -180,6 +180,16 @@ class Settings(BaseSettings):
     SQUAD_LIVE_SECRET_KEY: Optional[str] = None
     SQUAD_LIVE_PUBLIC_KEY: Optional[str] = None
 
+    # Ad-wallet credentials — a SEPARATE Squad merchant ("Uri Social Ads") from the
+    # one subscriptions are paid into. Ad money is client money being held to spend on
+    # their behalf; settling it into the same account as Uri's own subscription revenue
+    # makes the two indistinguishable at the bank and in Squad's own dashboard.
+    #
+    # Unset falls back to the shared live keys, which is the behaviour every existing
+    # environment already has — so adding these changes nothing until they are set.
+    SQUAD_ADS_LIVE_SECRET_KEY: Optional[str] = None
+    SQUAD_ADS_LIVE_PUBLIC_KEY: Optional[str] = None
+
     # Webhook secret (same for both modes)
     SQUAD_WEBHOOK_SECRET: Optional[str] = None
     SQUAD_CALLBACK_URL: str = "https://www.urisocial.com/checkout/callback"
