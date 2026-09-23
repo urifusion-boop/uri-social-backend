@@ -47,12 +47,13 @@ def test_describe_shows_what_jane_decided_in_readable_lines():
     assert fields["budget_ngn"]["value"] == 20000
 
 
-def test_derived_lines_are_shown_but_not_editable():
-    """Daily spend follows from budget and duration. Offering a pencil beside it would
-    promise an edit we would have to silently ignore."""
+def test_daily_spend_is_editable_and_destination_is_not():
+    """Daily spend is the number that governs whether an ad delivers, so the client
+    sets it directly. Destination is fixed by the connection, so it carries no pencil."""
     fields = {f["key"]: f for f in describe(_plan(), _req())}
-    assert fields["daily_spend"]["editable"] is False
+    assert fields["daily_spend"]["editable"] is True
     assert fields["daily_spend"]["value"] == 4000
+    assert fields["daily_spend"]["min"] == 2000
     assert fields["destination"]["editable"] is False
 
 
@@ -233,13 +234,13 @@ def test_an_unknown_placement_is_refused():
     assert rejected
 
 
-def test_a_duration_that_drops_daily_spend_under_metas_floor_is_refused():
-    """₦20,000 over 40 days is ₦500/day. Meta refuses the ad set outright (subcode
-    1885272), so this has to be caught while the client can still change it."""
+def test_a_duration_that_drops_daily_spend_under_the_minimum_is_refused():
+    """₦20,000 over 40 days is ₦500/day — under the ₦2,000 minimum, caught while the
+    client can still change it rather than at launch."""
     _, _, applied, rejected = _run(apply_edits(_plan(), _req(), {"days": 40}))
     assert applied == []
     assert "minimum" in rejected[0]
-    assert "12 days or fewer" in rejected[0]
+    assert "10 days or fewer" in rejected[0]
 
 
 def test_lowering_the_budget_alone_can_break_the_floor_too():
@@ -264,7 +265,7 @@ def test_shortening_the_run_is_a_valid_way_to_clear_the_floor():
 def test_duration_is_not_pinned_to_the_default():
     """'It mustn't always be 7 days' — any duration that clears the daily floor and
     the 1-90 bound is accepted, not just Jane's default."""
-    for days in (2, 3, 9, 12):
+    for days in (2, 3, 9, 10):
         plan, _, applied, rejected = _run(apply_edits(_plan(), _req(), {"days": days}))
         assert rejected == [], f"{days} days rejected: {rejected}"
         assert plan.platforms[0].days == days
@@ -534,3 +535,46 @@ def test_the_reach_estimate_is_refetched_not_carried_over(monkeypatch):
     assert calls["targeting"]["genders"] == [1]
     assert "cities" in calls["targeting"]["geo_locations"]
     assert out is not None
+
+
+# ── Setting the daily spend ───────────────────────────────────────────────────
+
+def test_setting_the_daily_spend_changes_the_duration_not_the_budget():
+    """The budget is what the client agreed to pay and is not ours to move on their
+    behalf, so a daily figure decides how long that money lasts."""
+    plan, req, applied, rejected = _run(apply_edits(
+        _plan(), _req(), {"daily_spend": 2500}))     # ₦20,000 budget
+    assert rejected == []
+    assert applied == ["daily_spend"]
+    assert req.budget_ngn == 20000                    # untouched
+    assert plan.platforms[0].days == 8                # 20,000 / 2,500
+
+
+def test_the_daily_spend_floor_is_two_thousand():
+    _, _, applied, rejected = _run(apply_edits(_plan(), _req(), {"daily_spend": 1900}))
+    assert applied == []
+    assert "at least ₦2,000" in rejected[0]
+
+
+def test_exactly_the_minimum_is_allowed():
+    """2,000 is the floor, not the first rejected value."""
+    plan, _, applied, rejected = _run(apply_edits(_plan(), _req(), {"daily_spend": 2000}))
+    assert rejected == []
+    assert plan.platforms[0].days == 10               # 20,000 / 2,000
+
+
+def test_an_explicit_duration_wins_over_a_daily_figure_in_the_same_save():
+    """Both in one save is contradictory. The client named the duration outright, so
+    that is the instruction; the daily figure is what it implies."""
+    plan, _, applied, rejected = _run(apply_edits(
+        _plan(), _req(), {"daily_spend": 2500, "days": 4}))
+    assert rejected == []
+    assert plan.platforms[0].days == 4
+    assert "days" in applied
+
+
+def test_the_daily_spend_shown_back_reflects_the_new_duration():
+    plan, req, _, _ = _run(apply_edits(_plan(), _req(), {"daily_spend": 2500}))
+    fields = {f["key"]: f for f in describe(plan, req)}
+    assert fields["daily_spend"]["value"] == 2500
+    assert fields["days"]["value"] == 8
