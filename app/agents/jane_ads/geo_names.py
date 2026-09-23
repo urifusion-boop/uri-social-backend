@@ -197,3 +197,58 @@ async def resolve_region(
             break
     _cache[cache_key] = result
     return result
+
+
+async def region_for(place: str, access_token: str = "", timeout: float = 8.0) -> str:
+    """The STATE a place sits in — what the region guard actually needs.
+
+    Callers naturally pass the campaign's city ("Ikeja"), but Meta reports every hit's
+    region as the state ("Lagos State"), so comparing pockets against a city rejected
+    everything. Live-caught: Opebi and Alausa are both real, targetable Meta locations
+    that were thrown away because the guard was asked to match them against "Ikeja",
+    and the campaign silently fell back to all of Nigeria.
+
+    Returns "" when nothing resolves, and the caller then matches on the place itself —
+    which is the old behaviour, and correct when the place IS a state ("Lagos").
+    """
+    place = (place or "").strip()
+    if not place:
+        return ""
+    cache_key = ("__regionfor__", _norm(place))
+    if cache_key in _cache:
+        return (_cache[cache_key] or {}).get("name", "")
+
+    # A place that IS a state needs no lookup.
+    as_region = await resolve_region(place, access_token, timeout)
+    if as_region:
+        _cache[cache_key] = as_region
+        return as_region["name"]
+
+    token = access_token or settings.META_ADS_ACCESS_TOKEN
+    if not token:
+        return ""
+    graph = f"https://graph.facebook.com/{settings.FACEBOOK_API_VERSION}"
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.get(
+                f"{graph}/search",
+                params={"type": "adgeolocation", "q": place, "country_code": "NG",
+                        "location_types": json.dumps(_SEARCH_TYPES), "limit": 10,
+                        "access_token": token},
+            )
+        hits = (resp.json() or {}).get("data") or []
+    except Exception as e:
+        print(f"[GeoNames] region_for failed for {place!r}: {e}", flush=True)
+        _cache[cache_key] = None
+        return ""
+
+    wanted = _norm(place)
+    for hit in hits:
+        # Exact name only. A fuzzy match here would pick the wrong state, which is the
+        # very failure (Yaba -> Katsina) the guard exists to prevent.
+        if _norm(hit.get("name", "")) == wanted and hit.get("region"):
+            result = {"name": hit["region"]}
+            _cache[cache_key] = result
+            return hit["region"]
+    _cache[cache_key] = None
+    return ""
