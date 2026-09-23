@@ -160,16 +160,17 @@ def describe(plan: CampaignPlan, req: CampaignRequest) -> list[dict[str, Any]]:
             "key": "days", "label": "Duration (days)", "type": "number",
             "value": (platform.days if platform else 0),
             "min": 1, "max": 90, "editable": True,
-            "help": "However long you want — Jane's default is only a starting point. "
-                    "Shorter means more spend per day, which is how a small budget "
-                    "clears Meta's daily minimum.",
+            "help": f"However long you want — Jane's default is only a starting point. "
+                    f"Shorter means more spend per day, and the daily figure cannot go "
+                    f"below ₦{C.MIN_DAILY_SPEND_NGN:,.0f}.",
         },
         {
-            "key": "daily_spend", "label": "Daily spend", "type": "derived",
+            "key": "daily_spend", "label": "Daily spend", "type": "number",
             "value": round(req.budget_ngn / platform.days, 2) if platform and platform.days else None,
-            "editable": False, "prefix": "₦",
-            "help": f"Budget divided by duration. Meta refuses anything under "
-                    f"₦{C.META_MIN_DAILY_NGN:,.0f} a day — change either of those to move it.",
+            "min": C.MIN_DAILY_SPEND_NGN, "editable": True, "prefix": "₦",
+            "help": f"How much goes out each day. At least ₦{C.MIN_DAILY_SPEND_NGN:,.0f} — "
+                    f"below that an ad delivers too thinly to learn anything. Setting this "
+                    f"changes how many days the budget lasts.",
         },
         {
             "key": "destination", "label": "Where taps go", "type": "derived",
@@ -403,10 +404,25 @@ async def apply_edits(
     # so validating either one alone would refuse edits that are in fact fine — and
     # would let a legal-looking pair through that the launch then fails on
     # ("Budget is too low", subcode 1885272).
-    if {"budget_ngn", "days"} & edits.keys():
+    if {"budget_ngn", "days", "daily_spend"} & edits.keys():
         current_days = plan.platforms[0].days if plan.platforms else C.DEFAULT_CAMPAIGN_DAYS
         budget = _as_float(edits["budget_ngn"]) if "budget_ngn" in edits else req.budget_ngn
         days = _as_int(edits["days"]) if "days" in edits else current_days
+
+        # Setting the daily spend decides the DURATION, not the budget: the budget is
+        # what the client agreed to pay and is not ours to move on their behalf. An
+        # explicit `days` in the same save wins, since they said it outright.
+        daily_accepted = False
+        if "daily_spend" in edits and "days" not in edits:
+            daily = _as_float(edits["daily_spend"])
+            if daily is None or daily < C.MIN_DAILY_SPEND_NGN:
+                rejections.append(
+                    f"Daily spend must be at least ₦{C.MIN_DAILY_SPEND_NGN:,.0f} — below that "
+                    f"an ad delivers too thinly to learn anything."
+                )
+            elif budget is not None and budget > 0:
+                days = max(1, round(budget / daily))
+                daily_accepted = True
 
         if "budget_ngn" in edits and (budget is None or budget <= 0):
             rejections.append("Budget must be a number greater than zero.")
@@ -418,14 +434,15 @@ async def apply_edits(
             )
         elif budget is None or days is None:
             rejections.append("Budget and duration must both be numbers.")
-        elif budget / days < C.META_MIN_DAILY_NGN:
-            longest = int(budget // C.META_MIN_DAILY_NGN)
+        elif budget / days < C.MIN_DAILY_SPEND_NGN:
+            longest = int(budget // C.MIN_DAILY_SPEND_NGN)
             rejections.append(
-                f"₦{budget:,.0f} over {days} days is ₦{budget / days:,.0f} a day, under Meta's "
-                f"₦{C.META_MIN_DAILY_NGN:,.0f} minimum — Meta refuses the ad set outright. "
+                f"₦{budget:,.0f} over {days} days is ₦{budget / days:,.0f} a day, under the "
+                f"₦{C.MIN_DAILY_SPEND_NGN:,.0f} minimum — an ad spending less than that "
+                f"delivers too thinly to learn anything. "
                 + (f"Run it over {longest} days or fewer, or raise the budget."
                    if longest >= 1 else
-                   f"You would need at least ₦{C.META_MIN_DAILY_NGN:,.0f} for a single day.")
+                   f"You would need at least ₦{C.MIN_DAILY_SPEND_NGN:,.0f} for a single day.")
             )
         else:
             if "budget_ngn" in edits:
@@ -433,6 +450,8 @@ async def apply_edits(
                 applied.append("budget_ngn")
             if "days" in edits:
                 applied.append("days")
+            if daily_accepted:
+                applied.append("daily_spend")
             if plan.platforms:
                 plan_update["platforms"] = [
                     plan.platforms[0].model_copy(update={"budget_ngn": budget, "days": days}),
