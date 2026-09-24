@@ -27,6 +27,7 @@ from typing import Any, Optional
 
 from . import constants as C
 from .models import CampaignPlan, CampaignRequest, GeoMode, GeoPin, GeoPlan, PinSource
+from .objectives import CHOICES as OBJECTIVE_CHOICES
 
 # Meta's own bounds. Sending outside these fails the ad set create outright.
 MIN_AGE, MAX_AGE = 18, 65
@@ -101,6 +102,15 @@ def describe(plan: CampaignPlan, req: CampaignRequest) -> list[dict[str, Any]]:
     geo = plan.geo
 
     return [
+        {
+            "key": "objective", "label": "Goal", "type": "select",
+            "value": (plan.objective.value if plan.objective else ""),
+            "options": [c["value"] for c in OBJECTIVE_CHOICES],
+            "option_labels": {c["value"]: c["label"] for c in OBJECTIVE_CHOICES},
+            "editable": True,
+            "help": "What Meta optimises toward. The last chance to change it — Meta "
+                    "refuses to alter a campaign's objective once it has launched.",
+        },
         {
             "key": "headline", "label": "Headline", "type": "text",
             "value": (creative.headline if creative else ""),
@@ -300,6 +310,27 @@ async def apply_edits(
     targeting = dict(plan.audience_targeting or {})
     plan_update: dict[str, Any] = {}
     req_update: dict[str, Any] = {}
+
+    # ── objective ─────────────────────────────────────────────────────────────
+    # Before launch ONLY. Meta refuses to change a campaign's objective once it has an
+    # ad set — "Updating objective of non-empty campaign" — and every launched campaign
+    # has one, so this really is the last moment it can move. Probed live.
+    if "objective" in edits:
+        from .objectives import coerce as coerce_objective
+
+        picked = coerce_objective(str(edits.get("objective") or ""))
+        allowed = {c["value"] for c in OBJECTIVE_CHOICES}
+        if not picked or picked.value not in allowed:
+            rejections.append(
+                "That is not a goal we can run — pick one of: "
+                + ", ".join(c["label"] for c in OBJECTIVE_CHOICES) + "."
+            )
+        else:
+            plan_update["objective"] = picked
+            plan_update["platforms"] = [
+                pl.model_copy(update={"objective": picked}) for pl in plan.platforms
+            ]
+            applied.append("objective")
 
     # ── ad copy ───────────────────────────────────────────────────────────────
     if plan.creative is not None and ({"headline", "caption"} & edits.keys()):
