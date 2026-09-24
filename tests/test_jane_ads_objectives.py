@@ -44,11 +44,12 @@ def test_awareness_never_optimises_for_conversations():
         assert optimization_goal(CampaignObjective.AWARENESS, is_whatsapp=wa) == "REACH"
 
 
-def test_a_followers_campaign_never_optimises_for_clicks():
-    """It stays on the Page; optimising for link clicks would send Meta chasing taps
-    that lead nowhere."""
+def test_a_followers_campaign_optimises_for_page_likes():
+    """It stays on the Page. POST_ENGAGEMENT is rejected once the ad set promotes a
+    Page — "Performance goal isn't available" (subcode 2446286) — and PAGE_LIKES is
+    what actually grows a following."""
     for wa in (True, False):
-        assert optimization_goal(CampaignObjective.FOLLOWERS, is_whatsapp=wa) == "POST_ENGAGEMENT"
+        assert optimization_goal(CampaignObjective.FOLLOWERS, is_whatsapp=wa) == "PAGE_LIKES"
 
 
 def test_the_legacy_objective_still_loads():
@@ -77,13 +78,11 @@ def test_app_promotion_is_not_offered():
     assert "app" not in " ".join(c["value"] for c in CHOICES).lower()
 
 
-def test_the_objectives_uri_cannot_fully_honour_say_so():
-    """Sales without a pixel optimises for taps, not purchases; Leads without an instant
-    form arrives as WhatsApp messages. Both deliver — stating the limit is the
-    difference between a useful choice and one the client unpicks from their bank."""
-    assert "purchases" in caveat_for(CampaignObjective.SALES)
-    assert "lead forms" in caveat_for(CampaignObjective.LEADS)
-    assert caveat_for(CampaignObjective.ENGAGEMENT) == ""
+def test_no_objective_second_guesses_the_clients_choice():
+    """Sales and Leads go to Meta as themselves and Meta optimises them. Warning about
+    them in the picker only made clients doubt a setting that works."""
+    for o in CampaignObjective:
+        assert caveat_for(o) == "", o
 
 
 def test_every_choice_is_a_real_objective():
