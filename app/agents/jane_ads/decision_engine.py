@@ -109,6 +109,26 @@ def budget_tier_for(total_budget_ngn: float) -> str:
     return "starter"
 
 
+
+# What Jane assumes when the client has not chosen an objective themselves. A fallback,
+# not a decision: the client picking explicitly always wins, and the point of offering
+# the choice is that this guess was wrong often enough to matter.
+_GOAL_OBJECTIVE = {
+    Goal.FOLLOWERS: CampaignObjective.FOLLOWERS,
+    Goal.AWARENESS: CampaignObjective.AWARENESS,
+    Goal.TRAFFIC: CampaignObjective.TRAFFIC,
+    Goal.SALES: CampaignObjective.SALES,
+    Goal.LEADS: CampaignObjective.LEADS,
+    Goal.BOOKINGS: CampaignObjective.LEADS,
+    Goal.MESSAGES: CampaignObjective.ENGAGEMENT,
+    Goal.WALK_INS: CampaignObjective.ENGAGEMENT,
+}
+
+
+def default_objective_for(goal: Goal) -> CampaignObjective:
+    return _GOAL_OBJECTIVE.get(goal, CampaignObjective.ENGAGEMENT)
+
+
 def _days_for(total_budget: float, platforms: list[Platform] | None = None) -> int:
     plats_for_days = platforms or [Platform.META]
     if Platform.META in plats_for_days:
@@ -235,7 +255,7 @@ def choose_platform(
         platform_plans.append(PlatformPlan(
             platform=p, budget_ngn=round(per_platform_budget, 2), days=days,
             variants=variants, test_scope=scope,
-            objective=CampaignObjective.ENGAGEMENT if request.goal == Goal.FOLLOWERS else CampaignObjective.CONVERSATIONS,
+            objective=default_objective_for(request.goal),
         ))
 
     trace.append(f"Caps — per-business ₦{funded_amount_ngn:,.0f}, "
@@ -278,7 +298,7 @@ def apply_platform_override(plan: CampaignPlan, chosen: list[Platform]) -> Campa
         platform_plans.append(PlatformPlan(
             platform=p, budget_ngn=round(per_platform_budget, 2), days=days,
             variants=variants, test_scope=scope,
-            objective=CampaignObjective.ENGAGEMENT if plan.goal == Goal.FOLLOWERS else CampaignObjective.CONVERSATIONS,
+            objective=default_objective_for(plan.goal),
         ))
     return plan.model_copy(update={"platforms": platform_plans})
 

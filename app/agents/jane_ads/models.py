@@ -70,8 +70,24 @@ class ABTestScope(str, Enum):
 
 
 class CampaignObjective(str, Enum):
-    CONVERSATIONS = "conversations"     # Click-to-WhatsApp — every goal except FOLLOWERS
-    ENGAGEMENT = "engagement"           # Page-follower growth (Goal.FOLLOWERS) — no WhatsApp
+    """Meta's own campaign objectives — what the CLIENT picks, in Meta's words.
+
+    This used to be a two-value internal detail (CONVERSATIONS / ENGAGEMENT) that Jane
+    derived from the goal, so every campaign came out as Engagement or Traffic on Meta
+    regardless of what the client actually wanted. These are the real objectives, and
+    what is chosen here is what Ads Manager shows them later. See objectives.py for the
+    mapping to OUTCOME_* and optimisation goals, and for the limits worth stating.
+    """
+    AWARENESS = "awareness"
+    TRAFFIC = "traffic"
+    ENGAGEMENT = "engagement"
+    LEADS = "leads"
+    SALES = "sales"
+    FOLLOWERS = "followers"
+
+    # Retained so plans and records written before the client could choose still load.
+    # objectives.py maps it to ENGAGEMENT's behaviour, which is what it always meant.
+    CONVERSATIONS = "conversations"
 
 
 class PlanDecision(str, Enum):

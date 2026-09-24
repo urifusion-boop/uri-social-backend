@@ -13,6 +13,7 @@ import pytest
 
 from app.agents.jane_ads.adapters.meta import MetaAdPlatformAdapter, MetaAPIError
 from app.agents.jane_ads.models import (
+    CampaignObjective,
     ABTestScope,
     AdCreative,
     CampaignObjective,
@@ -73,6 +74,12 @@ class FakeDb:
 
 
 def _plan(**kw) -> CampaignPlan:
+    # The campaign objective is derived from the goal exactly as the decision engine
+    # does, so these plans carry what a real one would rather than the enum default —
+    # otherwise a followers ad tests as if it optimised for link clicks.
+    from app.agents.jane_ads.decision_engine import default_objective_for
+    goal = kw.get("goal", Goal.MESSAGES)
+    kw.setdefault("objective", default_objective_for(goal))
     base = dict(
         business_id="b1", goal=Goal.MESSAGES, behaviour=PurchaseBehaviour.DISCOVER,
         platforms=[PlatformPlan(platform=Platform.META, budget_ngn=10_000, days=7,
