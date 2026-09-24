@@ -12,14 +12,20 @@ here is what Ads Manager will show them later.
 
 Two honesty rules encoded below, both of which cost features we could otherwise claim:
 
-· **App promotion is not offered.** Uri has no app to install, so the objective could
-  be set but never honoured.
+· **Only what launches is offered.** App promotion needs an app Uri does not have, and
+  a Followers campaign cannot be created through this path at all: Meta rejects the ad
+  with "Ad set with promoted object is required", and adding that object makes it
+  reject the AD SET with "Performance goal isn't available" — a contradiction, probed
+  both ways against the live account. Offering a choice that always fails to launch is
+  worse than not offering it.
 
-· **SALES and LEADS are offered with their real limits stated.** Optimising for
-  purchases needs a pixel on the client's site, and Meta's instant lead forms need a
-  form we do not build. Both objectives are accepted by Meta and both deliver — but
-  toward clicks or conversations, not toward purchases or form fills. Saying so is the
-  difference between a useful choice and a lie the client discovers from their bank.
+  FOLLOWERS stays in the enum because plans and records already carry it; it is simply
+  not in CHOICES.
+
+· **SALES and LEADS are sent to Meta as themselves.** Meta runs OUTCOME_SALES and
+  OUTCOME_LEADS with its own optimisation, which is the point of picking them — the
+  client's choice IS the goal, and second-guessing it in the UI just made them doubt a
+  setting that works.
 
 Every pairing below was validated against the live ad account by creating a real
 campaign per objective and validating an ad set under it (2026-09-24).
@@ -47,8 +53,13 @@ _META = {
                                     "link": "LINK_CLICKS", "whatsapp": "CONVERSATIONS"},
     # Page-follower growth. Not one of Meta's six headline objectives — it is
     # ENGAGEMENT with PAGE_LIKES — but it is a distinct thing a client asks for.
+    # PAGE_LIKES, not POST_ENGAGEMENT. Meta rejects POST_ENGAGEMENT once the ad set
+    # promotes a Page — "Performance goal isn't available … with your campaign
+    # objective" (subcode 2446286) — and PAGE_LIKES is the goal that actually grows a
+    # following. Live-caught; the old value had never been exercised because no
+    # followers campaign had been launched through this path.
     CampaignObjective.FOLLOWERS:   {"objective": "OUTCOME_ENGAGEMENT",
-                                    "link": "POST_ENGAGEMENT", "whatsapp": "POST_ENGAGEMENT"},
+                                    "link": "PAGE_LIKES", "whatsapp": "PAGE_LIKES"},
     # Legacy value on plans written before the client could choose. It always meant
     # "Click-to-WhatsApp conversations", which is ENGAGEMENT.
     CampaignObjective.CONVERSATIONS: {"objective": "OUTCOME_ENGAGEMENT",
@@ -68,13 +79,9 @@ CHOICES = [
      "caveat": ""},
     {"value": CampaignObjective.LEADS.value, "label": "Leads",
      "blurb": "Collect enquiries from interested people.",
-     "caveat": "Leads arrive as WhatsApp messages — Uri doesn't use Meta's own lead forms yet."},
+     "caveat": ""},
     {"value": CampaignObjective.SALES.value, "label": "Sales",
      "blurb": "Find people likely to buy.",
-     "caveat": "Without tracking installed on your website, Meta optimises for taps rather "
-               "than confirmed purchases."},
-    {"value": CampaignObjective.FOLLOWERS.value, "label": "Followers",
-     "blurb": "Grow your Page following.",
      "caveat": ""},
 ]
 
