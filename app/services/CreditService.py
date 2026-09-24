@@ -33,9 +33,14 @@ class CreditService:
 
     @property
     def db(self) -> AsyncIOMotorDatabase:
-        if self._db is None:
-            self._db = get_db()
-        return self._db
+        # Never cache the live handle beyond this call: get_db() is a cheap,
+        # no-I/O lookup of whatever database.client currently is, and caching
+        # it here is exactly what caused a prod outage — a DocumentDB
+        # password rotation swaps that module-level client, but a singleton
+        # that squirreled away its own reference kept authenticating with
+        # the dead one until the whole process restarted. _db only ever
+        # holds a value in tests, which inject a substitute directly.
+        return self._db if self._db is not None else get_db()
 
     @property
     def user_credits_collection(self):
