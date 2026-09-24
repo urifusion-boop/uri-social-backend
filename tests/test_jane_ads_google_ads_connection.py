@@ -22,6 +22,7 @@ from app.agents.jane_ads.google_ads_connection import (
     ConnectionState,
     GoogleAdsConnectionError,
     create_client_account_under_mcc,
+    exchange_code_for_tokens,
     get_admin_valid_access_token,
     get_valid_access_token,
     refresh_access_token,
@@ -245,6 +246,56 @@ def test_resolve_customer_id_for_launch_never_returns_a_settings_fallback():
 # ── refresh_access_token / get_valid_access_token (generic over any conn_doc —
 # exercised here via a plain doc; in production these only ever run against the
 # single admin doc, see get_admin_valid_access_token below) ─────────────────────
+
+# ── exchange_code_for_tokens's error shape — the OAuth TOKEN endpoint's error
+# envelope ({"error": "invalid_grant", "error_description": "..."}, a bare string)
+# is a DIFFERENT shape from the Ads REST API's ({"error": {"message": ...}}, a dict).
+# Confirmed live: a real failed exchange crashed with AttributeError: 'str' object
+# has no attribute 'get' instead of surfacing the actual Google error, because
+# _raise_for_error assumed every caller hit the dict shape.
+
+def test_exchange_code_for_tokens_success_returns_data():
+    with patch("httpx.AsyncClient") as MockClient:
+        MockClient.return_value.__aenter__.return_value = _mock_client(
+            [{"access_token": "new_at", "refresh_token": "new_rt", "expires_in": 3600}]
+        )
+        data = _run(exchange_code_for_tokens("auth-code", "https://api.example.com/callback"))
+    assert data["access_token"] == "new_at"
+
+
+def test_exchange_code_for_tokens_surfaces_real_oauth_error_instead_of_crashing():
+    # The exact shape Google's OAuth token endpoint returns on a real failure
+    # (expired/reused code, wrong client secret, etc.) — data["error"] is a bare
+    # string, not a dict.
+    with patch("httpx.AsyncClient") as MockClient:
+        MockClient.return_value.__aenter__.return_value = _mock_client(
+            [{"error": "invalid_grant", "error_description": "Malformed auth code."}]
+        )
+        try:
+            _run(exchange_code_for_tokens("bad-code", "https://api.example.com/callback"))
+            assert False, "expected GoogleAdsConnectionError"
+        except GoogleAdsConnectionError as e:
+            # The real diagnostic detail must reach the caller (and from there, the
+            # admin who's debugging a failed connect) — not an opaque AttributeError.
+            assert "Malformed auth code" in str(e)
+        except AttributeError:
+            raise AssertionError(
+                "_raise_for_error crashed on the OAuth token endpoint's string-shaped "
+                "error instead of raising GoogleAdsConnectionError with the real detail"
+            )
+
+
+def test_exchange_code_for_tokens_falls_back_to_bare_error_code_without_description():
+    with patch("httpx.AsyncClient") as MockClient:
+        MockClient.return_value.__aenter__.return_value = _mock_client(
+            [{"error": "invalid_client"}]  # no error_description this time
+        )
+        try:
+            _run(exchange_code_for_tokens("bad-code", "https://api.example.com/callback"))
+            assert False, "expected GoogleAdsConnectionError"
+        except GoogleAdsConnectionError as e:
+            assert "invalid_client" in str(e)
+
 
 def test_refresh_access_token_persists_new_token():
     db = FakeDb()
