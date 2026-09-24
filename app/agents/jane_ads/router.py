@@ -1822,6 +1822,11 @@ async def tiktok_test_launch(
 
 class MetaLaunchFromMessageBody(BaseModel):
     message: str                          # plain-English ask, e.g. "get me lunch customers in Surulere, ₦15k"
+    # The CLIENT's Meta campaign objective, picked at the start of the conversation.
+    # Empty means they have not chosen, and Jane falls back to the objective her goal
+    # implies — which is what she always used to do, and got wrong often enough that
+    # asking became necessary. See objectives.py.
+    objective: str = ""
     business_name: str = ""
     category: str = ""
     conversation_cost_ngn: float = Field(500.0, gt=0)
@@ -2209,6 +2214,7 @@ async def _build_campaign_plan(
     # linked NUMBER; a brand routing to their website or Instagram DMs may legitimately
     # have no number at all. Re-check strictly now, catching it here instead of at launch.
     from .destination import DestinationType, build_link, coerce_type, get_brand_destination
+    from .objectives import coerce as objectives_coerce
     brand_destination = await get_brand_destination(db, brand_ctx.get("brand_id"))
     # A destination named on THIS request wins over the brand's saved default;
     # "ask" means the user hasn't chosen yet (the choose_destination stage below),
@@ -2515,6 +2521,15 @@ async def _build_campaign_plan(
     audience_text = (own_audience
                      or (selected_variant.audience_segment if selected_variant else "")
                      or brand_profile.get("target_audience", ""))
+    # The client's own objective wins over the one Jane derived from the goal. Applied
+    # to BOTH the campaign plan and its platform plans, because the adapter reads the
+    # campaign's and the summary reads the platform's — leaving them to disagree is how
+    # a card ends up describing a different campaign from the one that launches.
+    chosen = objectives_coerce(body.objective)
+    if chosen:
+        plan.objective = chosen
+        plan.platforms = [p.model_copy(update={"objective": chosen}) for p in plan.platforms]
+
     try:
         from .audience_targeting import resolve_audience_targeting
         plan.audience_targeting = await resolve_audience_targeting(
@@ -4385,6 +4400,19 @@ async def edit_live_targeting(
         "baseline": targeting_fingerprint(confirmed),
         "verified": True,
     }
+
+
+@router.get("/objectives")
+async def list_objectives() -> dict:
+    """Meta's campaign objectives, for the picker Jane opens the conversation with.
+
+    Offered in Meta's own words so that what the client chooses here is what Ads
+    Manager shows them later — the mismatch that made this necessary was a client
+    asking for sales and finding "Objective: Engagement" on their campaign.
+    """
+    from .objectives import CHOICES
+
+    return {"objectives": CHOICES}
 
 
 @router.post("/meta/campaigns/{campaign_id}/status")
