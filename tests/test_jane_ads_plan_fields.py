@@ -651,3 +651,38 @@ def test_the_daily_spend_shown_back_reflects_the_new_duration():
     fields = {f["key"]: f for f in describe(plan, req)}
     assert fields["daily_spend"]["value"] == 2500
     assert fields["days"]["value"] == 8
+
+
+# ── The objective, editable right up to launch ────────────────────────────────
+
+def test_the_objective_is_offered_as_an_editable_goal():
+    fields = {f["key"]: f for f in describe(_plan(), _req())}
+    assert fields["objective"]["editable"] is True
+    assert "Sales" in fields["objective"]["option_labels"].values()
+    # Followers is not offered — it cannot be launched.
+    assert "followers" not in fields["objective"]["options"]
+
+
+def test_changing_the_objective_moves_it_on_the_plan_and_the_platform():
+    """The adapter reads the campaign's objective and the summary reads the platform's.
+    Leaving them to disagree is how a card describes a different campaign from the one
+    that launches."""
+    plan, _, applied, rejected = _run(apply_edits(_plan(), _req(), {"objective": "awareness"}))
+    assert rejected == []
+    assert applied == ["objective"]
+    assert plan.objective.value == "awareness"
+    assert plan.platforms[0].objective.value == "awareness"
+
+
+def test_an_objective_we_cannot_launch_is_refused():
+    """Followers cannot be created through this path at all — Meta rejects the ad
+    without a promoted object and rejects the ad SET with one."""
+    _, _, applied, rejected = _run(apply_edits(_plan(), _req(), {"objective": "followers"}))
+    assert applied == []
+    assert "not a goal we can run" in rejected[0]
+
+
+def test_nonsense_is_refused_rather_than_silently_ignored():
+    _, _, applied, rejected = _run(apply_edits(_plan(), _req(), {"objective": "world peace"}))
+    assert applied == []
+    assert rejected
