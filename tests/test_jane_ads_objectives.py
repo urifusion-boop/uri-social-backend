@@ -89,3 +89,22 @@ def test_every_choice_is_a_real_objective():
     for c in CHOICES:
         assert coerce(c["value"]) is not None, c["value"]
         assert c["label"] and c["blurb"]
+
+
+# ── Typing the objective is the same as tapping it ────────────────────────────
+
+def test_typing_an_objective_is_understood_as_a_choice():
+    """Someone who types "awareness" instead of tapping the card has chosen just as
+    deliberately. Treating it as ordinary prose left the objective to be inferred —
+    the exact guesswork the picker exists to remove."""
+    for typed in ("awareness", "Awareness", "  SALES  ", "leads", "traffic", "engagement"):
+        assert coerce(typed) is not None, typed
+
+
+def test_a_brief_that_merely_mentions_one_is_not_a_choice():
+    """"Get me more sales in Lekki" is a brief, not a pick. Reading an objective out of
+    a sentence would hand the client a campaign goal they never chose — and quietly
+    beat an explicit pick they might make afterwards."""
+    for brief in ("get me more sales in Lekki", "I want awareness for my salon",
+                  "traffic is bad on my website", "sell more wigs"):
+        assert coerce(brief) is None, brief

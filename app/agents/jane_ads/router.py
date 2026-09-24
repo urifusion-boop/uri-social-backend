@@ -2475,7 +2475,12 @@ async def _build_campaign_plan(
     # to BOTH the campaign plan and its platform plans, because the adapter reads the
     # campaign's and the summary reads the platform's — leaving them to disagree is how
     # a card ends up describing a different campaign from the one that launches.
-    chosen = objectives_coerce(body.objective)
+    # An explicit pick first, then the message itself. Someone who TYPES "awareness"
+    # instead of tapping the card has chosen just as deliberately, and treating that as
+    # ordinary prose left the objective to be inferred — the exact guesswork the picker
+    # exists to remove. Only a message that IS an objective counts: "get me more sales
+    # in Lekki" is a brief, not a choice, and coerce() returns None for it.
+    chosen = objectives_coerce(body.objective) or objectives_coerce(body.message)
     if chosen:
         plan.objective = chosen
         plan.platforms = [p.model_copy(update={"objective": chosen}) for p in plan.platforms]
