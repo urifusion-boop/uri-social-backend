@@ -58,23 +58,23 @@ _META = {
 # What the client is choosing between, in Meta's own words plus a plain-language line.
 CHOICES = [
     {"value": CampaignObjective.AWARENESS.value, "label": "Awareness",
-     "blurb": "Show the ad to as many people as possible. Good for being known, not for sales today.",
+     "blurb": "Reach as many people as possible.",
      "caveat": ""},
     {"value": CampaignObjective.TRAFFIC.value, "label": "Traffic",
-     "blurb": "Send people to your link — a website, a page, anywhere off Facebook.",
+     "blurb": "Send people to your link or website.",
      "caveat": ""},
     {"value": CampaignObjective.ENGAGEMENT.value, "label": "Engagement",
-     "blurb": "Get people messaging you, commenting and reacting. Best for WhatsApp orders.",
+     "blurb": "Get people messaging you. Best for WhatsApp orders.",
      "caveat": ""},
     {"value": CampaignObjective.LEADS.value, "label": "Leads",
-     "blurb": "Collect enquiries from people interested in what you sell.",
+     "blurb": "Collect enquiries from interested people.",
      "caveat": "Leads arrive as WhatsApp messages — Uri doesn't use Meta's own lead forms yet."},
     {"value": CampaignObjective.SALES.value, "label": "Sales",
      "blurb": "Find people likely to buy.",
      "caveat": "Without tracking installed on your website, Meta optimises for taps rather "
                "than confirmed purchases."},
     {"value": CampaignObjective.FOLLOWERS.value, "label": "Followers",
-     "blurb": "Grow the people following your Page.",
+     "blurb": "Grow your Page following.",
      "caveat": ""},
 ]
 
