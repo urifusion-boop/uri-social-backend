@@ -275,13 +275,13 @@ def test_plan_carries_its_own_budget_tier():
 
 # ── Followers goal gets the engagement objective, not Click-to-WhatsApp ────────
 
-def test_followers_goal_gets_engagement_objective():
+def test_followers_goal_gets_the_followers_objective():
     from app.agents.jane_ads.models import CampaignObjective
     res = _plan(goal=Goal.FOLLOWERS)
-    assert all(p.objective == CampaignObjective.ENGAGEMENT for p in res.plan.platforms)
+    assert all(p.objective == CampaignObjective.FOLLOWERS for p in res.plan.platforms)
 
 
-def test_non_followers_goal_still_gets_conversations_objective():
+def test_a_messages_goal_defaults_to_engagement():
     from app.agents.jane_ads.models import CampaignObjective
     res = _plan(goal=Goal.MESSAGES)
-    assert all(p.objective == CampaignObjective.CONVERSATIONS for p in res.plan.platforms)
+    assert all(p.objective == CampaignObjective.ENGAGEMENT for p in res.plan.platforms)
