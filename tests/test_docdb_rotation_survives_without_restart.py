@@ -61,7 +61,12 @@ def rotation_scenario(monkeypatch):
     monkeypatch.setattr(refresher_module, "_last_known_password", None)
     monkeypatch.setattr(refresher_module.settings, "DOCDB_SECRET_ARN", "arn:fake:docdb-secret")
     monkeypatch.setattr(refresher_module.settings, "MONGODB_URI", "mongodb://user:old-password@host/db")
-    monkeypatch.setattr(refresher_module.settings, "SDK_GATEWAY_MONGODB_URI", None)
+    # Not every environment's Settings even declares this field (pydantic
+    # rejects setting an undeclared one outright, unlike a plain object) —
+    # only patch it where it exists; this test only cares about the primary
+    # Mongo connection either way.
+    if hasattr(refresher_module.settings, "SDK_GATEWAY_MONGODB_URI"):
+        monkeypatch.setattr(refresher_module.settings, "SDK_GATEWAY_MONGODB_URI", None)
 
     old_client = _FakeMotorClient()
     new_client = _FakeMotorClient()
