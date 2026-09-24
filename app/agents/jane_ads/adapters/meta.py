@@ -52,6 +52,7 @@ from .base import AdPlatformAdapter
 from .. import constants as C
 from ..destination import DestinationType, link_for_plan
 from ..geo import meta_targeting_from_geo_named
+from ..objectives import meta_objective, optimization_goal
 from ..models import (
     CampaignPlan,
     ConversationDelivered,
@@ -309,11 +310,13 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                         # one are both real on-platform engagement, so both take
                         # OUTCOME_ENGAGEMENT — CONVERSATIONS optimisation is not
                         # available under OUTCOME_TRAFFIC.
-                        "objective": (
-                            "OUTCOME_ENGAGEMENT"
-                            if (is_followers_goal or use_native_whatsapp)
-                            else "OUTCOME_TRAFFIC"
-                        ),
+                        # THE CLIENT'S choice, not one Jane derived from the goal.
+                        # Every campaign used to come out OUTCOME_ENGAGEMENT or
+                        # OUTCOME_TRAFFIC whatever the client actually wanted, so Ads
+                        # Manager showed them "Objective: Engagement" for a campaign
+                        # they had asked to be about sales. objectives.py holds the
+                        # mapping, validated against the live ad account.
+                        "objective": meta_objective(plan.objective),
                         "status": "PAUSED",
                         "special_ad_categories": [],
                         # Budget lives on the ad set (per-business isolation via caps.py/
@@ -356,12 +359,21 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                     "start_time": start_time.isoformat(),
                     "end_time": end_time.isoformat(),
                 }
+                # The optimisation the CLIENT's objective implies, given where the tap
+                # goes. A Click-to-WhatsApp ad under ENGAGEMENT optimises for
+                # CONVERSATIONS; the same objective on a link ad has no conversation to
+                # count and optimises for POST_ENGAGEMENT instead. The branches below
+                # still own the WhatsApp ROUTING (destination_type, promoted_object) —
+                # only the goal itself comes from the objective now.
+                adset_payload["optimization_goal"] = optimization_goal(
+                    plan.objective, is_whatsapp=use_native_whatsapp)
+
                 if is_followers_goal:
                     # Grow the Page's own following — confirmed live shape (Meta Marketing
                     # API docs): same OUTCOME_ENGAGEMENT campaign objective as a Click-to-
                     # WhatsApp ad, but POST_ENGAGEMENT optimization and no WhatsApp routing
                     # at all (no destination_type, no promoted_object.whatsapp_phone_number).
-                    adset_payload["optimization_goal"] = "POST_ENGAGEMENT"
+                    pass   # routing: none — a followers ad stays on the Page
                 else:
                     # Optimize for started WhatsApp conversations, routed to the brand's
                     # own number. `promoted_object.whatsapp_phone_number` is confirmed live:
@@ -384,7 +396,6 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                     # native WhatsApp threads Meta can see, which is precisely why the
                     # native form above is used whenever the Page actually allows it.
                     if use_native_whatsapp:
-                        adset_payload["optimization_goal"] = "CONVERSATIONS"
                         adset_payload["destination_type"] = "WHATSAPP"
                         # Meta validates this pair at create time and rejects a number
                         # that isn't linked to the Page — the check before the campaign
