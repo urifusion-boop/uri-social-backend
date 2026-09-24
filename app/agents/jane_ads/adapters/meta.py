@@ -54,6 +54,7 @@ from ..destination import DestinationType, link_for_plan
 from ..geo import meta_targeting_from_geo_named
 from ..objectives import meta_objective, optimization_goal
 from ..models import (
+    CampaignObjective,
     CampaignPlan,
     ConversationDelivered,
     Goal,
@@ -212,7 +213,15 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
         # one there's nothing for the ad to open. Blocked here too (the router's
         # ads_connection gate checks first) so a missing destination can never
         # silently ship a dead-end ad.
-        is_followers_goal = plan.goal == Goal.FOLLOWERS
+        # The OBJECTIVE counts as much as the goal now that the client picks it.
+        # A Followers campaign is Page engagement with no WhatsApp routing at all;
+        # leaving destination_type=WHATSAPP on it while optimising for POST_ENGAGEMENT
+        # is a pair Meta rejects outright — "Performance goal isn't available … with
+        # your campaign objective" (code=100, subcode=2446286). Live-caught by
+        # launching each objective against the real ad account.
+        is_followers_goal = (
+            plan.goal == Goal.FOLLOWERS or plan.objective == CampaignObjective.FOLLOWERS
+        )
         destination = link_for_plan(plan)
         dest_link = destination.link
         if not is_followers_goal and not dest_link:
@@ -373,7 +382,13 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                     # API docs): same OUTCOME_ENGAGEMENT campaign objective as a Click-to-
                     # WhatsApp ad, but POST_ENGAGEMENT optimization and no WhatsApp routing
                     # at all (no destination_type, no promoted_object.whatsapp_phone_number).
-                    pass   # routing: none — a followers ad stays on the Page
+                    #
+                    # NO promoted_object either, despite the ad-level error asking for
+                    # one: adding it makes Meta reject the AD SET with "Performance goal
+                    # isn't available" (subcode 2446286), whichever optimisation is
+                    # used. Probed directly — PAGE_LIKES and POST_ENGAGEMENT both
+                    # validate without it and both fail with it.
+                    pass
                 else:
                     # Optimize for started WhatsApp conversations, routed to the brand's
                     # own number. `promoted_object.whatsapp_phone_number` is confirmed live:
