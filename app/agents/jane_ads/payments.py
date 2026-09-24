@@ -32,6 +32,29 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+async def _ads_squad_credentials() -> dict:
+    """Squad credentials for AD-WALLET money specifically.
+
+    Ad top-ups are client money Uri holds to spend on their behalf; subscriptions are
+    Uri's own revenue. Settling both into one merchant makes them indistinguishable at
+    the bank and in Squad's own dashboard, which is why the ads wallet gets its own.
+
+    Falls back to the shared live keys when the ads merchant is not configured, so an
+    environment that has never set them behaves exactly as it did before. Sandbox mode
+    is untouched: test money has nowhere to be separated to.
+    """
+    from app.core.config import settings
+
+    creds = await payment_service._get_squad_credentials()
+    if creds.get("mode") != "live":
+        return creds
+    secret = settings.SQUAD_ADS_LIVE_SECRET_KEY
+    public = settings.SQUAD_ADS_LIVE_PUBLIC_KEY
+    if not (secret and public):
+        return creds
+    return {**creds, "secret_key": secret, "public_key": public, "merchant": "ads"}
+
+
 class JaneAdsPayments:
     """Squad-backed top-ups for the Jane Ads custodial wallet."""
 
@@ -48,7 +71,7 @@ class JaneAdsPayments:
             raise MinimumTopUpError(
                 f"Minimum top-up is ₦{C.MIN_TOPUP_NGN:,.0f}; got ₦{amount_ngn:,.0f}."
             )
-        creds = await payment_service._get_squad_credentials()
+        creds = await _ads_squad_credentials()
         reference = f"JANEADS_{business_id[:8]}_{uuid.uuid4().hex[:12]}"
 
         await self._topups.insert_one({
@@ -99,7 +122,7 @@ class JaneAdsPayments:
         if rec["status"] == "completed":
             return {"status": "completed", "already_credited": True}
 
-        creds = await payment_service._get_squad_credentials()
+        creds = await _ads_squad_credentials()
         async with httpx.AsyncClient() as client:
             resp = await client.get(
                 f"{creds['api_url']}/transaction/verify/{reference}",
@@ -146,7 +169,10 @@ class JaneAdsPayments:
         """
         if not signature:
             return False
-        creds = await payment_service._get_squad_credentials()
+        # The ADS merchant's secret. Squad signs each webhook with the secret of the
+        # merchant that took the money, so checking an ad top-up against the
+        # subscription merchant's key would reject every genuine callback as forged.
+        creds = await _ads_squad_credentials()
         secret = (creds or {}).get("secret_key") or ""
         if not secret:
             return False

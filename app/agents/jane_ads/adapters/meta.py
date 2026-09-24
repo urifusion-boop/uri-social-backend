@@ -39,6 +39,7 @@ against the real Ad Account with a real (tiny, generated) test clip.
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -438,6 +439,41 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                     )
                     adset_data = adset_resp.json()
 
+                # Named areas carry their REAL boundaries, which are far smaller than
+                # the radius pins they replaced — a named neighbourhood estimates
+                # thousands where a 2km pin estimated hundreds of thousands. Three of
+                # those plus a detailed interest list can leave an audience Meta simply
+                # refuses to serve: "The configured audience is not valid — Broaden your
+                # audience" (code=100, subcode=2446395). Live-reported on a plan for
+                # Opebi + Allen Avenue + Ogba that estimated a reach of 1,000.
+                #
+                # Widen one rung at a time and re-ask, rather than failing the launch or
+                # jumping straight to nationwide. The campaign then lands at the tightest
+                # geography Meta will actually deliver to, which is the honest answer to
+                # "where should this run" — and each attempt builds a NEW payload, since
+                # httpx holds a reference to what was already sent.
+                widened_to = ""
+                while (adset_data.get("error") or {}).get("error_subcode") == 2446395:
+                    from ..geo import widen_targeting
+
+                    broader = await widen_targeting(
+                        adset_payload["targeting"],
+                        (plan.geo.city if plan.geo else ""),
+                        self._access_token,
+                    )
+                    if broader is None:
+                        break
+                    widened_to = json.dumps(broader.get("geo_locations"))
+                    print(f"[MetaAds] audience too narrow to deliver — widening to {widened_to}",
+                          flush=True)
+                    adset_payload = {**adset_payload, "targeting": broader}
+                    adset_resp = await client.post(
+                        f"{self._graph_base}/act_{self._ad_account_id}/adsets",
+                        params={"access_token": self._access_token},
+                        json=adset_payload,
+                    )
+                    adset_data = adset_resp.json()
+
                 _raise_for_error(adset_data, "ad set creation")
                 adset_id = adset_data["id"]
 
@@ -813,6 +849,63 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                 _raise_for_error(data, f"{label} status update")
                 updated[label] = bool(data.get("success"))
         return {"status": status, "updated": updated}
+
+    async def fetch_adset_targeting(self, campaign_id: str) -> dict:
+        """The ad set's CURRENT targeting, read fresh from Meta.
+
+        Never served from our own copy. The whole point of reading it here is that
+        somebody may have changed it in Ads Manager since we last looked, and an edit
+        built on a stale baseline would quietly overwrite their work (PRD D45/CM17).
+        """
+        record = await self._get_campaign_record(campaign_id)
+        adset_id = record.get("adset_id")
+        if not adset_id:
+            raise MetaAPIError(f"campaign {campaign_id} has no ad set recorded")
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(
+                f"{self._graph_base}/{adset_id}",
+                params={"access_token": self._access_token,
+                        "fields": "id,name,status,effective_status,targeting"},
+            )
+            data = resp.json()
+            _raise_for_error(data, "adset read")
+        return {"adset_id": adset_id, "status": data.get("status"),
+                "effective_status": data.get("effective_status"),
+                "targeting": data.get("targeting") or {}}
+
+    async def update_adset_targeting(
+        self, adset_id: str, targeting: dict, validate_only: bool = False,
+    ) -> dict:
+        """Write new targeting to a live ad set, then READ IT BACK.
+
+        Meta answering 200 means the request was accepted, not that the ad set now
+        carries what we sent (PRD CM13). So this returns the targeting Meta actually
+        holds afterwards and the caller compares — an ack is not evidence.
+
+        `validate_only` asks Meta to check without changing anything. Live-verified
+        that this genuinely validates targeting: age_min 5 and an invented interest id
+        are both rejected, unlike the creative endpoint which ignores the Instagram
+        identity entirely.
+        """
+        payload = {"targeting": json.dumps(targeting),
+                   "access_token": self._access_token}
+        if validate_only:
+            payload["execution_options"] = json.dumps(["validate_only"])
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(f"{self._graph_base}/{adset_id}", data=payload)
+            data = resp.json()
+            _raise_for_error(data, "adset targeting update")
+            if validate_only:
+                return {"validated": True}
+
+            # Readback. A timeout above raises; a 200 here still has to be proved.
+            confirm = await client.get(
+                f"{self._graph_base}/{adset_id}",
+                params={"access_token": self._access_token, "fields": "id,targeting"},
+            )
+            confirmed = confirm.json()
+            _raise_for_error(confirmed, "adset targeting readback")
+        return {"applied": True, "targeting": confirmed.get("targeting") or {}}
 
     async def delete_campaign(self, campaign_id: str) -> bool:
         """Permanently delete the campaign on Meta's side (cascades to its ad set and

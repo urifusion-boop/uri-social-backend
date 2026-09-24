@@ -41,6 +41,7 @@ def _no_named_geo_by_default(monkeypatch):
     async def _unresolved(name, expected_region, access_token="", timeout=8.0):
         return None
 
+    monkeypatch.setattr("app.agents.jane_ads.geo_names.region_for", _fixed_region)
     monkeypatch.setattr("app.agents.jane_ads.geo_names.resolve_named_location", _unresolved)
 
 
@@ -296,6 +297,7 @@ def test_launch_campaign_targets_the_plans_actual_geo_pins(monkeypatch):
     async def _resolved(name, expected_region, access_token="", timeout=8.0):
         return {"type": "city", "key": "1625140", "name": "Ikeja", "region": "Lagos State"}
 
+    monkeypatch.setattr("app.agents.jane_ads.geo_names.region_for", _fixed_region)
     monkeypatch.setattr("app.agents.jane_ads.geo_names.resolve_named_location", _resolved)
     geo = GeoPlan(mode=GeoMode.OWN_RADIUS, city="Ikeja", pins=[
         GeoPin(name="Ikeja", lat=6.6018, lng=3.3515, radius_km=3.0),
@@ -701,6 +703,12 @@ def test_a_website_destination_never_goes_native():
     assert spec["link_data"]["link"] == "https://example.com/shop"
 
 
+async def _fixed_region(place, access_token="", timeout=8.0):
+    """geo resolves the campaign's STATE before guarding pockets against it. Tests
+    pin it so they exercise the matching, not Meta's gazetteer."""
+    return "Lagos State"
+
+
 # ── Named locations (DASH: "show exact locations, not longitude and latitude") ──
 
 def test_a_verified_pocket_is_sent_as_a_named_location(monkeypatch):
@@ -710,6 +718,7 @@ def test_a_verified_pocket_is_sent_as_a_named_location(monkeypatch):
     async def _resolved(name, expected_region, access_token="", timeout=8.0):
         return {"type": "city", "key": "1625140", "name": "Ikeja", "region": "Lagos State"}
 
+    monkeypatch.setattr("app.agents.jane_ads.geo_names.region_for", _fixed_region)
     monkeypatch.setattr("app.agents.jane_ads.geo_names.resolve_named_location", _resolved)
     geo = GeoPlan(mode=GeoMode.OWN_RADIUS, city="Lagos", pins=[
         GeoPin(name="Ikeja", lat=6.6018, lng=3.3515, radius_km=3.0),
@@ -737,6 +746,7 @@ def test_an_unresolvable_pocket_is_dropped_never_sent_as_coordinates(monkeypatch
             return {"type": "city", "key": "1234", "name": "Lagos", "region": "Lagos State"}
         return None
 
+    monkeypatch.setattr("app.agents.jane_ads.geo_names.region_for", _fixed_region)
     monkeypatch.setattr("app.agents.jane_ads.geo_names.resolve_named_location", _only_the_city)
     geo = GeoPlan(mode=GeoMode.OWN_RADIUS, city="Lagos", pins=[
         GeoPin(name="Computer Village", lat=6.5960, lng=3.3420, radius_km=1.5),
@@ -761,6 +771,7 @@ def test_an_unnamed_pocket_never_drags_coordinates_in_beside_a_named_one(monkeyp
             return {"type": "city", "key": "1625140", "name": "Ikeja", "region": "Lagos State"}
         return None
 
+    monkeypatch.setattr("app.agents.jane_ads.geo_names.region_for", _fixed_region)
     monkeypatch.setattr("app.agents.jane_ads.geo_names.resolve_named_location", _resolve_only_ikeja)
     geo = GeoPlan(mode=GeoMode.OWN_RADIUS, city="Lagos", pins=[
         GeoPin(name="Ikeja", lat=6.6018, lng=3.3515, radius_km=3.0),
@@ -786,6 +797,7 @@ def test_when_nothing_can_be_named_it_widens_to_the_state_not_a_pin(monkeypatch)
     async def _region(region_name, access_token="", timeout=8.0):
         return {"type": "region", "key": "3871", "name": "Lagos State", "region": "Lagos State"}
 
+    monkeypatch.setattr("app.agents.jane_ads.geo_names.region_for", _fixed_region)
     monkeypatch.setattr("app.agents.jane_ads.geo_names.resolve_named_location", _nothing)
     monkeypatch.setattr("app.agents.jane_ads.geo_names.resolve_region", _region)
     geo = GeoPlan(mode=GeoMode.OWN_RADIUS, city="Lagos", pins=[
@@ -807,6 +819,7 @@ def test_with_every_lookup_dead_it_falls_back_to_the_country(monkeypatch):
     async def _boom(*a, **kw):
         raise RuntimeError("meta search unavailable")
 
+    monkeypatch.setattr("app.agents.jane_ads.geo_names.region_for", _fixed_region)
     monkeypatch.setattr("app.agents.jane_ads.geo_names.resolve_named_location", _boom)
     monkeypatch.setattr("app.agents.jane_ads.geo_names.resolve_region", _boom)
     geo = GeoPlan(mode=GeoMode.OWN_RADIUS, city="Lagos", pins=[
@@ -821,3 +834,104 @@ def test_with_every_lookup_dead_it_falls_back_to_the_country(monkeypatch):
     geo_locations = mock_client.post.call_args_list[1].kwargs["json"]["targeting"]["geo_locations"]
     assert geo_locations == {"countries": ["NG"]}
     assert "custom_locations" not in geo_locations
+
+
+def test_a_city_is_resolved_to_its_state_before_pockets_are_matched(monkeypatch):
+    """Live-reported: the region guard was fed the campaign's CITY ("Ikeja"), but Meta
+    reports every hit's region as the STATE ("Lagos State"). Opebi and Alausa — both
+    real, targetable locations — were rejected, the city fallback failed for the same
+    reason, and the campaign silently dropped to all of Nigeria."""
+    seen = {}
+
+    async def _region_for(place, access_token="", timeout=8.0):
+        seen["asked"] = place
+        return "Lagos State"
+
+    async def _resolve(name, expected_region, access_token="", timeout=8.0):
+        seen.setdefault("guards", []).append(expected_region)
+        if expected_region == "Lagos State" and name in ("Opebi", "Alausa"):
+            return {"type": "neighborhood", "key": f"k_{name}", "name": name,
+                    "region": "Lagos State"}
+        return None
+
+    monkeypatch.setattr("app.agents.jane_ads.geo_names.region_for", _region_for)
+    monkeypatch.setattr("app.agents.jane_ads.geo_names.resolve_named_location", _resolve)
+    geo = GeoPlan(mode=GeoMode.OWN_RADIUS, city="Ikeja", pins=[
+        GeoPin(name="Opebi", lat=6.6, lng=3.35),
+        GeoPin(name="Alausa", lat=6.61, lng=3.36),
+    ])
+    responses = [{"id": "cmp_1"}, {"id": "adset_1"}, {"id": "creative_1"}, {"id": "ad_1"}]
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client(responses)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        _run(_adapter().launch_campaign(_plan(geo=geo), _auth()))
+
+    geo_locations = mock_client.post.call_args_list[1].kwargs["json"]["targeting"]["geo_locations"]
+    assert seen["asked"] == "Ikeja"                 # the city went in
+    assert seen["guards"] == ["Lagos State", "Lagos State"]   # the STATE guarded
+    assert geo_locations["neighborhoods"] == [{"key": "k_Opebi"}, {"key": "k_Alausa"}]
+    assert "countries" not in geo_locations         # never silently nationwide
+
+
+# ── An audience Meta will not deliver to ──────────────────────────────────────
+
+def test_a_too_narrow_audience_widens_instead_of_failing_the_launch(monkeypatch):
+    """Live-reported: Opebi + Allen Avenue + Ogba as NAMED neighbourhoods estimated a
+    reach of 1,000 and Meta refused the ad set outright (subcode 2446395). Named areas
+    carry their real boundaries, far smaller than the radius pins they replaced."""
+    async def _region_for(place, access_token="", timeout=8.0):
+        return "Lagos State"
+
+    async def _resolve(name, expected_region, access_token="", timeout=8.0):
+        kind = "city" if name == "Ikeja" else "neighborhood"
+        return {"type": kind, "key": f"k_{name}", "name": name, "region": "Lagos State"}
+
+    monkeypatch.setattr("app.agents.jane_ads.geo_names.region_for", _region_for)
+    monkeypatch.setattr("app.agents.jane_ads.geo_names.resolve_named_location", _resolve)
+
+    geo = GeoPlan(mode=GeoMode.OWN_RADIUS, city="Ikeja",
+                  pins=[GeoPin(name="Opebi"), GeoPin(name="Ogba")])
+    too_narrow = {"error": {"code": 100, "error_subcode": 2446395,
+                            "message": "The configured audience is not valid"}}
+    responses = [{"id": "cmp_1"}, too_narrow, {"id": "adset_1"},
+                 {"id": "creative_1"}, {"id": "ad_1"}]
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client(responses)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        out = _run(_adapter().launch_campaign(_plan(geo=geo), _auth()))
+
+    assert out.campaign_id == "cmp_1"          # the launch SUCCEEDS
+    first = mock_client.post.call_args_list[1].kwargs["json"]["targeting"]["geo_locations"]
+    second = mock_client.post.call_args_list[2].kwargs["json"]["targeting"]["geo_locations"]
+    assert "neighborhoods" in first            # tried the tight pockets first
+    assert second == {"cities": [{"key": "k_Ikeja"}]}   # widened one rung, not to NG
+
+
+def test_widening_keeps_everything_that_is_not_geography(monkeypatch):
+    """Only the geography widens. Losing the interests or the age range while chasing
+    reach would change the audience the client actually approved."""
+    from app.agents.jane_ads.geo import widen_targeting
+
+    async def _region_for(place, access_token="", timeout=8.0):
+        return "Lagos State"
+
+    async def _resolve(name, expected_region, access_token="", timeout=8.0):
+        return {"type": "city", "key": "k_city", "name": name, "region": "Lagos State"}
+
+    monkeypatch.setattr("app.agents.jane_ads.geo_names.region_for", _region_for)
+    monkeypatch.setattr("app.agents.jane_ads.geo_names.resolve_named_location", _resolve)
+    out = _run(widen_targeting(
+        {"geo_locations": {"neighborhoods": [{"key": "1"}]},
+         "age_min": 25, "genders": [2], "flexible_spec": [{"interests": [{"id": "9"}]}]},
+        "Ikeja"))
+    assert out["age_min"] == 25
+    assert out["genders"] == [2]
+    assert out["flexible_spec"] == [{"interests": [{"id": "9"}]}]
+    assert out["geo_locations"] == {"cities": [{"key": "k_city"}]}
+
+
+def test_widening_stops_at_the_country(monkeypatch):
+    """Nothing is broader than nationwide, so it must give up rather than loop."""
+    from app.agents.jane_ads.geo import widen_targeting
+
+    assert _run(widen_targeting({"geo_locations": {"countries": ["NG"]}}, "Ikeja")) is None

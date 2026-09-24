@@ -625,7 +625,15 @@ def _enforce_hard_requirements(brief: ConsultantBrief, message: str, history: li
             goal=brief.goal, offer_type=brief.offer_type,
             clarify="What budget would you like to spend on this specific campaign?",
         )
-    if not brief.geo_mode and not brief.city:
+    # A geo_mode on its own is NOT an answer. The model can return
+    # geo_mode="own_radius" with no city and no areas, which passed the old
+    # `not geo_mode and not city` check and then produced a plan with zero pins: Jane
+    # never asked where, and the client's plan card showed no locations at all.
+    # Live-reported.
+    #
+    # NON_LOCAL is the one mode that genuinely needs no place — it means geography
+    # does not matter for this business, which is itself the answer.
+    if (brief.geo_mode or "").strip().lower() != "non_local" and not (brief.city or brief.geo_areas):
         return ConsultantBrief(
             business_name=brief.business_name, category=brief.category,
             goal=brief.goal, offer_type=brief.offer_type,
