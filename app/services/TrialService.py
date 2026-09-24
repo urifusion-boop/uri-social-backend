@@ -39,9 +39,11 @@ class TrialService:
 
     @property
     def db(self) -> AsyncIOMotorDatabase:
-        if self._db is None:
-            self._db = get_db()
-        return self._db
+        # Never cache the live handle beyond this call — see CreditService.db
+        # for why: a cached reference here survives a DocumentDB password
+        # rotation with the dead old password baked in, which took prod down.
+        # _db only ever holds a value in tests, which inject a substitute.
+        return self._db if self._db is not None else get_db()
 
     @property
     def trials_collection(self):
