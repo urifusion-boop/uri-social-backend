@@ -337,7 +337,9 @@ def test_launch_campaign_followers_goal_builds_engagement_not_whatsapp():
     campaign_json = mock_client.post.call_args_list[0].kwargs["json"]
     assert campaign_json["objective"] == "OUTCOME_ENGAGEMENT"
     adset_json = mock_client.post.call_args_list[1].kwargs["json"]
-    assert adset_json["optimization_goal"] == "POST_ENGAGEMENT"
+    # PAGE_LIKES, not POST_ENGAGEMENT: Meta rejects the latter on a Page-promoting
+    # ad set ("Performance goal isn't available", subcode 2446286).
+    assert adset_json["optimization_goal"] == "PAGE_LIKES"
     assert "destination_type" not in adset_json and "promoted_object" not in adset_json
     creative_spec = mock_client.post.call_args_list[2].kwargs["json"]["object_story_spec"]
     assert creative_spec["link_data"]["call_to_action"] == {"type": "LIKE_PAGE", "value": {"page": "pg123"}}
@@ -541,7 +543,7 @@ def test_followers_goal_keeps_engagement_objective_and_page_link():
         _run(adapter.launch_campaign(plan, _auth()))
 
     assert mock_client.post.call_args_list[0].kwargs["json"]["objective"] == "OUTCOME_ENGAGEMENT"
-    assert mock_client.post.call_args_list[1].kwargs["json"]["optimization_goal"] == "POST_ENGAGEMENT"
+    assert mock_client.post.call_args_list[1].kwargs["json"]["optimization_goal"] == "PAGE_LIKES"
     link_data = mock_client.post.call_args_list[2].kwargs["json"]["object_story_spec"]["link_data"]
     assert link_data["link"] == "https://www.facebook.com/pg123"
     assert link_data["call_to_action"]["type"] == "LIKE_PAGE"
