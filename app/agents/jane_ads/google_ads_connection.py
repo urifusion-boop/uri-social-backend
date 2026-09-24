@@ -116,8 +116,19 @@ def _parse_json_response(resp: httpx.Response, context: str) -> dict:
 
 
 def _raise_for_error(data: dict, context: str) -> None:
+    """Two DIFFERENT Google error envelope shapes flow through here: the Ads REST
+    API's ({"error": {"message": ..., "details": [...]}}, data["error"] a dict) and
+    the OAuth2 TOKEN endpoint's standard shape ({"error": "invalid_grant",
+    "error_description": "..."}, data["error"] a bare string) — exchange_code_for_tokens
+    hits the latter. Assuming the dict shape unconditionally crashed with
+    AttributeError: 'str' object has no attribute 'get' on any real OAuth failure
+    (bad client secret, expired/reused code, etc.), which masked the actual reason
+    instead of surfacing it — confirmed live on staging."""
     if "error" in data:
         err = data["error"]
+        if isinstance(err, str):
+            detail = data.get("error_description") or err
+            raise GoogleAdsConnectionError(f"{context}: {detail}")
         detail = err.get("message") or "unknown error"
         details = err.get("details") or []
         if details:
