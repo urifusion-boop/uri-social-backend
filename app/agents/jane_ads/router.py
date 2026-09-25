@@ -4118,18 +4118,50 @@ async def extend_quote(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
     brand_ctx: dict = Depends(get_active_brand_context),
 ) -> dict:
-    """What keeping this campaign running would cost — before anything is charged."""
+    """What keeping this campaign running would cost — before anything is charged.
+
+    Meta and TikTok both handled (2026-09-25) — the route stays named
+    /meta/campaigns/... for backwards compatibility, same as the other
+    dual-platform endpoints in this file.
+    """
     from app.core.config import settings
 
-    from .adapters.meta import MetaAdPlatformAdapter, MetaAPIError
     from .extend import ExtendError, new_end_time, quote
     from .store import MongoWalletStore
     from .wallet import WalletService
 
-    brand_id = brand_ctx.get("brand_id")
-    record = await db["jane_ads_meta_campaigns"].find_one({"campaign_id": campaign_id})
-    if not record or record.get("brand_id") != brand_id:
-        raise HTTPException(status_code=404, detail="Campaign not found")
+    record, is_tiktok = await _live_campaign(db, campaign_id, brand_ctx.get("brand_id"))
+
+    if is_tiktok:
+        from .adapters.tiktok import TikTokAdsAdapter, TikTokAdsAPIError
+
+        if not (settings.TIKTOK_ADS_ADVERTISER_ID and settings.TIKTOK_ADS_ACCESS_TOKEN):
+            raise HTTPException(status_code=400, detail="TikTok ads not configured")
+        adapter = TikTokAdsAdapter(db, advertiser_id=settings.TIKTOK_ADS_ADVERTISER_ID, access_token=settings.TIKTOK_ADS_ACCESS_TOKEN)
+        try:
+            sched = await adapter.fetch_adgroup_schedule(campaign_id)
+        except TikTokAdsAPIError as e:
+            _raise_http_for_tiktok_error(e)
+
+        markup = float(record.get("ad_spend_markup") or C.LEGACY_AD_SPEND_MARKUP)
+        try:
+            q = quote(sched["daily_ngn"], days, markup,
+                      floor=C.HARD_FLOOR_DAILY_NGN["tiktok"], platform_name="TikTok")
+        except ExtendError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+        balance = await WalletService(MongoWalletStore(db)).get_balance(record["business_id"])
+        return {
+            **q,
+            "campaign_id": campaign_id,
+            "current_end_time": sched["end_time"],
+            "new_end_time": new_end_time(sched["end_time"], days).isoformat(),
+            "has_ended": sched["has_ended"],
+            "wallet_balance_ngn": balance,
+            "affordable": balance >= q["total_due_ngn"],
+        }
+
+    from .adapters.meta import MetaAdPlatformAdapter, MetaAPIError
 
     adapter = MetaAdPlatformAdapter(db, access_token=settings.META_ADS_ACCESS_TOKEN)
     try:
@@ -4165,36 +4197,102 @@ async def extend_campaign(
 ) -> dict:
     """Keep a campaign running past the date it was set to end.
 
-    Keeps the campaign id, the ad set, the creative and everything Meta has learned
-    about who responds — only the end date moves. Starting a replacement campaign
-    instead throws that learning away, which is worst for exactly the campaigns worth
-    continuing.
+    Keeps the campaign id, the ad set, the creative and everything the platform has
+    learned about who responds — only the end date (and, on TikTok, the budget —
+    see extend_adgroup's own docstring for why) moves. Starting a replacement
+    campaign instead throws that learning away, which is worst for exactly the
+    campaigns worth continuing.
 
     Order matters and mirrors the launch: the wallet is checked first so the common
-    failure is a clean refusal, Meta is extended next, and the client is charged only
-    once Meta has confirmed the new end date. Nobody pays for delivery they did not get.
+    failure is a clean refusal, the platform is extended next, and the client is
+    charged only once it has confirmed the new end date. Nobody pays for delivery
+    they did not get. Meta and TikTok both handled (2026-09-25).
     """
     from datetime import datetime, timezone
 
     from app.core.config import settings
 
-    from .adapters.meta import MetaAdPlatformAdapter, MetaAPIError
     from .extend import ExtendError, new_end_time, quote
     from .store import MongoWalletStore
     from .wallet import InsufficientFundsError, WalletService
 
     brand_id = brand_ctx.get("brand_id")
-    record = await db["jane_ads_meta_campaigns"].find_one({"campaign_id": campaign_id})
-    if not record or record.get("brand_id") != brand_id:
-        raise HTTPException(status_code=404, detail="Campaign not found")
+    record, is_tiktok = await _live_campaign(db, campaign_id, brand_id)
     if not body.confirm:
         raise HTTPException(
             status_code=400,
             detail="Extending restarts spending on this campaign — confirm to go ahead.",
         )
+    wallet = WalletService(MongoWalletStore(db))
+
+    if is_tiktok:
+        from .adapters.tiktok import TikTokAdsAdapter, TikTokAdsAPIError
+
+        if not (settings.TIKTOK_ADS_ADVERTISER_ID and settings.TIKTOK_ADS_ACCESS_TOKEN):
+            raise HTTPException(status_code=400, detail="TikTok ads not configured")
+        adapter = TikTokAdsAdapter(db, advertiser_id=settings.TIKTOK_ADS_ADVERTISER_ID, access_token=settings.TIKTOK_ADS_ACCESS_TOKEN)
+        try:
+            sched = await adapter.fetch_adgroup_schedule(campaign_id)
+        except TikTokAdsAPIError as e:
+            _raise_http_for_tiktok_error(e)
+
+        markup = float(record.get("ad_spend_markup") or C.LEGACY_AD_SPEND_MARKUP)
+        try:
+            q = quote(sched["daily_ngn"], body.days, markup,
+                      floor=C.HARD_FLOOR_DAILY_NGN["tiktok"], platform_name="TikTok")
+        except ExtendError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+        balance = await wallet.get_balance(record["business_id"])
+        if balance < q["total_due_ngn"]:
+            raise HTTPException(
+                status_code=402,
+                detail=f"₦{q['total_due_ngn']:,.0f} needed to run {body.days} more day(s) at "
+                       f"₦{q['daily_ngn']:,.0f}/day — your wallet has ₦{balance:,.0f}. Top up first.",
+            )
+
+        ends_at = new_end_time(sched["end_time"], body.days)
+        # Both fields move together — see extend_adgroup's own docstring for why
+        # pushing only the end date would spread the SAME total budget thinner
+        # rather than actually buying more delivery on a BUDGET_MODE_TOTAL ad group.
+        new_budget = round(sched["budget_ngn"] + q["ad_spend_ngn"], 2)
+        try:
+            confirmed = await adapter.extend_adgroup(sched["adgroup_id"], new_budget, ends_at)
+        except TikTokAdsAPIError as e:
+            raise HTTPException(status_code=502, detail=f"TikTok did not accept the new end date: {e}")
+
+        try:
+            await wallet.charge_ad_spend(record["business_id"], q["total_due_ngn"],
+                                         campaign_id=campaign_id)
+        except InsufficientFundsError:
+            raise HTTPException(
+                status_code=402,
+                detail="The campaign was extended but your wallet could not cover it — "
+                       "top up now, or pause the campaign to stop it spending.",
+            )
+
+        await db["jane_ads_tiktok_campaigns"].update_one(
+            {"campaign_id": campaign_id},
+            {"$inc": {"charged_upfront_ngn": q["total_due_ngn"]},
+             "$push": {"extensions": {
+                 "days": body.days, "daily_ngn": q["daily_ngn"],
+                 "charged_ngn": q["total_due_ngn"], "new_end_time": ends_at.isoformat(),
+                 "at": datetime.now(timezone.utc),
+             }}},
+        )
+        return {
+            "campaign_id": campaign_id,
+            "extended_by_days": body.days,
+            "charged_ngn": q["total_due_ngn"],
+            "end_time": confirmed.get("end_time"),
+            "wallet_balance_ngn": await wallet.get_balance(record["business_id"]),
+            "note": "Same campaign, same creative — it keeps everything TikTok has learned. "
+                    "It runs until this date unless you pause it.",
+        }
+
+    from .adapters.meta import MetaAdPlatformAdapter, MetaAPIError
 
     adapter = MetaAdPlatformAdapter(db, access_token=settings.META_ADS_ACCESS_TOKEN)
-    wallet = WalletService(MongoWalletStore(db))
     try:
         sched = await adapter.fetch_adset_schedule(campaign_id)
     except MetaAPIError as e:

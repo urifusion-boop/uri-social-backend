@@ -10,6 +10,7 @@ responses helper covering both .get and .post (TikTok's reporting calls are GET,
 its mutation calls are POST).
 """
 import asyncio
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -27,6 +28,8 @@ from app.agents.jane_ads.adapters.tiktok import (
     _tiktok_gender_for,
     _tiktok_interest_names,
     _tiktok_location_names,
+    _tiktok_schedule_days,
+    _tiktok_schedule_has_ended,
     _video_thumbnail_url,
 )
 from app.agents.jane_ads.models import (
@@ -1173,3 +1176,81 @@ def test_delete_campaign_raises_on_error():
         MockClient.return_value.__aenter__.return_value = mock_client
         with pytest.raises(TikTokAdsAPIError, match="already deleted"):
             _run(adapter.delete_campaign("111"))
+
+
+# ── "Keep it running": schedule helpers ──────────────────────────────────────
+
+def test_schedule_days_counts_whole_days_between_tiktok_timestamps():
+    assert _tiktok_schedule_days("2026-09-20 10:00:00", "2026-09-27 10:00:00") == 7
+
+
+def test_schedule_days_is_zero_on_missing_or_unparseable_timestamps():
+    assert _tiktok_schedule_days(None, "2026-09-27 10:00:00") == 0
+    assert _tiktok_schedule_days("2026-09-20 10:00:00", None) == 0
+    assert _tiktok_schedule_days("not a date", "2026-09-27 10:00:00") == 0
+
+
+def test_schedule_has_ended_true_for_a_past_end_time():
+    past = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+    assert _tiktok_schedule_has_ended(past) is True
+
+
+def test_schedule_has_ended_false_for_a_future_end_time():
+    future = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+    assert _tiktok_schedule_has_ended(future) is False
+
+
+def test_schedule_has_ended_false_on_missing_or_unparseable_end_time():
+    assert _tiktok_schedule_has_ended(None) is False
+    assert _tiktok_schedule_has_ended("not a date") is False
+
+
+# ── "Keep it running": fetch_adgroup_schedule / extend_adgroup ──────────────────
+
+def test_fetch_adgroup_schedule_derives_daily_rate_from_the_total_budget():
+    db = FakeDb()
+    db["jane_ads_tiktok_campaigns"].docs["111"] = {"business_id": "b1", "adgroup_id": "222", "ad_id": "333"}
+    adapter = _adapter(db)
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client([{
+            "code": 0, "message": "OK",
+            "data": {"list": [{
+                "adgroup_id": "222", "operation_status": "ENABLE",
+                "budget": 217000.0, "budget_mode": "BUDGET_MODE_TOTAL",
+                "schedule_start_time": "2026-09-20 10:00:00",
+                "schedule_end_time": "2026-09-27 10:00:00",
+            }]},
+        }])
+        MockClient.return_value.__aenter__.return_value = mock_client
+        result = _run(adapter.fetch_adgroup_schedule("111"))
+    assert result["adgroup_id"] == "222"
+    assert result["budget_ngn"] == 217000.0
+    assert result["daily_ngn"] == 31000.0  # 217,000 / 7 days
+    assert result["has_ended"] is False
+
+
+def test_fetch_adgroup_schedule_raises_when_no_adgroup_recorded():
+    db = FakeDb()
+    db["jane_ads_tiktok_campaigns"].docs["111"] = {"business_id": "b1"}
+    adapter = _adapter(db)
+    with pytest.raises(TikTokAdsAPIError, match="no ad group recorded"):
+        _run(adapter.fetch_adgroup_schedule("111"))
+
+
+def test_extend_adgroup_writes_new_budget_and_end_date_then_reads_back():
+    adapter = _adapter()
+    new_end = datetime(2026, 10, 4, 10, 0, tzinfo=timezone.utc)
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client([
+            {"code": 0, "message": "OK", "data": {}},
+            {"code": 0, "message": "OK", "data": {"list": [
+                {"budget": 248000.0, "schedule_end_time": "2026-10-04 10:00:00"},
+            ]}},
+        ])
+        MockClient.return_value.__aenter__.return_value = mock_client
+        result = _run(adapter.extend_adgroup("222", 248000.0, new_end))
+    assert result == {"budget_ngn": 248000.0, "end_time": "2026-10-04 10:00:00"}
+    write_json = mock_client.post.call_args.kwargs["json"]
+    assert write_json["adgroup_id"] == "222"
+    assert write_json["budget"] == 248000.0
+    assert write_json["schedule_end_time"] == "2026-10-04 10:00:00"
