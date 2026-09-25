@@ -130,33 +130,69 @@ def _tiktok_age_groups_for(targeting: dict) -> list[str]:
     return groups or [enum for enum, _, _ in _TIKTOK_AGE_BUCKETS]
 
 
-async def _resolve_tiktok_locations(
-    names: list[str], advertiser_id: str, access_token: str,
-) -> tuple[list[dict], list[str]]:
-    """Resolve named areas ("Ikeja", "Lekki Peninsula"...) to TikTok location_ids.
+_TIKTOK_GENDER_TO_CHOICE = {"GENDER_MALE": "men", "GENDER_FEMALE": "women", "GENDER_UNLIMITED": "all"}
 
-    Returns ({"name": <TikTok's own canonical name>, "location_id": ...}, ...) for
-    what resolved rather than bare ids — plan_fields.py's review-panel edit path
-    needs the matched NAME too (to store as a GeoPin, the same shape Meta's own
-    location edits use), not just the id launch_campaign() itself cares about.
 
-    Unlike Meta's location search, TikTok's /tool/region/ has no per-country
-    filter or name-search parameter — the whole location tree comes back in one
-    call, at whatever level_range is asked for, and matching a name against it
-    happens here rather than server-side. Confirmed against TikTok's own
-    /tool/region/ reference (2026-09-25); NOT yet verified live — the exact
-    field names (location_id/name/next_level_ids/region_code) are taken
-    directly from the documented response shape, first real call against a real
-    (non-sandbox) advertiser account happens whenever this is next exercised.
+def _tiktok_gender_choice(gender: str) -> str:
+    """The reverse of _tiktok_gender_for — TikTok's own enum back to the same
+    all/men/women choice the live-targeting editor's Gender field uses,
+    for DISPLAYING a live ad group's current targeting."""
+    return _TIKTOK_GENDER_TO_CHOICE.get(gender, "all")
 
-    Never returns an empty list when names were given but none resolved and the
-    lookup itself also failed — the caller falls back to Nigeria-wide targeting
-    rather than sending TikTok an empty location_ids, which the launch would
-    reject outright.
+
+def _tiktok_age_range_from_groups(age_groups: list[str]) -> tuple[int, int]:
+    """The reverse of _tiktok_age_groups_for — reconstructs a continuous
+    [age_min, age_max] span covering every bucket TikTok says is currently
+    targeted, for DISPLAYING a live ad group's current targeting as the same
+    editable min/max numbers the pre-launch panel uses. An edit still goes
+    through _tiktok_age_groups_for on save, so a range that started as a real
+    min/max round-trips exactly; a live ad group with every bucket set (the
+    "everyone" default) reconstructs to the full 18-100 span, same as an
+    unset range would produce going forward."""
+    buckets = {enum: (lo, hi) for enum, lo, hi in _TIKTOK_AGE_BUCKETS}
+    present = [buckets[g] for g in (age_groups or []) if g in buckets]
+    if not present:
+        return 18, 100
+    return min(lo for lo, hi in present), max(hi for lo, hi in present)
+
+
+async def _tiktok_location_names(
+    location_ids: list[str], advertiser_id: str, access_token: str,
+) -> list[str]:
+    """The reverse of _resolve_tiktok_locations — given ids a live ad group
+    already carries, look up their display names via the same /tool/region/
+    tree fetch, so the live-targeting editor can show "Ikeja" instead of a
+    raw numeric id. Falls back to the raw ids themselves if the lookup fails
+    or a specific id isn't found — showing SOMETHING (even an opaque id) beats
+    silently dropping a location the ad group is actually running in."""
+    if not location_ids:
+        return []
+    nigeria_locations = await _fetch_tiktok_nigeria_locations(advertiser_id, access_token)
+    if nigeria_locations is None:
+        return list(location_ids)
+    by_id = {n["location_id"]: n.get("name", n["location_id"]) for n in nigeria_locations}
+    return [by_id.get(lid, lid) for lid in location_ids]
+
+
+async def _fetch_tiktok_nigeria_locations(
+    advertiser_id: str, access_token: str,
+) -> Optional[list[dict]]:
+    """Fetch TikTok's whole location tree once and return just Nigeria's subtree
+    (province -> city -> district), walked from the country entry rather than
+    searched from the full global list. Shared by both directions of the
+    name<->id lookup: _resolve_tiktok_locations (name -> id, for saving an
+    edit) and _tiktok_location_names (id -> name, for displaying a live ad
+    group's current targeting). Returns None on any failure (network, a
+    non-zero code, or no Nigeria entry at all) rather than raising — every
+    caller has its own honest fallback for "couldn't resolve locations right
+    now" rather than treating a lookup failure as fatal.
+
+    Confirmed against TikTok's own /tool/region/ reference (2026-09-25); NOT
+    yet verified live — the exact field names (location_id/name/
+    next_level_ids/region_code) are taken directly from the documented
+    response shape, first real call against a real (non-sandbox) advertiser
+    account happens whenever this is next exercised.
     """
-    rejected: list[str] = []
-    if not names:
-        return [], rejected
     api_base = f"{settings.TIKTOK_ADS_API_BASE}/open_api/{settings.TIKTOK_ADS_API_VERSION}"
     try:
         async with httpx.AsyncClient(timeout=20) as client:
@@ -172,20 +208,18 @@ async def _resolve_tiktok_locations(
             )
             data = resp.json()
     except Exception as e:
-        print(f"[TikTokAdsAdapter] location lookup failed, falling back to Nigeria-wide: {e}", flush=True)
-        return [], list(names)
+        print(f"[TikTokAdsAdapter] /tool/region/ lookup failed: {e}", flush=True)
+        return None
     if data.get("code") not in (0, None):
         print(f"[TikTokAdsAdapter] /tool/region/ rejected: {data.get('message')}", flush=True)
-        return [], list(names)
+        return None
 
     region_info = (data.get("data") or {}).get("region_info") or []
     by_id = {r["location_id"]: r for r in region_info if r.get("location_id")}
     nigeria = next((r for r in region_info if r.get("region_code") == "NG"), None)
     if not nigeria:
-        return [], list(names)
+        return None
 
-    # Walk the whole Nigeria subtree once (province -> city -> district) rather
-    # than searching the full global list per name.
     nigeria_locations: list[dict] = [nigeria]
     frontier = list(nigeria.get("next_level_ids") or [])
     seen = {nigeria["location_id"]}
@@ -199,6 +233,34 @@ async def _resolve_tiktok_locations(
             continue
         nigeria_locations.append(node)
         frontier.extend(node.get("next_level_ids") or [])
+    return nigeria_locations
+
+
+async def _resolve_tiktok_locations(
+    names: list[str], advertiser_id: str, access_token: str,
+) -> tuple[list[dict], list[str]]:
+    """Resolve named areas ("Ikeja", "Lekki Peninsula"...) to TikTok location_ids.
+
+    Returns ({"name": <TikTok's own canonical name>, "location_id": ...}, ...) for
+    what resolved rather than bare ids — plan_fields.py's review-panel edit path
+    needs the matched NAME too (to store as a GeoPin, the same shape Meta's own
+    location edits use), not just the id launch_campaign() itself cares about.
+
+    Unlike Meta's location search, TikTok's /tool/region/ has no per-country
+    filter or name-search parameter — the whole location tree comes back in one
+    call, matching happens locally (see _fetch_tiktok_nigeria_locations).
+
+    Never returns an empty list when names were given but none resolved and the
+    lookup itself also failed — the caller falls back to Nigeria-wide targeting
+    rather than sending TikTok an empty location_ids, which the launch would
+    reject outright.
+    """
+    rejected: list[str] = []
+    if not names:
+        return [], rejected
+    nigeria_locations = await _fetch_tiktok_nigeria_locations(advertiser_id, access_token)
+    if nigeria_locations is None:
+        return [], list(names)
 
     resolved: list[dict] = []
     for raw in names[:3]:
@@ -1080,16 +1142,128 @@ class TikTokAdsAdapter(AdPlatformAdapter):
 
         return {"status": status, "updated": updated}
 
+    async def fetch_adgroup_targeting(self, campaign_id: str) -> dict:
+        """Who a LIVE TikTok ad group is currently targeting, read fresh from
+        TikTok — mirrors MetaAdPlatformAdapter.fetch_adset_targeting's shape and
+        purpose exactly (Campaign Management PRD §19's "Audience or geography
+        edit"), so live_edit.py can offer the same editor for both platforms.
+
+        Returns TikTok's own wire-format targeting (gender enum, age_groups
+        list, location_ids list) — NOT the Meta-shaped audience_targeting dict
+        used elsewhere in this codebase; live_edit.py's TikTok-native functions
+        convert as needed for display.
+
+        NOT yet verified live — GET /adgroup/get/ follows the exact same
+        advertiser_id + filtering(JSON) + fields(JSON) shape every other GET in
+        this file already uses (campaign/get/, tool/region/), but this specific
+        call has never been made against a real account yet."""
+        record = await self._get_campaign_record(campaign_id)
+        adgroup_id = record.get("adgroup_id", "")
+        if not adgroup_id:
+            raise TikTokAdsAPIError(f"campaign {campaign_id} has no ad group recorded")
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(
+                f"{self._api_base}/adgroup/get/",
+                headers=self._headers(),
+                params={
+                    "advertiser_id": self._advertiser_id,
+                    "filtering": json.dumps({"adgroup_ids": [adgroup_id]}),
+                    "fields": json.dumps(["adgroup_id", "operation_status", "gender", "age_groups", "location_ids"]),
+                },
+            )
+            data = resp.json()
+        _raise_for_error(data, "adgroup targeting read")
+        rows = (data.get("data") or {}).get("list") or []
+        if not rows:
+            raise TikTokAdsAPIError(f"ad group {adgroup_id} not found on TikTok")
+        row = rows[0]
+        return {
+            "adgroup_id": adgroup_id,
+            "operation_status": row.get("operation_status"),
+            "targeting": {
+                "gender": row.get("gender") or "GENDER_UNLIMITED",
+                "age_groups": row.get("age_groups") or [],
+                "location_ids": row.get("location_ids") or [],
+            },
+        }
+
+    async def update_adgroup_targeting(
+        self, adgroup_id: str, targeting: dict, validate_only: bool = False,
+    ) -> dict:
+        """Write new targeting to a live TikTok ad group, then READ IT BACK —
+        same "an acknowledgement is not an effect" discipline
+        update_adset_targeting follows for Meta (live_edit.py's own module
+        docstring, PRD CM13): TikTok answering 200 means accepted, not that the
+        ad group now actually carries what was sent.
+
+        `targeting` is TikTok's own wire format (whichever of gender/age_groups/
+        location_ids are being changed) — the caller sends only the keys that
+        changed, not the whole targeting object; unlike Meta, TikTok's
+        /adgroup/update/ is a partial update (confirmed by the same
+        /adgroup/status/update/ pattern set_delivery already uses successfully,
+        which only ever sends operation_status, never the whole ad group).
+
+        validate_only: TikTok's own API reference (checked 2026-09-25) shows no
+        dry-run/validate_only mechanism for /adgroup/update/, unlike Meta's
+        execution_options — there is genuinely nothing to validate against
+        without mutating. Returns immediately without any network call rather
+        than either faking a validation that doesn't happen or actually
+        writing on what is meant to be a dry run."""
+        if validate_only:
+            return {"validated": True}
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"{self._api_base}/adgroup/update/",
+                headers=self._headers(),
+                json={
+                    "advertiser_id": self._advertiser_id,
+                    "adgroup_id": adgroup_id,
+                    **targeting,
+                },
+            )
+            data = resp.json()
+            _raise_for_error(data, "adgroup targeting update")
+
+            confirm = await client.get(
+                f"{self._api_base}/adgroup/get/",
+                headers=self._headers(),
+                params={
+                    "advertiser_id": self._advertiser_id,
+                    "filtering": json.dumps({"adgroup_ids": [adgroup_id]}),
+                    "fields": json.dumps(["gender", "age_groups", "location_ids"]),
+                },
+            )
+            confirmed = confirm.json()
+        _raise_for_error(confirmed, "adgroup targeting readback")
+        rows = (confirmed.get("data") or {}).get("list") or []
+        row = rows[0] if rows else {}
+        return {
+            "applied": True,
+            "targeting": {
+                "gender": row.get("gender") or "GENDER_UNLIMITED",
+                "age_groups": row.get("age_groups") or [],
+                "location_ids": row.get("location_ids") or [],
+            },
+        }
+
     async def delete_campaign(self, campaign_id: str) -> bool:
         """Permanently delete the campaign on TikTok's side (its ad group and ad
         go with it — TikTok doesn't require deleting those separately, same as
-        Meta). Same endpoint _rollback_partial_launch already uses for a failed
-        launch, but this one RAISES on failure rather than swallowing it — a
+        Meta). Same endpoint _rollback_partial_launch/set_delivery already use,
+        but this one RAISES on failure rather than swallowing it — a
         caller-requested delete failing silently would leave them thinking a
-        campaign is gone when it isn't."""
+        campaign is gone when it isn't.
+
+        Live-caught 2026-09-25: this was the SAME swapped-segment bug already
+        found and fixed twice elsewhere in this file (rollback, set_delivery) —
+        campaign/update/status/ 404s, the real endpoint is
+        campaign/status/update/. This one had never actually been exercised
+        live yet (no client had deleted a TikTok campaign through Jane's own
+        🗑 button before now), which is exactly how it survived both earlier
+        fixes unnoticed."""
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
-                f"{self._api_base}/campaign/update/status/",
+                f"{self._api_base}/campaign/status/update/",
                 headers=self._headers(),
                 json={
                     "advertiser_id": self._advertiser_id,

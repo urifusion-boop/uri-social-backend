@@ -21,7 +21,10 @@ from app.agents.jane_ads.adapters.tiktok import (
     _force_tiktok_video_ratio,
     _resolve_tiktok_locations,
     _tiktok_age_groups_for,
+    _tiktok_age_range_from_groups,
+    _tiktok_gender_choice,
     _tiktok_gender_for,
+    _tiktok_location_names,
     _video_thumbnail_url,
 )
 from app.agents.jane_ads.models import (
@@ -907,6 +910,119 @@ def test_set_delivery_raises_on_campaign_level_error():
             _run(adapter.set_delivery("111", active=True))
 
 
+# ── Live targeting edit: reverse-mapping helpers ─────────────────────────────────
+
+def test_gender_choice_reverses_gender_for():
+    assert _tiktok_gender_choice("GENDER_MALE") == "men"
+    assert _tiktok_gender_choice("GENDER_FEMALE") == "women"
+    assert _tiktok_gender_choice("GENDER_UNLIMITED") == "all"
+    assert _tiktok_gender_choice("") == "all"
+
+
+def test_age_range_from_groups_reverses_age_groups_for():
+    # A range that started as 25-45 became AGE_25_34+AGE_35_44+AGE_45_54 going
+    # forward (per _tiktok_age_groups_for) — the reverse reconstructs the full
+    # 25-54 span those three buckets cover, not the original 25-45 exactly
+    # (TikTok only ever reports back whole buckets, never the original range).
+    assert _tiktok_age_range_from_groups(["AGE_25_34", "AGE_35_44", "AGE_45_54"]) == (25, 54)
+
+
+def test_age_range_from_groups_defaults_to_full_span_when_empty():
+    assert _tiktok_age_range_from_groups([]) == (18, 100)
+
+
+def test_tiktok_location_names_resolves_ids_back_to_names():
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = AsyncMock()
+        resp = AsyncMock()
+        resp.json = lambda: _REGION_TREE_RESPONSE
+        mock_client.get = AsyncMock(return_value=resp)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        names = _run(_tiktok_location_names(["2001", "1001"], "adv123", "tok"))
+    assert names == ["Ikeja", "Lagos"]
+
+
+def test_tiktok_location_names_falls_back_to_raw_ids_on_lookup_failure():
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = AsyncMock()
+        resp = AsyncMock()
+        resp.json = lambda: {"code": 40001, "message": "nope"}
+        mock_client.get = AsyncMock(return_value=resp)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        names = _run(_tiktok_location_names(["2001"], "adv123", "tok"))
+    assert names == ["2001"]
+
+
+def test_tiktok_location_names_is_a_noop_on_no_ids():
+    assert _run(_tiktok_location_names([], "adv123", "tok")) == []
+
+
+# ── Live targeting edit: fetch/update adgroup targeting ─────────────────────────
+
+def test_fetch_adgroup_targeting_reads_the_live_adgroup():
+    db = FakeDb()
+    db["jane_ads_tiktok_campaigns"].docs["111"] = {"business_id": "b1", "adgroup_id": "222"}
+    adapter = _adapter(db)
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client([{
+            "code": 0, "message": "OK",
+            "data": {"list": [{
+                "adgroup_id": "222", "operation_status": "ENABLE",
+                "gender": "GENDER_FEMALE", "age_groups": ["AGE_25_34", "AGE_35_44"],
+                "location_ids": ["2001"],
+            }]},
+        }])
+        MockClient.return_value.__aenter__.return_value = mock_client
+        result = _run(adapter.fetch_adgroup_targeting("111"))
+    assert result["adgroup_id"] == "222"
+    assert result["targeting"]["gender"] == "GENDER_FEMALE"
+    assert result["targeting"]["age_groups"] == ["AGE_25_34", "AGE_35_44"]
+    assert result["targeting"]["location_ids"] == ["2001"]
+    params = mock_client.get.call_args.kwargs["params"]
+    assert params["advertiser_id"] == "adv123"
+
+
+def test_fetch_adgroup_targeting_raises_when_no_adgroup_recorded():
+    db = FakeDb()
+    db["jane_ads_tiktok_campaigns"].docs["111"] = {"business_id": "b1"}
+    adapter = _adapter(db)
+    with pytest.raises(TikTokAdsAPIError, match="no ad group recorded"):
+        _run(adapter.fetch_adgroup_targeting("111"))
+
+
+def test_update_adgroup_targeting_writes_then_reads_back():
+    adapter = _adapter()
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client([
+            {"code": 0, "message": "OK", "data": {}},
+            {"code": 0, "message": "OK", "data": {"list": [
+                {"gender": "GENDER_MALE", "age_groups": ["AGE_18_24"], "location_ids": ["1001"]},
+            ]}},
+        ])
+        MockClient.return_value.__aenter__.return_value = mock_client
+        result = _run(adapter.update_adgroup_targeting("222", {"gender": "GENDER_MALE"}))
+    assert result == {"applied": True, "targeting": {
+        "gender": "GENDER_MALE", "age_groups": ["AGE_18_24"], "location_ids": ["1001"],
+    }}
+    write_json = mock_client.post.call_args.kwargs["json"]
+    assert write_json["adgroup_id"] == "222"
+    assert write_json["gender"] == "GENDER_MALE"
+    # Only the changed key was sent — a partial update, not the whole ad group.
+    assert "age_groups" not in write_json
+    assert "location_ids" not in write_json
+
+
+def test_update_adgroup_targeting_validate_only_makes_no_network_call():
+    adapter = _adapter()
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client([])
+        MockClient.return_value.__aenter__.return_value = mock_client
+        result = _run(adapter.update_adgroup_targeting("222", {"gender": "GENDER_MALE"}, validate_only=True))
+    assert result == {"validated": True}
+    assert mock_client.post.call_count == 0
+    assert mock_client.get.call_count == 0
+
+
 def test_delete_campaign_sends_delete_status():
     adapter = _adapter()
     with patch("httpx.AsyncClient") as MockClient:
@@ -914,6 +1030,12 @@ def test_delete_campaign_sends_delete_status():
         MockClient.return_value.__aenter__.return_value = mock_client
         ok = _run(adapter.delete_campaign("111"))
     assert ok is True
+    # Live-caught 2026-09-25: same swapped-segment bug already found (and
+    # fixed) twice elsewhere in this file — .../campaign/update/status/ 404s,
+    # the real endpoint is .../campaign/status/update/. Assert the URL
+    # directly, not just the JSON body, which is exactly how this shipped
+    # unnoticed the first two times.
+    assert mock_client.post.call_args.args[0].endswith("/campaign/status/update/")
     sent = mock_client.post.call_args.kwargs["json"]
     assert sent["campaign_ids"] == ["111"]
     assert sent["operation_status"] == "DELETE"
