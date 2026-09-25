@@ -277,6 +277,112 @@ async def _resolve_tiktok_locations(
     return resolved, rejected
 
 
+# ── Interests (2026-09-25) ────────────────────────────────────────────────────
+# Confirmed against TikTok's own "Get general interest categories" API reference
+# (GET /tool/interest_category/) — the same shape and matching pattern as
+# locations above: one flat list back per call (every level — TikTok's own
+# example shows level-1 categories carrying sub_category_ids that reference
+# other entries in the SAME array, not a separate per-level call), matched
+# locally by name rather than via TikTok's own recommended /targeting/search/
+# (whose request/response shape was never confirmed despite three attempts —
+# /tool/interest_category/ has a complete, confirmed example response, unlike
+# that one).
+MAX_TIKTOK_INTERESTS = 6
+
+
+def _targeting_interest_names(targeting: dict) -> list[str]:
+    """The interest/behaviour label strings out of plan.audience_targeting's
+    Meta-shaped flexible_spec — a small local copy of plan_fields.py's own
+    _interest_names, kept independent rather than importing across modules
+    (same reason _tiktok_gender_for/_tiktok_age_groups_for are their own
+    small functions here rather than reaching into plan_fields.py's genders/
+    age_min/age_max reading): this file stays a self-contained leaf adapter,
+    and the underlying flexible_spec shape genuinely is platform-neutral —
+    Meta's own resolved interest ids inside it are irrelevant here, only the
+    names are read, then resolved fresh against TikTok's own catalogue."""
+    names: list[str] = []
+    for entry in targeting.get("flexible_spec") or []:
+        for value in entry.values():
+            for item in value or []:
+                name = (item or {}).get("name")
+                if name and name not in names:
+                    names.append(name)
+    return names
+
+
+async def _fetch_tiktok_interest_categories(
+    advertiser_id: str, access_token: str,
+) -> Optional[list[dict]]:
+    """Fetch TikTok's whole interest-category list once — shared by both
+    directions of the name<->id lookup, same role
+    _fetch_tiktok_nigeria_locations plays for locations. Returns None on any
+    failure rather than raising; every caller has its own honest fallback.
+
+    NOT yet verified live — the field names (interest_category_id/
+    interest_category_name) are taken directly from TikTok's own documented
+    example response, first real call happens whenever this is next
+    exercised."""
+    api_base = f"{settings.TIKTOK_ADS_API_BASE}/open_api/{settings.TIKTOK_ADS_API_VERSION}"
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.get(
+                f"{api_base}/tool/interest_category/",
+                headers={"Access-Token": access_token, "Content-Type": "application/json"},
+                params={"advertiser_id": advertiser_id, "version": 2},
+            )
+            data = resp.json()
+    except Exception as e:
+        print(f"[TikTokAdsAdapter] /tool/interest_category/ lookup failed: {e}", flush=True)
+        return None
+    if data.get("code") not in (0, None):
+        print(f"[TikTokAdsAdapter] /tool/interest_category/ rejected: {data.get('message')}", flush=True)
+        return None
+    return (data.get("data") or {}).get("interest_categories") or []
+
+
+async def _resolve_tiktok_interests(
+    names: list[str], advertiser_id: str, access_token: str,
+) -> tuple[list[dict], list[str]]:
+    """Resolve interest names ("Education", "Fashion"...) to TikTok
+    interest_category_ids — same shape and same "never silently empty"
+    fallback discipline as _resolve_tiktok_locations."""
+    rejected: list[str] = []
+    if not names:
+        return [], rejected
+    categories = await _fetch_tiktok_interest_categories(advertiser_id, access_token)
+    if categories is None:
+        return [], list(names)
+
+    resolved: list[dict] = []
+    for raw in names[:MAX_TIKTOK_INTERESTS]:
+        name = (raw or "").strip().lower()
+        if not name:
+            continue
+        hit = next((c for c in categories if (c.get("interest_category_name") or "").strip().lower() == name), None)
+        if not hit:
+            hit = next((c for c in categories if name in (c.get("interest_category_name") or "").strip().lower()), None)
+        if hit:
+            resolved.append({"name": hit["interest_category_name"], "interest_category_id": hit["interest_category_id"]})
+        else:
+            rejected.append(raw)
+    return resolved, rejected
+
+
+async def _tiktok_interest_names(
+    interest_category_ids: list[str], advertiser_id: str, access_token: str,
+) -> list[str]:
+    """The reverse of _resolve_tiktok_interests — given ids a live ad group
+    already carries, look up their display names, same role
+    _tiktok_location_names plays for locations."""
+    if not interest_category_ids:
+        return []
+    categories = await _fetch_tiktok_interest_categories(advertiser_id, access_token)
+    if categories is None:
+        return list(interest_category_ids)
+    by_id = {c["interest_category_id"]: c.get("interest_category_name", c["interest_category_id"]) for c in categories}
+    return [by_id.get(cid, cid) for cid in interest_category_ids]
+
+
 # TikTok's ad-group-level optimization/billing pair for a click-driving campaign —
 # mirrors the "Maximise Clicks"-equivalent choice google.py made for the same reason
 # (no conversion volume exists yet to train a smarter bidding strategy).
@@ -689,6 +795,18 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                 # never an empty location_ids, which the launch would reject.
                 location_ids = [r["location_id"] for r in resolved_locations] or [_NIGERIA_LOCATION_ID]
 
+                # Interests, unlike locations, are genuinely optional on TikTok —
+                # omitting interest_category_ids entirely means "no interest
+                # restriction", the same broad-audience meaning an empty/missing
+                # flexible_spec has on Meta. So no Nigeria-wide-style fallback
+                # here: resolving to nothing just means the key is left out.
+                interest_names = _targeting_interest_names(targeting)
+                resolved_interests, unresolved_interests = await _resolve_tiktok_interests(
+                    interest_names, self._advertiser_id, self._access_token)
+                if unresolved_interests:
+                    print(f"[TikTokAdsAdapter] interests not resolved, dropped: {unresolved_interests}", flush=True)
+                interest_category_ids = [r["interest_category_id"] for r in resolved_interests]
+
                 adgroup_resp = await client.post(
                     f"{self._api_base}/adgroup/create/",
                     headers=self._headers(),
@@ -709,6 +827,7 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                         "location_ids": location_ids,
                         "gender": _tiktok_gender_for(targeting),
                         "age_groups": _tiktok_age_groups_for(targeting),
+                        **({"interest_category_ids": interest_category_ids} if interest_category_ids else {}),
                         "budget_mode": "BUDGET_MODE_TOTAL",
                         "budget": total_budget_ngn,
                         "schedule_type": "SCHEDULE_START_END",
@@ -1168,7 +1287,10 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                 params={
                     "advertiser_id": self._advertiser_id,
                     "filtering": json.dumps({"adgroup_ids": [adgroup_id]}),
-                    "fields": json.dumps(["adgroup_id", "operation_status", "gender", "age_groups", "location_ids"]),
+                    "fields": json.dumps([
+                        "adgroup_id", "operation_status", "gender", "age_groups",
+                        "location_ids", "interest_category_ids",
+                    ]),
                 },
             )
             data = resp.json()
@@ -1184,6 +1306,7 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                 "gender": row.get("gender") or "GENDER_UNLIMITED",
                 "age_groups": row.get("age_groups") or [],
                 "location_ids": row.get("location_ids") or [],
+                "interest_category_ids": row.get("interest_category_ids") or [],
             },
         }
 
@@ -1230,7 +1353,7 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                 params={
                     "advertiser_id": self._advertiser_id,
                     "filtering": json.dumps({"adgroup_ids": [adgroup_id]}),
-                    "fields": json.dumps(["gender", "age_groups", "location_ids"]),
+                    "fields": json.dumps(["gender", "age_groups", "location_ids", "interest_category_ids"]),
                 },
             )
             confirmed = confirm.json()
@@ -1243,6 +1366,7 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                 "gender": row.get("gender") or "GENDER_UNLIMITED",
                 "age_groups": row.get("age_groups") or [],
                 "location_ids": row.get("location_ids") or [],
+                "interest_category_ids": row.get("interest_category_ids") or [],
             },
         }
 

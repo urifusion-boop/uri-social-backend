@@ -177,28 +177,33 @@ def describe(plan: CampaignPlan, req: CampaignRequest) -> list[dict[str, Any]]:
                      f"Up to {MAX_LOCATIONS} areas. Each must be somewhere Meta can name — "
                      "we never target raw coordinates."),
         },
+        # Real for both platforms since 2026-09-25 — TikTok resolves these same
+        # interest NAMES against its own /tool/interest_category/ catalogue
+        # (adapters/tiktok.py's _resolve_tiktok_interests) rather than Meta's;
+        # the flexible_spec this reads from is genuinely platform-neutral, only
+        # the resolved ids inside it differ by platform.
+        {
+            "key": "interests", "label": "Interests and behaviours", "type": "list",
+            "value": _interest_names(targeting),
+            "editable": True, "max_items": MAX_INTERESTS,
+            "help": ("Checked against TikTok's own targeting catalogue when you save."
+                     if is_tiktok else
+                     "Checked against Meta's own targeting catalogue when you save."),
+        },
     ]
     if not is_tiktok:
-        # Meta-only: no TikTok mapping wired up yet for interests, and placement
-        # ("Facebook and Instagram" vs "Instagram only") has no TikTok equivalent
-        # at all — TikTok only ever runs on TikTok's own placement.
-        fields += [
-            {
-                "key": "interests", "label": "Interests and behaviours", "type": "list",
-                "value": _interest_names(targeting),
-                "editable": True, "max_items": MAX_INTERESTS,
-                "help": "Checked against Meta's own targeting catalogue when you save.",
-            },
-            {
-                "key": "placement", "label": "Where it shows", "type": "select",
-                "value": _placement_of(targeting),
-                "options": list(_PLACEMENTS.keys()),
-                "option_labels": _PLACEMENT_LABELS,
-                "editable": True,
-                "help": "Automatic delivers best but also spends on Audience Network. "
-                        "Pick a platform to keep it off everything else.",
-            },
-        ]
+        # Placement ("Facebook and Instagram" vs "Instagram only") has no
+        # TikTok equivalent at all — TikTok only ever runs on TikTok's own
+        # placement, so this stays Meta-only.
+        fields.append({
+            "key": "placement", "label": "Where it shows", "type": "select",
+            "value": _placement_of(targeting),
+            "options": list(_PLACEMENTS.keys()),
+            "option_labels": _PLACEMENT_LABELS,
+            "editable": True,
+            "help": "Automatic delivers best but also spends on Audience Network. "
+                    "Pick a platform to keep it off everything else.",
+        })
     age_min_field: dict[str, Any] = {
         "key": "age_min", "label": "Minimum age", "type": "number",
         "value": targeting.get("age_min", MIN_AGE),
@@ -457,54 +462,63 @@ async def apply_edits(
             elif names:
                 rejections.append("No location was changed — none of those could be named by Meta.")
 
-    # ── interests, placement ─────────────────────────────────────────────────
-    # Meta-only guard: no TikTok mapping wired up yet for interests, and
-    # placement has no TikTok equivalent at all. describe() doesn't offer these
-    # for a TikTok plan, so this is defence-in-depth for a direct API call, not
-    # something the review panel itself can trigger.
-    if is_tiktok and ({"interests", "placement"} & edits.keys()):
-        rejections.append(
-            "TikTok campaigns don't support interest or placement targeting in "
-            "Jane yet."
-        )
-    if not is_tiktok:
-        # ── interests ─────────────────────────────────────────────────────────
-        if "interests" in edits:
-            names = [str(n) for n in (edits.get("interests") or [])]
-            if not names:
-                targeting.pop("flexible_spec", None)
-                applied.append("interests")
+    # ── interests ─────────────────────────────────────────────────────────────
+    # Real for both platforms since 2026-09-25 — TikTok resolves the SAME
+    # interest names against its own /tool/interest_category/ catalogue
+    # (adapters/tiktok.py's _resolve_tiktok_interests) rather than Meta's Graph
+    # API. flexible_spec itself is a platform-neutral internal representation;
+    # only the ids stored inside it (and which API validated them) differ.
+    if "interests" in edits:
+        names = [str(n) for n in (edits.get("interests") or [])]
+        if not names:
+            targeting.pop("flexible_spec", None)
+            applied.append("interests")
+        elif is_tiktok:
+            if not (tiktok_advertiser_id and tiktok_access_token):
+                rejections.append("TikTok isn't configured, so interests can't be checked right now.")
             else:
-                kept, bad = await _validated_interests(
-                    names, access_token, _resolved_interests(plan.audience_targeting or {}))
-                rejections += bad
-                if kept:
-                    # ONE flexible_spec entry: Meta ORs within an entry and ANDs across
-                    # entries, and an AND of interests is a near-empty audience.
-                    #
-                    # Everything in that entry which is NOT an interest — life_events,
-                    # behaviors, work_positions, industries — is carried over untouched.
-                    # Meta rejects an id filed under the wrong key, so these cannot simply
-                    # be folded in with the interests, and dropping them would silently
-                    # narrow an audience the client never asked to change. Live-caught on a
-                    # real ad set carrying 7 interests and 1 life_event.
+                from .adapters.tiktok import _resolve_tiktok_interests
+
+                hits, bad = await _resolve_tiktok_interests(names, tiktok_advertiser_id, tiktok_access_token)
+                rejections += [f"{n} — not something TikTok lets you target" for n in bad]
+                if hits:
                     entry = {k: v for k, v in _other_flex_fields(plan.audience_targeting or {}).items()}
-                    entry["interests"] = kept
+                    entry["interests"] = [{"id": h["interest_category_id"], "name": h["name"]} for h in hits]
                     targeting["flexible_spec"] = [entry]
                     applied.append("interests")
+        else:
+            kept, bad = await _validated_interests(
+                names, access_token, _resolved_interests(plan.audience_targeting or {}))
+            rejections += bad
+            if kept:
+                # ONE flexible_spec entry: Meta ORs within an entry and ANDs across
+                # entries, and an AND of interests is a near-empty audience.
+                #
+                # Everything in that entry which is NOT an interest — life_events,
+                # behaviors, work_positions, industries — is carried over untouched.
+                # Meta rejects an id filed under the wrong key, so these cannot simply
+                # be folded in with the interests, and dropping them would silently
+                # narrow an audience the client never asked to change. Live-caught on a
+                # real ad set carrying 7 interests and 1 life_event.
+                entry = {k: v for k, v in _other_flex_fields(plan.audience_targeting or {}).items()}
+                entry["interests"] = kept
+                targeting["flexible_spec"] = [entry]
+                applied.append("interests")
 
-        # ── placement ─────────────────────────────────────────────────────────
-        if "placement" in edits:
-            choice = str(edits.get("placement") or "").strip().lower()
-            if choice not in _PLACEMENTS:
-                rejections.append(f"Placement must be one of: {', '.join(_PLACEMENTS)}.")
+    # ── placement (Meta-only: no TikTok equivalent at all) ──────────────────────
+    if is_tiktok and "placement" in edits:
+        rejections.append("TikTok campaigns don't support placement targeting in Jane yet.")
+    if not is_tiktok and "placement" in edits:
+        choice = str(edits.get("placement") or "").strip().lower()
+        if choice not in _PLACEMENTS:
+            rejections.append(f"Placement must be one of: {', '.join(_PLACEMENTS)}.")
+        else:
+            placements = _PLACEMENTS[choice]
+            if placements:
+                targeting["publisher_platforms"] = placements
             else:
-                placements = _PLACEMENTS[choice]
-                if placements:
-                    targeting["publisher_platforms"] = placements
-                else:
-                    targeting.pop("publisher_platforms", None)
-                applied.append("placement")
+                targeting.pop("publisher_platforms", None)
+            applied.append("placement")
 
     # ── gender ────────────────────────────────────────────────────────────────
     # Real for both platforms now — TikTok's own gender enum

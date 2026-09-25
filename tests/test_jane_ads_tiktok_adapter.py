@@ -19,11 +19,13 @@ from app.agents.jane_ads.adapters.tiktok import (
     TikTokAdsAPIError,
     _force_jpg_delivery,
     _force_tiktok_video_ratio,
+    _resolve_tiktok_interests,
     _resolve_tiktok_locations,
     _tiktok_age_groups_for,
     _tiktok_age_range_from_groups,
     _tiktok_gender_choice,
     _tiktok_gender_for,
+    _tiktok_interest_names,
     _tiktok_location_names,
     _video_thumbnail_url,
 )
@@ -240,6 +242,94 @@ def test_resolve_tiktok_locations_falls_back_cleanly_on_api_error():
     assert rejected == ["Ikeja"]
 
 
+# ── Interests ─────────────────────────────────────────────────────────────────
+
+_INTEREST_CATEGORIES_RESPONSE = {
+    "code": 0, "message": "OK",
+    "data": {
+        "interest_categories": [
+            {"interest_category_id": "10", "interest_category_name": "Education",
+             "level": 1, "sub_category_ids": ["10100"], "placements": [], "special_industries": []},
+            {"interest_category_id": "11", "interest_category_name": "Vehicles & Transportation",
+             "level": 1, "sub_category_ids": [], "placements": [], "special_industries": []},
+            {"interest_category_id": "10100", "interest_category_name": "Online Courses",
+             "level": 2, "sub_category_ids": [], "placements": [], "special_industries": []},
+        ],
+    },
+}
+
+
+def test_resolve_tiktok_interests_matches_exact_and_partial_names():
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = AsyncMock()
+        resp = AsyncMock()
+        resp.json = lambda: _INTEREST_CATEGORIES_RESPONSE
+        mock_client.get = AsyncMock(return_value=resp)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        resolved, rejected = _run(_resolve_tiktok_interests(
+            ["Education", "vehicles"], "adv123", "tok"))
+    assert resolved == [
+        {"name": "Education", "interest_category_id": "10"},
+        {"name": "Vehicles & Transportation", "interest_category_id": "11"},
+    ]
+    assert rejected == []
+
+
+def test_resolve_tiktok_interests_reports_unmatched_names():
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = AsyncMock()
+        resp = AsyncMock()
+        resp.json = lambda: _INTEREST_CATEGORIES_RESPONSE
+        mock_client.get = AsyncMock(return_value=resp)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        resolved, rejected = _run(_resolve_tiktok_interests(["Astrology"], "adv123", "tok"))
+    assert resolved == []
+    assert rejected == ["Astrology"]
+
+
+def test_resolve_tiktok_interests_is_a_noop_on_no_names():
+    resolved, rejected = _run(_resolve_tiktok_interests([], "adv123", "tok"))
+    assert resolved == [] and rejected == []
+
+
+def test_resolve_tiktok_interests_falls_back_cleanly_on_api_error():
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = AsyncMock()
+        resp = AsyncMock()
+        resp.json = lambda: {"code": 40001, "message": "invalid advertiser_id"}
+        mock_client.get = AsyncMock(return_value=resp)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        resolved, rejected = _run(_resolve_tiktok_interests(["Education"], "adv123", "tok"))
+    assert resolved == []
+    assert rejected == ["Education"]
+
+
+def test_tiktok_interest_names_resolves_ids_back_to_names():
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = AsyncMock()
+        resp = AsyncMock()
+        resp.json = lambda: _INTEREST_CATEGORIES_RESPONSE
+        mock_client.get = AsyncMock(return_value=resp)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        names = _run(_tiktok_interest_names(["10", "11"], "adv123", "tok"))
+    assert names == ["Education", "Vehicles & Transportation"]
+
+
+def test_tiktok_interest_names_falls_back_to_raw_ids_on_lookup_failure():
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = AsyncMock()
+        resp = AsyncMock()
+        resp.json = lambda: {"code": 40001, "message": "nope"}
+        mock_client.get = AsyncMock(return_value=resp)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        names = _run(_tiktok_interest_names(["10"], "adv123", "tok"))
+    assert names == ["10"]
+
+
+def test_tiktok_interest_names_is_a_noop_on_no_ids():
+    assert _run(_tiktok_interest_names([], "adv123", "tok")) == []
+
+
 def test_requires_advertiser_id():
     with pytest.raises(TikTokAdsAPIError):
         TikTokAdsAdapter(FakeDb(), advertiser_id="", access_token="tok")
@@ -336,15 +426,17 @@ def test_launch_campaign_happy_path_full_call_sequence():
 
 
 def test_launch_campaign_uses_real_audience_targeting_when_the_plan_has_it():
-    # campaign(POST), video(POST), cover(POST), region lookup(GET), adgroup(POST),
-    # identity(GET), ad(POST) — the new /tool/region/ call lands between the
-    # creative upload and adgroup/create, exactly where it's inserted in
-    # launch_campaign, since _mock_client's .get/.post share one response queue.
+    # campaign(POST), video(POST), cover(POST), region lookup(GET), interest
+    # lookup(GET), adgroup(POST), identity(GET), ad(POST) — the two new lookups
+    # land between the creative upload and adgroup/create, exactly where
+    # they're inserted in launch_campaign, since _mock_client's .get/.post
+    # share one response queue.
     responses = [
         {"code": 0, "message": "OK", "data": {"campaign_id": "111"}},
         {"code": 0, "message": "OK", "data": [{"video_id": "vid_999", "video_cover_url": "https://cdn.example.com/cover.jpg"}]},
         {"code": 0, "message": "OK", "data": {"image_id": "img_888"}},
         _REGION_TREE_RESPONSE,
+        _INTEREST_CATEGORIES_RESPONSE,
         {"code": 0, "message": "OK", "data": {"adgroup_id": "222"}},
         {"code": 0, "message": "OK", "data": {"identity_list": [
             {"identity_id": "identity_777", "identity_authorized_bc_id": "bc_555", "available_status": "AVAILABLE",
@@ -356,7 +448,10 @@ def test_launch_campaign_uses_real_audience_targeting_when_the_plan_has_it():
     adapter = _adapter(db)
     plan = _plan(
         geo=GeoPlan(mode=GeoMode.OWN_RADIUS, city="Lagos", pins=[GeoPin(name="Ikeja", lat=6.6, lng=3.35)]),
-        audience_targeting={"age_min": 25, "age_max": 45, "genders": [2]},
+        audience_targeting={
+            "age_min": 25, "age_max": 45, "genders": [2],
+            "flexible_spec": [{"interests": [{"id": "meta-id-1", "name": "Education"}]}],
+        },
     )
     with patch("httpx.AsyncClient") as MockClient:
         mock_client = _mock_client(responses)
@@ -365,12 +460,41 @@ def test_launch_campaign_uses_real_audience_targeting_when_the_plan_has_it():
 
     assert result.campaign_id == "111"
     assert mock_client.post.call_count == 5
-    assert mock_client.get.call_count == 2  # region lookup + identity lookup
+    assert mock_client.get.call_count == 3  # region lookup + interest lookup + identity lookup
 
     adgroup_json = mock_client.post.call_args_list[3].kwargs["json"]
     assert adgroup_json["location_ids"] == ["2001"]  # Ikeja, resolved
     assert adgroup_json["gender"] == "GENDER_FEMALE"
     assert adgroup_json["age_groups"] == ["AGE_25_34", "AGE_35_44", "AGE_45_54"]
+    # Meta's own interest id ("meta-id-1") is irrelevant here — only the name
+    # was read, then resolved fresh against TikTok's own catalogue.
+    assert adgroup_json["interest_category_ids"] == ["10"]
+
+
+def test_launch_campaign_omits_interest_category_ids_when_none_given():
+    # No flexible_spec on this plan's audience_targeting at all — must not send
+    # an interest lookup call, and must not send the key rather than an empty list.
+    responses = [
+        {"code": 0, "message": "OK", "data": {"campaign_id": "111"}},
+        {"code": 0, "message": "OK", "data": [{"video_id": "vid_999", "video_cover_url": "https://cdn.example.com/cover.jpg"}]},
+        {"code": 0, "message": "OK", "data": {"image_id": "img_888"}},
+        {"code": 0, "message": "OK", "data": {"adgroup_id": "222"}},
+        {"code": 0, "message": "OK", "data": {"identity_list": [
+            {"identity_id": "identity_777", "identity_authorized_bc_id": "bc_555", "available_status": "AVAILABLE",
+             "username": "uri.creative", "display_name": "uricreative"},
+        ]}},
+        {"code": 0, "message": "OK", "data": {"ad_ids": ["333"]}},
+    ]
+    adapter = _adapter()
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client(responses)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        result = _run(adapter.launch_campaign(_plan(), _auth()))
+
+    assert result.campaign_id == "111"
+    assert mock_client.get.call_count == 1  # identity lookup only
+    adgroup_json = mock_client.post.call_args_list[3].kwargs["json"]
+    assert "interest_category_ids" not in adgroup_json
 
 
 # ── Carousel Ads (image-only path, no video) ────────────────────────────────────────
@@ -1003,6 +1127,7 @@ def test_update_adgroup_targeting_writes_then_reads_back():
         result = _run(adapter.update_adgroup_targeting("222", {"gender": "GENDER_MALE"}))
     assert result == {"applied": True, "targeting": {
         "gender": "GENDER_MALE", "age_groups": ["AGE_18_24"], "location_ids": ["1001"],
+        "interest_category_ids": [],
     }}
     write_json = mock_client.post.call_args.kwargs["json"]
     assert write_json["adgroup_id"] == "222"

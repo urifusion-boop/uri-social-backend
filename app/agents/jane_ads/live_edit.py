@@ -188,14 +188,15 @@ LEARNING_WARNING = (
 # translation: Meta's targeting is a nested audience_targeting object matching
 # Graph API's own shape (geo_locations, genders, age_min/age_max,
 # flexible_spec); TikTok's is flat wire-format fields (location_ids, gender
-# enum, age_groups bucket list) with no interests/placement equivalent at all.
-# Two small, honest functions in TikTok's own vocabulary beat one that quietly
-# only half-fits either platform.
+# enum, age_groups bucket list, interest_category_ids) with no placement
+# equivalent at all. Two small, honest functions in TikTok's own vocabulary
+# beat one that quietly only half-fits either platform.
 #
-# Same EDITABLE scope as Meta minus interests/placement (no TikTok mapping for
-# interests yet, no TikTok concept of placement at all — TikTok only ever runs
-# on TikTok's own placement).
-TIKTOK_EDITABLE = ("locations", "gender", "age_min", "age_max")
+# Same EDITABLE scope as Meta minus placement (interests joined
+# locations/gender/age as real 2026-09-25, resolved against TikTok's own
+# /tool/interest_category/; placement has no TikTok concept at all — TikTok
+# only ever runs on TikTok's own placement).
+TIKTOK_EDITABLE = ("locations", "interests", "gender", "age_min", "age_max")
 
 
 async def describe_live_tiktok(
@@ -203,12 +204,16 @@ async def describe_live_tiktok(
 ) -> list[dict[str, Any]]:
     """TikTok's own version of describe_live — the live ad group's current
     targeting (TikTok's native wire format) as the same editable-line shape
-    describe_live gives Meta, minus interests/placement (see TIKTOK_EDITABLE)."""
-    from .adapters.tiktok import _tiktok_age_range_from_groups, _tiktok_gender_choice, _tiktok_location_names
-    from .plan_fields import MAX_AGE, MAX_LOCATIONS, MIN_AGE
+    describe_live gives Meta, minus placement (see TIKTOK_EDITABLE)."""
+    from .adapters.tiktok import (
+        _tiktok_age_range_from_groups, _tiktok_gender_choice, _tiktok_interest_names, _tiktok_location_names,
+    )
+    from .plan_fields import MAX_AGE, MAX_INTERESTS, MAX_LOCATIONS, MIN_AGE
 
     names = await _tiktok_location_names(
         targeting.get("location_ids") or [], tiktok_advertiser_id, tiktok_access_token)
+    interest_names = await _tiktok_interest_names(
+        targeting.get("interest_category_ids") or [], tiktok_advertiser_id, tiktok_access_token)
     age_min, age_max = _tiktok_age_range_from_groups(targeting.get("age_groups") or [])
     return [
         {
@@ -216,6 +221,11 @@ async def describe_live_tiktok(
             "value": names, "editable": True, "max_items": MAX_LOCATIONS,
             "help": f"Up to {MAX_LOCATIONS} areas. Each must be somewhere TikTok can name — "
                     "we never target raw coordinates.",
+        },
+        {
+            "key": "interests", "label": "Interests and behaviours", "type": "list",
+            "value": interest_names, "editable": True, "max_items": MAX_INTERESTS,
+            "help": "Checked against TikTok's own targeting catalogue when you save.",
         },
         {
             "key": "gender", "label": "Gender", "type": "select",
@@ -249,8 +259,10 @@ async def build_tiktok_targeting_edit(
     actually changed, in TikTok's own wire format, ready to hand straight to
     update_adgroup_targeting.
     """
-    from .adapters.tiktok import _resolve_tiktok_locations, _tiktok_age_groups_for, _tiktok_age_range_from_groups
-    from .plan_fields import MAX_AGE, MAX_LOCATIONS, MIN_AGE, _as_int
+    from .adapters.tiktok import (
+        _resolve_tiktok_interests, _resolve_tiktok_locations, _tiktok_age_groups_for, _tiktok_age_range_from_groups,
+    )
+    from .plan_fields import MAX_AGE, MAX_INTERESTS, MAX_LOCATIONS, MIN_AGE, _as_int
 
     unsupported = [k for k in edits if k not in TIKTOK_EDITABLE]
     rejections = [
@@ -272,6 +284,18 @@ async def build_tiktok_targeting_edit(
             applied.append("locations")
         elif names:
             rejections.append("No location was changed — none of those could be named by TikTok.")
+
+    if "interests" in wanted:
+        names = [str(n) for n in (wanted.get("interests") or [])][:MAX_INTERESTS]
+        if not names:
+            changed["interest_category_ids"] = []
+            applied.append("interests")
+        else:
+            hits, bad = await _resolve_tiktok_interests(names, tiktok_advertiser_id, tiktok_access_token)
+            rejections += [f"{n} — not something TikTok lets you target" for n in bad]
+            if hits:
+                changed["interest_category_ids"] = [h["interest_category_id"] for h in hits]
+                applied.append("interests")
 
     if "gender" in wanted:
         choice = str(wanted.get("gender") or "").strip().lower()
