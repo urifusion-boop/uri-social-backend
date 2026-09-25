@@ -37,6 +37,10 @@ class Settings(BaseSettings):
     META_APP_ID: str = ""
     META_APP_SECRET: str = ""
     META_SYSTEM_TOKEN: str = ""
+    # The string Meta echoes back during the webhook subscription handshake. Ours to
+    # choose; it only proves the endpoint is the one we configured. Event authenticity
+    # comes from the X-Hub-Signature-256 HMAC, not from this.
+    META_WEBHOOK_VERIFY_TOKEN: str = ""
     # URI's own Meta Business Manager id — owned by Ibukun. Until this is set,
     # the ads page-connect flow still runs and stores the page token; only the
     # final "grant URI's Business Manager ADVERTISE access" step is skipped.
