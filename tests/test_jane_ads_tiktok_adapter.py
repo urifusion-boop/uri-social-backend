@@ -19,6 +19,9 @@ from app.agents.jane_ads.adapters.tiktok import (
     TikTokAdsAPIError,
     _force_jpg_delivery,
     _force_tiktok_video_ratio,
+    _resolve_tiktok_locations,
+    _tiktok_age_groups_for,
+    _tiktok_gender_for,
     _video_thumbnail_url,
 )
 from app.agents.jane_ads.models import (
@@ -26,6 +29,9 @@ from app.agents.jane_ads.models import (
     AdCreative,
     CampaignObjective,
     CampaignPlan,
+    GeoMode,
+    GeoPin,
+    GeoPlan,
     Goal,
     Platform,
     PlatformPlan,
@@ -138,6 +144,99 @@ _HAPPY_RESPONSES = [
 ]
 
 
+# ── Real audience targeting: gender/age mapping ─────────────────────────────────
+# Confirmed 2026-09-25 against TikTok's own Enumerations reference.
+
+def test_gender_maps_metas_codes_to_tiktoks_enum():
+    assert _tiktok_gender_for({}) == "GENDER_UNLIMITED"
+    assert _tiktok_gender_for({"genders": []}) == "GENDER_UNLIMITED"
+    assert _tiktok_gender_for({"genders": [1]}) == "GENDER_MALE"
+    assert _tiktok_gender_for({"genders": [2]}) == "GENDER_FEMALE"
+
+
+def test_age_groups_covers_every_bucket_that_overlaps_the_range():
+    # 25-45 genuinely overlaps three buckets (25-34, 35-44, 45-54 all contain
+    # part of that range) — picking just one would be arbitrary.
+    assert _tiktok_age_groups_for({"age_min": 25, "age_max": 45}) == [
+        "AGE_25_34", "AGE_35_44", "AGE_45_54",
+    ]
+
+
+def test_age_groups_defaults_to_every_bucket_when_unspecified():
+    assert _tiktok_age_groups_for({}) == [
+        "AGE_18_24", "AGE_25_34", "AGE_35_44", "AGE_45_54", "AGE_55_100",
+    ]
+
+
+def test_age_groups_single_bucket_for_a_narrow_range():
+    assert _tiktok_age_groups_for({"age_min": 55, "age_max": 65}) == ["AGE_55_100"]
+
+
+# ── Real audience targeting: location resolution ────────────────────────────────
+
+_REGION_TREE_RESPONSE = {
+    "code": 0, "message": "OK",
+    "data": {
+        "region_info": [
+            {"location_id": "2328926", "name": "Nigeria", "parent_id": "0",
+             "region_code": "NG", "level": "COUNTRY", "next_level_ids": ["1001", "1002"]},
+            {"location_id": "1001", "name": "Lagos", "parent_id": "2328926",
+             "level": "PROVINCE", "next_level_ids": ["2001"]},
+            {"location_id": "1002", "name": "Abuja", "parent_id": "2328926",
+             "level": "PROVINCE", "next_level_ids": []},
+            {"location_id": "2001", "name": "Ikeja", "parent_id": "1001",
+             "level": "CITY", "next_level_ids": []},
+        ],
+    },
+}
+
+
+def test_resolve_tiktok_locations_matches_exact_and_partial_names():
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = AsyncMock()
+        resp = AsyncMock()
+        resp.json = lambda: _REGION_TREE_RESPONSE
+        mock_client.get = AsyncMock(return_value=resp)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        resolved, rejected = _run(_resolve_tiktok_locations(["Ikeja", "Lagos"], "adv123", "tok"))
+    assert resolved == [
+        {"name": "Ikeja", "location_id": "2001"},
+        {"name": "Lagos", "location_id": "1001"},
+    ]
+    assert rejected == []
+
+
+def test_resolve_tiktok_locations_reports_unmatched_names():
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = AsyncMock()
+        resp = AsyncMock()
+        resp.json = lambda: _REGION_TREE_RESPONSE
+        mock_client.get = AsyncMock(return_value=resp)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        resolved, rejected = _run(_resolve_tiktok_locations(["Nowhereville"], "adv123", "tok"))
+    assert resolved == []
+    assert rejected == ["Nowhereville"]
+
+
+def test_resolve_tiktok_locations_is_a_noop_on_no_names():
+    resolved, rejected = _run(_resolve_tiktok_locations([], "adv123", "tok"))
+    assert resolved == [] and rejected == []
+
+
+def test_resolve_tiktok_locations_falls_back_cleanly_on_api_error():
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = AsyncMock()
+        resp = AsyncMock()
+        resp.json = lambda: {"code": 40001, "message": "invalid advertiser_id"}
+        mock_client.get = AsyncMock(return_value=resp)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        resolved, rejected = _run(_resolve_tiktok_locations(["Ikeja"], "adv123", "tok"))
+    # Nothing resolved, but every requested name comes back as "rejected" rather
+    # than raising — the caller (launch_campaign) falls back to Nigeria-wide.
+    assert resolved == []
+    assert rejected == ["Ikeja"]
+
+
 def test_requires_advertiser_id():
     with pytest.raises(TikTokAdsAPIError):
         TikTokAdsAdapter(FakeDb(), advertiser_id="", access_token="tok")
@@ -186,6 +285,15 @@ def test_launch_campaign_happy_path_full_call_sequence():
     assert adgroup_json["campaign_id"] == "111"
     assert adgroup_json["bid_type"] == "BID_TYPE_NO_BID"
     assert adgroup_json["pacing"] == "PACING_MODE_SMOOTH"
+    # No geo pins and no audience_targeting on this default plan — the honest
+    # fallback (Nigeria-wide, no gender/age restriction) rather than an empty
+    # or fabricated targeting. No extra /tool/region/ call either, since there
+    # was nothing to resolve (get.call_count stays 1 below, identity only).
+    assert adgroup_json["location_ids"] == ["2328926"]
+    assert adgroup_json["gender"] == "GENDER_UNLIMITED"
+    assert adgroup_json["age_groups"] == [
+        "AGE_18_24", "AGE_25_34", "AGE_35_44", "AGE_45_54", "AGE_55_100",
+    ]
 
     identity_params = mock_client.get.call_args_list[0].kwargs["params"]
     assert identity_params["identity_type"] == "BC_AUTH_TT"
@@ -222,6 +330,44 @@ def test_launch_campaign_happy_path_full_call_sequence():
     assert record["ad_id"] == "333"
     assert record["business_id"] == "b1"
     assert record["last_click_count"] == 0
+
+
+def test_launch_campaign_uses_real_audience_targeting_when_the_plan_has_it():
+    # campaign(POST), video(POST), cover(POST), region lookup(GET), adgroup(POST),
+    # identity(GET), ad(POST) — the new /tool/region/ call lands between the
+    # creative upload and adgroup/create, exactly where it's inserted in
+    # launch_campaign, since _mock_client's .get/.post share one response queue.
+    responses = [
+        {"code": 0, "message": "OK", "data": {"campaign_id": "111"}},
+        {"code": 0, "message": "OK", "data": [{"video_id": "vid_999", "video_cover_url": "https://cdn.example.com/cover.jpg"}]},
+        {"code": 0, "message": "OK", "data": {"image_id": "img_888"}},
+        _REGION_TREE_RESPONSE,
+        {"code": 0, "message": "OK", "data": {"adgroup_id": "222"}},
+        {"code": 0, "message": "OK", "data": {"identity_list": [
+            {"identity_id": "identity_777", "identity_authorized_bc_id": "bc_555", "available_status": "AVAILABLE",
+             "username": "uri.creative", "display_name": "uricreative"},
+        ]}},
+        {"code": 0, "message": "OK", "data": {"ad_ids": ["333"]}},
+    ]
+    db = FakeDb()
+    adapter = _adapter(db)
+    plan = _plan(
+        geo=GeoPlan(mode=GeoMode.OWN_RADIUS, city="Lagos", pins=[GeoPin(name="Ikeja", lat=6.6, lng=3.35)]),
+        audience_targeting={"age_min": 25, "age_max": 45, "genders": [2]},
+    )
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client(responses)
+        MockClient.return_value.__aenter__.return_value = mock_client
+        result = _run(adapter.launch_campaign(plan, _auth()))
+
+    assert result.campaign_id == "111"
+    assert mock_client.post.call_count == 5
+    assert mock_client.get.call_count == 2  # region lookup + identity lookup
+
+    adgroup_json = mock_client.post.call_args_list[3].kwargs["json"]
+    assert adgroup_json["location_ids"] == ["2001"]  # Ikeja, resolved
+    assert adgroup_json["gender"] == "GENDER_FEMALE"
+    assert adgroup_json["age_groups"] == ["AGE_25_34", "AGE_35_44", "AGE_45_54"]
 
 
 # ── Carousel Ads (image-only path, no video) ────────────────────────────────────────
