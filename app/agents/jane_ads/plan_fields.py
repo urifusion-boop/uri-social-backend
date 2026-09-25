@@ -120,15 +120,19 @@ def describe(plan: CampaignPlan, req: CampaignRequest) -> list[dict[str, Any]]:
     fields (the daily split) or fixed by the connection (the Page), and pretending
     otherwise would invite an edit we would have to silently ignore.
 
-    Live-caught 2026-09-23: every targeting-shaped field here (locations, interests,
-    gender, placement, age) used to render unconditionally, Meta-labelled, on a TikTok
-    plan too — but adapters/tiktok.py never reads plan.geo or plan.audience_targeting
-    at all when it builds the ad group; every TikTok campaign today targets "all adults
-    in Nigeria" regardless of what got saved here. Showing those fields as editable on
-    a TikTok plan meant a client could change one, see "applied," and have it do
-    nothing — exactly the "system says yes and then does something else" bug class
-    this whole module exists to prevent (see module docstring). They're left out for
-    TikTok, with one honest line in their place, rather than shown as if they worked.
+    Live-caught 2026-09-23, revised 2026-09-25: every targeting-shaped field here
+    used to render unconditionally, Meta-labelled, on a TikTok plan too — but
+    adapters/tiktok.py didn't read plan.geo or plan.audience_targeting at all when
+    it built the ad group, so editing any of them on a TikTok plan changed nothing
+    real ("system says yes and does something else", the exact bug class this
+    module's docstring says it exists to prevent). adapters/tiktok.py now genuinely
+    uses location/gender/age (confirmed against TikTok's own Audience targeting and
+    Enumerations API reference), so locations/gender/age are real again for both
+    platforms. Interests and placement stay Meta-only: interests have no TikTok
+    mapping wired up yet (deferred, not silently dropped — see
+    _resolve_tiktok_locations's own docstring in adapters/tiktok.py for the same
+    honesty pattern), and placement ("Facebook and Instagram" vs "Instagram only"
+    etc.) is a Meta-only concept with no TikTok equivalent at all.
     """
     targeting = plan.audience_targeting or {}
     creative = plan.creative
@@ -162,36 +166,28 @@ def describe(plan: CampaignPlan, req: CampaignRequest) -> list[dict[str, Any]]:
         },
     ]
 
-    if is_tiktok:
-        fields.append({
-            "key": "tiktok_audience_note", "label": "Audience", "type": "derived",
-            "value": "All adults in Nigeria",
-            "editable": False,
-            "help": "TikTok campaigns don't yet support location, interest, age or "
-                    "gender targeting in Jane — every campaign reaches everyone in "
-                    "your country. That's coming later; for now this line is here so "
-                    "it isn't a silent gap.",
-        })
-    else:
+    fields += [
+        {
+            "key": "locations", "label": "Locations", "type": "list",
+            "value": [p.name for p in (geo.pins if geo else [])],
+            "editable": True, "max_items": MAX_LOCATIONS,
+            "help": (f"Up to {MAX_LOCATIONS} areas. Each must be somewhere TikTok can name — "
+                     "we never target raw coordinates."
+                     if is_tiktok else
+                     f"Up to {MAX_LOCATIONS} areas. Each must be somewhere Meta can name — "
+                     "we never target raw coordinates."),
+        },
+    ]
+    if not is_tiktok:
+        # Meta-only: no TikTok mapping wired up yet for interests, and placement
+        # ("Facebook and Instagram" vs "Instagram only") has no TikTok equivalent
+        # at all — TikTok only ever runs on TikTok's own placement.
         fields += [
-            {
-                "key": "locations", "label": "Locations", "type": "list",
-                "value": [p.name for p in (geo.pins if geo else [])],
-                "editable": True, "max_items": MAX_LOCATIONS,
-                "help": f"Up to {MAX_LOCATIONS} areas. Each must be somewhere Meta can name — "
-                        "we never target raw coordinates.",
-            },
             {
                 "key": "interests", "label": "Interests and behaviours", "type": "list",
                 "value": _interest_names(targeting),
                 "editable": True, "max_items": MAX_INTERESTS,
                 "help": "Checked against Meta's own targeting catalogue when you save.",
-            },
-            {
-                "key": "gender", "label": "Gender", "type": "select",
-                "value": _gender_of(targeting),
-                "options": ["all", "men", "women"], "editable": True,
-                "help": "Who sees it. 'All' is usually right unless the product is gendered.",
             },
             {
                 "key": "placement", "label": "Where it shows", "type": "select",
@@ -202,17 +198,31 @@ def describe(plan: CampaignPlan, req: CampaignRequest) -> list[dict[str, Any]]:
                 "help": "Automatic delivers best but also spends on Audience Network. "
                         "Pick a platform to keep it off everything else.",
             },
-            {
-                "key": "age_min", "label": "Minimum age", "type": "number",
-                "value": targeting.get("age_min", MIN_AGE),
-                "min": MIN_AGE, "max": MAX_AGE, "editable": True,
-            },
-            {
-                "key": "age_max", "label": "Maximum age", "type": "number",
-                "value": targeting.get("age_max", MAX_AGE),
-                "min": MIN_AGE, "max": MAX_AGE, "editable": True,
-            },
         ]
+    age_min_field: dict[str, Any] = {
+        "key": "age_min", "label": "Minimum age", "type": "number",
+        "value": targeting.get("age_min", MIN_AGE),
+        "min": MIN_AGE, "max": MAX_AGE, "editable": True,
+    }
+    if is_tiktok:
+        age_min_field["help"] = (
+            "TikTok targets in age bands, not this exact number — the range you give "
+            "gets mapped onto whichever of its bands overlap it."
+        )
+    fields += [
+        {
+            "key": "gender", "label": "Gender", "type": "select",
+            "value": _gender_of(targeting),
+            "options": ["all", "men", "women"], "editable": True,
+            "help": "Who sees it. 'All' is usually right unless the product is gendered.",
+        },
+        age_min_field,
+        {
+            "key": "age_max", "label": "Maximum age", "type": "number",
+            "value": targeting.get("age_max", MAX_AGE),
+            "min": MIN_AGE, "max": MAX_AGE, "editable": True,
+        },
+    ]
 
     fields += [
         {
@@ -352,6 +362,9 @@ async def apply_edits(
     req: CampaignRequest,
     edits: dict[str, Any],
     access_token: str = "",
+    *,
+    tiktok_advertiser_id: str = "",
+    tiktok_access_token: str = "",
 ) -> tuple[CampaignPlan, CampaignRequest, list[str], list[str]]:
     """Fold validated edits into the plan.
 
@@ -410,23 +423,30 @@ async def apply_edits(
                 )
                 applied += [k for k in ("headline", "caption") if k in edits]
 
-    # ── targeting fields (locations, interests, gender, placement, age) ────────
-    # TikTok-only guard, live-caught 2026-09-23: adapters/tiktok.py never reads
-    # plan.geo or plan.audience_targeting when it launches, so accepting any of
-    # these on a TikTok plan would save happily and change nothing — the exact
-    # bug this module's docstring says it exists to prevent. describe() no longer
-    # offers these fields for a TikTok plan, so this branch is defence-in-depth
-    # for a direct API call, not something the review panel itself can trigger.
-    _targeting_keys = {"locations", "interests", "gender", "placement", "age_min", "age_max"}
-    if is_tiktok and (_targeting_keys & edits.keys()):
-        rejections.append(
-            "TikTok campaigns don't support location, interest, age or gender "
-            "targeting in Jane yet — every campaign reaches all adults in Nigeria."
-        )
-    if not is_tiktok:
-        # ── locations ─────────────────────────────────────────────────────────
-        if "locations" in edits:
-            names = [str(n) for n in (edits.get("locations") or [])]
+    # ── locations ─────────────────────────────────────────────────────────────
+    # Real for both platforms now (2026-09-25) — TikTok resolves against its own
+    # /tool/region/ (adapters/tiktok.py's _resolve_tiktok_locations) instead of
+    # Meta's Graph API, but both land in the same plan.geo.pins shape, since
+    # that's what each platform's own launch step re-resolves by name from.
+    if "locations" in edits:
+        names = [str(n) for n in (edits.get("locations") or [])]
+        if is_tiktok:
+            if not (tiktok_advertiser_id and tiktok_access_token):
+                rejections.append("TikTok isn't configured, so locations can't be checked right now.")
+            else:
+                from .adapters.tiktok import _resolve_tiktok_locations
+
+                hits, bad = await _resolve_tiktok_locations(
+                    names[:MAX_LOCATIONS], tiktok_advertiser_id, tiktok_access_token)
+                rejections += [f"{n} — TikTok has no targetable area by that name in Nigeria" for n in bad]
+                pins = [GeoPin(name=h["name"], source=PinSource.GEOCODED, reason="chosen by you") for h in hits]
+                if pins:
+                    base = plan.geo or GeoPlan(mode=GeoMode.OWN_RADIUS, city=(plan.geo.city if plan.geo else req.geo))
+                    plan_update["geo"] = base.model_copy(update={"pins": pins})
+                    applied.append("locations")
+                elif names:
+                    rejections.append("No location was changed — none of those could be named by TikTok.")
+        else:
             region = (plan.geo.city if plan.geo else "") or req.geo
             pins, bad = await _validated_locations(names, region, access_token)
             rejections += bad
@@ -437,6 +457,17 @@ async def apply_edits(
             elif names:
                 rejections.append("No location was changed — none of those could be named by Meta.")
 
+    # ── interests, placement ─────────────────────────────────────────────────
+    # Meta-only guard: no TikTok mapping wired up yet for interests, and
+    # placement has no TikTok equivalent at all. describe() doesn't offer these
+    # for a TikTok plan, so this is defence-in-depth for a direct API call, not
+    # something the review panel itself can trigger.
+    if is_tiktok and ({"interests", "placement"} & edits.keys()):
+        rejections.append(
+            "TikTok campaigns don't support interest or placement targeting in "
+            "Jane yet."
+        )
+    if not is_tiktok:
         # ── interests ─────────────────────────────────────────────────────────
         if "interests" in edits:
             names = [str(n) for n in (edits.get("interests") or [])]
@@ -462,19 +493,6 @@ async def apply_edits(
                     targeting["flexible_spec"] = [entry]
                     applied.append("interests")
 
-        # ── gender ────────────────────────────────────────────────────────────
-        if "gender" in edits:
-            choice = str(edits.get("gender") or "").strip().lower()
-            if choice not in _GENDER_TO_CODES:
-                rejections.append(f"Gender must be one of: {', '.join(_GENDER_TO_CODES)}.")
-            else:
-                codes = _GENDER_TO_CODES[choice]
-                if codes:
-                    targeting["genders"] = codes
-                else:
-                    targeting.pop("genders", None)
-                applied.append("gender")
-
         # ── placement ─────────────────────────────────────────────────────────
         if "placement" in edits:
             choice = str(edits.get("placement") or "").strip().lower()
@@ -488,19 +506,40 @@ async def apply_edits(
                     targeting.pop("publisher_platforms", None)
                 applied.append("placement")
 
-        # ── age ───────────────────────────────────────────────────────────────
-        if {"age_min", "age_max"} & edits.keys():
-            lo = _as_int(edits.get("age_min", targeting.get("age_min", MIN_AGE)))
-            hi = _as_int(edits.get("age_max", targeting.get("age_max", MAX_AGE)))
-            if lo is None or hi is None:
-                rejections.append("Ages must be whole numbers.")
-            elif not (MIN_AGE <= lo < hi <= MAX_AGE):
-                rejections.append(
-                    f"Age range must sit between {MIN_AGE} and {MAX_AGE}, with the minimum below the maximum."
-                )
+    # ── gender ────────────────────────────────────────────────────────────────
+    # Real for both platforms now — TikTok's own gender enum
+    # (GENDER_MALE/GENDER_FEMALE/GENDER_UNLIMITED) maps directly onto this same
+    # genders encoding (see adapters/tiktok.py's _tiktok_gender_for).
+    if "gender" in edits:
+        choice = str(edits.get("gender") or "").strip().lower()
+        if choice not in _GENDER_TO_CODES:
+            rejections.append(f"Gender must be one of: {', '.join(_GENDER_TO_CODES)}.")
+        else:
+            codes = _GENDER_TO_CODES[choice]
+            if codes:
+                targeting["genders"] = codes
             else:
-                targeting["age_min"], targeting["age_max"] = lo, hi
-                applied += [k for k in ("age_min", "age_max") if k in edits]
+                targeting.pop("genders", None)
+            applied.append("gender")
+
+    # ── age ───────────────────────────────────────────────────────────────────
+    # Real for both platforms now — TikTok maps this same continuous age_min/
+    # age_max range onto whichever of its discrete age bands overlap it (see
+    # adapters/tiktok.py's _tiktok_age_groups_for), so the bounds validated here
+    # stay platform-agnostic rather than needing TikTok's own bucket enum
+    # surfaced in the UI.
+    if {"age_min", "age_max"} & edits.keys():
+        lo = _as_int(edits.get("age_min", targeting.get("age_min", MIN_AGE)))
+        hi = _as_int(edits.get("age_max", targeting.get("age_max", MAX_AGE)))
+        if lo is None or hi is None:
+            rejections.append("Ages must be whole numbers.")
+        elif not (MIN_AGE <= lo < hi <= MAX_AGE):
+            rejections.append(
+                f"Age range must sit between {MIN_AGE} and {MAX_AGE}, with the minimum below the maximum."
+            )
+        else:
+            targeting["age_min"], targeting["age_max"] = lo, hi
+            applied += [k for k in ("age_min", "age_max") if k in edits]
 
     # ── budget, duration and daily spend ────────────────────────────────────────
     # Judged TOGETHER, because what the platform actually rejects is the daily

@@ -75,6 +75,146 @@ COLLECTION = "jane_ads_tiktok_campaigns"
 # region-list call; re-verify once a real (non-sandbox) launch is possible.
 _NIGERIA_LOCATION_ID = "2328926"
 
+# ── Real audience targeting (2026-09-25) ──────────────────────────────────────
+# Confirmed against TikTok's own "Audience targeting" and "Enumerations" API
+# reference pages. Every TikTok ad group before this launched with location_ids
+# hardcoded to all of Nigeria and no gender/age targeting at all — the plan's
+# own audience_targeting (age_min/age_max/genders/pins) was computed by Jane but
+# silently discarded at the TikTok launch step. gender and age_groups map
+# directly onto plan.audience_targeting's existing Meta-shaped fields (same
+# dict the review panel already edits); interests have no TikTok equivalent
+# wired up yet — deferred, not silently dropped: see _get_carousel_music_id's
+# own "NOT yet verified live" precedent for how a genuinely-unconfirmed piece
+# gets flagged here rather than guessed at.
+
+# GENDER_UNLIMITED/GENDER_MALE/GENDER_FEMALE — confirmed against TikTok's
+# Enumerations reference. Reuses plan_fields.py's own genders encoding
+# ([]=all, [1]=men, [2]=women) rather than a separate one, so a plan edited in
+# the review panel and a plan TikTok launches from can never disagree about
+# what "men" means.
+_TIKTOK_GENDER = {(): "GENDER_UNLIMITED", (1,): "GENDER_MALE", (2,): "GENDER_FEMALE"}
+
+# (enum, inclusive lower bound, inclusive upper bound) — confirmed against
+# TikTok's Enumerations reference. AGE_13_17 is deliberately never reachable
+# here: plan_fields.py's own MIN_AGE floor is 18, so no plan this adapter ever
+# receives can have age_min below 18, which also sidesteps TikTok's own extra
+# targeting restrictions on the 13-17 bucket in several regions.
+_TIKTOK_AGE_BUCKETS: list[tuple[str, int, int]] = [
+    ("AGE_18_24", 18, 24),
+    ("AGE_25_34", 25, 34),
+    ("AGE_35_44", 35, 44),
+    ("AGE_45_54", 45, 54),
+    ("AGE_55_100", 55, 100),
+]
+
+
+def _tiktok_gender_for(targeting: dict) -> str:
+    codes = tuple(sorted(targeting.get("genders") or []))
+    return _TIKTOK_GENDER.get(codes, "GENDER_UNLIMITED")
+
+
+def _tiktok_age_groups_for(targeting: dict) -> list[str]:
+    """Every TikTok age bucket that overlaps [age_min, age_max] at all — TikTok
+    targets by discrete bucket, not a continuous range, so a plan's 25-45 range
+    becomes AGE_25_34 + AGE_35_44 + AGE_45_54 (all three genuinely include part
+    of that range) rather than picking one bucket arbitrarily. Falls back to
+    every bucket (TikTok's own documented default for an unspecified range)
+    when the plan carries no age fields at all."""
+    lo = targeting.get("age_min")
+    hi = targeting.get("age_max")
+    if lo is None and hi is None:
+        return [enum for enum, _, _ in _TIKTOK_AGE_BUCKETS]
+    lo = lo if lo is not None else 18
+    hi = hi if hi is not None else 100
+    groups = [enum for enum, blo, bhi in _TIKTOK_AGE_BUCKETS if blo <= hi and bhi >= lo]
+    return groups or [enum for enum, _, _ in _TIKTOK_AGE_BUCKETS]
+
+
+async def _resolve_tiktok_locations(
+    names: list[str], advertiser_id: str, access_token: str,
+) -> tuple[list[dict], list[str]]:
+    """Resolve named areas ("Ikeja", "Lekki Peninsula"...) to TikTok location_ids.
+
+    Returns ({"name": <TikTok's own canonical name>, "location_id": ...}, ...) for
+    what resolved rather than bare ids — plan_fields.py's review-panel edit path
+    needs the matched NAME too (to store as a GeoPin, the same shape Meta's own
+    location edits use), not just the id launch_campaign() itself cares about.
+
+    Unlike Meta's location search, TikTok's /tool/region/ has no per-country
+    filter or name-search parameter — the whole location tree comes back in one
+    call, at whatever level_range is asked for, and matching a name against it
+    happens here rather than server-side. Confirmed against TikTok's own
+    /tool/region/ reference (2026-09-25); NOT yet verified live — the exact
+    field names (location_id/name/next_level_ids/region_code) are taken
+    directly from the documented response shape, first real call against a real
+    (non-sandbox) advertiser account happens whenever this is next exercised.
+
+    Never returns an empty list when names were given but none resolved and the
+    lookup itself also failed — the caller falls back to Nigeria-wide targeting
+    rather than sending TikTok an empty location_ids, which the launch would
+    reject outright.
+    """
+    rejected: list[str] = []
+    if not names:
+        return [], rejected
+    api_base = f"{settings.TIKTOK_ADS_API_BASE}/open_api/{settings.TIKTOK_ADS_API_VERSION}"
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.get(
+                f"{api_base}/tool/region/",
+                headers={"Access-Token": access_token, "Content-Type": "application/json"},
+                params={
+                    "advertiser_id": advertiser_id,
+                    "placements": json.dumps(["PLACEMENT_TIKTOK"]),
+                    "objective_type": "TRAFFIC",
+                    "level_range": "TO_CITY",
+                },
+            )
+            data = resp.json()
+    except Exception as e:
+        print(f"[TikTokAdsAdapter] location lookup failed, falling back to Nigeria-wide: {e}", flush=True)
+        return [], list(names)
+    if data.get("code") not in (0, None):
+        print(f"[TikTokAdsAdapter] /tool/region/ rejected: {data.get('message')}", flush=True)
+        return [], list(names)
+
+    region_info = (data.get("data") or {}).get("region_info") or []
+    by_id = {r["location_id"]: r for r in region_info if r.get("location_id")}
+    nigeria = next((r for r in region_info if r.get("region_code") == "NG"), None)
+    if not nigeria:
+        return [], list(names)
+
+    # Walk the whole Nigeria subtree once (province -> city -> district) rather
+    # than searching the full global list per name.
+    nigeria_locations: list[dict] = [nigeria]
+    frontier = list(nigeria.get("next_level_ids") or [])
+    seen = {nigeria["location_id"]}
+    while frontier:
+        next_id = frontier.pop()
+        if next_id in seen:
+            continue
+        seen.add(next_id)
+        node = by_id.get(next_id)
+        if not node:
+            continue
+        nigeria_locations.append(node)
+        frontier.extend(node.get("next_level_ids") or [])
+
+    resolved: list[dict] = []
+    for raw in names[:3]:
+        name = (raw or "").strip().lower()
+        if not name:
+            continue
+        hit = next((n for n in nigeria_locations if (n.get("name") or "").strip().lower() == name), None)
+        if not hit:
+            hit = next((n for n in nigeria_locations if name in (n.get("name") or "").strip().lower()), None)
+        if hit:
+            resolved.append({"name": hit["name"], "location_id": hit["location_id"]})
+        else:
+            rejected.append(raw)
+    return resolved, rejected
+
+
 # TikTok's ad-group-level optimization/billing pair for a click-driving campaign —
 # mirrors the "Maximise Clicks"-equivalent choice google.py made for the same reason
 # (no conversion volume exists yet to train a smarter bidding strategy).
@@ -469,6 +609,24 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                 # 3. Ad group — the real budget + targeting + schedule live here.
                 # PAUSED via operation_status="DISABLE", same as every other create
                 # call in this method.
+                #
+                # Real audience targeting (2026-09-25) — see the module-level
+                # constants/helpers above for what's confirmed vs. still deferred.
+                # Every campaign before this launched with location_ids hardcoded
+                # to all of Nigeria and no gender/age targeting at all, silently
+                # discarding whatever plan.audience_targeting/plan.geo Jane had
+                # actually computed for this plan.
+                targeting = plan.audience_targeting or {}
+                location_names = [p.name for p in (plan.geo.pins if plan.geo else [])]
+                resolved_locations, unresolved_locations = await _resolve_tiktok_locations(
+                    location_names, self._advertiser_id, self._access_token)
+                if unresolved_locations:
+                    print(f"[TikTokAdsAdapter] locations not resolved, dropped: {unresolved_locations}", flush=True)
+                # Nigeria-wide is the honest fallback whenever nothing named
+                # resolved (no pins on the plan at all, or every lookup failed) —
+                # never an empty location_ids, which the launch would reject.
+                location_ids = [r["location_id"] for r in resolved_locations] or [_NIGERIA_LOCATION_ID]
+
                 adgroup_resp = await client.post(
                     f"{self._api_base}/adgroup/create/",
                     headers=self._headers(),
@@ -486,7 +644,9 @@ class TikTokAdsAdapter(AdPlatformAdapter):
                         "promotion_type": "WEBSITE",
                         "placement_type": "PLACEMENT_TYPE_NORMAL",
                         "placements": ["PLACEMENT_TIKTOK"],
-                        "location_ids": [_NIGERIA_LOCATION_ID],
+                        "location_ids": location_ids,
+                        "gender": _tiktok_gender_for(targeting),
+                        "age_groups": _tiktok_age_groups_for(targeting),
                         "budget_mode": "BUDGET_MODE_TOTAL",
                         "budget": total_budget_ngn,
                         "schedule_type": "SCHEDULE_START_END",

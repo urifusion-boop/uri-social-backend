@@ -3470,8 +3470,13 @@ async def meta_plan_edit_fields(
 
     plan = CampaignPlan.model_validate(doc["plan"])
     req = CampaignRequest.model_validate(doc["req"])
+    # TikTok credentials threaded through separately (keyword-only) — locations
+    # now resolve against TikTok's own /tool/region/ for a TikTok plan rather
+    # than Meta's Graph API, which the positional access_token below is for.
     new_plan, new_req, applied, rejections = await apply_edits(
         plan, req, body.edits, settings.META_ADS_ACCESS_TOKEN,
+        tiktok_advertiser_id=settings.TIKTOK_ADS_ADVERTISER_ID,
+        tiktok_access_token=settings.TIKTOK_ADS_ACCESS_TOKEN,
     )
 
     rebuilt_summary = None
