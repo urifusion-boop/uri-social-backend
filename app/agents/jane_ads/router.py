@@ -4271,11 +4271,24 @@ class LiveTargetingBody(BaseModel):
     baseline: str = ""
 
 
-async def _live_campaign(db, campaign_id: str, brand_id: str) -> dict:
+async def _live_campaign(db, campaign_id: str, brand_id: str) -> tuple[dict, bool]:
+    """Looks a live campaign up across both platform collections and says which
+    one it's on — same dual-collection pattern set_meta_campaign_status already
+    uses, extended here now that TikTok has real live targeting to read/edit
+    too (2026-09-25). Returns (record, is_tiktok)."""
     record = await db["jane_ads_meta_campaigns"].find_one({"campaign_id": campaign_id})
-    if not record or record.get("brand_id") != brand_id:
-        raise HTTPException(status_code=404, detail="Campaign not found")
-    return record
+    if record and record.get("brand_id") == brand_id:
+        return record, False
+    record = await db["jane_ads_tiktok_campaigns"].find_one({"campaign_id": campaign_id})
+    if record and record.get("brand_id") == brand_id:
+        return record, True
+    raise HTTPException(status_code=404, detail="Campaign not found")
+
+
+_TIKTOK_LEARNING_WARNING = (
+    "Changing who this ad targets while it's already running can affect delivery for "
+    "a while as TikTok's system adjusts to the new audience."
+)
 
 
 @router.get("/meta/campaigns/{campaign_id}/targeting")
@@ -4284,17 +4297,47 @@ async def get_live_targeting(
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
     brand_ctx: dict = Depends(get_active_brand_context),
 ) -> dict:
-    """Who a LIVE campaign is currently targeting, read fresh from Meta.
+    """Who a LIVE campaign is currently targeting, read fresh from the platform.
 
     Campaign Management PRD §19, "Audience or geography edit" — the only row of that
-    action matrix implemented here.
+    action matrix implemented here. Meta and TikTok both handled now (2026-09-25) —
+    the route stays named /meta/campaigns/... for backwards compatibility, same as
+    the campaign list and status-toggle endpoints already do.
     """
     from app.core.config import settings
 
-    from .adapters.meta import MetaAdPlatformAdapter, MetaAPIError
-    from .live_edit import LEARNING_WARNING, describe_live, targeting_fingerprint
+    from .live_edit import targeting_fingerprint
 
-    await _live_campaign(db, campaign_id, brand_ctx.get("brand_id"))
+    _, is_tiktok = await _live_campaign(db, campaign_id, brand_ctx.get("brand_id"))
+
+    if is_tiktok:
+        from .adapters.tiktok import TikTokAdsAdapter, TikTokAdsAPIError
+        from .live_edit import describe_live_tiktok
+
+        if not (settings.TIKTOK_ADS_ADVERTISER_ID and settings.TIKTOK_ADS_ACCESS_TOKEN):
+            raise HTTPException(status_code=400, detail="TikTok ads not configured")
+        adapter = TikTokAdsAdapter(db, advertiser_id=settings.TIKTOK_ADS_ADVERTISER_ID, access_token=settings.TIKTOK_ADS_ACCESS_TOKEN)
+        try:
+            live = await adapter.fetch_adgroup_targeting(campaign_id)
+        except TikTokAdsAPIError as e:
+            _raise_http_for_tiktok_error(e)
+
+        delivering = (live.get("operation_status") or "").upper() == "ENABLE"
+        fields = await describe_live_tiktok(
+            live["targeting"], settings.TIKTOK_ADS_ADVERTISER_ID, settings.TIKTOK_ADS_ACCESS_TOKEN)
+        return {
+            "campaign_id": campaign_id,
+            "adset_id": live["adgroup_id"],
+            "effective_status": live.get("operation_status"),
+            "fields": fields,
+            "baseline": targeting_fingerprint(live["targeting"]),
+            "delivering": delivering,
+            "learning_warning": _TIKTOK_LEARNING_WARNING if delivering else "",
+        }
+
+    from .adapters.meta import MetaAdPlatformAdapter, MetaAPIError
+    from .live_edit import LEARNING_WARNING, describe_live
+
     adapter = MetaAdPlatformAdapter(db, access_token=settings.META_ADS_ACCESS_TOKEN)
     try:
         live = await adapter.fetch_adset_targeting(campaign_id)
@@ -4325,27 +4368,93 @@ async def edit_live_targeting(
 
     The sequence is fixed and every step earns its place (PRD §20):
 
-    1. Re-read Meta's CURRENT targeting and check it still matches the baseline the
-       client was shown. A mismatch is 409 — someone edited it in Ads Manager and we do
-       not overwrite people's work (D45/CM17).
-    2. Validate the edit against Meta without changing anything.
+    1. Re-read the platform's CURRENT targeting and check it still matches the
+       baseline the client was shown. A mismatch is 409 — someone edited it in Ads
+       Manager and we do not overwrite people's work (D45/CM17).
+    2. Validate the edit against the platform without changing anything (Meta only —
+       see build_tiktok_targeting_edit/update_adgroup_targeting's own docstrings for
+       why TikTok has no equivalent dry-run step).
     3. Write it.
-    4. Re-read and report from what Meta actually holds. An ack is not an effect (CM13).
+    4. Re-read and report from what the platform actually holds. An ack is not an
+       effect (CM13).
 
-    Only interests, age, gender, placement and locations. Budget, schedule, objective
-    and bid strategy are separate action families and are refused here.
+    Meta: interests, age, gender, placement and locations. TikTok: locations, age and
+    gender only (no interests/placement equivalent — see live_edit.py's
+    TIKTOK_EDITABLE). Budget, schedule, objective and bid strategy are separate action
+    families on both platforms and are refused here.
     """
     from datetime import datetime, timezone
 
     from app.core.config import settings
 
-    from .adapters.meta import MetaAdPlatformAdapter, MetaAPIError
-    from .live_edit import build_targeting_edit, describe_live, targeting_fingerprint
+    from .live_edit import targeting_fingerprint
 
     brand_id = brand_ctx.get("brand_id")
-    record = await _live_campaign(db, campaign_id, brand_id)
+    record, is_tiktok = await _live_campaign(db, campaign_id, brand_id)
     if not body.edits:
         raise HTTPException(status_code=400, detail="No edits supplied.")
+
+    if is_tiktok:
+        from .adapters.tiktok import TikTokAdsAdapter, TikTokAdsAPIError
+        from .live_edit import build_tiktok_targeting_edit, describe_live_tiktok
+
+        if not (settings.TIKTOK_ADS_ADVERTISER_ID and settings.TIKTOK_ADS_ACCESS_TOKEN):
+            raise HTTPException(status_code=400, detail="TikTok ads not configured")
+        adapter = TikTokAdsAdapter(db, advertiser_id=settings.TIKTOK_ADS_ADVERTISER_ID, access_token=settings.TIKTOK_ADS_ACCESS_TOKEN)
+        try:
+            live = await adapter.fetch_adgroup_targeting(campaign_id)
+        except TikTokAdsAPIError as e:
+            _raise_http_for_tiktok_error(e)
+
+        current = live["targeting"]
+        fingerprint = targeting_fingerprint(current)
+        if body.baseline and body.baseline != fingerprint:
+            raise HTTPException(
+                status_code=409,
+                detail="This campaign's targeting was changed somewhere else since you "
+                       "opened it. Reload to see the current settings before editing.",
+            )
+
+        changed, applied, rejections = await build_tiktok_targeting_edit(
+            current, body.edits, settings.TIKTOK_ADS_ADVERTISER_ID, settings.TIKTOK_ADS_ACCESS_TOKEN)
+        if not applied or changed is None:
+            fields = await describe_live_tiktok(
+                current, settings.TIKTOK_ADS_ADVERTISER_ID, settings.TIKTOK_ADS_ACCESS_TOKEN)
+            return {"campaign_id": campaign_id, "applied": [], "rejected": rejections,
+                    "fields": fields, "baseline": fingerprint}
+
+        # No genuine validate_only exists for TikTok's /adgroup/update/ (see
+        # update_adgroup_targeting's own docstring) — straight to the real write,
+        # same "an ack is not an effect" readback discipline as Meta below.
+        try:
+            result = await adapter.update_adgroup_targeting(live["adgroup_id"], changed)
+        except TikTokAdsAPIError as e:
+            fields = await describe_live_tiktok(
+                current, settings.TIKTOK_ADS_ADVERTISER_ID, settings.TIKTOK_ADS_ACCESS_TOKEN)
+            return {"campaign_id": campaign_id, "applied": [], "fields": fields,
+                    "baseline": fingerprint, "rejected": [*rejections, f"TikTok rejected the change: {e}"]}
+
+        confirmed = result.get("targeting") or {}
+        await db["jane_ads_live_targeting_edits"].insert_one({
+            "campaign_id": campaign_id, "brand_id": brand_id, "adset_id": live["adgroup_id"],
+            "fields": applied, "before": current, "after": confirmed,
+            "was_delivering": (live.get("operation_status") or "").upper() == "ENABLE",
+            "edited_at": datetime.now(timezone.utc),
+        })
+        confirmed_fields = await describe_live_tiktok(
+            confirmed, settings.TIKTOK_ADS_ADVERTISER_ID, settings.TIKTOK_ADS_ACCESS_TOKEN)
+        return {
+            "campaign_id": campaign_id,
+            "applied": applied,
+            "rejected": rejections,
+            # Reported from what TikTok HOLDS, not from what we sent.
+            "fields": confirmed_fields,
+            "baseline": targeting_fingerprint(confirmed),
+            "verified": True,
+        }
+
+    from .adapters.meta import MetaAdPlatformAdapter, MetaAPIError
+    from .live_edit import build_targeting_edit, describe_live
 
     adapter = MetaAdPlatformAdapter(db, access_token=settings.META_ADS_ACCESS_TOKEN)
     try:
