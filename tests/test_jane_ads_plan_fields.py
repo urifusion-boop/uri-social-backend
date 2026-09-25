@@ -280,11 +280,14 @@ def _tiktok_plan(**over):
 # equivalent at all).
 
 def test_describe_shows_real_tiktok_targeting_but_not_meta_only_fields():
+    # interests joined locations/gender/age as real for TikTok 2026-09-25
+    # (resolved against TikTok's own /tool/interest_category/) — only
+    # placement has no TikTok equivalent at all and stays hidden.
     fields = {f["key"]: f for f in describe(_tiktok_plan(), _req())}
-    for key in ("locations", "gender", "age_min", "age_max"):
+    for key in ("locations", "interests", "gender", "age_min", "age_max"):
         assert key in fields, f"{key} should be real (and shown) for TikTok now"
-    for key in ("interests", "placement"):
-        assert key not in fields, f"{key} has no TikTok equivalent and must stay hidden"
+    assert "placement" not in fields, "placement has no TikTok equivalent and must stay hidden"
+    assert "TikTok" in fields["interests"]["help"]
     # Still real, still shown: TikTok's ad_text/budget/schedule are genuinely used.
     assert "caption" in fields
     assert "budget_ngn" in fields
@@ -305,17 +308,43 @@ def test_daily_spend_help_names_tiktoks_own_floor_not_metas():
     assert "Meta" not in fields["daily_spend"]["help"]
 
 
-def test_apply_edits_rejects_interests_and_placement_on_a_tiktok_plan_without_calling_meta():
-    # No monkeypatch on the Meta lookups here — if this reached _validated_interests
-    # it would try a real network call and the test would hang/error, which is
-    # itself proof the gate works. gender DOES apply for TikTok now, so it's
-    # asserted separately below rather than folded into the rejection here.
+def test_apply_edits_rejects_placement_on_a_tiktok_plan():
+    # placement has no TikTok equivalent at all — this must be refused without
+    # attempting any network call. Interests is tested separately below now
+    # that it's real for TikTok too.
     plan, req, applied, rejected = _run(apply_edits(
-        _tiktok_plan(), _req(), {"interests": ["Fashion"], "placement": "instagram_only"}))
+        _tiktok_plan(), _req(), {"placement": "instagram_only"}))
     assert applied == []
     assert len(rejected) == 1
     assert "TikTok" in rejected[0]
-    assert plan.audience_targeting == _tiktok_plan().audience_targeting
+
+
+def test_apply_edits_interests_refused_without_tiktok_credentials():
+    # No monkeypatch on the Meta lookups here — if this reached
+    # _validated_interests it would try a real network call and the test
+    # would hang/error, which is itself proof the platform branch is right.
+    plan, req, applied, rejected = _run(apply_edits(
+        _tiktok_plan(), _req(), {"interests": ["Fashion"]}))
+    assert applied == []
+    assert "TikTok isn't configured" in rejected[0]
+
+
+def test_apply_edits_resolves_tiktok_interests_via_interest_category_not_meta(monkeypatch):
+    async def _fake_resolve(names, advertiser_id, access_token):
+        assert advertiser_id == "adv123"
+        assert access_token == "tiktok-tok"
+        return [{"name": "Education", "interest_category_id": "10"}], []
+
+    monkeypatch.setattr(
+        "app.agents.jane_ads.adapters.tiktok._resolve_tiktok_interests", _fake_resolve)
+    plan, req, applied, rejected = _run(apply_edits(
+        _tiktok_plan(), _req(), {"interests": ["Education"]},
+        tiktok_advertiser_id="adv123", tiktok_access_token="tiktok-tok",
+    ))
+    assert rejected == []
+    assert applied == ["interests"]
+    entry = plan.audience_targeting["flexible_spec"][0]
+    assert entry["interests"] == [{"id": "10", "name": "Education"}]
 
 
 def test_apply_edits_applies_gender_and_age_on_a_tiktok_plan():
