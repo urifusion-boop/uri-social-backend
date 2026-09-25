@@ -245,3 +245,140 @@ def test_a_deleted_campaign_says_what_to_do_instead(monkeypatch):
     assert e.value.status_code == 409
     assert "deleted" in e.value.detail.lower()
     assert wallet.charges == []
+
+
+# ── TikTok: the same feature, dispatched by platform ─────────────────────────
+# Added 2026-09-25 — "Keep it running" needed a real TikTok adapter to extend
+# against (fetch_adgroup_schedule/extend_adgroup) before this was buildable;
+# see those methods' own docstrings for what's confirmed vs. still unverified.
+
+class _TikTokAdapter:
+    """TikTok's own version of _Adapter — same role, TikTok's method names
+    (fetch_adgroup_schedule/extend_adgroup, a total budget instead of a daily
+    one) and TikTokAdsAPIError instead of MetaAPIError."""
+
+    def __init__(self, daily=31000, budget=217000, end=None, fail_extend=False):
+        self.daily = daily
+        self.budget = budget
+        self.end = end or (NOW + timedelta(days=1)).isoformat()
+        self.fail_extend = fail_extend
+        self.extended_to = None
+        self.extended_budget = None
+
+    async def fetch_adgroup_schedule(self, campaign_id):
+        return {"adgroup_id": "ag_1", "ad_id": "ad_1", "operation_status": "ENABLE",
+                "budget_ngn": self.budget, "daily_ngn": self.daily,
+                "start_time": None, "end_time": self.end, "has_ended": False}
+
+    async def extend_adgroup(self, adgroup_id, new_budget_ngn, new_end_time):
+        if self.fail_extend:
+            from app.agents.jane_ads.adapters.tiktok import TikTokAdsAPIError
+            raise TikTokAdsAPIError("nope")
+        self.extended_to = new_end_time
+        self.extended_budget = new_budget_ngn
+        return {"budget_ngn": new_budget_ngn, "end_time": new_end_time.isoformat()}
+
+
+class _MultiCollDb:
+    """Distinguishes collection names, unlike _Db above (which returns the
+    same collection whatever name is asked for — fine for a Meta-only record,
+    but _live_campaign's dual-collection lookup needs the Meta collection to
+    genuinely come back empty for a TikTok record, exactly like the real
+    jane_ads_meta_campaigns/jane_ads_tiktok_campaigns split)."""
+
+    def __init__(self, tiktok_doc):
+        self.meta = _Coll(None)
+        self.tiktok = _Coll(tiktok_doc)
+
+    def __getitem__(self, name):
+        return self.tiktok if name == "jane_ads_tiktok_campaigns" else self.meta
+
+
+def _tiktok_record(**over):
+    base = {"campaign_id": "c1", "brand_id": "b1", "business_id": "biz1",
+            "adgroup_id": "ag_1", "ad_spend_markup": 1.1}
+    base.update(over)
+    return base
+
+
+def _patch_tiktok(monkeypatch, adapter, wallet):
+    monkeypatch.setattr("app.agents.jane_ads.adapters.tiktok.TikTokAdsAdapter",
+                        lambda *a, **k: adapter)
+    monkeypatch.setattr("app.agents.jane_ads.wallet.WalletService", lambda *a, **k: wallet)
+    monkeypatch.setattr("app.core.config.settings.TIKTOK_ADS_ADVERTISER_ID", "adv123")
+    monkeypatch.setattr("app.core.config.settings.TIKTOK_ADS_ACCESS_TOKEN", "tok")
+
+
+def test_tiktok_extending_charges_only_after_tiktok_confirms(monkeypatch):
+    from app.agents.jane_ads.router import ExtendBody, extend_campaign
+
+    adapter, wallet = _TikTokAdapter(), _Wallet(balance=500000)
+    _patch_tiktok(monkeypatch, adapter, wallet)
+    out = _run(extend_campaign("c1", ExtendBody(days=7, confirm=True),
+                               db=_MultiCollDb(_tiktok_record()), brand_ctx={"brand_id": "b1"}))
+    assert adapter.extended_to is not None
+    # 31,000/day * 7 days * 1.1 markup = 238,700
+    assert wallet.charges == [238700.0]
+    assert out["extended_by_days"] == 7
+    # Both budget AND end date move together — the whole point of
+    # extend_adgroup existing separately from Meta's end-date-only extend.
+    assert adapter.extended_budget == 217000 + 31000 * 7
+
+
+def test_tiktok_extend_uses_tiktoks_own_floor_not_metas(monkeypatch):
+    """31,000/day clears TikTok's real floor easily but the quote/floor check must
+    use TikTok's ₦31,000, not Meta's ₦1,610 — a campaign spending, say, ₦5,000/day
+    would pass Meta's floor and fail TikTok's for real."""
+    from app.agents.jane_ads.router import ExtendBody, extend_campaign
+
+    adapter, wallet = _TikTokAdapter(daily=5000), _Wallet()
+    _patch_tiktok(monkeypatch, adapter, wallet)
+    with pytest.raises(HTTPException) as e:
+        _run(extend_campaign("c1", ExtendBody(days=7, confirm=True),
+                             db=_MultiCollDb(_tiktok_record()), brand_ctx={"brand_id": "b1"}))
+    assert e.value.status_code == 400
+    assert "TikTok" in e.value.detail
+    assert "31,000" in e.value.detail
+    assert wallet.charges == []
+
+
+def test_tiktok_failed_extension_charges_nothing(monkeypatch):
+    from app.agents.jane_ads.router import ExtendBody, extend_campaign
+
+    adapter, wallet = _TikTokAdapter(fail_extend=True), _Wallet(balance=500000)
+    _patch_tiktok(monkeypatch, adapter, wallet)
+    with pytest.raises(HTTPException) as e:
+        _run(extend_campaign("c1", ExtendBody(days=7, confirm=True),
+                             db=_MultiCollDb(_tiktok_record()), brand_ctx={"brand_id": "b1"}))
+    assert e.value.status_code == 502
+    assert wallet.charges == []
+
+
+def test_tiktok_extension_recorded_on_the_tiktok_collection(monkeypatch):
+    from app.agents.jane_ads.router import ExtendBody, extend_campaign
+
+    adapter, wallet = _TikTokAdapter(), _Wallet(balance=500000)
+    _patch_tiktok(monkeypatch, adapter, wallet)
+    db = _MultiCollDb(_tiktok_record())
+    _run(extend_campaign("c1", ExtendBody(days=5, confirm=True),
+                         db=db, brand_ctx={"brand_id": "b1"}))
+    # Written to jane_ads_tiktok_campaigns, not jane_ads_meta_campaigns.
+    assert db.tiktok.updates
+    assert not db.meta.updates
+    update = db.tiktok.updates[0]
+    assert update["$push"]["extensions"]["days"] == 5
+
+
+def test_tiktok_extend_refused_without_configured_credentials(monkeypatch):
+    from app.agents.jane_ads.router import ExtendBody, extend_campaign
+
+    adapter, wallet = _TikTokAdapter(), _Wallet(balance=500000)
+    monkeypatch.setattr("app.agents.jane_ads.adapters.tiktok.TikTokAdsAdapter",
+                        lambda *a, **k: adapter)
+    monkeypatch.setattr("app.agents.jane_ads.wallet.WalletService", lambda *a, **k: wallet)
+    monkeypatch.setattr("app.core.config.settings.TIKTOK_ADS_ADVERTISER_ID", "")
+    with pytest.raises(HTTPException) as e:
+        _run(extend_campaign("c1", ExtendBody(days=7, confirm=True),
+                             db=_MultiCollDb(_tiktok_record()), brand_ctx={"brand_id": "b1"}))
+    assert e.value.status_code == 400
+    assert "not configured" in e.value.detail

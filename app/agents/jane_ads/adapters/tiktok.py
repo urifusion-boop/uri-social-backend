@@ -290,6 +290,49 @@ async def _resolve_tiktok_locations(
 MAX_TIKTOK_INTERESTS = 6
 
 
+# ── "Keep it running" (2026-09-25) ────────────────────────────────────────────
+# TikTok's own schedule timestamps use "%Y-%m-%d %H:%M:%S" (the exact format
+# launch_campaign already sends for schedule_start_time/schedule_end_time) —
+# these two small helpers are the only date parsing fetch_adgroup_schedule
+# needs, kept as plain functions rather than methods since neither touches
+# self.
+
+def _tiktok_schedule_days(start: Optional[str], end: Optional[str]) -> int:
+    """Whole days between TikTok's own schedule timestamps — used to derive
+    an effective daily rate from a BUDGET_MODE_TOTAL ad group's lifetime
+    budget, since TikTok has no separate daily-budget field to read the way
+    Meta does. Returns 0 (not an error) on anything unparseable — the caller
+    falls back to treating the whole budget as a single day's rate rather
+    than raising over a schedule it can't make sense of."""
+    if not start or not end:
+        return 0
+    try:
+        parsed_start = datetime.strptime(start, "%Y-%m-%d %H:%M:%S")
+        parsed_end = datetime.strptime(end, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return 0
+    days = (parsed_end - parsed_start).total_seconds() / 86400
+    return max(0, round(days))
+
+
+def _tiktok_schedule_has_ended(end: Optional[str]) -> bool:
+    """Whether a TikTok ad group's own schedule_end_time has already passed —
+    TikTok has no single status value the way Meta's ADSET_PAUSED/
+    CAMPAIGN_PAUSED effective_status signals a time-based pause specifically,
+    so this is computed directly from the timestamp. An unparseable or
+    missing end time is treated as NOT ended (the honest "we don't know"
+    default — new_end_time's own fallback already handles a missing/bad
+    end_time by measuring from now either way, so this only affects the
+    "has_ended" flag shown to the client, not the actual extension math)."""
+    if not end:
+        return False
+    try:
+        parsed = datetime.strptime(end, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return False
+    return parsed < datetime.now(timezone.utc)
+
+
 def _targeting_interest_names(targeting: dict) -> list[str]:
     """The interest/behaviour label strings out of plan.audience_targeting's
     Meta-shaped flexible_spec — a small local copy of plan_fields.py's own
@@ -1398,3 +1441,117 @@ class TikTokAdsAdapter(AdPlatformAdapter):
         data = resp.json()
         _raise_for_error(data, "campaign delete")
         return data.get("code") == 0
+
+    async def fetch_adgroup_schedule(self, campaign_id: str) -> dict:
+        """When this campaign runs and what it spends a day — read fresh from
+        TikTok, mirrors MetaAdPlatformAdapter.fetch_adset_schedule's shape and
+        purpose exactly (the "Keep it running" feature, extend.py).
+
+        TikTok has no daily-budget field to read directly the way Meta does —
+        every ad group here launches with budget_mode=BUDGET_MODE_TOTAL, a
+        lifetime budget for the whole schedule (see launch_campaign). daily_ngn
+        is DERIVED as budget / scheduled days, the rate TikTok would need to
+        spend at to exhaust that budget exactly by schedule_end_time — the
+        same number the quote/extension math needs regardless of platform.
+
+        NOT yet verified live — GET /adgroup/get/ follows the exact same shape
+        every other GET in this file already uses; this specific field
+        combination (budget/budget_mode/schedule_*) has never been requested
+        together before now."""
+        record = await self._get_campaign_record(campaign_id)
+        adgroup_id = record.get("adgroup_id", "")
+        if not adgroup_id:
+            raise TikTokAdsAPIError(f"campaign {campaign_id} has no ad group recorded")
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(
+                f"{self._api_base}/adgroup/get/",
+                headers=self._headers(),
+                params={
+                    "advertiser_id": self._advertiser_id,
+                    "filtering": json.dumps({"adgroup_ids": [adgroup_id]}),
+                    "fields": json.dumps([
+                        "adgroup_id", "operation_status", "budget", "budget_mode",
+                        "schedule_start_time", "schedule_end_time",
+                    ]),
+                },
+            )
+            data = resp.json()
+        _raise_for_error(data, "adgroup schedule read")
+        rows = (data.get("data") or {}).get("list") or []
+        if not rows:
+            raise TikTokAdsAPIError(f"ad group {adgroup_id} not found on TikTok")
+        row = rows[0]
+        budget = float(row.get("budget") or 0)
+        start = row.get("schedule_start_time")
+        end = row.get("schedule_end_time")
+        scheduled_days = _tiktok_schedule_days(start, end)
+        daily_ngn = round(budget / scheduled_days, 2) if scheduled_days else budget
+        return {
+            "adgroup_id": adgroup_id,
+            "ad_id": record.get("ad_id", ""),
+            "operation_status": row.get("operation_status"),
+            "budget_ngn": budget,
+            "daily_ngn": daily_ngn,
+            "start_time": start,
+            "end_time": end,
+            # Whether the schedule's own end date has already passed — TikTok
+            # has no single "effective_status" the way Meta's ADSET_PAUSED/
+            # CAMPAIGN_PAUSED values signal a time-based pause, so this is
+            # computed directly from the timestamp rather than inferred from
+            # operation_status (which only reflects ENABLE/DISABLE, not why).
+            "has_ended": _tiktok_schedule_has_ended(end),
+        }
+
+    async def extend_adgroup(
+        self, adgroup_id: str, new_budget_ngn: float, new_end_time: datetime,
+    ) -> dict:
+        """Push a TikTok ad group's budget and end date to new ABSOLUTE values
+        together, then READ IT BACK — same "an acknowledgement is not an
+        effect" discipline as update_adgroup_targeting/extend_adset (PRD
+        CM13).
+
+        Both fields move together, unlike Meta's extend_adset (end_time
+        alone, since Meta's DAILY budget means more days automatically buys
+        more spend): TikTok's BUDGET_MODE_TOTAL is a lifetime budget for the
+        whole schedule, so pushing only the end date would spread the SAME
+        budget thinner over more days rather than actually buying more
+        delivery. The caller computes the new absolute budget (current +
+        this extension's ad spend) and passes it here directly, same
+        convention as new_end_time — never a delta, so this stays a simple
+        field write like every other TikTok update in this file.
+
+        NOT yet verified live — /adgroup/update/'s support for raising the
+        budget on an already-live BUDGET_MODE_TOTAL ad group is the one piece
+        of this whole "Keep it running" feature that was never in TikTok's
+        own documented reference; first real call happens on next use."""
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"{self._api_base}/adgroup/update/",
+                headers=self._headers(),
+                json={
+                    "advertiser_id": self._advertiser_id,
+                    "adgroup_id": adgroup_id,
+                    "budget": new_budget_ngn,
+                    "schedule_end_time": new_end_time.strftime("%Y-%m-%d %H:%M:%S"),
+                },
+            )
+            data = resp.json()
+            _raise_for_error(data, "adgroup extend")
+
+            confirm = await client.get(
+                f"{self._api_base}/adgroup/get/",
+                headers=self._headers(),
+                params={
+                    "advertiser_id": self._advertiser_id,
+                    "filtering": json.dumps({"adgroup_ids": [adgroup_id]}),
+                    "fields": json.dumps(["budget", "schedule_end_time"]),
+                },
+            )
+            confirmed = confirm.json()
+        _raise_for_error(confirmed, "adgroup extend readback")
+        rows = (confirmed.get("data") or {}).get("list") or []
+        row = rows[0] if rows else {}
+        return {
+            "budget_ngn": float(row.get("budget") or 0),
+            "end_time": row.get("schedule_end_time"),
+        }
