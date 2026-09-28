@@ -653,63 +653,41 @@ class ApprovalWorkflowService:
             if not scheduled_content:
                 return {"message": "No scheduled content to publish", "published": 0}
 
-            # Deduplicate ALL scheduled content: keep only the newest draft per (user_id, platform).
-            # Applies to both direct-publish drafts (no platform_post_id) and
-            # Outstand-polled drafts (has platform_post_id). This prevents old Outstand
-            # submissions from publishing after a newer draft has already been scheduled.
+            # REMOVED (was here from 2026-05-15 to 2026-09-28, commit 46d4424): a
+            # "dedup" step that kept only the single newest-CREATED draft per
+            # (user_id, platform) and silently cancelled every other one to
+            # status="replaced" on every cron tick — with no scheduled_date
+            # awareness at all. That's indistinguishable from having two or more
+            # DIFFERENT posts legitimately scheduled for different days on the
+            # same platform (the normal shape of any real content calendar):
+            # every tick it killed all but the most-recently-created one,
+            # regardless of which was actually due next. Confirmed live-reported:
+            # a user's scheduled posts vanished from the Scheduled tab (the
+            # frontend filters "replaced" out of every active view) and never
+            # reached Facebook — with zero notification, because "replaced" was
+            # never surfaced anywhere as an error.
             #
-            # Live-reported crash: created_at is NOT consistently a BSON date across every
-            # draft-creation path in this codebase — the AI-video/ZapCap production
-            # pipeline stores it as an ISO string (datetime.now(timezone.utc).isoformat()),
-            # same pattern as video_publish_service.py's create_job, while most other
-            # paths store a real datetime. Sorting `d.get("created_at") or datetime.min`
-            # directly raises TypeError the moment a string and a datetime (or an aware and
-            # a naive datetime) land in the same candidate batch — which silently aborted
-            # the ENTIRE tick (every draft in it, not just the mismatched one) with no log
-            # line at all, because the outer except below returns {"error": ...} and the
-            # scheduler wrapper only ever checks the plural key "errors". Normalize every
-            # value to a naive UTC datetime before comparing, so type/tz drift between
-            # creation paths can never crash the batch again.
-            def _created_at_key(d: dict) -> datetime:
-                ca = d.get("created_at")
-                if isinstance(ca, str):
-                    try:
-                        ca = datetime.fromisoformat(ca)
-                    except ValueError:
-                        return datetime.min
-                if not isinstance(ca, datetime):
-                    return datetime.min
-                if ca.tzinfo is not None:
-                    ca = ca.astimezone(timezone.utc).replace(tzinfo=None)
-                return ca
-
-            _seen_platform_user: dict = {}
-            _to_cancel: list = []
-            _all_scheduled = [d for d in scheduled_content if d.get("status") == _sched_status]
-            _all_scheduled.sort(key=_created_at_key, reverse=True)
-            for _dup in _all_scheduled:
-                _key = (str(_dup.get("user_id")), _dup.get("platform"))
-                if _key in _seen_platform_user:
-                    _to_cancel.append(_dup.get("id"))
-                else:
-                    _seen_platform_user[_key] = _dup.get("id")
-            if _to_cancel:
-                # Filter out None IDs before cancelling to avoid matching unindexed docs
-                valid_cancel_ids = [i for i in _to_cancel if i is not None]
-                if valid_cancel_ids:
-                    await db["content_drafts"].update_many(
-                        {"id": {"$in": valid_cancel_ids}},
-                        {"$set": {
-                            "status": "replaced",
-                            "error_message": "Superseded by a newer draft for the same platform.",
-                            "updated_at": current_time,
-                        }},
-                    )
-                print(f"🗑️ Cancelled {len(valid_cancel_ids)} duplicate drafts (kept newest per platform): {valid_cancel_ids}")
-                _cancel_set = set(_to_cancel)
-                scheduled_content = [d for d in scheduled_content if d.get("id") not in _cancel_set]
-
-            print(f"✅ After dedup: {len(scheduled_content)} draft(s) to process | ids={[d.get('id') for d in scheduled_content]}")
+            # It was added to fix a real bug ("Facebook was posting 8 times"),
+            # but that was root-caused to duplicate DRAFT CREATION (a double-
+            # submit producing several separate draft docs for what the user
+            # intended as one post) — this blanket keep-only-the-newest rule
+            # never actually addressed that at the source, it just usually
+            # happened to hide most of the resulting duplicates as a side
+            # effect, at the cost of also hiding every legitimately distinct
+            # future post. The two safeguards that DO correctly prevent
+            # double-publishing are both still here and don't have this
+            # failure mode:
+            #   1. approve_content cancels only genuinely in-flight drafts
+            #      ("publishing"/"ready_to_publish") for the same platform at
+            #      the moment a new one is explicitly scheduled — never touches
+            #      other cleanly-"scheduled" future posts.
+            #   2. The atomic find_one_and_update claim below (status=
+            #      _sched_status -> "publishing") ensures only one cron run can
+            #      ever pick up a given draft, so concurrent ticks can't
+            #      double-publish the same draft.
+            # A real fix for duplicate draft creation belongs at that source
+            # (idempotency on the create/approve action), not here.
+            print(f"📋 {len(scheduled_content)} draft(s) to process | ids={[d.get('id') for d in scheduled_content]}")
 
             published_count = 0
             errors = []
