@@ -24,9 +24,6 @@ from .entities import CHANNEL_ACCOUNTS, Platform, now
 
 SOCIAL_CONNECTIONS = "social_connections"
 
-# Surfaced by the link endpoint so a failed Page subscription is visible.
-_LAST_SUBSCRIPTIONS: list[dict] = []
-
 
 def _workspace_of(conn: dict) -> str:
     """The workspace a connection belongs to.
@@ -77,7 +74,7 @@ def channel_rows(conn: dict, workspace_id: str = "") -> list[dict]:
     return rows
 
 
-async def link_workspace_channels(db, user_id: str, workspace_id: str) -> list[dict]:
+async def link_workspace_channels(db, user_id: str, workspace_id: str) -> dict:
     """Register this workspace's connected accounts with the inbox. Safe to re-run.
 
     Re-running is the normal case, not an edge one: tokens are refreshed and Pages are
@@ -125,15 +122,13 @@ async def link_workspace_channels(db, user_id: str, workspace_id: str) -> list[d
         if not ok:
             print(f"[Inbox] could not subscribe page {page_id}: {err}", flush=True)
 
-    if subscriptions:
-        _LAST_SUBSCRIPTIONS.clear()
-        _LAST_SUBSCRIPTIONS.extend(subscriptions)
-
     if not linked:
         print(f"[Inbox] linked nothing for {workspace_id!r}: "
               f"{len(conns)} connection(s) considered, "
               f"{len(skipped)} in other workspaces {sorted(set(skipped))[:5]}", flush=True)
-    return linked
+    # Returned, not stashed on the module: a global would be shared across
+    # requests and hand one workspace's page ids to the next caller.
+    return {"linked": linked, "subscriptions": subscriptions}
 
 
 async def subscribe_page_to_app(page_id: str, access_token: str) -> tuple[bool, str]:
