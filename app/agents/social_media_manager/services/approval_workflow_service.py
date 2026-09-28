@@ -16,6 +16,36 @@ from app.agents.social_media_manager.services.outstand_service import OutstandSe
 from app.agents.social_media_manager.services.x_direct_service import XDirectService
 
 
+# Outstand/Facebook errors are raw API text ("Failed to upload Facebook
+# photo: 400 - Confirm your identity...") — technically accurate, but leaves
+# a user with no idea what actually happened or what to do about it. Where a
+# known Facebook-side signature is recognized, this substitutes a plain-
+# language explanation + next step. Table of (pattern, friendly message) so
+# new signatures can be added without touching the call sites below.
+_FRIENDLY_FACEBOOK_ERROR_PATTERNS = [
+    (
+        re.compile(r"confirm your identity", re.IGNORECASE),
+        "Facebook needs you to confirm your identity before this Page can publish. "
+        "This is a security check from Facebook itself, not something wrong with your "
+        "account here — open the Facebook app (or Meta Business Suite) and check "
+        "Notifications or Support Inbox for a verification prompt, then follow "
+        "Facebook's steps. Once confirmed, this and future posts to this Page will go "
+        "out normally again — no need to reconnect anything here."
+    ),
+]
+
+
+def _friendlier_facebook_error(raw: Optional[str]) -> str:
+    """Prepend a plain-language explanation for a recognized Facebook error
+    signature, keeping the raw detail alongside it (support/debugging).
+    Unrecognized errors pass through unchanged."""
+    raw = raw or "unknown error"
+    for pattern, friendly in _FRIENDLY_FACEBOOK_ERROR_PATTERNS:
+        if pattern.search(raw):
+            return f"{friendly} (Facebook's detail: {raw})"
+    return raw
+
+
 class ApprovalWorkflowService:
     """
     Complete approval and scheduling workflow for social media content
@@ -265,7 +295,7 @@ class ApprovalWorkflowService:
                                     "draft_id": _d["draft_id"],
                                     "warning": (
                                         f"{_d['platform'].capitalize()} rejected this post just now "
-                                        f"({_d['publish_result'].get('error') or 'unknown error'}). "
+                                        f"({_friendlier_facebook_error(_d['publish_result'].get('error'))}). "
                                         f"It's still queued and will retry automatically at the "
                                         f"scheduled time, but you may want to check your "
                                         f"{_d['platform'].capitalize()} connection."
@@ -276,7 +306,8 @@ class ApprovalWorkflowService:
                         warnings.append({
                             "draft_id": _d["draft_id"],
                             "warning": (
-                                f"{_d['platform'].capitalize()} rejected this post just now ({_se}). "
+                                f"{_d['platform'].capitalize()} rejected this post just now "
+                                f"({_friendlier_facebook_error(str(_se))}). "
                                 f"It's still queued and will retry automatically at the scheduled "
                                 f"time, but you may want to check your {_d['platform'].capitalize()} connection."
                             ),
@@ -793,7 +824,8 @@ class ApprovalWorkflowService:
                                     ]
                                     if failed_accounts:
                                         error_detail = "; ".join(
-                                            acc.get("error") or f"{acc.get('network', 'platform')} publish failed"
+                                            _friendlier_facebook_error(acc.get("error"))
+                                            if acc.get("error") else f"{acc.get('network', 'platform')} publish failed"
                                             for acc in failed_accounts
                                         )
                                         await db["content_drafts"].update_one(
