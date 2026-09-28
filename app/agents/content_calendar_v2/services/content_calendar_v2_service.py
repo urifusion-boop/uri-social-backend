@@ -68,6 +68,19 @@ from ..creative_framework import (
     get_creative_framework,
     STRUCTURAL_DEVICE_SLIDE_HINT,
     ANTI_BORING_PHRASES,
+    ANTI_BORING_OPENER_STEMS,
+)
+
+# Matches a risky verb, any conjugation ("Unlock", "Unlocking", "Discover",
+# "Discovering"...), OPENING the title or a later clause within it — a title
+# can be two sentences ("Why Pay More? Discover Our Pricing Edge"), and the
+# addendum's concern is the verb opening a headline-style clause, not merely
+# appearing somewhere in the sentence structure (that's still the fixed
+# bigrams above, and why "the electrician masters in year one" — the verb
+# mid-clause — must NOT match here). Built once at import time.
+_ANTI_BORING_OPENER_RE = re.compile(
+    r"(?:^|[.!?:—-]\s+)\s*((?:" + "|".join(ANTI_BORING_OPENER_STEMS) + r")\w*)\b",
+    re.IGNORECASE,
 )
 
 COLLECTION = "content_calendar_v2_plans"
@@ -364,6 +377,24 @@ def _visual_guide_block(brand: Dict[str, Any]) -> str:
         f"layout_direction must stay recognisably within this visual language every time — "
         f"do not invent a different design style per item."
     )
+
+
+def _recurring_series_names(resolved_names: List[Optional[str]], min_occurrences: int = 2) -> set:
+    """Which series names actually recurred across the plan.
+
+    PRD §21 / the candidate-generation prompt both say a series name should
+    only be used when it genuinely applies to several concepts — "a series
+    used exactly once isn't recurring, don't invent one just to fill this
+    field." That was prompt-only until now, and confirmed live: a real plan
+    carried 6 distinct series names, every one used exactly once. Pure and
+    deterministic on purpose, matching this file's other hard-rule checks
+    (_find_banned_words, the carousel slide-count clamp) — this rule doesn't
+    get to depend on the model having followed the instruction."""
+    counts: Dict[str, int] = {}
+    for name in resolved_names:
+        if name:
+            counts[name] = counts.get(name, 0) + 1
+    return {name for name, count in counts.items() if count >= min_occurrences}
 
 
 def _resolve_series_name(name: Optional[str], brand_name: str, industry: str) -> Optional[str]:
@@ -1091,10 +1122,17 @@ def _anti_boring_check(items: List[Dict[str, Any]], brand_name: str = "") -> Dic
     brand_lower = (brand_name or "").strip().lower()
     flagged: Dict[int, str] = {}
     for i, item in enumerate(items):
+        title = str(item.get("title", ""))
         text = " ".join([
-            str(item.get("title", "")), str(item.get("hook", "")),
+            title, str(item.get("hook", "")),
             str((item.get("exact_copy") or {}).get("caption", "")),
         ]).lower()
+
+        opener_match = _ANTI_BORING_OPENER_RE.search(title)
+        if opener_match:
+            flagged[i] = f'generic AI-sounding headline opener: "{opener_match.group(1)}..." — verify the execution redeems it'
+            continue
+
         for phrase in ANTI_BORING_PHRASES:
             # Confirmed live: "at {brand}, we believe".split("{brand}")[0].strip()
             # reduces to the bare word "at" — a substring present in nearly any
@@ -1848,6 +1886,22 @@ async def _build_plan_doc(
     # PRD §21 — every item sharing a series_name within this plan gets the
     # same series_id, so the frontend can group/highlight a recurring series
     # as one thing rather than N unrelated items that happen to share a label.
+    #
+    # The candidate-generation prompt already asks the model to reuse a series
+    # name across at least 2 concepts and never invent one just to fill the
+    # field — but nothing enforced that. Confirmed live: a real plan carried 6
+    # distinct series names, every one used exactly once, which isn't a
+    # recurring series, it's noise dressed up as one. Same pattern this
+    # pipeline already uses for its other hard rules (words_to_avoid, the 2-5
+    # carousel-slide limit) — count actual occurrences across the selected 30
+    # and silently drop any series_name that didn't genuinely recur, rather
+    # than trusting the model to have followed the instruction.
+    resolved_series_names = [
+        _resolve_series_name(idea.get("series_name"), brand.get("brand_name") or "the brand", industry or "business")
+        for idea in all_items
+    ]
+    recurring_series_names = _recurring_series_names(resolved_series_names)
+
     series_ids_by_name: Dict[str, str] = {}
     items_out: List[Dict[str, Any]] = []
     for i, idea in enumerate(all_items):
@@ -1890,6 +1944,8 @@ async def _build_plan_doc(
         )
 
         device = idea.get("creative_device") or {}
+        resolved_series = resolved_series_names[i]
+        recurring_series = resolved_series if resolved_series in recurring_series_names else None
         items_out.append({
             "item_id": str(uuid.uuid4()),
             "day_index": day_index,
@@ -1937,15 +1993,10 @@ async def _build_plan_doc(
             "primary_kpi": idea.get("primary_kpi", "engagement"),
             "selection_score": idea.get("selection_score", {}),
             "series_id": (
-                series_ids_by_name.setdefault(
-                    _resolve_series_name(idea["series_name"], brand.get("brand_name") or "the brand", industry or "business"),
-                    str(uuid.uuid4()),
-                )
-                if idea.get("series_name") else None
+                series_ids_by_name.setdefault(recurring_series, str(uuid.uuid4()))
+                if recurring_series else None
             ),
-            "series_name": _resolve_series_name(
-                idea.get("series_name"), brand.get("brand_name") or "the brand", industry or "business"
-            ),
+            "series_name": recurring_series,
             "creative_quality_review_note": anti_boring_notes.get(day_index),
             "diversity_check": {
                 "passed": day_index not in flagged_set,
