@@ -170,11 +170,16 @@ class FakeCollection:
         self.docs.append(doc)
         return copy.deepcopy(doc)
 
-    async def update_one(self, q, update):
+    async def update_one(self, q, update, upsert=False):
+        self._reject_empty_operators(update)
         for d in self.docs:
             if self._matches(d, q):
                 d.update(update.get("$set", {}))
                 return
+        if upsert:
+            self.docs.append({"_id": ObjectId(), **q,
+                              **update.get("$setOnInsert", {}),
+                              **update.get("$set", {})})
 
     async def insert_one(self, doc):
         doc = {"_id": ObjectId(), **doc}
@@ -355,3 +360,33 @@ def test_a_comment_thread_gets_no_reply_window():
     ev = _dm(); ev["type"] = "comment"; ev["external_thread_id"] = "post_1"
     _run(record_event(db, WS, ACCT, "facebook", ev))
     assert "reply_window_expires_at" not in db[CONVERSATIONS].docs[0]
+
+
+def test_an_instagram_comment_uses_the_media_id_as_its_thread():
+    """Instagram sends `media` as an object, not a string. Stringifying it whole gives
+    a thread id of "{'id': ...}" and every comment on that post lands in its own
+    thread."""
+    payload = {"entry": [{"id": "IG1", "changes": [{"field": "comments", "value": {
+        "id": "c_1", "media": {"id": "media_9", "media_product_type": "FEED"},
+        "from": {"id": "U2", "username": "ada_ng"}, "text": "is this still available?"}}]}]}
+    ev = parse_meta_event(payload)[0]
+    assert ev["external_thread_id"] == "media_9"
+    assert ev["source_post_id"] == "media_9"
+
+
+def test_an_instagram_commenter_gets_their_username():
+    """Instagram sends from.username where Facebook sends from.name."""
+    payload = {"entry": [{"id": "IG1", "changes": [{"field": "comments", "value": {
+        "id": "c_2", "media": {"id": "m"}, "from": {"id": "U3", "username": "ada_ng"},
+        "text": "hi"}}]}]}
+    assert parse_meta_event(payload)[0]["display_name"] == "ada_ng"
+
+
+def test_two_instagram_comments_on_one_post_share_a_thread():
+    db = FakeDB()
+    for n in (1, 2):
+        ev = parse_meta_event({"entry": [{"id": "IG1", "changes": [{"field": "comments",
+            "value": {"id": f"c_{n}", "media": {"id": "media_9"},
+                      "from": {"id": "U2", "username": "ada"}, "text": "x"}}]}]})[0]
+        _run(record_event(db, WS, ACCT, "instagram", ev))
+    assert len(db[CONVERSATIONS].docs) == 1

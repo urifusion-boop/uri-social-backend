@@ -18,6 +18,7 @@ from app.core.config import settings
 from app.dependencies import get_active_brand_context, get_db_dependency
 
 from .entities import CHANNEL_ACCOUNTS, CONVERSATIONS, IDENTITIES, MESSAGES
+from .channels import account_for_event, link_workspace_channels
 from .meta_transport import meta_transport
 from .send import SendRefused, send_reply
 from .ingest import (
@@ -71,8 +72,7 @@ async def receive_meta_webhook(
     events = parse_meta_event(payload)
     stored = 0
     for ev in events:
-        account = await db[CHANNEL_ACCOUNTS].find_one(
-            {"external_account_id": ev.get("external_account_id")})
+        account = await account_for_event(db, ev.get("external_account_id"))
         if not account:
             # An event for an account nobody connected. Dropping it is right: there is
             # no workspace to file it under, and guessing one would put a stranger's
@@ -211,3 +211,19 @@ async def reply_to_conversation(
         "provider_message_id": record.get("provider_message_id", ""),
         "failure_reason": record.get("failure_reason", ""),
     }
+
+
+@router.post("/channels/link")
+async def link_channels(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Register the workspace's connected Pages and Instagram accounts with the inbox.
+
+    Reuses the tokens the user already granted when they connected for publishing —
+    prompting for OAuth again would ask them to grant what they have already granted.
+    Safe to re-run; a refreshed token updates the existing row rather than adding one.
+    """
+    linked = await link_workspace_channels(
+        db, brand_ctx.get("user_id", ""), brand_ctx.get("brand_id"))
+    return {"linked": len(linked), "accounts": linked}

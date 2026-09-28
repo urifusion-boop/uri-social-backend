@@ -139,19 +139,24 @@ def parse_meta_event(payload: dict) -> list[dict]:
             if not comment_id:
                 continue
             frm = v.get("from") or {}
+            # Instagram and Facebook disagree on shape: FB sends post_id and from.name,
+            # Instagram sends media as an OBJECT and from.username. Reading them the
+            # same way yields "{'id': ...}" as a thread id and a blank commenter name.
+            media = v.get("media")
+            media_id = media.get("id") if isinstance(media, dict) else media
             events.append({
                 "type": "comment",
                 "external_account_id": account_id,
                 "external_user_id": str(frm.get("id") or ""),
-                "display_name": frm.get("name") or "",
+                "display_name": frm.get("name") or frm.get("username") or "",
                 # The post is the thread: every comment on it belongs together.
-                "external_thread_id": str(v.get("post_id") or v.get("media") or comment_id),
+                "external_thread_id": str(v.get("post_id") or media_id or comment_id),
                 "provider_message_id": comment_id,
                 "parent_id": str((v.get("parent_id") or "")),
                 "text": v.get("message") or v.get("text") or "",
                 "provider_timestamp": _ts(v.get("created_time")),
                 # Provider-supplied only. Never derived from the comment's wording.
-                "source_post_id": str(v.get("post_id") or ""),
+                "source_post_id": str(v.get("post_id") or media_id or ""),
                 "source_ad_id": str(v.get("ad_id") or ""),
             })
     return events
