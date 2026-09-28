@@ -24,6 +24,9 @@ from .entities import CHANNEL_ACCOUNTS, Platform, now
 
 SOCIAL_CONNECTIONS = "social_connections"
 
+# Surfaced by the link endpoint so a failed Page subscription is visible.
+_LAST_SUBSCRIPTIONS: list[dict] = []
+
 
 def _workspace_of(conn: dict) -> str:
     """The workspace a connection belongs to.
@@ -106,11 +109,60 @@ async def link_workspace_channels(db, user_id: str, workspace_id: str) -> list[d
             )
             linked.append(key)
 
+    # Subscribe each distinct Page once, after the rows are stored.
+    subscriptions: list[dict] = []
+    seen_pages: set[str] = set()
+    for conn in conns:
+        if _workspace_of(conn) != workspace_id:
+            continue
+        page_id = str(conn.get("page_id") or "")
+        token = conn.get("page_access_token") or ""
+        if not page_id or not token or page_id in seen_pages:
+            continue
+        seen_pages.add(page_id)
+        ok, err = await subscribe_page_to_app(page_id, token)
+        subscriptions.append({"page_id": page_id, "subscribed": ok, "error": err})
+        if not ok:
+            print(f"[Inbox] could not subscribe page {page_id}: {err}", flush=True)
+
+    if subscriptions:
+        _LAST_SUBSCRIPTIONS.clear()
+        _LAST_SUBSCRIPTIONS.extend(subscriptions)
+
     if not linked:
         print(f"[Inbox] linked nothing for {workspace_id!r}: "
               f"{len(conns)} connection(s) considered, "
               f"{len(skipped)} in other workspaces {sorted(set(skipped))[:5]}", flush=True)
     return linked
+
+
+async def subscribe_page_to_app(page_id: str, access_token: str) -> tuple[bool, str]:
+    """Subscribe the Page to this app so Meta actually delivers its events.
+
+    Ticking fields in the App Dashboard is NOT enough: that configures which
+    fields the app may receive, while this says the Page consents to sending
+    them. Miss it and everything looks correctly configured and nothing arrives.
+    """
+    import httpx
+
+    from app.core.config import settings
+
+    version = getattr(settings, "FACEBOOK_API_VERSION", "") or "v21.0"
+    url = f"https://graph.facebook.com/{version}/{page_id}/subscribed_apps"
+    fields = "messages,messaging_postbacks,message_reactions,feed"
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            r = await client.post(
+                url, data={"subscribed_fields": fields, "access_token": access_token})
+    except Exception as e:
+        return False, str(e)[:200]
+
+    if r.status_code >= 400:
+        try:
+            return False, (r.json().get("error") or {}).get("message", "")[:200]
+        except ValueError:
+            return False, r.text[:200]
+    return True, ""
 
 
 async def account_for_event(db, external_account_id: str) -> Optional[dict]:
