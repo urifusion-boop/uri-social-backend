@@ -196,3 +196,23 @@ def test_a_missing_messaging_scope_still_subscribes_comments():
     assert ok is True
     assert "pages_messaging" in note
     assert attempts == ["messages,messaging_postbacks,message_reactions,feed", "feed"]
+
+
+def test_an_account_claimed_by_two_workspaces_is_not_routed():
+    """Meta says which ACCOUNT an event is for, never which workspace. Picking
+    either one puts a real customer's message in another tenant's inbox."""
+    db = Db()
+    for ws in ("ws_a", "ws_b"):
+        db[CHANNEL_ACCOUNTS].docs.append(
+            {"workspace_id": ws, "platform": "facebook", "external_account_id": "PAGE7"})
+    assert _run(account_for_event(db, "PAGE7")) is None
+
+
+def test_the_same_workspace_twice_still_routes():
+    """Duplicate rows within ONE workspace are not ambiguous — same destination."""
+    db = Db()
+    for _ in range(2):
+        db[CHANNEL_ACCOUNTS].docs.append(
+            {"workspace_id": "ws_a", "platform": "facebook", "external_account_id": "PAGE7"})
+    found = _run(account_for_event(db, "PAGE7"))
+    assert found is not None and found["workspace_id"] == "ws_a"
