@@ -99,6 +99,15 @@ class ApprovalWorkflowService:
             print(f"✅ approve_content | user_id={user_id} draft_ids={draft_ids} schedule_option={schedule_option}")
             approved_drafts = []
             errors = []
+            # Distinct from errors: the draft IS genuinely scheduled (status
+            # stays "scheduled", the cron will still retry at send time) but
+            # something about the initial dispatch attempt is worth flagging
+            # now rather than leaving the user to find out only when/if the
+            # later retry also fails. errors[] is reserved for "this draft
+            # was not accepted at all" — conflating the two would make the
+            # frontend show a hard failure toast for a post that actually is
+            # queued, which is its own kind of misleading.
+            warnings = []
 
             for draft_id in draft_ids:
                 try:
@@ -240,12 +249,43 @@ class ApprovalWorkflowService:
                                 scheduled_datetime=_schedule_dt,
                             )
                             _d["publish_result"] = _res.get(_d["draft_id"])
+                            # This submission failing here used to be silent — the draft
+                            # still ends up status="scheduled" (see _trigger_immediate_
+                            # publishing's is_scheduled branch, which deliberately keeps
+                            # that status so the cron gets its own honest retry at the real
+                            # send time rather than giving up on one early hiccup) and the
+                            # response still reported plain success. That meant a genuinely
+                            # dead connection (e.g. an expired Facebook token) produced a
+                            # "Scheduled!" toast with zero signal anything was wrong, and the
+                            # user only found out when the cron's later retry also failed —
+                            # by then framed as a surprise, unexplained failure. Surfacing it
+                            # now, still without changing the retry behavior itself.
+                            if _d["publish_result"] and not _d["publish_result"].get("success"):
+                                warnings.append({
+                                    "draft_id": _d["draft_id"],
+                                    "warning": (
+                                        f"{_d['platform'].capitalize()} rejected this post just now "
+                                        f"({_d['publish_result'].get('error') or 'unknown error'}). "
+                                        f"It's still queued and will retry automatically at the "
+                                        f"scheduled time, but you may want to check your "
+                                        f"{_d['platform'].capitalize()} connection."
+                                    ),
+                                })
                     except Exception as _se:
                         print(f"⚠️ Outstand schedule submission failed for draft_id={_d['draft_id']}: {_se}")
+                        warnings.append({
+                            "draft_id": _d["draft_id"],
+                            "warning": (
+                                f"{_d['platform'].capitalize()} rejected this post just now ({_se}). "
+                                f"It's still queued and will retry automatically at the scheduled "
+                                f"time, but you may want to check your {_d['platform'].capitalize()} connection."
+                            ),
+                        })
             
             return UriResponse.get_single_data_response("content_approval", {
                 "approved_drafts": approved_drafts,
                 "errors": errors,
+                "warnings": warnings,
                 "schedule_option": schedule_option,
                 "scheduled_datetime": scheduled_datetime.isoformat() if scheduled_datetime else None,
                 "approved_at": datetime.utcnow().isoformat()
@@ -1056,15 +1096,18 @@ class ApprovalWorkflowService:
                 if publish_result.get("success"):
                     await db["content_drafts"].update_one(
                         {"id": draft_id},
-                        {"$set": {
-                            "status": "scheduled" if is_scheduled else "published",
-                            "published_date": None if is_scheduled else datetime.utcnow(),
-                            "scheduled_date": scheduled_datetime if is_scheduled else None,
-                            "platform_post_id": publish_result.get("post_id"),
-                            "outstand_post_status": publish_result.get("outstand_status", "queued"),
-                            "publish_response": publish_result.get("raw_response"),
-                            "updated_at": datetime.utcnow(),
-                        }},
+                        {
+                            "$set": {
+                                "status": "scheduled" if is_scheduled else "published",
+                                "published_date": None if is_scheduled else datetime.utcnow(),
+                                "scheduled_date": scheduled_datetime if is_scheduled else None,
+                                "platform_post_id": publish_result.get("post_id"),
+                                "outstand_post_status": publish_result.get("outstand_status", "queued"),
+                                "publish_response": publish_result.get("raw_response"),
+                                "updated_at": datetime.utcnow(),
+                            },
+                            "$unset": {"last_dispatch_warning": ""},
+                        },
                     )
                     await db["social_connections"].update_one(conn_filter, {"$inc": {"total_posts_published": 1}})
 
@@ -1085,12 +1128,18 @@ class ApprovalWorkflowService:
                     # When scheduling, the draft was already marked status=scheduled in
                     # approve_content. Keep that status — don't overwrite to publish_failed.
                     # The cron job will attempt the actual publish at the right time.
+                    # last_dispatch_warning is informational only (surfaced to the user at
+                    # schedule time via approve_content's warnings[] — see there for why this
+                    # is kept separate from error_message/publish_failed) and is cleared the
+                    # next time a dispatch attempt succeeds, so a stale warning from an
+                    # earlier reschedule never lingers on a post that's since gone out fine.
                     print(f"⚠️ Scheduled dispatch failed for draft_id={draft_id}, keeping status=scheduled: {publish_result.get('error')}")
                     await db["content_drafts"].update_one(
                         {"id": draft_id},
                         {"$set": {
                             "status": "scheduled",
                             "scheduled_date": scheduled_datetime,
+                            "last_dispatch_warning": publish_result.get("error"),
                             "updated_at": datetime.utcnow(),
                         }},
                     )
