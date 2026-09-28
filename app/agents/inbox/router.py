@@ -19,8 +19,7 @@ from app.dependencies import get_active_brand_context, get_db_dependency
 
 from .entities import CHANNEL_ACCOUNTS, CONVERSATIONS, IDENTITIES, MESSAGES
 from .channels import (
-    _LAST_SUBSCRIPTIONS, SOCIAL_CONNECTIONS, _workspace_of, account_for_event,
-    link_workspace_channels,
+    SOCIAL_CONNECTIONS, _workspace_of, account_for_event, link_workspace_channels,
 )
 from .meta_transport import meta_transport
 from .send import SendRefused, send_reply
@@ -228,8 +227,9 @@ async def link_channels(
     Safe to re-run; a refreshed token updates the existing row rather than adding one.
     """
     workspace_id = brand_ctx.get("brand_id")
-    linked = await link_workspace_channels(
+    result = await link_workspace_channels(
         db, brand_ctx.get("user_id", ""), workspace_id)
+    linked = result["linked"]
 
     considered = await db[SOCIAL_CONNECTIONS].count_documents(
         {"connection_status": "active", "platform": {"$in": ["instagram", "facebook"]}})
@@ -262,5 +262,5 @@ async def link_channels(
         "considered": considered,
         "workspace_id": workspace_id,
         "my_connections": mine,
-        "page_subscriptions": list(_LAST_SUBSCRIPTIONS),
+        "page_subscriptions": result["subscriptions"],
     }

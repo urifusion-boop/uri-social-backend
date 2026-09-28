@@ -108,3 +108,12 @@ def test_an_instagram_webhook_finds_the_account_by_its_instagram_id():
     found = _run(account_for_event(db, "IG99"))
     assert found["platform"] == "instagram"
     assert found["page_id"] == "PAGE7"
+
+
+def test_linking_returns_its_results_rather_than_stashing_them():
+    """A module-level global would be shared between requests and hand one
+    workspace's page ids to the next caller."""
+    db = _seeded_db([IG_CONN])
+    out = _run(link_workspace_channels(db, "u1", "ws_1"))
+    assert set(out) == {"linked", "subscriptions"}
+    assert len(out["linked"]) == 2
