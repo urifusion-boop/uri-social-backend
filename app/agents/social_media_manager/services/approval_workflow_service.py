@@ -777,7 +777,42 @@ class ApprovalWorkflowService:
                                     published_count += 1
                                     print(f"✅ Outstand-scheduled post confirmed published | draft_id={draft['id']} post_id={existing_post_id}")
                                 else:
-                                    print(f"⏳ Outstand post not yet published | draft_id={draft['id']} post_id={existing_post_id}")
+                                    # Live-reported bug: a post whose underlying platform
+                                    # publish attempt actually FAILED on Outstand's side
+                                    # (e.g. Facebook rejecting it with a real, specific error)
+                                    # was indistinguishable here from one that just hadn't
+                                    # published YET — this branch only ever checked
+                                    # publishedAt, never each socialAccounts[] entry's own
+                                    # status. That left the draft silently stuck in
+                                    # status="scheduled" ("Publishing soon..." forever in the
+                                    # UI) with the real, specific, actionable error from
+                                    # Outstand/Facebook never reaching the user at all.
+                                    failed_accounts = [
+                                        acc for acc in post.get("socialAccounts", [])
+                                        if acc.get("status") == "failed"
+                                    ]
+                                    if failed_accounts:
+                                        error_detail = "; ".join(
+                                            acc.get("error") or f"{acc.get('network', 'platform')} publish failed"
+                                            for acc in failed_accounts
+                                        )
+                                        await db["content_drafts"].update_one(
+                                            {"id": draft["id"]},
+                                            {"$set": {
+                                                "status": "publish_failed",
+                                                "error_message": error_detail,
+                                                # Clear it — this submission is dead, retrying
+                                                # would poll the same failed Outstand post
+                                                # forever. platform_post_id=None makes this
+                                                # draft eligible for the existing retry_result
+                                                # sweep above (capped at 3 attempts) instead.
+                                                "platform_post_id": None,
+                                                "updated_at": datetime.utcnow(),
+                                            }},
+                                        )
+                                        print(f"❌ Outstand-scheduled post failed at the platform | draft_id={draft['id']} post_id={existing_post_id} error={error_detail}")
+                                    else:
+                                        print(f"⏳ Outstand post not yet published | draft_id={draft['id']} post_id={existing_post_id}")
                             except Exception as e:
                                 print(f"⚠️ Could not poll Outstand for draft_id={draft['id']}: {e}")
                                 # 404 = post no longer exists in Outstand; mark published to stop retry loop.
