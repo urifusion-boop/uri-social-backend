@@ -325,7 +325,13 @@ class SocialAccountService:
                     "account_name": acc.get("nickname"),
                     "profile_picture_url": acc.get("profile_picture_url"),
                     "account_type": acc.get("accountType"),
-                    "is_active": bool(acc.get("isActive")),
+                    # Preserve None (Outstand didn't return this field for this
+                    # account/network) distinctly from an explicit False — collapsing
+                    # both to False here would make the frontend flag accounts as
+                    # "needs reconnecting" just because Outstand's response happened
+                    # not to include the field, not because anything is actually wrong.
+                    # Only an explicit isActive: false is a real signal worth surfacing.
+                    "is_active": acc.get("isActive"),
                     "connected_at": acc.get("createdAt"),
                 })
         except Exception as e:
