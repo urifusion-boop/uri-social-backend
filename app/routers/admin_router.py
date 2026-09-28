@@ -491,6 +491,68 @@ async def adjust_user_credits(
     }
 
 
+class SetSubscriptionRequest(BaseModel):
+    plan_tier_id: str = Field(..., description="subscription_tiers.tier_id to grant, e.g. 'starter'")
+    duration_days: int = Field(default=30, gt=0, description="How many days this grant lasts before falling back to free")
+    reason: Optional[str] = Field(default=None, description="Admin's free-text note for this grant")
+
+
+@router.post("/users/{user_id}/subscription/set")
+async def set_user_subscription(
+    user_id: str,
+    body: SetSubscriptionRequest,
+    admin_user: dict = Depends(verify_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """
+    Directly assign a user a subscription tier. This is the actual "change
+    this user's plan" action — /credits/adjust above only ever touches
+    bonus_credits, which is why topping a user up to 20 credits there never
+    made the admin panel stop showing "free"; a bonus grant and a plan
+    change are different things.
+    """
+    billing_id = await _resolve_billing_id(user_id, db)
+
+    tier = await db["subscription_tiers"].find_one({"tier_id": body.plan_tier_id})
+    if not tier:
+        raise HTTPException(status_code=404, detail=f"Plan '{body.plan_tier_id}' not found")
+
+    wallet = await credit_service.admin_set_subscription(
+        billing_id,
+        body.plan_tier_id,
+        tier.get("credits_monthly", tier.get("credits", 0)),
+        body.duration_days,
+        notes=body.reason,
+    )
+    return {
+        "user_id": user_id,
+        "subscription_tier": wallet.subscription_tier,
+        "end_date": wallet.end_date.isoformat() if wallet.end_date else None,
+        "credits_balance": wallet.credits_remaining,
+    }
+
+
+class ClearSubscriptionRequest(BaseModel):
+    reason: Optional[str] = Field(default=None, description="Admin's free-text note for this revert")
+
+
+@router.post("/users/{user_id}/subscription/clear")
+async def clear_user_subscription(
+    user_id: str,
+    body: ClearSubscriptionRequest = ClearSubscriptionRequest(),
+    admin_user: dict = Depends(verify_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Revert a user to free — the undo for /subscription/set (e.g. the wrong tier was picked)."""
+    billing_id = await _resolve_billing_id(user_id, db)
+    wallet = await credit_service.admin_clear_subscription(billing_id, notes=body.reason)
+    return {
+        "user_id": user_id,
+        "subscription_tier": wallet.subscription_tier,
+        "credits_balance": wallet.credits_remaining,
+    }
+
+
 @router.post("/users/{user_id}/trial/adjust")
 async def adjust_user_trial_credits(
     user_id: str,
