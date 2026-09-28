@@ -284,3 +284,35 @@ async def link_channels(
         "my_connections": mine,
         "page_subscriptions": result["subscriptions"],
     }
+
+
+@router.get("/channels")
+async def list_channels(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """The accounts this workspace has actually connected to the inbox.
+
+    Reports only what is recorded: a channel nobody connected is absent rather
+    than shown as connected, and nothing about capability is inferred — a token
+    existing is not proof that Meta will accept a reply through it.
+    """
+    workspace_id = brand_ctx.get("brand_id")
+    rows = await db[CHANNEL_ACCOUNTS].find({"workspace_id": workspace_id}).to_list(50)
+
+    out = []
+    for r in rows:
+        last = await db[MESSAGES].find({
+            "workspace_id": workspace_id,
+        }).sort("received_at", -1).limit(1).to_list(1)
+        out.append({
+            "platform": r.get("platform"),
+            "name": r.get("name") or "",
+            "external_account_id": r.get("external_account_id"),
+            "page_id": r.get("page_id", ""),
+            "connected_at": r.get("connected_at"),
+            "updated_at": r.get("updated_at"),
+            "has_token": bool(r.get("access_token")),
+            "last_event_at": (last[0].get("received_at") if last else None),
+        })
+    return {"channels": out}
