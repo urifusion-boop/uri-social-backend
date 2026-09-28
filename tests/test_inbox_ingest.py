@@ -181,6 +181,12 @@ class FakeCollection:
                               **update.get("$setOnInsert", {}),
                               **update.get("$set", {})})
 
+    async def update_many(self, q, update):
+        self._reject_empty_operators(update)
+        for d in self.docs:
+            if self._matches(d, q):
+                d.update(update.get("$set", {}))
+
     async def insert_one(self, doc):
         doc = {"_id": ObjectId(), **doc}
         self.docs.append(doc)

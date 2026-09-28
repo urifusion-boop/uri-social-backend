@@ -117,7 +117,17 @@ async def link_workspace_channels(db, user_id: str, workspace_id: str) -> dict:
         if not page_id or not token or page_id in seen_pages:
             continue
         seen_pages.add(page_id)
-        ok, err = await subscribe_page_to_app(page_id, token)
+
+        page_token = await resolve_page_token(page_id, token)
+        if page_token != token:
+            # Store the Page's own token: replies are Page-scoped too, so a user
+            # token here fails every send with the same (#210).
+            await db[CHANNEL_ACCOUNTS].update_many(
+                {"workspace_id": workspace_id, "page_id": page_id},
+                {"$set": {"access_token": page_token, "updated_at": now()}},
+            )
+
+        ok, err = await subscribe_page_to_app(page_id, page_token)
         subscriptions.append({"page_id": page_id, "subscribed": ok, "error": err})
         if not ok:
             print(f"[Inbox] could not subscribe page {page_id}: {err}", flush=True)
@@ -129,6 +139,35 @@ async def link_workspace_channels(db, user_id: str, workspace_id: str) -> dict:
     # Returned, not stashed on the module: a global would be shared across
     # requests and hand one workspace's page ids to the next caller.
     return {"linked": linked, "subscriptions": subscriptions}
+
+
+async def resolve_page_token(page_id: str, token: str) -> str:
+    """The Page's OWN access token, given whatever token we have stored.
+
+    Connections do not all store the same thing under page_access_token: some
+    paths save a USER token, and Meta answers "(#210) A page access token is
+    required" to anything Page-scoped. Asking the Page for its own token works
+    whichever kind we started with, and the answer is what both subscribing and
+    replying need.
+    """
+    import httpx
+
+    from app.core.config import settings
+
+    if not (page_id and token):
+        return token
+
+    version = getattr(settings, "FACEBOOK_API_VERSION", "") or "v21.0"
+    url = f"https://graph.facebook.com/{version}/{page_id}"
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            r = await client.get(url, params={"fields": "access_token",
+                                              "access_token": token})
+        if r.status_code < 400:
+            return r.json().get("access_token") or token
+    except Exception as e:
+        print(f"[Inbox] could not resolve a page token for {page_id}: {e}", flush=True)
+    return token
 
 
 async def subscribe_page_to_app(page_id: str, access_token: str) -> tuple[bool, str]:

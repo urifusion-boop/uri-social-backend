@@ -4,6 +4,8 @@ The id confusion these cover is the kind that loses real customer messages silen
 Meta routes Instagram webhooks by the Instagram account id but accepts replies only
 through the Page.
 """
+import copy
+
 import pytest
 
 from app.agents.inbox.channels import account_for_event, channel_rows, link_workspace_channels
@@ -61,7 +63,9 @@ def test_the_bare_user_id_is_not_treated_as_a_workspace():
 
 def _seeded_db(conns):
     db = Db()
-    db[ "social_connections" ].docs.extend(conns)
+    # Copies: a test that mutates a connection must not edit the shared fixture
+    # and change what every later test sees.
+    db["social_connections"].docs.extend(copy.deepcopy(c) for c in conns)
     db["social_connections"].find = lambda q, *a, **k: _All(db["social_connections"].docs)
     return db
 
@@ -117,3 +121,34 @@ def test_linking_returns_its_results_rather_than_stashing_them():
     out = _run(link_workspace_channels(db, "u1", "ws_1"))
     assert set(out) == {"linked", "subscriptions"}
     assert len(out["linked"]) == 2
+
+
+def test_a_user_token_is_exchanged_for_the_pages_own_token():
+    """Some connection paths store a USER token under page_access_token, and Meta
+    answers "(#210) A page access token is required" to anything Page-scoped —
+    subscribing AND replying. The stored token has to be the Page's own."""
+    import app.agents.inbox.channels as ch
+
+    db = _seeded_db([IG_CONN])
+    calls = {}
+
+    async def fake_resolve(page_id, token):
+        calls["resolve"] = (page_id, token)
+        return "PAGE_TOKEN"
+
+    async def fake_subscribe(page_id, token):
+        calls["subscribe"] = (page_id, token)
+        return True, ""
+
+    original = (ch.resolve_page_token, ch.subscribe_page_to_app)
+    ch.resolve_page_token, ch.subscribe_page_to_app = fake_resolve, fake_subscribe
+    try:
+        out = _run(ch.link_workspace_channels(db, "u1", "ws_1"))
+    finally:
+        ch.resolve_page_token, ch.subscribe_page_to_app = original
+
+    assert calls["resolve"] == ("PAGE7", "tok")
+    # The Page's token, not the one we started with.
+    assert calls["subscribe"] == ("PAGE7", "PAGE_TOKEN")
+    assert out["subscriptions"][0]["subscribed"] is True
+    assert all(d["access_token"] == "PAGE_TOKEN" for d in db[CHANNEL_ACCOUNTS].docs)
