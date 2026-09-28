@@ -72,6 +72,10 @@ async def receive_meta_webhook(
         return {"status": "ignored", "reason": "unparseable body"}
 
     events = parse_meta_event(payload)
+    # Logged on EVERY delivery, including ones that parse to nothing: silence in
+    # the log then means Meta sent nothing, rather than us dropping it quietly.
+    print(f"[Inbox] webhook received: object={payload.get('object')!r} "
+          f"entries={len(payload.get('entry') or [])} parsed={len(events)}", flush=True)
     stored = 0
     for ev in events:
         account = await account_for_event(db, ev.get("external_account_id"))
@@ -86,6 +90,7 @@ async def receive_meta_webhook(
             account.get("platform") or "facebook", ev)
         if msg_id:
             stored += 1
+    print(f"[Inbox] webhook stored {stored}/{len(events)} event(s)", flush=True)
     return {"status": "ok", "events": len(events), "stored": stored}
 
 
