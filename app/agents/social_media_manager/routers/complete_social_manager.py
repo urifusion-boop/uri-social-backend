@@ -1453,6 +1453,9 @@ async def facebook_direct_initiate(source: Optional[str] = Query("settings")):
         "pages_read_engagement",
         "read_insights",
         "pages_manage_posts",
+        # Unified Inbox — see the Instagram flow for why these three travel together.
+        "pages_messaging",
+        "pages_manage_engagement",
         "pages_manage_metadata",
     ]
     params = {
@@ -1964,6 +1967,14 @@ async def instagram_direct_initiate(source: Optional[str] = Query("settings")):
         "pages_read_engagement",
         "instagram_manage_insights",
         "instagram_content_publish",
+        # Unified Inbox. pages_manage_metadata authorises subscribing the Page to
+        # the app, which is what makes Meta deliver anything at all; without the
+        # messaging scopes Meta refuses the whole subscription, comments included.
+        "instagram_manage_messages",
+        "instagram_manage_comments",
+        "pages_messaging",
+        "pages_manage_engagement",
+        "pages_manage_metadata",
     ]
     params = {
         "client_id": app_id,
