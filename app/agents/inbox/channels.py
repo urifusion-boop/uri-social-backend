@@ -248,8 +248,25 @@ async def fetch_contact_name(external_user_id: str, access_token: str) -> str:
 
 
 async def account_for_event(db, external_account_id: str) -> Optional[dict]:
-    """The channel account a webhook belongs to, or None if nobody connected it."""
+    """The channel account a webhook belongs to, or None if it is ambiguous.
+
+    Meta tells us which ACCOUNT an event is for, never which workspace. If two
+    workspaces have registered the same Page, picking either one delivers a real
+    customer's message into somebody else's inbox — so this refuses instead, and
+    says so loudly. Dropping a message is recoverable from the raw event store;
+    leaking one to the wrong tenant is not.
+    """
     if not external_account_id:
         return None
-    return await db[CHANNEL_ACCOUNTS].find_one(
-        {"external_account_id": str(external_account_id)})
+
+    rows = await db[CHANNEL_ACCOUNTS].find(
+        {"external_account_id": str(external_account_id)}).to_list(5)
+    if not rows:
+        return None
+    if len(rows) > 1:
+        workspaces = sorted({str(r.get("workspace_id")) for r in rows})
+        if len(workspaces) > 1:
+            print(f"[Inbox] REFUSING to route account {external_account_id}: "
+                  f"claimed by {len(workspaces)} workspaces {workspaces}", flush=True)
+            return None
+    return rows[0]
