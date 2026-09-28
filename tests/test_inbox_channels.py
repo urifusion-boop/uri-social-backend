@@ -21,7 +21,7 @@ IG_CONN = {
 def test_one_instagram_connection_registers_both_the_account_and_its_page():
     """Instagram DMs arrive under the Instagram id; Messenger and Page comments arrive
     under the Page's. Registering one loses half the inbox."""
-    rows = channel_rows(IG_CONN, "u1")
+    rows = channel_rows(IG_CONN, "ws_1")
     by_platform = {r["platform"]: r for r in rows}
     assert by_platform["instagram"]["external_account_id"] == "IG99"
     assert by_platform["facebook"]["external_account_id"] == "PAGE7"
@@ -29,19 +29,34 @@ def test_one_instagram_connection_registers_both_the_account_and_its_page():
 
 def test_the_instagram_row_still_sends_through_the_page():
     """Posting a reply to the Instagram user id fails; it has to go via the Page."""
-    ig = next(r for r in channel_rows(IG_CONN, "u1") if r["platform"] == "instagram")
+    ig = next(r for r in channel_rows(IG_CONN, "ws_1") if r["platform"] == "instagram")
     assert ig["external_account_id"] == "IG99"
     assert ig["page_id"] == "PAGE7"
 
 
 def test_a_connection_with_no_token_registers_nothing():
     """A row without a token would match a webhook and then fail every reply."""
-    assert channel_rows({**IG_CONN, "page_access_token": ""}, "u1") == []
+    assert channel_rows({**IG_CONN, "page_access_token": ""}, "ws_1") == []
 
 
-def test_a_personal_workspace_falls_back_to_the_user_id():
-    rows = channel_rows({**IG_CONN, "brand_id": None}, "u1")
-    assert rows[0]["workspace_id"] == "u1"
+def test_a_personal_connection_resolves_to_the_personal_brand_id():
+    """Personal connections carry no brand_id, and the workspace is NOT the bare
+    user id — it is brnd_personal_<user_id>. Comparing against the raw user id
+    matches nothing, which is exactly how this shipped returning linked: 0."""
+    rows = channel_rows({**IG_CONN, "brand_id": None})
+    assert rows[0]["workspace_id"] == "brnd_personal_u1"
+
+
+def test_a_personal_connection_links_for_its_personal_workspace():
+    db = _seeded_db([{**IG_CONN, "brand_id": None}])
+    _run(link_workspace_channels(db, "u1", "brnd_personal_u1"))
+    assert len(db[CHANNEL_ACCOUNTS].docs) == 2
+
+
+def test_the_bare_user_id_is_not_treated_as_a_workspace():
+    db = _seeded_db([{**IG_CONN, "brand_id": None}])
+    _run(link_workspace_channels(db, "u1", "u1"))
+    assert db[CHANNEL_ACCOUNTS].docs == []
 
 
 def _seeded_db(conns):

@@ -18,7 +18,7 @@ from app.core.config import settings
 from app.dependencies import get_active_brand_context, get_db_dependency
 
 from .entities import CHANNEL_ACCOUNTS, CONVERSATIONS, IDENTITIES, MESSAGES
-from .channels import account_for_event, link_workspace_channels
+from .channels import SOCIAL_CONNECTIONS, account_for_event, link_workspace_channels
 from .meta_transport import meta_transport
 from .send import SendRefused, send_reply
 from .ingest import (
@@ -224,6 +224,17 @@ async def link_channels(
     prompting for OAuth again would ask them to grant what they have already granted.
     Safe to re-run; a refreshed token updates the existing row rather than adding one.
     """
+    workspace_id = brand_ctx.get("brand_id")
     linked = await link_workspace_channels(
-        db, brand_ctx.get("user_id", ""), brand_ctx.get("brand_id"))
-    return {"linked": len(linked), "accounts": linked}
+        db, brand_ctx.get("user_id", ""), workspace_id)
+
+    considered = await db[SOCIAL_CONNECTIONS].count_documents(
+        {"connection_status": "active", "platform": {"$in": ["instagram", "facebook"]}})
+    return {
+        "linked": len(linked),
+        "accounts": linked,
+        # So that a zero is diagnosable: no connections at all is a different
+        # problem from connections belonging to another workspace.
+        "considered": considered,
+        "workspace_id": workspace_id,
+    }

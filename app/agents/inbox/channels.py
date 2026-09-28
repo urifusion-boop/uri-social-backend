@@ -18,17 +18,27 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from app.models.brand_account import BrandAccount
+
 from .entities import CHANNEL_ACCOUNTS, Platform, now
 
 SOCIAL_CONNECTIONS = "social_connections"
 
 
-def _workspace_of(conn: dict, user_id: str) -> str:
-    """A personal workspace has no brand_id; the user id stands in for it."""
-    return conn.get("brand_id") or user_id
+def _workspace_of(conn: dict) -> str:
+    """The workspace a connection belongs to.
+
+    A personal connection carries no brand_id, and the workspace is NOT the bare
+    user id — it is the deterministic personal brand id the rest of the app uses.
+    Comparing against the raw user id silently matches nothing.
+    """
+    brand_id = conn.get("brand_id")
+    if brand_id:
+        return brand_id
+    return BrandAccount.personal_brand_id(conn.get("user_id") or "")
 
 
-def channel_rows(conn: dict, user_id: str) -> list[dict]:
+def channel_rows(conn: dict, workspace_id: str = "") -> list[dict]:
     """Turn one social connection into the channel accounts it provides.
 
     An Instagram connection provides TWO: the Instagram account (DMs and comments
@@ -38,7 +48,7 @@ def channel_rows(conn: dict, user_id: str) -> list[dict]:
     token = conn.get("page_access_token") or ""
     page_id = str(conn.get("page_id") or "")
     ig_user_id = str(conn.get("ig_user_id") or "")
-    workspace_id = _workspace_of(conn, user_id)
+    workspace_id = workspace_id or _workspace_of(conn)
     if not token:
         return []
 
@@ -76,10 +86,15 @@ async def link_workspace_channels(db, user_id: str, workspace_id: str) -> list[d
     conns = await db[SOCIAL_CONNECTIONS].find(q).to_list(200)
 
     linked: list[dict] = []
+    # Why a link found nothing matters: no connections at all is a different
+    # problem from connections that belong to another workspace, and without
+    # this the caller cannot tell them apart.
+    skipped: list[str] = []
     for conn in conns:
-        if _workspace_of(conn, conn.get("user_id", "")) != workspace_id:
+        if _workspace_of(conn) != workspace_id:
+            skipped.append(_workspace_of(conn))
             continue
-        for row in channel_rows(conn, user_id):
+        for row in channel_rows(conn, workspace_id):
             key = {"workspace_id": row["workspace_id"],
                    "platform": row["platform"],
                    "external_account_id": row["external_account_id"]}
@@ -90,6 +105,11 @@ async def link_workspace_channels(db, user_id: str, workspace_id: str) -> list[d
                 upsert=True,
             )
             linked.append(key)
+
+    if not linked:
+        print(f"[Inbox] linked nothing for {workspace_id!r}: "
+              f"{len(conns)} connection(s) considered, "
+              f"{len(skipped)} in other workspaces {sorted(set(skipped))[:5]}", flush=True)
     return linked
 
 
