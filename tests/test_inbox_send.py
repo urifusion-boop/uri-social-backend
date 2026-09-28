@@ -242,3 +242,22 @@ def test_a_comment_thread_with_nothing_to_reply_to_is_refused():
     with pytest.raises(SendRefused) as e:
         _send(db, _conv(db, kind="comment"))
     assert e.value.reason == "no_target"
+
+
+def test_a_naive_stored_expiry_is_read_as_utc():
+    """Mongo returns naive datetimes. Comparing one against an aware now() raises,
+    so the composer 500s instead of sending — which is how this shipped."""
+    from datetime import datetime, timedelta as td
+    naive_future = datetime.utcnow() + td(hours=2)
+    assert reply_window_open({"reply_window_expires_at": naive_future}) is True
+
+    naive_past = datetime.utcnow() - td(hours=2)
+    assert reply_window_open({"reply_window_expires_at": naive_past}) is False
+
+
+def test_a_naive_expiry_does_not_break_sending():
+    from datetime import datetime, timedelta as td
+    db = Db()
+    conv_id = _conv(db)
+    db[CONVERSATIONS].docs[0]["reply_window_expires_at"] = datetime.utcnow() + td(hours=2)
+    assert _send(db, conv_id)["delivery"] == "accepted"

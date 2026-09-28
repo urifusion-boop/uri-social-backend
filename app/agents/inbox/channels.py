@@ -217,6 +217,36 @@ async def subscribe_page_to_app(page_id: str, access_token: str) -> tuple[bool, 
         return False, f"{err} | feed-only also failed: {err_partial}"
 
     return False, err
+async def fetch_contact_name(external_user_id: str, access_token: str) -> str:
+    """The sender's name, which the DM webhook does not include.
+
+    Instagram sends only a scoped user id, so an inbox built purely from webhook
+    payloads shows every customer as "Unknown contact". Best effort: a failure
+    here leaves the name blank rather than holding up the message.
+    """
+    import httpx
+
+    from app.core.config import settings
+
+    if not (external_user_id and access_token):
+        return ""
+
+    version = getattr(settings, "FACEBOOK_API_VERSION", "") or "v21.0"
+    url = f"https://graph.facebook.com/{version}/{external_user_id}"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(url, params={"fields": "name,username",
+                                              "access_token": access_token})
+        if r.status_code < 400:
+            body = r.json()
+            return body.get("name") or body.get("username") or ""
+        print(f"[Inbox] could not fetch a name for {external_user_id}: "
+              f"{r.status_code}", flush=True)
+    except Exception as e:
+        print(f"[Inbox] could not fetch a name for {external_user_id}: {e}", flush=True)
+    return ""
+
+
 async def account_for_event(db, external_account_id: str) -> Optional[dict]:
     """The channel account a webhook belongs to, or None if nobody connected it."""
     if not external_account_id:
