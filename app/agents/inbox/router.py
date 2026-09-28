@@ -11,13 +11,15 @@ from typing import Optional
 
 from bson import ObjectId
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, Response
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from app.core.config import settings
 from app.dependencies import get_active_brand_context, get_db_dependency
 
 from .entities import CHANNEL_ACCOUNTS, CONVERSATIONS, IDENTITIES, MESSAGES
+from .meta_transport import meta_transport
+from .send import SendRefused, send_reply
 from .ingest import (
     ensure_indexes, parse_meta_event, record_event, store_raw, verify_signature,
 )
@@ -167,3 +169,45 @@ async def create_indexes(
     """The uniqueness that makes Meta's redelivery harmless. Safe to re-run."""
     await ensure_indexes(db)
     return {"status": "ok"}
+
+
+@router.post("/conversations/{conversation_id}/reply")
+async def reply_to_conversation(
+    conversation_id: str,
+    text: str = Body(..., embed=True),
+    idempotency_key: str = Body("", embed=True),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Send an agent's reply.
+
+    A refusal (closed window, unknown thread) is a 4xx with a reason the composer can
+    show. A provider failure is NOT an error here — it is a recorded delivery state,
+    because the agent needs to see what happened to their message rather than a stack
+    trace.
+    """
+    workspace_id = brand_ctx.get("brand_id")
+    conv = await db[CONVERSATIONS].find_one(
+        {"_id": ObjectId(conversation_id), "workspace_id": workspace_id}
+    ) if ObjectId.is_valid(conversation_id) else None
+    account = await db[CHANNEL_ACCOUNTS].find_one(
+        {"_id": ObjectId(conv["channel_account_id"])}
+    ) if conv and ObjectId.is_valid(conv.get("channel_account_id", "")) else None
+
+    try:
+        record = await send_reply(
+            db, workspace_id, conversation_id, text,
+            idempotency_key=idempotency_key,
+            actor_id=brand_ctx.get("user_id", ""),
+            transport=meta_transport,
+            account=account or {},
+        )
+    except SendRefused as e:
+        raise HTTPException(status_code=409 if e.reason == "window_closed" else 400,
+                            detail=e.detail)
+
+    return {
+        "delivery": record.get("delivery"),
+        "provider_message_id": record.get("provider_message_id", ""),
+        "failure_reason": record.get("failure_reason", ""),
+    }

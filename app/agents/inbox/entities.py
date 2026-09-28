@@ -37,6 +37,7 @@ IDENTITY_LINKS = "inbox_contact_links"
 CONVERSATIONS = "inbox_conversations"
 MESSAGES = "inbox_messages"
 RAW_EVENTS = "inbox_raw_events"
+OUTBOX = "inbox_outbox"
 AUDIT = "inbox_audit_events"
 
 

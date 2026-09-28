@@ -25,7 +25,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from .entities import (
@@ -194,12 +194,22 @@ async def _upsert_conversation(db, workspace_id: str, channel_account_id: str,
             on_insert[field] = ev[field]
             on_insert["attribution_evidence"] = "provider_webhook"
 
+    set_fields: dict[str, Any] = {
+        "last_activity_at": ev.get("provider_timestamp") or now(),
+    }
+    # An inbound DM reopens the provider's 24-hour free-form reply window. Recorded
+    # from the message's OWN timestamp, not arrival: a webhook retried an hour late
+    # would otherwise buy an hour of window that does not exist.
+    if kind == Kind.DM.value:
+        base = ev.get("provider_timestamp") or now()
+        set_fields["reply_window_expires_at"] = base + timedelta(hours=24)
+
     doc = await db[CONVERSATIONS].find_one_and_update(
         key,
         {"$setOnInsert": on_insert,
          # New activity on a resolved thread REOPENS it (PRD §4.2) — a customer writing
          # again is unambiguously work, whatever an agent concluded earlier.
-         "$set": {"last_activity_at": ev.get("provider_timestamp") or now()}},
+         "$set": set_fields},
         upsert=True, return_document=True,
     )
     if doc.get("status") == "resolved":
