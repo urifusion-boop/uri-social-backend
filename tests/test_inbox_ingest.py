@@ -12,7 +12,8 @@ import json
 
 import pytest
 
-from app.agents.inbox.ingest import parse_meta_event, record_event, verify_signature
+from app.agents.inbox.ingest import (describe_unparsed, parse_meta_event, record_event,
+                                     verify_signature)
 
 SECRET = "app-secret"
 
@@ -409,3 +410,30 @@ def test_two_instagram_comments_on_one_post_share_a_thread():
                       "from": {"id": "U2", "username": "ada"}, "text": "x"}}]}]})[0]
         _run(record_event(db, WS, ACCT, "instagram", ev))
     assert len(db[CONVERSATIONS].docs) == 1
+
+
+# ── Why a delivery parsed to nothing ──────────────────────────────────────────
+# Indistinguishable from "Meta never sent it" without this, which is the
+# difference between a parser bug and an unsubscribed Page.
+
+def test_an_echo_is_named_as_an_echo():
+    payload = {"object": "page", "entry": [{"id": "PAGE7", "messaging": [
+        {"sender": {"id": "PAGE7"}, "message": {"mid": "m1", "text": "hi", "is_echo": True}}]}]}
+    assert parse_meta_event(payload) == []
+    assert "is_echo" in describe_unparsed(payload)
+
+
+def test_a_read_receipt_is_named():
+    payload = {"object": "page", "entry": [{"id": "PAGE7", "messaging": [
+        {"sender": {"id": "U1"}, "read": {"watermark": 1}}]}]}
+    assert parse_meta_event(payload) == []
+    assert "read" in describe_unparsed(payload)
+
+
+def test_a_standby_delivery_names_the_shape():
+    """Another app is the primary receiver for the Page — the message arrives
+    under standby, not messaging, and this app may not reply to it."""
+    payload = {"object": "page", "entry": [{"id": "PAGE7", "standby": [
+        {"sender": {"id": "U1"}, "message": {"mid": "m1", "text": "hi"}}]}]}
+    assert parse_meta_event(payload) == []
+    assert "standby" in describe_unparsed(payload)
