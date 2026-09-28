@@ -19,7 +19,8 @@ from app.dependencies import get_active_brand_context, get_db_dependency
 
 from .entities import CHANNEL_ACCOUNTS, CONVERSATIONS, IDENTITIES, MESSAGES
 from .channels import (
-    SOCIAL_CONNECTIONS, _workspace_of, account_for_event, link_workspace_channels,
+    SOCIAL_CONNECTIONS, _workspace_of, account_for_event, fetch_contact_name,
+    link_workspace_channels,
 )
 from .meta_transport import meta_transport
 from .send import SendRefused, send_reply
@@ -85,6 +86,20 @@ async def receive_meta_webhook(
             # message in somebody's inbox.
             print(f"[Inbox] event for unconnected account {ev.get('external_account_id')}", flush=True)
             continue
+        # The DM payload has no name, only a scoped id. Fetched once, when the
+        # identity is new, so a busy thread is not a request per message.
+        if not ev.get("display_name") and ev.get("external_user_id"):
+            known = await db[IDENTITIES].find_one(
+                {"workspace_id": account["workspace_id"],
+                 "external_user_id": ev["external_user_id"]},
+                {"display_name": 1},
+            )
+            if known and known.get("display_name"):
+                ev["display_name"] = known["display_name"]
+            else:
+                ev["display_name"] = await fetch_contact_name(
+                    ev["external_user_id"], account.get("access_token", ""))
+
         msg_id = await record_event(
             db, account["workspace_id"], str(account["_id"]),
             account.get("platform") or "facebook", ev)

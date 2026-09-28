@@ -22,6 +22,7 @@ at a moment the platform forbids. Four rules, each the opposite of the shortcut:
 """
 from __future__ import annotations
 
+from datetime import timezone
 from typing import Any, Awaitable, Callable, Optional
 
 from bson import ObjectId
@@ -58,6 +59,11 @@ def reply_window_open(conv: dict, at=None) -> bool:
     expires = conv.get("reply_window_expires_at")
     if not expires:
         return False
+    # Mongo hands back NAIVE datetimes while now() is timezone-aware, and comparing
+    # the two raises rather than returning False — so the composer 500s instead of
+    # refusing. Stored times are UTC, so that is what a naive one is read as.
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=timezone.utc)
     return expires > (at or now())
 
 
