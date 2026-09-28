@@ -176,6 +176,11 @@ async def subscribe_page_to_app(page_id: str, access_token: str) -> tuple[bool, 
     Ticking fields in the App Dashboard is NOT enough: that configures which
     fields the app may receive, while this says the Page consents to sending
     them. Miss it and everything looks correctly configured and nothing arrives.
+
+    Meta rejects the WHOLE call if any one field needs a permission the token
+    lacks, so a missing pages_messaging would also cost us comments. Falling back
+    to the fields that do work means half a working inbox instead of none, and
+    the returned message still names what was dropped.
     """
     import httpx
 
@@ -183,22 +188,35 @@ async def subscribe_page_to_app(page_id: str, access_token: str) -> tuple[bool, 
 
     version = getattr(settings, "FACEBOOK_API_VERSION", "") or "v21.0"
     url = f"https://graph.facebook.com/{version}/{page_id}/subscribed_apps"
-    fields = "messages,messaging_postbacks,message_reactions,feed"
-    try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            r = await client.post(
-                url, data={"subscribed_fields": fields, "access_token": access_token})
-    except Exception as e:
-        return False, str(e)[:200]
 
-    if r.status_code >= 400:
+    async def attempt(fields: str) -> tuple[bool, str]:
         try:
-            return False, (r.json().get("error") or {}).get("message", "")[:200]
-        except ValueError:
-            return False, r.text[:200]
-    return True, ""
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                r = await client.post(
+                    url, data={"subscribed_fields": fields, "access_token": access_token})
+        except Exception as e:
+            return False, str(e)[:200]
+        if r.status_code >= 400:
+            try:
+                return False, (r.json().get("error") or {}).get("message", "")[:300]
+            except ValueError:
+                return False, r.text[:300]
+        return True, ""
 
+    full = "messages,messaging_postbacks,message_reactions,feed"
+    ok, err = await attempt(full)
+    if ok:
+        return True, ""
 
+    # Only the messaging fields need pages_messaging; comments ride on feed.
+    if "pages_messaging" in err or "(#200)" in err:
+        ok_partial, err_partial = await attempt("feed")
+        if ok_partial:
+            return True, ("comments only — the token lacks pages_messaging, so DMs "
+                          "will not be delivered until that scope is granted")
+        return False, f"{err} | feed-only also failed: {err_partial}"
+
+    return False, err
 async def account_for_event(db, external_account_id: str) -> Optional[dict]:
     """The channel account a webhook belongs to, or None if nobody connected it."""
     if not external_account_id:
