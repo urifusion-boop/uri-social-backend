@@ -152,3 +152,47 @@ def test_a_user_token_is_exchanged_for_the_pages_own_token():
     assert calls["subscribe"] == ("PAGE7", "PAGE_TOKEN")
     assert out["subscriptions"][0]["subscribed"] is True
     assert all(d["access_token"] == "PAGE_TOKEN" for d in db[CHANNEL_ACCOUNTS].docs)
+
+
+def test_a_missing_messaging_scope_still_subscribes_comments():
+    """Meta rejects the whole call if ONE field needs a permission the token
+    lacks, so a missing pages_messaging would also cost us comments. Half a
+    working inbox beats none."""
+    import httpx
+
+    import app.agents.inbox.channels as ch
+
+    attempts = []
+
+    class FakeResponse:
+        def __init__(self, status, body):
+            self.status_code, self._body = status, body
+
+        def json(self):
+            return self._body
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, data=None):
+            attempts.append(data["subscribed_fields"])
+            if "messages" in data["subscribed_fields"]:
+                return FakeResponse(400, {"error": {"message":
+                    "(#200) To subscribe to the messages field, one of these "
+                    "permissions is needed: pages_messaging."}})
+            return FakeResponse(200, {"success": True})
+
+    original = httpx.AsyncClient
+    httpx.AsyncClient = lambda **kw: FakeClient()
+    try:
+        ok, note = _run(ch.subscribe_page_to_app("PAGE7", "tok"))
+    finally:
+        httpx.AsyncClient = original
+
+    assert ok is True
+    assert "pages_messaging" in note
+    assert attempts == ["messages,messaging_postbacks,message_reactions,feed", "feed"]
