@@ -18,7 +18,9 @@ from app.core.config import settings
 from app.dependencies import get_active_brand_context, get_db_dependency
 
 from .entities import CHANNEL_ACCOUNTS, CONVERSATIONS, IDENTITIES, MESSAGES
-from .channels import SOCIAL_CONNECTIONS, account_for_event, link_workspace_channels
+from .channels import (
+    SOCIAL_CONNECTIONS, _workspace_of, account_for_event, link_workspace_channels,
+)
 from .meta_transport import meta_transport
 from .send import SendRefused, send_reply
 from .ingest import (
@@ -230,6 +232,27 @@ async def link_channels(
 
     considered = await db[SOCIAL_CONNECTIONS].count_documents(
         {"connection_status": "active", "platform": {"$in": ["instagram", "facebook"]}})
+
+    # When nothing links, say which workspaces THIS user's own connections resolve
+    # to. Ids only — no tokens. Without it a zero is indistinguishable from
+    # "connected under a brand you are not currently acting as".
+    mine: list[dict] = []
+    if not linked:
+        rows = await db[SOCIAL_CONNECTIONS].find(
+            {"user_id": brand_ctx.get("user_id", "")},
+            {"platform": 1, "brand_id": 1, "connection_status": 1,
+             "page_id": 1, "ig_user_id": 1, "page_access_token": 1},
+        ).to_list(50)
+        for r in rows:
+            mine.append({
+                "platform": r.get("platform"),
+                "status": r.get("connection_status"),
+                "workspace": _workspace_of(r),
+                "has_page_id": bool(r.get("page_id")),
+                "has_ig_user_id": bool(r.get("ig_user_id")),
+                "has_token": bool(r.get("page_access_token")),
+            })
+
     return {
         "linked": len(linked),
         "accounts": linked,
@@ -237,4 +260,5 @@ async def link_channels(
         # problem from connections belonging to another workspace.
         "considered": considered,
         "workspace_id": workspace_id,
+        "my_connections": mine,
     }
