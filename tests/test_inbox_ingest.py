@@ -192,6 +192,19 @@ class FakeCollection:
         self.docs.append(doc)
         return type("R", (), {"inserted_id": doc["_id"]})()
 
+    async def delete_one(self, q):
+        for i, d in enumerate(self.docs):
+            if self._matches(d, q):
+                del self.docs[i]
+                return type("R", (), {"deleted_count": 1})()
+        return type("R", (), {"deleted_count": 0})()
+
+    async def delete_many(self, q):
+        keep = [d for d in self.docs if not self._matches(d, q)]
+        removed = len(self.docs) - len(keep)
+        self.docs[:] = keep
+        return type("R", (), {"deleted_count": removed})()
+
 
 class FakeDB:
     def __init__(self):

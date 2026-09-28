@@ -8,7 +8,9 @@ import copy
 
 import pytest
 
-from app.agents.inbox.channels import account_for_event, channel_rows, link_workspace_channels
+from app.agents.inbox.channels import (account_for_event, channel_rows,
+                                       link_workspace_channels, prune_stale_claims,
+                                       release_channels)
 from app.agents.inbox.entities import CHANNEL_ACCOUNTS
 from tests.test_inbox_ingest import FakeDB, _run
 from tests.test_inbox_send import Db
@@ -216,3 +218,49 @@ def test_the_same_workspace_twice_still_routes():
             {"workspace_id": "ws_a", "platform": "facebook", "external_account_id": "PAGE7"})
     found = _run(account_for_event(db, "PAGE7"))
     assert found is not None and found["workspace_id"] == "ws_a"
+
+
+# ── Releasing a claim ─────────────────────────────────────────────────────────
+# A channel row is a CLAIM on a provider account, and account_for_event refuses
+# an account two workspaces claim. So a row that outlives its connection does not
+# merely go stale — it breaks the inbox for whoever connects that Page next.
+
+def test_disconnecting_releases_this_workspaces_claim():
+    db = Db()
+    db[CHANNEL_ACCOUNTS].docs.extend([
+        {"workspace_id": "ws_1", "platform": "facebook", "external_account_id": "PAGE7"},
+        {"workspace_id": "ws_1", "platform": "instagram", "external_account_id": "IG99"},
+    ])
+    assert _run(release_channels(db, "ws_1", external_account_id="PAGE7")) == 1
+    assert [r["external_account_id"] for r in db[CHANNEL_ACCOUNTS].docs] == ["IG99"]
+
+
+def test_releasing_leaves_another_workspaces_rows_alone():
+    db = Db()
+    db[CHANNEL_ACCOUNTS].docs.extend([
+        {"workspace_id": "ws_1", "platform": "facebook", "external_account_id": "PAGE7"},
+        {"workspace_id": "ws_2", "platform": "facebook", "external_account_id": "PAGE7"},
+    ])
+    _run(release_channels(db, "ws_1"))
+    assert [r["workspace_id"] for r in db[CHANNEL_ACCOUNTS].docs] == ["ws_2"]
+
+
+def test_linking_prunes_a_claim_no_connection_backs():
+    """The Page moved to another workspace. The old claim has no connection behind
+    it, and leaving it there makes every webhook for that Page ambiguous."""
+    db = _seeded_db([{**IG_CONN, "brand_id": "ws_2"}])
+    db[CHANNEL_ACCOUNTS].docs.append(
+        {"workspace_id": "ws_1", "platform": "facebook", "external_account_id": "PAGE7"})
+    _run(link_workspace_channels(db, "u1", "ws_2"))
+    assert {r["workspace_id"] for r in db[CHANNEL_ACCOUNTS].docs} == {"ws_2"}
+    assert _run(account_for_event(db, "PAGE7"))["workspace_id"] == "ws_2"
+
+
+def test_linking_keeps_a_claim_a_live_connection_still_backs():
+    """Two workspaces genuinely connected to one Page is a real conflict, not stale
+    data — this must not resolve it by deleting somebody's live connection."""
+    db = _seeded_db([{**IG_CONN, "brand_id": "ws_1"}])
+    db[CHANNEL_ACCOUNTS].docs.append(
+        {"workspace_id": "ws_1", "platform": "facebook", "external_account_id": "PAGE7"})
+    _run(prune_stale_claims(db, "ws_2", "PAGE7"))
+    assert len(db[CHANNEL_ACCOUNTS].docs) == 1

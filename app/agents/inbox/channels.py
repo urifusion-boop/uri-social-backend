@@ -74,6 +74,70 @@ def channel_rows(conn: dict, workspace_id: str = "") -> list[dict]:
     return rows
 
 
+async def release_channels(db, workspace_id: str, platform: str = "",
+                           external_account_id: str = "") -> int:
+    """Give up this workspace's claim on channel accounts. Returns rows removed.
+
+    Disconnecting a Page in Connected Accounts used to leave its inbox row
+    behind, and a row is a CLAIM: the workspace keeps it even though it has no
+    connection any more, so the next workspace to connect that Page becomes a
+    second claimant and account_for_event drops every webhook for it. Releasing
+    is therefore part of disconnecting, not a cleanup job.
+    """
+    q: dict[str, Any] = {"workspace_id": workspace_id}
+    if platform:
+        q["platform"] = platform
+    if external_account_id:
+        q["external_account_id"] = str(external_account_id)
+    result = await db[CHANNEL_ACCOUNTS].delete_many(q)
+    if result.deleted_count:
+        print(f"[Inbox] released {result.deleted_count} channel row(s) for "
+              f"{workspace_id} {platform or 'all platforms'}", flush=True)
+    return result.deleted_count
+
+
+async def prune_stale_claims(db, workspace_id: str, external_account_id: str) -> int:
+    """Drop OTHER workspaces' claims on an account they no longer connect.
+
+    Only ever removes a row that nothing backs: the owning workspace must have
+    no active social connection for that account. A workspace that still has
+    one is left alone and the ambiguity stands — refusing to route is the right
+    outcome there, because two live connections to one Page is a real conflict
+    this cannot arbitrate.
+    """
+    rows = [r for r in await db[CHANNEL_ACCOUNTS].find(
+        {"external_account_id": str(external_account_id)}).to_list(20)
+        if r.get("workspace_id") != workspace_id]
+
+    pruned = 0
+    for row in rows:
+        other = row.get("workspace_id")
+        # Two equality lookups rather than one $or: the id is a page_id for a
+        # Page row and an ig_user_id for an Instagram one, and either backing
+        # connection keeps the claim alive.
+        backing = (
+            await db[SOCIAL_CONNECTIONS].find_one(
+                {"connection_status": "active", "page_id": str(external_account_id)})
+            or await db[SOCIAL_CONNECTIONS].find_one(
+                {"connection_status": "active", "ig_user_id": str(external_account_id)})
+        )
+        if backing and _workspace_of(backing) == other:
+            print(f"[Inbox] {other} still connects {external_account_id}; "
+                  f"leaving its claim in place — routing stays ambiguous", flush=True)
+            continue
+        # Deleted by the natural key (workspace + platform + account), which is
+        # what makes a row unique, rather than by _id.
+        await db[CHANNEL_ACCOUNTS].delete_one({
+            "workspace_id": other,
+            "platform": row.get("platform"),
+            "external_account_id": str(external_account_id),
+        })
+        pruned += 1
+        print(f"[Inbox] pruned stale claim on {external_account_id} held by "
+              f"{other} (no active connection backs it)", flush=True)
+    return pruned
+
+
 async def link_workspace_channels(db, user_id: str, workspace_id: str) -> dict:
     """Register this workspace's connected accounts with the inbox. Safe to re-run.
 
@@ -98,6 +162,10 @@ async def link_workspace_channels(db, user_id: str, workspace_id: str) -> dict:
             key = {"workspace_id": row["workspace_id"],
                    "platform": row["platform"],
                    "external_account_id": row["external_account_id"]}
+            # Before claiming, clear any abandoned claim on the same account:
+            # an account moved between workspaces (support hand-over, a review
+            # test account) is otherwise claimed twice and routes nowhere.
+            await prune_stale_claims(db, workspace_id, row["external_account_id"])
             await db[CHANNEL_ACCOUNTS].update_one(
                 key,
                 {"$set": {**row, "updated_at": now()},
