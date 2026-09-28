@@ -810,6 +810,24 @@ RULES FOR THIS EDIT:
             target_w, target_h = map(int, size.split("x"))
             image = image.resize((target_w, target_h), Image.LANCZOS)
 
+            loop = asyncio.get_running_loop()
+
+            # Inpaint away whatever is currently in the logo's badge rectangle
+            # (almost always the brand logo baked in by the original generation
+            # pass) BEFORE this image goes to the edit model. Sending it with
+            # the old logo still in the pixels means the edit model treats
+            # that logo as real content to preserve or redraw — which is how
+            # an edit ends up distorting or duplicating it instead of the
+            # deterministic re-paste below cleanly replacing it.
+            if logo_url:
+                from app.agents.social_media_manager.services.image_content_service import ImageContentService
+                image = await loop.run_in_executor(
+                    None,
+                    lambda: ImageContentService.clear_logo_region(
+                        image, logo_url, logo_position or "bottom_right", logo_size or "small"
+                    )
+                )
+
             # Save to PNG buffer
             png_buffer = io.BytesIO()
             image.save(png_buffer, format="PNG")
@@ -818,7 +836,6 @@ RULES FOR THIS EDIT:
             print(f"[EDIT] Calling OpenAI images.edit (size={size})")
 
             # Call edit API in executor (blocking call)
-            loop = asyncio.get_running_loop()
             response = await loop.run_in_executor(
                 None,
                 lambda: openai_client.images.edit(
@@ -861,16 +878,16 @@ RULES FOR THIS EDIT:
             # Deterministically re-composite the REAL brand logo on top, exactly
             # like the original generation path does — never trust the edit model
             # to have preserved (or correctly redrawn) it. See the caller for why.
+            # Uses the CV-busyness-ranked smart overlay (not a blind fixed
+            # corner) since the edit may have moved text/content around from
+            # where it was on the pre-edit image.
             if logo_url:
                 from app.agents.social_media_manager.services.image_content_service import ImageContentService
                 pre_logo_buffer = io.BytesIO()
                 edited_image.save(pre_logo_buffer, format="PNG")
                 pre_logo_b64 = base64.b64encode(pre_logo_buffer.getvalue()).decode()
-                relogo_b64 = await loop.run_in_executor(
-                    None,
-                    lambda: ImageContentService._overlay_logo(
-                        pre_logo_b64, logo_url, logo_position or "bottom_right", logo_size or "small"
-                    )
+                relogo_b64 = await ImageContentService.overlay_logo_smart(
+                    pre_logo_b64, logo_url, logo_size or "small", preferred_position=logo_position or "bottom_right"
                 )
                 edited_image = Image.open(io.BytesIO(base64.b64decode(relogo_b64))).convert("RGB")
 
