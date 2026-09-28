@@ -43,7 +43,9 @@ async def meta_transport(conv: dict, account: dict, text: str) -> str:
         url = f"{base}/{target}/{path}"
         payload = {"message": text, "access_token": token}
     else:
-        page_id = account.get("external_account_id") or ""
+        # Instagram DMs are sent through the PAGE too — posting to the Instagram
+        # user id fails. external_account_id is the webhook routing key, not this.
+        page_id = account.get("page_id") or account.get("external_account_id") or ""
         recipient = conv.get("external_thread_id") or ""
         if not (page_id and recipient):
             raise Exception("missing page id or recipient for a direct message")
