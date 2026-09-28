@@ -19,7 +19,8 @@ from app.dependencies import get_active_brand_context, get_db_dependency
 
 from .entities import CHANNEL_ACCOUNTS, CONVERSATIONS, IDENTITIES, MESSAGES
 from .channels import (
-    SOCIAL_CONNECTIONS, _workspace_of, account_for_event, link_workspace_channels,
+    _LAST_SUBSCRIPTIONS, SOCIAL_CONNECTIONS, _workspace_of, account_for_event,
+    link_workspace_channels,
 )
 from .meta_transport import meta_transport
 from .send import SendRefused, send_reply
@@ -261,4 +262,5 @@ async def link_channels(
         "considered": considered,
         "workspace_id": workspace_id,
         "my_connections": mine,
+        "page_subscriptions": list(_LAST_SUBSCRIPTIONS),
     }
