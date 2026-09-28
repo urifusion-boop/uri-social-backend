@@ -329,3 +329,29 @@ def test_a_name_is_recorded_when_the_provider_sends_one():
     db = FakeDB()
     _run(record_event(db, WS, ACCT, "facebook", _dm()))
     assert db[IDENTITIES].docs[0]["display_name"] == "Ada"
+
+
+def test_an_inbound_dm_opens_a_24_hour_reply_window():
+    """Meta allows a free-form reply for 24 hours after the customer writes. The
+    composer refuses without this, so ingestion has to record it."""
+    from datetime import timedelta
+    db = FakeDB()
+    _run(record_event(db, WS, ACCT, "instagram", _dm()))
+    assert db[CONVERSATIONS].docs[0]["reply_window_expires_at"] == now_dt() + timedelta(hours=24)
+
+
+def test_the_window_is_measured_from_the_message_not_its_arrival():
+    """A webhook retried an hour late would otherwise buy an hour of window that does
+    not exist, and the reply would be rejected in front of the customer."""
+    from datetime import timedelta
+    db = FakeDB()
+    sent_at = now_dt() - timedelta(hours=3)
+    _run(record_event(db, WS, ACCT, "instagram", _dm(ts=sent_at)))
+    assert db[CONVERSATIONS].docs[0]["reply_window_expires_at"] == sent_at + timedelta(hours=24)
+
+
+def test_a_comment_thread_gets_no_reply_window():
+    db = FakeDB()
+    ev = _dm(); ev["type"] = "comment"; ev["external_thread_id"] = "post_1"
+    _run(record_event(db, WS, ACCT, "facebook", ev))
+    assert "reply_window_expires_at" not in db[CONVERSATIONS].docs[0]
