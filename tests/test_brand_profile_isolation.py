@@ -154,6 +154,12 @@ class TestBrandProfileIdentityFallback:
         assert data["brand_colors"] == ["#111", "#222"]
         assert data["industry"] == "Fashion"
         assert data["onboarding_completed"] is False
+        # Unlike style defaults above, a logo is the literal visual mark of
+        # ONE specific brand — a brand-new sub-brand must not silently launch
+        # wearing the personal brand's logo (confirmed live: this used to
+        # happen, and also meant an agency brand could never end up with "no
+        # logo" once it inherited one this way).
+        assert not data.get("logo_url")
 
     @pytest.mark.asyncio
     async def test_agency_brand_with_no_brand_accounts_entry_gets_empty_name_not_borrowed(self, isolated_user):
@@ -174,3 +180,60 @@ class TestBrandProfileIdentityFallback:
 
         assert data["brand_name"] == ""
         assert data["industry"] == "Fashion"  # style default still applies
+
+
+class TestAgencyBrandLogoNotInherited:
+    """The actual reported bug: an agency brand that HAS its own profile
+    document (already onboarded, not the "brand-new" case above) and
+    explicitly clears its logo must stay cleared — not have it silently
+    restored from the personal brand's logo on the very next read, which is
+    exactly what the old per-field PLAYBOOK_FIELDS merge did for any field
+    that happened to be falsy, logo included."""
+
+    @pytest.mark.asyncio
+    async def test_explicitly_cleared_logo_is_not_restored_from_personal_brand(self, isolated_user):
+        user_id, db = isolated_user
+        personal_bid = BrandAccount.personal_brand_id(user_id)
+        agency_brand_id = f"{user_id}_agency_brand"
+
+        await db["brand_profiles"].insert_one({
+            "user_id": user_id, "brand_id": personal_bid, "brand_name": "Real Personal Biz",
+            "logo_url": "https://cdn/personal-logo.png", "onboarding_completed": True,
+        })
+        # The agency brand has its OWN, already-onboarded profile — this is
+        # the "existing but sparse" branch, not the brand-new one — with its
+        # logo explicitly set to None (the user hit "Remove logo" and saved).
+        await db["brand_profiles"].insert_one({
+            "user_id": user_id, "brand_id": agency_brand_id, "brand_name": "Sub Brand",
+            "logo_url": None, "onboarding_completed": True,
+        })
+
+        result = await BrandProfileService.get(user_id, db, brand_id=agency_brand_id)
+        data = result["responseData"]
+
+        assert not data.get("logo_url"), (
+            "cleared logo was silently restored from the personal brand's own logo"
+        )
+
+    @pytest.mark.asyncio
+    async def test_agency_brands_own_logo_is_still_used_when_set(self, isolated_user):
+        """Not inheriting the personal brand's logo must not be confused with
+        never showing a logo at all — an agency brand's OWN logo still comes
+        through normally."""
+        user_id, db = isolated_user
+        personal_bid = BrandAccount.personal_brand_id(user_id)
+        agency_brand_id = f"{user_id}_agency_brand"
+
+        await db["brand_profiles"].insert_one({
+            "user_id": user_id, "brand_id": personal_bid, "brand_name": "Real Personal Biz",
+            "logo_url": "https://cdn/personal-logo.png", "onboarding_completed": True,
+        })
+        await db["brand_profiles"].insert_one({
+            "user_id": user_id, "brand_id": agency_brand_id, "brand_name": "Sub Brand",
+            "logo_url": "https://cdn/sub-brand-own-logo.png", "onboarding_completed": True,
+        })
+
+        result = await BrandProfileService.get(user_id, db, brand_id=agency_brand_id)
+        data = result["responseData"]
+
+        assert data["logo_url"] == "https://cdn/sub-brand-own-logo.png"

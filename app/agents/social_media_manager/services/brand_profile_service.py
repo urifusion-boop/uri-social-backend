@@ -419,7 +419,15 @@ class BrandProfileService:
                 "brand_colors", "industry", "visual_style", "aesthetic_keywords",
                 "derived_voice", "personality_quiz", "audience_age_range",
                 "audience_interests", "content_tones", "cta_styles", "default_link",
-                "tagline", "region", "font_preference", "logo_url", "logo_position", "logo_size",
+                "tagline", "region", "font_preference",
+                # Deliberately NOT logo_url/logo_position/logo_size — a logo is
+                # the literal, unique visual mark of ONE specific brand, not
+                # reusable style scaffolding like voice/tone/colors above.
+                # Inheriting it meant a sibling agency brand could never
+                # actually have "no logo": clearing it just made this same
+                # merge silently restore the personal brand's logo on the
+                # very next read, and a brand-new agency profile launched
+                # wearing a different brand's mark by default.
                 "target_audience", "ideal_customer_profile",
                 # Business Details — evergreen brand facts, same reasoning as tagline/region above
                 "price_range", "unique_selling_proposition", "business_stage", "business_priorities",
@@ -437,7 +445,10 @@ class BrandProfileService:
                 # nothing. Never borrow brand_name: this brand's own real name
                 # (from brand_accounts) must always be what's shown/generated for
                 # it, or the Brand Playbook page displays a different brand's
-                # identity as if it were this one's.
+                # identity as if it were this one's. logo_url/logo_position/
+                # logo_size are no longer in PLAYBOOK_FIELDS (see above), so this
+                # comprehension naturally leaves them out — a brand-new agency
+                # brand starts with no logo, not a copy of the personal brand's.
                 profile = {f: personal_profile[f] for f in PLAYBOOK_FIELDS if personal_profile.get(f)}
                 profile["brand_id"] = brand_id
                 profile["user_id"] = user_id
