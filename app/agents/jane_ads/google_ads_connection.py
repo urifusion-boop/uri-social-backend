@@ -114,6 +114,14 @@ class MccNotEligibleToCreateAccounts(GoogleAdsConnectionError):
     that unlocks CreateCustomerClient for every brand after that."
     """
 
+    def __init__(self, message: str, newly_discovered: bool = False) -> None:
+        super().__init__(message)
+        # True only the first time this MCC is confirmed ineligible (the
+        # stored flag actually flipped) — lets the caller alert operators
+        # once per real discovery instead of on every subsequent attempt
+        # that hits the same already-known restriction.
+        self.newly_discovered = newly_discovered
+
 
 # Google Ads REST error envelopes bury the machine-readable reason inside
 # errors[].errorCode, whose actual KEY varies by error category (customerError,
@@ -227,6 +235,34 @@ async def save_admin_connection(db, tokens: dict) -> None:
         # blank on a routine refresh.
         update["refresh_token"] = tokens["refresh_token"]
     await db[CONNECTIONS].update_one({"id": _ADMIN_CONN_ID}, {"$set": update}, upsert=True)
+
+
+async def set_mcc_creation_eligibility(db, eligible: bool, reason: str = "") -> bool:
+    """Persists whether URI's MCC can currently mint fresh client accounts, onto
+    the same single admin doc (URI has exactly one MCC — this is a URI-wide fact,
+    never per-brand). Read back by the connection-status endpoint so the frontend
+    can hide/show "Create one for me" based on a REAL, previously-confirmed
+    result instead of optimistically trying it and eating the round trip on
+    every brand-new client (see MccNotEligibleToCreateAccounts).
+
+    Returns True when this is a NEW discovery (the stored value actually
+    changed) — the caller uses this to decide whether an ops alert is
+    warranted, so a string of identical failed attempts doesn't spam the same
+    alert repeatedly.
+    """
+    existing = await get_admin_connection(db)
+    previous = (existing or {}).get("mcc_can_create_accounts")
+    changed = previous != eligible
+    await db[CONNECTIONS].update_one(
+        {"id": _ADMIN_CONN_ID},
+        {"$set": {
+            "mcc_can_create_accounts": eligible,
+            "mcc_eligibility_checked_at": datetime.now(timezone.utc),
+            "mcc_eligibility_failure_reason": reason if not eligible else "",
+        }},
+        upsert=True,
+    )
+    return changed
 
 
 async def get_admin_valid_access_token(db) -> str:
@@ -486,13 +522,20 @@ async def create_client_account_under_mcc(
         )
     data = _parse_json_response(resp, "create client account")
     if "error" in data and _is_ineligible_mcc_error(json.dumps(data.get("error", {}))):
-        raise MccNotEligibleToCreateAccounts(
+        reason = (
             "This manager account can't create new accounts yet — it needs at least one linked "
             "account with real ad spend and a clean policy history first."
         )
+        newly_discovered = await set_mcc_creation_eligibility(db, False, reason)
+        raise MccNotEligibleToCreateAccounts(reason, newly_discovered=newly_discovered)
     _raise_for_error(data, "create client account")
     resource_name = data.get("resourceName", "")
     new_customer_id = resource_name.split("/")[-1] if resource_name else ""
+
+    # A real success is proof-positive the MCC IS eligible — clears the gate
+    # for every brand after this one, not just this brand, without needing a
+    # separate manual bootstrap step to be remembered/run.
+    await set_mcc_creation_eligibility(db, True)
 
     await db[CONNECTIONS].update_one(
         {"id": conn["id"]},
