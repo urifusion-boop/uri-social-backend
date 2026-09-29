@@ -5491,7 +5491,18 @@ async def save_brand_profile(
     """Save or update the brand profile for the active brand."""
     user_id = ctx["user_id"]
     try:
-        payload = request.dict(exclude_none=True)
+        # exclude_unset (not exclude_none): BrandProfileService.save() below
+        # decides whether to touch a field by checking `if field in data` —
+        # that's how it tells "the client explicitly cleared this" from "the
+        # client didn't send this at all". exclude_none collapsed that
+        # distinction: a field explicitly sent as null (e.g. logo_url after
+        # "Remove logo") was stripped out identically to a field that was
+        # simply never included, so save() never saw the clear and the old
+        # value just stayed in the database — confirmed live, the removed
+        # logo reappeared after every save. exclude_unset keeps any field
+        # that was actually present in the request body, null or not, while
+        # still excluding genuinely-omitted fields exactly as before.
+        payload = request.dict(exclude_unset=True)
         # Serialize nested Pydantic models to plain dicts
         if "guardrails" in payload and hasattr(payload["guardrails"], "dict"):
             payload["guardrails"] = payload["guardrails"].dict(exclude_none=True)
