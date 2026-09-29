@@ -488,6 +488,62 @@ def test_write_ad_copy_video_recommendation_parsed():
     assert copy.video_recommendation_reason == "movement sells this"
 
 
+# ── platform threading: TikTok gets its own framing, Meta stays exactly as before ─
+
+def test_write_ad_copy_defaults_to_meta_instagram_framing():
+    generic = {"headline": "h", "primary_text": "p", "image_prompt": "p",
+              "video_recommended": False, "video_recommendation_reason": ""}
+    mock_call = AsyncMock(return_value=generic)
+    with patch("app.agents.jane_ads.creative._call_ad_copy_model", new=mock_call):
+        _run(write_ad_copy("Test Biz", "bags"))
+    prompt = mock_call.await_args.args[0]
+    assert "Write a Meta/Instagram ad for" in prompt
+    assert "write like a real Nigerian business owner texting a customer on WhatsApp" in prompt
+    assert "TikTok" not in prompt
+
+
+def test_write_ad_copy_platform_tiktok_changes_the_prompt_not_just_a_label():
+    generic = {"headline": "h", "primary_text": "p", "image_prompt": "p",
+              "video_recommended": False, "video_recommendation_reason": ""}
+    mock_call = AsyncMock(return_value=generic)
+    with patch("app.agents.jane_ads.creative._call_ad_copy_model", new=mock_call):
+        _run(write_ad_copy("Test Biz", "bags", platform="tiktok"))
+    prompt = mock_call.await_args.args[0]
+    assert "Write a TikTok ad for" in prompt
+    assert "Meta/Instagram" not in prompt
+    # Register changes to a native-creator voice, not the WhatsApp-texting one.
+    assert "native TikTok creator's own caption" in prompt
+    assert "write like a real Nigerian business owner texting a customer on WhatsApp" not in prompt
+    # The image brief also nudges toward a native/candid look, not a staged photoshoot.
+    assert "phone-shot feel" in prompt
+    # The shared discipline (price honesty, forbidden words, mandatory CTA) is not lost.
+    assert "REQUIRED: the last sentence is a direct ask" in prompt
+    assert "Never use:" in prompt
+
+
+def test_write_ad_copy_for_image_platform_tiktok_changes_the_prompt():
+    generic = {"headline": "h", "primary_text": "p", "video_recommended": False,
+              "video_recommendation_reason": ""}
+    mock_call = AsyncMock(return_value=generic)
+    with patch("app.agents.jane_ads.creative._call_ad_copy_model", new=mock_call):
+        _run(write_ad_copy_for_image("a product on a table", "Test Biz", "bags", platform="tiktok"))
+    prompt = mock_call.await_args.args[0]
+    assert "Write the copy for a TikTok ad for" in prompt
+    assert "Meta/Instagram" not in prompt
+    assert "native TikTok creator's own caption" in prompt
+
+
+def test_write_ad_copy_for_image_defaults_to_meta_instagram_framing():
+    generic = {"headline": "h", "primary_text": "p", "video_recommended": False,
+              "video_recommendation_reason": ""}
+    mock_call = AsyncMock(return_value=generic)
+    with patch("app.agents.jane_ads.creative._call_ad_copy_model", new=mock_call):
+        _run(write_ad_copy_for_image("a product on a table", "Test Biz", "bags"))
+    prompt = mock_call.await_args.args[0]
+    assert "Write the copy for a Meta/Instagram ad for" in prompt
+    assert "TikTok" not in prompt
+
+
 # ── write_ad_copy_for_image: same leakage/register treatment (upload/draft path) ─
 
 def test_write_ad_copy_for_image_never_leaks_and_parses_video_signal():
