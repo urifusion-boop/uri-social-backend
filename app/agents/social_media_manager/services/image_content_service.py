@@ -2334,46 +2334,6 @@ rich tonal range, no pure black or pure white."""
         )
     
     @staticmethod
-    def _clear_region_for_logo(base_img: "Image.Image", box: tuple) -> None:
-        """Deterministically erases whatever the AI drew inside `box` (the
-        logo's exact footprint) by replacing it with a heavily blurred sample
-        of its own surroundings — mutates base_img in place. build_logo_space_note
-        only ASKS the model to leave this corner clear, and confirmed live it
-        doesn't always comply (headline text landing directly under the logo).
-        This is what makes the outcome guaranteed instead of hoped-for: no
-        matter how detailed or text-heavy the generated output is at that
-        exact spot, the pixels under the logo are smoothed clean before the
-        logo goes down, so the brand's chosen corner never has to move to
-        avoid a collision — the content makes way, not the logo."""
-        from PIL import ImageFilter
-
-        x0, y0, x1, y1 = box
-        img_w, img_h = base_img.size
-        box_w, box_h = x1 - x0, y1 - y0
-
-        # Sample a patch that extends beyond the box on every side — the blur
-        # needs real neighbouring colour/texture to smooth from, not just the
-        # box in isolation (which may be 100% text and would just soften in
-        # place rather than erase).
-        margin = max(box_w, box_h)
-        sx0 = max(0, x0 - margin)
-        sy0 = max(0, y0 - margin)
-        sx1 = min(img_w, x1 + margin)
-        sy1 = min(img_h, y1 + margin)
-
-        patch = base_img.crop((sx0, sy0, sx1, sy1))
-        # Scales with the reserved area rather than a fixed pixel count, so it
-        # stays strong enough to wash out headline-scale text across small,
-        # medium, and large logo sizes and different platform dimensions.
-        blur_radius = max(24, margin // 2)
-        patch = patch.filter(ImageFilter.GaussianBlur(radius=blur_radius))
-
-        crop_x0 = x0 - sx0
-        crop_y0 = y0 - sy0
-        cleaned = patch.crop((crop_x0, crop_y0, crop_x0 + box_w, crop_y0 + box_h))
-        base_img.paste(cleaned, (x0, y0))
-
-    @staticmethod
     def _overlay_logo(b64: str, logo_url: str, position: str = "bottom_right", logo_size: str = "small") -> str:
         """
         Download the brand logo and composite it onto the generated image using Pillow.
@@ -2435,18 +2395,6 @@ rich tonal range, no pure black or pure white."""
             else:  # bottom_right (default)
                 bx = bw - badge_w - edge_pad
                 by = bh - badge_h - edge_pad
-
-            # GUARANTEE a clean surface under the logo — the prompt-level
-            # instruction (build_logo_space_note) asking the AI to leave this
-            # corner empty is only a request it can ignore, and confirmed live
-            # it sometimes does, putting headline text or detail directly where
-            # the logo lands. This makes the outcome deterministic instead of
-            # probabilistic: whatever the AI drew in the logo's exact footprint
-            # gets smoothed away into the surrounding background BEFORE the
-            # logo is pasted, so the logo's position — the brand's own choice —
-            # never has to move to avoid a collision. The content makes way,
-            # not the logo.
-            ImageContentService._clear_region_for_logo(base_img, (bx, by, bx + badge_w, by + badge_h))
 
             # Paste logo directly on image (no shadow, no badge background)
             logo_x = bx + badge_pad_inner
