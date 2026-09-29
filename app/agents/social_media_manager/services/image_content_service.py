@@ -2357,6 +2357,19 @@ rich tonal range, no pure black or pure white."""
             resp.raise_for_status()
             logo_img = Image.open(io.BytesIO(resp.content)).convert("RGBA")
 
+            # Crop out any transparent padding baked into the logo file itself
+            # before sizing it — a logo exported with extra breathing room
+            # around the actual mark (common from Canva/Figma-style exports)
+            # otherwise makes "large" still look small, since the size
+            # percentage below is computed against the file's full canvas,
+            # not the visible content inside it. Reading only the alpha
+            # channel's bounding box (not all RGBA bands) avoids being thrown
+            # off by non-zero RGB values hiding under fully transparent
+            # pixels, which a plain getbbox() on the whole image would catch.
+            content_bbox = logo_img.split()[-1].getbbox()
+            if content_bbox and content_bbox != (0, 0, logo_img.width, logo_img.height):
+                logo_img = logo_img.crop(content_bbox)
+
             # Resize logo based on user preference or keep default at 8%
             # User can set logo_size: "small" (8%), "medium" (12%), "large" (16%)
             logo_size_map = {"small": 0.08, "medium": 0.12, "large": 0.16}
