@@ -38,6 +38,7 @@ how to authenticate as them (there is no "as them").
 """
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Optional
@@ -90,6 +91,50 @@ class AdsConnectionRequired(Exception):
 class GoogleAdsConnectionError(Exception):
     """An OAuth token exchange/refresh call, or a manager-link/create-account call,
     returned an error Google didn't give us a more specific typed state for."""
+
+
+class MccNotEligibleToCreateAccounts(GoogleAdsConnectionError):
+    """CreateCustomerClient specifically (not linking) rejected with Google's
+    account-creation eligibility gate — live-confirmed error text: "This manager
+    account can't create new accounts. You'll need to link a Google Ads account
+    that has spent more than $1,000 and has a history of policy compliance."
+
+    This is a real Google anti-fraud restriction on brand-new Manager Accounts
+    (MCCs), not a bug: Google won't let an MCC with no proven history mint fresh
+    child accounts on demand, since that's exactly the pattern a spam/fraud
+    operation would use to mass-produce disposable ad accounts. It has nothing to
+    do with OAuth verification or developer-token access level (both confirmed
+    separately approved) — it's gated purely on whether the MCC already has at
+    least one linked account with real spend and clean policy history.
+
+    Distinct from every other GoogleAdsConnectionError because the correct
+    response isn't "retry" or "fix your credentials" — it's "link an existing,
+    qualifying account instead (to any brand-new client, not necessarily this
+    one), which both gets this brand onto Google Ads today AND is the one thing
+    that unlocks CreateCustomerClient for every brand after that."
+    """
+
+
+# Google Ads REST error envelopes bury the machine-readable reason inside
+# errors[].errorCode, whose actual KEY varies by error category (customerError,
+# authorizationError, quotaError, ...) — there's no single fixed field name to
+# read. Matching on the raw JSON text for either the enum Google is known to use
+# for this (CREATION_DENIED_INELIGIBLE_MCC / CREATION_DENIED) or the stable
+# human-readable phrase from the live-confirmed message is deliberately
+# redundant: if Google ever changes the wording, the enum match still catches
+# it, and vice versa.
+_INELIGIBLE_MCC_SIGNATURES = (
+    "ineligible_mcc",
+    "creation_denied",
+    "can't create new accounts",
+    "cannot create new accounts",
+    "can not create new accounts",
+)
+
+
+def _is_ineligible_mcc_error(raw_error_json: str) -> bool:
+    lowered = raw_error_json.lower()
+    return any(sig in lowered for sig in _INELIGIBLE_MCC_SIGNATURES)
 
 
 def _brand_scope(user_id: Optional[str], brand_id: Optional[str]) -> dict:
@@ -440,6 +485,11 @@ async def create_client_account_under_mcc(
             }},
         )
     data = _parse_json_response(resp, "create client account")
+    if "error" in data and _is_ineligible_mcc_error(json.dumps(data.get("error", {}))):
+        raise MccNotEligibleToCreateAccounts(
+            "This manager account can't create new accounts yet — it needs at least one linked "
+            "account with real ad spend and a clean policy history first."
+        )
     _raise_for_error(data, "create client account")
     resource_name = data.get("resourceName", "")
     new_customer_id = resource_name.split("/")[-1] if resource_name else ""

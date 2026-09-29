@@ -1484,7 +1484,12 @@ async def jane_google_ads_create_account(
 ) -> dict:
     """Path (b): client has no Google Ads account — create one fresh under URI's
     MCC (auto-linked, no accept step needed)."""
-    from .google_ads_connection import AdsConnectionRequired, GoogleAdsConnectionError, create_client_account_under_mcc
+    from .google_ads_connection import (
+        AdsConnectionRequired,
+        GoogleAdsConnectionError,
+        MccNotEligibleToCreateAccounts,
+        create_client_account_under_mcc,
+    )
 
     try:
         return await create_client_account_under_mcc(
@@ -1492,6 +1497,13 @@ async def jane_google_ads_create_account(
         )
     except AdsConnectionRequired as e:
         raise HTTPException(status_code=409, detail=f"google_ads_connection_{e.state.value}")
+    except MccNotEligibleToCreateAccounts as e:
+        # Caught BEFORE the broader GoogleAdsConnectionError below — it's a
+        # subclass, so ordering matters. A distinct code (not a generic 502)
+        # so the frontend can show the actual guided next step (sign up with
+        # Google directly, then link) instead of a dead-end "try again" error.
+        print(f"ℹ️  Google Ads account-creation not yet eligible: {e}")
+        raise HTTPException(status_code=409, detail="google_ads_mcc_not_eligible_to_create")
     except GoogleAdsConnectionError as e:
         print(f"⚠️  Google Ads REST failure: {e}")
         raise HTTPException(status_code=502, detail=str(e))
