@@ -1,16 +1,18 @@
 """The brand's chosen logo position is a user decision, not something the AI
-image generator gets to override — these cover ImageContentService.build_logo_space_note
-(the shared "reserve this corner" instruction, a best-effort request to the
-model) and _clear_region_for_logo (the deterministic guarantee: the prompt
-instruction alone was confirmed live to not always be honored — headline text
-still landed under the logo — so the logo's exact footprint is now forcibly
-cleaned before every paste, regardless of what the model drew there)."""
-import base64
-import io
-from unittest.mock import AsyncMock, MagicMock, Mock, patch
+image generator gets to override — these cover
+ImageContentService.build_logo_space_note, the shared "reserve this corner"
+instruction told to the image model, and confirm it's wired into the V2
+custom-guide prompt path, which was previously missing it entirely.
+
+Deliberately NOT covered here: any kind of post-generation pixel patch/blur
+behind the logo. That approach was tried and reverted — it left a visible
+box/smudge behind the logo over detailed backgrounds and risked silently
+destroying real headline text that happened to land in that rectangle,
+which is worse than the original overlap. The logo must sit directly on
+whatever the AI actually drew, no exceptions, no background of any kind."""
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from PIL import Image, ImageDraw, ImageStat
 
 from app.agents.social_media_manager.services.image_content_service import (
     ImageContentService,
@@ -150,122 +152,3 @@ class TestV2GuideRespectsLogoPosition:
 
         assert result["success"] is True
         assert "LOGO OVERLAY ZONE" not in captured["prompt"]
-
-
-def _text_like_box(draw: "ImageDraw.ImageDraw", box: tuple) -> None:
-    """Dense black/white stripes standing in for real rendered headline
-    text — high-contrast, high-frequency detail is what a real letterform
-    looks like to a blur/variance check, whether or not it's literally text."""
-    x0, y0, x1, y1 = box
-    for x in range(x0, x1, 5):
-        draw.rectangle([x, y0, x + 2, y1], fill=(255, 255, 255))
-
-
-class TestClearRegionForLogo:
-    def test_erases_text_like_content_inside_the_box(self):
-        img = Image.new("RGBA", (1080, 1080), (20, 90, 60, 255))
-        draw = ImageDraw.Draw(img)
-        box = (800, 20, 1000, 120)  # top-right-ish region
-        _text_like_box(draw, box)
-
-        before_variance = ImageStat.Stat(img.crop(box).convert("L")).var[0]
-        ImageContentService._clear_region_for_logo(img, box)
-        after_variance = ImageStat.Stat(img.crop(box).convert("L")).var[0]
-
-        assert after_variance < before_variance * 0.1, (
-            f"text-like content was not smoothed away: variance {before_variance:.1f} -> {after_variance:.1f}"
-        )
-
-    def test_handles_box_touching_image_edge_without_error(self):
-        img = Image.new("RGBA", (400, 400), (10, 10, 10, 255))
-        draw = ImageDraw.Draw(img)
-        box = (0, 0, 120, 120)  # true corner — no margin available on two sides
-        _text_like_box(draw, box)
-
-        # Must not raise despite the sampling margin being clipped by the
-        # image bounds on the top and left.
-        ImageContentService._clear_region_for_logo(img, box)
-        assert img.size == (400, 400)
-
-
-class TestOverlayLogoGuaranteesCleanSurface:
-    """End-to-end: even when the base image has dense text-like content
-    baked directly into the logo's configured footprint (the AI ignored the
-    reservation instruction, exactly as seen live), the final composited
-    image must not show that content peeking out around/under the logo, and
-    the logo itself must stay at the brand's configured position."""
-
-    @staticmethod
-    def _fake_logo_response():
-        logo = Image.new("RGBA", (200, 200), (255, 0, 0, 255))
-        buf = io.BytesIO()
-        logo.save(buf, format="PNG")
-        resp = Mock()
-        resp.content = buf.getvalue()
-        resp.raise_for_status = Mock()
-        return resp
-
-    def test_logo_position_unchanged_and_surrounding_text_cleared(self):
-        size = (1080, 1080)
-        img = Image.new("RGB", size, (30, 120, 80))
-        draw = ImageDraw.Draw(img)
-        # Cover the ENTIRE top-right quadrant with text-like content — the
-        # logo's reserved footprint sits inside this, simulating the AI
-        # having completely ignored the reservation instruction.
-        _text_like_box(draw, (700, 0, 1080, 200))
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        base_b64 = base64.b64encode(buf.getvalue()).decode()
-
-        with patch("requests.get", return_value=self._fake_logo_response()):
-            result_b64 = ImageContentService._overlay_logo(
-                base_b64, "https://example.com/logo.png", position="top_right", logo_size="small"
-            )
-
-        result_img = Image.open(io.BytesIO(base64.b64decode(result_b64))).convert("RGB")
-        bw, bh = result_img.size
-        edge_pad = max(20, int(bw * 0.03))
-
-        # Logo (solid red) must be present at the configured top-right spot —
-        # position was never moved to dodge the busy content.
-        logo_sample = result_img.crop((bw - edge_pad - 60, edge_pad, bw - edge_pad, edge_pad + 60))
-        assert any(
-            px[0] > 200 and px[1] < 50 and px[2] < 50 for px in logo_sample.getdata()
-        ), "logo was not pasted at the configured top-right position"
-
-        # Locate the logo's actual bounding box dynamically (rather than
-        # hardcoding badge math the test would otherwise have to duplicate
-        # from the implementation) so the "cleared" check inspects exactly
-        # where the badge landed, not an arbitrary guess at its coordinates.
-        red_pixels = [
-            (x, y)
-            for x in range(700, bw)
-            for y in range(0, 200)
-            if (px := result_img.getpixel((x, y)))[0] > 200 and px[1] < 50 and px[2] < 50
-        ]
-        assert red_pixels, "could not locate pasted logo pixels"
-        xs, ys = zip(*red_pixels)
-        # Stay INSIDE the badge's inner padding band (badge_pad_inner in the
-        # source is max(5, 0.5% of image width) — 4px here is safely under
-        # that at this test's 1080px width) so this margin can't reach past
-        # the cleared box into the still-striped region just outside it,
-        # which would fail the assertion for a reason unrelated to the fix.
-        margin = 4
-        badge_box = (
-            max(0, min(xs) - margin),
-            max(0, min(ys) - margin),
-            min(bw, max(xs) + margin),
-            min(200, max(ys) + margin),
-        )
-
-        # Within the badge's own footprint (logo + its immediate padding),
-        # the original pure-white stripe fill must be gone — blurred into a
-        # blend with the background, not left sharp and pure white.
-        badge_sample = result_img.crop(badge_box)
-        pure_white_count = sum(
-            1 for px in badge_sample.getdata() if px[0] > 250 and px[1] > 250 and px[2] > 250
-        )
-        assert pure_white_count == 0, (
-            f"sharp text-like content ({pure_white_count} pure-white px) still visible "
-            f"inside the logo's own badge footprint — clearing did not run or was too weak"
-        )
