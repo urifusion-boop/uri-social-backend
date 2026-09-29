@@ -25,7 +25,8 @@ from .channels import (
 from .meta_transport import meta_transport
 from .send import SendRefused, send_reply
 from .ingest import (
-    ensure_indexes, parse_meta_event, record_event, store_raw, verify_signature,
+    describe_unparsed, ensure_indexes, parse_meta_event, record_event, store_raw,
+    verify_signature,
 )
 
 router = APIRouter(prefix="/inbox", tags=["Unified Inbox"])
@@ -77,6 +78,11 @@ async def receive_meta_webhook(
     # the log then means Meta sent nothing, rather than us dropping it quietly.
     print(f"[Inbox] webhook received: object={payload.get('object')!r} "
           f"entries={len(payload.get('entry') or [])} parsed={len(events)}", flush=True)
+    # A delivery that parses to nothing is the hardest case to diagnose from the
+    # outside — it looks identical to Meta never sending it. Say what was in it.
+    if not events:
+        print(f"[Inbox] nothing to store from that delivery: "
+              f"{describe_unparsed(payload)}", flush=True)
     stored = 0
     for ev in events:
         account = await account_for_event(db, ev.get("external_account_id"))
