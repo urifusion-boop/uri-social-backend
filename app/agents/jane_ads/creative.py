@@ -198,7 +198,8 @@ _FORBIDDEN_COPY_WORDS = (
 )
 
 
-def _register_rules_block(destination_type: str = DEFAULT_DESTINATION.value) -> str:
+def _register_rules_block(destination_type: str = DEFAULT_DESTINATION.value,
+                          platform: str = "meta") -> str:
     """Nigerian commerce register (creative brief spec §5) — specific and
     transactional beats fluent and abstract, and it's also what performs under
     retrieval-driven delivery, since specificity is what tells the platform who
@@ -207,11 +208,26 @@ def _register_rules_block(destination_type: str = DEFAULT_DESTINATION.value) -> 
     The closing-ask EXAMPLES follow the brand's ad destination: "Message me to order"
     is only right when the tap opens WhatsApp, and an example is what the model
     actually imitates — leaving it fixed put a WhatsApp ask on website ads whose
-    button said "Shop Now"."""
+    button said "Shop Now".
+
+    `platform` only changes the OPENING line — everything below it (price honesty,
+    the required closing ask, forbidden words, no manufactured urgency) is the same
+    discipline regardless of which platform the ad runs on; TikTok doesn't need
+    looser guardrails, just a different voice. Defaults to "meta" so every existing
+    caller that hasn't been updated keeps this byte-identical."""
     _ex = copy_action_examples(coerce_type(destination_type))
-    return (
+    opening = (
+        "REGISTER — write like a native TikTok creator's own caption, not a brand's "
+        "ad: a hook in the first handful of words that would actually stop a scroll "
+        "(a question, a bold claim, a relatable moment) — never open by naming the "
+        "business or announcing an offer. Casual spoken Nigerian voice, short lines, "
+        "reads like a real person posted it, not a poster:\n"
+        if platform == "tiktok" else
         "REGISTER — write like a real Nigerian business owner texting a customer on "
         "WhatsApp, not a brand:\n"
+    )
+    return (
+        opening +
         "- Name what it actually is (\"bags\", not \"accessories solutions\") — category "
         "words matter.\n"
         "- If a specific price or starting price is mentioned in the context below, "
@@ -393,13 +409,22 @@ async def write_ad_copy(business_name: str, category: str, goal: str = "messages
                         audience_segment: str = "", who_its_for: str = "",
                         geo_pockets: Optional[list[str]] = None,
                         corpus: Optional["RetrievalResult"] = None,
-                        destination_type: str = DEFAULT_DESTINATION.value) -> AdCopy:
+                        destination_type: str = DEFAULT_DESTINATION.value,
+                        platform: str = "meta") -> AdCopy:
     """Write a short headline, primary text, and an image prompt (used only for the
     GENERATE source). Voice-matched to the brand playbook when a profile exists, and
     visually grounded in the real city/area the campaign targets. Also does the
     creative-type reasoning (PRD §4.1): flags when a video would clearly serve this
     ad better than the photo we're about to generate — gpt-image-1 can't produce
     one, so this is a heads-up for the caller to offer an upload, not a capability.
+
+    `platform` ("meta" | "tiktok", default "meta" — every existing caller that
+    hasn't been updated keeps today's Meta/Instagram framing byte-for-byte). Before
+    this, the prompt told the model it was writing a "Meta/Instagram ad" regardless
+    of which platform the campaign actually launches on, so a TikTok campaign still
+    got Meta-toned copy and a staged-photoshoot image brief — the platform decision
+    made upstream by decision_engine.choose_platform never reached the creative
+    step at all. See _register_rules_block for what actually changes.
 
     Two-zone brief (creative brief spec §2): DELIVERY CONTEXT (geo/audience — never
     written) is kept separate from MESSAGE (what the ad actually says), backed by a
@@ -441,14 +466,24 @@ async def write_ad_copy(business_name: str, category: str, goal: str = "messages
            f"{service_area}\n" if service_area else "")
         + f"- the_action: {copy_action(coerce_type(destination_type))}\n"
     )
+    ad_label = "TikTok" if platform == "tiktok" else "Meta/Instagram"
+    # TikTok's own feed is dominated by phone-shot, unstaged footage — an obviously
+    # art-directed brand photoshoot reads as an ad and gets scrolled past. Meta's
+    # image brief stays exactly as it was (still additive-only per platform).
+    image_style_bit = (
+        " Lean toward a native, candid, phone-shot feel — a real moment caught in "
+        "the middle of happening, not a staged studio photoshoot — the way a "
+        "TikTok creator's own footage looks, never an obvious brand ad."
+        if platform == "tiktok" else ""
+    )
     prompt = (
-        f"Write a Meta/Instagram ad for '{business_name or bc.get('brand_name') or 'a business'}' "
+        f"Write a {ad_label} ad for '{business_name or bc.get('brand_name') or 'a business'}' "
         f"(a {category or 'local business'}) whose goal is {goal}.{(' ' + brand_bits) if brand_bits else ''}\n"
         f"{zone_a}{zone_b}"
         f"{location_bit}\n"
         f"Context: {description or 'none'}\n"
         f"How customers find this business: {behaviour or 'unknown'}.\n"
-        f"{_register_rules_block(destination_type)}\n"
+        f"{_register_rules_block(destination_type, platform)}\n"
         f"{_corpus_rules(corpus)}"
         "Return JSON with:\n"
         "- headline: punchy, <= 5 words, no ALL CAPS, no emoji spam, from MESSAGE only\n"
@@ -462,7 +497,7 @@ async def write_ad_copy(business_name: str, category: str, goal: str = "messages
         "DELIVERY CONTEXT and must never end up rendered as words in the picture (a "
         "live-confirmed bug painted the targeted areas onto a billboard in the image). "
         "Also no watermarks and no shop signage carrying the business name. Not an "
-        "illustration.\n"
+        f"illustration.{image_style_bit}\n"
         f"{_video_fit_fields_block()}"
         "Return ONLY the JSON."
     )
@@ -708,7 +743,8 @@ async def write_ad_copy_for_image(image_summary: str, business_name: str, catego
                                   who_its_for: str = "",
                                   geo_pockets: Optional[list[str]] = None,
                                   corpus: Optional["RetrievalResult"] = None,
-                                  destination_type: str = DEFAULT_DESTINATION.value) -> AdCopy:
+                                  destination_type: str = DEFAULT_DESTINATION.value,
+                                  platform: str = "meta") -> AdCopy:
     """Write the headline + primary text to MATCH a specific image (its vision description),
     so the caption references what's actually on screen instead of a generic line. Returns
     an AdCopy with only headline + primary_text set.
@@ -716,7 +752,10 @@ async def write_ad_copy_for_image(image_summary: str, business_name: str, catego
     Same two-zone/leakage-check treatment as write_ad_copy (creative brief spec §2-4) —
     this path (upload/draft/recomposite) has the identical leakage risk since it also
     has geo/audience context available. `audience_segment`/`who_its_for`/`geo_pockets`
-    — see write_ad_copy's docstring (Multi-Plan Audience Variants spec §8)."""
+    — see write_ad_copy's docstring (Multi-Plan Audience Variants spec §8).
+
+    `platform` — see write_ad_copy's docstring; defaults to "meta" for the same
+    byte-identical-unless-updated reason."""
     if not settings.jane_ads_openai_key or not image_summary.strip():
         return AdCopy()
     bc = brand_context or {}
@@ -741,14 +780,15 @@ async def write_ad_copy_for_image(image_summary: str, business_name: str, catego
            f"{service_area}\n" if service_area else "")
         + f"- the_action: {copy_action(coerce_type(destination_type))}\n"
     )
+    ad_label = "TikTok" if platform == "tiktok" else "Meta/Instagram"
     prompt = (
-        f"Write the copy for a Meta/Instagram ad for "
+        f"Write the copy for a {ad_label} ad for "
         f"'{business_name or bc.get('brand_name') or 'a business'}' (a "
         f"{category or 'local business'}) whose goal is {goal}.{(' ' + brand_bits) if brand_bits else ''}\n"
         f"{zone_a}{zone_b}"
         f"The ad's IMAGE shows: {image_summary}.\n"
         f"Context: {description or 'none'}\n"
-        f"{_register_rules_block(destination_type)}\n"
+        f"{_register_rules_block(destination_type, platform)}\n"
         f"{_corpus_rules(corpus)}"
         "Write copy that clearly connects to what's in the image above — the headline and "
         "body should feel like they belong with that visual, not generic.\n"
@@ -892,6 +932,7 @@ async def generate_ad_creative(
     who_its_for: str = "", geo_pockets: Optional[list[str]] = None,
     budget_ngn: float = 0.0, destination_type: str = DEFAULT_DESTINATION.value,
     destination_cta: str = "", vsg01_format_id: Optional[str] = None,
+    platform: str = "meta",
 ) -> AdCreative:
     """SOURCE 1 (default) — Jane writes the copy and generates the image herself,
     using the brand playbook's colours/voice/region/industry, grounded in `city` (the
@@ -905,7 +946,11 @@ async def generate_ad_creative(
     override the brand's generic target_audience for this one campaign. For "use my
     own photo", see SOURCE 2 (creative_from_upload) — a distinct source, not a
     reference nudge on generation. Never raises — falls back to copy-only if image
-    generation fails."""
+    generation fails.
+
+    `platform` ("meta" | "tiktok") — see write_ad_copy's docstring. Threaded through
+    to both the copy call below and the vision-matched rewrite further down, so a
+    TikTok campaign gets TikTok-toned copy end to end, not just on the first pass."""
     brand_context = await get_brand_context(user_id, db, brand_id) if user_id else {}
     # `db is not None`, never `if db`: Motor's Database raises NotImplementedError on
     # truth-value testing, and in a conditional expression that fires while evaluating
@@ -918,7 +963,7 @@ async def generate_ad_creative(
     copy = await write_ad_copy(business_name, category, goal, description, brand_context,
                                city, behaviour, service_area, audience_segment, who_its_for,
                                geo_pockets=geo_pockets, corpus=corpus,
-                               destination_type=destination_type)
+                               destination_type=destination_type, platform=platform)
 
     # VSG-01 v3 (§6-9, step 10) — try a corpus-selected, composited ad format
     # (Us vs Them / Borrowed Interface / Problem-Solution today; see
@@ -978,7 +1023,7 @@ async def generate_ad_creative(
                 matched = await write_ad_copy_for_image(
                     summary, business_name, category, goal, description, brand_context, city,
                     service_area, audience_segment, who_its_for, geo_pockets=geo_pockets,
-                    corpus=corpus, destination_type=destination_type,
+                    corpus=corpus, destination_type=destination_type, platform=platform,
                 )
                 if matched.headline:
                     copy.headline = matched.headline
@@ -1009,7 +1054,7 @@ async def creative_from_upload(
     audience_segment: str = "", who_its_for: str = "", geo_pockets: Optional[list[str]] = None,
     destination_type: str = DEFAULT_DESTINATION.value, destination_cta: str = "",
     asset_attestation: Optional[str] = None, vsg01_format_id: Optional[str] = None,
-    day30_photo_url: Optional[str] = None,
+    day30_photo_url: Optional[str] = None, platform: str = "meta",
 ) -> AdCreative:
     """SOURCE 2 — the user's own uploaded photo OR video (uploaded via
     /jane-ads/creative/upload, or the existing /upload-user-content flow) becomes
@@ -1017,7 +1062,9 @@ async def creative_from_upload(
     grounding needed for the IMAGE — the media IS the real place already — but the
     copy still needs `service_area`/`city` for the same leakage-check treatment as
     every other path. `audience_segment`/`who_its_for`/`geo_pockets` — see
-    write_ad_copy's docstring (Multi-Plan Audience Variants spec §8).
+    write_ad_copy's docstring (Multi-Plan Audience Variants spec §8). `platform` —
+    see write_ad_copy's docstring; the image is the user's own either way, only the
+    copy's voice changes.
 
     `asset_attestation` ("product_photo" | "real_customer_photo" | None) — the
     user's own confirmation of what this photo genuinely shows, collected once
@@ -1062,13 +1109,13 @@ async def creative_from_upload(
         copy = await write_ad_copy_for_image(
             summary, business_name, category, goal, description, brand_context, city,
             service_area, audience_segment, who_its_for, geo_pockets=geo_pockets,
-            destination_type=destination_type,
+            destination_type=destination_type, platform=platform,
         )
     else:
         copy = await write_ad_copy(business_name, category, goal, description, brand_context, city,
                                    service_area=service_area, audience_segment=audience_segment,
                                    who_its_for=who_its_for, geo_pockets=geo_pockets,
-                                   destination_type=destination_type)
+                                   destination_type=destination_type, platform=platform)
     ad = assemble_creative(copy, final_image_url, source=CreativeSource.UPLOAD, is_video=is_video,
                            service_area=service_area, destination_type=destination_type,
                            destination_cta=destination_cta)
@@ -1083,9 +1130,11 @@ async def creative_from_draft(
     goal: str = "messages", brand_id: Optional[str] = None, city: str = "", service_area: str = "",
     audience_segment: str = "", who_its_for: str = "", geo_pockets: Optional[list[str]] = None,
     destination_type: str = DEFAULT_DESTINATION.value, destination_cta: str = "",
+    platform: str = "meta",
 ) -> Optional[AdCreative]:
     """SOURCE 3 — reuse a content draft the user already generated and liked.
-    Returns None if the draft can't be found (caller should 404)."""
+    Returns None if the draft can't be found (caller should 404). `platform` — see
+    write_ad_copy's docstring."""
     draft = await get_draft_image(draft_id, user_id, db)
     if draft is None or not draft["image_url"]:
         return None
@@ -1096,7 +1145,7 @@ async def creative_from_draft(
     copy = await write_ad_copy_for_image(
         summary, business_name, category, goal, draft["content"], brand_context, city,
         service_area, audience_segment, who_its_for, geo_pockets=geo_pockets,
-        destination_type=destination_type,
+        destination_type=destination_type, platform=platform,
     )
     return assemble_creative(copy, draft["image_url"], source=CreativeSource.DRAFT,
                              service_area=service_area, destination_type=destination_type,
@@ -1109,7 +1158,7 @@ async def creative_from_recomposite(
     city: str = "", service_area: str = "", audience_segment: str = "", who_its_for: str = "",
     geo_pockets: Optional[list[str]] = None, destination_type: str = DEFAULT_DESTINATION.value,
     destination_cta: str = "", asset_attestation: Optional[str] = None,
-    vsg01_format_id: Optional[str] = None,
+    vsg01_format_id: Optional[str] = None, platform: str = "meta",
 ) -> AdCreative:
     """SOURCE 4 — the user's own real product photo, recomposited: background
     cleaned/replaced, the product itself preserved exactly (creative brief spec §7,
@@ -1123,7 +1172,8 @@ async def creative_from_recomposite(
     `asset_attestation` — see creative_from_upload's docstring. Recomposite's
     already-clean, background-processed cutout is also what makes VSG-01's
     Starter Pack format buildable here specifically (never from a plain
-    upload — see vsg01_orchestrator.py's own note on why)."""
+    upload — see vsg01_orchestrator.py's own note on why). `platform` — see
+    write_ad_copy's docstring."""
     brand_context = await get_brand_context(user_id, db, brand_id) if user_id else {}
     content_for_image = f"{business_name or category} — {description or category}"
     image_url = await generate_ad_image(
@@ -1155,13 +1205,13 @@ async def creative_from_recomposite(
         copy = await write_ad_copy_for_image(
             summary, business_name, category, goal, description, brand_context, city,
             service_area, audience_segment, who_its_for, geo_pockets=geo_pockets,
-            destination_type=destination_type,
+            destination_type=destination_type, platform=platform,
         )
     else:
         copy = await write_ad_copy(business_name, category, goal, description, brand_context, city,
                                    audience_segment=audience_segment, who_its_for=who_its_for,
                                    service_area=service_area, geo_pockets=geo_pockets,
-                                   destination_type=destination_type)
+                                   destination_type=destination_type, platform=platform)
     ad = assemble_creative(copy, final_image, source=CreativeSource.RECOMPOSITE,
                            service_area=service_area, destination_type=destination_type,
                            destination_cta=destination_cta)
