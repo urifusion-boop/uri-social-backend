@@ -21,6 +21,8 @@ from app.agents.jane_ads.google_ads_connection import (
     AdsConnectionRequired,
     ConnectionState,
     GoogleAdsConnectionError,
+    MccNotEligibleToCreateAccounts,
+    _is_ineligible_mcc_error,
     create_client_account_under_mcc,
     exchange_code_for_tokens,
     get_admin_valid_access_token,
@@ -421,3 +423,82 @@ def test_create_client_account_under_mcc_auto_links():
     brand_doc = next(d for d in db["social_connections"].docs if d["platform"] == "google_ads")
     assert brand_doc["manager_link_status"] == "active"
     assert brand_doc["created_account_by_uri"] is True
+
+
+# ── MCC-not-eligible-to-create detection — live-confirmed Google restriction:
+# a brand-new Manager Account can't mint fresh client accounts until it has at
+# least one linked account with real spend + clean policy history. ────────────
+
+def test_is_ineligible_mcc_error_matches_the_live_confirmed_message():
+    raw = (
+        '{"message": "This manager account can\'t create new accounts. You\'ll need to '
+        'link a Google Ads account that has spent more than $1,000 and has a history of '
+        'policy compliance."}'
+    )
+    assert _is_ineligible_mcc_error(raw) is True
+
+
+def test_is_ineligible_mcc_error_matches_the_enum_even_without_the_phrase():
+    # Belt-and-suspenders: still catches it if Google's wording changes but the
+    # machine-readable enum is present, or vice versa.
+    raw = '{"errorCode": {"customerError": "CREATION_DENIED_INELIGIBLE_MCC"}}'
+    assert _is_ineligible_mcc_error(raw) is True
+
+
+def test_is_ineligible_mcc_error_does_not_false_positive_on_unrelated_errors():
+    raw = '{"message": "The customer_id you supplied does not exist."}'
+    assert _is_ineligible_mcc_error(raw) is False
+
+
+def test_create_client_account_under_mcc_raises_typed_exception_on_ineligible_mcc():
+    db = FakeDb()
+    db["social_connections"].docs.append(_conn_doc(manager_link_status="none", customer_id=""))
+    db["social_connections"].docs.append(_admin_conn_doc())
+    with patch("httpx.AsyncClient") as MockClient:
+        MockClient.return_value.__aenter__.return_value = _mock_client([{
+            "error": {
+                "message": (
+                    "This manager account can't create new accounts. You'll need to link a "
+                    "Google Ads account that has spent more than $1,000 and has a history of "
+                    "policy compliance."
+                ),
+            },
+        }])
+        try:
+            _run(create_client_account_under_mcc(db, "u1", "b1", "New Brand Ads"))
+            assert False, "expected MccNotEligibleToCreateAccounts"
+        except MccNotEligibleToCreateAccounts:
+            pass
+        except GoogleAdsConnectionError:
+            raise AssertionError(
+                "raised the generic GoogleAdsConnectionError instead of the typed "
+                "MccNotEligibleToCreateAccounts subclass — the router can't tell the two "
+                "apart, so the frontend would show a dead-end error instead of the guided "
+                "sign-up-then-link flow"
+            )
+
+    # Nothing should have been written to the brand's connection doc — a
+    # failed creation attempt must not look like it succeeded.
+    brand_doc = next(d for d in db["social_connections"].docs if d["platform"] == "google_ads")
+    assert brand_doc.get("manager_link_status") == "none"
+    assert "created_account_by_uri" not in brand_doc
+
+
+def test_create_client_account_under_mcc_other_errors_still_raise_the_generic_type():
+    """Regression guard: only the ineligible-MCC signature should route through the
+    new typed exception — every other real Google error must still surface as the
+    plain GoogleAdsConnectionError, unchanged."""
+    db = FakeDb()
+    db["social_connections"].docs.append(_conn_doc(manager_link_status="none", customer_id=""))
+    db["social_connections"].docs.append(_admin_conn_doc())
+    with patch("httpx.AsyncClient") as MockClient:
+        MockClient.return_value.__aenter__.return_value = _mock_client(
+            [{"error": {"message": "The descriptive_name is required."}}]
+        )
+        try:
+            _run(create_client_account_under_mcc(db, "u1", "b1", "New Brand Ads"))
+            assert False, "expected GoogleAdsConnectionError"
+        except MccNotEligibleToCreateAccounts:
+            raise AssertionError("an unrelated error was misclassified as the ineligible-MCC case")
+        except GoogleAdsConnectionError as e:
+            assert "descriptive_name is required" in str(e)
