@@ -31,6 +31,7 @@ from app.agents.jane_ads.google_ads_connection import (
     request_manager_link,
     resolve_connection_state,
     resolve_customer_id_for_launch,
+    set_mcc_creation_eligibility,
 )
 
 
@@ -482,6 +483,82 @@ def test_create_client_account_under_mcc_raises_typed_exception_on_ineligible_mc
     brand_doc = next(d for d in db["social_connections"].docs if d["platform"] == "google_ads")
     assert brand_doc.get("manager_link_status") == "none"
     assert "created_account_by_uri" not in brand_doc
+
+
+def test_create_client_account_under_mcc_persists_ineligible_flag_and_marks_newly_discovered():
+    db = FakeDb()
+    db["social_connections"].docs.append(_conn_doc(manager_link_status="none", customer_id=""))
+    db["social_connections"].docs.append(_admin_conn_doc())  # mcc_can_create_accounts not set yet
+    with patch("httpx.AsyncClient") as MockClient:
+        MockClient.return_value.__aenter__.return_value = _mock_client([{
+            "error": {"message": "This manager account can't create new accounts."},
+        }])
+        try:
+            _run(create_client_account_under_mcc(db, "u1", "b1", "New Brand Ads"))
+            assert False, "expected MccNotEligibleToCreateAccounts"
+        except MccNotEligibleToCreateAccounts as e:
+            assert e.newly_discovered is True  # unset -> False is a real change
+
+    admin_doc = next(d for d in db["social_connections"].docs if d["platform"] == "google_ads_admin")
+    assert admin_doc["mcc_can_create_accounts"] is False
+    assert admin_doc["mcc_eligibility_failure_reason"]
+
+
+def test_create_client_account_under_mcc_second_failure_is_not_newly_discovered():
+    """The whole point of persisting the flag: don't alert operators again for
+    every subsequent attempt that hits the exact same, already-known restriction."""
+    db = FakeDb()
+    db["social_connections"].docs.append(_conn_doc(manager_link_status="none", customer_id=""))
+    db["social_connections"].docs.append(_admin_conn_doc(mcc_can_create_accounts=False))
+    with patch("httpx.AsyncClient") as MockClient:
+        MockClient.return_value.__aenter__.return_value = _mock_client([{
+            "error": {"message": "This manager account can't create new accounts."},
+        }])
+        try:
+            _run(create_client_account_under_mcc(db, "u1", "b1", "New Brand Ads"))
+            assert False, "expected MccNotEligibleToCreateAccounts"
+        except MccNotEligibleToCreateAccounts as e:
+            assert e.newly_discovered is False
+
+
+def test_create_client_account_under_mcc_success_marks_eligible_true():
+    db = FakeDb()
+    db["social_connections"].docs.append(_conn_doc(manager_link_status="none", customer_id=""))
+    db["social_connections"].docs.append(_admin_conn_doc(mcc_can_create_accounts=False))
+    with patch("httpx.AsyncClient") as MockClient:
+        MockClient.return_value.__aenter__.return_value = _mock_client(
+            [{"resourceName": "customers/777888999"}]
+        )
+        _run(create_client_account_under_mcc(db, "u1", "b1", "New Brand Ads"))
+
+    admin_doc = next(d for d in db["social_connections"].docs if d["platform"] == "google_ads_admin")
+    assert admin_doc["mcc_can_create_accounts"] is True
+    assert admin_doc["mcc_eligibility_failure_reason"] == ""
+
+
+# ── set_mcc_creation_eligibility ─────────────────────────────────────────────
+
+def test_set_mcc_creation_eligibility_reports_changed_on_first_write():
+    db = FakeDb()
+    db["social_connections"].docs.append(_admin_conn_doc())
+    changed = _run(set_mcc_creation_eligibility(db, False, "some reason"))
+    assert changed is True
+
+
+def test_set_mcc_creation_eligibility_reports_unchanged_on_repeat_same_value():
+    db = FakeDb()
+    db["social_connections"].docs.append(_admin_conn_doc(mcc_can_create_accounts=False))
+    changed = _run(set_mcc_creation_eligibility(db, False, "same reason again"))
+    assert changed is False
+
+
+def test_set_mcc_creation_eligibility_clears_reason_on_eligible():
+    db = FakeDb()
+    db["social_connections"].docs.append(_admin_conn_doc(mcc_can_create_accounts=False))
+    _run(set_mcc_creation_eligibility(db, True))
+    admin_doc = db["social_connections"].docs[0]
+    assert admin_doc["mcc_can_create_accounts"] is True
+    assert admin_doc["mcc_eligibility_failure_reason"] == ""
 
 
 def test_create_client_account_under_mcc_other_errors_still_raise_the_generic_type():
