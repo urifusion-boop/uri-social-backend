@@ -873,7 +873,18 @@ Style it subtle but legible, approximately 30% the size of the headline.
 Position: bottom-centre or bottom-right within safe zone.
 Do NOT style it as a button or banner."""
 
-            final_prompt = f"""{style_instructions}
+            # The logo's position is the brand's own choice, never the model's to
+            # negotiate — without this, the meta-prompt above only reserves TEXT
+            # zones (step C/G), leaving it free to fill the logo's actual corner
+            # with headline text or decoration, which is what caused the
+            # generated content to collide with the logo instead of the logo's
+            # position being respected. Placed FIRST (highest prompt weight),
+            # same as the default (non-V2) generation path.
+            logo_space_note = ImageContentService.build_logo_space_note(brand_context)
+
+            final_prompt = f"""{logo_space_note}
+
+{style_instructions}
 
 {content_section}
 
