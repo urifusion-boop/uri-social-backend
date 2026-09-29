@@ -868,8 +868,8 @@ Return only the JSON. No preamble, no explanation."""
 
             # CTA instruction (same format as regular generation)
             cta_instruction = f"""=== CALL-TO-ACTION ===
-Display the following CTA text at the bottom of the image in small clean sans-serif text: "{cta}"
-Style it subtle but legible, approximately 30% the size of the headline.
+Display the following CTA text at the bottom of the image in clean sans-serif text: "{cta}"
+Clearly legible at a glance — approximately 45% the size of the headline, not a tiny caption.
 Position: bottom-centre or bottom-right within safe zone.
 Do NOT style it as a button or banner."""
 
