@@ -1,8 +1,8 @@
 """
 Content Calendar V2 — deterministic guardrail checks.
 
-Covers two bugs found by live end-to-end verification of a real 30-day
-generation run:
+Covers bugs found by live end-to-end verification of real 30-day generation
+runs:
 
 1. A brand's words_to_avoid was only ever a prompt instruction — the model
    used a banned word ("guaranteed") anyway under pressure to satisfy other
@@ -13,10 +13,19 @@ generation run:
 2. A series name template with an unresolved placeholder ("The [Industry]
    Myth") shipped verbatim in a real generated plan, because nothing ever
    substituted the bracket before it reached the model or the final item.
+3. The generic-AI-headline check (ANTI_BORING_PHRASES) only matched fixed
+   bigrams ("unlock the", "discover how"...) and missed ordinary conjugations
+   of the same opener verb — a real plan shipped "Unlocking the Production
+   Process" and "Discover Our Pricing Edge" untouched.
+4. series_name was carried straight from the model's candidate output with no
+   check that it actually recurred — a real plan carried 6 distinct series
+   names, each used exactly once, which the prompt itself says not to do.
 """
 from app.agents.content_calendar_v2.services.content_calendar_v2_service import (
+    _anti_boring_check,
     _collect_item_text,
     _find_banned_words,
+    _recurring_series_names,
     _resolve_series_name,
     _validate_item_v2,
 )
@@ -136,6 +145,70 @@ def test_validate_item_v2_without_words_to_avoid_is_a_no_op():
     idea = _item()
     issues = _validate_item_v2(idea, is_carousel=False, words_to_avoid=None)
     assert issues == []
+
+
+# ── _anti_boring_check — generic-AI-headline detection ──────────────────────
+
+def test_anti_boring_check_catches_the_live_bug_unlocking():
+    items = [_item(title="Unlocking the Production Process", hook="See how it all comes together.")]
+    flagged = _anti_boring_check(items, brand_name="Docerity")
+    assert 0 in flagged and "unlocking" in flagged[0].lower()
+
+
+def test_anti_boring_check_catches_the_live_bug_discover_our():
+    items = [_item(title="Why Pay More? Discover Our Pricing Edge")]
+    flagged = _anti_boring_check(items, brand_name="Docerity")
+    assert 0 in flagged
+
+
+def test_anti_boring_check_catches_other_conjugations_of_the_same_verbs():
+    items = [
+        _item(title="Discovering What Makes Us Different"),
+        _item(title="Master the Art of Predictable Power"),
+        _item(title="Revolutionizing How SMEs Handle Power"),
+    ]
+    flagged = _anti_boring_check(items, brand_name="Docerity")
+    assert set(flagged.keys()) == {0, 1, 2}
+
+
+def test_anti_boring_check_does_not_false_positive_on_the_word_mid_sentence():
+    # The whole reason these stayed fixed phrases / opener-only instead of a
+    # bare-word-anywhere check: "discover" and "master" are ordinary English
+    # words that show up in completely normal, non-generic sentences.
+    items = [
+        _item(title="Your skin isn't necessarily dry. Your routine may just be fighting itself.",
+              hook="Customers discover this the hard way — usually after switching products."),
+        _item(title="What the electrician masters in year one"),
+    ]
+    flagged = _anti_boring_check(items, brand_name="Docerity")
+    assert flagged == {}
+
+
+def test_anti_boring_check_still_catches_the_original_fixed_phrase_bugs():
+    items = [
+        _item(title="Fine.", exact_copy={"headline": "Fine.", "caption": "We are excited to announce our new plan.", "hashtags": []}),
+        _item(title="At Docerity, we believe in better tech.", hook=""),
+    ]
+    flagged = _anti_boring_check(items, brand_name="Docerity")
+    assert set(flagged.keys()) == {0, 1}
+
+
+# ── _recurring_series_names ──────────────────────────────────────────────────
+
+def test_recurring_series_names_keeps_only_names_used_at_least_twice():
+    # The exact shape of the live bug: 6 distinct series names, each used once.
+    names = ["Ask Docerity", "Founder Truths", "Before You Buy", "Customer Question of the Week", "The Tech & SaaS Myth", "Would You Choose This?"]
+    assert _recurring_series_names(names) == set()
+
+
+def test_recurring_series_names_keeps_names_that_genuinely_recur():
+    names = ["Ask Docerity", "Founder Truths", "Ask Docerity", None, "Ask Docerity", "Founder Truths"]
+    assert _recurring_series_names(names) == {"Ask Docerity", "Founder Truths"}
+
+
+def test_recurring_series_names_ignores_none_and_empty():
+    assert _recurring_series_names([None, "", None]) == set()
+    assert _recurring_series_names([]) == set()
 
 
 if __name__ == "__main__":

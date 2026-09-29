@@ -432,6 +432,27 @@ ANTI_BORING_PHRASES: List[str] = [
     "revolutionize your",
 ]
 
+# The fixed bigrams above catch the addendum's own worked phrasing ("unlock the",
+# "discover how"...) but miss ordinary conjugations of the same opener verb —
+# confirmed live: "Unlocking the Production Process" and "Discover Our Pricing
+# Edge" both slipped through untouched, since neither is an exact match for
+# "unlock the/your" or "discover the/how". These verbs are risky specifically as
+# a HEADLINE OPENER — the addendum's own "Unlock...", "Discover..." framing, each
+# followed by an ellipsis meaning "anything after this" — not as a bare word
+# appearing anywhere in running text (a "discover" mid-sentence is ordinary
+# English and must not flag; that's exactly why the entries above stayed as
+# fixed phrases instead of bare words). So this list is checked only against
+# where a TITLE/HEADLINE starts, regardless of the verb's conjugation — narrower
+# than a same-word-anywhere check, broader than the fixed bigrams above.
+# Stems, not full words: English drops a trailing silent "e" before "-ing"
+# ("elevate" -> "elevating", not "elevateing"), so a stem ending in the bare
+# consonant before that "e" still matches every conjugation via the \w* that
+# follows it at the call site (elevat + e/ed/es/ing; revolutioni + s/z + e/ed/ing).
+ANTI_BORING_OPENER_STEMS: List[str] = [
+    "unlock", "discover", "master", "boost", "elevat",
+    "supercharg", "revolutioni[sz]", "transform",
+]
+
 
 def get_creative_framework(industry: str) -> Dict[str, Any]:
     """The one exported function — Step 2 of the pipeline (PRD §35). Returns

@@ -939,12 +939,16 @@ Do NOT style it as a button or banner."""
                         base64_image = base64.b64encode(img_response.content).decode('utf-8')
                         print(f"[V2] Downloaded image from URL and converted to base64")
 
-                # Overlay logo using ImageContentService (expects base64 string)
-                logo_result_b64 = ImageContentService._overlay_logo(
+                # Overlay logo using ImageContentService (expects base64 string).
+                # overlay_logo_smart ranks candidate corners by actual pixel
+                # busyness first, rather than blindly trusting logo_position —
+                # the art-directed prompt above has no way to guarantee the
+                # model won't place the headline in that exact corner.
+                logo_result_b64 = await ImageContentService.overlay_logo_smart(
                     b64=base64_image,
                     logo_url=logo_url,
-                    position=logo_position,
                     logo_size=logo_size,
+                    preferred_position=logo_position,
                 )
 
                 # Upload final image with logo to Cloudinary

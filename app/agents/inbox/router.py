@@ -11,15 +11,22 @@ from typing import Optional
 
 from bson import ObjectId
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, Response
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from app.core.config import settings
 from app.dependencies import get_active_brand_context, get_db_dependency
 
 from .entities import CHANNEL_ACCOUNTS, CONVERSATIONS, IDENTITIES, MESSAGES
+from .channels import (
+    SOCIAL_CONNECTIONS, _workspace_of, account_for_event, fetch_contact_name,
+    link_workspace_channels,
+)
+from .meta_transport import meta_transport
+from .send import SendRefused, send_reply
 from .ingest import (
-    ensure_indexes, parse_meta_event, record_event, store_raw, verify_signature,
+    describe_unparsed, ensure_indexes, parse_meta_event, record_event, store_raw,
+    verify_signature,
 )
 
 router = APIRouter(prefix="/inbox", tags=["Unified Inbox"])
@@ -67,21 +74,44 @@ async def receive_meta_webhook(
         return {"status": "ignored", "reason": "unparseable body"}
 
     events = parse_meta_event(payload)
+    # Logged on EVERY delivery, including ones that parse to nothing: silence in
+    # the log then means Meta sent nothing, rather than us dropping it quietly.
+    print(f"[Inbox] webhook received: object={payload.get('object')!r} "
+          f"entries={len(payload.get('entry') or [])} parsed={len(events)}", flush=True)
+    # A delivery that parses to nothing is the hardest case to diagnose from the
+    # outside — it looks identical to Meta never sending it. Say what was in it.
+    if not events:
+        print(f"[Inbox] nothing to store from that delivery: "
+              f"{describe_unparsed(payload)}", flush=True)
     stored = 0
     for ev in events:
-        account = await db[CHANNEL_ACCOUNTS].find_one(
-            {"external_account_id": ev.get("external_account_id")})
+        account = await account_for_event(db, ev.get("external_account_id"))
         if not account:
             # An event for an account nobody connected. Dropping it is right: there is
             # no workspace to file it under, and guessing one would put a stranger's
             # message in somebody's inbox.
             print(f"[Inbox] event for unconnected account {ev.get('external_account_id')}", flush=True)
             continue
+        # The DM payload has no name, only a scoped id. Fetched once, when the
+        # identity is new, so a busy thread is not a request per message.
+        if not ev.get("display_name") and ev.get("external_user_id"):
+            known = await db[IDENTITIES].find_one(
+                {"workspace_id": account["workspace_id"],
+                 "external_user_id": ev["external_user_id"]},
+                {"display_name": 1},
+            )
+            if known and known.get("display_name"):
+                ev["display_name"] = known["display_name"]
+            else:
+                ev["display_name"] = await fetch_contact_name(
+                    ev["external_user_id"], account.get("access_token", ""))
+
         msg_id = await record_event(
             db, account["workspace_id"], str(account["_id"]),
             account.get("platform") or "facebook", ev)
         if msg_id:
             stored += 1
+    print(f"[Inbox] webhook stored {stored}/{len(events)} event(s)", flush=True)
     return {"status": "ok", "events": len(events), "stored": stored}
 
 
@@ -167,3 +197,128 @@ async def create_indexes(
     """The uniqueness that makes Meta's redelivery harmless. Safe to re-run."""
     await ensure_indexes(db)
     return {"status": "ok"}
+
+
+@router.post("/conversations/{conversation_id}/reply")
+async def reply_to_conversation(
+    conversation_id: str,
+    text: str = Body(..., embed=True),
+    idempotency_key: str = Body("", embed=True),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Send an agent's reply.
+
+    A refusal (closed window, unknown thread) is a 4xx with a reason the composer can
+    show. A provider failure is NOT an error here — it is a recorded delivery state,
+    because the agent needs to see what happened to their message rather than a stack
+    trace.
+    """
+    workspace_id = brand_ctx.get("brand_id")
+    conv = await db[CONVERSATIONS].find_one(
+        {"_id": ObjectId(conversation_id), "workspace_id": workspace_id}
+    ) if ObjectId.is_valid(conversation_id) else None
+    account = await db[CHANNEL_ACCOUNTS].find_one(
+        {"_id": ObjectId(conv["channel_account_id"])}
+    ) if conv and ObjectId.is_valid(conv.get("channel_account_id", "")) else None
+
+    try:
+        record = await send_reply(
+            db, workspace_id, conversation_id, text,
+            idempotency_key=idempotency_key,
+            actor_id=brand_ctx.get("user_id", ""),
+            transport=meta_transport,
+            account=account or {},
+        )
+    except SendRefused as e:
+        raise HTTPException(status_code=409 if e.reason == "window_closed" else 400,
+                            detail=e.detail)
+
+    return {
+        "delivery": record.get("delivery"),
+        "provider_message_id": record.get("provider_message_id", ""),
+        "failure_reason": record.get("failure_reason", ""),
+    }
+
+
+@router.post("/channels/link")
+async def link_channels(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Register the workspace's connected Pages and Instagram accounts with the inbox.
+
+    Reuses the tokens the user already granted when they connected for publishing —
+    prompting for OAuth again would ask them to grant what they have already granted.
+    Safe to re-run; a refreshed token updates the existing row rather than adding one.
+    """
+    workspace_id = brand_ctx.get("brand_id")
+    result = await link_workspace_channels(
+        db, brand_ctx.get("user_id", ""), workspace_id)
+    linked = result["linked"]
+
+    considered = await db[SOCIAL_CONNECTIONS].count_documents(
+        {"connection_status": "active", "platform": {"$in": ["instagram", "facebook"]}})
+
+    # When nothing links, say which workspaces THIS user's own connections resolve
+    # to. Ids only — no tokens. Without it a zero is indistinguishable from
+    # "connected under a brand you are not currently acting as".
+    mine: list[dict] = []
+    if not linked:
+        rows = await db[SOCIAL_CONNECTIONS].find(
+            {"user_id": brand_ctx.get("user_id", "")},
+            {"platform": 1, "brand_id": 1, "connection_status": 1,
+             "page_id": 1, "ig_user_id": 1, "page_access_token": 1},
+        ).to_list(50)
+        for r in rows:
+            mine.append({
+                "platform": r.get("platform"),
+                "status": r.get("connection_status"),
+                "workspace": _workspace_of(r),
+                "has_page_id": bool(r.get("page_id")),
+                "has_ig_user_id": bool(r.get("ig_user_id")),
+                "has_token": bool(r.get("page_access_token")),
+            })
+
+    return {
+        "linked": len(linked),
+        "accounts": linked,
+        # So that a zero is diagnosable: no connections at all is a different
+        # problem from connections belonging to another workspace.
+        "considered": considered,
+        "workspace_id": workspace_id,
+        "my_connections": mine,
+        "page_subscriptions": result["subscriptions"],
+    }
+
+
+@router.get("/channels")
+async def list_channels(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """The accounts this workspace has actually connected to the inbox.
+
+    Reports only what is recorded: a channel nobody connected is absent rather
+    than shown as connected, and nothing about capability is inferred — a token
+    existing is not proof that Meta will accept a reply through it.
+    """
+    workspace_id = brand_ctx.get("brand_id")
+    rows = await db[CHANNEL_ACCOUNTS].find({"workspace_id": workspace_id}).to_list(50)
+
+    out = []
+    for r in rows:
+        last = await db[MESSAGES].find({
+            "workspace_id": workspace_id,
+        }).sort("received_at", -1).limit(1).to_list(1)
+        out.append({
+            "platform": r.get("platform"),
+            "name": r.get("name") or "",
+            "external_account_id": r.get("external_account_id"),
+            "page_id": r.get("page_id", ""),
+            "connected_at": r.get("connected_at"),
+            "updated_at": r.get("updated_at"),
+            "has_token": bool(r.get("access_token")),
+            "last_event_at": (last[0].get("received_at") if last else None),
+        })
+    return {"channels": out}

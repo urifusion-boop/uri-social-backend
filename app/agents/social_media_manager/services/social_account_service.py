@@ -17,6 +17,37 @@ from .outstand_service import OutstandService, PLATFORM_TO_NETWORK, SUPPORTED_PL
 NETWORKS_REQUIRING_ACCOUNT_SELECTION = {"tiktok"}
 
 
+async def _release_inbox_claim(
+    db: AsyncIOMotorDatabase,
+    connection: Optional[Dict[str, Any]],
+    user_id: str,
+    brand_id: Optional[str],
+) -> None:
+    """Drop the inbox channel rows this connection provided.
+
+    An inbox channel row is a claim on a provider account, and routing refuses
+    an account two workspaces claim. Leaving the row behind after a disconnect
+    means this workspace keeps claiming a Page it no longer connects, which
+    silently breaks the inbox for whoever connects it next. Best-effort: a
+    disconnect must still succeed for the customer if this fails.
+    """
+    if not connection:
+        return
+
+    from app.agents.inbox.channels import release_channels
+    from app.models.brand_account import BrandAccount
+
+    workspace_id = brand_id or BrandAccount.personal_brand_id(user_id)
+    for external_id in (connection.get("page_id"), connection.get("ig_user_id")):
+        if not external_id:
+            continue
+        try:
+            await release_channels(db, workspace_id, external_account_id=str(external_id))
+        except Exception as e:
+            print(f"[Disconnect] could not release inbox claim on {external_id}: {e}",
+                  flush=True)
+
+
 class SocialAccountService:
 
     # -------------------------------------------------------------------------
@@ -325,7 +356,13 @@ class SocialAccountService:
                     "account_name": acc.get("nickname"),
                     "profile_picture_url": acc.get("profile_picture_url"),
                     "account_type": acc.get("accountType"),
-                    "is_active": bool(acc.get("isActive")),
+                    # Preserve None (Outstand didn't return this field for this
+                    # account/network) distinctly from an explicit False — collapsing
+                    # both to False here would make the frontend flag accounts as
+                    # "needs reconnecting" just because Outstand's response happened
+                    # not to include the field, not because anything is actually wrong.
+                    # Only an explicit isActive: false is a real signal worth surfacing.
+                    "is_active": acc.get("isActive"),
                     "connected_at": acc.get("createdAt"),
                 })
         except Exception as e:
@@ -436,6 +473,12 @@ class SocialAccountService:
                 flush=True,
             )
 
+        # Release the inbox's claim on this account too. A channel row outlives
+        # the connection otherwise, and a workspace that still claims a Page it
+        # no longer connects makes the next workspace to connect it a second
+        # claimant — at which point webhooks for that Page are dropped, for both.
+        await _release_inbox_claim(db, local, user_id, brand_id)
+
         # Best-effort Outstand delete, with a couple of retries — a transient
         # timeout/500 on Outstand's side is common and often just needs a
         # second attempt. Every failure mode (404/500/timeout/auth) still
@@ -543,7 +586,11 @@ class SocialAccountService:
             direct_filter: Dict[str, Any] = {**brand_scope, "platform": platform}
             if platform == "instagram" and acc.get("ig_user_id"):
                 direct_filter["ig_user_id"] = acc["ig_user_id"]
+            # Read before deleting: the connection carries the page/Instagram ids
+            # the inbox claims are keyed on, and they are gone after the delete.
+            doomed = await db["social_connections"].find_one(direct_filter)
             await db["social_connections"].delete_one(direct_filter)
+            await _release_inbox_claim(db, doomed, user_id, brand_id)
             results.append({"connected_via": acc.get("connected_via"), "status": "disconnected"})
 
         return UriResponse.get_single_data_response("disconnect_all", {

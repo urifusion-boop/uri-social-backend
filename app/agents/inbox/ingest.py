@@ -25,7 +25,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from .entities import (
@@ -100,6 +100,33 @@ def _ts(value: Any) -> Optional[datetime]:
     return datetime.fromtimestamp(n, timezone.utc)
 
 
+def describe_unparsed(payload: dict) -> str:
+    """Why a delivery yielded no events, in one line, without the message text.
+
+    A webhook that parses to nothing is indistinguishable from one Meta never
+    sent, which is the difference between "our parser dropped it" and "the Page
+    is not subscribed" — hours of looking in the wrong place. Says what the
+    payload actually contained instead: the shapes below are the ones that
+    legitimately carry no new customer message, and `standby` means another app
+    is the primary receiver for that Page, so this app gets a copy it may not
+    reply to (Meta's handover protocol).
+    """
+    notes: list[str] = []
+    for entry in payload.get("entry") or []:
+        shapes = sorted(k for k in entry.keys() if k != "id" and k != "time")
+        for m in entry.get("messaging") or []:
+            kinds = sorted(k for k in m.keys() if k not in ("sender", "recipient", "timestamp"))
+            if (m.get("message") or {}).get("is_echo"):
+                kinds.append("is_echo")
+            notes.append(f"messaging[{','.join(kinds) or 'empty'}]")
+        for ch in entry.get("changes") or []:
+            notes.append(f"change[field={ch.get('field')!r},"
+                         f"item={(ch.get('value') or {}).get('item')!r}]")
+        if not notes:
+            notes.append(f"entry keys {shapes}")
+    return "; ".join(notes) or "no entries"
+
+
 def parse_meta_event(payload: dict) -> list[dict]:
     """Flatten a Meta webhook into normalised events.
 
@@ -139,19 +166,24 @@ def parse_meta_event(payload: dict) -> list[dict]:
             if not comment_id:
                 continue
             frm = v.get("from") or {}
+            # Instagram and Facebook disagree on shape: FB sends post_id and from.name,
+            # Instagram sends media as an OBJECT and from.username. Reading them the
+            # same way yields "{'id': ...}" as a thread id and a blank commenter name.
+            media = v.get("media")
+            media_id = media.get("id") if isinstance(media, dict) else media
             events.append({
                 "type": "comment",
                 "external_account_id": account_id,
                 "external_user_id": str(frm.get("id") or ""),
-                "display_name": frm.get("name") or "",
+                "display_name": frm.get("name") or frm.get("username") or "",
                 # The post is the thread: every comment on it belongs together.
-                "external_thread_id": str(v.get("post_id") or v.get("media") or comment_id),
+                "external_thread_id": str(v.get("post_id") or media_id or comment_id),
                 "provider_message_id": comment_id,
                 "parent_id": str((v.get("parent_id") or "")),
                 "text": v.get("message") or v.get("text") or "",
                 "provider_timestamp": _ts(v.get("created_time")),
                 # Provider-supplied only. Never derived from the comment's wording.
-                "source_post_id": str(v.get("post_id") or ""),
+                "source_post_id": str(v.get("post_id") or media_id or ""),
                 "source_ad_id": str(v.get("ad_id") or ""),
             })
     return events
@@ -194,12 +226,22 @@ async def _upsert_conversation(db, workspace_id: str, channel_account_id: str,
             on_insert[field] = ev[field]
             on_insert["attribution_evidence"] = "provider_webhook"
 
+    set_fields: dict[str, Any] = {
+        "last_activity_at": ev.get("provider_timestamp") or now(),
+    }
+    # An inbound DM reopens the provider's 24-hour free-form reply window. Recorded
+    # from the message's OWN timestamp, not arrival: a webhook retried an hour late
+    # would otherwise buy an hour of window that does not exist.
+    if kind == Kind.DM.value:
+        base = ev.get("provider_timestamp") or now()
+        set_fields["reply_window_expires_at"] = base + timedelta(hours=24)
+
     doc = await db[CONVERSATIONS].find_one_and_update(
         key,
         {"$setOnInsert": on_insert,
          # New activity on a resolved thread REOPENS it (PRD §4.2) — a customer writing
          # again is unambiguously work, whatever an agent concluded earlier.
-         "$set": {"last_activity_at": ev.get("provider_timestamp") or now()}},
+         "$set": set_fields},
         upsert=True, return_document=True,
     )
     if doc.get("status") == "resolved":

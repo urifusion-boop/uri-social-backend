@@ -12,7 +12,8 @@ import json
 
 import pytest
 
-from app.agents.inbox.ingest import parse_meta_event, record_event, verify_signature
+from app.agents.inbox.ingest import (describe_unparsed, parse_meta_event, record_event,
+                                     verify_signature)
 
 SECRET = "app-secret"
 
@@ -170,16 +171,40 @@ class FakeCollection:
         self.docs.append(doc)
         return copy.deepcopy(doc)
 
-    async def update_one(self, q, update):
+    async def update_one(self, q, update, upsert=False):
+        self._reject_empty_operators(update)
         for d in self.docs:
             if self._matches(d, q):
                 d.update(update.get("$set", {}))
                 return
+        if upsert:
+            self.docs.append({"_id": ObjectId(), **q,
+                              **update.get("$setOnInsert", {}),
+                              **update.get("$set", {})})
+
+    async def update_many(self, q, update):
+        self._reject_empty_operators(update)
+        for d in self.docs:
+            if self._matches(d, q):
+                d.update(update.get("$set", {}))
 
     async def insert_one(self, doc):
         doc = {"_id": ObjectId(), **doc}
         self.docs.append(doc)
         return type("R", (), {"inserted_id": doc["_id"]})()
+
+    async def delete_one(self, q):
+        for i, d in enumerate(self.docs):
+            if self._matches(d, q):
+                del self.docs[i]
+                return type("R", (), {"deleted_count": 1})()
+        return type("R", (), {"deleted_count": 0})()
+
+    async def delete_many(self, q):
+        keep = [d for d in self.docs if not self._matches(d, q)]
+        removed = len(self.docs) - len(keep)
+        self.docs[:] = keep
+        return type("R", (), {"deleted_count": removed})()
 
 
 class FakeDB:
@@ -329,3 +354,86 @@ def test_a_name_is_recorded_when_the_provider_sends_one():
     db = FakeDB()
     _run(record_event(db, WS, ACCT, "facebook", _dm()))
     assert db[IDENTITIES].docs[0]["display_name"] == "Ada"
+
+
+def test_an_inbound_dm_opens_a_24_hour_reply_window():
+    """Meta allows a free-form reply for 24 hours after the customer writes. The
+    composer refuses without this, so ingestion has to record it."""
+    from datetime import timedelta
+    db = FakeDB()
+    _run(record_event(db, WS, ACCT, "instagram", _dm()))
+    assert db[CONVERSATIONS].docs[0]["reply_window_expires_at"] == now_dt() + timedelta(hours=24)
+
+
+def test_the_window_is_measured_from_the_message_not_its_arrival():
+    """A webhook retried an hour late would otherwise buy an hour of window that does
+    not exist, and the reply would be rejected in front of the customer."""
+    from datetime import timedelta
+    db = FakeDB()
+    sent_at = now_dt() - timedelta(hours=3)
+    _run(record_event(db, WS, ACCT, "instagram", _dm(ts=sent_at)))
+    assert db[CONVERSATIONS].docs[0]["reply_window_expires_at"] == sent_at + timedelta(hours=24)
+
+
+def test_a_comment_thread_gets_no_reply_window():
+    db = FakeDB()
+    ev = _dm(); ev["type"] = "comment"; ev["external_thread_id"] = "post_1"
+    _run(record_event(db, WS, ACCT, "facebook", ev))
+    assert "reply_window_expires_at" not in db[CONVERSATIONS].docs[0]
+
+
+def test_an_instagram_comment_uses_the_media_id_as_its_thread():
+    """Instagram sends `media` as an object, not a string. Stringifying it whole gives
+    a thread id of "{'id': ...}" and every comment on that post lands in its own
+    thread."""
+    payload = {"entry": [{"id": "IG1", "changes": [{"field": "comments", "value": {
+        "id": "c_1", "media": {"id": "media_9", "media_product_type": "FEED"},
+        "from": {"id": "U2", "username": "ada_ng"}, "text": "is this still available?"}}]}]}
+    ev = parse_meta_event(payload)[0]
+    assert ev["external_thread_id"] == "media_9"
+    assert ev["source_post_id"] == "media_9"
+
+
+def test_an_instagram_commenter_gets_their_username():
+    """Instagram sends from.username where Facebook sends from.name."""
+    payload = {"entry": [{"id": "IG1", "changes": [{"field": "comments", "value": {
+        "id": "c_2", "media": {"id": "m"}, "from": {"id": "U3", "username": "ada_ng"},
+        "text": "hi"}}]}]}
+    assert parse_meta_event(payload)[0]["display_name"] == "ada_ng"
+
+
+def test_two_instagram_comments_on_one_post_share_a_thread():
+    db = FakeDB()
+    for n in (1, 2):
+        ev = parse_meta_event({"entry": [{"id": "IG1", "changes": [{"field": "comments",
+            "value": {"id": f"c_{n}", "media": {"id": "media_9"},
+                      "from": {"id": "U2", "username": "ada"}, "text": "x"}}]}]})[0]
+        _run(record_event(db, WS, ACCT, "instagram", ev))
+    assert len(db[CONVERSATIONS].docs) == 1
+
+
+# ── Why a delivery parsed to nothing ──────────────────────────────────────────
+# Indistinguishable from "Meta never sent it" without this, which is the
+# difference between a parser bug and an unsubscribed Page.
+
+def test_an_echo_is_named_as_an_echo():
+    payload = {"object": "page", "entry": [{"id": "PAGE7", "messaging": [
+        {"sender": {"id": "PAGE7"}, "message": {"mid": "m1", "text": "hi", "is_echo": True}}]}]}
+    assert parse_meta_event(payload) == []
+    assert "is_echo" in describe_unparsed(payload)
+
+
+def test_a_read_receipt_is_named():
+    payload = {"object": "page", "entry": [{"id": "PAGE7", "messaging": [
+        {"sender": {"id": "U1"}, "read": {"watermark": 1}}]}]}
+    assert parse_meta_event(payload) == []
+    assert "read" in describe_unparsed(payload)
+
+
+def test_a_standby_delivery_names_the_shape():
+    """Another app is the primary receiver for the Page — the message arrives
+    under standby, not messaging, and this app may not reply to it."""
+    payload = {"object": "page", "entry": [{"id": "PAGE7", "standby": [
+        {"sender": {"id": "U1"}, "message": {"mid": "m1", "text": "hi"}}]}]}
+    assert parse_meta_event(payload) == []
+    assert "standby" in describe_unparsed(payload)
