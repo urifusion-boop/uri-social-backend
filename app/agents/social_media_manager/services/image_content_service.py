@@ -989,9 +989,10 @@ Follow these rules precisely for every image. No exceptions.
 1. BRAND NAME: {brand_name_directive}
 
 2. CALL-TO-ACTION: Display the following CTA text at the bottom of the image
-   in small clean sans-serif text: "{cta_text}". Style it subtle but legible,
-   approximately 30% the size of the headline. Position: bottom-centre or
-   bottom-right within safe zone. Do NOT style it as a button or banner.
+   in clean sans-serif text: "{cta_text}". Clearly legible at a glance —
+   approximately 45% the size of the headline, not a tiny caption. Position:
+   bottom-centre or bottom-right within safe zone. Do NOT style it as a
+   button or banner.
 
 3. FONTS: Maximum 2 font styles in the entire image. One bold/heavy weight
    for headlines. One regular weight for body and CTA. Same family or
@@ -1424,7 +1425,7 @@ Use the brand's colours where relevant: {color_str or 'a palette that suits the 
 Place the following text in {text_zone_desc}, in the negative space, never overlapping
 the reserved product zone:
 Headline based on: {seed_content.strip()[:80]}
-CTA text (small, clean sans-serif, subtle): "{cta_text}"
+CTA text (clean sans-serif, clearly legible — approximately 45% the size of the headline, not a tiny caption): "{cta_text}"
 {logo_space_note}
 
 Style: atmospheric, professional social-media graphic, one clear light source,
