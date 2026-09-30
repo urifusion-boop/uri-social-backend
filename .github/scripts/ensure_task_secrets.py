@@ -42,9 +42,15 @@ def ensure(task_definition: dict, container_name: str, required: dict) -> list[s
         raise SystemExit(f"container {container_name!r} not found in the task definition")
 
     secrets = container.setdefault("secrets", [])
+    environment = container.setdefault("environment", [])
     present = {s.get("name") for s in secrets}
     added = []
     for name, arn in required.items():
+        # A name can't live in both `environment` and `secrets` on the same
+        # container — ECS's RegisterTaskDefinition rejects that outright. If an
+        # earlier manual step left this as a plaintext env var, drop it here so
+        # the SSM-backed secret is the only source of truth going forward.
+        environment[:] = [e for e in environment if e.get("name") != name]
         if name not in present:
             secrets.append({"name": name, "valueFrom": arn})
             added.append(name)
