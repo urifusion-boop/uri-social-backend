@@ -1312,6 +1312,8 @@ OVERALL:
                 # Composite brand logo onto generated image for all models.
                 logo_url = (brand_context or {}).get('logo_url')
                 print(f"🖼️  LOGO CHECK: logo_url={repr(logo_url)}, has_brand_context={brand_context is not None}")
+                background_image_data_url = None
+                logo_placement = None
                 if logo_url:
                     import re as _re_logo
                     logo_position = (brand_context or {}).get('logo_position', 'bottom_right')
@@ -1320,17 +1322,25 @@ OVERALL:
                     data_url = image_response['url']
                     _m = _re_logo.match(r"data:[^;]+;base64,(.+)", data_url, _re_logo.DOTALL)
                     if _m:
-                        loop = asyncio.get_running_loop()
-                        b64_final = await loop.run_in_executor(
-                            None,
-                            lambda: ImageContentService._overlay_logo(_m.group(1), logo_url, logo_position, logo_size)
+                        # Captured BEFORE compositing — this is the logo-free
+                        # background a later manual reposition/resize needs to
+                        # re-paste the logo onto from scratch, instead of
+                        # re-running AI generation just to move a badge.
+                        background_image_data_url = data_url
+                        b64_final, chosen_position, geometry = await ImageContentService.overlay_logo_smart(
+                            _m.group(1), logo_url, logo_size, preferred_position=logo_position,
+                            return_placement=True,
                         )
                         image_response['url'] = f"data:image/webp;base64,{b64_final}"
+                        if geometry:
+                            logo_placement = {**geometry, "position": chosen_position, "logo_size": logo_size}
                 else:
                     print(f"⚠️  LOGO SKIPPED: logo_url is None or empty")
 
                 return UriResponse.get_single_data_response("platform_image", {
                     "image_url": image_response['url'],
+                    "background_image_url": background_image_data_url,
+                    "logo_placement": logo_placement,
                     "platform": platform,
                     "specs": specs,
                     "prompt_used": image_prompt,
@@ -2358,12 +2368,105 @@ rich tonal range, no pure black or pure white."""
         )
     
     @staticmethod
-    def _overlay_logo(b64: str, logo_url: str, position: str = "bottom_right", logo_size: str = "small") -> str:
+    async def composite_logo_at_position(
+        background_url: str, logo_url: str, x: int, y: int, width: int, height: int
+    ) -> str:
+        """Paste the brand logo onto an EXISTING (already-hosted) background
+        image at an exact, caller-specified pixel box — the deterministic
+        primitive behind manual logo reposition/resize (drag/resize in the
+        UI), as opposed to overlay_logo_smart's automatic corner-picking at
+        generation time. No AI call of any kind, so nothing else in the
+        image can change — only the logo moves. Returns a base64-encoded
+        WEBP string (no data: URL prefix), matching _overlay_logo's
+        contract. Raises on a real failure (a caller-facing action should
+        know reposition failed, not silently get the old image back)."""
+        import base64 as _b64
+        import io
+
+        import httpx
+        from PIL import Image
+
+        async with httpx.AsyncClient(timeout=20) as client:
+            bg_resp = await client.get(background_url)
+            bg_resp.raise_for_status()
+            logo_resp = await client.get(logo_url)
+            logo_resp.raise_for_status()
+
+        base_img = Image.open(io.BytesIO(bg_resp.content)).convert("RGBA")
+        logo_img = Image.open(io.BytesIO(logo_resp.content)).convert("RGBA")
+        logo_img = logo_img.resize((max(1, int(width)), max(1, int(height))), Image.LANCZOS)
+
+        base_img.paste(logo_img, (int(x), int(y)), logo_img)
+
+        buf = io.BytesIO()
+        base_img.convert("RGB").save(buf, format="WEBP", quality=97, method=6)
+        return _b64.b64encode(buf.getvalue()).decode()
+
+    @staticmethod
+    def _compute_logo_badge_geometry(
+        bw: int, bh: int, logo_native_size: tuple, logo_size_pct: float, position: str
+    ) -> tuple:
+        """
+        Shared badge-rectangle math for _overlay_logo and clear_logo_region —
+        factored out so a caller that needs to know WHERE the logo will land
+        (to clear that region first, for example) computes the exact same
+        rectangle _overlay_logo will paste into, rather than an approximation
+        that could drift out of sync with it.
+
+        Returns (bx, by, badge_w, badge_h, target_w, target_h).
+        """
+        lw0, lh0 = logo_native_size
+        target_w = max(40, int(bw * logo_size_pct))
+        scale = target_w / lw0
+        target_h = int(lh0 * scale)
+
+        # Badge padding (inner: 5px each side, outer edge: 3% of width for better spacing)
+        badge_pad_inner = max(5, int(bw * 0.005))
+        edge_pad = max(20, int(bw * 0.03))  # Increased from 1.5% to 3% to avoid text overlap
+
+        badge_w = target_w + badge_pad_inner * 2
+        badge_h = target_h + badge_pad_inner * 2
+
+        if position == "bottom_left":
+            bx = edge_pad
+            by = bh - badge_h - edge_pad
+        elif position == "top_left":
+            bx = edge_pad
+            by = edge_pad
+        elif position == "top_right":
+            bx = bw - badge_w - edge_pad
+            by = edge_pad
+        elif position == "top_center":
+            bx = (bw - badge_w) // 2
+            by = edge_pad
+        elif position == "bottom_center":
+            bx = (bw - badge_w) // 2
+            by = bh - badge_h - edge_pad
+        elif position == "center":
+            bx = (bw - badge_w) // 2
+            by = (bh - badge_h) // 2
+        else:  # bottom_right (default)
+            bx = bw - badge_w - edge_pad
+            by = bh - badge_h - edge_pad
+
+        return bx, by, badge_w, badge_h, target_w, target_h
+
+    @staticmethod
+    def _overlay_logo(
+        b64: str, logo_url: str, position: str = "bottom_right", logo_size: str = "small",
+        return_geometry: bool = False,
+    ):
         """
         Download the brand logo and composite it onto the generated image using Pillow.
         Logo is resized based on logo_size preference and placed at the specified corner.
         Falls back to the original image if anything fails.
-        """
+
+        return_geometry (opt-in, default False so every existing caller is
+        unaffected): also returns the exact pixel box the logo was pasted
+        into — {x, y, width, height} — so a caller that needs to know WHERE
+        it landed (e.g. to let a user later drag/resize it against the
+        saved pre-logo background) doesn't have to re-derive it separately
+        and risk drifting out of sync with the actual paste."""
         import base64 as _b64
         import io
         import requests as _req
@@ -2442,11 +2545,310 @@ rich tonal range, no pure black or pure white."""
             base_img.convert("RGB").save(buf, format="WEBP", quality=97, method=6)
             result_b64 = _b64.b64encode(buf.getvalue()).decode()
             print(f"✅ Logo composited at {position} with badge ({lw}×{lh}px on {bw}×{bh}px image)")
+            if return_geometry:
+                return result_b64, {"x": logo_x, "y": logo_y, "width": lw, "height": lh}
             return result_b64
 
         except Exception as e:
             print(f"⚠️ Logo overlay failed: {e}, returning original image")
+            if return_geometry:
+                return b64, None
             return b64
+
+    @staticmethod
+    def clear_logo_region(
+        image: "Image.Image", logo_url: str, position: str = "bottom_right", logo_size: str = "small"
+    ) -> "Image.Image":
+        """
+        Inpaint away whatever currently occupies the logo's badge rectangle —
+        e.g. a logo already baked into this image's pixels from a prior
+        generation pass — BEFORE handing the image to an AI edit model.
+
+        Without this, images.edit() receives the old logo as real image
+        content to preserve or redraw, which is how an edit could distort or
+        duplicate it: the deterministic _overlay_logo() re-paste that runs
+        after the edit pastes cleanly on top of whatever the edit model left
+        in that corner, not onto a blank one. Clearing the region first means
+        there's nothing left for the edit model to preserve or hallucinate
+        from there.
+
+        Uses the exact same badge geometry as _overlay_logo so the cleared
+        region lines up precisely with where the fresh logo will land after.
+        Falls back to returning the image unchanged on any failure.
+        """
+        import io
+        import numpy as np
+        import cv2
+        import requests as _req
+        from PIL import Image
+
+        try:
+            bw, bh = image.size
+            resp = _req.get(logo_url, timeout=10)
+            resp.raise_for_status()
+            logo_img = Image.open(io.BytesIO(resp.content)).convert("RGBA")
+
+            logo_size_map = {"small": 0.08, "medium": 0.12, "large": 0.16}
+            logo_size_pct = logo_size_map.get(logo_size, 0.08)
+
+            bx, by, badge_w, badge_h, _, _ = ImageContentService._compute_logo_badge_geometry(
+                bw, bh, logo_img.size, logo_size_pct, position
+            )
+
+            # Pad the mask a little beyond the exact badge rect so the
+            # inpaint blends the edge instead of leaving a hard-edged
+            # rectangular remnant of the old badge.
+            mp = max(4, int(bw * 0.01))
+            x1, y1 = max(0, bx - mp), max(0, by - mp)
+            x2, y2 = min(bw, bx + badge_w + mp), min(bh, by + badge_h + mp)
+
+            np_img = np.array(image.convert("RGB"))
+            mask = np.zeros((bh, bw), dtype=np.uint8)
+            mask[y1:y2, x1:x2] = 255
+
+            bgr = cv2.cvtColor(np_img, cv2.COLOR_RGB2BGR)
+            inpainted = cv2.inpaint(bgr, mask, 3, cv2.INPAINT_TELEA)
+            result_rgb = cv2.cvtColor(inpainted, cv2.COLOR_BGR2RGB)
+
+            result = Image.fromarray(result_rgb)
+            return result.convert("RGBA") if image.mode == "RGBA" else result
+
+        except Exception as e:
+            print(f"⚠️ Logo region clear failed: {e}, leaving image unchanged")
+            return image
+
+    @staticmethod
+    async def overlay_logo_smart(
+        b64: str, logo_url: str, logo_size: str = "small", preferred_position: Optional[str] = None,
+        return_placement: bool = False,
+    ):
+        """
+        Composite the logo using the same CV-busyness-ranking + AI conflict
+        check already proven out for user-uploaded posts (see
+        complete_social_manager.py's manual logo-overlay flow), instead of
+        blindly pasting at a fixed corner regardless of what the AI actually
+        rendered there. This is what AI-GENERATED image paths should call —
+        a hardcoded corner has no way to know the model happened to place the
+        headline exactly where the badge is about to land.
+
+        preferred_position, if given (e.g. an explicit brand_context
+        setting), is tried FIRST; it's only passed over if it actually
+        conflicts with something, so an explicit user preference still wins
+        whenever it isn't the source of the problem.
+
+        return_placement (opt-in, default False so every existing caller is
+        unaffected): also returns (chosen_position, geometry) — the corner
+        that actually won and its exact pixel box — for a caller that wants
+        to let a user later drag/resize the logo against the saved
+        pre-logo background."""
+        import asyncio
+        import base64 as _b64
+
+        loop = asyncio.get_running_loop()
+        image_bytes = _b64.b64decode(b64)
+
+        ranked = await loop.run_in_executor(
+            None, lambda: ImageContentService.rank_overlay_positions_cv(image_bytes)
+        )
+        if preferred_position:
+            candidates = [preferred_position] + [p for p in ranked if p != preferred_position]
+        else:
+            candidates = ranked
+
+        result_b64 = None
+        chosen_geometry = None
+        chosen_position = candidates[0] if candidates else "bottom_right"
+        for attempt_position in candidates[:3]:
+            attempt_b64, attempt_geometry = await loop.run_in_executor(
+                None,
+                lambda p=attempt_position: ImageContentService._overlay_logo(
+                    b64, logo_url, p, logo_size, return_geometry=True
+                ),
+            )
+            conflict = await ImageContentService.composited_overlay_has_conflict(
+                f"data:image/webp;base64,{attempt_b64}", attempt_position
+            )
+            chosen_position = attempt_position
+            result_b64 = attempt_b64
+            chosen_geometry = attempt_geometry
+            if not conflict:
+                break
+        print(f"✅ Smart logo overlay resolved at: {chosen_position}")
+        if return_placement:
+            return result_b64, chosen_position, chosen_geometry
+        return result_b64
+
+    @staticmethod
+    def rank_overlay_positions_cv(image_bytes: bytes, region_pct: float = 0.22) -> List[str]:
+        """
+        Deterministically rank candidate logo corners by how visually "busy"
+        each region actually is, using plain pixel analysis — no AI guessing.
+
+        Text, faces, and graphics all produce measurably higher edge density
+        than flat background or sky, so scoring each corner's edge variance
+        (a standard OpenCV blur/detail metric) and picking the lowest is a
+        far more reliable signal than asking a vision model "which corner
+        looks empty?" — this is what actually fixed unreliable placement,
+        the earlier vision-only ranking never had real pixel data to go on.
+
+        Returns positions ordered least-busy (safest) to most-busy (worst).
+        """
+        import cv2
+        import numpy as np
+        from PIL import Image
+        import io as _io
+
+        try:
+            img = Image.open(_io.BytesIO(image_bytes)).convert("L")  # grayscale
+            w, h = img.size
+            rw = max(1, int(w * region_pct))
+            rh = max(1, int(h * region_pct))
+
+            regions = {
+                "top_left": (0, 0, rw, rh),
+                "top_right": (w - rw, 0, w, rh),
+                "top_center": ((w - rw) // 2, 0, (w - rw) // 2 + rw, rh),
+                "bottom_left": (0, h - rh, rw, h),
+                "bottom_right": (w - rw, h - rh, w, h),
+                "bottom_center": ((w - rw) // 2, h - rh, (w - rw) // 2 + rw, h),
+            }
+
+            np_img = np.array(img)
+            scores = {}
+            for pos, (x1, y1, x2, y2) in regions.items():
+                crop = np_img[y1:y2, x1:x2]
+                scores[pos] = float(cv2.Laplacian(crop, cv2.CV_64F).var()) if crop.size else float("inf")
+
+            ranked = sorted(scores.keys(), key=lambda p: scores[p])
+            print(f"📐 Logo corner busyness (lower=emptier): {[(p, round(scores[p], 1)) for p in ranked]}")
+            return ranked
+
+        except Exception as e:
+            print(f"⚠️ CV-based position ranking failed: {e}, using fixed fallback order")
+            return ["bottom_right", "bottom_left", "top_right", "top_left", "bottom_center", "top_center"]
+
+    @staticmethod
+    async def rank_overlay_positions(image_url: str) -> List[str]:
+        """
+        Determine a ranked list of candidate corners (best to worst) for placing
+        a logo/badge overlay on a user-uploaded image.
+
+        Forces the model to look at each candidate region individually before
+        picking, rather than a single open-ended guess — this is meaningfully
+        more reliable for small vision models than "just tell me the best one."
+        Falls back to a fixed safe order if the model call or parsing fails.
+
+        NOTE: superseded by rank_overlay_positions_cv() for the primary ranking
+        signal (see that docstring) — kept here in case a text-based fallback
+        or secondary signal is useful later.
+        """
+        from app.services.AIService import AIService
+        import json as _json
+
+        valid_positions = ["top_left", "top_right", "top_center", "bottom_left", "bottom_right", "bottom_center"]
+        fallback_order = ["bottom_right", "bottom_left", "top_right", "top_left", "bottom_center", "top_center"]
+
+        prompt = """You are choosing where to place a small brand logo badge on this image, so it never
+covers anything important.
+
+For EACH of these six regions, briefly note what is actually there — text, a face, a focal
+subject, or just empty/background:
+- top_left
+- top_right
+- top_center
+- bottom_left
+- bottom_right
+- bottom_center
+
+Then rank all six from BEST (emptiest, least important content, furthest from any text or
+faces) to WORST (most likely to cover something important).
+
+Return JSON only, no markdown, no explanations outside the JSON:
+{
+  "regions": {"top_left": "...", "top_right": "...", "top_center": "...", "bottom_left": "...", "bottom_right": "...", "bottom_center": "..."},
+  "ranking": ["best_position", "...", "...", "...", "...", "worst_position"]
+}"""
+
+        try:
+            request = AIService.build_ai_model(
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": image_url}},
+                    ],
+                }],
+                model="gpt-4o-mini",
+                temperature=0,
+                max_tokens=500,
+            )
+            response = await AIService.chat_completion(request)
+            if isinstance(response, dict) and "error" in response:
+                raise Exception(response["error"])
+
+            raw = response.choices[0].message.content.strip()
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+
+            parsed = _json.loads(raw)
+            ranking = [p for p in parsed.get("ranking", []) if p in valid_positions]
+            # Append any missing positions at the end so we always have all 6 as a fallback chain
+            ranking += [p for p in fallback_order if p not in ranking]
+            print(f"🎯 Logo position ranking: {ranking}")
+            return ranking
+
+        except Exception as e:
+            print(f"⚠️ Logo position ranking failed: {e}, using fixed fallback order")
+            return fallback_order
+
+    @staticmethod
+    async def composited_overlay_has_conflict(composited_data_url: str, position: str) -> bool:
+        """
+        Post-placement sanity check: look at the FINAL composited image and ask
+        whether the logo actually landed on top of text, a face, or another
+        important element. Returns True if there's a conflict (caller should
+        try the next-ranked position), False if it looks clean.
+
+        Fails safe (returns False = "accept it") on any error — a broken
+        quality-check call must never block the post from going out.
+        """
+        from app.services.AIService import AIService
+
+        position_label = position.replace("_", "-")
+        prompt = f"""A small brand logo badge was just placed in the {position_label} corner of this image.
+
+Look specifically at that corner. Does the logo visibly overlap, cover, or cut off any text,
+a face, or another important visual element?
+
+Answer with exactly one word: "yes" or "no"."""
+
+        try:
+            request = AIService.build_ai_model(
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": composited_data_url}},
+                    ],
+                }],
+                model="gpt-4o-mini",
+                temperature=0,
+                max_tokens=10,
+            )
+            response = await AIService.chat_completion(request)
+            if isinstance(response, dict) and "error" in response:
+                raise Exception(response["error"])
+
+            answer = response.choices[0].message.content.strip().lower()
+            has_conflict = answer.startswith("yes")
+            print(f"🔍 Overlay conflict check at {position}: {'CONFLICT' if has_conflict else 'clean'}")
+            return has_conflict
+
+        except Exception as e:
+            print(f"⚠️ Overlay conflict check failed: {e}, accepting placement as-is")
+            return False
 
     @staticmethod
     def _map_to_gemini_aspect(size: str) -> str:

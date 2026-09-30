@@ -2743,6 +2743,51 @@ async def edit_draft_image(
     )
 
 
+@router.post("/drafts/{draft_id}/logo/reposition")
+async def reposition_draft_logo(
+    draft_id: str,
+    request: Request,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    auth: dict = Depends(flexible_auth)
+):
+    """
+    Move/resize the logo on an already-generated draft's image — a plain
+    deterministic paste onto the saved logo-free background, no AI call,
+    so nothing else in the image can change. See LogoRepositionService for
+    why this exists as its own path separate from the Canvas Editor.
+
+    Body: {x, y, width, height, slide_index?} — all in pixels on the
+    original generated image (not the on-screen rendered size), slide_index
+    only for a carousel draft's specific slide.
+    """
+    from app.agents.social_media_manager.services.logo_reposition_service import LogoRepositionService
+
+    user_id = auth.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
+
+    body = await request.json()
+    for field in ("x", "y", "width", "height"):
+        if field not in body:
+            raise HTTPException(status_code=400, detail=f"{field} is required")
+
+    result = await LogoRepositionService.reposition(
+        draft_id=draft_id,
+        user_id=user_id,
+        x=int(body["x"]),
+        y=int(body["y"]),
+        width=int(body["width"]),
+        height=int(body["height"]),
+        db=db,
+        slide_index=body.get("slide_index"),
+    )
+
+    return JSONResponse(
+        status_code=200 if result.get("status") else 400,
+        content=result
+    )
+
+
 @router.post("/drafts/{draft_id}/undo-image")
 async def undo_draft_image_edit(
     draft_id: str,
@@ -6092,6 +6137,23 @@ async def _generate_image_bg(
 
         final_url = stored_url if not stored_url.startswith("data:") else None
 
+        # For a seamless (non-AI, no other side effects) logo reposition/resize
+        # later, we need the logo-free background AND exactly where the logo
+        # landed on it — both captured by the generation call above, before
+        # this point. Upload the background the same way as the final image;
+        # skip silently on any failure, since this only degrades "logo can be
+        # repositioned later" for this one draft, not the draft itself.
+        stored_background_url = None
+        raw_background_url = (image_result.get("responseData") or {}).get("background_image_url")
+        logo_placement = (image_result.get("responseData") or {}).get("logo_placement")
+        if raw_background_url and raw_background_url.startswith("data:"):
+            try:
+                from app.utils.s3_upload import upload_base64 as _upload_bg
+                stored_background_url = await _upload_bg(raw_background_url, folder="uri-social/content-draft-backgrounds")
+            except Exception as bg_upload_err:
+                print(f"⚠️  Background image upload failed for draft {draft_id} (logo will not be repositionable later): {bg_upload_err}")
+                logo_placement = None
+
         print(f"[Canvas Editor DEBUG] final_url exists: {final_url is not None}, db exists: {db is not None}")
         if final_url:
             print(f"[Canvas Editor DEBUG] final_url value: {final_url[:100]}...")
@@ -6148,6 +6210,9 @@ async def _generate_image_bg(
                     f"slides.{slide_index}.image_failed": False,
                     "has_image": True,
                 }
+                if stored_background_url and logo_placement:
+                    update_fields[f"slides.{slide_index}.background_image_url"] = stored_background_url
+                    update_fields[f"slides.{slide_index}.logo_placement"] = logo_placement
 
                 # Add canvas document to slide if generated
                 if canvas_doc:
@@ -6178,6 +6243,9 @@ async def _generate_image_bg(
                     "image_url": final_url,
                     "has_image": True
                 }
+                if stored_background_url and logo_placement:
+                    update_fields["background_image_url"] = stored_background_url
+                    update_fields["logo_placement"] = logo_placement
 
                 # Add canvas document if generated
                 if canvas_doc:
