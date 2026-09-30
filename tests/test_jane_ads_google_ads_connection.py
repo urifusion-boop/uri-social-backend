@@ -21,6 +21,7 @@ from app.agents.jane_ads.google_ads_connection import (
     AdsConnectionRequired,
     ConnectionState,
     GoogleAdsConnectionError,
+    InvalidCustomerId,
     MccNotEligibleToCreateAccounts,
     _is_ineligible_mcc_error,
     create_client_account_under_mcc,
@@ -432,6 +433,57 @@ def test_request_manager_link_strips_hyphens_from_customer_id():
 
     brand_doc = next(d for d in db["social_connections"].docs if d["platform"] == "google_ads")
     assert brand_doc["customer_id"] == "9297032641", "stored customer_id must also be digits-only"
+
+
+def test_request_manager_link_accepts_digits_only_customer_id_unchanged():
+    """The other half of "accept both cases": a user who already typed just the
+    10 digits, no hyphens, must work identically — not just the hyphenated
+    form."""
+    db = FakeDb()
+    db["social_connections"].docs.append(_conn_doc(manager_link_status="none", customer_id=""))
+    db["social_connections"].docs.append(_admin_conn_doc())
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client(
+            [{"results": [{"resourceName": "customers/1/customerClientLinks/2"}]}]
+        )
+        MockClient.return_value.__aenter__.return_value = mock_client
+        result = _run(request_manager_link(db, "u1", "b1", "9297032641"))
+
+    assert result["manager_link_status"] == "pending"
+    sent_json = mock_client.post.call_args.kwargs["json"]
+    assert sent_json["operation"]["create"]["clientCustomer"] == "customers/9297032641"
+
+
+def test_request_manager_link_rejects_too_short_customer_id_before_any_network_call():
+    db = FakeDb()
+    db["social_connections"].docs.append(_conn_doc(manager_link_status="none", customer_id=""))
+    db["social_connections"].docs.append(_admin_conn_doc())
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client([])
+        MockClient.return_value.__aenter__.return_value = mock_client
+        try:
+            _run(request_manager_link(db, "u1", "b1", "123-456"))
+            assert False, "expected InvalidCustomerId"
+        except InvalidCustomerId as e:
+            assert "10 digits" in str(e)
+    mock_client.post.assert_not_called()
+
+
+def test_request_manager_link_rejects_non_numeric_garbage():
+    db = FakeDb()
+    db["social_connections"].docs.append(_conn_doc(manager_link_status="none", customer_id=""))
+    db["social_connections"].docs.append(_admin_conn_doc())
+    try:
+        _run(request_manager_link(db, "u1", "b1", "not-a-customer-id"))
+        assert False, "expected InvalidCustomerId"
+    except InvalidCustomerId:
+        pass
+
+
+def test_invalid_customer_id_is_a_google_ads_connection_error_subclass():
+    """The router relies on this to fall through to the generic 502 handler
+    for any InvalidCustomerId it doesn't explicitly catch first."""
+    assert issubclass(InvalidCustomerId, GoogleAdsConnectionError)
 
 
 def test_request_manager_link_refusal_sets_refused_and_next_resolve_reports_it():

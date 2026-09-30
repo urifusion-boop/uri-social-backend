@@ -1448,7 +1448,12 @@ async def jane_google_ads_link_existing(
     """Path (a): client already has a Google Ads account — send a manager-link
     invitation. On the known 'already linked to another manager' friction, returns
     a specific, actionable message instead of a generic failure."""
-    from .google_ads_connection import AdsConnectionRequired, GoogleAdsConnectionError, request_manager_link
+    from .google_ads_connection import (
+        AdsConnectionRequired,
+        GoogleAdsConnectionError,
+        InvalidCustomerId,
+        request_manager_link,
+    )
 
     try:
         result = await request_manager_link(
@@ -1456,6 +1461,11 @@ async def jane_google_ads_link_existing(
         )
     except AdsConnectionRequired as e:
         raise HTTPException(status_code=409, detail=f"google_ads_connection_{e.state.value}")
+    except InvalidCustomerId as e:
+        # Caught before any Google API call was even made — a client input
+        # problem, not a rejected REST call, so 400 (not the 502 below).
+        print(f"ℹ️  Invalid Google Ads customer ID entered: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
     except GoogleAdsConnectionError as e:
         print(f"⚠️  Google Ads REST failure: {e}")
         raise HTTPException(status_code=502, detail=str(e))
