@@ -20,6 +20,15 @@ REQUIRED = {
     # The Unified Inbox webhook handshake. Without it Meta cannot subscribe, so
     # no message or comment ever arrives.
     "META_WEBHOOK_VERIFY_TOKEN": f"{SSM_PREFIX}/META_WEBHOOK_VERIFY_TOKEN",
+    # AI video creation (storyboard writing on Gemini 3.5 Flash-Lite, scene
+    # animation on Veo 3.1) — confirmed missing/invalid live 2026-09-30:
+    # generate-storyboard returned Google's own "API key not valid" error the
+    # first time this path was ever exercised against the deployed container
+    # (the feature's UI tab has been hidden since Jul 31, so nothing had
+    # called it live before). The SSM parameter itself still needs a real key
+    # value put there by whoever manages this project's secrets — this entry
+    # only makes sure that value reaches the container once it exists.
+    "GOOGLE_GEMINI_API_KEY": f"{SSM_PREFIX}/GOOGLE_GEMINI_API_KEY",
 }
 
 
