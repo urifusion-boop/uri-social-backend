@@ -438,6 +438,17 @@ async def request_manager_link(
     friction — a previous agency's link was never removed), stores WHY so
     resolve_connection_state reports MANAGER_LINK_REFUSED with a precise, actionable
     reason next time, instead of retrying blindly."""
+    # Google Ads resource names take a plain digit string (customers/9297032641),
+    # but Google's OWN UI displays customer IDs hyphenated (929-703-2641) — exactly
+    # the format the account-linking input's own placeholder suggests, and exactly
+    # what a user would naturally copy-paste from their Google Ads dashboard.
+    # Confirmed live: sending the hyphenated form produced Google's own "part of
+    # the resource name is invalid" error. Stripped once here, at the single point
+    # this ever enters the system, so the customer_id stored on the connection doc
+    # (and therefore every later Google Ads API call that reads it back) is always
+    # the clean, API-compatible form — not just this one request.
+    client_customer_id = "".join(ch for ch in client_customer_id if ch.isdigit())
+
     conn = await get_google_ads_connection(db, user_id, brand_id)
     if not conn:
         raise AdsConnectionRequired(ConnectionState.NONE)
