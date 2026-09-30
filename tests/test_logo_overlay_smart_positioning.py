@@ -92,7 +92,7 @@ def test_overlay_logo_smart_accepts_preferred_position_when_clean():
         ImageContentService, "rank_overlay_positions_cv",
         return_value=["top_left", "bottom_right", "top_right"],
     ) as mock_rank, \
-        patch.object(ImageContentService, "_overlay_logo", side_effect=lambda b64, url, pos, size: f"result@{pos}") as mock_overlay, \
+        patch.object(ImageContentService, "_overlay_logo", side_effect=lambda b64, url, pos, size, return_geometry=False: (f"result@{pos}", {"x": 0, "y": 0, "width": 10, "height": 10})) as mock_overlay, \
         patch.object(ImageContentService, "composited_overlay_has_conflict", new=AsyncMock(return_value=False)) as mock_conflict:
 
         result = _run(ImageContentService.overlay_logo_smart(
@@ -120,7 +120,7 @@ def test_overlay_logo_smart_falls_back_when_preferred_position_conflicts():
         ImageContentService, "rank_overlay_positions_cv",
         return_value=["top_left", "top_right", "bottom_left"],
     ), \
-        patch.object(ImageContentService, "_overlay_logo", side_effect=lambda b64, url, pos, size: f"result@{pos}") as mock_overlay, \
+        patch.object(ImageContentService, "_overlay_logo", side_effect=lambda b64, url, pos, size, return_geometry=False: (f"result@{pos}", {"x": 0, "y": 0, "width": 10, "height": 10})) as mock_overlay, \
         patch.object(ImageContentService, "composited_overlay_has_conflict", new=AsyncMock(side_effect=fake_conflict)):
 
         result = _run(ImageContentService.overlay_logo_smart(
@@ -139,7 +139,7 @@ def test_overlay_logo_smart_uses_pure_cv_ranking_without_a_preferred_position():
         ImageContentService, "rank_overlay_positions_cv",
         return_value=["top_center", "bottom_center", "center"],
     ), \
-        patch.object(ImageContentService, "_overlay_logo", side_effect=lambda b64, url, pos, size: f"result@{pos}") as mock_overlay, \
+        patch.object(ImageContentService, "_overlay_logo", side_effect=lambda b64, url, pos, size, return_geometry=False: (f"result@{pos}", {"x": 0, "y": 0, "width": 10, "height": 10})) as mock_overlay, \
         patch.object(ImageContentService, "composited_overlay_has_conflict", new=AsyncMock(return_value=False)):
 
         result = _run(ImageContentService.overlay_logo_smart(
@@ -157,7 +157,7 @@ def test_overlay_logo_smart_keeps_last_attempt_when_all_three_candidates_conflic
         ImageContentService, "rank_overlay_positions_cv",
         return_value=["top_left", "top_right", "bottom_left", "bottom_right"],
     ), \
-        patch.object(ImageContentService, "_overlay_logo", side_effect=lambda b64, url, pos, size: f"result@{pos}") as mock_overlay, \
+        patch.object(ImageContentService, "_overlay_logo", side_effect=lambda b64, url, pos, size, return_geometry=False: (f"result@{pos}", {"x": 0, "y": 0, "width": 10, "height": 10})) as mock_overlay, \
         patch.object(ImageContentService, "composited_overlay_has_conflict", new=AsyncMock(return_value=True)):
 
         result = _run(ImageContentService.overlay_logo_smart(

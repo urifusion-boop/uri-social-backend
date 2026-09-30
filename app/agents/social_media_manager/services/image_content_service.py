@@ -1388,6 +1388,8 @@ OVERALL:
                 # Composite brand logo onto generated image for all models.
                 logo_url = (brand_context or {}).get('logo_url')
                 print(f"🖼️  LOGO CHECK: logo_url={repr(logo_url)}, has_brand_context={brand_context is not None}")
+                background_image_data_url = None
+                logo_placement = None
                 if logo_url:
                     import re as _re_logo
                     logo_position = (brand_context or {}).get('logo_position', 'bottom_right')
@@ -1396,15 +1398,25 @@ OVERALL:
                     data_url = image_response['url']
                     _m = _re_logo.match(r"data:[^;]+;base64,(.+)", data_url, _re_logo.DOTALL)
                     if _m:
-                        b64_final = await ImageContentService.overlay_logo_smart(
-                            _m.group(1), logo_url, logo_size, preferred_position=logo_position
+                        # Captured BEFORE compositing — this is the logo-free
+                        # background a later manual reposition/resize needs to
+                        # re-paste the logo onto from scratch, instead of
+                        # re-running AI generation just to move a badge.
+                        background_image_data_url = data_url
+                        b64_final, chosen_position, geometry = await ImageContentService.overlay_logo_smart(
+                            _m.group(1), logo_url, logo_size, preferred_position=logo_position,
+                            return_placement=True,
                         )
                         image_response['url'] = f"data:image/webp;base64,{b64_final}"
+                        if geometry:
+                            logo_placement = {**geometry, "position": chosen_position, "logo_size": logo_size}
                 else:
                     print(f"⚠️  LOGO SKIPPED: logo_url is None or empty")
 
                 return UriResponse.get_single_data_response("platform_image", {
                     "image_url": image_response['url'],
+                    "background_image_url": background_image_data_url,
+                    "logo_placement": logo_placement,
                     "platform": platform,
                     "specs": specs,
                     "prompt_used": image_prompt,
@@ -2440,6 +2452,41 @@ rich tonal range, no pure black or pure white."""
         )
     
     @staticmethod
+    async def composite_logo_at_position(
+        background_url: str, logo_url: str, x: int, y: int, width: int, height: int
+    ) -> str:
+        """Paste the brand logo onto an EXISTING (already-hosted) background
+        image at an exact, caller-specified pixel box — the deterministic
+        primitive behind manual logo reposition/resize (drag/resize in the
+        UI), as opposed to overlay_logo_smart's automatic corner-picking at
+        generation time. No AI call of any kind, so nothing else in the
+        image can change — only the logo moves. Returns a base64-encoded
+        WEBP string (no data: URL prefix), matching _overlay_logo's
+        contract. Raises on a real failure (a caller-facing action should
+        know reposition failed, not silently get the old image back)."""
+        import base64 as _b64
+        import io
+
+        import httpx
+        from PIL import Image
+
+        async with httpx.AsyncClient(timeout=20) as client:
+            bg_resp = await client.get(background_url)
+            bg_resp.raise_for_status()
+            logo_resp = await client.get(logo_url)
+            logo_resp.raise_for_status()
+
+        base_img = Image.open(io.BytesIO(bg_resp.content)).convert("RGBA")
+        logo_img = Image.open(io.BytesIO(logo_resp.content)).convert("RGBA")
+        logo_img = logo_img.resize((max(1, int(width)), max(1, int(height))), Image.LANCZOS)
+
+        base_img.paste(logo_img, (int(x), int(y)), logo_img)
+
+        buf = io.BytesIO()
+        base_img.convert("RGB").save(buf, format="WEBP", quality=97, method=6)
+        return _b64.b64encode(buf.getvalue()).decode()
+
+    @staticmethod
     def _compute_logo_badge_geometry(
         bw: int, bh: int, logo_native_size: tuple, logo_size_pct: float, position: str
     ) -> tuple:
@@ -2489,12 +2536,21 @@ rich tonal range, no pure black or pure white."""
         return bx, by, badge_w, badge_h, target_w, target_h
 
     @staticmethod
-    def _overlay_logo(b64: str, logo_url: str, position: str = "bottom_right", logo_size: str = "small") -> str:
+    def _overlay_logo(
+        b64: str, logo_url: str, position: str = "bottom_right", logo_size: str = "small",
+        return_geometry: bool = False,
+    ):
         """
         Download the brand logo and composite it onto the generated image using Pillow.
         Logo is resized based on logo_size preference and placed at the specified corner.
         Falls back to the original image if anything fails.
-        """
+
+        return_geometry (opt-in, default False so every existing caller is
+        unaffected): also returns the exact pixel box the logo was pasted
+        into — {x, y, width, height} — so a caller that needs to know WHERE
+        it landed (e.g. to let a user later drag/resize it against the
+        saved pre-logo background) doesn't have to re-derive it separately
+        and risk drifting out of sync with the actual paste."""
         import base64 as _b64
         import io
         import requests as _req
@@ -2533,10 +2589,14 @@ rich tonal range, no pure black or pure white."""
             base_img.convert("RGB").save(buf, format="WEBP", quality=97, method=6)
             result_b64 = _b64.b64encode(buf.getvalue()).decode()
             print(f"✅ Logo composited at {position} with badge ({lw}×{lh}px on {bw}×{bh}px image)")
+            if return_geometry:
+                return result_b64, {"x": logo_x, "y": logo_y, "width": lw, "height": lh}
             return result_b64
 
         except Exception as e:
             print(f"⚠️ Logo overlay failed: {e}, returning original image")
+            if return_geometry:
+                return b64, None
             return b64
 
     @staticmethod
@@ -2603,8 +2663,9 @@ rich tonal range, no pure black or pure white."""
 
     @staticmethod
     async def overlay_logo_smart(
-        b64: str, logo_url: str, logo_size: str = "small", preferred_position: Optional[str] = None
-    ) -> str:
+        b64: str, logo_url: str, logo_size: str = "small", preferred_position: Optional[str] = None,
+        return_placement: bool = False,
+    ):
         """
         Composite the logo using the same CV-busyness-ranking + AI conflict
         check already proven out for user-uploaded posts (see
@@ -2618,7 +2679,12 @@ rich tonal range, no pure black or pure white."""
         setting), is tried FIRST; it's only passed over if it actually
         conflicts with something, so an explicit user preference still wins
         whenever it isn't the source of the problem.
-        """
+
+        return_placement (opt-in, default False so every existing caller is
+        unaffected): also returns (chosen_position, geometry) — the corner
+        that actually won and its exact pixel box — for a caller that wants
+        to let a user later drag/resize the logo against the saved
+        pre-logo background."""
         import asyncio
         import base64 as _b64
 
@@ -2634,20 +2700,26 @@ rich tonal range, no pure black or pure white."""
             candidates = ranked
 
         result_b64 = None
+        chosen_geometry = None
         chosen_position = candidates[0] if candidates else "bottom_right"
         for attempt_position in candidates[:3]:
-            attempt_b64 = await loop.run_in_executor(
+            attempt_b64, attempt_geometry = await loop.run_in_executor(
                 None,
-                lambda p=attempt_position: ImageContentService._overlay_logo(b64, logo_url, p, logo_size),
+                lambda p=attempt_position: ImageContentService._overlay_logo(
+                    b64, logo_url, p, logo_size, return_geometry=True
+                ),
             )
             conflict = await ImageContentService.composited_overlay_has_conflict(
                 f"data:image/webp;base64,{attempt_b64}", attempt_position
             )
             chosen_position = attempt_position
             result_b64 = attempt_b64
+            chosen_geometry = attempt_geometry
             if not conflict:
                 break
         print(f"✅ Smart logo overlay resolved at: {chosen_position}")
+        if return_placement:
+            return result_b64, chosen_position, chosen_geometry
         return result_b64
 
     @staticmethod
