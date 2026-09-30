@@ -407,6 +407,33 @@ def test_request_manager_link_sends_singular_operation_not_plural_operations():
     assert sent_json["operation"]["create"]["status"] == "PENDING"
 
 
+def test_request_manager_link_strips_hyphens_from_customer_id():
+    """Google Ads displays customer IDs hyphenated (929-703-2641) — exactly what
+    the account-linking input's own placeholder suggests entering, and exactly
+    what a user would copy-paste from their Google Ads dashboard — but the
+    resource name Google's API expects is digits only. Confirmed live: the
+    hyphenated form produced "'929-703-2641' part of the resource name is
+    invalid." This must be stripped both in the outgoing request AND in what
+    gets stored, since every later Google Ads API call reads customer_id back
+    off the connection doc."""
+    db = FakeDb()
+    db["social_connections"].docs.append(_conn_doc(manager_link_status="none", customer_id=""))
+    db["social_connections"].docs.append(_admin_conn_doc())
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client(
+            [{"results": [{"resourceName": "customers/1/customerClientLinks/2"}]}]
+        )
+        MockClient.return_value.__aenter__.return_value = mock_client
+        result = _run(request_manager_link(db, "u1", "b1", "929-703-2641"))
+
+    assert result["manager_link_status"] == "pending"
+    sent_json = mock_client.post.call_args.kwargs["json"]
+    assert sent_json["operation"]["create"]["clientCustomer"] == "customers/9297032641"
+
+    brand_doc = next(d for d in db["social_connections"].docs if d["platform"] == "google_ads")
+    assert brand_doc["customer_id"] == "9297032641", "stored customer_id must also be digits-only"
+
+
 def test_request_manager_link_refusal_sets_refused_and_next_resolve_reports_it():
     db = FakeDb()
     db["social_connections"].docs.append(_conn_doc(manager_link_status="none", customer_id=""))
