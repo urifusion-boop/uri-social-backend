@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from app.database import get_db
 from app.services.AIService import client as openai_client
-from app.utils.cloudinary_upload import upload_bytes
+from app.utils.s3_upload import upload_bytes
 
 _SYSTEM_PROMPT = """You are a creative director specialising in short-form social video for brands.
 

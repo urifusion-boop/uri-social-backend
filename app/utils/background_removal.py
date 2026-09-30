@@ -199,7 +199,7 @@ async def remove_background(image_url: str, method: str = "auto") -> Optional[st
     Returns:
         Cloudinary URL of the cutout with transparent background
     """
-    from app.utils.cloudinary_upload import upload_bytes
+    from app.utils.s3_upload import upload_bytes
 
     cutout_bytes = None
     cutout_url = None
