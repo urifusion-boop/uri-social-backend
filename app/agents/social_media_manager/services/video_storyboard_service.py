@@ -6,9 +6,27 @@ import uuid
 from io import BytesIO
 from typing import Any, Dict, List, Optional
 
+from app.core.config import settings
 from app.database import get_db
 from app.services.AIService import client as openai_client
 from app.utils.cloudinary_upload import upload_bytes
+
+# Storyboard WRITING (this step only — frame images below stay on gpt-image-2,
+# scene animation stays on Veo/Kling/Seedance) moved off gpt-5.4 onto Gemini
+# 3.5 Flash-Lite: same multimodal-in/JSON-out shape this call already needs
+# (read brand images, follow a style directive, return structured scenes),
+# at roughly 1/8th the per-token cost — see video_generation_service.py's
+# identical fail-soft client-init pattern, reused here rather than duplicated
+# differently.
+try:
+    from google import genai
+    from google.genai import types as genai_types
+    _gemini_client = genai.Client(api_key=settings.GOOGLE_GEMINI_API_KEY)
+except Exception as _e:
+    _gemini_client = None
+    print(f"[VideoStoryboardService] google-genai init failed: {_e}")
+
+STORYBOARD_MODEL = "gemini-3.5-flash-lite"
 
 _SYSTEM_PROMPT = """You are a creative director specialising in short-form social video for brands.
 
@@ -273,6 +291,14 @@ class VideoStoryboardService:
         return await _frame_jobs_collection().find_one({"job_id": job_id}, {"_id": 0})
 
     @staticmethod
+    def _brand_image_mime(img_data: str) -> str:
+        """Best-effort mime type from a data URL prefix; jpeg default matches
+        what _decode_brand_image already assumes for a bare base64 string."""
+        if img_data.startswith("data:") and ";base64," in img_data:
+            return img_data.split(";base64,", 1)[0][len("data:"):] or "image/jpeg"
+        return "image/jpeg"
+
+    @staticmethod
     async def generate_storyboard(
         brand_images: List[str],
         optional_text: Optional[str],
@@ -282,12 +308,19 @@ class VideoStoryboardService:
         video_style: Optional[str] = "clean_commercial",
     ) -> Dict[str, Any]:
         """
-        Send brand images + optional creative text to GPT-4o Vision.
+        Send brand images + optional creative text to Gemini 3.5 Flash-Lite
+        (moved off gpt-5.4 — this call is read-images-then-write-structured-JSON,
+        exactly the "simple data extraction" shape Flash-Lite is built for, at
+        roughly 1/8th the per-token cost; the actual media generation steps below
+        — frame stills, scene animation — are untouched and stay on their own
+        models, since Flash-Lite has no image/video output capability at all).
         Returns a structured storyboard JSON dict. Frame images are generated
         separately via the /generate-storyboard-frames background job.
         """
         if not brand_images:
             return {"status": False, "error": "At least one brand image is required."}
+        if not _gemini_client:
+            return {"status": False, "error": "Storyboard generation is not configured."}
 
         brand_images = brand_images[:5]
         target_duration_seconds = max(5, min(target_duration_seconds, 30))
@@ -327,30 +360,36 @@ class VideoStoryboardService:
         if style_directive:
             system_prompt = f"{_SYSTEM_PROMPT}\n\n{style_directive}"
 
-        content: List[Dict] = [{"type": "text", "text": "\n".join(preamble_lines)}]
+        contents: List[Any] = [genai_types.Part.from_text(text="\n".join(preamble_lines))]
 
         for i, img_data in enumerate(brand_images):
-            url = img_data if img_data.startswith("data:") else f"data:image/jpeg;base64,{img_data}"
-            content.append({"type": "text", "text": f"Image {i} (use reference_image_index={i}):"})
-            content.append({"type": "image_url", "image_url": {"url": url, "detail": "high"}})
+            contents.append(genai_types.Part.from_text(text=f"Image {i} (use reference_image_index={i}):"))
+            img_bytes = VideoStoryboardService._decode_brand_image(img_data)
+            mime = VideoStoryboardService._brand_image_mime(img_data)
+            contents.append(genai_types.Part.from_bytes(data=img_bytes, mime_type=mime))
 
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": content},
-        ]
-
-        loop = asyncio.get_running_loop()
-        response = await loop.run_in_executor(
-            None,
-            lambda: openai_client.chat.completions.create(
-                model="gpt-5.4",
-                messages=messages,
-                temperature=0.7,
-                max_completion_tokens=2000,
-            ),
+        config = genai_types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            temperature=0.7,
+            max_output_tokens=2000,
+            response_mime_type="application/json",
         )
 
-        raw = response.choices[0].message.content.strip()
+        loop = asyncio.get_running_loop()
+        try:
+            response = await loop.run_in_executor(
+                None,
+                lambda: _gemini_client.models.generate_content(
+                    model=STORYBOARD_MODEL,
+                    contents=contents,
+                    config=config,
+                ),
+            )
+        except Exception as e:
+            print(f"[VideoStoryboardService] storyboard generation error: {e}", flush=True)
+            return {"status": False, "error": "Failed to generate storyboard."}
+
+        raw = (response.text or "").strip()
         raw = re.sub(r"^```(?:json)?\s*", "", raw)
         raw = re.sub(r"\s*```$", "", raw)
 

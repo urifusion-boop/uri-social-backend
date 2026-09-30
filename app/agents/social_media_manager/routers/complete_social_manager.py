@@ -6681,11 +6681,19 @@ async def generate_video_caption(
 ):
     """
     Generate a platform-optimised social media caption for a merged video
-    using the storyboard's scene descriptions and brand context.
+    using the storyboard's scene descriptions and brand context. Moved off
+    gpt-4o onto Gemini 3.5 Flash-Lite (same reasoning as generate_storyboard
+    in video_storyboard_service.py) — this is a pure short-text write with
+    no image input, the cheapest and lowest-risk of the pipeline's model
+    swaps.
     """
-    import openai as _openai
+    from google.genai import types as _genai_types
+    from app.agents.social_media_manager.services.video_storyboard_service import _gemini_client
 
     _get_user_id(token)
+
+    if not _gemini_client:
+        raise HTTPException(status_code=503, detail="Caption generation is not configured.")
 
     scenes = request.storyboard.get("scenes", [])
     brand_context = request.storyboard.get("brand_context", {})
@@ -6725,14 +6733,20 @@ Rules:
 - Hashtags go at the very end, on a new line.
 - Do not include a trailing newline."""
 
-    client = _openai.AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
-    response = await client.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=600,
-        temperature=0.8,
-    )
-    caption = (response.choices[0].message.content or "").strip()
+    loop = asyncio.get_running_loop()
+    try:
+        response = await loop.run_in_executor(
+            None,
+            lambda: _gemini_client.models.generate_content(
+                model="gemini-3.5-flash-lite",
+                contents=prompt,
+                config=_genai_types.GenerateContentConfig(temperature=0.8, max_output_tokens=600),
+            ),
+        )
+    except Exception as e:
+        print(f"[VideoCaption] generation error: {e}", flush=True)
+        raise HTTPException(status_code=503, detail="Failed to generate caption.")
+    caption = (response.text or "").strip()
     return UriResponse.get_single_data_response("caption", {"caption": caption})
 
 
