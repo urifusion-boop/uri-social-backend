@@ -304,6 +304,8 @@ RULES FOR THIS EDIT:
         edit_category: str,
         edit_feedback: str,
         slide_index: Optional[int] = None,
+        background_image_url: Optional[str] = None,
+        logo_placement: Optional[Dict[str, Any]] = None,
     ) -> None:
         """
         Save image version to version history
@@ -314,6 +316,12 @@ RULES FOR THIS EDIT:
         {"slide_index": None} against both explicit nulls and the field being
         absent entirely, so this stays backward-compatible with every version
         document saved before carousels had per-slide history.
+
+        background_image_url/logo_placement are optional — only the logo
+        reposition feature's versions carry them (see LogoRepositionService).
+        Recording them here lets undo_image_edit restore the correct
+        Move-Logo-eligibility alongside the image itself, instead of leaving
+        it pointing at a background that no longer matches the restored image.
         """
         try:
             version_filter = {"draft_id": draft_id, "slide_index": slide_index}
@@ -334,6 +342,8 @@ RULES FOR THIS EDIT:
                 "image_url": image_url,
                 "edit_category": edit_category,
                 "edit_feedback": edit_feedback,
+                "background_image_url": background_image_url,
+                "logo_placement": logo_placement,
                 "is_current": True,
                 "created_at": datetime.utcnow()
             }
@@ -409,12 +419,23 @@ RULES FOR THIS EDIT:
                     f"slides.{slide_index}.image_version": previous_version["version_number"],
                     "updated_at": datetime.utcnow()
                 }
+                bg_field = f"slides.{slide_index}.background_image_url"
+                placement_field = f"slides.{slide_index}.logo_placement"
             else:
                 restore_fields = {
                     "image_url": previous_version["image_url"],
                     "image_version": previous_version["version_number"],
                     "updated_at": datetime.utcnow()
                 }
+                bg_field = "background_image_url"
+                placement_field = "logo_placement"
+
+            # Older/non-logo versions never recorded these — restoring to one
+            # of those correctly makes Move Logo unavailable again rather
+            # than leaving it pointed at a background that predates (or
+            # postdates) the image being restored to.
+            restore_fields[bg_field] = previous_version.get("background_image_url")
+            restore_fields[placement_field] = previous_version.get("logo_placement")
 
             await db["content_drafts"].update_one(
                 {"$or": [{"id": draft_id}, {"draft_id": draft_id}]},
@@ -609,6 +630,12 @@ RULES FOR THIS EDIT:
                 if not existing_v1:
                     # Save the original image as v1 before editing
                     print(f"[EDIT] Saving original image as v1 before first edit")
+                    if slide_index is not None:
+                        _orig_bg = slides[slide_index].get("background_image_url")
+                        _orig_placement = slides[slide_index].get("logo_placement")
+                    else:
+                        _orig_bg = draft.get("background_image_url")
+                        _orig_placement = draft.get("logo_placement")
                     await ImageEditingService.save_image_version(
                         db=db,
                         draft_id=actual_draft_id,
@@ -617,6 +644,8 @@ RULES FOR THIS EDIT:
                         edit_category="initial",
                         edit_feedback="Original generated image",
                         slide_index=slide_index,
+                        background_image_url=_orig_bg,
+                        logo_placement=_orig_placement,
                     )
 
             # Step 7: Download the current image
@@ -699,10 +728,18 @@ RULES FOR THIS EDIT:
             )
 
             # Step 10: Update draft with new image
+            # This edit redraws the WHOLE image via the AI edit API and
+            # re-pastes the logo at the brand's fixed default spot — it
+            # doesn't produce a logo-free background the way generation does.
+            # Clearing these means Move Logo correctly becomes unavailable
+            # ("regenerate to enable") instead of silently recompositing onto
+            # a background that predates this edit and discarding it.
             if slide_index is not None:
                 update_data = {
                     f"slides.{slide_index}.image_url": edited_image_url,
                     f"slides.{slide_index}.image_version": new_version,
+                    f"slides.{slide_index}.background_image_url": None,
+                    f"slides.{slide_index}.logo_placement": None,
                     "updated_at": datetime.utcnow()
                 }
                 count_field = f"slides.{slide_index}.content_edit_count"
@@ -710,6 +747,8 @@ RULES FOR THIS EDIT:
                 update_data = {
                     "image_url": edited_image_url,
                     "image_version": new_version,
+                    "background_image_url": None,
+                    "logo_placement": None,
                     "updated_at": datetime.utcnow()
                 }
                 count_field = "content_edit_count"
