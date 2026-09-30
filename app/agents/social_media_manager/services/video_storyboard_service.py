@@ -360,23 +360,36 @@ class VideoStoryboardService:
         if style_directive:
             system_prompt = f"{_SYSTEM_PROMPT}\n\n{style_directive}"
 
-        contents: List[Any] = [genai_types.Part.from_text(text="\n".join(preamble_lines))]
-
-        for i, img_data in enumerate(brand_images):
-            contents.append(genai_types.Part.from_text(text=f"Image {i} (use reference_image_index={i}):"))
-            img_bytes = VideoStoryboardService._decode_brand_image(img_data)
-            mime = VideoStoryboardService._brand_image_mime(img_data)
-            contents.append(genai_types.Part.from_bytes(data=img_bytes, mime_type=mime))
-
-        config = genai_types.GenerateContentConfig(
-            system_instruction=system_prompt,
-            temperature=0.7,
-            max_output_tokens=2000,
-            response_mime_type="application/json",
-        )
-
-        loop = asyncio.get_running_loop()
+        # Everything from here down — decoding each real uploaded image, building
+        # the multimodal request, and the actual model call — is wrapped in ONE
+        # try/except. It used to only wrap the generate_content() call itself, which
+        # left image decoding (base64.b64decode on whatever the browser actually
+        # sent) able to raise unhandled straight through the router with no fail-
+        # soft response at all — live-confirmed 2026-09-30: a real attempt against
+        # a real uploaded photo produced no POST access-log line whatsoever (only
+        # the OPTIONS preflight), meaning the request never got as far as sending
+        # ANY response back, unlike a clean model-call failure which does log a
+        # normal 400. A malformed/unexpected data URL from a real upload is a much
+        # more plausible trigger for that than a network blip on this endpoint
+        # specifically. Broadening the guard makes every real failure a logged,
+        # clean 400 instead of a request that just vanishes.
         try:
+            contents: List[Any] = [genai_types.Part.from_text(text="\n".join(preamble_lines))]
+
+            for i, img_data in enumerate(brand_images):
+                contents.append(genai_types.Part.from_text(text=f"Image {i} (use reference_image_index={i}):"))
+                img_bytes = VideoStoryboardService._decode_brand_image(img_data)
+                mime = VideoStoryboardService._brand_image_mime(img_data)
+                contents.append(genai_types.Part.from_bytes(data=img_bytes, mime_type=mime))
+
+            config = genai_types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                temperature=0.7,
+                max_output_tokens=2000,
+                response_mime_type="application/json",
+            )
+
+            loop = asyncio.get_running_loop()
             response = await loop.run_in_executor(
                 None,
                 lambda: _gemini_client.models.generate_content(
@@ -386,7 +399,7 @@ class VideoStoryboardService:
                 ),
             )
         except Exception as e:
-            print(f"[VideoStoryboardService] storyboard generation error: {e}", flush=True)
+            print(f"[VideoStoryboardService] storyboard generation error: {type(e).__name__}: {e}", flush=True)
             return {"status": False, "error": "Failed to generate storyboard."}
 
         raw = (response.text or "").strip()
