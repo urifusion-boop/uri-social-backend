@@ -454,10 +454,16 @@ async def request_manager_link(
         resp = await client.post(
             f"{api_base}/customers/{mcc_id}/customerClientLinks:mutate",
             headers=headers,
-            json={"operations": [{"create": {
+            # CustomerClientLinkService's RPC is MutateCustomerClientLink —
+            # singular, unlike bulk services (MutateCampaigns etc.) — and its
+            # request field is "operation" (singular, a create/update union),
+            # not the plural "operations" array most other mutate endpoints
+            # use. Confirmed live: sending "operations" produced Google's own
+            # "Unknown name 'operations': Cannot find field" error.
+            json={"operation": {"create": {
                 "clientCustomer": f"customers/{client_customer_id}",
                 "status": "PENDING",
-            }}]},
+            }}},
         )
     data = _parse_json_response(resp, "manager-link request")
     if "error" in data:
