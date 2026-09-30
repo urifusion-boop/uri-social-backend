@@ -371,14 +371,40 @@ def test_request_manager_link_success_sets_pending():
     db["social_connections"].docs.append(_conn_doc(manager_link_status="none", customer_id=""))
     db["social_connections"].docs.append(_admin_conn_doc())
     with patch("httpx.AsyncClient") as MockClient:
-        MockClient.return_value.__aenter__.return_value = _mock_client(
+        mock_client = _mock_client(
             [{"results": [{"resourceName": "customers/1/customerClientLinks/2"}]}]
         )
+        MockClient.return_value.__aenter__.return_value = mock_client
         result = _run(request_manager_link(db, "u1", "b1", "5551234567"))
     assert result["manager_link_status"] == "pending"
     brand_doc = next(d for d in db["social_connections"].docs if d["platform"] == "google_ads")
     assert brand_doc["manager_link_status"] == "pending"
     assert brand_doc["customer_id"] == "5551234567"
+
+
+def test_request_manager_link_sends_singular_operation_not_plural_operations():
+    """CustomerClientLinkService's RPC is MutateCustomerClientLink (singular),
+    unlike bulk services (MutateCampaigns etc.) — its request field is
+    "operation" (singular, a create/update union), not the plural
+    "operations" array most other mutate endpoints use. Confirmed live:
+    sending "operations" here produced Google's own "Unknown name
+    'operations': Cannot find field" error, so this locks the correct shape
+    in against a regression back to the plural form."""
+    db = FakeDb()
+    db["social_connections"].docs.append(_conn_doc(manager_link_status="none", customer_id=""))
+    db["social_connections"].docs.append(_admin_conn_doc())
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client(
+            [{"results": [{"resourceName": "customers/1/customerClientLinks/2"}]}]
+        )
+        MockClient.return_value.__aenter__.return_value = mock_client
+        _run(request_manager_link(db, "u1", "b1", "5551234567"))
+
+    sent_json = mock_client.post.call_args.kwargs["json"]
+    assert "operation" in sent_json, "request body must use singular 'operation'"
+    assert "operations" not in sent_json, "plural 'operations' is not a valid field for this endpoint"
+    assert sent_json["operation"]["create"]["clientCustomer"] == "customers/5551234567"
+    assert sent_json["operation"]["create"]["status"] == "PENDING"
 
 
 def test_request_manager_link_refusal_sets_refused_and_next_resolve_reports_it():
