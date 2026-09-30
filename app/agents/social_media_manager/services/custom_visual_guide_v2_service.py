@@ -951,18 +951,16 @@ Do NOT style it as a button or banner."""
                     preferred_position=logo_position,
                 )
 
-                # Upload final image with logo to Cloudinary
-                import cloudinary.uploader
-
                 # Decode base64 back to bytes for upload
                 final_image_bytes = base64.b64decode(logo_result_b64)
 
-                upload_result = cloudinary.uploader.upload(
+                from app.utils.s3_upload import upload_bytes
+
+                final_image_url = await upload_bytes(
                     final_image_bytes,
                     folder="uri-social/generated-images",
                     resource_type="image",
                 )
-                final_image_url = upload_result['secure_url']
                 print(f"[V2] ✅ Logo overlaid and uploaded: {final_image_url[:80]}...")
             else:
                 final_image_url = generated_image_url

@@ -699,11 +699,11 @@ async def generate_ad_image(content: str, brand_context: Optional[dict] = None,
         # picture). Every OTHER caller of this same engine uploads to Cloudinary first;
         # this one didn't. Mirror that here so ads always get a real hosted URL.
         if image_url and image_url.startswith("data:"):
-            from app.utils.cloudinary_upload import upload_base64
+            from app.utils.s3_upload import upload_base64
             try:
                 image_url = await upload_base64(image_url, folder="uri-social/jane-ads")
             except Exception as e:
-                print(f"[Creative] Cloudinary upload failed, cannot use for a Meta ad: {e}", flush=True)
+                print(f"[Creative] Upload failed, cannot use for a Meta ad: {e}", flush=True)
                 return None
         return image_url
     except Exception as e:

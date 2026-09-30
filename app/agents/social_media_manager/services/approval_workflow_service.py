@@ -1221,7 +1221,7 @@ class ApprovalWorkflowService:
         Returns the Cloudinary secure_url string or None on failure.
         """
         try:
-            from app.utils.cloudinary_upload import upload_base64 as _cld_upload
+            from app.utils.s3_upload import upload_base64 as _cld_upload
             url = await _cld_upload(data_url, folder="uri-social/drafts")
             print(f"📸 Image uploaded to Cloudinary: {url}")
             return url

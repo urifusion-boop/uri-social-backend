@@ -1448,7 +1448,12 @@ async def jane_google_ads_link_existing(
     """Path (a): client already has a Google Ads account — send a manager-link
     invitation. On the known 'already linked to another manager' friction, returns
     a specific, actionable message instead of a generic failure."""
-    from .google_ads_connection import AdsConnectionRequired, GoogleAdsConnectionError, request_manager_link
+    from .google_ads_connection import (
+        AdsConnectionRequired,
+        GoogleAdsConnectionError,
+        InvalidCustomerId,
+        request_manager_link,
+    )
 
     try:
         result = await request_manager_link(
@@ -1456,6 +1461,11 @@ async def jane_google_ads_link_existing(
         )
     except AdsConnectionRequired as e:
         raise HTTPException(status_code=409, detail=f"google_ads_connection_{e.state.value}")
+    except InvalidCustomerId as e:
+        # Caught before any Google API call was even made — a client input
+        # problem, not a rejected REST call, so 400 (not the 502 below).
+        print(f"ℹ️  Invalid Google Ads customer ID entered: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
     except GoogleAdsConnectionError as e:
         print(f"⚠️  Google Ads REST failure: {e}")
         raise HTTPException(status_code=502, detail=str(e))
@@ -1484,7 +1494,12 @@ async def jane_google_ads_create_account(
 ) -> dict:
     """Path (b): client has no Google Ads account — create one fresh under URI's
     MCC (auto-linked, no accept step needed)."""
-    from .google_ads_connection import AdsConnectionRequired, GoogleAdsConnectionError, create_client_account_under_mcc
+    from .google_ads_connection import (
+        AdsConnectionRequired,
+        GoogleAdsConnectionError,
+        MccNotEligibleToCreateAccounts,
+        create_client_account_under_mcc,
+    )
 
     try:
         return await create_client_account_under_mcc(
@@ -1492,6 +1507,19 @@ async def jane_google_ads_create_account(
         )
     except AdsConnectionRequired as e:
         raise HTTPException(status_code=409, detail=f"google_ads_connection_{e.state.value}")
+    except MccNotEligibleToCreateAccounts as e:
+        # Caught BEFORE the broader GoogleAdsConnectionError below — it's a
+        # subclass, so ordering matters. A distinct code (not a generic 502)
+        # so the frontend can show the actual guided next step (sign up with
+        # Google directly, then link) instead of a dead-end "try again" error.
+        print(f"ℹ️  Google Ads account-creation not yet eligible: {e}")
+        if e.newly_discovered:
+            from app.services.NotificationService import notification_service
+            try:
+                await notification_service.notify_admin_google_ads_mcc_ineligible(str(e))
+            except Exception as notify_err:
+                print(f"⚠️ Failed to send Google Ads eligibility alert: {notify_err}")
+        raise HTTPException(status_code=409, detail="google_ads_mcc_not_eligible_to_create")
     except GoogleAdsConnectionError as e:
         print(f"⚠️  Google Ads REST failure: {e}")
         raise HTTPException(status_code=502, detail=str(e))
@@ -1506,18 +1534,27 @@ async def jane_google_ads_connection_status(
     state in the body — this is a pure status read, not a pre-flight gate inside a
     build flow, so there's never a reason to raise here (unlike
     resolve_customer_id_for_launch, which does)."""
-    from .google_ads_connection import resolve_connection_state
+    from .google_ads_connection import get_admin_connection, resolve_connection_state
     from .whatsapp import get_brand_whatsapp
 
     state, conn = await resolve_connection_state(
         db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"),
     )
     wa_number = await get_brand_whatsapp(db, brand_ctx.get("brand_id"))
+    # URI-wide, not per-brand (URI has exactly one MCC) — a previously
+    # CONFIRMED result from set_mcc_creation_eligibility, not a live check on
+    # every status poll. None means never tested yet: the frontend still
+    # offers "Create one for me" optimistically in that case, same as before
+    # this existed, with the real attempt's own failure handling as the
+    # fallback if it turns out not to be eligible after all.
+    admin_conn = await get_admin_connection(db)
+    can_create_account = (admin_conn or {}).get("mcc_can_create_accounts")
     return {
         "state": state.value,
         "account_name": (conn or {}).get("account_name", ""),
         "customer_id": (conn or {}).get("customer_id", ""),
         "whatsapp_number": wa_number,
+        "can_create_account": can_create_account,
     }
 
 
