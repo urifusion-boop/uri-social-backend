@@ -243,20 +243,20 @@ def test_assemble_creative_recommendation_suppressed_when_already_video():
 # ── generate_ad_image: base64 must never reach a Meta ad (live-diagnosed) ──────
 # The shared content engine (ImageContentService._generate_platform_image) returns a
 # raw base64 data: URL, not a hosted one — every OTHER caller of that engine uploads
-# it to Cloudinary first. generate_ad_image didn't, so a real ad launch failed with
-# Meta's generic "code=1, unknown error" because Meta's crawler can't fetch a data URI.
+# it first. generate_ad_image didn't, so a real ad launch failed with Meta's generic
+# "code=1, unknown error" because Meta's crawler can't fetch a data URI.
 
-def test_generate_ad_image_uploads_base64_result_to_cloudinary():
+def test_generate_ad_image_uploads_base64_result_to_s3():
     fake_engine_result = {"status": True, "responseData": {"image_url": "data:image/webp;base64,AAAA"}}
     with patch(
         "app.agents.social_media_manager.services.image_content_service.ImageContentService._generate_platform_image",
         new=AsyncMock(return_value=fake_engine_result),
     ), patch(
-        "app.utils.cloudinary_upload.upload_base64",
-        new=AsyncMock(return_value="https://res.cloudinary.com/df8ckaeam/image/upload/v1/uri-social/jane-ads/x.png"),
+        "app.utils.s3_upload.upload_base64",
+        new=AsyncMock(return_value="https://uri-social-media-dev.s3.eu-west-1.amazonaws.com/uri-social/jane-ads/x.png"),
     ) as mock_upload:
         url = _run(generate_ad_image("a vibrant workspace"))
-    assert url == "https://res.cloudinary.com/df8ckaeam/image/upload/v1/uri-social/jane-ads/x.png"
+    assert url == "https://uri-social-media-dev.s3.eu-west-1.amazonaws.com/uri-social/jane-ads/x.png"
     mock_upload.assert_called_once()
     assert mock_upload.call_args.args[0] == "data:image/webp;base64,AAAA"
 
@@ -266,13 +266,13 @@ def test_generate_ad_image_passes_through_an_already_hosted_url():
     with patch(
         "app.agents.social_media_manager.services.image_content_service.ImageContentService._generate_platform_image",
         new=AsyncMock(return_value=fake_engine_result),
-    ), patch("app.utils.cloudinary_upload.upload_base64", new=AsyncMock()) as mock_upload:
+    ), patch("app.utils.s3_upload.upload_base64", new=AsyncMock()) as mock_upload:
         url = _run(generate_ad_image("a vibrant workspace"))
     assert url == "https://cdn.example.com/already-hosted.png"
     mock_upload.assert_not_called()
 
 
-def test_generate_ad_image_returns_none_when_cloudinary_upload_fails():
+def test_generate_ad_image_returns_none_when_upload_fails():
     # A base64 data URL is guaranteed to fail Meta's ad creation — better to fall back
     # to copy-only (the established, already-tested failure path) than hand it over.
     fake_engine_result = {"status": True, "responseData": {"image_url": "data:image/webp;base64,AAAA"}}
@@ -280,8 +280,8 @@ def test_generate_ad_image_returns_none_when_cloudinary_upload_fails():
         "app.agents.social_media_manager.services.image_content_service.ImageContentService._generate_platform_image",
         new=AsyncMock(return_value=fake_engine_result),
     ), patch(
-        "app.utils.cloudinary_upload.upload_base64",
-        new=AsyncMock(side_effect=Exception("cloudinary down")),
+        "app.utils.s3_upload.upload_base64",
+        new=AsyncMock(side_effect=Exception("upload service down")),
     ):
         url = _run(generate_ad_image("a vibrant workspace"))
     assert url is None

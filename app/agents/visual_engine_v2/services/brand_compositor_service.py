@@ -23,7 +23,7 @@ from app.agents.visual_engine_v2.config.vendor_config import VendorConfig
 from app.agents.social_media_manager.services.brand_profile_service import BrandProfileService
 from app.agents.social_media_manager.services.image_content_service import ImageContentService
 from app.agents.visual_engine_v2.services.brand_prefs_service import BrandPrefsServiceV2
-from app.utils.cloudinary_upload import upload_bytes
+from app.utils.s3_upload import upload_bytes
 import asyncio
 import base64
 import httpx

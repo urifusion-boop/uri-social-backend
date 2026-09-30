@@ -94,7 +94,7 @@ async def _download_twilio_media(media_url: str, content_type: Optional[str] = N
         data_url = f"data:{ct};base64,{b64}"
 
         try:
-            from app.utils.cloudinary_upload import upload_base64
+            from app.utils.s3_upload import upload_base64
             public_url = await upload_base64(data_url, folder="uri-social/whatsapp-uploads")
             if public_url and public_url.endswith(".webp"):
                 public_url = public_url[:-5] + ".jpg"
@@ -2256,7 +2256,7 @@ class WhatsAppFlowService:
         # WhatsApp requires JPEG/PNG — convert .webp Cloudinary URLs to .jpg
         if raw_url.startswith("data:"):
             try:
-                from app.utils.cloudinary_upload import upload_base64
+                from app.utils.s3_upload import upload_base64
                 public_url = await upload_base64(raw_url, folder="uri-social/whatsapp")
                 # Cloudinary serves .webp by default but WhatsApp rejects it (Twilio error 63021)
                 # Force JPEG by swapping the extension

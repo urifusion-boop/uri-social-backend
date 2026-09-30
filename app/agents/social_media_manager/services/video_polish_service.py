@@ -709,26 +709,27 @@ def _credit_amount(duration_seconds: float) -> float:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Cloudinary upload
+# S3 upload
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def _upload_to_cloudinary(video_bytes: bytes, filename: str) -> str:
-    """Upload to Cloudinary and return the public URL."""
+async def _upload_to_s3(video_bytes: bytes, filename: str) -> str:
+    """Upload to S3 and return the public URL. Uses boto3's managed transfer
+    (upload_fileobj), which automatically does a multipart upload above its
+    size threshold — the same reliability cloudinary.uploader.upload_large
+    existed for with large video source files."""
     import io
-    import cloudinary.uploader
+    from app.utils.s3_upload import _S3_BUCKET, _S3_REGION, _s3_client
+
     loop = asyncio.get_running_loop()
     buf = io.BytesIO(video_bytes)
-    buf.name = f"{filename}.mp4"
-    result = await loop.run_in_executor(
+    key = f"uri_polish_source/{filename}.mp4"
+    await loop.run_in_executor(
         None,
-        lambda: cloudinary.uploader.upload_large(
-            buf,
-            resource_type="video",
-            folder="uri_polish_source",
-            public_id=filename,
+        lambda: _s3_client.upload_fileobj(
+            buf, _S3_BUCKET, key, ExtraArgs={"ContentType": "video/mp4"}
         ),
     )
-    return result["secure_url"]
+    return f"https://{_S3_BUCKET}.s3.{_S3_REGION}.amazonaws.com/{key}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -887,7 +888,7 @@ class VideoPolishService:
 
             # ── Stage 1c: upload to Cloudinary ────────────────────────────
             await update(job_id, db, progress=20, status_message="Uploading to cloud storage…")
-            source_url = await _upload_to_cloudinary(processed_bytes, f"polish_{job_id}")
+            source_url = await _upload_to_s3(processed_bytes, f"polish_{job_id}")
             await update(job_id, db, source_video_url=source_url, progress=30)
 
             # ── Stage 1d: deduct credits ───────────────────────────────────

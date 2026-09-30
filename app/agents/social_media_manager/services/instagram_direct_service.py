@@ -194,7 +194,7 @@ class InstagramDirectService:
             # Facebook CDN URLs for unpublished photos can have access restrictions
             # that prevent Meta's crawler from fetching them (container sits with no status).
             try:
-                from app.utils.cloudinary_upload import upload_bytes as _cld_bytes
+                from app.utils.s3_upload import upload_bytes as _cld_bytes
                 rehosted = await _cld_bytes(jpeg_bytes, folder="uri-social/instagram")
             except Exception as _cld_err:
                 print(f"⚠️ Cloudinary upload failed: {_cld_err}")
@@ -306,7 +306,7 @@ class InstagramDirectService:
                     print(f"⚠️ Could not download slide {i} image — skipping")
                     continue
                 try:
-                    from app.utils.cloudinary_upload import upload_bytes as _cld_bytes
+                    from app.utils.s3_upload import upload_bytes as _cld_bytes
                     cdn_url = await _cld_bytes(jpeg_bytes, folder="uri-social/instagram")
                 except Exception as _cld_err:
                     print(f"⚠️ Cloudinary upload failed for slide {i}: {_cld_err}")

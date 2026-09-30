@@ -16,7 +16,7 @@ import httpx
 from openai import AsyncOpenAI
 
 from app.agents.visual_engine_v2.config.vendor_config import VendorConfig
-from app.utils.cloudinary_upload import upload_bytes
+from app.utils.s3_upload import upload_bytes
 
 
 class ImageGenerationError(Exception):
