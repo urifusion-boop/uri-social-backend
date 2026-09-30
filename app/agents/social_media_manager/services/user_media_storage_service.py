@@ -3,7 +3,7 @@
 import base64
 import re
 from typing import Any, Dict, List
-from app.utils.cloudinary_upload import upload_bytes
+from app.utils.s3_upload import upload_bytes
 
 
 class UserMediaStorageService:

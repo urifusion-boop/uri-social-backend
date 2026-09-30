@@ -456,7 +456,7 @@ async def render_document(
         data_url = f"data:image/{request.output_format};base64,{image_base64}"
 
         # Optionally upload to Cloudinary for permanent storage
-        from app.utils.cloudinary_upload import upload_base64
+        from app.utils.s3_upload import upload_base64
         permanent_url = await upload_base64(data_url, folder="uri-social/canvas-renders")
 
         return UriResponse.get_single_data_response("document_rendered", {

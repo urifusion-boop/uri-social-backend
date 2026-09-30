@@ -450,7 +450,7 @@ class ImageContentService:
                         if raw_image_url and raw_image_url.startswith("data:"):
                             print(f"🔄 Uploading image to Cloudinary for draft {draft['id']} ({draft['platform']})...")
                             try:
-                                from app.utils.cloudinary_upload import upload_base64
+                                from app.utils.s3_upload import upload_base64
                                 stored_url = await upload_base64(raw_image_url, folder="uri-social/content-drafts")
                                 print(f"☁️  ✅ CLOUDINARY UPLOAD SUCCESS!")
                                 print(f"   📍 Draft ID: {draft['id']}")
@@ -586,7 +586,7 @@ class ImageContentService:
             if raw_url and raw_url.startswith("data:"):
                 print(f"🔄 Uploading REGENERATED image to Cloudinary for draft {draft_id}...")
                 try:
-                    from app.utils.cloudinary_upload import upload_base64
+                    from app.utils.s3_upload import upload_base64
                     stored_url = await upload_base64(raw_url, folder="uri-social/content-drafts")
                     print(f"☁️  ✅ CLOUDINARY REGENERATION UPLOAD SUCCESS!")
                     print(f"   📍 Draft ID: {draft_id}")
@@ -2896,7 +2896,7 @@ Answer with exactly one word: "yes" or "no"."""
         import io
         import httpx
         from PIL import Image
-        from app.utils.cloudinary_upload import upload_bytes
+        from app.utils.s3_upload import upload_bytes
 
         target_w, target_h = 1080, 1920
         try:

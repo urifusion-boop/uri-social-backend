@@ -38,6 +38,7 @@ how to authenticate as them (there is no "as them").
 """
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Optional
@@ -90,6 +91,66 @@ class AdsConnectionRequired(Exception):
 class GoogleAdsConnectionError(Exception):
     """An OAuth token exchange/refresh call, or a manager-link/create-account call,
     returned an error Google didn't give us a more specific typed state for."""
+
+
+class InvalidCustomerId(GoogleAdsConnectionError):
+    """The customer ID the brand entered isn't a valid Google Ads Customer ID
+    (wrong length once hyphens are stripped) — caught before any network call,
+    so this is a client input problem, not a Google API failure. Kept as its
+    own type so the router can return 400 with a clean message instead of the
+    502 it uses for an actual rejected REST call."""
+
+
+class MccNotEligibleToCreateAccounts(GoogleAdsConnectionError):
+    """CreateCustomerClient specifically (not linking) rejected with Google's
+    account-creation eligibility gate — live-confirmed error text: "This manager
+    account can't create new accounts. You'll need to link a Google Ads account
+    that has spent more than $1,000 and has a history of policy compliance."
+
+    This is a real Google anti-fraud restriction on brand-new Manager Accounts
+    (MCCs), not a bug: Google won't let an MCC with no proven history mint fresh
+    child accounts on demand, since that's exactly the pattern a spam/fraud
+    operation would use to mass-produce disposable ad accounts. It has nothing to
+    do with OAuth verification or developer-token access level (both confirmed
+    separately approved) — it's gated purely on whether the MCC already has at
+    least one linked account with real spend and clean policy history.
+
+    Distinct from every other GoogleAdsConnectionError because the correct
+    response isn't "retry" or "fix your credentials" — it's "link an existing,
+    qualifying account instead (to any brand-new client, not necessarily this
+    one), which both gets this brand onto Google Ads today AND is the one thing
+    that unlocks CreateCustomerClient for every brand after that."
+    """
+
+    def __init__(self, message: str, newly_discovered: bool = False) -> None:
+        super().__init__(message)
+        # True only the first time this MCC is confirmed ineligible (the
+        # stored flag actually flipped) — lets the caller alert operators
+        # once per real discovery instead of on every subsequent attempt
+        # that hits the same already-known restriction.
+        self.newly_discovered = newly_discovered
+
+
+# Google Ads REST error envelopes bury the machine-readable reason inside
+# errors[].errorCode, whose actual KEY varies by error category (customerError,
+# authorizationError, quotaError, ...) — there's no single fixed field name to
+# read. Matching on the raw JSON text for either the enum Google is known to use
+# for this (CREATION_DENIED_INELIGIBLE_MCC / CREATION_DENIED) or the stable
+# human-readable phrase from the live-confirmed message is deliberately
+# redundant: if Google ever changes the wording, the enum match still catches
+# it, and vice versa.
+_INELIGIBLE_MCC_SIGNATURES = (
+    "ineligible_mcc",
+    "creation_denied",
+    "can't create new accounts",
+    "cannot create new accounts",
+    "can not create new accounts",
+)
+
+
+def _is_ineligible_mcc_error(raw_error_json: str) -> bool:
+    lowered = raw_error_json.lower()
+    return any(sig in lowered for sig in _INELIGIBLE_MCC_SIGNATURES)
 
 
 def _brand_scope(user_id: Optional[str], brand_id: Optional[str]) -> dict:
@@ -182,6 +243,34 @@ async def save_admin_connection(db, tokens: dict) -> None:
         # blank on a routine refresh.
         update["refresh_token"] = tokens["refresh_token"]
     await db[CONNECTIONS].update_one({"id": _ADMIN_CONN_ID}, {"$set": update}, upsert=True)
+
+
+async def set_mcc_creation_eligibility(db, eligible: bool, reason: str = "") -> bool:
+    """Persists whether URI's MCC can currently mint fresh client accounts, onto
+    the same single admin doc (URI has exactly one MCC — this is a URI-wide fact,
+    never per-brand). Read back by the connection-status endpoint so the frontend
+    can hide/show "Create one for me" based on a REAL, previously-confirmed
+    result instead of optimistically trying it and eating the round trip on
+    every brand-new client (see MccNotEligibleToCreateAccounts).
+
+    Returns True when this is a NEW discovery (the stored value actually
+    changed) — the caller uses this to decide whether an ops alert is
+    warranted, so a string of identical failed attempts doesn't spam the same
+    alert repeatedly.
+    """
+    existing = await get_admin_connection(db)
+    previous = (existing or {}).get("mcc_can_create_accounts")
+    changed = previous != eligible
+    await db[CONNECTIONS].update_one(
+        {"id": _ADMIN_CONN_ID},
+        {"$set": {
+            "mcc_can_create_accounts": eligible,
+            "mcc_eligibility_checked_at": datetime.now(timezone.utc),
+            "mcc_eligibility_failure_reason": reason if not eligible else "",
+        }},
+        upsert=True,
+    )
+    return changed
 
 
 async def get_admin_valid_access_token(db) -> str:
@@ -357,6 +446,26 @@ async def request_manager_link(
     friction — a previous agency's link was never removed), stores WHY so
     resolve_connection_state reports MANAGER_LINK_REFUSED with a precise, actionable
     reason next time, instead of retrying blindly."""
+    # Google Ads resource names take a plain digit string (customers/9297032641),
+    # but Google's OWN UI displays customer IDs hyphenated (929-703-2641) — exactly
+    # the format the account-linking input's own placeholder suggests, and exactly
+    # what a user would naturally copy-paste from their Google Ads dashboard.
+    # Confirmed live: sending the hyphenated form produced Google's own "part of
+    # the resource name is invalid" error. Accept either form (with or without
+    # hyphens) — strip whatever's there, then validate what's left, so both a
+    # clean 10-digit paste and the dashed display format work identically, and
+    # anything else fails fast with a clear message instead of a wasted round
+    # trip to Google's API. Stripped once here, at the single point this ever
+    # enters the system, so the customer_id stored on the connection doc (and
+    # therefore every later Google Ads API call that reads it back) is always
+    # the clean, API-compatible form — not just this one request.
+    client_customer_id = "".join(ch for ch in client_customer_id if ch.isdigit())
+    if len(client_customer_id) != 10:
+        raise InvalidCustomerId(
+            "That doesn't look like a valid Google Ads Customer ID — it should be "
+            "10 digits, e.g. 123-456-7890 (hyphens are fine, they're just ignored)."
+        )
+
     conn = await get_google_ads_connection(db, user_id, brand_id)
     if not conn:
         raise AdsConnectionRequired(ConnectionState.NONE)
@@ -373,10 +482,16 @@ async def request_manager_link(
         resp = await client.post(
             f"{api_base}/customers/{mcc_id}/customerClientLinks:mutate",
             headers=headers,
-            json={"operations": [{"create": {
+            # CustomerClientLinkService's RPC is MutateCustomerClientLink —
+            # singular, unlike bulk services (MutateCampaigns etc.) — and its
+            # request field is "operation" (singular, a create/update union),
+            # not the plural "operations" array most other mutate endpoints
+            # use. Confirmed live: sending "operations" produced Google's own
+            # "Unknown name 'operations': Cannot find field" error.
+            json={"operation": {"create": {
                 "clientCustomer": f"customers/{client_customer_id}",
                 "status": "PENDING",
-            }}]},
+            }}},
         )
     data = _parse_json_response(resp, "manager-link request")
     if "error" in data:
@@ -440,9 +555,21 @@ async def create_client_account_under_mcc(
             }},
         )
     data = _parse_json_response(resp, "create client account")
+    if "error" in data and _is_ineligible_mcc_error(json.dumps(data.get("error", {}))):
+        reason = (
+            "This manager account can't create new accounts yet — it needs at least one linked "
+            "account with real ad spend and a clean policy history first."
+        )
+        newly_discovered = await set_mcc_creation_eligibility(db, False, reason)
+        raise MccNotEligibleToCreateAccounts(reason, newly_discovered=newly_discovered)
     _raise_for_error(data, "create client account")
     resource_name = data.get("resourceName", "")
     new_customer_id = resource_name.split("/")[-1] if resource_name else ""
+
+    # A real success is proof-positive the MCC IS eligible — clears the gate
+    # for every brand after this one, not just this brand, without needing a
+    # separate manual bootstrap step to be remembered/run.
+    await set_mcc_creation_eligibility(db, True)
 
     await db[CONNECTIONS].update_one(
         {"id": conn["id"]},

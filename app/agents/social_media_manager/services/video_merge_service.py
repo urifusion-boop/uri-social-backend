@@ -6,7 +6,7 @@ from typing import List
 
 import httpx
 
-from app.utils.cloudinary_upload import upload_bytes
+from app.utils.s3_upload import upload_bytes
 
 
 class VideoMergeService:

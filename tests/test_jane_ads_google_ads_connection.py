@@ -21,6 +21,9 @@ from app.agents.jane_ads.google_ads_connection import (
     AdsConnectionRequired,
     ConnectionState,
     GoogleAdsConnectionError,
+    InvalidCustomerId,
+    MccNotEligibleToCreateAccounts,
+    _is_ineligible_mcc_error,
     create_client_account_under_mcc,
     exchange_code_for_tokens,
     get_admin_valid_access_token,
@@ -29,6 +32,7 @@ from app.agents.jane_ads.google_ads_connection import (
     request_manager_link,
     resolve_connection_state,
     resolve_customer_id_for_launch,
+    set_mcc_creation_eligibility,
 )
 
 
@@ -368,14 +372,118 @@ def test_request_manager_link_success_sets_pending():
     db["social_connections"].docs.append(_conn_doc(manager_link_status="none", customer_id=""))
     db["social_connections"].docs.append(_admin_conn_doc())
     with patch("httpx.AsyncClient") as MockClient:
-        MockClient.return_value.__aenter__.return_value = _mock_client(
+        mock_client = _mock_client(
             [{"results": [{"resourceName": "customers/1/customerClientLinks/2"}]}]
         )
+        MockClient.return_value.__aenter__.return_value = mock_client
         result = _run(request_manager_link(db, "u1", "b1", "5551234567"))
     assert result["manager_link_status"] == "pending"
     brand_doc = next(d for d in db["social_connections"].docs if d["platform"] == "google_ads")
     assert brand_doc["manager_link_status"] == "pending"
     assert brand_doc["customer_id"] == "5551234567"
+
+
+def test_request_manager_link_sends_singular_operation_not_plural_operations():
+    """CustomerClientLinkService's RPC is MutateCustomerClientLink (singular),
+    unlike bulk services (MutateCampaigns etc.) — its request field is
+    "operation" (singular, a create/update union), not the plural
+    "operations" array most other mutate endpoints use. Confirmed live:
+    sending "operations" here produced Google's own "Unknown name
+    'operations': Cannot find field" error, so this locks the correct shape
+    in against a regression back to the plural form."""
+    db = FakeDb()
+    db["social_connections"].docs.append(_conn_doc(manager_link_status="none", customer_id=""))
+    db["social_connections"].docs.append(_admin_conn_doc())
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client(
+            [{"results": [{"resourceName": "customers/1/customerClientLinks/2"}]}]
+        )
+        MockClient.return_value.__aenter__.return_value = mock_client
+        _run(request_manager_link(db, "u1", "b1", "5551234567"))
+
+    sent_json = mock_client.post.call_args.kwargs["json"]
+    assert "operation" in sent_json, "request body must use singular 'operation'"
+    assert "operations" not in sent_json, "plural 'operations' is not a valid field for this endpoint"
+    assert sent_json["operation"]["create"]["clientCustomer"] == "customers/5551234567"
+    assert sent_json["operation"]["create"]["status"] == "PENDING"
+
+
+def test_request_manager_link_strips_hyphens_from_customer_id():
+    """Google Ads displays customer IDs hyphenated (929-703-2641) — exactly what
+    the account-linking input's own placeholder suggests entering, and exactly
+    what a user would copy-paste from their Google Ads dashboard — but the
+    resource name Google's API expects is digits only. Confirmed live: the
+    hyphenated form produced "'929-703-2641' part of the resource name is
+    invalid." This must be stripped both in the outgoing request AND in what
+    gets stored, since every later Google Ads API call reads customer_id back
+    off the connection doc."""
+    db = FakeDb()
+    db["social_connections"].docs.append(_conn_doc(manager_link_status="none", customer_id=""))
+    db["social_connections"].docs.append(_admin_conn_doc())
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client(
+            [{"results": [{"resourceName": "customers/1/customerClientLinks/2"}]}]
+        )
+        MockClient.return_value.__aenter__.return_value = mock_client
+        result = _run(request_manager_link(db, "u1", "b1", "929-703-2641"))
+
+    assert result["manager_link_status"] == "pending"
+    sent_json = mock_client.post.call_args.kwargs["json"]
+    assert sent_json["operation"]["create"]["clientCustomer"] == "customers/9297032641"
+
+    brand_doc = next(d for d in db["social_connections"].docs if d["platform"] == "google_ads")
+    assert brand_doc["customer_id"] == "9297032641", "stored customer_id must also be digits-only"
+
+
+def test_request_manager_link_accepts_digits_only_customer_id_unchanged():
+    """The other half of "accept both cases": a user who already typed just the
+    10 digits, no hyphens, must work identically — not just the hyphenated
+    form."""
+    db = FakeDb()
+    db["social_connections"].docs.append(_conn_doc(manager_link_status="none", customer_id=""))
+    db["social_connections"].docs.append(_admin_conn_doc())
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client(
+            [{"results": [{"resourceName": "customers/1/customerClientLinks/2"}]}]
+        )
+        MockClient.return_value.__aenter__.return_value = mock_client
+        result = _run(request_manager_link(db, "u1", "b1", "9297032641"))
+
+    assert result["manager_link_status"] == "pending"
+    sent_json = mock_client.post.call_args.kwargs["json"]
+    assert sent_json["operation"]["create"]["clientCustomer"] == "customers/9297032641"
+
+
+def test_request_manager_link_rejects_too_short_customer_id_before_any_network_call():
+    db = FakeDb()
+    db["social_connections"].docs.append(_conn_doc(manager_link_status="none", customer_id=""))
+    db["social_connections"].docs.append(_admin_conn_doc())
+    with patch("httpx.AsyncClient") as MockClient:
+        mock_client = _mock_client([])
+        MockClient.return_value.__aenter__.return_value = mock_client
+        try:
+            _run(request_manager_link(db, "u1", "b1", "123-456"))
+            assert False, "expected InvalidCustomerId"
+        except InvalidCustomerId as e:
+            assert "10 digits" in str(e)
+    mock_client.post.assert_not_called()
+
+
+def test_request_manager_link_rejects_non_numeric_garbage():
+    db = FakeDb()
+    db["social_connections"].docs.append(_conn_doc(manager_link_status="none", customer_id=""))
+    db["social_connections"].docs.append(_admin_conn_doc())
+    try:
+        _run(request_manager_link(db, "u1", "b1", "not-a-customer-id"))
+        assert False, "expected InvalidCustomerId"
+    except InvalidCustomerId:
+        pass
+
+
+def test_invalid_customer_id_is_a_google_ads_connection_error_subclass():
+    """The router relies on this to fall through to the generic 502 handler
+    for any InvalidCustomerId it doesn't explicitly catch first."""
+    assert issubclass(InvalidCustomerId, GoogleAdsConnectionError)
 
 
 def test_request_manager_link_refusal_sets_refused_and_next_resolve_reports_it():
@@ -421,3 +529,158 @@ def test_create_client_account_under_mcc_auto_links():
     brand_doc = next(d for d in db["social_connections"].docs if d["platform"] == "google_ads")
     assert brand_doc["manager_link_status"] == "active"
     assert brand_doc["created_account_by_uri"] is True
+
+
+# ── MCC-not-eligible-to-create detection — live-confirmed Google restriction:
+# a brand-new Manager Account can't mint fresh client accounts until it has at
+# least one linked account with real spend + clean policy history. ────────────
+
+def test_is_ineligible_mcc_error_matches_the_live_confirmed_message():
+    raw = (
+        '{"message": "This manager account can\'t create new accounts. You\'ll need to '
+        'link a Google Ads account that has spent more than $1,000 and has a history of '
+        'policy compliance."}'
+    )
+    assert _is_ineligible_mcc_error(raw) is True
+
+
+def test_is_ineligible_mcc_error_matches_the_enum_even_without_the_phrase():
+    # Belt-and-suspenders: still catches it if Google's wording changes but the
+    # machine-readable enum is present, or vice versa.
+    raw = '{"errorCode": {"customerError": "CREATION_DENIED_INELIGIBLE_MCC"}}'
+    assert _is_ineligible_mcc_error(raw) is True
+
+
+def test_is_ineligible_mcc_error_does_not_false_positive_on_unrelated_errors():
+    raw = '{"message": "The customer_id you supplied does not exist."}'
+    assert _is_ineligible_mcc_error(raw) is False
+
+
+def test_create_client_account_under_mcc_raises_typed_exception_on_ineligible_mcc():
+    db = FakeDb()
+    db["social_connections"].docs.append(_conn_doc(manager_link_status="none", customer_id=""))
+    db["social_connections"].docs.append(_admin_conn_doc())
+    with patch("httpx.AsyncClient") as MockClient:
+        MockClient.return_value.__aenter__.return_value = _mock_client([{
+            "error": {
+                "message": (
+                    "This manager account can't create new accounts. You'll need to link a "
+                    "Google Ads account that has spent more than $1,000 and has a history of "
+                    "policy compliance."
+                ),
+            },
+        }])
+        try:
+            _run(create_client_account_under_mcc(db, "u1", "b1", "New Brand Ads"))
+            assert False, "expected MccNotEligibleToCreateAccounts"
+        except MccNotEligibleToCreateAccounts:
+            pass
+        except GoogleAdsConnectionError:
+            raise AssertionError(
+                "raised the generic GoogleAdsConnectionError instead of the typed "
+                "MccNotEligibleToCreateAccounts subclass — the router can't tell the two "
+                "apart, so the frontend would show a dead-end error instead of the guided "
+                "sign-up-then-link flow"
+            )
+
+    # Nothing should have been written to the brand's connection doc — a
+    # failed creation attempt must not look like it succeeded.
+    brand_doc = next(d for d in db["social_connections"].docs if d["platform"] == "google_ads")
+    assert brand_doc.get("manager_link_status") == "none"
+    assert "created_account_by_uri" not in brand_doc
+
+
+def test_create_client_account_under_mcc_persists_ineligible_flag_and_marks_newly_discovered():
+    db = FakeDb()
+    db["social_connections"].docs.append(_conn_doc(manager_link_status="none", customer_id=""))
+    db["social_connections"].docs.append(_admin_conn_doc())  # mcc_can_create_accounts not set yet
+    with patch("httpx.AsyncClient") as MockClient:
+        MockClient.return_value.__aenter__.return_value = _mock_client([{
+            "error": {"message": "This manager account can't create new accounts."},
+        }])
+        try:
+            _run(create_client_account_under_mcc(db, "u1", "b1", "New Brand Ads"))
+            assert False, "expected MccNotEligibleToCreateAccounts"
+        except MccNotEligibleToCreateAccounts as e:
+            assert e.newly_discovered is True  # unset -> False is a real change
+
+    admin_doc = next(d for d in db["social_connections"].docs if d["platform"] == "google_ads_admin")
+    assert admin_doc["mcc_can_create_accounts"] is False
+    assert admin_doc["mcc_eligibility_failure_reason"]
+
+
+def test_create_client_account_under_mcc_second_failure_is_not_newly_discovered():
+    """The whole point of persisting the flag: don't alert operators again for
+    every subsequent attempt that hits the exact same, already-known restriction."""
+    db = FakeDb()
+    db["social_connections"].docs.append(_conn_doc(manager_link_status="none", customer_id=""))
+    db["social_connections"].docs.append(_admin_conn_doc(mcc_can_create_accounts=False))
+    with patch("httpx.AsyncClient") as MockClient:
+        MockClient.return_value.__aenter__.return_value = _mock_client([{
+            "error": {"message": "This manager account can't create new accounts."},
+        }])
+        try:
+            _run(create_client_account_under_mcc(db, "u1", "b1", "New Brand Ads"))
+            assert False, "expected MccNotEligibleToCreateAccounts"
+        except MccNotEligibleToCreateAccounts as e:
+            assert e.newly_discovered is False
+
+
+def test_create_client_account_under_mcc_success_marks_eligible_true():
+    db = FakeDb()
+    db["social_connections"].docs.append(_conn_doc(manager_link_status="none", customer_id=""))
+    db["social_connections"].docs.append(_admin_conn_doc(mcc_can_create_accounts=False))
+    with patch("httpx.AsyncClient") as MockClient:
+        MockClient.return_value.__aenter__.return_value = _mock_client(
+            [{"resourceName": "customers/777888999"}]
+        )
+        _run(create_client_account_under_mcc(db, "u1", "b1", "New Brand Ads"))
+
+    admin_doc = next(d for d in db["social_connections"].docs if d["platform"] == "google_ads_admin")
+    assert admin_doc["mcc_can_create_accounts"] is True
+    assert admin_doc["mcc_eligibility_failure_reason"] == ""
+
+
+# ── set_mcc_creation_eligibility ─────────────────────────────────────────────
+
+def test_set_mcc_creation_eligibility_reports_changed_on_first_write():
+    db = FakeDb()
+    db["social_connections"].docs.append(_admin_conn_doc())
+    changed = _run(set_mcc_creation_eligibility(db, False, "some reason"))
+    assert changed is True
+
+
+def test_set_mcc_creation_eligibility_reports_unchanged_on_repeat_same_value():
+    db = FakeDb()
+    db["social_connections"].docs.append(_admin_conn_doc(mcc_can_create_accounts=False))
+    changed = _run(set_mcc_creation_eligibility(db, False, "same reason again"))
+    assert changed is False
+
+
+def test_set_mcc_creation_eligibility_clears_reason_on_eligible():
+    db = FakeDb()
+    db["social_connections"].docs.append(_admin_conn_doc(mcc_can_create_accounts=False))
+    _run(set_mcc_creation_eligibility(db, True))
+    admin_doc = db["social_connections"].docs[0]
+    assert admin_doc["mcc_can_create_accounts"] is True
+    assert admin_doc["mcc_eligibility_failure_reason"] == ""
+
+
+def test_create_client_account_under_mcc_other_errors_still_raise_the_generic_type():
+    """Regression guard: only the ineligible-MCC signature should route through the
+    new typed exception — every other real Google error must still surface as the
+    plain GoogleAdsConnectionError, unchanged."""
+    db = FakeDb()
+    db["social_connections"].docs.append(_conn_doc(manager_link_status="none", customer_id=""))
+    db["social_connections"].docs.append(_admin_conn_doc())
+    with patch("httpx.AsyncClient") as MockClient:
+        MockClient.return_value.__aenter__.return_value = _mock_client(
+            [{"error": {"message": "The descriptive_name is required."}}]
+        )
+        try:
+            _run(create_client_account_under_mcc(db, "u1", "b1", "New Brand Ads"))
+            assert False, "expected GoogleAdsConnectionError"
+        except MccNotEligibleToCreateAccounts:
+            raise AssertionError("an unrelated error was misclassified as the ineligible-MCC case")
+        except GoogleAdsConnectionError as e:
+            assert "descriptive_name is required" in str(e)

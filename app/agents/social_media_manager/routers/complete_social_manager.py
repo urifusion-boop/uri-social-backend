@@ -1075,7 +1075,7 @@ Choose the position that will cause the LEAST visual disruption."""
                     buf.seek(0)
 
                     # Re-upload to Cloudinary
-                    from app.utils.cloudinary_upload import upload_bytes
+                    from app.utils.s3_upload import upload_bytes
                     folder = f"uri-social/user-uploads/{user_id}/processed"
                     processed_url = await upload_bytes(buf.getvalue(), folder=folder, resource_type="image")
                     processed_media_urls.append(processed_url)
@@ -5492,7 +5492,7 @@ async def upload_brand_logo(
         if len(contents) > 5 * 1024 * 1024:
             raise HTTPException(status_code=400, detail="Logo file must be under 5 MB.")
 
-        from app.utils.cloudinary_upload import upload_bytes
+        from app.utils.s3_upload import upload_bytes
         logo_url = await upload_bytes(contents, folder="uri-social/logos")
 
         await db["brand_profiles"].update_one(
@@ -5538,7 +5538,7 @@ async def upload_sample_template(
         if len(contents) > 10 * 1024 * 1024:
             raise HTTPException(status_code=400, detail="File must be under 10 MB.")
 
-        from app.utils.cloudinary_upload import upload_bytes
+        from app.utils.s3_upload import upload_bytes
         resource_type = "raw" if file.content_type == "application/pdf" else "image"
         file_url = await upload_bytes(contents, folder="uri-social/templates", resource_type=resource_type)
 
@@ -6215,7 +6215,7 @@ async def _generate_image_bg(
         if raw_url and raw_url.startswith("data:"):
             print(f"🔄 Uploading image to Cloudinary for draft {draft_id}...")
             try:
-                from app.utils.cloudinary_upload import upload_base64
+                from app.utils.s3_upload import upload_base64
                 stored_url = await upload_base64(raw_url, folder="uri-social/content-drafts")
                 print(f"☁️  ✅ CLOUDINARY UPLOAD SUCCESS!")
                 print(f"   📍 Draft ID: {draft_id}")
@@ -6433,7 +6433,7 @@ async def _generate_blog_image_bg(
         if raw_url and raw_url.startswith("data:"):
             print(f"🔄 Uploading blog image to Cloudinary for draft {draft_id}...")
             try:
-                from app.utils.cloudinary_upload import upload_base64
+                from app.utils.s3_upload import upload_base64
                 stored_url = await upload_base64(raw_url, folder="uri-social/blog-images")
                 print(f"☁️  ✅ CLOUDINARY UPLOAD SUCCESS!")
                 print(f"   📍 Draft ID: {draft_id}")
@@ -6993,7 +6993,7 @@ async def upload_custom_font(
         print(f"[CUSTOM_FONT] Uploading font: {file.filename} ({file_size_mb:.2f}MB)")
 
         # Upload to Cloudinary
-        from app.utils.cloudinary_upload import upload_bytes
+        from app.utils.s3_upload import upload_bytes
 
         font_url = await upload_bytes(
             file_bytes,
@@ -7429,7 +7429,7 @@ async def upload_chat_image(
     token: dict = Depends(JWTBearer()),
 ):
     """Upload an image for use in the agent chat. Returns a Cloudinary URL."""
-    from app.utils.cloudinary_upload import upload_bytes
+    from app.utils.s3_upload import upload_bytes
 
     user_id = _get_user_id(token)
     if not user_id:

@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional
 from app.core.config import settings
 from app.database import get_db
 from app.services.AIService import client as openai_client
-from app.utils.cloudinary_upload import upload_bytes
+from app.utils.s3_upload import upload_bytes
 
 # Storyboard WRITING (this step only — frame images below stay on gpt-image-2,
 # scene animation stays on Veo/Kling/Seedance) moved off gpt-5.4 onto Gemini
