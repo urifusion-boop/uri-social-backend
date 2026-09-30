@@ -42,8 +42,12 @@ class LogoRepositionService:
             if slide_index < 0 or slide_index >= len(slides):
                 return UriResponse.error_response("Invalid slide_index")
             background_url = slides[slide_index].get("background_image_url")
+            current_image_url = slides[slide_index].get("image_url")
+            current_version = slides[slide_index].get("image_version", 1)
         else:
             background_url = draft.get("background_image_url")
+            current_image_url = draft.get("image_url")
+            current_version = draft.get("image_version", 1)
 
         if not background_url:
             return UriResponse.error_response(
@@ -84,13 +88,49 @@ class LogoRepositionService:
 
         placement = {"x": x, "y": y, "width": width, "height": height}
         actual_draft_id = draft.get("id") or draft.get("draft_id")
+
+        # Plug into the same version history the chat-edit flow uses, so the
+        # existing Undo button correctly covers a logo move too — without
+        # this, moving the logo never bumped image_version, so Undo either
+        # stayed hidden or (worse, if a version already existed) reverted
+        # past this move without ever having recorded it.
+        from .image_editing_service import ImageEditingService
+        if current_version == 1 and current_image_url:
+            existing_v1 = await db["image_versions"].find_one({
+                "draft_id": actual_draft_id, "slide_index": slide_index, "version_number": 1
+            })
+            if not existing_v1:
+                prior_placement = (
+                    slides[slide_index].get("logo_placement") if slide_index is not None
+                    else draft.get("logo_placement")
+                )
+                await ImageEditingService.save_image_version(
+                    db=db, draft_id=actual_draft_id, version_number=1,
+                    image_url=current_image_url, edit_category="initial",
+                    edit_feedback="Original generated image", slide_index=slide_index,
+                    background_image_url=background_url, logo_placement=prior_placement,
+                )
+
+        new_version = current_version + 1
+        await ImageEditingService.save_image_version(
+            db=db, draft_id=actual_draft_id, version_number=new_version,
+            image_url=new_image_url, edit_category="logo_reposition",
+            edit_feedback=f"Moved logo to x={x}, y={y}, width={width}, height={height}",
+            slide_index=slide_index, background_image_url=background_url, logo_placement=placement,
+        )
+
         if slide_index is not None:
             update_fields = {
                 f"slides.{slide_index}.image_url": new_image_url,
                 f"slides.{slide_index}.logo_placement": placement,
+                f"slides.{slide_index}.image_version": new_version,
             }
         else:
-            update_fields = {"image_url": new_image_url, "logo_placement": placement}
+            update_fields = {
+                "image_url": new_image_url,
+                "logo_placement": placement,
+                "image_version": new_version,
+            }
 
         await db["content_drafts"].update_one({"id": actual_draft_id}, {"$set": update_fields})
 
