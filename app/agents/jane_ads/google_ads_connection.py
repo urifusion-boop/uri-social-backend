@@ -93,6 +93,14 @@ class GoogleAdsConnectionError(Exception):
     returned an error Google didn't give us a more specific typed state for."""
 
 
+class InvalidCustomerId(GoogleAdsConnectionError):
+    """The customer ID the brand entered isn't a valid Google Ads Customer ID
+    (wrong length once hyphens are stripped) — caught before any network call,
+    so this is a client input problem, not a Google API failure. Kept as its
+    own type so the router can return 400 with a clean message instead of the
+    502 it uses for an actual rejected REST call."""
+
+
 class MccNotEligibleToCreateAccounts(GoogleAdsConnectionError):
     """CreateCustomerClient specifically (not linking) rejected with Google's
     account-creation eligibility gate — live-confirmed error text: "This manager
@@ -443,11 +451,20 @@ async def request_manager_link(
     # the format the account-linking input's own placeholder suggests, and exactly
     # what a user would naturally copy-paste from their Google Ads dashboard.
     # Confirmed live: sending the hyphenated form produced Google's own "part of
-    # the resource name is invalid" error. Stripped once here, at the single point
-    # this ever enters the system, so the customer_id stored on the connection doc
-    # (and therefore every later Google Ads API call that reads it back) is always
+    # the resource name is invalid" error. Accept either form (with or without
+    # hyphens) — strip whatever's there, then validate what's left, so both a
+    # clean 10-digit paste and the dashed display format work identically, and
+    # anything else fails fast with a clear message instead of a wasted round
+    # trip to Google's API. Stripped once here, at the single point this ever
+    # enters the system, so the customer_id stored on the connection doc (and
+    # therefore every later Google Ads API call that reads it back) is always
     # the clean, API-compatible form — not just this one request.
     client_customer_id = "".join(ch for ch in client_customer_id if ch.isdigit())
+    if len(client_customer_id) != 10:
+        raise InvalidCustomerId(
+            "That doesn't look like a valid Google Ads Customer ID — it should be "
+            "10 digits, e.g. 123-456-7890 (hyphens are fine, they're just ignored)."
+        )
 
     conn = await get_google_ads_connection(db, user_id, brand_id)
     if not conn:
