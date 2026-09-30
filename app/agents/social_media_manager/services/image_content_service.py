@@ -580,6 +580,13 @@ class ImageContentService:
 
             raw_url = image_result["responseData"]["image_url"]
             specs = image_result["responseData"]["specs"]
+            # _generate_platform_image (used for both first generation and
+            # this regeneration) always computes a logo-free background +
+            # exact placement now — previously this path just discarded them,
+            # leaving Move Logo pointed at the background from BEFORE this
+            # regeneration once it landed.
+            raw_background_url = image_result["responseData"].get("background_image_url")
+            logo_placement = image_result["responseData"].get("logo_placement")
 
             # Upload base64 to Cloudinary for permanent CDN storage
             stored_url = raw_url
@@ -596,14 +603,36 @@ class ImageContentService:
                     print(f"   📍 Draft ID: {draft_id}")
                     print(f"   ❌ Error: {_e}")
 
+            stored_background_url = raw_background_url
+            if raw_background_url and raw_background_url.startswith("data:"):
+                try:
+                    from app.utils.s3_upload import upload_base64
+                    stored_background_url = await upload_base64(
+                        raw_background_url, folder="uri-social/content-draft-backgrounds"
+                    )
+                except Exception as _bg_e:
+                    print(f"⚠️  background image upload failed for regenerated draft {draft_id}: {_bg_e}")
+                    stored_background_url = None
+                    logo_placement = None
+
+            update_fields = {
+                "image_url": stored_url if not stored_url.startswith("data:") else None,
+                "image_specs": specs,
+                "has_image": True,
+                "updated_at": datetime.utcnow(),
+            }
+            if stored_background_url and logo_placement:
+                update_fields["background_image_url"] = stored_background_url
+                update_fields["logo_placement"] = logo_placement
+            else:
+                # No usable background this time — leave Move Logo unavailable
+                # rather than pointed at a stale one from before regeneration.
+                update_fields["background_image_url"] = None
+                update_fields["logo_placement"] = None
+
             await db["content_drafts"].update_one(
                 {"$or": [{"id": draft_id}, {"draft_id": draft_id}]},
-                {"$set": {
-                    "image_url": stored_url if not stored_url.startswith("data:") else None,
-                    "image_specs": specs,
-                    "has_image": True,
-                    "updated_at": datetime.utcnow(),
-                }},
+                {"$set": update_fields},
             )
             print(f"✅ regenerate_image: draft {draft_id} image updated")
 
