@@ -518,3 +518,15 @@ def test_a_remembered_past_spend_in_janes_own_words_is_not_recovered():
     result = _enforce_hard_requirements(asking, "ALL OF LAGOS", history,
                                         known_budget=130000)
     assert result.budget_ngn is None
+
+
+def test_a_whole_area_request_is_never_left_as_non_local():
+    """non_local attaches no geography at all, so a client who named a state would
+    have been targeted across the whole country."""
+    asking = ConsultantBrief(business_name="URI Social", offer_type="service",
+                             budget_ngn=20000, geo_mode="non_local")
+    result = _enforce_hard_requirements(
+        asking, "ALL OF LAGOS", [{"role": "user", "content": "budget 20000"}],
+        known_budget=20000)
+    assert result.geo_mode != "non_local"
+    assert result.city == "Lagos"
