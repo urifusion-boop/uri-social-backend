@@ -619,6 +619,22 @@ def _enforce_hard_requirements(brief: ConsultantBrief, message: str, history: li
     # this can never overwrite a considered answer with a stray number.
     if brief.budget_ngn is None:
         typed = stated_budget_ngn(message)
+        if not typed:
+            # ...and if not in THIS message, in this thread's earlier ones. A budget
+            # the client gave in their opening line is still their budget three turns
+            # later, but the model only sees "ALL OF LAGOS" and returns null — so the
+            # guard below asked for a figure that was already in the conversation,
+            # word for word, every turn. Live-reproduced.
+            #
+            # The client's OWN turns only: Jane's text carries the remembered spend
+            # from a PAST campaign (₦130,000 here), and reading that back would be the
+            # silent carry-over _budget_grounded exists to prevent.
+            for turn in reversed(history):
+                if turn.get("role") != "user":
+                    continue
+                typed = stated_budget_ngn(turn.get("content", ""))
+                if typed:
+                    break
         if typed:
             brief = brief.model_copy(update={"budget_ngn": typed})
             print(f"[Consultant] recovered a stated budget of {typed} the model left null",
