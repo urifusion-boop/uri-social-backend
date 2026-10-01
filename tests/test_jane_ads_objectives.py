@@ -12,6 +12,7 @@ real campaign per objective and validating an ad set under it (2026-09-24).
 import pytest
 
 from app.agents.jane_ads.models import CampaignObjective
+from app.agents.jane_ads import objectives as O
 from app.agents.jane_ads.objectives import (
     CHOICES, caveat_for, coerce, meta_objective, optimization_goal,
 )
@@ -108,3 +109,76 @@ def test_a_brief_that_merely_mentions_one_is_not_a_choice():
     for brief in ("get me more sales in Lekki", "I want awareness for my salon",
                   "traffic is bad on my website", "sell more wigs"):
         assert coerce(brief) is None, brief
+
+
+# ── The follow-up questions the objective makes necessary ─────────────────────
+# The objective is the decision; destination and desired action refine it. The
+# backend owns which question belongs to which objective, so a frontend cannot
+# define a weaker version of the rules and launch a campaign the API would refuse.
+
+def test_an_action_from_another_objective_is_not_accepted():
+    """"purchase" is real under Sales and meaningless under Awareness. Accepting it
+    there optimises the campaign for something the objective cannot deliver."""
+    assert O.coerce_action(CampaignObjective.SALES, "purchase") == "purchase"
+    assert O.coerce_action(CampaignObjective.AWARENESS, "purchase") == ""
+
+
+def test_a_plainly_worded_action_still_resolves():
+    assert O.coerce_action(CampaignObjective.SALES, "buy") == "purchase"
+    assert O.coerce_action(CampaignObjective.ENGAGEMENT, "messages") == "send_message"
+
+
+def test_traffic_cannot_send_people_to_whatsapp():
+    """Traffic optimises for link clicks; a WhatsApp tap is not one."""
+    problems = O.validate(CampaignObjective.TRAFFIC, destination_type="whatsapp",
+                          desired_action="visit_site")
+    assert any("cannot send people to" in p for p in problems)
+
+
+def test_sales_in_the_dm_is_allowed():
+    """Most SMEs here close the sale in a DM — refusing that pairing would be
+    modelling Meta's documentation instead of the business."""
+    assert O.validate(CampaignObjective.SALES, destination_type="whatsapp",
+                      desired_action="purchase") == []
+
+
+def test_a_website_destination_with_no_link_is_refused():
+    """Meta accepts the campaign and rejects the ad, so this has to be caught here."""
+    problems = O.validate(CampaignObjective.TRAFFIC, destination_type="website",
+                          desired_action="visit_site", destination_link="")
+    assert any("web address" in p for p in problems)
+
+
+def test_every_problem_is_reported_at_once():
+    """One form to fix, not three in sequence."""
+    problems = O.validate(CampaignObjective.SALES, destination_type="website",
+                          desired_action="", destination_link="")
+    assert len(problems) == 2
+
+
+def test_a_legacy_plan_with_no_action_still_launches():
+    """Plans written before the client was ever asked carry no action. Refusing them
+    at commit would strand campaigns that were valid when planned."""
+    assert O.validate(CampaignObjective.SALES, destination_type="whatsapp",
+                      desired_action="", require_action=False) == []
+
+
+def test_a_legacy_conversations_objective_still_has_a_destination():
+    """CONVERSATIONS predates the picker. An objective the matrix never knew about
+    would read as "no destination allowed" and block every one of those plans."""
+    assert O.validate(CampaignObjective.CONVERSATIONS, destination_type="whatsapp",
+                      require_action=False) == []
+
+
+def test_changing_the_objective_drops_an_answer_that_no_longer_applies():
+    """Silently keeping it is how a campaign launches optimising for something the
+    client never chose for THIS goal."""
+    kept = O.clear_incompatible(CampaignObjective.TRAFFIC,
+                                destination_type="whatsapp", desired_action="purchase")
+    assert kept == {"destination_type": "", "desired_action": ""}
+
+
+def test_changing_the_objective_keeps_an_answer_that_still_fits():
+    kept = O.clear_incompatible(CampaignObjective.SALES,
+                                destination_type="website", desired_action="purchase")
+    assert kept == {"destination_type": "website", "desired_action": "purchase"}
