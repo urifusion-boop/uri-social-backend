@@ -142,3 +142,43 @@ async def upload_bytes(
         ),
     )
     return _public_url(key)
+
+
+async def upload_file_path(
+    file_path: str,
+    folder: str = "uri-social",
+    resource_type: str = "video",
+    public_id: str | None = None,
+) -> str:
+    """Upload a file already on local disk to S3, streaming it in chunks via
+    boto3's upload_file — never reads the whole file into memory. Use this
+    instead of upload_bytes for anything that didn't already need to be a
+    Python bytes object for some other reason (downloaded media especially —
+    stream the download straight to a temp file and hand this the path,
+    rather than buffering it fully in memory just to immediately re-upload
+    it). Confirmed live: a video-generation request doing exactly that
+    (download a multi-MB clip into a `bytes`, then upload_bytes it straight
+    back out) was large enough, combined with glibc not returning the
+    memory to the OS afterward (containerised services commonly keep the
+    per-thread malloc arena it was allocated in), that repeated requests
+    ratcheted the process's memory up until the kernel OOM-killed a uvicorn
+    worker — same final symptom as a real leak, without one actually being
+    in the Python object graph."""
+    with open(file_path, "rb") as f:
+        head = f.read(200)
+    ext = _sniff_extension(head, resource_type)
+    key_name = public_id if public_id else uuid.uuid4().hex
+    key = f"{folder}/{key_name}.{ext}"
+
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(
+        None,
+        partial(
+            _s3_client.upload_file,
+            file_path,
+            _S3_BUCKET,
+            key,
+            ExtraArgs={"ContentType": _EXT_TO_CONTENT_TYPE.get(ext, "application/octet-stream")},
+        ),
+    )
+    return _public_url(key)
