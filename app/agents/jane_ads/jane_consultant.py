@@ -589,6 +589,18 @@ _GEOGRAPHY_WORDS = ("area", "areas", "neighbourhood", "neighborhood", "pocket",
 _BUDGET_WORDS = ("budget", "spend", "naira", "₦", "how much")
 
 
+def _geographic_mode(mode: str) -> str:
+    """A mode that actually attaches geography.
+
+    "All of Lagos" came back as geo_mode=non_local — "location barely matters" — and
+    non_local attaches no geography at all, so a client who named a state would have
+    been targeted across the whole country. Naming a place is the opposite of saying
+    location does not matter.
+    """
+    current = (mode or "").strip().lower()
+    return current if current in ("own_radius", "watering_hole", "mixed") else "watering_hole"
+
+
 def _is_about_geography(text: str) -> bool:
     """Whether a question is asking WHERE. Used to drop one the client just answered."""
     low = (text or "").lower()
@@ -657,11 +669,13 @@ def _enforce_hard_requirements(brief: ConsultantBrief, message: str, history: li
         brief = brief.model_copy(update={
             "city": brief.city or whole,
             "geo_areas": [],
+            "geo_mode": _geographic_mode(brief.geo_mode),
             "clarify": "",
             "missing": [m for m in (brief.missing or []) if not _is_about_geography(m)],
         })
-    elif whole and not brief.city:
-        brief = brief.model_copy(update={"city": whole, "geo_areas": []})
+    elif whole:
+        brief = brief.model_copy(update={"city": brief.city or whole, "geo_areas": [],
+                                         "geo_mode": _geographic_mode(brief.geo_mode)})
 
     # The same loop, for the budget. A figure the client has already given does not
     # become unknown because the model asked again — and the existing loop-breaker
