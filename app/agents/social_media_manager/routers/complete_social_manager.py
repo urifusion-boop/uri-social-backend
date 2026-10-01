@@ -164,7 +164,11 @@ class PublishVideoDraftRequest(BaseModel):
 class VideoFromStoryboardRequest(BaseModel):
     storyboard: Dict[str, Any]
     brand_images: List[str] = Field(default_factory=list, max_items=5)
-    model: str = "minimax/h3-max-turbo/image-to-video"
+    # Engineering-brief routing (§2): the caller picks an OUTCOME, never a raw
+    # model id — one of video_generation_service.OUTCOME_ROUTES's keys (e.g.
+    # "quick_video", "animate_product"). The actual model is an implementation
+    # detail resolved server-side, with its own brief-specified fallback.
+    outcome: str = "quick_video"
 
 class ContentGenerationRequest(BaseModel):
     seed_content: str = Field(..., min_length=10, max_length=5000)
@@ -6614,7 +6618,9 @@ async def generate_video_from_storyboard(
     token: dict = Depends(JWTBearer()),
 ):
     """
-    Start Veo 3.1 video generation for every scene in a storyboard.
+    Start video generation for every scene in a storyboard, routed by outcome
+    (engineering brief §2/§4) rather than a caller-chosen model — e.g.
+    "quick_video" routes to H3 Max Turbo with PixVerse V6 as its fallback.
     Returns a job_id immediately. Poll GET /video-job/{job_id} for progress.
     """
     from app.agents.social_media_manager.services.video_generation_service import (
@@ -6623,13 +6629,13 @@ async def generate_video_from_storyboard(
 
     _get_user_id(token)  # auth check
 
-    job_id = await VideoGenerationService.create_job(request.storyboard, request.model)
+    job_id = await VideoGenerationService.create_job(request.storyboard, request.outcome)
     background_tasks.add_task(
         VideoGenerationService.run_job,
         job_id,
         request.storyboard,
         request.brand_images,
-        request.model,
+        request.outcome,
     )
     return UriResponse.get_single_data_response(
         "video_job",
