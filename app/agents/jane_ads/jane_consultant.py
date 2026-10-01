@@ -25,6 +25,7 @@ from pydantic import Field
 
 from app.core.config import settings
 
+from .geo import whole_area_request
 from .nl import parse_ngn
 from .models import Goal, OfferType, PurchaseBehaviour
 from .nl import NlUnavailableError, ParsedCampaign
@@ -633,6 +634,21 @@ def _enforce_hard_requirements(brief: ConsultantBrief, message: str, history: li
     #
     # NON_LOCAL is the one mode that genuinely needs no place — it means geography
     # does not matter for this business, which is itself the answer.
+    # THE CLIENT ASKED FOR THE WHOLE AREA. That is an answer to the geography
+    # question, not a failure to answer it — but Jane kept coming back with "which
+    # pockets within Rivers State?", and the app's own "ALL OF LAGOS" chip led
+    # straight back into the same question. Live-reported, twice in one session.
+    #
+    # Taken from the client's latest reply only: a state named in an earlier turn was
+    # the answer to an earlier question.
+    whole = whole_area_request(_latest_user_reply(message))
+    if whole and not brief.city:
+        print(f"[Consultant] client asked for all of {whole} — geography is settled",
+              flush=True)
+        return brief.model_copy(update={"city": whole, "geo_areas": []})
+    if whole:
+        return brief
+
     if (brief.geo_mode or "").strip().lower() != "non_local" and not (brief.city or brief.geo_areas):
         return ConsultantBrief(
             business_name=brief.business_name, category=brief.category,
