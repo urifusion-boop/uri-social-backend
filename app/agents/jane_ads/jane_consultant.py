@@ -368,6 +368,20 @@ async def consult(message: str, business_name: str = "", category: str = "",
             f"it names an area, that IS the geography (set city/geo_areas from it). Do not "
             f"substitute a different audience or widen it"
         )
+    # The client asking for a whole state is a DECISION, and the rest of this file
+    # enforces it after the fact — but stated_plan is written here, in the model's own
+    # words, and it kept narrating "I'll focus on key business areas in Lagos like
+    # Ikeja, Victoria Island and Surulere" over a plan card that correctly read "All of
+    # Lagos". Live-caught in the UI. Telling the model up front is the only way the
+    # sentence it writes agrees with the plan it produces.
+    whole_now = whole_area_request(_latest_user_reply(message))
+    if whole_now:
+        known_bits.append(
+            f"the client has asked to cover ALL of {whole_now} — that IS the geography, "
+            f"already decided. Say so in stated_plan ('all of {whole_now}'), do not name "
+            f"neighbourhoods or pockets inside it, and do not ask which areas to focus on"
+        )
+
     known_line = (f"Already known about this client — {', '.join(known_bits)}."
                   if known_bits else "Nothing known about this client yet.")
 
