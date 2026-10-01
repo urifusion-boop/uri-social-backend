@@ -230,3 +230,14 @@ def test_a_named_pocket_still_wins_over_the_phrasing():
         geocoder=StaticGeocoder({"ikeja": (6.6018, 3.3515, 3.0)}),
     ))
     assert [p.name for p in plan.pins] == ["Ikeja"]
+
+
+def test_a_pocket_that_is_itself_a_whole_area_phrase_is_not_geocoded():
+    """Variant cards carry "All of Lagos" as their location when the client asked for
+    the whole state. Geocoding that as a neighbourhood finds nothing and degraded into
+    the apologetic "I couldn't confirm specific pockets" fallback."""
+    plan = _run(geo_plan_from_named_areas(
+        "watering_hole", "Lagos", [{"name": "All of Lagos", "reason": "as asked"}]))
+    assert plan.pins == []
+    assert "all of Lagos" in plan.explanation
+    assert "couldn't confirm" not in plan.explanation

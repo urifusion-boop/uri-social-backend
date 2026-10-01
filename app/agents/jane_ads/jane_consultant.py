@@ -44,6 +44,11 @@ class ConsultantBrief(ParsedCampaign):
     geo_mode: Optional[str] = None                       # own_radius|watering_hole|mixed|non_local
     geo_areas: list[dict] = Field(default_factory=list)  # [{"name": "...", "reason": "..."}]
     geo_explanation: str = ""
+    whole_area: bool = False       # the client asked to cover a named area ENTIRELY
+                                    # ("all of Lagos"). Carried rather than re-derived:
+                                    # the plan variants are generated from this brief,
+                                    # and without it they pitch neighbourhoods back at
+                                    # a client who just said they wanted the whole state.
     intermediary_note: str = ""    # one sentence, only when an intermediary beats the end user
     creative_fit_warning: str = "" # §8 — set only when a creative won't serve the stated goal
     stated_plan: str = ""          # the plain-language "here's what I'll do" line (§7.6) —
@@ -670,12 +675,14 @@ def _enforce_hard_requirements(brief: ConsultantBrief, message: str, history: li
             "city": brief.city or whole,
             "geo_areas": [],
             "geo_mode": _geographic_mode(brief.geo_mode),
+            "whole_area": True,
             "clarify": "",
             "missing": [m for m in (brief.missing or []) if not _is_about_geography(m)],
         })
     elif whole:
         brief = brief.model_copy(update={"city": brief.city or whole, "geo_areas": [],
-                                         "geo_mode": _geographic_mode(brief.geo_mode)})
+                                         "geo_mode": _geographic_mode(brief.geo_mode),
+                                         "whole_area": True})
 
     # The same loop, for the budget. A figure the client has already given does not
     # become unknown because the model asked again — and the existing loop-breaker
