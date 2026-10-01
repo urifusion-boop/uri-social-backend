@@ -12,6 +12,8 @@ from app.agents.jane_ads.geo import (
     build_geo_plan,
     decide_geo_mode,
     geo_plan_from_named_areas,
+    whole_area_plan,
+    whole_area_request,
 )
 from app.agents.jane_ads.models import GeoMode, PinSource
 
@@ -174,3 +176,57 @@ def test_place_named_in_needs_a_whole_word_and_tolerates_none():
     assert place_named_in("small business owners") is None
     assert place_named_in("") is None
     assert place_named_in(None) is None
+
+
+# ── "All of Lagos" ────────────────────────────────────────────────────────────
+# A client who asks for a whole state has ANSWERED the geography question. Jane used
+# to keep asking which pockets to focus on inside it — and the app's own "ALL OF
+# LAGOS" chip led straight back into the same question.
+
+def test_a_whole_state_request_is_recognised():
+    assert whole_area_request("ALL OF LAGOS") == "Lagos"
+    assert whole_area_request("Ogun as a whole") == "Ogun"
+    assert whole_area_request("entire Ogun State") == "Ogun"
+    assert whole_area_request("everywhere in Kano") == "Kano"
+
+
+def test_prose_that_merely_mentions_a_place_is_not_a_targeting_instruction():
+    """The cost of a false positive is a campaign silently retargeted at a state."""
+    assert whole_area_request("all of our customers in Lagos are students") == ""
+    assert whole_area_request("all of it") == ""
+    assert whole_area_request("Lagos") == ""
+
+
+def test_a_whole_area_plan_carries_no_pins():
+    """meta_targeting_from_geo_named resolves a pinless plan to the city and then its
+    state, so the campaign covers exactly what was asked for."""
+    plan = whole_area_plan("Lagos")
+    assert plan.pins == []
+    assert plan.city == "Lagos"
+    assert plan.fallback_area == "Lagos"
+
+
+def test_a_whole_area_plan_does_not_apologise_for_having_no_pockets():
+    """It used to explain itself with "I couldn't confirm specific pockets" — an
+    apology for doing exactly what the client asked."""
+    plan = whole_area_plan("Rivers")
+    assert "couldn't confirm" not in plan.explanation
+    assert "all of Rivers" in plan.explanation
+
+
+def test_named_areas_honours_a_whole_area_city_with_no_pockets():
+    plan = _run(geo_plan_from_named_areas("watering_hole", "all of Lagos", []))
+    assert plan is not None
+    assert plan.pins == []
+    assert plan.city == "Lagos"
+    assert "all of Lagos" in plan.explanation
+
+
+def test_a_named_pocket_still_wins_over_the_phrasing():
+    """"All of Lagos, especially Ikeja" is a pocket request — the areas the consultant
+    reasoned about are not discarded because the city string was phrased broadly."""
+    plan = _run(geo_plan_from_named_areas(
+        "watering_hole", "all of Lagos", [{"name": "Ikeja", "reason": "offices"}],
+        geocoder=StaticGeocoder({"ikeja": (6.6018, 3.3515, 3.0)}),
+    ))
+    assert [p.name for p in plan.pins] == ["Ikeja"]
