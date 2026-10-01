@@ -43,9 +43,30 @@ Rules:
 - video_prompt fields must be motion-aware: describe exactly what moves, camera direction, speed, and lighting.
 - APPLY THE VIDEO STYLE DIRECTIVE to every scene's motion, video_prompt, and text_overlay decisions.
 - reference_image_index tells which supplied image becomes the first frame of that clip (0-based).
-- Each scene must work as a self-contained 3–5 second moment.
 - text_overlay is a short on-screen caption/tagline string, or null.
 - shot_type must be one of: product_hero | lifestyle | brand_close_up | text_card | transition
+
+CONTINUITY — the scenes are NOT independent moments. They are chapters of ONE
+continuous story and must read that way end to end:
+- The whole storyboard needs a clear through-line: scene 1 hooks/sets up, the
+  middle scenes build or demonstrate, the final scene pays off with a CTA or
+  resolution — never a sequence of unrelated vignettes sharing only a style.
+- Subject continuity: once a scene establishes a specific product, person, or
+  setting, later scenes must keep featuring that SAME subject — reuse the same
+  reference_image_index for the same subject across scenes — unless the
+  narrative deliberately cuts away (e.g. a before/after contrast), which must
+  be an intentional story beat, not a random switch.
+- Each scene's motion/video_prompt should read as a natural continuation of
+  the previous scene's action and energy, as if one camera/story is flowing
+  forward, not disconnected clips stitched together after the fact.
+- continuity_note: one short phrase stating how this scene follows directly
+  from the previous one (for scene 1, how it sets up what follows).
+- dialogue: ONLY when this video features a person speaking on camera
+  (testimonial/direct-to-camera/talking-head content). Write ONE continuous
+  spoken script for that speaker and split it naturally across scenes — scene
+  1's words must lead directly into scene 2's, like one take cut into pieces,
+  never separate unrelated lines. If no one speaks on camera in a scene, set
+  dialogue to null.
 
 Return ONLY valid JSON — no markdown fences, no explanation:
 {
@@ -60,7 +81,9 @@ Return ONLY valid JSON — no markdown fences, no explanation:
       "motion": "<plain-English camera/subject motion description>",
       "video_prompt": "<full motion-aware prompt for the video model>",
       "reference_image_index": <int 0-based>,
-      "text_overlay": <string or null>
+      "text_overlay": <string or null>,
+      "continuity_note": "<how this scene follows the previous one>",
+      "dialogue": <string spoken on camera this scene, or null>
     }
   ]
 }"""
@@ -164,6 +187,9 @@ Create the feel of an authentic user-generated or interview-style testimonial.
 • Composition: person occupies 60% of frame; product visible but not forced into foreground.
 • Text overlays: quote highlights as bold lower-thirds; result stat or name/title for social proof.
 • Transitions: jump cuts (intentionally casual) or simple cross-dissolve.
+• Dialogue: this is a talking-head video — write ONE continuous spoken script for the
+  on-camera speaker and populate every scene's `dialogue` field with its segment of that
+  script, in order, as if it's one uninterrupted take cut into scenes.
 • Energy: honest and relatable — the viewer should think "that could be me." """,
 
     "menu_showcase": """VIDEO STYLE — MENU SHOWCASE:
@@ -222,11 +248,13 @@ class VideoStoryboardService:
             video_prompt = scene.get("video_prompt", "")
             motion = scene.get("motion", "")
             text = scene.get("text_overlay") or ""
+            continuity = scene.get("continuity_note") or ""
 
             prompt = (
                 f"Cinematic storyboard frame, {shot} shot. "
                 f"{video_prompt} "
                 f"Camera movement: {motion}. "
+                + (f"Continuity with the surrounding scenes: {continuity}. " if continuity else "")
                 + (f'On-screen text: "{text}". ' if text else "")
                 + "Keep the brand product, colors, and visual identity exactly as shown. "
                 "Photorealistic, dramatic lighting. Vertical 9:16 composition."
@@ -385,7 +413,11 @@ class VideoStoryboardService:
             config = genai_types.GenerateContentConfig(
                 system_instruction=system_prompt,
                 temperature=0.7,
-                max_output_tokens=2000,
+                # Bumped from 2000: each scene now carries two more fields
+                # (continuity_note, dialogue) — 2000 was already close to the
+                # ceiling for a 6-scene storyboard and risked truncated/
+                # unparseable JSON once those fields were added.
+                max_output_tokens=3000,
                 response_mime_type="application/json",
             )
 
