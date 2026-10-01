@@ -892,6 +892,12 @@ async def upload_user_content(
         profile_data = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
         brand_context_dict = BrandProfileService.to_brand_context(profile_data)
 
+        # Parallel to (post-overlay) media_urls once the block below runs —
+        # stays all-None (one per original upload) when no overlay was
+        # requested at all, so the draft-tagging step further down can
+        # always safely index into it regardless of add_logo/add_cta.
+        item_logo_backgrounds = [None] * len(media_urls)
+
         # Apply logo and/or CTA overlays if requested
         if add_logo or add_cta:
             from ..services.image_content_service import ImageContentService
@@ -901,12 +907,19 @@ async def upload_user_content(
             from PIL import Image
 
             processed_media_urls = []
+            # Parallel to processed_media_urls — None for any item that didn't
+            # get a logo (no logo configured, overlay failed, or a video that
+            # skipped this loop entirely), else {"background_url", "logo_placement"}
+            # so Move Logo (LogoRepositionService) can reposition it later the
+            # same way it already works for AI-generated posts.
+            item_logo_backgrounds = []
             for media_url in media_urls:
                 if media_url in video_urls:
                     # Logo/CTA overlay here is PIL-based (single still frame) — no
                     # video support, and downloading a video just to skip it wastes
                     # the request. Pass the upload through untouched.
                     processed_media_urls.append(media_url)
+                    item_logo_backgrounds.append(None)
                     continue
                 try:
                     # Download the uploaded image
@@ -914,88 +927,13 @@ async def upload_user_content(
                     resp.raise_for_status()
                     img = Image.open(io.BytesIO(resp.content)).convert("RGBA")
 
-                    # Apply logo overlay if requested
-                    if add_logo and brand_context_dict.get('logo_url'):
-                        logo_size = brand_context_dict.get('logo_size', 'small')
-
-                        # Determine logo position: user override > AI analysis > brand profile default
-                        if logo_position_override:
-                            # User manually selected position for this upload
-                            logo_position = logo_position_override
-                            print(f"🎨 Using user-selected logo position: {logo_position}")
-                        else:
-                            # Use AI to find best logo position (avoids important content)
-                            print(f"🤖 Analyzing image to find best logo position...")
-                            try:
-                                from app.services.AIService import AIService
-
-                                vision_prompt = """Analyze this image and determine the best corner to place a brand logo overlay.
-
-Consider:
-1. Which corners have the LEAST important content (text, faces, key visual elements)?
-2. Which corners have the most empty/background space?
-3. Avoid corners with text, faces, or focal points
-
-Respond with ONLY ONE of these positions:
-- top_left
-- top_right
-- top_center
-- bottom_left
-- bottom_right
-- bottom_center
-
-Choose the position that will cause the LEAST visual disruption."""
-
-                                vision_request = AIService.build_ai_model(
-                                    messages=[{
-                                        "role": "user",
-                                        "content": [
-                                            {"type": "text", "text": vision_prompt},
-                                            {"type": "image_url", "image_url": {"url": media_url}}
-                                        ]
-                                    }],
-                                    temperature=0.3,
-                                )
-                                vision_response = await AIService.chat_completion(vision_request)
-                                ai_position = vision_response.choices[0].message.content.strip().lower()
-
-                                # Validate AI response
-                                valid_positions = ["top_left", "top_right", "top_center", "bottom_left", "bottom_right", "bottom_center"]
-                                if ai_position in valid_positions:
-                                    logo_position = ai_position
-                                    print(f"✅ AI selected best logo position: {logo_position}")
-                                else:
-                                    # Fallback to brand profile default
-                                    logo_position = brand_context_dict.get('logo_position', 'bottom_right')
-                                    print(f"⚠️ AI gave invalid position '{ai_position}', using brand default: {logo_position}")
-
-                            except Exception as vision_err:
-                                # If AI analysis fails, use brand profile default
-                                logo_position = brand_context_dict.get('logo_position', 'bottom_right')
-                                print(f"⚠️ AI position analysis failed: {vision_err}, using brand default: {logo_position}")
-
-                        print(f"🎨 Applying logo overlay: position={logo_position}, size={logo_size}")
-
-                        # Convert image to base64, apply logo, convert back
-                        buf = io.BytesIO()
-                        img.convert("RGB").save(buf, format="JPEG", quality=95)
-                        img_b64 = base64.b64encode(buf.getvalue()).decode()
-
-                        # Use existing logo overlay method
-                        img_b64_with_logo = ImageContentService._overlay_logo(
-                            img_b64,
-                            brand_context_dict['logo_url'],
-                            logo_position,
-                            logo_size
-                        )
-
-                        # Convert back to PIL for CTA overlay
-                        img = Image.open(io.BytesIO(base64.b64decode(img_b64_with_logo))).convert("RGBA")
-                        print(f"✅ Logo overlay applied successfully")
-                    elif add_logo and not brand_context_dict.get('logo_url'):
-                        print(f"⚠️ Logo overlay requested but no logo_url in brand profile")
-
-                    # Apply CTA overlay if requested
+                    # CTA overlay applies FIRST, logo LAST — the opposite of
+                    # intuition, but it means the image saved as this item's
+                    # "background" (captured right before the logo goes on,
+                    # below) already has the CTA text baked in and only the
+                    # logo missing, matching exactly what Move Logo needs to
+                    # recomposite from. CTA has no reposition UI of its own,
+                    # so baking it in early is fine.
                     if add_cta:
                         # Determine CTA text (same logic as normal image generation)
                         cta_text = None
@@ -1127,6 +1065,77 @@ Choose the position that will cause the LEAST visual disruption."""
                             except Exception as cta_err:
                                 print(f"⚠️ CTA overlay failed: {cta_err}, skipping CTA")
 
+                    # Apply logo overlay if requested — LAST, after any CTA, so
+                    # img_b64 captured right here (pre-logo) is exactly the
+                    # "background" Move Logo recomposites onto later.
+                    item_background_url = None
+                    item_logo_placement = None
+                    if add_logo and brand_context_dict.get('logo_url'):
+                        logo_size = brand_context_dict.get('logo_size', 'small')
+
+                        # Convert image to base64 up front — needed either way,
+                        # and this is the pre-logo background itself.
+                        buf = io.BytesIO()
+                        img.convert("RGB").save(buf, format="JPEG", quality=95)
+                        img_b64 = base64.b64encode(buf.getvalue()).decode()
+                        pre_logo_bytes = buf.getvalue()
+
+                        if logo_position_override:
+                            # User manually selected position for this upload — respect it, no AI second-guessing
+                            logo_position = logo_position_override
+                            print(f"🎨 Using user-selected logo position: {logo_position}")
+                            img_b64_with_logo, logo_geometry = ImageContentService._overlay_logo(
+                                img_b64, brand_context_dict['logo_url'], logo_position, logo_size, return_geometry=True
+                            )
+                        else:
+                            # Rank candidate corners by actual pixel busyness (deterministic,
+                            # not an AI guess — see rank_overlay_positions_cv docstring), then
+                            # place + verify, retrying the next candidate if it still overlaps
+                            # something the pixel analysis alone didn't catch (e.g. a face on
+                            # a flat-coloured background). Note: ranked against the ORIGINAL
+                            # download (resp.content), not the CTA-overlaid img — conflict
+                            # checking below still runs against the actual composited
+                            # candidate, so a logo landing on CTA text still gets caught.
+                            print(f"📐 Ranking candidate logo positions by pixel busyness...")
+                            candidates = ImageContentService.rank_overlay_positions_cv(resp.content)
+
+                            img_b64_with_logo = None
+                            logo_geometry = None
+                            logo_position = brand_context_dict.get('logo_position', 'bottom_right')
+                            for attempt_position in candidates[:3]:
+                                attempt_b64, attempt_geometry = ImageContentService._overlay_logo(
+                                    img_b64, brand_context_dict['logo_url'], attempt_position, logo_size, return_geometry=True
+                                )
+                                conflict = await ImageContentService.composited_overlay_has_conflict(
+                                    f"data:image/webp;base64,{attempt_b64}", attempt_position
+                                )
+                                logo_position = attempt_position
+                                img_b64_with_logo = attempt_b64
+                                logo_geometry = attempt_geometry
+                                if not conflict:
+                                    print(f"✅ Logo position accepted: {attempt_position}")
+                                    break
+                                print(f"↩️ Retrying with next-ranked position after conflict at {attempt_position}")
+                            else:
+                                print(f"⚠️ All candidate positions showed a conflict — keeping last attempt ({logo_position}) rather than skip the logo")
+
+                        print(f"🎨 Applying logo overlay: position={logo_position}, size={logo_size}")
+
+                        img = Image.open(io.BytesIO(base64.b64decode(img_b64_with_logo))).convert("RGBA")
+                        print(f"✅ Logo overlay applied successfully")
+
+                        if logo_geometry:
+                            try:
+                                from app.utils.cloudinary_upload import upload_bytes as _upload_bg_bytes
+                                item_background_url = await _upload_bg_bytes(
+                                    pre_logo_bytes, folder=f"uri-social/user-uploads/{user_id}/backgrounds", resource_type="image"
+                                )
+                                item_logo_placement = logo_geometry
+                            except Exception as bg_err:
+                                print(f"⚠️ background upload failed for Move Logo on uploaded image: {bg_err}")
+                    elif add_logo and not brand_context_dict.get('logo_url'):
+                        print(f"⚠️ Logo overlay requested but no logo_url in brand profile")
+
                     # Upload processed image back to Cloudinary
                     buf = io.BytesIO()
                     img.convert("RGB").save(buf, format="JPEG", quality=95)
@@ -1137,11 +1146,16 @@ Choose the position that will cause the LEAST visual disruption."""
                     folder = f"uri-social/user-uploads/{user_id}/processed"
                     processed_url = await upload_bytes(buf.getvalue(), folder=folder, resource_type="image")
                     processed_media_urls.append(processed_url)
+                    item_logo_backgrounds.append(
+                        {"background_url": item_background_url, "logo_placement": item_logo_placement}
+                        if item_background_url and item_logo_placement else None
+                    )
                     print(f"✅ Applied overlays to image {len(processed_media_urls)}/{len(media_urls)}")
 
                 except Exception as e:
                     print(f"⚠️ Overlay processing failed for image, using original: {e}")
                     processed_media_urls.append(media_url)
+                    item_logo_backgrounds.append(None)
 
             # Use processed URLs
             media_urls = processed_media_urls
@@ -1240,10 +1254,14 @@ Create engaging social media captions for THIS UPLOADED CONTENT. Base your writi
                     # expect. A prior "carousel_images" field here was never read
                     # by either, so uploaded carousels silently rendered/published
                     # as a single post.
-                    slides = [
-                        {"headline": "", "body": "", "image_url": url, "image_failed": False}
-                        for url in media_urls
-                    ]
+                    slides = []
+                    for i, url in enumerate(media_urls):
+                        slide = {"headline": "", "body": "", "image_url": url, "image_failed": False}
+                        bg = item_logo_backgrounds[i] if i < len(item_logo_backgrounds) else None
+                        if bg:
+                            slide["background_image_url"] = bg["background_url"]
+                            slide["logo_placement"] = bg["logo_placement"]
+                        slides.append(slide)
                     update_fields = {
                         "brand_id": active_brand_id,
                         "content_source": "user_uploaded",
@@ -1269,6 +1287,10 @@ Create engaging social media captions for THIS UPLOADED CONTENT. Base your writi
                         "image_url": None if is_first_video else first_url,
                         "video_url": first_url if is_first_video else None,
                     }
+                    first_bg = item_logo_backgrounds[0] if item_logo_backgrounds and not is_first_video else None
+                    if first_bg:
+                        update_fields["background_image_url"] = first_bg["background_url"]
+                        update_fields["logo_placement"] = first_bg["logo_placement"]
 
                 # Mark drafts as user-uploaded and attach media URLs
                 await db["content_drafts"].update_many(
@@ -6148,7 +6170,7 @@ async def _generate_image_bg(
         logo_placement = (image_result.get("responseData") or {}).get("logo_placement")
         if raw_background_url and raw_background_url.startswith("data:"):
             try:
-                from app.utils.s3_upload import upload_base64 as _upload_bg
+                from app.utils.cloudinary_upload import upload_base64 as _upload_bg
                 stored_background_url = await _upload_bg(raw_background_url, folder="uri-social/content-draft-backgrounds")
             except Exception as bg_upload_err:
                 print(f"⚠️  Background image upload failed for draft {draft_id} (logo will not be repositionable later): {bg_upload_err}")
