@@ -86,6 +86,155 @@ CHOICES = [
 ]
 
 
+# What the objective still needs to know before it can be launched, per objective.
+# Only the question the previous answer makes necessary is asked — AWARENESS never
+# needs a URL, and SALES on WhatsApp never needs a pixel event.
+#
+# These are OUR enums, not Meta's. The value is stored; the label is shown. A display
+# label must never become business logic: renaming a button would then change what
+# launches.
+ACTIONS: dict[str, list[dict]] = {
+    CampaignObjective.AWARENESS.value: [
+        {"value": "remember_brand", "label": "Remember my business"},
+        {"value": "watch_video", "label": "Watch my video"},
+        {"value": "see_business", "label": "See my business"},
+    ],
+    CampaignObjective.TRAFFIC.value: [
+        {"value": "visit_site", "label": "Visit my website"},
+    ],
+    CampaignObjective.ENGAGEMENT.value: [
+        {"value": "send_message", "label": "Message me"},
+        {"value": "post_engagement", "label": "Like, comment or share"},
+        {"value": "video_views", "label": "Watch my video"},
+    ],
+    CampaignObjective.LEADS.value: [
+        {"value": "submit_lead", "label": "Send me their details"},
+    ],
+    CampaignObjective.SALES.value: [
+        {"value": "purchase", "label": "Buy something"},
+        {"value": "booking", "label": "Book an appointment"},
+        {"value": "subscription", "label": "Start a subscription"},
+        {"value": "application", "label": "Apply or register"},
+        {"value": "payment", "label": "Pay a deposit"},
+    ],
+    CampaignObjective.FOLLOWERS.value: [
+        {"value": "follow_page", "label": "Follow my page"},
+    ],
+}
+
+# A destination that answers "where does the tap go" for each objective. SALES and
+# LEADS can also be fulfilled in a DM, which is how most Nigerian SMEs actually sell —
+# refusing that pairing would be modelling Meta's docs instead of the business.
+_ALLOWED_DESTINATIONS: dict[str, set[str]] = {
+    CampaignObjective.AWARENESS.value: {"whatsapp", "website", "instagram_dm", "custom"},
+    CampaignObjective.TRAFFIC.value: {"website", "custom"},
+    CampaignObjective.ENGAGEMENT.value: {"whatsapp", "instagram_dm", "website", "custom"},
+    CampaignObjective.LEADS.value: {"whatsapp", "instagram_dm", "website", "custom"},
+    CampaignObjective.SALES.value: {"whatsapp", "instagram_dm", "website", "custom"},
+    CampaignObjective.FOLLOWERS.value: {"whatsapp", "website", "instagram_dm", "custom"},
+    # Legacy. Plans written before the client could choose carry CONVERSATIONS, and
+    # they are still launchable — an objective this never knew about would otherwise
+    # read as "no destination is allowed" and block every one of them.
+    CampaignObjective.CONVERSATIONS.value: {"whatsapp", "website", "instagram_dm", "custom"},
+}
+
+# Objectives whose desired action names a measurable conversion — the thing the
+# client counts as a customer. Asked only for these; inventing one elsewhere would
+# put a number on the review screen that nothing measures.
+_NEEDS_ACTION = {CampaignObjective.SALES.value, CampaignObjective.AWARENESS.value,
+                 CampaignObjective.ENGAGEMENT.value}
+
+
+def destinations_for(objective: CampaignObjective) -> list[str]:
+    """Where this objective is allowed to send people."""
+    return sorted(_ALLOWED_DESTINATIONS.get(objective.value, set()))
+
+
+def actions_for(objective: CampaignObjective) -> list[dict]:
+    """The follow-up choices this objective still needs, or [] if it needs none."""
+    return ACTIONS.get(objective.value, [])
+
+
+def coerce_action(objective: CampaignObjective, value: Optional[str]) -> str:
+    """The desired action as one of OURS, or "" if it is not valid for this objective.
+
+    Scoped to the objective on purpose: "purchase" is a real action under SALES and
+    meaningless under AWARENESS, and accepting it there would launch a campaign
+    optimising for something the objective cannot deliver.
+    """
+    raw = (value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if not raw:
+        return ""
+    allowed = {a["value"] for a in actions_for(objective)}
+    aliases = {
+        "messages": "send_message", "message": "send_message", "conversations": "send_message",
+        "video": "watch_video", "views": "video_views",
+        "lead": "submit_lead", "leads": "submit_lead", "enquiry": "submit_lead",
+        "buy": "purchase", "sale": "purchase", "sales": "purchase",
+        "book": "booking", "deposit": "payment", "register": "application",
+    }
+    raw = aliases.get(raw, raw)
+    return raw if raw in allowed else ""
+
+
+def validate(objective: CampaignObjective, *, destination_type: str = "",
+             desired_action: str = "", destination_link: str = "",
+             require_action: bool = True) -> list[str]:
+    """Everything still wrong with this configuration, in the client's language.
+
+    Server-side and total: the frontend decides what to ASK, this decides what may
+    LAUNCH. Returning every problem at once rather than the first one means a client
+    fixes one form, not three in sequence.
+
+    require_action=False asks only whether what IS set can launch. The launch path
+    uses it: a plan built before the client was ever asked carries no action, and
+    refusing it at commit would strand campaigns that were valid when planned. An
+    action that contradicts the objective is still refused either way — absent is
+    survivable, wrong is not.
+    """
+    problems: list[str] = []
+
+    allowed = _ALLOWED_DESTINATIONS.get(objective.value, set())
+    if not destination_type:
+        problems.append("Choose where people should go when they tap the ad.")
+    elif destination_type not in allowed:
+        problems.append(
+            f"A {objective.value} campaign cannot send people to "
+            f"{destination_type.replace('_', ' ')}.")
+
+    # A website destination with no link launches an ad that goes nowhere — Meta
+    # accepts the campaign and rejects the ad, so this has to be caught here.
+    if destination_type in ("website", "custom") and not destination_link:
+        problems.append("Add the web address people should land on.")
+
+    if require_action and objective.value in _NEEDS_ACTION and not desired_action:
+        problems.append("Choose what you want people to do.")
+    elif desired_action and not coerce_action(objective, desired_action):
+        problems.append(
+            f"'{desired_action}' is not something a {objective.value} campaign can "
+            f"optimise for.")
+
+    return problems
+
+
+def clear_incompatible(objective: CampaignObjective, *, destination_type: str = "",
+                       desired_action: str = "") -> dict[str, str]:
+    """What survives an objective change, as the fields to keep.
+
+    Changing the objective silently keeping a now-invalid action is how a campaign
+    launches optimising for something the client never chose for THIS goal — so an
+    answer that no longer applies is dropped and asked again, rather than coerced
+    into the nearest valid one.
+    """
+    keep_destination = (destination_type
+                        if destination_type in _ALLOWED_DESTINATIONS.get(objective.value, set())
+                        else "")
+    return {
+        "destination_type": keep_destination,
+        "desired_action": coerce_action(objective, desired_action),
+    }
+
+
 def coerce(value: Optional[str]) -> Optional[CampaignObjective]:
     """Whatever the client picked, as an objective — or None if it is not one of ours."""
     raw = (value or "").strip().lower().replace("-", "_").replace(" ", "_")
