@@ -723,6 +723,29 @@ class ImageContentService:
         )
 
     @staticmethod
+    def build_bottom_margin_rule(brand_context: Optional[Dict[str, Any]]) -> str:
+        """The large 30% bottom reservation only earns its keep when a logo
+        is actually going to be composited into it afterward — without one,
+        nothing ever fills that space, and a third of the canvas left blank
+        reads as broken, not intentional. Confirmed live: identical designs
+        with vs. without a logo, the no-logo one has a conspicuous empty
+        band at the bottom where the logo would have sat. No logo
+        configured means no bottom-dwelling element, so this just needs the
+        same edge-clipping safety margin as the other three sides."""
+        bc = brand_context or {}
+        if bc.get('logo_url'):
+            return (
+                "⚠️ BOTTOM MARGIN — CRITICAL: CTA text, footers, and any bottom text must END at least\n"
+                "30% from the bottom edge (leave the bottom 30% of image height as EMPTY SPACE below any text) —\n"
+                "this reserved strip is where the brand's logo will be placed after generation."
+            )
+        return (
+            "Maintain a minimum 20% safe-zone margin from the bottom edge too, same as the other three edges.\n"
+            "No logo is configured for this brand, so there's no need to reserve extra empty space beyond that —\n"
+            "content may extend naturally into the lower part of the canvas."
+        )
+
+    @staticmethod
     async def _generate_platform_image(
         platform: str,
         content: str,
@@ -861,6 +884,7 @@ class ImageContentService:
             # position, never the other way around.
             logo_url = bc.get('logo_url')
             logo_space_note = ImageContentService.build_logo_space_note(bc)
+            bottom_margin_rule = ImageContentService.build_bottom_margin_rule(bc)
 
             # SECTION 1: ABSOLUTE RULES (READ FIRST)
             absolute_rules = f"""=== ABSOLUTE RULES (READ FIRST — THESE OVERRIDE ALL OTHER INSTRUCTIONS) ===
@@ -875,8 +899,7 @@ CANVAS SAFETY — NON-NEGOTIABLE, OVERRIDES ALL STYLE RULES:
 Every letter of every word must be 100% inside the image canvas with no clipping.
 Maintain a minimum 20% safe-zone margin from the top, left, and right edges.
 Headlines must begin at least 20% from the top edge.
-⚠️ BOTTOM MARGIN — CRITICAL: CTA text, footers, and any bottom text must END at least
-30% from the bottom edge (leave the bottom 30% of image height as EMPTY SPACE below any text).
+{bottom_margin_rule}
 If text is too large to fit within these margins, reduce the font size — do NOT let any
 character touch or cross any edge.
 ⚠️ CRITICAL: Text cut off at bottom edges is a CRITICAL FAILURE. Leave generous space

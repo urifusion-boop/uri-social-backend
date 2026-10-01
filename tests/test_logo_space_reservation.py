@@ -62,6 +62,36 @@ class TestBuildLogoSpaceNote:
         assert large_pct > small_pct
 
 
+class TestBuildBottomMarginRule:
+    """The 30% bottom reservation only earns its keep when a logo is
+    actually going to land in it afterward — confirmed live: generated
+    images without a logo configured had a conspicuous, unexplained blank
+    band across the bottom third of the canvas, because nothing was ever
+    composited into the space the AI was told to leave empty."""
+
+    def test_no_logo_uses_the_smaller_universal_safe_zone(self):
+        rule = ImageContentService.build_bottom_margin_rule({})
+        assert "30%" not in rule
+        assert "20%" in rule
+
+    def test_no_logo_does_not_instruct_leaving_it_empty(self):
+        rule = ImageContentService.build_bottom_margin_rule(None)
+        assert "EMPTY SPACE" not in rule
+
+    def test_with_logo_keeps_the_large_reservation(self):
+        rule = ImageContentService.build_bottom_margin_rule(
+            {"logo_url": "https://example.com/logo.png"}
+        )
+        assert "30%" in rule
+        assert "EMPTY SPACE" in rule
+
+    def test_with_logo_explains_what_the_reserved_space_is_for(self):
+        rule = ImageContentService.build_bottom_margin_rule(
+            {"logo_url": "https://example.com/logo.png"}
+        )
+        assert "logo" in rule.lower()
+
+
 class TestV2GuideRespectsLogoPosition:
     """generate_image_with_v2_guide previously built its prompt with zero
     knowledge of the logo at all — brand_context's logo_url/logo_position
