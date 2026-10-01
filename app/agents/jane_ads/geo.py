@@ -274,6 +274,23 @@ async def geo_plan_from_named_areas(
     mode = _GEO_MODE_MAP.get((mode_str or "").strip().lower())
     if mode is None or mode == GeoMode.NON_LOCAL:
         return None
+
+    # "All of Lagos" is a decision, not a gap. Without this the plan still targeted
+    # the right place but explained itself with "I couldn't confirm specific pockets"
+    # — apologising for doing exactly what the client asked for.
+    # A pocket that is itself a whole-area phrase is not a pocket. The variant cards
+    # carry "All of Lagos" as their location when the client asked for the whole
+    # state, and geocoding that as a neighbourhood finds nothing — which used to
+    # degrade into the apologetic "I couldn't confirm specific pockets" fallback.
+    named = [a for a in areas if (a.get("name") or "").strip()
+             and not whole_area_request(a.get("name") or "")]
+    whole = whole_area_request(city) or next(
+        (whole_area_request(a.get("name") or "") for a in areas
+         if whole_area_request(a.get("name") or "")), "")
+    if whole and not named:
+        return whole_area_plan(whole, mode)
+    areas = named
+
     geocoder = geocoder or CompositeGeocoder()
     pins: list[GeoPin] = []
     # Three pockets, not four. Client feedback after the first live campaigns: one
@@ -303,10 +320,98 @@ async def geo_plan_from_named_areas(
     return GeoPlan(mode=mode, city=city, pins=pins, explanation=explanation or _explain(mode, city, pins))
 
 
+# "All of Lagos", "Ogun as a whole", "statewide" — the client declining pockets.
+# A client who says this has answered the geography question; they have not failed to
+# answer it. Jane used to keep asking which pockets to focus on, and the chip the app
+# offers for exactly this ("ALL OF LAGOS") led straight back into the same question.
+_AREA = r"(?P<area>[A-Za-z'.-]+(?:\s+[A-Za-z'.-]+){0,2})"
+# Searched for ANYWHERE in the reply, not anchored to the whole string: the client
+# types it inside a brief ("promote my tool, budget 20000, all of Lagos") as often as
+# they tap it as a chip, and an anchored match silently ignored the former — live-
+# caught in the UI, where the brief was honoured for everything except geography.
+# The stoplist below, not the anchoring, is what keeps prose out.
+_WHOLE_AREA = re.compile(
+    r"(?:^|[\s,;:.])(?:all\s+of|the\s+whole\s+of|whole\s+of|entire|everywhere\s+in|"
+    r"across)\s+(?:the\s+)?" + _AREA + r"(?:\s+state)?(?=$|[\s,;:.!?])",
+    re.IGNORECASE,
+)
+_WHOLE_AREA_SUFFIX = re.compile(
+    r"(?:^|[\s,;:.])" + _AREA + r"\s+(?:state\s+)?"
+    r"(?:as\s+a\s+whole|statewide|state\s*-?\s*wide)(?=$|[\s,;:.!?])",
+    re.IGNORECASE,
+)
+
+# Words that mean the sentence is prose, not a place — "all of our customers in Lagos
+# are students" describes an audience and must not retarget the campaign at a state.
+_NOT_A_PLACE = {"our", "my", "your", "their", "his", "her", "its", "this", "that",
+                "these", "those", "customers", "clients", "people", "buyers", "users",
+                "them", "us", "it", "is", "are", "was", "were", "and", "with", "who",
+                "they", "we", "you", "area", "areas", "places", "above", "budget"}
+
+
+# Trailing politeness the capture would otherwise swallow into the place name:
+# "all of Rivers state please" is Rivers, not "Rivers State Please".
+_FILLER = {"please", "thanks", "thank", "now", "instead", "too", "also", "ok", "okay",
+           "sha", "abeg", "biko"}
+
+
+def whole_area_request(text: str) -> str:
+    """The area a client asked to cover ENTIRELY, or "" if they asked no such thing.
+
+    Deliberately strict: it matches a sentence that is ONLY this request, so "all of
+    our customers in Lagos are students" is a brief, not a targeting instruction — the
+    same discipline objectives.coerce() uses for a typed objective. The cost of a false
+    positive is a campaign silently retargeted at a whole state.
+    """
+    raw = (text or "").strip().strip(".!?").replace("\u2019", "'")
+    for pattern in (_WHOLE_AREA, _WHOLE_AREA_SUFFIX):
+        hit = pattern.search(raw)
+        if not hit:
+            continue
+        words = hit.group("area").split()
+        while words and words[-1].lower() in _FILLER:
+            words.pop()
+        if not words or any(w.lower() in _NOT_A_PLACE for w in words):
+            return ""
+        area = " ".join(words).strip(" .-'")
+        # "entire Ogun State" and "all of Ogun" are the same request; Meta's own
+        # search names the region "Ogun", so the suffix is dropped here rather than
+        # left to resolve as a different string.
+        if area.lower().endswith(" state"):
+            area = area[:-6].strip()
+        if area.lower() in {"nigeria", "the country", "country"}:
+            return "NG"
+        return area.title()
+    return ""
+
+
+def whole_area_plan(area: str, mode: GeoMode = GeoMode.WATERING_HOLE) -> GeoPlan:
+    """Cover the whole of one named area, because the client asked to.
+
+    No pins by design. meta_targeting_from_geo_named() already resolves a pinless plan
+    to the city, then its state — so the campaign targets exactly the area named, and
+    nothing here has to understand Nigerian state boundaries to make that true.
+    """
+    return GeoPlan(
+        mode=mode, city=area, pins=[], fallback_area=area,
+        explanation=(f"Targeting all of {area}, as you asked. A wider area needs more "
+                     f"budget to make an impression, so keep an eye on cost per result "
+                     f"— if it climbs, narrowing to a few areas is the first thing to try."),
+    )
+
+
 async def geo_for_request(business_name: str, category: str, city: str,
                           goal: Goal = Goal.MESSAGES, description: str = "") -> GeoPlan:
     """Convenience: LLM proposes; if its names don't validate, fall back to the
     known-good gazetteer heuristic; Google-then-gazetteer geocodes."""
+    # Asked for the whole area? Then there are no pockets to propose — skipping the
+    # proposer honours the request AND saves the LLM call that would only be
+    # thrown away.
+    whole = whole_area_request(city)
+    if whole:
+        print(f"[Geo] client asked for all of {whole} — no pockets proposed", flush=True)
+        return whole_area_plan(whole, decide_geo_mode(category, description))
+
     return await build_geo_plan(
         business_name, category, city,
         proposer=LLMPinProposer(), geocoder=CompositeGeocoder(),

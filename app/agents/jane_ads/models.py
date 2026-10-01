@@ -211,6 +211,18 @@ class CampaignPlan(BaseModel):
                                              # destination.CTA_CHOICES ("shop_now", "book_now",
                                              # …). Ignored for a WhatsApp destination, which
                                              # uses Meta's own native button.
+    desired_action: str = ""                # what the client wants people to DO, as a key
+                                             # into objectives.ACTIONS ("purchase", "booking",
+                                             # "send_message", …). Distinct from the objective:
+                                             # SALES says Meta should find buyers, this says
+                                             # what buying means for this business, and the
+                                             # review screen states it in those words. "" on
+                                             # every plan built before the client was asked.
+    conversion_event: str = ""              # the measurable event that counts as that action
+                                             # on the client's own site (a pixel event name).
+                                             # Only meaningful for a website destination —
+                                             # a WhatsApp sale is counted in the inbox, not
+                                             # by a pixel, so this stays empty there.
     creative: Optional["AdCreative"] = None # the actual ad (image/video + copy) from creative.py —
                                              # Meta rejects link-ad creation with no real media
                                              # attached, so the real adapter needs this, not just

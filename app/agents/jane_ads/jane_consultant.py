@@ -25,6 +25,7 @@ from pydantic import Field
 
 from app.core.config import settings
 
+from .geo import whole_area_request
 from .nl import parse_ngn
 from .models import Goal, OfferType, PurchaseBehaviour
 from .nl import NlUnavailableError, ParsedCampaign
@@ -43,6 +44,11 @@ class ConsultantBrief(ParsedCampaign):
     geo_mode: Optional[str] = None                       # own_radius|watering_hole|mixed|non_local
     geo_areas: list[dict] = Field(default_factory=list)  # [{"name": "...", "reason": "..."}]
     geo_explanation: str = ""
+    whole_area: bool = False       # the client asked to cover a named area ENTIRELY
+                                    # ("all of Lagos"). Carried rather than re-derived:
+                                    # the plan variants are generated from this brief,
+                                    # and without it they pitch neighbourhoods back at
+                                    # a client who just said they wanted the whole state.
     intermediary_note: str = ""    # one sentence, only when an intermediary beats the end user
     creative_fit_warning: str = "" # §8 — set only when a creative won't serve the stated goal
     stated_plan: str = ""          # the plain-language "here's what I'll do" line (§7.6) —
@@ -362,6 +368,20 @@ async def consult(message: str, business_name: str = "", category: str = "",
             f"it names an area, that IS the geography (set city/geo_areas from it). Do not "
             f"substitute a different audience or widen it"
         )
+    # The client asking for a whole state is a DECISION, and the rest of this file
+    # enforces it after the fact — but stated_plan is written here, in the model's own
+    # words, and it kept narrating "I'll focus on key business areas in Lagos like
+    # Ikeja, Victoria Island and Surulere" over a plan card that correctly read "All of
+    # Lagos". Live-caught in the UI. Telling the model up front is the only way the
+    # sentence it writes agrees with the plan it produces.
+    whole_now = whole_area_request(_latest_user_reply(message))
+    if whole_now:
+        known_bits.append(
+            f"the client has asked to cover ALL of {whole_now} — that IS the geography, "
+            f"already decided. Say so in stated_plan ('all of {whole_now}'), do not name "
+            f"neighbourhoods or pockets inside it, and do not ask which areas to focus on"
+        )
+
     known_line = (f"Already known about this client — {', '.join(known_bits)}."
                   if known_bits else "Nothing known about this client yet.")
 
@@ -582,6 +602,35 @@ def _times_already_asked(history: list[dict], needle: str) -> int:
     )
 
 
+_GEOGRAPHY_WORDS = ("area", "areas", "neighbourhood", "neighborhood", "pocket",
+                    "pockets", "location", "locations", "district", "districts",
+                    "where", "city", "state", "region", "zone", "axis")
+_BUDGET_WORDS = ("budget", "spend", "naira", "₦", "how much")
+
+
+def _geographic_mode(mode: str) -> str:
+    """A mode that actually attaches geography.
+
+    "All of Lagos" came back as geo_mode=non_local — "location barely matters" — and
+    non_local attaches no geography at all, so a client who named a state would have
+    been targeted across the whole country. Naming a place is the opposite of saying
+    location does not matter.
+    """
+    current = (mode or "").strip().lower()
+    return current if current in ("own_radius", "watering_hole", "mixed") else "watering_hole"
+
+
+def _is_about_geography(text: str) -> bool:
+    """Whether a question is asking WHERE. Used to drop one the client just answered."""
+    low = (text or "").lower()
+    return any(w in low for w in _GEOGRAPHY_WORDS)
+
+
+def _is_about_budget(text: str) -> bool:
+    low = (text or "").lower()
+    return any(w in low for w in _BUDGET_WORDS)
+
+
 def _enforce_hard_requirements(brief: ConsultantBrief, message: str, history: list[dict],
                                known_budget: Optional[float]) -> ConsultantBrief:
     """A real media buyer never guesses or skips the budget and the area — enforced HERE,
@@ -601,10 +650,65 @@ def _enforce_hard_requirements(brief: ConsultantBrief, message: str, history: li
     # this can never overwrite a considered answer with a stray number.
     if brief.budget_ngn is None:
         typed = stated_budget_ngn(message)
+        if not typed:
+            # ...and if not in THIS message, in this thread's earlier ones. A budget
+            # the client gave in their opening line is still their budget three turns
+            # later, but the model only sees "ALL OF LAGOS" and returns null — so the
+            # guard below asked for a figure that was already in the conversation,
+            # word for word, every turn. Live-reproduced.
+            #
+            # The client's OWN turns only: Jane's text carries the remembered spend
+            # from a PAST campaign (₦130,000 here), and reading that back would be the
+            # silent carry-over _budget_grounded exists to prevent.
+            for turn in reversed(history):
+                if turn.get("role") != "user":
+                    continue
+                typed = stated_budget_ngn(turn.get("content", ""))
+                if typed:
+                    break
         if typed:
             brief = brief.model_copy(update={"budget_ngn": typed})
             print(f"[Consultant] recovered a stated budget of {typed} the model left null",
                   flush=True)
+
+    # THE CLIENT ASKED FOR THE WHOLE AREA. That is an answer to the geography
+    # question, not a failure to answer it — but Jane kept coming back with "which
+    # pockets within Rivers State?", and the app's own ALL OF LAGOS chip led straight
+    # back into the same question. Live-reproduced: two taps, two more pocket
+    # questions, the second one naming Yaba, Ikoyi and Lekki unprompted.
+    #
+    # Handled BEFORE the guard below, not after. The question comes from the MODEL's
+    # own clarify, and everything past that guard only runs when there is no clarify
+    # to begin with — so a check placed after it can never see the loop it exists to
+    # break.
+    whole = whole_area_request(_latest_user_reply(message))
+    if whole and _is_about_geography(brief.clarify):
+        print(f"[Consultant] client asked for all of {whole} — dropping the area "
+              f"question and settling the geography", flush=True)
+        brief = brief.model_copy(update={
+            "city": brief.city or whole,
+            "geo_areas": [],
+            "geo_mode": _geographic_mode(brief.geo_mode),
+            "whole_area": True,
+            "clarify": "",
+            "missing": [m for m in (brief.missing or []) if not _is_about_geography(m)],
+        })
+    elif whole:
+        brief = brief.model_copy(update={"city": brief.city or whole, "geo_areas": [],
+                                         "geo_mode": _geographic_mode(brief.geo_mode),
+                                         "whole_area": True})
+
+    # The same loop, for the budget. A figure the client has already given does not
+    # become unknown because the model asked again — and the existing loop-breaker
+    # below is also downstream of the guard, so it never fired on a repeat the model
+    # itself produced.
+    if brief.clarify and _is_about_budget(brief.clarify):
+        settled = brief.budget_ngn or stated_budget_ngn(message) or known_budget
+        if settled and _times_already_asked(history, "budget") >= _MAX_REPEATED_ASKS:
+            print(f"[Consultant] budget {settled} already asked "
+                  f"{_MAX_REPEATED_ASKS}× — taking it rather than looping", flush=True)
+            brief = brief.model_copy(update={"budget_ngn": settled, "clarify": "",
+                                             "missing": []})
 
     if brief.missing or brief.clarify:
         return brief   # already an "ask" — nothing to enforce
