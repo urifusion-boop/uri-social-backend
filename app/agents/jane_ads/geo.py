@@ -278,9 +278,18 @@ async def geo_plan_from_named_areas(
     # "All of Lagos" is a decision, not a gap. Without this the plan still targeted
     # the right place but explained itself with "I couldn't confirm specific pockets"
     # — apologising for doing exactly what the client asked for.
-    whole = whole_area_request(city)
-    if whole and not [a for a in areas if (a.get("name") or "").strip()]:
+    # A pocket that is itself a whole-area phrase is not a pocket. The variant cards
+    # carry "All of Lagos" as their location when the client asked for the whole
+    # state, and geocoding that as a neighbourhood finds nothing — which used to
+    # degrade into the apologetic "I couldn't confirm specific pockets" fallback.
+    named = [a for a in areas if (a.get("name") or "").strip()
+             and not whole_area_request(a.get("name") or "")]
+    whole = whole_area_request(city) or next(
+        (whole_area_request(a.get("name") or "") for a in areas
+         if whole_area_request(a.get("name") or "")), "")
+    if whole and not named:
         return whole_area_plan(whole, mode)
+    areas = named
 
     geocoder = geocoder or CompositeGeocoder()
     pins: list[GeoPin] = []

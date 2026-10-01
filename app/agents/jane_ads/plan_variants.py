@@ -209,6 +209,14 @@ async def generate_plan_variants(
         f"city: {parsed.city}" if parsed.city else "",
         f"has video: {parsed.has_video}",
     ]
+    if getattr(parsed, "whole_area", False) and parsed.city:
+        # Live-caught in the real UI: the client answered "ALL OF LAGOS" and every
+        # variant came back offering three neighbourhoods to confirm. The prompt only
+        # ever saw "city: Lagos", which reads as "pick pockets in Lagos".
+        known_bits.append(
+            f"the client has EXPLICITLY asked to cover ALL of {parsed.city} — "
+            f"geo_pockets must be exactly [\"All of {parsed.city}\"] for every "
+            f"variant, and must never narrow to neighbourhoods or districts")
     if parsed.geo_explanation:
         known_bits.append(f"Jane's geography read so far: {parsed.geo_explanation}")
     if parsed.intermediary_note:
