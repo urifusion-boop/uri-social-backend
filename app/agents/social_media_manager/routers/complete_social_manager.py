@@ -169,6 +169,10 @@ class VideoFromStoryboardRequest(BaseModel):
     # "quick_video", "animate_product"). The actual model is an implementation
     # detail resolved server-side, with its own brief-specified fallback.
     outcome: str = "quick_video"
+    # Only consulted when the outcome routes to the talking-avatar model
+    # (currently "talking_dialogue") — one of video_generation_service.
+    # AVATAR_VOICES. Ignored by every other outcome.
+    avatar_voice: str = "Sarah"
 
 class ContentGenerationRequest(BaseModel):
     seed_content: str = Field(..., min_length=10, max_length=5000)
@@ -6629,13 +6633,14 @@ async def generate_video_from_storyboard(
 
     _get_user_id(token)  # auth check
 
-    job_id = await VideoGenerationService.create_job(request.storyboard, request.outcome)
+    job_id = await VideoGenerationService.create_job(request.storyboard, request.outcome, request.avatar_voice)
     background_tasks.add_task(
         VideoGenerationService.run_job,
         job_id,
         request.storyboard,
         request.brand_images,
         request.outcome,
+        request.avatar_voice,
     )
     return UriResponse.get_single_data_response(
         "video_job",

@@ -60,6 +60,19 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
         "label": "Seedance 2.0 Fast",
         "cost_per_second": 0.2419,
     },
+    # Not in the brief (which predates this need) — added for real talking-
+    # head support. Veo 3.1 Fast's "generate_audio" only produces ambient/
+    # prompt-described audio, not a script the caller actually controls, and
+    # isn't true lip-sync. fal-ai/ai-avatar/single-text takes an exact script
+    # (text_input), converts it to speech (voice enum), and lip-syncs a still
+    # image to it — confirmed via fal.ai's own API docs, 2026-10-01. Priced
+    # at $0.2/sec at 480p ("$0.2 per second... 720p price will be doubled" —
+    # fal.ai's own pricing copy); this registry entry fixes 480p so cost stays
+    # predictable (see _generate_scene_fal).
+    "fal-ai/ai-avatar/single-text": {
+        "label": "Talking Avatar",
+        "cost_per_second": 0.2,
+    },
 }
 
 _H3_TURBO = "minimax/h3-max-turbo/image-to-video"
@@ -69,6 +82,16 @@ _H3_MAX = "minimax/h3-max/image-to-video"
 _WAN_3 = "alibaba/wan-3.0/image-to-video"
 _VEO_FAST = "fal-ai/veo3.1/fast/image-to-video"
 _SEEDANCE_FAST = "bytedance/seedance-2.0/image-to-video"
+_AVATAR_TALKING = "fal-ai/ai-avatar/single-text"
+
+# fal.ai's own documented voice enum for fal-ai/ai-avatar/single-text — keep
+# in sync with AVATAR_VOICES in VideoStoryboardGenerator.tsx if this changes.
+AVATAR_VOICES = [
+    "Aria", "Roger", "Sarah", "Laura", "Charlie", "George", "Callum", "River",
+    "Liam", "Charlotte", "Alice", "Matilda", "Will", "Jessica", "Eric",
+    "Chris", "Brian", "Daniel", "Lily", "Bill",
+]
+DEFAULT_AVATAR_VOICE = "Sarah"
 
 # §2 ("Product Principle: URI Chooses the Model") + §4 ("Recommended URI
 # Routing Logic") of the brief, combined: the customer picks an OUTCOME, never
@@ -112,8 +135,13 @@ OUTCOME_ROUTES: Dict[str, Dict[str, Any]] = {
     "talking_dialogue": {
         "label": "Talking / Dialogue",
         "description": "Synchronized speech, lip-sync, a visible talking human.",
-        "primary": _VEO_FAST,
-        "fallback": _PIXVERSE,
+        # Primary is the dedicated talking-avatar model (exact scripted
+        # dialogue + real lip-sync), not Veo — Veo's audio is prompt-described,
+        # not a script the caller controls. Veo stays as fallback: it still
+        # produces a plausible talking-human clip (its own prompt can describe
+        # speech) if the avatar model fails, which beats a hard failure.
+        "primary": _AVATAR_TALKING,
+        "fallback": _VEO_FAST,
     },
     "advanced_references": {
         "label": "Advanced References",
@@ -138,7 +166,7 @@ async def get_job(job_id: str) -> Optional[Dict[str, Any]]:
 class VideoGenerationService:
 
     @staticmethod
-    async def create_job(storyboard: dict, outcome: str) -> str:
+    async def create_job(storyboard: dict, outcome: str, avatar_voice: str = DEFAULT_AVATAR_VOICE) -> str:
         job_id = uuid.uuid4().hex
         route = OUTCOME_ROUTES.get(outcome, OUTCOME_ROUTES[DEFAULT_OUTCOME])
         await _jobs_collection().insert_one({
@@ -146,6 +174,7 @@ class VideoGenerationService:
             "status": "queued",
             "outcome": outcome,
             "model": route["primary"],  # kept for display/back-compat; the real model per clip is `routed_model`
+            "avatar_voice": avatar_voice,  # only consulted when a clip routes to _AVATAR_TALKING
             "total_scenes": len(storyboard.get("scenes", [])),
             "current_scene": 0,
             "clips": [],
@@ -159,11 +188,14 @@ class VideoGenerationService:
         storyboard: dict,
         brand_images: List[str],
         outcome: str,
+        avatar_voice: str = DEFAULT_AVATAR_VOICE,
     ) -> None:
         col = _jobs_collection()
         scenes = storyboard.get("scenes", [])
         route = OUTCOME_ROUTES.get(outcome, OUTCOME_ROUTES[DEFAULT_OUTCOME])
         primary_model, fallback_model = route["primary"], route["fallback"]
+        if avatar_voice not in AVATAR_VOICES:
+            avatar_voice = DEFAULT_AVATAR_VOICE
         await col.update_one({"job_id": job_id}, {"$set": {"status": "generating"}})
 
         for scene in scenes:
@@ -187,14 +219,26 @@ class VideoGenerationService:
             # that's a real, surfaced failure, not a silent third attempt.
             started = time.monotonic()
             fallback_used = False
+            fallback_warning = None
             try:
-                video_url, cost_usd = await VideoGenerationService._generate_scene_fal(scene, primary_model)
+                video_url, cost_usd = await VideoGenerationService._generate_scene_fal(
+                    scene, primary_model, avatar_voice
+                )
                 routed_model = primary_model
             except Exception as primary_error:
                 print(f"[VideoGenJob {job_id}] Scene {scene_num}: {primary_model} failed "
                       f"({primary_error}), falling back to {fallback_model}")
+                # Record WHY it fell back even when the fallback itself succeeds —
+                # a clip that "works" on the fallback can still be materially
+                # different from what was asked for (e.g. talking_dialogue's
+                # fallback has no scripted-speech guarantee at all), and without
+                # this the UI shows an identical "Done" badge either way, hiding
+                # that mismatch from the caller entirely.
+                fallback_warning = f"Fell back to {MODEL_REGISTRY.get(fallback_model, {}).get('label', fallback_model)}: {primary_model} failed ({primary_error})"
                 try:
-                    video_url, cost_usd = await VideoGenerationService._generate_scene_fal(scene, fallback_model)
+                    video_url, cost_usd = await VideoGenerationService._generate_scene_fal(
+                        scene, fallback_model, avatar_voice
+                    )
                     routed_model = fallback_model
                     fallback_used = True
                 except Exception as fallback_error:
@@ -221,6 +265,7 @@ class VideoGenerationService:
                 "outcome": outcome,
                 "routed_model": routed_model,
                 "fallback_used": fallback_used,
+                "warning": fallback_warning,
                 "latency_seconds": latency,
             }}})
 
@@ -239,7 +284,9 @@ class VideoGenerationService:
     #    rather than pretending they share one shape. ───────────────────────
 
     @staticmethod
-    async def _generate_scene_fal(scene: dict, model: str) -> tuple[str, Optional[float]]:
+    async def _generate_scene_fal(
+        scene: dict, model: str, avatar_voice: str = DEFAULT_AVATAR_VOICE
+    ) -> tuple[str, Optional[float]]:
         import fal_client
 
         frame_image_url = scene.get("frame_image_url")
@@ -329,6 +376,29 @@ class VideoGenerationService:
                 "generate_audio": True,
             }
             print(f"[VideoGen] Scene {scene_num}: Seedance 2.0 Fast, {seconds}s")
+
+        elif model == _AVATAR_TALKING:
+            # No duration field on this model — it's driven by num_frames at a
+            # fixed internal frame rate. fal.ai doesn't publish the fps for
+            # this endpoint; 25fps is the standard rate for the MultiTalk-
+            # family avatar models this one is built on, used here as the
+            # best-available estimate — if a live generation's actual runtime
+            # diverges noticeably from this, re-derive from a real response.
+            fps = 25
+            num_frames = max(41, min(721, round(duration_req * fps)))
+            actual_seconds = round(num_frames / fps, 2)
+            dialogue = (scene.get("dialogue") or scene.get("text_overlay") or prompt or "").strip()
+            if not dialogue:
+                raise ValueError("Talking Avatar requires a scripted line — this scene has no dialogue")
+            arguments = {
+                "image_url": frame_image_url,
+                "text_input": dialogue,
+                "voice": avatar_voice if avatar_voice in AVATAR_VOICES else DEFAULT_AVATAR_VOICE,
+                "prompt": prompt or dialogue,
+                "num_frames": num_frames,
+                "resolution": "480p",  # fixed — 720p doubles the $/sec rate baked into MODEL_REGISTRY above
+            }
+            print(f"[VideoGen] Scene {scene_num}: Talking Avatar ({avatar_voice}), ~{actual_seconds}s")
 
         else:
             raise ValueError(f"Unknown video model: {model}")
