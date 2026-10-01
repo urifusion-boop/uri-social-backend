@@ -619,7 +619,7 @@ class ImageContentService:
             stored_background_url = raw_background_url
             if raw_background_url and raw_background_url.startswith("data:"):
                 try:
-                    from app.utils.s3_upload import upload_base64
+                    from app.utils.cloudinary_upload import upload_base64
                     stored_background_url = await upload_base64(
                         raw_background_url, folder="uri-social/content-draft-backgrounds"
                     )
