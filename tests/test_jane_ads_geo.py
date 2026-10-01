@@ -241,3 +241,21 @@ def test_a_pocket_that_is_itself_a_whole_area_phrase_is_not_geocoded():
     assert plan.pins == []
     assert "all of Lagos" in plan.explanation
     assert "couldn't confirm" not in plan.explanation
+
+
+def test_the_request_is_recognised_inside_a_longer_brief():
+    """Clients type it as part of the brief as often as they tap the chip. An anchored
+    match silently honoured everything in the brief except the geography."""
+    assert whole_area_request(
+        "I want to promote my tool, budget 20000, all of Lagos") == "Lagos"
+    assert whole_area_request("promote my tool across Ogun") == "Ogun"
+
+
+def test_trailing_politeness_is_not_part_of_the_place_name():
+    assert whole_area_request("target all of Rivers state please") == "Rivers"
+    assert whole_area_request("all of Lagos abeg") == "Lagos"
+
+
+def test_prose_inside_a_longer_message_is_still_not_a_request():
+    assert whole_area_request("I spent all of my budget in Lagos") == ""
+    assert whole_area_request("all of our customers in Lagos are students") == ""
