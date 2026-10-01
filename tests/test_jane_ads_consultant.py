@@ -494,3 +494,27 @@ def test_a_first_budget_question_still_gets_asked():
         clarify="What budget would you like for this campaign?")
     result = _enforce_hard_requirements(asking, "promote my tool", [], known_budget=None)
     assert result.clarify == "What budget would you like for this campaign?"
+
+
+def test_a_budget_from_an_earlier_turn_is_not_asked_for_again():
+    """The client's opening line carried the budget; three turns later the model sees
+    only "ALL OF LAGOS" and returns null. Asking again puts a figure already in the
+    conversation back on screen as a question."""
+    history = [{"role": "user", "content": "promote my tool, budget 20000"},
+               {"role": "assistant", "content": "Which area should I focus on?"}]
+    asking = ConsultantBrief(business_name="URI Social", offer_type="service",
+                             city="Lagos")
+    result = _enforce_hard_requirements(asking, "ALL OF LAGOS", history,
+                                        known_budget=130000)
+    assert result.budget_ngn == 20000
+    assert not _is_about_budget(result.clarify)
+
+
+def test_a_remembered_past_spend_in_janes_own_words_is_not_recovered():
+    """Reading Jane's text back would be the silent carry-over the grounding rule
+    exists to prevent."""
+    history = [{"role": "assistant", "content": "Last time you spent ₦130,000 — same again?"}]
+    asking = ConsultantBrief(business_name="URI Social", offer_type="service", city="Lagos")
+    result = _enforce_hard_requirements(asking, "ALL OF LAGOS", history,
+                                        known_budget=130000)
+    assert result.budget_ngn is None
