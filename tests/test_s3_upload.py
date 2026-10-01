@@ -8,9 +8,11 @@ that test_cloudinary_upload.py already guards for the Cloudinary version
 silently break again here)."""
 import asyncio
 import base64
+import os
+import tempfile
 from unittest.mock import MagicMock, patch
 
-from app.utils.s3_upload import _sniff_extension, upload_base64, upload_bytes
+from app.utils.s3_upload import _sniff_extension, upload_base64, upload_bytes, upload_file_path
 
 # Minimal real magic-byte prefixes for each format, not full valid files —
 # _sniff_extension only ever looks at the header, so a truncated-but-correct
@@ -99,6 +101,72 @@ class TestUploadBytes:
             url2 = _run(upload_bytes(_PNG_HEAD, folder="uri-social/logos"))
 
         assert url1 != url2, "two uploads with no public_id must not collide on the same key"
+
+
+class TestUploadFilePath:
+    """upload_file_path — the streaming, disk-based sibling to upload_bytes.
+    Added for video generation specifically: downloading a multi-MB clip
+    fully into memory just to immediately re-upload it (the old pattern)
+    was large and frequent enough, combined with glibc not returning freed
+    memory to the OS inside the container, to ratchet process memory up
+    until the kernel OOM-killed a uvicorn worker — confirmed live via
+    repeating "Child process [N] died" log entries. upload_file never loads
+    the whole file into Python memory; it streams from disk."""
+
+    def _write_tmp(self, data: bytes) -> str:
+        fd, path = tempfile.mkstemp()
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        return path
+
+    def test_uploads_via_upload_file_not_put_object(self):
+        """The whole point — upload_file streams from disk in chunks;
+        put_object would require the caller to have the full bytes in
+        memory already, defeating the purpose of this function existing."""
+        path = self._write_tmp(_MP4_HEAD)
+        try:
+            with patch("app.utils.s3_upload._s3_client") as mock_s3, \
+                 patch("app.utils.s3_upload._S3_BUCKET", "uri-social-media-dev"), \
+                 patch("app.utils.s3_upload._S3_REGION", "eu-west-1"):
+                url = _run(upload_file_path(path, folder="uri-social/generated-videos"))
+
+            assert url.startswith("https://uri-social-media-dev.s3.eu-west-1.amazonaws.com/uri-social/generated-videos/")
+            assert url.endswith(".mp4")
+            mock_s3.put_object.assert_not_called()
+            args, kwargs = mock_s3.upload_file.call_args
+            assert args[0] == path
+            assert args[1] == "uri-social-media-dev"
+            assert args[2].endswith(".mp4")
+            assert kwargs["ExtraArgs"]["ContentType"] == "video/mp4"
+        finally:
+            os.unlink(path)
+
+    def test_sniffs_extension_from_a_small_head_read_not_the_whole_file(self):
+        """Confirms the sniff only reads the file's head — doesn't assert
+        timing, but documents the intent: a multi-MB clip shouldn't need a
+        full read just to pick an extension."""
+        path = self._write_tmp(_PNG_HEAD + b"\x00" * 10_000)
+        try:
+            with patch("app.utils.s3_upload._s3_client") as mock_s3, \
+                 patch("app.utils.s3_upload._S3_BUCKET", "uri-social-media-dev"), \
+                 patch("app.utils.s3_upload._S3_REGION", "eu-west-1"):
+                url = _run(upload_file_path(path, folder="uri-social/thumbs", resource_type="image"))
+            assert url.endswith(".png")
+        finally:
+            os.unlink(path)
+
+    def test_public_id_becomes_the_key_name(self):
+        path = self._write_tmp(_MP4_HEAD)
+        try:
+            with patch("app.utils.s3_upload._s3_client") as mock_s3, \
+                 patch("app.utils.s3_upload._S3_BUCKET", "uri-social-media-dev"), \
+                 patch("app.utils.s3_upload._S3_REGION", "eu-west-1"):
+                url = _run(upload_file_path(
+                    path, folder="uri-social/generated-videos", public_id="scene-1-clip",
+                ))
+            assert "scene-1-clip.mp4" in url
+        finally:
+            os.unlink(path)
 
 
 class TestUploadBase64:

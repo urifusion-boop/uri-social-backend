@@ -2294,7 +2294,14 @@ async def run_production_job(
         print(f"[VideoProduction] job={job_id} {progress}% {message}", flush=True)
 
     try:
-        duration = _probe_duration(video_bytes)
+        # to_thread, not a direct call — _probe_duration shells out to ffprobe
+        # synchronously (up to a 30s timeout); called directly, that blocks
+        # THE ENTIRE event loop for the duration, including the /health
+        # endpoint, since this background job runs on the same loop as the
+        # HTTP server. Confirmed live: every video production run froze the
+        # whole backend long enough for ECS's health check to time out and
+        # kill the task, over and over, every ~40-50s.
+        duration = await asyncio.to_thread(_probe_duration, video_bytes)
         print(f"[VideoProduction] duration={duration:.1f}s", flush=True)
 
         # ── Load brand profile for branding overlays ──────────────────────────────
@@ -2358,7 +2365,9 @@ async def run_production_job(
             await update(30, "Captions disabled — skipping transcription…")
         else:
             await update(5, "Checking audio…")
-            has_speech = _probe_has_speech(video_bytes)
+            # Same event-loop-blocking risk as _probe_duration above — this one
+            # runs ffprobe AND ffmpeg volumedetect (up to 90s combined).
+            has_speech = await asyncio.to_thread(_probe_has_speech, video_bytes)
             print(f"[VideoProduction] has_speech={has_speech}", flush=True)
 
             if has_speech:

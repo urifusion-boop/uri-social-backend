@@ -1,5 +1,6 @@
 import asyncio
 import os
+import tempfile
 import time
 import uuid
 from typing import Any, Dict, List, Optional
@@ -8,7 +9,7 @@ import httpx
 
 from app.core.config import settings
 from app.database import get_db
-from app.utils.s3_upload import upload_bytes
+from app.utils.s3_upload import upload_file_path
 
 # Model lineup matches the "URI_AI_Video_API_Model_Selection_Engineering_Brief"
 # (Uzuri Creative / URI, 1 October 2026) exactly — its 7 selected launch routes,
@@ -425,16 +426,29 @@ class VideoGenerationService:
 
         video_url = result["video"]["url"]
 
-        # Download and store in Cloudinary
-        async with httpx.AsyncClient(timeout=120) as client:
-            video_resp = await client.get(video_url)
-            video_resp.raise_for_status()
-            video_bytes = video_resp.content
+        # Stream the download straight to a temp file and upload FROM that
+        # file (upload_file_path streams it in chunks too) — never holds the
+        # whole clip in memory at once, unlike the old `.content` + bytes
+        # upload. Confirmed live: that pattern was large and frequent enough,
+        # combined with glibc not returning freed memory to the OS inside
+        # the container, to ratchet process memory up until the kernel
+        # OOM-killed a uvicorn worker. See upload_file_path's docstring.
+        tmp_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4().hex}.mp4")
+        try:
+            async with httpx.AsyncClient(timeout=120) as client:
+                async with client.stream("GET", video_url) as video_resp:
+                    video_resp.raise_for_status()
+                    with open(tmp_path, "wb") as f:
+                        async for chunk in video_resp.aiter_bytes():
+                            f.write(chunk)
 
-        stored_url = await upload_bytes(
-            video_bytes,
-            folder="uri-social/generated-videos",
-            resource_type="video",
-        )
+            stored_url = await upload_file_path(
+                tmp_path,
+                folder="uri-social/generated-videos",
+                resource_type="video",
+            )
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
         cost_usd = round(actual_seconds * info["cost_per_second"], 3)
         return stored_url, cost_usd
