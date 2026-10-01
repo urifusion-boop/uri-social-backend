@@ -7,7 +7,8 @@ to_campaign_request() keeps working unchanged downstream.
 """
 from app.agents.jane_ads.jane_consultant import (
     ConsultantBrief, _budget_grounded, _build_budget_confirmation_note, _coerce,
-    _enforce_hard_requirements, _latest_user_reply, build_history_turns,
+    _enforce_hard_requirements, _is_about_budget, _is_about_geography,
+    _latest_user_reply, build_history_turns,
 )
 from app.agents.jane_ads.nl import to_campaign_request
 
@@ -431,3 +432,65 @@ def test_nothing_at_all_still_asks():
     b = _enforce_hard_requirements(_ready(), "yes 10000", [], 10000.0)
     assert b.clarify
     assert "area or city" in b.clarify
+
+
+# ── The client answered; stop asking ──────────────────────────────────────────
+# Live-reproduced on a real account: "ALL OF LAGOS" twice, and Jane came back with
+# "are there particular areas within Lagos?" and then named Yaba, Ikoyi and Lekki
+# unprompted. The question comes from the MODEL's own clarify, so a guard placed
+# after the "already an ask" early-return can never see it.
+
+def test_a_whole_area_reply_drops_the_pocket_question():
+    asking = ConsultantBrief(
+        business_name="URI Social", offer_type="service", budget_ngn=20000,
+        clarify="Are there particular areas or neighborhoods within Lagos to focus on?")
+    result = _enforce_hard_requirements(
+        asking, "ALL OF LAGOS", [{"role": "user", "content": "budget 20000"}],
+        known_budget=20000)
+    # The geography is settled. Any question that remains is about something else —
+    # falling through to the next unanswered requirement is correct; coming back for
+    # pockets is the bug.
+    assert not _is_about_geography(result.clarify)
+    assert result.city == "Lagos"
+    assert result.geo_areas == []
+
+
+def test_a_whole_area_reply_leaves_an_unrelated_question_alone():
+    """Only the question the client just answered is dropped — a creative question
+    is still a real question."""
+    asking = ConsultantBrief(
+        business_name="URI Social", offer_type="service", budget_ngn=20000,
+        clarify="Do you have a photo or video you'd like to use for this ad?")
+    result = _enforce_hard_requirements(asking, "ALL OF LAGOS", [], known_budget=20000)
+    assert result.clarify == "Do you have a photo or video you'd like to use for this ad?"
+
+
+def test_prose_mentioning_a_place_does_not_settle_the_geography():
+    asking = ConsultantBrief(
+        business_name="URI Social", offer_type="service", budget_ngn=20000,
+        clarify="Which areas in Lagos should I focus on?")
+    result = _enforce_hard_requirements(
+        asking, "all of our customers in Lagos are students", [], known_budget=20000)
+    assert result.clarify == "Which areas in Lagos should I focus on?"
+
+
+def test_a_budget_already_asked_twice_is_taken_rather_than_asked_again():
+    """A figure the client has given does not become unknown because the model asked
+    again. Two asks is the limit the budget guard already used downstream."""
+    history = [{"role": "assistant", "content": "What budget for this campaign?"},
+               {"role": "assistant", "content": "Could you confirm the budget?"}]
+    asking = ConsultantBrief(
+        business_name="URI Social", offer_type="service", budget_ngn=20000,
+        city="Lagos",
+        clarify="Should we base this campaign on the same ₦130,000 budget?")
+    result = _enforce_hard_requirements(asking, "20000", history, known_budget=20000)
+    assert not _is_about_budget(result.clarify)
+    assert result.budget_ngn == 20000
+
+
+def test_a_first_budget_question_still_gets_asked():
+    asking = ConsultantBrief(
+        business_name="URI Social", offer_type="service",
+        clarify="What budget would you like for this campaign?")
+    result = _enforce_hard_requirements(asking, "promote my tool", [], known_budget=None)
+    assert result.clarify == "What budget would you like for this campaign?"

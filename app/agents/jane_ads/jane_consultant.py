@@ -583,6 +583,23 @@ def _times_already_asked(history: list[dict], needle: str) -> int:
     )
 
 
+_GEOGRAPHY_WORDS = ("area", "areas", "neighbourhood", "neighborhood", "pocket",
+                    "pockets", "location", "locations", "district", "districts",
+                    "where", "city", "state", "region", "zone", "axis")
+_BUDGET_WORDS = ("budget", "spend", "naira", "₦", "how much")
+
+
+def _is_about_geography(text: str) -> bool:
+    """Whether a question is asking WHERE. Used to drop one the client just answered."""
+    low = (text or "").lower()
+    return any(w in low for w in _GEOGRAPHY_WORDS)
+
+
+def _is_about_budget(text: str) -> bool:
+    low = (text or "").lower()
+    return any(w in low for w in _BUDGET_WORDS)
+
+
 def _enforce_hard_requirements(brief: ConsultantBrief, message: str, history: list[dict],
                                known_budget: Optional[float]) -> ConsultantBrief:
     """A real media buyer never guesses or skips the budget and the area — enforced HERE,
@@ -606,6 +623,41 @@ def _enforce_hard_requirements(brief: ConsultantBrief, message: str, history: li
             brief = brief.model_copy(update={"budget_ngn": typed})
             print(f"[Consultant] recovered a stated budget of {typed} the model left null",
                   flush=True)
+
+    # THE CLIENT ASKED FOR THE WHOLE AREA. That is an answer to the geography
+    # question, not a failure to answer it — but Jane kept coming back with "which
+    # pockets within Rivers State?", and the app's own ALL OF LAGOS chip led straight
+    # back into the same question. Live-reproduced: two taps, two more pocket
+    # questions, the second one naming Yaba, Ikoyi and Lekki unprompted.
+    #
+    # Handled BEFORE the guard below, not after. The question comes from the MODEL's
+    # own clarify, and everything past that guard only runs when there is no clarify
+    # to begin with — so a check placed after it can never see the loop it exists to
+    # break.
+    whole = whole_area_request(_latest_user_reply(message))
+    if whole and _is_about_geography(brief.clarify):
+        print(f"[Consultant] client asked for all of {whole} — dropping the area "
+              f"question and settling the geography", flush=True)
+        brief = brief.model_copy(update={
+            "city": brief.city or whole,
+            "geo_areas": [],
+            "clarify": "",
+            "missing": [m for m in (brief.missing or []) if not _is_about_geography(m)],
+        })
+    elif whole and not brief.city:
+        brief = brief.model_copy(update={"city": whole, "geo_areas": []})
+
+    # The same loop, for the budget. A figure the client has already given does not
+    # become unknown because the model asked again — and the existing loop-breaker
+    # below is also downstream of the guard, so it never fired on a repeat the model
+    # itself produced.
+    if brief.clarify and _is_about_budget(brief.clarify):
+        settled = brief.budget_ngn or stated_budget_ngn(message) or known_budget
+        if settled and _times_already_asked(history, "budget") >= _MAX_REPEATED_ASKS:
+            print(f"[Consultant] budget {settled} already asked "
+                  f"{_MAX_REPEATED_ASKS}× — taking it rather than looping", flush=True)
+            brief = brief.model_copy(update={"budget_ngn": settled, "clarify": "",
+                                             "missing": []})
 
     if brief.missing or brief.clarify:
         return brief   # already an "ask" — nothing to enforce
@@ -634,21 +686,6 @@ def _enforce_hard_requirements(brief: ConsultantBrief, message: str, history: li
     #
     # NON_LOCAL is the one mode that genuinely needs no place — it means geography
     # does not matter for this business, which is itself the answer.
-    # THE CLIENT ASKED FOR THE WHOLE AREA. That is an answer to the geography
-    # question, not a failure to answer it — but Jane kept coming back with "which
-    # pockets within Rivers State?", and the app's own "ALL OF LAGOS" chip led
-    # straight back into the same question. Live-reported, twice in one session.
-    #
-    # Taken from the client's latest reply only: a state named in an earlier turn was
-    # the answer to an earlier question.
-    whole = whole_area_request(_latest_user_reply(message))
-    if whole and not brief.city:
-        print(f"[Consultant] client asked for all of {whole} — geography is settled",
-              flush=True)
-        return brief.model_copy(update={"city": whole, "geo_areas": []})
-    if whole:
-        return brief
-
     if (brief.geo_mode or "").strip().lower() != "non_local" and not (brief.city or brief.geo_areas):
         return ConsultantBrief(
             business_name=brief.business_name, category=brief.category,
