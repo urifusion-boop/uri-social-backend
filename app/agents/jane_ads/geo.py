@@ -325,14 +325,19 @@ async def geo_plan_from_named_areas(
 # answer it. Jane used to keep asking which pockets to focus on, and the chip the app
 # offers for exactly this ("ALL OF LAGOS") led straight back into the same question.
 _AREA = r"(?P<area>[A-Za-z'.-]+(?:\s+[A-Za-z'.-]+){0,2})"
+# Searched for ANYWHERE in the reply, not anchored to the whole string: the client
+# types it inside a brief ("promote my tool, budget 20000, all of Lagos") as often as
+# they tap it as a chip, and an anchored match silently ignored the former — live-
+# caught in the UI, where the brief was honoured for everything except geography.
+# The stoplist below, not the anchoring, is what keeps prose out.
 _WHOLE_AREA = re.compile(
-    r"^\s*(?:all\s+of|the\s+whole\s+of|whole\s+of|entire|everywhere\s+in|across)\s+"
-    r"(?:the\s+)?" + _AREA + r"(?:\s+state)?\s*$",
+    r"(?:^|[\s,;:.])(?:all\s+of|the\s+whole\s+of|whole\s+of|entire|everywhere\s+in|"
+    r"across)\s+(?:the\s+)?" + _AREA + r"(?:\s+state)?(?=$|[\s,;:.!?])",
     re.IGNORECASE,
 )
 _WHOLE_AREA_SUFFIX = re.compile(
-    r"^\s*" + _AREA + r"\s+(?:state\s+)?"
-    r"(?:as\s+a\s+whole|statewide|state\s*-?\s*wide|in\s+general|generally)\s*$",
+    r"(?:^|[\s,;:.])" + _AREA + r"\s+(?:state\s+)?"
+    r"(?:as\s+a\s+whole|statewide|state\s*-?\s*wide)(?=$|[\s,;:.!?])",
     re.IGNORECASE,
 )
 
@@ -342,6 +347,12 @@ _NOT_A_PLACE = {"our", "my", "your", "their", "his", "her", "its", "this", "that
                 "these", "those", "customers", "clients", "people", "buyers", "users",
                 "them", "us", "it", "is", "are", "was", "were", "and", "with", "who",
                 "they", "we", "you", "area", "areas", "places", "above", "budget"}
+
+
+# Trailing politeness the capture would otherwise swallow into the place name:
+# "all of Rivers state please" is Rivers, not "Rivers State Please".
+_FILLER = {"please", "thanks", "thank", "now", "instead", "too", "also", "ok", "okay",
+           "sha", "abeg", "biko"}
 
 
 def whole_area_request(text: str) -> str:
@@ -354,11 +365,13 @@ def whole_area_request(text: str) -> str:
     """
     raw = (text or "").strip().strip(".!?").replace("\u2019", "'")
     for pattern in (_WHOLE_AREA, _WHOLE_AREA_SUFFIX):
-        hit = pattern.match(raw)
+        hit = pattern.search(raw)
         if not hit:
             continue
         words = hit.group("area").split()
-        if any(w.lower() in _NOT_A_PLACE for w in words):
+        while words and words[-1].lower() in _FILLER:
+            words.pop()
+        if not words or any(w.lower() in _NOT_A_PLACE for w in words):
             return ""
         area = " ".join(words).strip(" .-'")
         # "entire Ogun State" and "all of Ogun" are the same request; Meta's own
