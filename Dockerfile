@@ -31,6 +31,28 @@ COPY . .
 # Stage 2: Production
 FROM python:3.13.0-bookworm AS production
 WORKDIR /app
+# Live-diagnosed 2026-10-01: memory utilization climbed to ~100% during AI
+# video-generation testing (full video/image byte buffers moving through
+# video_generation_service.py / video_storyboard_service.py — a Veo clip,
+# say, fully in memory before it's re-uploaded to Cloudinary) and then NEVER
+# came back down, even once CPU went idle for hours afterward — confirmed via
+# the ECS service's own CPU/Memory utilization graphs. That shape (RSS stays
+# pinned well after the triggering work stops, despite the Python objects
+# being properly garbage collected) is glibc's per-thread malloc arena
+# behavior on a bookworm/glibc base image, not a reference leak in app code:
+# glibc keeps the memory arenas it allocated for large buffers rather than
+# returning them to the OS, and a multi-worker/multi-threaded process like
+# this (uvicorn --workers 4, each doing blocking SDK calls via
+# run_in_executor's thread pool) can end up with many such arenas. This is
+# exactly what was killing uvicorn worker processes via Linux's OOM killer —
+# "Child process died" with no Python traceback, since a SIGKILL from the
+# kernel bypasses application-level exception handling entirely.
+# MALLOC_ARENA_MAX=2 is the standard, well-documented fix for this class of
+# symptom in containerized Python/glibc services — caps the number of arenas
+# glibc will create instead of scaling them with thread/core count, which
+# bounds how much memory can get stuck unreturned this way. Pure allocator
+# tuning, no application behavior change.
+ENV MALLOC_ARENA_MAX=2
 RUN echo 'Acquire::Retries "5";' > /etc/apt/apt.conf.d/80-retries && \
     apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
