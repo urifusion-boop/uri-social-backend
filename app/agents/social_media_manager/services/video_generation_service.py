@@ -1,5 +1,6 @@
 import asyncio
 import os
+import time
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -33,42 +34,96 @@ from app.utils.s3_upload import upload_bytes
 MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
     "minimax/h3-max-turbo/image-to-video": {
         "label": "H3 Max Turbo",
-        "role": "Default generation",
         "cost_per_second": 0.0399,
     },
     "fal-ai/kling-video/v2.5-turbo/standard/image-to-video": {
         "label": "Kling 2.5 Standard",
-        "role": "Product image animation",
         "cost_per_second": 0.0422,
     },
     "fal-ai/pixverse/v6/image-to-video": {
         "label": "PixVerse V6",
-        "role": "Social content",
         "cost_per_second": 0.0603,
     },
     "minimax/h3-max/image-to-video": {
         "label": "H3 Max",
-        "role": "Premium quality",
         "cost_per_second": 0.0798,
     },
     "alibaba/wan-3.0/image-to-video": {
         "label": "Wan 3.0",
-        "role": "Complex motion",
         "cost_per_second": 0.1002,
     },
     "fal-ai/veo3.1/fast/image-to-video": {
         "label": "Veo 3.1 Fast",
-        "role": "Dialogue / speaking",
         "cost_per_second": 0.1499,
     },
     "bytedance/seedance-2.0/image-to-video": {
         "label": "Seedance 2.0 Fast",
-        "role": "Advanced references",
         "cost_per_second": 0.2419,
     },
 }
 
-DEFAULT_MODEL = "minimax/h3-max-turbo/image-to-video"
+_H3_TURBO = "minimax/h3-max-turbo/image-to-video"
+_KLING_STANDARD = "fal-ai/kling-video/v2.5-turbo/standard/image-to-video"
+_PIXVERSE = "fal-ai/pixverse/v6/image-to-video"
+_H3_MAX = "minimax/h3-max/image-to-video"
+_WAN_3 = "alibaba/wan-3.0/image-to-video"
+_VEO_FAST = "fal-ai/veo3.1/fast/image-to-video"
+_SEEDANCE_FAST = "bytedance/seedance-2.0/image-to-video"
+
+# §2 ("Product Principle: URI Chooses the Model") + §4 ("Recommended URI
+# Routing Logic") of the brief, combined: the customer picks an OUTCOME, never
+# a raw model name — "Model names should remain an implementation detail so
+# engineering can change routing as pricing, quality and availability change."
+# Each outcome's fallback is §4's own table entry for that same request
+# signal, used automatically (not offered as a choice) when the primary route
+# fails — see run_job below. label/description are what the UI shows; the
+# model ids are never surfaced to a customer-facing caller.
+OUTCOME_ROUTES: Dict[str, Dict[str, Any]] = {
+    "quick_video": {
+        "label": "Quick Video",
+        "description": "Fast, low-cost general creative — the everyday default.",
+        "primary": _H3_TURBO,
+        "fallback": _PIXVERSE,
+    },
+    "animate_product": {
+        "label": "Animate My Product",
+        "description": "Turn a product/brand photo into camera movement.",
+        "primary": _KLING_STANDARD,
+        "fallback": _H3_TURBO,
+    },
+    "social_video": {
+        "label": "Social Video",
+        "description": "Cheap variants for iteration — native audio, high volume.",
+        "primary": _PIXVERSE,
+        "fallback": _H3_TURBO,
+    },
+    "high_quality": {
+        "label": "High Quality",
+        "description": "Premium brand shots and hero creative.",
+        "primary": _H3_MAX,
+        "fallback": _WAN_3,
+    },
+    "complex_cinematic": {
+        "label": "Complex / Cinematic",
+        "description": "Hard motion, multiple subjects, demanding scene coherence.",
+        "primary": _WAN_3,
+        "fallback": _H3_MAX,
+    },
+    "talking_dialogue": {
+        "label": "Talking / Dialogue",
+        "description": "Synchronized speech, lip-sync, a visible talking human.",
+        "primary": _VEO_FAST,
+        "fallback": _PIXVERSE,
+    },
+    "advanced_references": {
+        "label": "Advanced References",
+        "description": "Sophisticated reference-driven, brand-consistency-critical creative.",
+        "primary": _SEEDANCE_FAST,
+        "fallback": _H3_MAX,
+    },
+}
+
+DEFAULT_OUTCOME = "quick_video"
 
 
 def _jobs_collection():
@@ -83,12 +138,14 @@ async def get_job(job_id: str) -> Optional[Dict[str, Any]]:
 class VideoGenerationService:
 
     @staticmethod
-    async def create_job(storyboard: dict, model: str) -> str:
+    async def create_job(storyboard: dict, outcome: str) -> str:
         job_id = uuid.uuid4().hex
+        route = OUTCOME_ROUTES.get(outcome, OUTCOME_ROUTES[DEFAULT_OUTCOME])
         await _jobs_collection().insert_one({
             "job_id": job_id,
             "status": "queued",
-            "model": model,
+            "outcome": outcome,
+            "model": route["primary"],  # kept for display/back-compat; the real model per clip is `routed_model`
             "total_scenes": len(storyboard.get("scenes", [])),
             "current_scene": 0,
             "clips": [],
@@ -101,43 +158,71 @@ class VideoGenerationService:
         job_id: str,
         storyboard: dict,
         brand_images: List[str],
-        model: str,
+        outcome: str,
     ) -> None:
         col = _jobs_collection()
         scenes = storyboard.get("scenes", [])
+        route = OUTCOME_ROUTES.get(outcome, OUTCOME_ROUTES[DEFAULT_OUTCOME])
+        primary_model, fallback_model = route["primary"], route["fallback"]
         await col.update_one({"job_id": job_id}, {"$set": {"status": "generating"}})
 
         for scene in scenes:
             scene_num = scene.get("scene_number", 0)
             await col.update_one({"job_id": job_id}, {"$set": {"current_scene": scene_num}})
 
-            try:
-                video_url, cost_usd = await VideoGenerationService._generate_scene_fal(scene, model)
-                clip = {
-                    "scene_number": scene_num,
-                    "shot_type": scene.get("shot_type", ""),
-                    "duration_seconds": scene.get("duration_seconds", 5),
-                    "motion": scene.get("motion", ""),
-                    "text_overlay": scene.get("text_overlay"),
-                    "video_prompt": scene.get("video_prompt", ""),
-                    "video_url": video_url,
-                    "cost_usd": cost_usd,
-                }
-            except Exception as e:
-                print(f"[VideoGenJob {job_id}] Scene {scene_num} failed: {e}")
-                clip = {
-                    "scene_number": scene_num,
-                    "shot_type": scene.get("shot_type", ""),
-                    "duration_seconds": scene.get("duration_seconds", 5),
-                    "motion": scene.get("motion", ""),
-                    "text_overlay": scene.get("text_overlay"),
-                    "video_prompt": scene.get("video_prompt", ""),
-                    "video_url": None,
-                    "cost_usd": None,
-                    "error": str(e),
-                }
+            base_fields = {
+                "scene_number": scene_num,
+                "shot_type": scene.get("shot_type", ""),
+                "duration_seconds": scene.get("duration_seconds", 5),
+                "motion": scene.get("motion", ""),
+                "text_overlay": scene.get("text_overlay"),
+                "video_prompt": scene.get("video_prompt", ""),
+            }
 
-            await col.update_one({"job_id": job_id}, {"$push": {"clips": clip}})
+            # §6 ("Reliability & fallback"): "Fallback to the nearest lower-cost/
+            # quality-compatible route where possible" + "Record whether fallback
+            # altered expected quality, audio or reference support." One retry on
+            # the outcome's own paired fallback model (§4's table), never a blind
+            # retry of the same failing endpoint — if the fallback also fails,
+            # that's a real, surfaced failure, not a silent third attempt.
+            started = time.monotonic()
+            fallback_used = False
+            try:
+                video_url, cost_usd = await VideoGenerationService._generate_scene_fal(scene, primary_model)
+                routed_model = primary_model
+            except Exception as primary_error:
+                print(f"[VideoGenJob {job_id}] Scene {scene_num}: {primary_model} failed "
+                      f"({primary_error}), falling back to {fallback_model}")
+                try:
+                    video_url, cost_usd = await VideoGenerationService._generate_scene_fal(scene, fallback_model)
+                    routed_model = fallback_model
+                    fallback_used = True
+                except Exception as fallback_error:
+                    latency = round(time.monotonic() - started, 2)
+                    print(f"[VideoGenJob {job_id}] Scene {scene_num}: fallback {fallback_model} "
+                          f"also failed ({fallback_error})")
+                    await col.update_one({"job_id": job_id}, {"$push": {"clips": {
+                        **base_fields,
+                        "video_url": None,
+                        "cost_usd": None,
+                        "outcome": outcome,
+                        "routed_model": None,
+                        "fallback_used": True,
+                        "latency_seconds": latency,
+                        "error": f"{primary_model}: {primary_error} | fallback {fallback_model}: {fallback_error}",
+                    }}})
+                    continue
+
+            latency = round(time.monotonic() - started, 2)
+            await col.update_one({"job_id": job_id}, {"$push": {"clips": {
+                **base_fields,
+                "video_url": video_url,
+                "cost_usd": cost_usd,
+                "outcome": outcome,
+                "routed_model": routed_model,
+                "fallback_used": fallback_used,
+                "latency_seconds": latency,
+            }}})
 
         await col.update_one(
             {"job_id": job_id},
@@ -170,7 +255,7 @@ class VideoGenerationService:
         scene_num = scene.get("scene_number")
         actual_seconds: float
 
-        if model in ("minimax/h3-max-turbo/image-to-video", "minimax/h3-max/image-to-video"):
+        if model in (_H3_TURBO, _H3_MAX):
             # No documented min/max on `duration` beyond "integer, default 5" —
             # clamped to the 5-10s range every other MiniMax model in this file
             # uses, rather than sending an unvalidated raw value.
@@ -185,7 +270,7 @@ class VideoGenerationService:
             }
             print(f"[VideoGen] Scene {scene_num}: {info['label']}, {seconds}s")
 
-        elif model == "fal-ai/kling-video/v2.5-turbo/standard/image-to-video":
+        elif model == _KLING_STANDARD:
             seconds = 10 if duration_req >= 8 else 5  # only valid values per this model's own schema
             actual_seconds = seconds
             arguments = {
@@ -195,7 +280,7 @@ class VideoGenerationService:
             }
             print(f"[VideoGen] Scene {scene_num}: Kling 2.5 Standard, {seconds}s")
 
-        elif model == "fal-ai/pixverse/v6/image-to-video":
+        elif model == _PIXVERSE:
             seconds = max(1, min(15, duration_req))
             actual_seconds = seconds
             arguments = {
@@ -207,7 +292,7 @@ class VideoGenerationService:
             }
             print(f"[VideoGen] Scene {scene_num}: PixVerse V6, {seconds}s")
 
-        elif model == "alibaba/wan-3.0/image-to-video":
+        elif model == _WAN_3:
             seconds = max(3, min(10, duration_req))
             actual_seconds = seconds
             arguments = {
@@ -219,7 +304,7 @@ class VideoGenerationService:
             }
             print(f"[VideoGen] Scene {scene_num}: Wan 3.0, {seconds}s")
 
-        elif model == "fal-ai/veo3.1/fast/image-to-video":
+        elif model == _VEO_FAST:
             seconds = 8 if duration_req >= 7 else (6 if duration_req >= 5 else 4)
             actual_seconds = seconds
             arguments = {
@@ -232,7 +317,7 @@ class VideoGenerationService:
             }
             print(f"[VideoGen] Scene {scene_num}: Veo 3.1 Fast, {seconds}s")
 
-        elif model == "bytedance/seedance-2.0/image-to-video":
+        elif model == _SEEDANCE_FAST:
             seconds = max(4, min(15, duration_req))
             actual_seconds = seconds
             arguments = {
