@@ -154,6 +154,13 @@ OUTCOME_ROUTES: Dict[str, Dict[str, Any]] = {
 
 DEFAULT_OUTCOME = "quick_video"
 
+# Per-attempt ceiling on fal.ai's subscribe_async (see _generate_scene_fal) —
+# generous enough for the slower models (avatar/lip-sync, Seedance) without
+# letting a genuine hang block a scene (and the background task behind it)
+# forever. A timeout here is treated exactly like any other primary-model
+# failure: run_job retries once on the outcome's paired fallback.
+_FAL_SUBSCRIBE_TIMEOUT_SECONDS = 300
+
 
 def _jobs_collection():
     return get_db()["video_generation_jobs"]
@@ -410,7 +417,20 @@ class VideoGenerationService:
             os.environ["FAL_KEY"] = fal_key
 
         try:
-            result = await fal_client.subscribe_async(model, arguments)
+            # subscribe_async has no timeout of its own — confirmed live
+            # 2026-10-01: a job silently sat inside this call for minutes with
+            # no error and no progress. Bounding it means a genuine hang (as
+            # opposed to a slow-but-working queue) fails cleanly and fast
+            # enough to trigger run_job's existing primary→fallback retry,
+            # instead of parking a scene — and the whole job behind it —
+            # indefinitely.
+            result = await asyncio.wait_for(
+                fal_client.subscribe_async(model, arguments), timeout=_FAL_SUBSCRIBE_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            raise TimeoutError(
+                f"{model} did not respond within {_FAL_SUBSCRIBE_TIMEOUT_SECONDS}s"
+            )
         except Exception as e:
             err_str = str(e)
             has_audio_toggle = "generate_audio" in arguments or "generate_audio_switch" in arguments
@@ -420,7 +440,9 @@ class VideoGenerationService:
                 print(f"[VideoGen] Scene {scene_num}: audio flagged, retrying without audio")
                 toggle_key = "generate_audio" if "generate_audio" in arguments else "generate_audio_switch"
                 arguments = {**arguments, toggle_key: False}
-                result = await fal_client.subscribe_async(model, arguments)
+                result = await asyncio.wait_for(
+                    fal_client.subscribe_async(model, arguments), timeout=_FAL_SUBSCRIBE_TIMEOUT_SECONDS
+                )
             else:
                 raise
 
