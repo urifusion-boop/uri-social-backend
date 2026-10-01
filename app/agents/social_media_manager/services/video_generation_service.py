@@ -401,11 +401,26 @@ class VideoGenerationService:
             # best-available estimate — if a live generation's actual runtime
             # diverges noticeably from this, re-derive from a real response.
             fps = 25
-            num_frames = max(41, min(721, round(duration_req * fps)))
-            actual_seconds = round(num_frames / fps, 2)
             dialogue = (scene.get("dialogue") or scene.get("text_overlay") or prompt or "").strip()
             if not dialogue:
                 raise ValueError("Talking Avatar requires a scripted line — this scene has no dialogue")
+
+            # The model converts text_input to speech internally and hard-
+            # rejects num_frames that outruns that synthesized audio — live-
+            # confirmed 2026-10-01: a 9-word line produced 3.58s of audio
+            # (≈2.5 words/sec, normal TTS cadence) and a scene-duration-based
+            # num_frames exceeded it, so it was never really duration_req that
+            # bounded this model, it's how long the dialogue takes to say.
+            # 3.0 words/sec is a deliberately faster-than-typical estimate —
+            # it under-predicts speech length, keeping num_frames comfortably
+            # under the real synthesized audio rather than risking the same
+            # error from an optimistic guess. Still capped by duration_req so
+            # a long line in a short scene doesn't run past the scene's pacing.
+            word_count = max(1, len(dialogue.split()))
+            estimated_speech_seconds = word_count / 3.0
+            seconds = min(estimated_speech_seconds, duration_req)
+            num_frames = max(41, min(721, round(seconds * fps)))
+            actual_seconds = round(num_frames / fps, 2)
             arguments = {
                 "image_url": frame_image_url,
                 "text_input": dialogue,
