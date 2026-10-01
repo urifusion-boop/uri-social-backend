@@ -1864,6 +1864,10 @@ class MetaLaunchFromMessageBody(BaseModel):
     # implies — which is what she always used to do, and got wrong often enough that
     # asking became necessary. See objectives.py.
     objective: str = ""
+    # What the client wants people to DO — the follow-up the objective makes necessary
+    # (objectives.ACTIONS). Empty is normal: most objectives need no second question,
+    # and a plan built before this existed carries none.
+    desired_action: str = ""
     business_name: str = ""
     category: str = ""
     conversation_cost_ngn: float = Field(500.0, gt=0)
@@ -2571,6 +2575,11 @@ async def _build_campaign_plan(
     if chosen:
         plan.objective = chosen
         plan.platforms = [p.model_copy(update={"objective": chosen}) for p in plan.platforms]
+        # Stored only if it is valid FOR the objective just chosen: an action left over
+        # from a different goal would otherwise ride along and be stated on the review
+        # screen as though the client had chosen it for this campaign.
+        from .objectives import coerce_action
+        plan.desired_action = coerce_action(chosen, body.desired_action)
 
     try:
         from .audience_targeting import resolve_audience_targeting
@@ -3346,6 +3355,24 @@ async def meta_launch_plan(
             status_code=400,
             detail="This ad has nowhere to send people — set your ad destination (WhatsApp number, website, or Instagram handle) and try again.",
         )
+
+    # The objective's own configuration, re-checked at commit for the same reason as
+    # the destination above: the brand's destination is re-resolved here, so a client
+    # who switched their brand destination to a website after choosing a Traffic
+    # campaign — or to WhatsApp under an objective that cannot use it — only becomes
+    # invalid at this moment, and launching anyway spends their money on a campaign
+    # optimising for something it cannot deliver.
+    from .objectives import validate as validate_objective
+
+    objective_problems = validate_objective(
+        plan.objective,
+        destination_type=plan.destination_type,
+        desired_action=plan.desired_action,
+        destination_link=plan.destination_link,
+        require_action=False,
+    )
+    if objective_problems:
+        raise HTTPException(status_code=400, detail=objective_problems[0])
 
     # Policy re-check at commit — cheap and deterministic, and real time has passed
     # since the plan was built, so this is a genuine safety re-validation, not just
@@ -4675,9 +4702,58 @@ async def list_objectives() -> dict:
     Manager shows them later — the mismatch that made this necessary was a client
     asking for sales and finding "Objective: Engagement" on their campaign.
     """
-    from .objectives import CHOICES
+    from .objectives import ACTIONS, CHOICES, coerce as objectives_coerce, destinations_for
 
-    return {"objectives": CHOICES}
+    # The follow-ups ship WITH the choices so the client is never asked a question the
+    # answer above has already settled, and the frontend never has to hardcode which
+    # question belongs to which objective — that mapping is the backend's (PRD §8).
+    return {
+        "objectives": [
+            {**c,
+             "actions": ACTIONS.get(c["value"], []),
+             "destinations": destinations_for(objectives_coerce(c["value"]))}
+            for c in CHOICES
+        ],
+    }
+
+
+class ObjectiveConfigBody(BaseModel):
+    objective: str
+    destination_type: str = ""
+    desired_action: str = ""
+    destination_link: str = ""
+
+
+@router.post("/objectives/validate")
+async def validate_objective_config(body: ObjectiveConfigBody) -> dict:
+    """Whether this objective/destination/action combination may launch.
+
+    The same check the launch path runs, exposed so the review screen can state the
+    problems before the client commits rather than after — and so the frontend cannot
+    accidentally define its own, weaker version of the rules.
+    """
+    from .objectives import clear_incompatible, coerce as objectives_coerce, validate
+
+    objective = objectives_coerce(body.objective)
+    if not objective:
+        return {"valid": False, "problems": ["Choose a campaign goal."], "keep": {}}
+
+    problems = validate(
+        objective,
+        destination_type=body.destination_type,
+        desired_action=body.desired_action,
+        destination_link=body.destination_link,
+    )
+    return {
+        "valid": not problems,
+        "objective": objective.value,
+        "problems": problems,
+        # What survives if the client just changed the objective — the frontend clears
+        # the rest rather than submitting an answer to a question that no longer exists.
+        "keep": clear_incompatible(objective,
+                                   destination_type=body.destination_type,
+                                   desired_action=body.desired_action),
+    }
 
 
 @router.post("/meta/campaigns/{campaign_id}/status")
