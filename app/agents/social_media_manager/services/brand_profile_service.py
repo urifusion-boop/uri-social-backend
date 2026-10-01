@@ -1,6 +1,7 @@
 from datetime import datetime
 from typing import Dict, Any, Optional, List
 from motor.motor_asyncio import AsyncIOMotorDatabase
+from pymongo import ReturnDocument
 
 from app.domain.responses.uri_response import UriResponse
 
@@ -323,12 +324,23 @@ class BrandProfileService:
             identifier = end_user_id or brand_id or user_id
             print(f"🖼️  SAVE DEBUG identifier={identifier}: saving logo_position={repr(doc.get('logo_position'))}")
 
-            # Update existing profile using the scope (respects multi-tenant isolation)
+            # find_one_and_update (not update_one followed by a separate
+            # find_one) so the write and the read-back are a single atomic
+            # operation. A separate find_one right after update_one can race
+            # a lagging replica read and return the document from BEFORE
+            # this write landed — confirmed live: identical save requests
+            # sometimes got back the OLD field value, sometimes a different
+            # stale value from an earlier save entirely. Never reproduced
+            # via a direct, isolated API call — only through the real
+            # browser session, which is exactly what a read-your-own-write
+            # consistency gap looks like rather than a deterministic logic
+            # bug. This makes the response always reflect exactly what was
+            # just written, by construction.
             try:
-                result = await db[BrandProfileService.COLLECTION].update_one(
-                    scope, {"$set": doc}
+                result = await db[BrandProfileService.COLLECTION].find_one_and_update(
+                    scope, {"$set": doc}, return_document=ReturnDocument.AFTER
                 )
-                print(f"✅ Updated brand profile for {scope}: matched={result.matched_count}, modified={result.modified_count}")
+                print(f"✅ Updated brand profile for {scope}")
             except Exception as e:
                 print(f"❌ Error updating brand profile for {scope}: {e}")
                 raise
@@ -338,21 +350,24 @@ class BrandProfileService:
                 await db[BrandProfileService.COLLECTION].insert_one(doc)
                 identifier = end_user_id or brand_id or user_id
                 print(f"✅ Created new brand profile for {identifier}")
+                # doc is already the complete, just-inserted document —
+                # insert_one mutates it in place with the generated _id, so
+                # there's no need to read it back at all.
+                result = doc
             except Exception as e:
                 # Handle duplicate key error
                 if "duplicate key" in str(e).lower():
                     identifier = end_user_id or brand_id or user_id
                     print(f"⚠️  Duplicate profile detected for {identifier}, updating instead")
                     # Profile was created by another request, update it instead
-                    result = await db[BrandProfileService.COLLECTION].update_one(
-                        scope, {"$set": doc}
+                    result = await db[BrandProfileService.COLLECTION].find_one_and_update(
+                        scope, {"$set": doc}, return_document=ReturnDocument.AFTER
                     )
-                    print(f"✅ Updated via fallback for {identifier}: matched={result.matched_count}, modified={result.modified_count}")
+                    print(f"✅ Updated via fallback for {identifier}")
                 else:
                     print(f"❌ Error creating brand profile for user {user_id}: {e}")
                     raise
 
-        result = await db[BrandProfileService.COLLECTION].find_one(scope)
         if result:
             result.pop("_id", None)
         return UriResponse.get_single_data_response("brand_profile", result)
