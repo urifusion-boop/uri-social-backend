@@ -8215,7 +8215,10 @@ async def produce_video(
     # Video Editing Billing PRD §11: don't charge for a video whose duration
     # can't even be detected — that almost certainly means an invalid/corrupt
     # file the render pipeline would fail on anyway.
-    duration_seconds = probe_duration_strict(video_bytes)
+    # to_thread — probe_duration_strict shells out to ffprobe synchronously
+    # (up to a 30s timeout); called directly in this async handler, that
+    # blocks the whole event loop, including /health, for the duration.
+    duration_seconds = await asyncio.to_thread(probe_duration_strict, video_bytes)
     if duration_seconds is None:
         return JSONResponse(status_code=422, content=duration_undetectable_response())
 
@@ -9735,7 +9738,9 @@ async def submagic_produce(
         raise HTTPException(status_code=400, detail="Empty video file")
 
     # Video Editing Billing PRD §11: don't charge if duration can't be detected.
-    duration_seconds = probe_duration_strict(video_bytes)
+    # to_thread — see produce_video's identical call for why (blocking
+    # ffprobe subprocess call freezing the whole event loop otherwise).
+    duration_seconds = await asyncio.to_thread(probe_duration_strict, video_bytes)
     if duration_seconds is None:
         return JSONResponse(status_code=422, content=duration_undetectable_response())
 
