@@ -115,6 +115,23 @@ async def approve_item_v2_endpoint(
     return UriResponse.get_single_data_response("calendar_plan_v2", updated)
 
 
+def _single_image_seed_with_headline(image_seed_content: str, exact_copy: dict) -> str:
+    """image_seed_content always ends with the upstream ai_image_prompt's own
+    "no text, no logos" instruction (content_calendar_v2_service.py) — the
+    carousel branch of create_draft_from_item_v2 overrides that by appending
+    each slide's real headline/body AFTER it, since the image model treats
+    the most-recent, most-specific instruction as the one that wins. This
+    single-image path never did the equivalent, so the model inconsistently
+    took "no text, no logos" literally instead of the generic "render a
+    headline" style guidance (confirmed live: single-image posts
+    intermittently came back as a bare photo + logo; carousel slides never
+    did, because they always have this override). Pure function — no I/O —
+    so it's unit-tested directly rather than through the whole endpoint.
+    """
+    item_headline = exact_copy.get("headline")
+    return f"{image_seed_content}. Headline: {item_headline}" if item_headline else image_seed_content
+
+
 @router.post("/plan/{plan_id}/item/{item_index}/create-draft")
 async def create_draft_from_item_v2(
     plan_id: str,
@@ -330,12 +347,13 @@ async def create_draft_from_item_v2(
                                 carousel_id=draft_id,
                             )))
                 else:
+                    enriched_seed = _single_image_seed_with_headline(image_seed_content, exact_copy)
                     _bg_image_tasks = [
                         asyncio.create_task(_generate_image_bg(
                             draft_id=d.get("draft_id") or d.get("id"),
                             platform=d.get("platform", "facebook"),
                             content=d.get("content", image_seed_content),
-                            seed_content=image_seed_content,
+                            seed_content=enriched_seed,
                             brand_context=brand_context,
                             db=db,
                             reference_image=None,
