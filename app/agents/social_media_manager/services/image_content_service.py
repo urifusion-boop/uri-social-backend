@@ -1356,13 +1356,16 @@ OVERALL:
                         # re-paste the logo onto from scratch, instead of
                         # re-running AI generation just to move a badge.
                         background_image_data_url = data_url
-                        b64_final, chosen_position, geometry = await ImageContentService.overlay_logo_smart(
-                            _m.group(1), logo_url, logo_size, preferred_position=logo_position,
-                            return_placement=True,
+                        loop = asyncio.get_running_loop()
+                        b64_final, geometry = await loop.run_in_executor(
+                            None,
+                            lambda: ImageContentService._overlay_logo(
+                                _m.group(1), logo_url, logo_position, logo_size, return_geometry=True
+                            ),
                         )
                         image_response['url'] = f"data:image/webp;base64,{b64_final}"
                         if geometry:
-                            logo_placement = {**geometry, "position": chosen_position, "logo_size": logo_size}
+                            logo_placement = {**geometry, "position": logo_position, "logo_size": logo_size}
                 else:
                     print(f"⚠️  LOGO SKIPPED: logo_url is None or empty")
 
