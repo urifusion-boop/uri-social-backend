@@ -9,53 +9,66 @@ from app.core.config import settings
 from app.database import get_db
 from app.utils.s3_upload import upload_bytes
 
-# Every model now runs through fal.ai — Veo was moved off the direct Google
-# Gemini API call (google-genai client, DEFAULT_MODEL = "veo-3.1-generate-preview")
-# onto fal.ai's own Veo 3.1 endpoint, same pattern as Kling/Seedance already used.
-# Two independent reasons, both real: (1) the Google-direct path kept failing on
-# a real Veo quota/billing gate on that Google Cloud project (confirmed live via
-# 429 RESOURCE_EXHAUSTED on every attempt, 2026-09-30/10-01) that fal.ai's own
-# account sidesteps entirely; (2) fal.ai's price for the SAME Veo 3.1 Standard
-# model is HALF what Google charges directly for it ($0.20/s vs $0.40/s, no
-# audio, 720p/1080p — confirmed from fal.ai's own pricing) — so this is strictly
-# better even once the Google quota issue is eventually resolved.
+# Model lineup matches the "URI_AI_Video_API_Model_Selection_Engineering_Brief"
+# (Uzuri Creative / URI, 1 October 2026) exactly — its 7 selected launch routes,
+# minus Seedance 2.5 which the brief explicitly says not to make a launch
+# default ("Do not expose as standard launch infrastructure without evidence
+# that the quality uplift improves conversion or reduces retries enough to
+# justify the cost" — §3.8). Every model here is fal.ai's own IMAGE-to-video
+# endpoint for that model (confirmed per-model from fal.ai's own API docs,
+# 2026-10-01) since this pipeline always has a real, brand-grounded storyboard
+# frame to animate — never a bare text prompt.
 #
-# MODEL_REGISTRY is the single source of truth for every selectable model: its
-# fal.ai endpoint id, its display label (the UI shows this now, not "Version N"),
-# and its published per-second rate. cost_per_second is fal.ai's own documented
-# rate (confirmed 2026-10-01, no-audio / mid-resolution tier for each — the tier
-# actually requested below) — used to show an ESTIMATED cost per generated clip.
-# fal_client.subscribe_async's response has no real-time billing field, so this
-# is computed (duration actually sent to the model × its rate), not read back
-# from fal.ai; label it as an estimate wherever it's shown.
+# Two of the brief's picks (MiniMax H3 Max Turbo, MiniMax H3 Max) are listed
+# under fal.ai's bare `minimax/` namespace rather than `fal-ai/` — confirmed
+# correct, not a typo; that's how fal.ai itself hosts this specific partner's
+# models.
+#
+# cost_per_second below is the brief's own figure (§1's table), converted from
+# its stated NGN back to USD at the brief's own FX assumption (₦1,327.84/$1,
+# 1 October 2026) so it's directly comparable with the rest of this file's USD
+# math — not re-derived from a separate pricing lookup. The brief itself warns
+# prices change and should be re-checked against live fal.ai pricing before any
+# production rollout; this is a snapshot, not a live-fetched rate.
 MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
-    "fal-ai/veo3.1/image-to-video": {
-        "label": "Veo 3.1",
-        "cost_per_second": 0.20,
+    "minimax/h3-max-turbo/image-to-video": {
+        "label": "H3 Max Turbo",
+        "role": "Default generation",
+        "cost_per_second": 0.0399,
     },
-    "fal-ai/kling-video/v3/pro/image-to-video": {
-        "label": "Kling 3.0 Pro",
-        "cost_per_second": 0.112,
+    "fal-ai/kling-video/v2.5-turbo/standard/image-to-video": {
+        "label": "Kling 2.5 Standard",
+        "role": "Product image animation",
+        "cost_per_second": 0.0422,
+    },
+    "fal-ai/pixverse/v6/image-to-video": {
+        "label": "PixVerse V6",
+        "role": "Social content",
+        "cost_per_second": 0.0603,
+    },
+    "minimax/h3-max/image-to-video": {
+        "label": "H3 Max",
+        "role": "Premium quality",
+        "cost_per_second": 0.0798,
+    },
+    "alibaba/wan-3.0/image-to-video": {
+        "label": "Wan 3.0",
+        "role": "Complex motion",
+        "cost_per_second": 0.1002,
+    },
+    "fal-ai/veo3.1/fast/image-to-video": {
+        "label": "Veo 3.1 Fast",
+        "role": "Dialogue / speaking",
+        "cost_per_second": 0.1499,
     },
     "bytedance/seedance-2.0/image-to-video": {
-        "label": "Seedance 2.0",
+        "label": "Seedance 2.0 Fast",
+        "role": "Advanced references",
         "cost_per_second": 0.2419,
-    },
-    "fal-ai/luma-dream-machine/ray-2/image-to-video": {
-        "label": "Luma Ray 2",
-        "cost_per_second": 0.10,
-    },
-    "fal-ai/minimax/hailuo-02/standard/image-to-video": {
-        "label": "MiniMax Hailuo 02",
-        "cost_per_second": 0.045,
-    },
-    "fal-ai/wan/v2.2-a14b/image-to-video": {
-        "label": "Wan 2.2",
-        "cost_per_second": 0.08,
     },
 }
 
-DEFAULT_MODEL = "fal-ai/veo3.1/image-to-video"
+DEFAULT_MODEL = "minimax/h3-max-turbo/image-to-video"
 
 
 def _jobs_collection():
@@ -131,13 +144,14 @@ class VideoGenerationService:
             {"$set": {"status": "complete", "current_scene": len(scenes)}},
         )
 
-    # ── fal.ai — every model (Veo 3.1, Kling 3.0 Pro, Seedance 2.0, Luma Ray 2,
-    #    MiniMax Hailuo 02, Wan 2.2) goes through this one entry point. Each
-    #    model's request shape differs (confirmed from fal.ai's own per-model API
-    #    docs, 2026-10-01) — duration as a string-with-"s" suffix for Veo/Luma,
-    #    a bare integer for Hailuo, or not a direct field at all for Wan (it's
-    #    frames ÷ fps instead) — so this dispatches per model id rather than
-    #    pretending they share one shape. ─────────────────────────────────────
+    # ── fal.ai — every model in MODEL_REGISTRY goes through this one entry
+    #    point. Each model's request shape genuinely differs (confirmed from
+    #    fal.ai's own per-model API docs, 2026-10-01) — Wan 3.0 uniquely uses
+    #    `start_image_url` where every other model here uses `image_url`;
+    #    Kling 2.5 Standard only accepts duration 5 or 10; the two MiniMax H3
+    #    models have no resolution/audio toggle beyond a 480P/768P/1080P enum
+    #    (audio is automatic, not optional) — so this dispatches per model id
+    #    rather than pretending they share one shape. ───────────────────────
 
     @staticmethod
     async def _generate_scene_fal(scene: dict, model: str) -> tuple[str, Optional[float]]:
@@ -156,29 +170,67 @@ class VideoGenerationService:
         scene_num = scene.get("scene_number")
         actual_seconds: float
 
-        if model == "fal-ai/veo3.1/image-to-video":
-            seconds = 8 if duration_req >= 7 else (6 if duration_req >= 5 else 4)
+        if model in ("minimax/h3-max-turbo/image-to-video", "minimax/h3-max/image-to-video"):
+            # No documented min/max on `duration` beyond "integer, default 5" —
+            # clamped to the 5-10s range every other MiniMax model in this file
+            # uses, rather than sending an unvalidated raw value.
+            seconds = max(5, min(10, duration_req))
             actual_seconds = seconds
             arguments: Dict[str, Any] = {
+                "image_url": frame_image_url,
+                "prompt": prompt,
+                "duration": seconds,
+                "resolution": "768P",
+                "prompt_expansion_mode": "balanced",
+            }
+            print(f"[VideoGen] Scene {scene_num}: {info['label']}, {seconds}s")
+
+        elif model == "fal-ai/kling-video/v2.5-turbo/standard/image-to-video":
+            seconds = 10 if duration_req >= 8 else 5  # only valid values per this model's own schema
+            actual_seconds = seconds
+            arguments = {
+                "image_url": frame_image_url,
+                "prompt": prompt,
+                "duration": seconds,
+            }
+            print(f"[VideoGen] Scene {scene_num}: Kling 2.5 Standard, {seconds}s")
+
+        elif model == "fal-ai/pixverse/v6/image-to-video":
+            seconds = max(1, min(15, duration_req))
+            actual_seconds = seconds
+            arguments = {
+                "image_url": frame_image_url,
+                "prompt": prompt,
+                "duration": seconds,
+                "resolution": "720p",
+                "generate_audio_switch": True,  # brief's own ₦80/sec figure is priced "720p + audio"
+            }
+            print(f"[VideoGen] Scene {scene_num}: PixVerse V6, {seconds}s")
+
+        elif model == "alibaba/wan-3.0/image-to-video":
+            seconds = max(3, min(10, duration_req))
+            actual_seconds = seconds
+            arguments = {
+                "start_image_url": frame_image_url,  # NOT image_url — this model's own field name
+                "prompt": prompt,
+                "duration": seconds,
+                "resolution": "720p",
+                "aspect_ratio": "9:16",
+            }
+            print(f"[VideoGen] Scene {scene_num}: Wan 3.0, {seconds}s")
+
+        elif model == "fal-ai/veo3.1/fast/image-to-video":
+            seconds = 8 if duration_req >= 7 else (6 if duration_req >= 5 else 4)
+            actual_seconds = seconds
+            arguments = {
                 "image_url": frame_image_url,
                 "prompt": prompt,
                 "duration": f"{seconds}s",
                 "aspect_ratio": "9:16",
                 "resolution": "720p",
-                "generate_audio": False,  # audio doubles the price for no benefit on a silent storyboard clip
+                "generate_audio": True,  # brief's own ₦199/sec figure is priced "Fast + audio"
             }
-            print(f"[VideoGen] Scene {scene_num}: Veo 3.1 (fal.ai), {seconds}s")
-
-        elif model == "fal-ai/kling-video/v3/pro/image-to-video":
-            seconds = max(3, min(15, duration_req))
-            actual_seconds = seconds
-            arguments = {
-                "start_image_url": frame_image_url,
-                "prompt": prompt,
-                "duration": str(seconds),
-                "generate_audio": True,
-            }
-            print(f"[VideoGen] Scene {scene_num}: Kling 3.0 Pro, {seconds}s")
+            print(f"[VideoGen] Scene {scene_num}: Veo 3.1 Fast, {seconds}s")
 
         elif model == "bytedance/seedance-2.0/image-to-video":
             seconds = max(4, min(15, duration_req))
@@ -191,48 +243,7 @@ class VideoGenerationService:
                 "resolution": "720p",
                 "generate_audio": True,
             }
-            print(f"[VideoGen] Scene {scene_num}: Seedance 2.0, {seconds}s")
-
-        elif model == "fal-ai/luma-dream-machine/ray-2/image-to-video":
-            seconds = 9 if duration_req >= 7 else 5
-            actual_seconds = seconds
-            arguments = {
-                "image_url": frame_image_url,
-                "prompt": prompt,
-                "duration": f"{seconds}s",
-                "aspect_ratio": "9:16",
-                "resolution": "720p",
-            }
-            print(f"[VideoGen] Scene {scene_num}: Luma Ray 2, {seconds}s")
-
-        elif model == "fal-ai/minimax/hailuo-02/standard/image-to-video":
-            seconds = 10 if duration_req >= 8 else 6
-            actual_seconds = seconds
-            arguments = {
-                "image_url": frame_image_url,
-                "prompt": prompt,
-                "duration": seconds,  # integer, not a string, per this model's own schema
-                "resolution": "768P",
-            }
-            print(f"[VideoGen] Scene {scene_num}: MiniMax Hailuo 02, {seconds}s")
-
-        elif model == "fal-ai/wan/v2.2-a14b/image-to-video":
-            # No direct duration field — Wan takes frame count + fps instead.
-            # 16 fps (its own default) keeps this a plain multiply, clamped to
-            # the model's accepted 17-161 frame range.
-            fps = 16
-            seconds = max(2, min(10, duration_req))
-            num_frames = max(17, min(161, round(seconds * fps)))
-            actual_seconds = num_frames / fps
-            arguments = {
-                "image_url": frame_image_url,
-                "prompt": prompt,
-                "num_frames": num_frames,
-                "frames_per_second": fps,
-                "aspect_ratio": "9:16",
-                "resolution": "720p",
-            }
-            print(f"[VideoGen] Scene {scene_num}: Wan 2.2, {num_frames}f @ {fps}fps (~{actual_seconds:.1f}s)")
+            print(f"[VideoGen] Scene {scene_num}: Seedance 2.0 Fast, {seconds}s")
 
         else:
             raise ValueError(f"Unknown video model: {model}")
@@ -246,11 +257,13 @@ class VideoGenerationService:
             result = await fal_client.subscribe_async(model, arguments)
         except Exception as e:
             err_str = str(e)
-            if "generate_audio" in arguments and (
+            has_audio_toggle = "generate_audio" in arguments or "generate_audio_switch" in arguments
+            if has_audio_toggle and (
                 "content_policy_violation" in err_str or "sensitive content" in err_str.lower()
             ):
                 print(f"[VideoGen] Scene {scene_num}: audio flagged, retrying without audio")
-                arguments = {**arguments, "generate_audio": False}
+                toggle_key = "generate_audio" if "generate_audio" in arguments else "generate_audio_switch"
+                arguments = {**arguments, toggle_key: False}
                 result = await fal_client.subscribe_async(model, arguments)
             else:
                 raise

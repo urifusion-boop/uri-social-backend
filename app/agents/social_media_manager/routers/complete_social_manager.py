@@ -164,7 +164,7 @@ class PublishVideoDraftRequest(BaseModel):
 class VideoFromStoryboardRequest(BaseModel):
     storyboard: Dict[str, Any]
     brand_images: List[str] = Field(default_factory=list, max_items=5)
-    model: str = "fal-ai/veo3.1/image-to-video"
+    model: str = "minimax/h3-max-turbo/image-to-video"
 
 class ContentGenerationRequest(BaseModel):
     seed_content: str = Field(..., min_length=10, max_length=5000)
