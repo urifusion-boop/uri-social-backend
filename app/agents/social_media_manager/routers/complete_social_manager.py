@@ -161,7 +161,10 @@ class CreativeStoryboardRequest(BaseModel):
     reference_images: List[str] = Field(default_factory=list, max_items=5)
     target_platform: str = "instagram_reels"
     target_duration_seconds: int = Field(15, ge=5, le=30)
-    video_style: Optional[str] = "clean_commercial"
+    # None (the describe-it UI's default — it has no style picker) lets the
+    # model infer the best-fitting style from the brief itself; pass a slug
+    # to force one instead.
+    video_style: Optional[str] = None
 
 class CreativeFramesRequest(BaseModel):
     scenes: List[Dict[str, Any]]
