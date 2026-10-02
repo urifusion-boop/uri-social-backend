@@ -192,7 +192,13 @@ class VideoCreativeService:
                         {"role": "user", "content": content},
                     ],
                     temperature=0.8,
-                    max_tokens=3000,
+                    # gpt-5.4 rejects max_tokens outright — live-confirmed
+                    # 2026-10-02: "Unsupported parameter: 'max_tokens' is not
+                    # supported with this model. Use 'max_completion_tokens'
+                    # instead." The one other gpt-5.4 call site in this
+                    # codebase (auto_content_service.py) never hit this
+                    # because it never passes a token limit at all.
+                    max_completion_tokens=3000,
                     response_format={"type": "json_object"},
                 ),
             )
