@@ -2808,6 +2808,11 @@ async def _build_campaign_plan(
                         # The pockets were the thing that made it undeliverable, so
                         # they stop being the plan's geography too.
                         plan.geo = plan.geo.model_copy(update={"pins": [], "fallback_area": city})
+                        # And the card is re-dumped from it. geo_dump is a snapshot
+                        # taken when the geo plan was first built; leaving it behind
+                        # showed the client three pockets on a plan that would launch
+                        # Lagos-wide — the exact mismatch this widening exists to avoid.
+                        geo_dump = plan.geo.model_dump(mode="json")
                     plan.explanation = " ".join(
                         p for p in (plan.explanation, widened["note"]) if p)
                     plan.trace.append(f"audience widened for delivery: {widened['note']}")
@@ -2880,7 +2885,11 @@ def _plan_response_dict(built: _PlanBuildResult) -> dict:
             "account_cap_ngn": plan.account_cap_ngn,
             "budget_tier": plan.budget_tier,
             "estimated_conversations": plan.estimated_conversations,
-            "geo": built.geo_dump,
+            # From the PLAN, falling back to the snapshot only when there is no geo
+            # on it. geo_dump is taken when the geography is first resolved, and
+            # anything that legitimately changes the plan's geography afterwards (the
+            # delivery widening does) left the card describing the older one.
+            "geo": (plan.geo.model_dump(mode="json") if plan.geo else built.geo_dump),
             "trace": plan.trace,
         },
         "creative": plan.creative.model_dump(mode="json"),
