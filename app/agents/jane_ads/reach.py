@@ -23,6 +23,7 @@ alone rather than stripping it down to nothing for no gain.
 """
 from __future__ import annotations
 
+import re
 from typing import Any, Optional
 
 # Below this, Meta's own UI calls the audience "very narrow". Not a hard Meta limit —
@@ -42,6 +43,37 @@ _WIDENED_GEO = (
     "Even without the interest filter {where} only reach about {size} people, so I've "
     "widened this to all of {city}."
 )
+
+
+def restate_geography(text: str, dropped: list[str], city: str) -> str:
+    """The same sentence, talking about where the ad will ACTUALLY run.
+
+    Jane writes her plan before the audience is measured, so after a widening her
+    own words still promised the pockets: "I'll focus on busy professionals in
+    Victoria Island, Ikoyi and Lekki Phase 1..." immediately above a note saying the
+    campaign had been widened to all of Lagos. The client reads the first sentence
+    and believes it.
+
+    The names are REPLACED rather than the sentence deleted: that sentence usually
+    carries the audience reasoning too ("...who would benefit from a convenient
+    pickup service"), and throwing it away to fix the geography would cost more than
+    it saved.
+    """
+    if not text or not dropped or not city:
+        return text
+    # Longest first, so "Lekki Phase 1" is consumed before the "Lekki" inside it.
+    names = sorted({n.strip() for n in dropped if n and n.strip()}, key=len, reverse=True)
+    one = "|".join(re.escape(n) for n in names)
+    # A run of them: "A, B and C", "A and B", "A, B, C".
+    run = re.compile(rf"(?:{one})(?:\s*(?:,|,?\s*and)\s*(?:{one}))*", re.IGNORECASE)
+    replacement = f"all of {city}"
+    out, replaced = run.subn(replacement, text)
+    if not replaced:
+        return text
+    # "all of Lagos, all of Lagos and all of Lagos" if the names were scattered.
+    collapse = re.compile(rf"(?:{re.escape(replacement)})(?:\s*(?:,|,?\s*and)\s*{re.escape(replacement)})+",
+                          re.IGNORECASE)
+    return collapse.sub(replacement, out)
 
 
 def reach_bounds(estimate: Optional[dict]) -> tuple[Optional[int], Optional[int]]:
