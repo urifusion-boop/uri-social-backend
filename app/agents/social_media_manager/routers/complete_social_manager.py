@@ -1904,6 +1904,7 @@ async def facebook_ads_callback(
             profile_pic = page.get("picture", {}).get("data", {}).get("url", "") if isinstance(page.get("picture"), dict) else ""
 
             business_manager_shared = False
+            system_user_assigned = False
             business_manager_error = None
             try:
                 await share_page_with_business_manager(page_id, page_token)
@@ -1916,25 +1917,32 @@ async def facebook_ads_callback(
                 # Advertiser role or higher" even though the business holds
                 # PROFILE_PLUS_ADVERTISE. Live-confirmed 2026-08-31. Without this the
                 # only alternative is an admin assigning every client Page by hand.
-                try:
-                    await assign_page_to_system_user(page_id, page_token)
-                    print(f"[FBAdsOAuth] ✅ Assigned ads system user to page {page_id}")
-                except SystemUserNotConfigured:
-                    business_manager_error = (
-                        "META_ADS_SYSTEM_USER_ID not set — ads cannot run from this Page yet."
-                    )
-                    print(f"[FBAdsOAuth] ⚠️ system user not configured — page {page_id} not assignable")
-                except Exception as e:
-                    # The share succeeded; only the assignment failed. Record it rather
-                    # than reporting the connection as fully shared, because a launch
-                    # from this Page will fail until it is resolved.
-                    business_manager_error = f"system-user assignment: {e}"
-                    print(f"[FBAdsOAuth] ⚠️ system-user assignment failed for {page_id}: {e}")
             except BusinessManagerNotConfigured:
                 print(f"[FBAdsOAuth] ⚠️ META_BUSINESS_MANAGER_ID not set — page {page_id} token stored, BM share deferred")
             except Exception as e:
                 business_manager_error = str(e)
                 print(f"[FBAdsOAuth] ❌ Business Manager share failed for page {page_id}: {e}")
+
+            # Attempted whether or not the share above succeeded. The two grants are
+            # independent — a system user does NOT inherit Page access from the
+            # business it belongs to — and nesting this inside the success branch meant
+            # a Page whose share Meta refused ("(#200) Permissions error", seen in prod
+            # on repeat attempts) never even tried the grant that ad creatives actually
+            # need. Trying costs one call and can only improve the outcome.
+            try:
+                await assign_page_to_system_user(page_id, page_token)
+                system_user_assigned = True
+                print(f"[FBAdsOAuth] ✅ Assigned ads system user to page {page_id}")
+            except SystemUserNotConfigured:
+                business_manager_error = business_manager_error or (
+                    "META_ADS_SYSTEM_USER_ID not set — ads cannot run from this Page yet."
+                )
+                print(f"[FBAdsOAuth] ⚠️ system user not configured — page {page_id} not assignable")
+            except Exception as e:
+                # Recorded, never swallowed: a launch from this Page fails until it is
+                # resolved, and the stored error is what the client is finally shown.
+                business_manager_error = business_manager_error or f"system-user assignment: {e}"
+                print(f"[FBAdsOAuth] ⚠️ system-user assignment failed for {page_id}: {e}")
 
             now = datetime.now(timezone.utc).isoformat()
             conn_doc = {
@@ -1954,6 +1962,10 @@ async def facebook_ads_callback(
                 "profile_picture_url": profile_pic,
                 "connection_status": "pending_user_match",
                 "business_manager_shared": business_manager_shared,
+                # Recorded separately: the system-user grant is what ad-creative
+                # creation actually needs, and it can succeed on a Page whose
+                # Business-Manager share Meta refused.
+                "system_user_assigned": system_user_assigned,
                 "business_manager_error": business_manager_error,
                 "connected_at": now,
                 "updated_at": now,
