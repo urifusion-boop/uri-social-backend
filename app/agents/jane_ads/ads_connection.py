@@ -401,9 +401,20 @@ async def set_whatsapp_number(db, user_id: Optional[str], brand_id: Optional[str
     normalized = normalize_wa_number(number)
     if not normalized:
         raise ValueError("That WhatsApp number doesn't look right — please type it in full, e.g. 0803 123 4567.")
+    from .whatsapp import set_brand_whatsapp
+
     ads = await get_ads_connection(db, user_id, brand_id)
     if not ads:
         raise AdsConnectionRequired(ConnectionState.NONE)
+    # Written where it is READ. resolve_connection_state and the launch path both read
+    # the number from the jane_ads settings store (get_brand_whatsapp); this used to
+    # write it onto the social_connections doc instead, so a number saved here was
+    # invisible to both — the state stayed ADS_NO_WHATSAPP and Connected Accounts kept
+    # saying "WhatsApp not linked yet" for a brand that had just given us the number.
+    # The read side was already corrected once for exactly this mismatch; the writer
+    # was left behind.
+    await set_brand_whatsapp(db, brand_id, normalized)
+    # Kept in step on the connection doc too — several older reads still look here.
     await db[CONNECTIONS].update_one(
         {"id": ads["id"]},
         {"$set": {"whatsapp_number": normalized, "whatsapp_page_linked": True}},
