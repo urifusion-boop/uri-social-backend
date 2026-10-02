@@ -23,6 +23,7 @@ then does something else.
 """
 from __future__ import annotations
 
+import re
 from typing import Any, Optional
 
 from . import constants as C
@@ -191,6 +192,26 @@ def describe(plan: CampaignPlan, req: CampaignRequest) -> list[dict[str, Any]]:
     ]
 
 
+def _name_list(value: Any) -> list[str]:
+    """The names in an edit value, whatever shape the client sent.
+
+    A STRING is split, never iterated. `[str(n) for n in value]` over "Ikeja,
+    Surulere" yields its CHARACTERS — live-reproduced on staging, where editing a
+    campaign's locations to "Ikeja, Surulere" resolved 'I', 'k', 'e' against Meta's
+    geo search and moved a real ad set to Epe, Ikate and Ikosi Ketu. It reported
+    success, because each character did match somewhere.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        parts = re.split(r"[,\n;]", value)
+    elif isinstance(value, (list, tuple, set)):
+        parts = [str(v) for v in value]
+    else:
+        parts = [str(value)]
+    return [p.strip() for p in parts if str(p).strip()]
+
+
 async def _validated_locations(
     names: list[str], region: str, access_token: str
 ) -> tuple[list[GeoPin], list[str]]:
@@ -353,7 +374,7 @@ async def apply_edits(
 
     # ── locations ─────────────────────────────────────────────────────────────
     if "locations" in edits:
-        names = [str(n) for n in (edits.get("locations") or [])]
+        names = _name_list(edits.get("locations"))
         region = (plan.geo.city if plan.geo else "") or req.geo
         pins, bad = await _validated_locations(names, region, access_token)
         rejections += bad
@@ -366,7 +387,7 @@ async def apply_edits(
 
     # ── interests ─────────────────────────────────────────────────────────────
     if "interests" in edits:
-        names = [str(n) for n in (edits.get("interests") or [])]
+        names = _name_list(edits.get("interests"))
         if not names:
             targeting.pop("flexible_spec", None)
             applied.append("interests")
