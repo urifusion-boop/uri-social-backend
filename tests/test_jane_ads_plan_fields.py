@@ -613,3 +613,33 @@ def test_nonsense_is_refused_rather_than_silently_ignored():
     _, _, applied, rejected = _run(apply_edits(_plan(), _req(), {"objective": "world peace"}))
     assert applied == []
     assert rejected
+
+
+# ── Edit values arrive in whatever shape the client sent ──────────────────────
+# Live-reproduced on staging: editing a campaign's locations to the STRING
+# "Ikeja, Surulere" iterated its characters, resolved 'I', 'k' and 'e' against
+# Meta's geo search, and moved a real ad set to Epe, Ikate and Ikosi Ketu — reported
+# as a success, because each character did match somewhere.
+
+from app.agents.jane_ads.plan_fields import _name_list
+
+
+def test_a_comma_separated_string_is_split_not_iterated():
+    assert _name_list("Ikeja, Surulere") == ["Ikeja", "Surulere"]
+    assert _name_list("Ikeja; Surulere, Lekki") == ["Ikeja", "Surulere", "Lekki"]
+
+
+def test_a_single_name_stays_one_name():
+    """The failure was three places from one word, so this is the case that matters."""
+    assert _name_list("Ikeja") == ["Ikeja"]
+
+
+def test_a_list_is_taken_as_given():
+    assert _name_list(["Ikeja", "Surulere"]) == ["Ikeja", "Surulere"]
+
+
+def test_nothing_is_nothing():
+    assert _name_list(None) == []
+    assert _name_list("") == []
+    assert _name_list([]) == []
+    assert _name_list("  ,  ") == []
