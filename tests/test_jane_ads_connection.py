@@ -95,16 +95,34 @@ def test_no_page_when_ads_connection_missing_page_id():
     assert state == ConnectionState.NO_PAGE
 
 
-def test_expired_when_business_manager_share_genuinely_failed():
-    # A real share failure still blocks: the shared ad account cannot advertise for a
-    # Page it was never granted, so letting this reach READY would fail at ad time.
+def test_a_refused_share_blocks_but_is_not_reported_as_expired():
+    """A real share failure still blocks — the shared ad account cannot advertise for a
+    Page it was never granted — but it is NOT "expired": the token and scopes are fine,
+    Meta refused the grant. Reported as expired, the client is told to reconnect, which
+    re-runs the identical call for the identical refusal. One did it several times."""
     db = FakeDb([_ads_doc(
         business_manager_shared=False,
         business_manager_error="Business Manager page-share failed: insufficient permissions.",
     )])
     state, ads = _run(resolve_connection_state(db, None, "brnd_1"))
-    assert state == ConnectionState.EXPIRED
+    assert state == ConnectionState.PAGE_NOT_SHARED
     assert "insufficient permissions" in ads["_business_manager_error"]
+
+
+def test_a_system_user_grant_rescues_a_page_whose_share_was_refused():
+    """The system-user grant is what ad-creative creation actually needs, and it can
+    succeed on a Page whose Business-Manager share Meta refused — blocking on the share
+    alone held back a Page that can advertise perfectly well."""
+    db = FakeDb([_ads_doc(
+        business_manager_shared=False,
+        business_manager_error="Business Manager page-share failed: (#200) Permissions error",
+        system_user_assigned=True,
+        whatsapp_page_linked=True, whatsapp_number="2348031234567",
+    )])
+    with patch("app.agents.jane_ads.ads_connection.verify_token_live",
+               new=AsyncMock(return_value=(True, REQUIRED_ADS_SCOPES))):
+        state, _ = _run(resolve_connection_state(db, None, "brnd_1"))
+    assert state == ConnectionState.READY
 
 
 def test_duplicate_asset_share_error_is_treated_as_already_shared():
@@ -150,7 +168,7 @@ def test_business_manager_share_failure_is_checked_before_the_live_network_call(
     with patch("app.agents.jane_ads.ads_connection.verify_token_live",
                new=AsyncMock(return_value=(True, REQUIRED_ADS_SCOPES))) as mock_verify:
         state, ads = _run(resolve_connection_state(db, None, "brnd_1"))
-    assert state == ConnectionState.EXPIRED
+    assert state == ConnectionState.PAGE_NOT_SHARED
     mock_verify.assert_not_called()
 
 
