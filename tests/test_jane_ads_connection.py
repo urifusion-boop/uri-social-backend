@@ -348,6 +348,18 @@ def test_set_whatsapp_number_normalizes_and_marks_linked():
     assert stored["whatsapp_page_linked"] is True
 
 
+def test_set_whatsapp_number_lands_where_the_state_machine_reads_it():
+    """The read side (resolve_connection_state, and the launch path) takes the number
+    from the jane_ads settings store. Writing it only onto the connection doc left a
+    brand that had just given us their number still reported as ADS_NO_WHATSAPP, with
+    Connected Accounts saying "WhatsApp not linked yet"."""
+    from app.agents.jane_ads.whatsapp import get_brand_whatsapp
+
+    db = FakeDb([_ads_doc()])
+    _run(set_whatsapp_number(db, None, "brnd_1", "0803 123 4567"))
+    assert _run(get_brand_whatsapp(db, "brnd_1")) == "2348031234567"
+
+
 def test_set_whatsapp_number_rejects_unparseable_input():
     db = FakeDb([_ads_doc()])
     with pytest.raises(ValueError):
