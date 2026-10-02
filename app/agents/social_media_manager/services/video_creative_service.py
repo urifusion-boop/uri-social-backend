@@ -70,6 +70,7 @@ continuous story and must read that way end to end:
 Return ONLY valid JSON — no markdown fences, no explanation:
 {
   "creative_direction": "<2-4 sentence overall creative concept>",
+  "video_style": "<the exact style slug you picked, e.g. clean_commercial — echo it back even if it was given to you>",
   "total_duration_seconds": <int>,
   "target_platform": "<string>",
   "aspect_ratio": "9:16",
@@ -98,7 +99,7 @@ class VideoCreativeService:
         brand_context: Dict[str, Any],
         target_platform: str = "instagram_reels",
         target_duration_seconds: int = 15,
-        video_style: Optional[str] = "clean_commercial",
+        video_style: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Write a creative_direction + scene-by-scene script from a free-text
@@ -107,6 +108,12 @@ class VideoCreativeService:
         — once scenes carry frame_image_url, the existing outcome-routed
         fal.ai generation pipeline (video_generation_service.py) picks up
         from there completely unchanged.
+
+        video_style: pass an explicit slug to force one (matches the upload-
+        first flow's behavior); leave None (the describe-it UI's default) and
+        the model picks whichever of VIDEO_STYLE_DIRECTIVES best fits the
+        brief itself, returned in the storyboard's own "video_style" field so
+        the choice is visible rather than a silent internal decision.
         """
         if not brief or not brief.strip():
             return {"status": False, "error": "Describe what the video should be about."}
@@ -149,10 +156,26 @@ class VideoCreativeService:
             )
         preamble_lines.append(f"\nGenerate exactly {num_scenes} scenes totalling {target_duration_seconds}s.")
 
-        style_directive = VIDEO_STYLE_DIRECTIVES.get(video_style or "clean_commercial", "")
-        system_prompt = _SYSTEM_PROMPT
-        if style_directive:
-            system_prompt = f"{_SYSTEM_PROMPT}\n\n{style_directive}"
+        forced_style = VIDEO_STYLE_DIRECTIVES.get(video_style) if video_style else None
+        if forced_style:
+            system_prompt = f"{_SYSTEM_PROMPT}\n\n{forced_style}"
+        else:
+            # No style given — list every available style in full and let the
+            # model choose whichever best fits the brief, applying only that
+            # one's rules. Each block is tagged with its own slug so the model
+            # can echo an exact, valid key back in "video_style" rather than
+            # deriving one from prose.
+            all_styles = "\n\n".join(
+                f"STYLE SLUG: {slug}\n{directive}" for slug, directive in VIDEO_STYLE_DIRECTIVES.items()
+            )
+            system_prompt = (
+                f"{_SYSTEM_PROMPT}\n\n"
+                "VIDEO STYLE — CHOOSE ONE: no style was specified. Read the brief and brand "
+                "context, pick exactly ONE of the styles below that best fits the brief's "
+                "subject, tone, and goal, then apply ONLY that style's rules to every scene. "
+                "Return its exact STYLE SLUG value as \"video_style\" in your JSON.\n\n"
+                f"{all_styles}"
+            )
 
         content: List[Dict[str, Any]] = [{"type": "text", "text": "\n".join(preamble_lines)}]
         for img in reference_images:
@@ -186,6 +209,17 @@ class VideoCreativeService:
         except json.JSONDecodeError as e:
             print(f"Creative storyboard JSON parse error: {e}\nRaw: {raw[:300]}")
             return {"status": False, "error": "Failed to parse creative storyboard from model response."}
+
+        # Forced style: trust our own value over whatever the model echoed.
+        # Inferred style: trust the model's pick only if it's a real slug —
+        # a hallucinated one would otherwise silently fall through to no
+        # style directive at all on any later regeneration of this storyboard.
+        if forced_style:
+            storyboard["video_style"] = video_style
+        elif storyboard.get("video_style") not in VIDEO_STYLE_DIRECTIVES:
+            print(f"[VideoCreativeService] model returned unknown video_style "
+                  f"{storyboard.get('video_style')!r}, defaulting to clean_commercial")
+            storyboard["video_style"] = "clean_commercial"
 
         return {"status": True, "storyboard": storyboard}
 
