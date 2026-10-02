@@ -117,3 +117,38 @@ def test_the_lower_bound_is_what_counts():
     90,000" and delivers to 20,000 passes a floor it should have failed."""
     assert audience_size({"data": [{"estimate_mau_lower_bound": 20_000,
                                     "estimate_mau_upper_bound": 90_000}]}) == 20_000
+
+
+# ── Jane's own words after a widening ─────────────────────────────────────────
+
+def test_the_plan_sentence_stops_promising_the_dropped_pockets():
+    """Live-caught: the card and the pins were right, and the sentence above them
+    still read "I'll focus on Victoria Island, Ikoyi and Lekki Phase 1" — which is
+    the line a client actually reads."""
+    from app.agents.jane_ads.reach import restate_geography
+
+    said = ("I'll focus on targeting busy professionals in Victoria Island, Ikoyi, and "
+            "Lekki Phase 1 as these areas have a high concentration of affluent "
+            "professionals who would benefit from a convenient laundry pickup service.")
+    out = restate_geography(said, ["Victoria Island", "Ikoyi", "Lekki Phase 1"], "Lagos")
+    assert "all of Lagos" in out
+    for pocket in ("Victoria Island", "Ikoyi", "Lekki Phase 1"):
+        assert pocket not in out
+    # The audience reasoning survives — deleting the sentence would cost more than
+    # the geography it fixed.
+    assert "busy professionals" in out and "laundry pickup service" in out
+
+
+def test_a_longer_pocket_name_is_not_half_replaced():
+    """"Lekki Phase 1" must be consumed before the "Lekki" inside it."""
+    from app.agents.jane_ads.reach import restate_geography
+
+    out = restate_geography("Running in Lekki Phase 1 only.", ["Lekki", "Lekki Phase 1"], "Lagos")
+    assert out == "Running in all of Lagos only."
+
+
+def test_a_sentence_naming_no_pockets_is_untouched():
+    from app.agents.jane_ads.reach import restate_geography
+
+    said = "I chose Instagram and Facebook because your customers discover this by scrolling."
+    assert restate_geography(said, ["Ikeja"], "Lagos") == said

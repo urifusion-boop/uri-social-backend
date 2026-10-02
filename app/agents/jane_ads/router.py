@@ -2797,6 +2797,7 @@ async def _build_campaign_plan(
                     wider_geo = await meta_targeting_from_geo_named(
                         GeoPlan(mode=plan.geo.mode, city=city, pins=[]), region=city)
 
+                plan_pins_before = list(plan.geo.pins) if plan.geo else []
                 widened = await widen_for_delivery(
                     est_adapter, geo_targeting, plan.audience_targeting,
                     city=city, budget_label=f"\u20a6{req.budget_ngn:,.0f}",
@@ -2813,8 +2814,16 @@ async def _build_campaign_plan(
                         # showed the client three pockets on a plan that would launch
                         # Lagos-wide — the exact mismatch this widening exists to avoid.
                         geo_dump = plan.geo.model_dump(mode="json")
+                    # Jane wrote her plan before the audience was measured, so her
+                    # own sentence still promised the pockets. Restate it before the
+                    # note lands under it, or the client reads "I'll focus on Victoria
+                    # Island, Ikoyi and Lekki Phase 1" and believes it.
+                    from .reach import restate_geography
+
+                    dropped = [p.name for p in (plan_pins_before or [])]
                     plan.explanation = " ".join(
-                        p for p in (plan.explanation, widened["note"]) if p)
+                        p for p in (restate_geography(plan.explanation, dropped, city),
+                                    widened["note"]) if p)
                     plan.trace.append(f"audience widened for delivery: {widened['note']}")
                     print(f"[oneshot] {widened['note']}", flush=True)
                 estimate = widened["estimate"]
