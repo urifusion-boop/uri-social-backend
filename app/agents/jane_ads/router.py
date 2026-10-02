@@ -2900,12 +2900,46 @@ async def _build_campaign_plan(
                 # so the estimate shown here can never promise a tighter audience than
                 # what actually launches.
                 from .geo import meta_targeting_from_geo_named
-                targeting = {
-                    **(await meta_targeting_from_geo_named(
-                        plan.geo, region=(plan.geo.city if plan.geo else ""))),
-                    **plan.audience_targeting,
-                }
-                estimate = await est_adapter.get_delivery_estimate(targeting)
+                geo_targeting = await meta_targeting_from_geo_named(
+                    plan.geo, region=(plan.geo.city if plan.geo else ""))
+                targeting = {**geo_targeting, **plan.audience_targeting}
+
+                # Measure the audience before it launches, and widen it if Meta says
+                # it is too small to deliver to. Three tight pockets stacked against a
+                # long interest list produced 38,600-45,400 people on a real campaign
+                # — "very narrow" by Ads Manager's own warning, which still launches,
+                # spends unevenly, and bills the client for the lesson.
+                #
+                # The widened audience is written back onto the PLAN, not just used
+                # for the estimate: an estimate that quietly describes a different
+                # audience from the one that launches is worse than no estimate.
+                from .reach import widen_for_delivery
+
+                city = plan.geo.city if plan.geo else ""
+                wider_geo = None
+                if city and (plan.geo and plan.geo.pins):
+                    # The same geography minus the pockets — resolves to the city and
+                    # then its state, exactly as a pinless plan already does.
+                    from .models import GeoPlan
+                    wider_geo = await meta_targeting_from_geo_named(
+                        GeoPlan(mode=plan.geo.mode, city=city, pins=[]), region=city)
+
+                widened = await widen_for_delivery(
+                    est_adapter, geo_targeting, plan.audience_targeting,
+                    city=city, budget_label=f"\u20a6{req.budget_ngn:,.0f}",
+                    wider_geo_targeting=wider_geo,
+                )
+                if widened["widened"]:
+                    plan.audience_targeting = widened["audience_targeting"]
+                    if widened["geo_targeting"] is not geo_targeting and plan.geo:
+                        # The pockets were the thing that made it undeliverable, so
+                        # they stop being the plan's geography too.
+                        plan.geo = plan.geo.model_copy(update={"pins": [], "fallback_area": city})
+                    plan.explanation = " ".join(
+                        p for p in (plan.explanation, widened["note"]) if p)
+                    plan.trace.append(f"audience widened for delivery: {widened['note']}")
+                    print(f"[oneshot] {widened['note']}", flush=True)
+                estimate = widened["estimate"]
             except Exception as e:
                 print(f"[oneshot] delivery estimate skipped: {e}", flush=True)
         summary = build_campaign_summary(plan, req, price_per_result_ngn=price_per_conversation,
