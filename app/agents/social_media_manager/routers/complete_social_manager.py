@@ -156,6 +156,17 @@ class StoryboardFramesRequest(BaseModel):
     scenes: List[Dict[str, Any]]
     brand_images: List[str] = Field(default_factory=list, max_items=5)
 
+class CreativeStoryboardRequest(BaseModel):
+    brief: str = Field(..., min_length=10, max_length=2000)
+    reference_images: List[str] = Field(default_factory=list, max_items=5)
+    target_platform: str = "instagram_reels"
+    target_duration_seconds: int = Field(15, ge=5, le=30)
+    video_style: Optional[str] = "clean_commercial"
+
+class CreativeFramesRequest(BaseModel):
+    scenes: List[Dict[str, Any]]
+    reference_images: List[str] = Field(default_factory=list, max_items=5)
+
 class PublishVideoDraftRequest(BaseModel):
     draft_id: str
     platform: str   # "instagram_reels" | "facebook_reels" | "tiktok"
@@ -6766,6 +6777,80 @@ async def get_storyboard_frame_job(
         raise HTTPException(status_code=404, detail="Frame job not found")
 
     return UriResponse.get_single_data_response("frame_job", job)
+
+
+@router.post("/generate-creative-storyboard")
+async def generate_creative_storyboard(
+    request: CreativeStoryboardRequest,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    "Describe it" flow: write a creative_direction + scene-by-scene script
+    from a free-text brief (reference images optional, unlike /generate-
+    storyboard which requires 1-5). Frame images come from a separate call
+    to /generate-creative-frames below; once scenes carry frame_image_url,
+    the existing outcome-routed /generate-video-from-storyboard pipeline
+    picks up completely unchanged.
+    """
+    user_id = _get_user_id(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    profile_result = await BrandProfileService.get(user_id, db)
+    profile_data = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
+
+    brand_context = {
+        "brand_name": profile_data.get("brand_name", ""),
+        "industry": profile_data.get("industry", "general_other"),
+        "brand_colors": profile_data.get("brand_colors", []),
+        "brand_voice": profile_data.get("derived_voice", ""),
+        "region": profile_data.get("region", ""),
+    }
+
+    from app.agents.social_media_manager.services.video_creative_service import VideoCreativeService
+
+    result = await VideoCreativeService.generate_creative_storyboard(
+        brief=request.brief,
+        reference_images=request.reference_images,
+        brand_context=brand_context,
+        target_platform=request.target_platform,
+        target_duration_seconds=request.target_duration_seconds,
+        video_style=request.video_style,
+    )
+
+    if not result.get("status"):
+        raise HTTPException(status_code=400, detail=result.get("error", "Creative storyboard generation failed"))
+
+    return UriResponse.get_single_data_response("storyboard", result["storyboard"])
+
+
+@router.post("/generate-creative-frames")
+async def generate_creative_frames(
+    request: CreativeFramesRequest,
+    background_tasks: BackgroundTasks,
+    token: dict = Depends(JWTBearer()),
+):
+    """
+    Start background generation of consistent frame images for a creative
+    storyboard's scenes — each scene chains off the previous scene's own
+    generated image (or a user reference image for scene 1, or a from-
+    scratch generation if neither exists) rather than editing a fixed
+    uploaded photo by index. Writes to the SAME job collection as /generate-
+    storyboard-frames, so GET /storyboard-frame-job/{job_id} above polls
+    this too — no separate polling endpoint needed.
+    """
+    from app.agents.social_media_manager.services.video_creative_service import VideoCreativeService
+
+    _get_user_id(token)  # auth check
+
+    job_id = await VideoCreativeService.create_frame_job(request.scenes)
+    background_tasks.add_task(VideoCreativeService.run_frame_job, job_id, request.scenes, request.reference_images)
+
+    return UriResponse.get_single_data_response(
+        "frame_job",
+        {"job_id": job_id, "status": "generating", "total_scenes": len(request.scenes)},
+    )
 
 
 @router.post("/merge-video-job/{job_id}")
