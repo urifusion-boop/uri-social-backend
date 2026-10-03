@@ -295,10 +295,10 @@ def start_notification_scheduler():
     # reconcile_published_posts is NOT yet registered on an automatic cron —
     # deliberately. It's new, unvalidated against real production data, and
     # on a match it writes a customer-visible status change and fires a real
-    # notification. Trigger it manually first via
-    # POST /social-media/reconcile-published-posts (same X-Cron-Secret
-    # pattern as /publish-scheduled) and confirm its behavior against real
-    # drafts before adding it here on a schedule.
+    # notification. Trigger it manually first via the Admin page ("Reconcile
+    # Facebook/Outstand Publishes" in admin_router.py's
+    # POST /api/admin/social-media/reconcile-published-posts) and confirm its
+    # behavior against real drafts before adding it here on a schedule.
 
     _scheduler.start()
     print("📅 Notification scheduler started with 9 jobs")

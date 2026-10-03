@@ -6461,29 +6461,6 @@ async def trigger_publish_scheduled(
     return result
 
 
-@router.post("/reconcile-published-posts")
-async def trigger_reconcile_published_posts(
-    request: Request,
-    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
-):
-    """
-    Manual trigger for ApprovalWorkflowService.reconcile_published_posts —
-    deliberately NOT yet on the automatic scheduler (see
-    notification_scheduler.py). New code that, on a match, writes a
-    customer-visible status change and fires a real notification; call this
-    once and check CloudWatch before it's added to the recurring cron.
-    Protected by X-Cron-Secret, same as /publish-scheduled.
-    """
-    from app.core.config import settings as _cfg
-    expected = getattr(_cfg, "CRON_SECRET", "") or ""
-    cron_secret = request.headers.get("X-Cron-Secret", "")
-    if expected and cron_secret != expected:
-        raise HTTPException(status_code=403, detail="Invalid cron secret")
-
-    result = await ApprovalWorkflowService.reconcile_published_posts(db=db)
-    return result
-
-
 @router.post("/generate-storyboard")
 async def generate_storyboard(
     request: StoryboardRequest,
