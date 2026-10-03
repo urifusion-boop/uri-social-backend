@@ -175,6 +175,24 @@ def _job_publish_scheduled_content():
     _run_async("publish_scheduled_content", _run)
 
 
+def _job_reconcile_published_posts():
+    """Catches an immediately-published ("Publish Now") draft whose platform
+    dispatch actually failed after Outstand accepted the submission — the
+    publish_scheduled_content cron only ever re-checks "scheduled" drafts, so
+    a "published" one that silently failed on Facebook's (or any platform's)
+    side had nothing to ever correct it. See
+    ApprovalWorkflowService.reconcile_published_posts for the live-reported
+    bug this closes."""
+    async def _run():
+        from app.database import get_db
+        from app.agents.social_media_manager.services.approval_workflow_service import ApprovalWorkflowService
+        db = get_db()
+        result = await ApprovalWorkflowService.reconcile_published_posts(db=db)
+        if result.get("checked") or result.get("corrected"):
+            print(f"🔁 Published-post reconciliation: {result}")
+    _run_async("reconcile_published_posts", _run)
+
+
 def start_notification_scheduler():
     """Start the APScheduler with all notification batch jobs."""
     global _scheduler, _main_loop
@@ -273,6 +291,14 @@ def start_notification_scheduler():
         id="publish_scheduled_content",
         **_JOB_DEFAULTS,
     )
+
+    # reconcile_published_posts is NOT yet registered on an automatic cron —
+    # deliberately. It's new, unvalidated against real production data, and
+    # on a match it writes a customer-visible status change and fires a real
+    # notification. Trigger it manually first via
+    # POST /social-media/reconcile-published-posts (same X-Cron-Secret
+    # pattern as /publish-scheduled) and confirm its behavior against real
+    # drafts before adding it here on a schedule.
 
     _scheduler.start()
     print("📅 Notification scheduler started with 9 jobs")
