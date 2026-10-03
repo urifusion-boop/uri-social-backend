@@ -34,16 +34,86 @@ _FRIENDLY_FACEBOOK_ERROR_PATTERNS = [
     ),
 ]
 
+# Signatures that mean the connection's OWN token/session is dead — distinct from
+# the "confirm your identity" case above, which resolves without reconnecting.
+# Live-reported: the "Vchain" Facebook Page's access token was invalidated
+# (Facebook: "Error validating access token: The session has been invalidated
+# because..."); every subsequent publish to that Page failed the same way, but
+# nothing marked the connection disconnected or told the user to reconnect — it
+# just kept silently failing post after post. Matched against the raw Outstand/
+# Facebook error text, not the OutstandPublishError "no social accounts found"
+# signature (that one means Outstand itself no longer has the connection; this
+# one means Facebook rejected the token Outstand is still holding).
+_TOKEN_INVALIDATION_PATTERNS = [
+    re.compile(r"error validating access token", re.IGNORECASE),
+    re.compile(r"session has been invalidated", re.IGNORECASE),
+    re.compile(r"session is invalid", re.IGNORECASE),
+]
+
 
 def _friendlier_facebook_error(raw: Optional[str]) -> str:
     """Prepend a plain-language explanation for a recognized Facebook error
     signature, keeping the raw detail alongside it (support/debugging).
     Unrecognized errors pass through unchanged."""
     raw = raw or "unknown error"
+    if _is_token_invalidation_error(raw):
+        return (
+            "Your Facebook connection has expired or was revoked — this Page needs to be "
+            "reconnected before it can publish again. Go to Connected Accounts and reconnect "
+            f"Facebook. (Facebook's detail: {raw})"
+        )
     for pattern, friendly in _FRIENDLY_FACEBOOK_ERROR_PATTERNS:
         if pattern.search(raw):
             return f"{friendly} (Facebook's detail: {raw})"
     return raw
+
+
+def _is_token_invalidation_error(raw: Optional[str]) -> bool:
+    """True when an error message signature means the connection's token/session
+    itself is dead (needs reconnecting), as opposed to a one-off content/policy
+    rejection. Used to decide whether to mark a connection disconnected."""
+    raw = raw or ""
+    return any(pattern.search(raw) for pattern in _TOKEN_INVALIDATION_PATTERNS)
+
+
+async def _mark_connection_disconnected_and_notify(
+    db: AsyncIOMotorDatabase,
+    user_id: Optional[str],
+    platform: str,
+    connection: Optional[Dict[str, Any]],
+    reason: str,
+) -> None:
+    """Shared by every place that discovers a connection's token/session is
+    dead — the immediate-publish exception path, the scheduled-poll failure
+    branch, and the published-post reconciliation sweep. Without this, a dead
+    connection stays connection_status="active" forever and every future
+    publish attempt just fails silently again, exactly as it did for "Vchain"'s
+    Facebook Page (confirmed live via CloudWatch: repeated "Error validating
+    access token" failures, connection never marked disconnected, user never
+    notified)."""
+    if not user_id or not db:
+        return
+    try:
+        # connection is only available at a few call sites (an already-looked-up
+        # doc, pinning the match to the exact outstand_account_id); the others
+        # only have the draft's user_id/platform, which is matched alone —
+        # still correct since a user has one active connection per platform.
+        match: Dict[str, Any] = {"user_id": user_id, "platform": (connection or {}).get("platform", platform)}
+        if connection and connection.get("outstand_account_id"):
+            match["outstand_account_id"] = connection["outstand_account_id"]
+        await db["social_connections"].update_one(
+            match,
+            {"$set": {"connection_status": "disconnected", "updated_at": datetime.utcnow()}},
+        )
+        print(f"⚠️ Marked {platform} connection disconnected for user_id={user_id} ({reason})")
+    except Exception as mark_err:
+        print(f"⚠️ Failed to mark connection disconnected: {mark_err}")
+
+    try:
+        from app.services.NotificationService import notification_service
+        await notification_service.notify_connection_disconnected(user_id=user_id, platform=platform)
+    except Exception as notify_err:
+        print(f"⚠️ connection_disconnected notification failed: {notify_err}")
 
 
 class ApprovalWorkflowService:
@@ -843,6 +913,11 @@ class ApprovalWorkflowService:
                                             }},
                                         )
                                         print(f"❌ Outstand-scheduled post failed at the platform | draft_id={draft['id']} post_id={existing_post_id} error={error_detail}")
+                                        if any(_is_token_invalidation_error(acc.get("error")) for acc in failed_accounts):
+                                            await _mark_connection_disconnected_and_notify(
+                                                db=db, user_id=draft.get("user_id"), platform=draft.get("platform", "unknown"),
+                                                connection=None, reason="token invalidated (detected via scheduled-post poll)",
+                                            )
                                     else:
                                         print(f"⏳ Outstand post not yet published | draft_id={draft['id']} post_id={existing_post_id}")
                             except Exception as e:
@@ -1060,6 +1135,103 @@ class ApprovalWorkflowService:
             import traceback
             traceback.print_exc()
             return {"published_count": 0, "errors": [{"draft_id": "batch", "error": str(e)}]}
+
+    @staticmethod
+    async def reconcile_published_posts(db: AsyncIOMotorDatabase):
+        """
+        publish_scheduled_content's Sept-28 fix (see _friendlier_facebook_error /
+        _is_token_invalidation_error above) taught the SCHEDULED-post cron to
+        check each socialAccounts[] entry's real status instead of trusting
+        Outstand's initial "accepted" response — but that only covers drafts
+        with status="scheduled". A draft published via "Publish Now" is marked
+        status="published" the moment Outstand ACCEPTS the submission
+        (outstand_post_status="queued"/"processing" — see _publish_to_platform's
+        caller), which only means Outstand will attempt the dispatch, not that
+        each platform actually accepted it. Nothing ever revisited that draft
+        afterward.
+
+        Live-reported: a "Vchain" Facebook post (post_id=MADzP) was marked
+        published in our DB, confirmed via CloudWatch logs to have actually
+        failed on Facebook's side ("Error validating access token") — the only
+        reason it surfaced at all was someone manually opening that post's
+        analytics, which checks Outstand's live status but never corrects the
+        draft's own status field. This sweep does for "published" drafts what
+        the scheduled cron already does for "scheduled" ones.
+
+        Bounded to a 7-day window (Outstand/platform status for very old posts
+        isn't useful to keep re-polling) and to drafts not yet confirmed
+        (outstand_post_status still "queued"/"processing" — once confirmed
+        either way it's set to "published" or the draft moves to
+        "publish_failed", so it drops out of this query on its own).
+        """
+        try:
+            current_time = datetime.utcnow()
+            earliest = current_time - timedelta(days=7)
+            candidates = await db["content_drafts"].find({
+                "status": "published",
+                "outstand_post_status": {"$in": ["queued", "processing"]},
+                "platform_post_id": {"$exists": True, "$ne": None},
+                "published_date": {"$gte": earliest},
+            }).to_list(length=100)
+
+            print(f"🔁 reconcile_published_posts | candidates={len(candidates)} ids={[d.get('id') for d in candidates]}")
+
+            if not candidates:
+                return {"checked": 0, "corrected": 0}
+
+            from app.agents.social_media_manager.services.outstand_service import OutstandService
+            outstand = OutstandService()
+            corrected = 0
+
+            for draft in candidates:
+                post_id = draft.get("platform_post_id")
+                # Facebook direct post IDs ("1234567_9876543") never went through
+                # Outstand and have no outstand_post_status to begin with — this
+                # query can't actually match one, but guard anyway for safety.
+                if re.match(r'^\d+_\d+$', str(post_id)):
+                    continue
+                try:
+                    post_data = await outstand.get_post(post_id)
+                    post = post_data.get("post", {})
+                    failed_accounts = [acc for acc in post.get("socialAccounts", []) if acc.get("status") == "failed"]
+                    if failed_accounts:
+                        error_detail = "; ".join(
+                            _friendlier_facebook_error(acc.get("error"))
+                            if acc.get("error") else f"{acc.get('network', 'platform')} publish failed"
+                            for acc in failed_accounts
+                        )
+                        await db["content_drafts"].update_one(
+                            {"id": draft["id"]},
+                            {"$set": {
+                                "status": "publish_failed",
+                                "error_message": error_detail,
+                                "updated_at": current_time,
+                            }},
+                        )
+                        corrected += 1
+                        print(f"❌ Published draft actually failed at the platform | draft_id={draft['id']} post_id={post_id} error={error_detail}")
+                        if any(_is_token_invalidation_error(acc.get("error")) for acc in failed_accounts):
+                            await _mark_connection_disconnected_and_notify(
+                                db=db, user_id=draft.get("user_id"), platform=draft.get("platform", "unknown"),
+                                connection=None, reason="token invalidated (detected via published-post reconciliation)",
+                            )
+                    elif post.get("publishedAt"):
+                        await db["content_drafts"].update_one(
+                            {"id": draft["id"]},
+                            {"$set": {"outstand_post_status": "published", "updated_at": current_time}},
+                        )
+                        print(f"✅ Published draft confirmed live | draft_id={draft['id']} post_id={post_id}")
+                    # Neither failed nor confirmed published yet — leave as-is,
+                    # it'll be re-checked next tick.
+                except Exception as e:
+                    print(f"⚠️ Could not poll Outstand for published draft_id={draft['id']}: {e}")
+
+            return {"checked": len(candidates), "corrected": corrected}
+        except Exception as e:
+            print(f"❌ reconcile_published_posts crashed: {e}")
+            import traceback
+            traceback.print_exc()
+            return {"checked": 0, "corrected": 0, "error": str(e)}
 
     @staticmethod
     async def _trigger_immediate_publishing(
@@ -1860,43 +2032,24 @@ class ApprovalWorkflowService:
                 # no longer exists on our side" — confirmed live against
                 # Outstand's own list_accounts API for several affected
                 # users: it was always revoked on Outstand's/the platform's
-                # side, never a transient error. Without this, the
-                # connection stays connection_status="active" forever and
-                # every future publish just fails silently again — up to 16
-                # times for one user before this was caught.
+                # side, never a transient error. "Error validating access
+                # token" / "session has been invalidated" is the Facebook-side
+                # equivalent — Outstand still has the connection, but the
+                # token it's holding is dead (live-reported: "Vchain"'s
+                # Facebook Page). Without this, the connection stays
+                # connection_status="active" forever and every future publish
+                # just fails silently again — up to 16 times for one user
+                # before the first signature was caught.
+                _msg = e.message if isinstance(e, OutstandPublishError) else str(e)
                 if (
-                    isinstance(e, OutstandPublishError)
-                    and "no social accounts found" in e.message.lower()
-                    and db is not None
+                    db is not None
+                    and ("no social accounts found" in _msg.lower() or _is_token_invalidation_error(_msg))
                 ):
                     user_id = connection.get("user_id")
-                    try:
-                        await db["social_connections"].update_one(
-                            {
-                                "user_id": user_id,
-                                # Match on whatever platform value is actually
-                                # stored for this connection — the Outstand
-                                # sync path stores the network name (e.g.
-                                # "x" for twitter), which can differ from
-                                # this function's own `platform` parameter.
-                                "platform": connection.get("platform", platform),
-                                "outstand_account_id": connection.get("outstand_account_id"),
-                            },
-                            {"$set": {"connection_status": "disconnected", "updated_at": datetime.utcnow()}},
-                        )
-                        print(f"⚠️ Marked {platform} connection disconnected for user_id={user_id} (Outstand no longer recognizes it)")
-                    except Exception as mark_err:
-                        print(f"⚠️ Failed to mark connection disconnected: {mark_err}")
-
-                    if user_id:
-                        try:
-                            from app.services.NotificationService import notification_service
-                            await notification_service.notify_connection_disconnected(
-                                user_id=user_id, platform=platform
-                            )
-                        except Exception as notify_err:
-                            print(f"⚠️ connection_disconnected notification failed: {notify_err}")
-
+                    await _mark_connection_disconnected_and_notify(
+                        db=db, user_id=user_id, platform=platform, connection=connection,
+                        reason="Outstand no longer recognizes it" if "no social accounts found" in _msg.lower() else "token invalidated",
+                    )
                     return {
                         "success": False,
                         "error": f"Your {platform} connection is no longer valid. Please reconnect your account.",
