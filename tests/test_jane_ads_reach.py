@@ -60,25 +60,29 @@ def test_an_audience_big_enough_is_left_exactly_as_planned():
     assert len(est.calls) == 1
 
 
-def test_a_narrow_audience_drops_the_interests_and_keeps_the_areas():
-    """The areas are what the client chose and can see; the interest list is mostly
-    Jane's inference, so it is the cheapest thing to give up."""
+def test_a_narrow_audience_widens_the_area_and_keeps_the_interests():
+    """Interests are what keep the WRONG people out — comparing Jane's launched ad
+    sets with manually-run ones, the campaigns bringing chancers were the ones with
+    no interest filter. A wider area full of the right people beats a tight area
+    full of anybody."""
     est = Estimator([40_000, 250_000])
-    out = _run(widen_for_delivery(est, GEO, AUDIENCE, budget_label="₦20,000"))
+    out = _run(widen_for_delivery(est, GEO, AUDIENCE, city="Lagos",
+                                  budget_label="₦20,000", wider_geo_targeting=WIDER_GEO))
     assert out["widened"] is True
-    assert "flexible_spec" not in out["audience_targeting"]
-    assert out["audience_targeting"]["age_min"] == 23      # age is the client's own words
-    assert out["geo_targeting"] == GEO                      # areas survive
+    assert out["geo_targeting"] == WIDER_GEO                 # the area gave way
+    assert out["audience_targeting"] == AUDIENCE             # the interests did not
     assert "40,000" in out["note"] and "₦20,000" in out["note"]
-    assert "Ikeja, Lekki Peninsula and Yaba" in out["note"]
+    assert "all of Lagos" in out["note"]
 
 
-def test_still_narrow_without_interests_widens_the_areas():
+def test_the_interest_filter_goes_only_when_a_whole_city_is_still_too_small():
     est = Estimator([40_000, 60_000, 900_000])
     out = _run(widen_for_delivery(est, GEO, AUDIENCE, city="Lagos",
                                   wider_geo_targeting=WIDER_GEO))
     assert out["geo_targeting"] == WIDER_GEO
-    assert "all of Lagos" in out["note"]
+    assert "flexible_spec" not in out["audience_targeting"]
+    assert out["audience_targeting"]["age_min"] == 23        # age is the client's own
+    assert "drop the interest filter" in out["note"]
 
 
 def test_widening_is_not_kept_when_meta_says_it_did_not_help():
@@ -152,3 +156,27 @@ def test_a_sentence_naming_no_pockets_is_untouched():
 
     said = "I chose Instagram and Facebook because your customers discover this by scrolling."
     assert restate_geography(said, ["Ikeja"], "Lagos") == said
+
+
+# ── What a human buyer sets and Jane did not ─────────────────────────────────
+
+def test_the_launch_targeting_excludes_audience_network_and_sets_a_language():
+    """Unset, Meta picks automatic placements — Audience Network included, where a tap
+    is as often a misfire as an intention — and serves in any language. Both were
+    differences against manually-run ad sets on the same account."""
+    from app.agents.jane_ads import constants as C
+
+    assert "audience_network" not in C.DEFAULT_PUBLISHER_PLATFORMS
+    assert C.DEFAULT_PUBLISHER_PLATFORMS == ["facebook", "instagram"]
+    assert C.DEFAULT_LOCALES == [1001]          # English (All), per Meta's adlocale search
+
+
+def test_the_client_s_own_placement_still_wins_over_the_default():
+    """These are defaults, not policy: a placement the client picked on the plan card
+    is spread over them at launch."""
+    src = open("app/agents/jane_ads/adapters/meta.py").read()
+    publisher = src.index('"publisher_platforms": list(C.DEFAULT_PUBLISHER_PLATFORMS)')
+    audience = src.index("**plan.audience_targeting", publisher)
+    automation = src.index('"targeting_automation"', publisher)
+    # defaults → client's own targeting → the advantage_audience flag Meta requires
+    assert publisher < audience < automation

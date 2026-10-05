@@ -48,6 +48,7 @@ import httpx
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from app.core.config import settings
+from .. import constants as C
 from .base import AdPlatformAdapter
 from .. import constants as C
 from ..destination import DestinationType, link_for_plan
@@ -361,6 +362,20 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                             region=(plan.geo.city if plan.geo else ""),
                             access_token=self._access_token,
                         )),
+                        # Placements and language, which Jane never set and a human
+                        # buyer always does. Unset, Meta picks automatic placements
+                        # (Audience Network included — third-party apps and games,
+                        # where the cheapest conversations in the auction come from)
+                        # and serves in any language. Compared against manually-run
+                        # ad sets on the same account, these were the two differences
+                        # that explain conversations from people with no interest in
+                        # the offer.
+                        #
+                        # BEFORE plan.audience_targeting on purpose: the client's own
+                        # choice — a placement they picked, a locale they set — still
+                        # wins, because these are defaults, not policy.
+                        "publisher_platforms": list(C.DEFAULT_PUBLISHER_PLATFORMS),
+                        "locales": list(C.DEFAULT_LOCALES),
                         **plan.audience_targeting,
                         "targeting_automation": {"advantage_audience": 0},
                     },
