@@ -312,6 +312,14 @@ class VideoGenerationService:
         every timeout looked identical and undiagnosable. This logs on every
         STATE change (not every poll, to avoid log spam) so the next timeout
         tells us which one it was.
+
+        Field/method names below (status.position, status.error, handle.get())
+        were pulled from the actually-installed fal_client package source
+        (inspect.getsource on fal_client.client.AsyncRequestHandle/Status in
+        this repo's venv), not from fal.ai's docs — a first version of this
+        trusted the docs' `position_`/`error_`/`.result()` and broke every
+        single fal.ai call in this file with `'AsyncRequestHandle' object has
+        no attribute 'result'`, confirmed live 2026-10-05.
         """
         import fal_client
 
@@ -329,7 +337,7 @@ class VideoGenerationService:
             state = type(status).__name__  # "Queued" | "InProgress" | "Completed"
             if state != last_state:
                 if state == "Queued":
-                    pos = getattr(status, "position_", "?")
+                    pos = getattr(status, "position", "?")
                     print(f"[VideoGen] Scene {scene_num}: {model} queued (position {pos}), {elapsed:.0f}s elapsed")
                 elif state == "InProgress":
                     print(f"[VideoGen] Scene {scene_num}: {model} now processing, {elapsed:.0f}s elapsed")
@@ -338,10 +346,10 @@ class VideoGenerationService:
                 last_state = state
 
             if state == "Completed":
-                error = getattr(status, "error_", None)
+                error = getattr(status, "error", None)
                 if error:
                     raise RuntimeError(f"{model} failed: {error}")
-                return await handle.result()
+                return await handle.get()
 
             await asyncio.sleep(5)
 
