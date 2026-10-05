@@ -154,11 +154,11 @@ OUTCOME_ROUTES: Dict[str, Dict[str, Any]] = {
 
 DEFAULT_OUTCOME = "quick_video"
 
-# Per-attempt ceiling on fal.ai's subscribe_async (see _generate_scene_fal) —
-# generous enough for the slower models without letting a genuine hang block
-# a scene (and the background task behind it) forever. A timeout here is
-# treated exactly like any other primary-model failure: run_job retries once
-# on the outcome's paired fallback.
+# Per-attempt ceiling on _submit_and_poll's manual queue polling (see
+# _generate_scene_fal) — generous enough for the slower models without
+# letting a genuine hang block a scene (and the background task behind it)
+# forever. A timeout here is treated exactly like any other primary-model
+# failure: run_job retries once on the outcome's paired fallback.
 _FAL_SUBSCRIBE_TIMEOUT_SECONDS = 300
 
 # Per-model override — live-confirmed 2026-10-01: the talking-avatar model
@@ -298,6 +298,52 @@ class VideoGenerationService:
     #    models have no resolution/audio toggle beyond a 480P/768P/1080P enum
     #    (audio is automatic, not optional) — so this dispatches per model id
     #    rather than pretending they share one shape. ───────────────────────
+
+    @staticmethod
+    async def _submit_and_poll(
+        model: str, arguments: Dict[str, Any], timeout_seconds: int, scene_num: Any
+    ) -> Dict[str, Any]:
+        """
+        Submit + manually poll fal.ai's queue instead of subscribe_async's
+        black-box wait. Live-confirmed 2026-10-05: the talking-avatar model
+        timed out at 300s, then again at 600s, on three separate real jobs —
+        subscribe_async gave zero visibility into whether that time was spent
+        actually queued (fal.ai capacity problem) or genuinely processing, so
+        every timeout looked identical and undiagnosable. This logs on every
+        STATE change (not every poll, to avoid log spam) so the next timeout
+        tells us which one it was.
+        """
+        import fal_client
+
+        handle = await fal_client.submit_async(model, arguments=arguments)
+        started = time.monotonic()
+        last_state = None
+        while True:
+            elapsed = time.monotonic() - started
+            if elapsed > timeout_seconds:
+                raise TimeoutError(
+                    f"{model} did not respond within {timeout_seconds}s (last known state: {last_state})"
+                )
+
+            status = await handle.status(with_logs=False)
+            state = type(status).__name__  # "Queued" | "InProgress" | "Completed"
+            if state != last_state:
+                if state == "Queued":
+                    pos = getattr(status, "position_", "?")
+                    print(f"[VideoGen] Scene {scene_num}: {model} queued (position {pos}), {elapsed:.0f}s elapsed")
+                elif state == "InProgress":
+                    print(f"[VideoGen] Scene {scene_num}: {model} now processing, {elapsed:.0f}s elapsed")
+                elif state == "Completed":
+                    print(f"[VideoGen] Scene {scene_num}: {model} completed, {elapsed:.0f}s elapsed")
+                last_state = state
+
+            if state == "Completed":
+                error = getattr(status, "error_", None)
+                if error:
+                    raise RuntimeError(f"{model} failed: {error}")
+                return await handle.result()
+
+            await asyncio.sleep(5)
 
     @staticmethod
     async def _generate_scene_fal(
@@ -442,18 +488,7 @@ class VideoGenerationService:
         model_timeout = _MODEL_TIMEOUT_OVERRIDES.get(model, _FAL_SUBSCRIBE_TIMEOUT_SECONDS)
 
         try:
-            # subscribe_async has no timeout of its own — confirmed live
-            # 2026-10-01: a job silently sat inside this call for minutes with
-            # no error and no progress. Bounding it means a genuine hang (as
-            # opposed to a slow-but-working queue) fails cleanly and fast
-            # enough to trigger run_job's existing primary→fallback retry,
-            # instead of parking a scene — and the whole job behind it —
-            # indefinitely.
-            result = await asyncio.wait_for(
-                fal_client.subscribe_async(model, arguments), timeout=model_timeout
-            )
-        except asyncio.TimeoutError:
-            raise TimeoutError(f"{model} did not respond within {model_timeout}s")
+            result = await VideoGenerationService._submit_and_poll(model, arguments, model_timeout, scene_num)
         except Exception as e:
             err_str = str(e)
             has_audio_toggle = "generate_audio" in arguments or "generate_audio_switch" in arguments
@@ -463,12 +498,7 @@ class VideoGenerationService:
                 print(f"[VideoGen] Scene {scene_num}: audio flagged, retrying without audio")
                 toggle_key = "generate_audio" if "generate_audio" in arguments else "generate_audio_switch"
                 arguments = {**arguments, toggle_key: False}
-                try:
-                    result = await asyncio.wait_for(
-                        fal_client.subscribe_async(model, arguments), timeout=model_timeout
-                    )
-                except asyncio.TimeoutError:
-                    raise TimeoutError(f"{model} (retry without audio) did not respond within {model_timeout}s")
+                result = await VideoGenerationService._submit_and_poll(model, arguments, model_timeout, scene_num)
             else:
                 raise
 
