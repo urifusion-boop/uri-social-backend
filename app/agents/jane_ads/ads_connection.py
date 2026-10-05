@@ -50,6 +50,9 @@ class ConnectionState(str, Enum):
     READY = "ready"                       # ads permission + WhatsApp linked
     EXPIRED = "expired"                   # token invalid or a required scope missing
     NO_PAGE = "no_page"                   # business has no Facebook Page at all
+    PAGE_NOT_SHARED = "page_not_shared"   # Meta refused to give URI's Business Manager
+                                           # ADVERTISE access to the Page — reconnecting
+                                           # cannot fix it, the Page's owner has to act
 
 
 def _bm_share_was_already_done(ads: dict) -> bool:
@@ -214,10 +217,22 @@ async def resolve_connection_state(
     # goes through URI's own shared ad-account token, which needs that grant to act
     # on this page. Missing the key entirely (older connections from before this was
     # tracked) is treated as shared, not blocking.
-    if ads.get("business_manager_shared") is False and not _bm_share_was_already_done(ads):
+    # NOT "expired": the token and the scopes are fine, Meta simply refused to give
+    # URI's Business Manager ADVERTISE access to this Page — typically because another
+    # Business Manager already owns it, or the person connecting is not a full Page
+    # admin. Reported as EXPIRED, the client was told to reconnect, which re-runs the
+    # identical Graph call and gets the identical refusal; one client did it "several
+    # times" and nothing could have changed. Live-confirmed in prod:
+    # "(#200) Permissions error" on POST /{page_id}/agencies, repeating per attempt.
+    # The system-user grant is what ad-creative creation actually needs, and it can
+    # succeed on a Page whose Business-Manager share Meta refused. Blocking on the
+    # share alone would hold back a Page that can advertise perfectly well.
+    if (ads.get("business_manager_shared") is False
+            and not ads.get("system_user_assigned")
+            and not _bm_share_was_already_done(ads)):
         ads = dict(ads)
         ads["_business_manager_error"] = ads.get("business_manager_error") or ""
-        return ConnectionState.EXPIRED, ads
+        return ConnectionState.PAGE_NOT_SHARED, ads
 
     if live_check:
         valid, granted = await verify_token_live(
@@ -386,9 +401,20 @@ async def set_whatsapp_number(db, user_id: Optional[str], brand_id: Optional[str
     normalized = normalize_wa_number(number)
     if not normalized:
         raise ValueError("That WhatsApp number doesn't look right — please type it in full, e.g. 0803 123 4567.")
+    from .whatsapp import set_brand_whatsapp
+
     ads = await get_ads_connection(db, user_id, brand_id)
     if not ads:
         raise AdsConnectionRequired(ConnectionState.NONE)
+    # Written where it is READ. resolve_connection_state and the launch path both read
+    # the number from the jane_ads settings store (get_brand_whatsapp); this used to
+    # write it onto the social_connections doc instead, so a number saved here was
+    # invisible to both — the state stayed ADS_NO_WHATSAPP and Connected Accounts kept
+    # saying "WhatsApp not linked yet" for a brand that had just given us the number.
+    # The read side was already corrected once for exactly this mismatch; the writer
+    # was left behind.
+    await set_brand_whatsapp(db, brand_id, normalized)
+    # Kept in step on the connection doc too — several older reads still look here.
     await db[CONNECTIONS].update_one(
         {"id": ads["id"]},
         {"$set": {"whatsapp_number": normalized, "whatsapp_page_linked": True}},
