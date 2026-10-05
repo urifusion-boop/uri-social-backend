@@ -160,3 +160,25 @@ PLAN_VARIANT_TIER_4_NGN: float = 250_000.0   # at/above: multiple, with proper s
 # the number is not trusted and multi-day tactics are excluded — fail closed.
 SUSTAINED_WINDOW_DAYS: int = 90
 SUSTAINED_MIN_TOPUP_EVENTS: int = 2
+
+
+# ── Audience quality defaults (Meta) ─────────────────────────────────────────
+# Reported after comparing Jane's launched ad sets with manually-run ones on the
+# same ad account: Jane's campaigns brought conversations from people with no
+# interest in the offer — chancers asking for money, and replies in languages the
+# business does not sell in — where the manual campaigns did not.
+#
+# Both defaults below were things a human buyer sets and Jane never did. Neither
+# narrows WHO is targeted (age, interests and areas are still the client's); they
+# decide WHERE the ad is shown and in WHAT LANGUAGE the audience reads.
+
+# Automatic placements include Audience Network — third-party apps and games where
+# a tap is as often a misfire as an intention, and the cheapest conversations in the
+# auction come from. Facebook and Instagram only, matching plan_fields' existing
+# "facebook_and_instagram" choice, which the client can still change per campaign.
+DEFAULT_PUBLISHER_PLATFORMS = ["facebook", "instagram"]
+
+# English (All). Nigeria is multilingual and an unset locale lets Meta serve a Lagos
+# ad to a profile reading in any language, which is the complaint in its most literal
+# form. Overridden by anything the client's own targeting sets.
+DEFAULT_LOCALES = [1001]

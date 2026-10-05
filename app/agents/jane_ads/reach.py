@@ -12,10 +12,14 @@ So the audience is measured before launch, against Meta's own delivery_estimate,
 widened one rung at a time until it can deliver:
 
   1. As planned.
-  2. Drop the interest filter, keep the areas. Interests are the cheapest thing to
-     give up — the areas are what the client chose and can see, and an interest list
-     this long is mostly Jane's inference anyway.
-  3. Widen the areas to the whole city/state, keep whatever the step above left.
+  2. Widen the areas to the whole city/state, keep the interests.
+  3. Only then drop the interest filter.
+
+Interests go LAST, and that order is the whole point. Reach is cheapest to buy by
+dropping them, but lead quality is what they buy: comparing Jane's launched ad sets
+against manually-run ones on the same account, the campaigns that brought chancers
+and people with no interest in the offer were the ones with no interest filter. A
+wider area full of the right people beats a tight area full of anybody.
 
 Each rung is measured, not assumed: widening is only kept when Meta says it actually
 helped, so a floor that cannot be reached (a genuinely small market) leaves the plan
@@ -34,14 +38,15 @@ from typing import Any, Optional
 MIN_DELIVERABLE_AUDIENCE = 100_000
 
 # What Jane says about it. Plain language, and specific about what was given up.
-_DROPPED_INTERESTS = (
-    "{where} together only reach about {size} people with the interest filter on — "
-    "too tight for Meta to spend {budget} evenly — so I've dropped the interests and "
-    "kept the areas."
-)
 _WIDENED_GEO = (
-    "Even without the interest filter {where} only reach about {size} people, so I've "
-    "widened this to all of {city}."
+    "{where} only reach about {size} people — too tight for Meta to spend {budget} "
+    "evenly — so I've widened this to all of {city} and kept who we're looking for "
+    "the same."
+)
+_DROPPED_INTERESTS = (
+    "Even across all of {city} this is still only about {size} people, so I've also "
+    "had to drop the interest filter. Watch who actually messages: if they're the "
+    "wrong people, narrowing the area again works better than narrowing the budget."
 )
 
 
@@ -159,31 +164,30 @@ async def widen_for_delivery(
     if size is None or size >= floor:
         return result
 
-    # Rung 2 — drop the interests, keep the areas.
-    stripped = _without_interests(audience_targeting)
-    if stripped != audience_targeting:
-        wider_estimate, wider_size = await measure(geo_targeting, stripped)
+    # Rung 2 — widen the areas, keep who we are looking for.
+    if wider_geo_targeting and wider_geo_targeting != geo_targeting:
+        wider_estimate, wider_size = await measure(wider_geo_targeting, audience_targeting)
         # Kept only when it actually helped: Meta sometimes returns a lower number for
         # a broader spec, and shipping a worse audience plus an explanation of how it
         # was improved would be the wrong kind of confident.
         if wider_size is not None and wider_size > size:
-            result.update(audience_targeting=stripped, estimate=wider_estimate,
+            result.update(geo_targeting=wider_geo_targeting, estimate=wider_estimate,
                           widened=True,
-                          note=_DROPPED_INTERESTS.format(
-                              where=_names(geo_targeting),
-                              size=f"{size:,}", budget=budget_label))
+                          note=_WIDENED_GEO.format(
+                              where=_names(geo_targeting), size=f"{size:,}",
+                              budget=budget_label, city=city or "the city"))
             estimate, size = wider_estimate, wider_size
             if size >= floor:
                 return result
-            audience_targeting = stripped
+            geo_targeting = wider_geo_targeting
 
-    # Rung 3 — widen the areas themselves, when the caller gave us somewhere wider.
-    if wider_geo_targeting and wider_geo_targeting != geo_targeting:
-        widest_estimate, widest_size = await measure(wider_geo_targeting, audience_targeting)
+    # Rung 3 — the interest filter, last, because it is what keeps the WRONG people out.
+    stripped = _without_interests(audience_targeting)
+    if stripped != audience_targeting:
+        widest_estimate, widest_size = await measure(geo_targeting, stripped)
         if widest_size is not None and widest_size > (size or 0):
-            result.update(geo_targeting=wider_geo_targeting, audience_targeting=audience_targeting,
+            result.update(audience_targeting=stripped, geo_targeting=geo_targeting,
                           estimate=widest_estimate, widened=True,
-                          note=_WIDENED_GEO.format(
-                              where=_names(geo_targeting), size=f"{size:,}",
-                              city=city or "the city"))
+                          note=_DROPPED_INTERESTS.format(
+                              city=city or "that area", size=f"{size:,}"))
     return result
