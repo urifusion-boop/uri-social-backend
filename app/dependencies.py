@@ -192,6 +192,18 @@ async def flexible_auth(
             claims = jwt_payload.get("claims", {})
             user_id = claims.get("userId") or claims.get("user_id")
             if not user_id:
+                # Live-reported (connect-account flow): a 401 here silently
+                # force-logged the user out client-side with no visible error
+                # at all — "bounces back, no error". That client-side bug is
+                # now fixed too, but this 401 happening in the first place
+                # means a token decoded fine yet has no userId/user_id claim,
+                # which sign_jwt always sets — log enough to actually diagnose
+                # it (never the token itself) if it recurs.
+                print(
+                    f"⚠️ flexible_auth 401: JWT decoded but no userId/user_id in claims | "
+                    f"path={request.url.path} claim_keys={list(claims.keys())} "
+                    f"user_agent={request.headers.get('user-agent', '')[:200]}"
+                )
                 raise HTTPException(status_code=401, detail="User ID not found in JWT token")
             return {
                 "user_id": user_id,
@@ -202,7 +214,16 @@ async def flexible_auth(
         except HTTPException:
             raise
 
-    # No valid authentication provided
+    # No valid authentication provided — no Bearer header and no X-API-Key.
+    # Same live-reported case as above: log enough to tell "token genuinely
+    # missing from this request" apart from the claims-shape case, without
+    # needing the user to reproduce it again.
+    print(
+        f"⚠️ flexible_auth 401: no Authorization/X-API-Key header on request | "
+        f"path={request.url.path} has_auth_header={bool(authorization)} "
+        f"auth_header_prefix={authorization[:10]!r} "
+        f"user_agent={request.headers.get('user-agent', '')[:200]}"
+    )
     raise HTTPException(
         status_code=401,
         detail="Authentication required. Provide either X-API-Key header (SDK) or Authorization: Bearer header (Dashboard)."
