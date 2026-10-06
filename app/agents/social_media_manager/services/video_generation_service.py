@@ -248,7 +248,7 @@ class VideoGenerationService:
             fallback_warning = None
             try:
                 video_url, cost_usd = await VideoGenerationService._generate_scene_fal(
-                    scene, primary_model, avatar_voice
+                    scene, primary_model, avatar_voice, job_id
                 )
                 routed_model = primary_model
             except Exception as primary_error:
@@ -297,7 +297,7 @@ class VideoGenerationService:
                 fallback_warning = f"Fell back to {MODEL_REGISTRY.get(fallback_model, {}).get('label', fallback_model)}: {primary_model} failed ({primary_error})"
                 try:
                     video_url, cost_usd = await VideoGenerationService._generate_scene_fal(
-                        scene, fallback_model, avatar_voice
+                        scene, fallback_model, avatar_voice, job_id
                     )
                     routed_model = fallback_model
                     fallback_used = True
@@ -345,7 +345,7 @@ class VideoGenerationService:
 
     @staticmethod
     async def _submit_and_poll(
-        model: str, arguments: Dict[str, Any], timeout_seconds: int, scene_num: Any
+        model: str, arguments: Dict[str, Any], timeout_seconds: int, scene_num: Any, job_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Submit + manually poll fal.ai's queue instead of subscribe_async's
@@ -364,25 +364,36 @@ class VideoGenerationService:
         trusted the docs' `position_`/`error_`/`.result()` and broke every
         single fal.ai call in this file with `'AsyncRequestHandle' object has
         no attribute 'result'`, confirmed live 2026-10-05.
+
+        When job_id is given, the live fal.ai status (queued/position,
+        processing, elapsed seconds) is written to that job's own document on
+        every poll — not just logged server-side — so the frontend's existing
+        10s job-status poll can show real progress instead of a static
+        "Generating…" spinner for however long this model actually takes.
         """
         import fal_client
 
         handle = await fal_client.submit_async(model, arguments=arguments)
         started = time.monotonic()
         last_state = None
+        col = _jobs_collection() if job_id else None
+        model_label = MODEL_REGISTRY.get(model, {}).get("label", model)
+
         while True:
             elapsed = time.monotonic() - started
             if elapsed > timeout_seconds:
+                if col:
+                    await col.update_one({"job_id": job_id}, {"$unset": {"current_scene_status": ""}})
                 raise TimeoutError(
                     f"{model} did not respond within {timeout_seconds}s (last known state: {last_state})"
                 )
 
             status = await handle.status(with_logs=False)
             state = type(status).__name__  # "Queued" | "InProgress" | "Completed"
+            position = getattr(status, "position", None) if state == "Queued" else None
             if state != last_state:
                 if state == "Queued":
-                    pos = getattr(status, "position", "?")
-                    print(f"[VideoGen] Scene {scene_num}: {model} queued (position {pos}), {elapsed:.0f}s elapsed")
+                    print(f"[VideoGen] Scene {scene_num}: {model} queued (position {position}), {elapsed:.0f}s elapsed")
                 elif state == "InProgress":
                     print(f"[VideoGen] Scene {scene_num}: {model} now processing, {elapsed:.0f}s elapsed")
                 elif state == "Completed":
@@ -390,16 +401,29 @@ class VideoGenerationService:
                 last_state = state
 
             if state == "Completed":
+                if col:
+                    await col.update_one({"job_id": job_id}, {"$unset": {"current_scene_status": ""}})
                 error = getattr(status, "error", None)
                 if error:
                     raise RuntimeError(f"{model} failed: {error}")
                 return await handle.get()
 
+            if col:
+                await col.update_one({"job_id": job_id}, {"$set": {
+                    "current_scene_status": {
+                        "scene_number": scene_num,
+                        "model_label": model_label,
+                        "state": state,  # "Queued" | "InProgress"
+                        "position": position,
+                        "elapsed_seconds": round(elapsed),
+                    },
+                }})
+
             await asyncio.sleep(5)
 
     @staticmethod
     async def _generate_scene_fal(
-        scene: dict, model: str, avatar_voice: str = DEFAULT_AVATAR_VOICE
+        scene: dict, model: str, avatar_voice: str = DEFAULT_AVATAR_VOICE, job_id: Optional[str] = None
     ) -> tuple[str, Optional[float]]:
         import fal_client
 
@@ -540,7 +564,9 @@ class VideoGenerationService:
         model_timeout = _MODEL_TIMEOUT_OVERRIDES.get(model, _FAL_SUBSCRIBE_TIMEOUT_SECONDS)
 
         try:
-            result = await VideoGenerationService._submit_and_poll(model, arguments, model_timeout, scene_num)
+            result = await VideoGenerationService._submit_and_poll(
+                model, arguments, model_timeout, scene_num, job_id
+            )
         except Exception as e:
             err_str = str(e)
             has_audio_toggle = "generate_audio" in arguments or "generate_audio_switch" in arguments
@@ -550,7 +576,9 @@ class VideoGenerationService:
                 print(f"[VideoGen] Scene {scene_num}: audio flagged, retrying without audio")
                 toggle_key = "generate_audio" if "generate_audio" in arguments else "generate_audio_switch"
                 arguments = {**arguments, toggle_key: False}
-                result = await VideoGenerationService._submit_and_poll(model, arguments, model_timeout, scene_num)
+                result = await VideoGenerationService._submit_and_poll(
+                    model, arguments, model_timeout, scene_num, job_id
+                )
             else:
                 raise
 
