@@ -26,16 +26,22 @@ from app.utils.s3_upload import upload_file_path
 # correct, not a typo; that's how fal.ai itself hosts this specific partner's
 # models.
 #
-# cost_per_second below is the brief's own figure (§1's table), converted from
-# its stated NGN back to USD at the brief's own FX assumption (₦1,327.84/$1,
-# 1 October 2026) so it's directly comparable with the rest of this file's USD
-# math — not re-derived from a separate pricing lookup. The brief itself warns
-# prices change and should be re-checked against live fal.ai pricing before any
-# production rollout; this is a snapshot, not a live-fetched rate.
+# cost_per_second below was originally the brief's own figure (§1's table),
+# converted from its stated NGN back to USD at the brief's own FX assumption
+# (₦1,327.84/$1, 1 October 2026) — the brief itself warned this was a
+# snapshot, not a live-fetched rate, and should be re-checked before
+# production rollout. That check happened 2026-10-06 against the account's
+# own fal.ai billing dashboard: Veo 3.1 Fast and the Talking Avatar model
+# matched closely, but H3 Max Turbo and PixVerse V6 were off by 3.2x and 12x
+# respectively — both corrected below to the real billed rate. Kling 2.5
+# Standard, H3 Max, Wan 3.0, and Seedance 2.0 Fast have not yet had a single
+# real billed call to verify against (fal.ai's dashboard only had 4 endpoints
+# with usage as of this check) — still the brief-converted figure, same
+# "re-check before relying on it" caveat applies to those four.
 MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
     "minimax/h3-max-turbo/image-to-video": {
         "label": "H3 Max Turbo",
-        "cost_per_second": 0.0399,
+        "cost_per_second": 0.0125,  # confirmed 2026-10-06 via fal.ai billing dashboard; was 0.0399
     },
     "fal-ai/kling-video/v2.5-turbo/standard/image-to-video": {
         "label": "Kling 2.5 Standard",
@@ -43,7 +49,7 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "fal-ai/pixverse/v6/image-to-video": {
         "label": "PixVerse V6",
-        "cost_per_second": 0.0603,
+        "cost_per_second": 0.005,  # confirmed 2026-10-06 via fal.ai billing dashboard; was 0.0603
     },
     "minimax/h3-max/image-to-video": {
         "label": "H3 Max",
@@ -161,12 +167,16 @@ DEFAULT_OUTCOME = "quick_video"
 # failure: run_job retries once on the outcome's paired fallback.
 _FAL_SUBSCRIBE_TIMEOUT_SECONDS = 300
 
-# Per-model override — live-confirmed 2026-10-01: the talking-avatar model
-# (TTS + lip-sync diffusion, inherently heavier than a plain motion model)
-# exceeded the default 300s on two separate real attempts, not one unlucky
-# run. Everything else keeps the default until it shows the same pattern.
+# Per-model override. The talking-avatar model routinely takes 3-12+ minutes
+# to complete even on SUCCESS — confirmed 2026-10-06 from fal.ai's own
+# request-history dashboard (one real request: Completed at 750.62s). Since
+# run_job no longer falls back on a timeout for this model specifically (see
+# the comment there — a timeout used to mean double-billing for a strictly
+# worse result), this ceiling is now a pure safety net against a genuinely
+# dead request, not a "give up and substitute" trigger — set generously
+# above every real completion time seen so far, not tuned to the typical case.
 _MODEL_TIMEOUT_OVERRIDES: Dict[str, int] = {
-    "fal-ai/ai-avatar/single-text": 600,
+    "fal-ai/ai-avatar/single-text": 1800,
 }
 
 
@@ -242,6 +252,40 @@ class VideoGenerationService:
                 )
                 routed_model = primary_model
             except Exception as primary_error:
+                # The talking-avatar model routinely takes 3-12+ minutes to
+                # complete even on success (fal.ai's own request history,
+                # live-confirmed 2026-10-06) — a client-side timeout there
+                # does NOT mean the generation failed, fal.ai keeps running it
+                # and bills for it either way. Falling back on a timeout for
+                # THIS model specifically meant double-billing (the full
+                # avatar generation + the Veo fallback that then also ran)
+                # for a strictly worse result (no real lip-synced speech) —
+                # confirmed live: a request that timed out at our old 600s
+                # ceiling shows as Completed at 750.62s on fal.ai's own
+                # dashboard. No fallback on slowness for this one model; a
+                # genuine error (content policy, missing dialogue, a real
+                # API failure) still falls back exactly as before.
+                if primary_model == _AVATAR_TALKING and isinstance(primary_error, TimeoutError):
+                    latency = round(time.monotonic() - started, 2)
+                    print(f"[VideoGenJob {job_id}] Scene {scene_num}: {primary_model} timed out "
+                          f"client-side ({primary_error}) — not falling back, fal.ai may still complete it")
+                    await col.update_one({"job_id": job_id}, {"$push": {"clips": {
+                        **base_fields,
+                        "video_url": None,
+                        "cost_usd": None,
+                        "outcome": outcome,
+                        "routed_model": None,
+                        "fallback_used": False,
+                        "latency_seconds": latency,
+                        "error": (
+                            f"{primary_model} is still generating past our {primary_error} — "
+                            "this model routinely takes several minutes. No fallback was used "
+                            "(it would mean paying for this generation twice with a worse result). "
+                            "Check fal.ai's dashboard — it may complete on its own; regenerate this "
+                            "scene once it does."
+                        ),
+                    }}})
+                    continue
                 print(f"[VideoGenJob {job_id}] Scene {scene_num}: {primary_model} failed "
                       f"({primary_error}), falling back to {fallback_model}")
                 # Record WHY it fell back even when the fallback itself succeeds —
