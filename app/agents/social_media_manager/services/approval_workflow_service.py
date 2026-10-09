@@ -1722,8 +1722,16 @@ class ApprovalWorkflowService:
                         media_urls = slide_urls
                         print(f"🎠 Carousel: collected {len(media_urls)} slide image(s) for Outstand")
 
+                # `not media_urls` guards against the carousel block above having
+                # already set the real multi-slide list — live bug, confirmed
+                # 2026-10-09: this single-image fallback ran unconditionally for
+                # every post_type, so any carousel draft that still carried a
+                # stale top-level image_url (e.g. one originally created as a
+                # single-image post, later converted to a carousel by a path
+                # that sets `slides` but never clears the old `image_url`) had
+                # its carousel silently reduced to 1 image at publish time.
                 image_url = ApprovalWorkflowService._resolve_image_url(image_url)
-                if image_url:
+                if image_url and not media_urls:
                     if image_url.startswith("data:"):
                         public_image_url = await ApprovalWorkflowService._upload_base64_to_imgbb(image_url)
                         if public_image_url:
