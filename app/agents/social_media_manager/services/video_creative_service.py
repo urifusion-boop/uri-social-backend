@@ -100,6 +100,7 @@ class VideoCreativeService:
         target_platform: str = "instagram_reels",
         target_duration_seconds: int = 15,
         video_style: Optional[str] = None,
+        creative_direction_override: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Write a creative_direction + scene-by-scene script from a free-text
@@ -114,6 +115,13 @@ class VideoCreativeService:
         the model picks whichever of VIDEO_STYLE_DIRECTIVES best fits the
         brief itself, returned in the storyboard's own "video_style" field so
         the choice is visible rather than a silent internal decision.
+
+        creative_direction_override: when the user has hand-edited a
+        previously-generated creative_direction and wants scenes rewritten to
+        match it, pass the edited text here — the model is told to use it
+        VERBATIM (not invent its own) and write scenes that execute that
+        exact concept. Leave None for a fresh/first generation, where the
+        model writes its own creative_direction from the brief.
         """
         if not brief or not brief.strip():
             return {"status": False, "error": "Describe what the video should be about."}
@@ -153,6 +161,13 @@ class VideoCreativeService:
         else:
             preamble_lines.append(
                 "\nNo reference images supplied — invent the entire visual world from the brief and brand context."
+            )
+        if creative_direction_override and creative_direction_override.strip():
+            preamble_lines.append(
+                "\nCREATIVE DIRECTION — ALREADY DECIDED, DO NOT CHANGE IT:\n"
+                f"{creative_direction_override.strip()}\n"
+                "Write scenes that execute this exact concept. Return it VERBATIM, unchanged, as "
+                "\"creative_direction\" in your JSON — do not rewrite, summarize, or improve it."
             )
         preamble_lines.append(f"\nGenerate exactly {num_scenes} scenes totalling {target_duration_seconds}s.")
 
@@ -228,6 +243,11 @@ class VideoCreativeService:
             print(f"[VideoCreativeService] model returned unknown video_style "
                   f"{storyboard.get('video_style')!r}, defaulting to clean_commercial")
             storyboard["video_style"] = "clean_commercial"
+
+        # Forced creative_direction: trust the user's exact edited text over
+        # whatever the model echoed back, same reasoning as forced_style above.
+        if creative_direction_override and creative_direction_override.strip():
+            storyboard["creative_direction"] = creative_direction_override.strip()
 
         return {"status": True, "storyboard": storyboard}
 
