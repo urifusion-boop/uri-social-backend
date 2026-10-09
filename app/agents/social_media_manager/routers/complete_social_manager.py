@@ -165,6 +165,9 @@ class CreativeStoryboardRequest(BaseModel):
     # model infer the best-fitting style from the brief itself; pass a slug
     # to force one instead.
     video_style: Optional[str] = None
+    # Set only when regenerating from a hand-edited creative_direction — see
+    # VideoCreativeService.generate_creative_storyboard's own docstring.
+    creative_direction_override: Optional[str] = Field(None, max_length=2000)
 
 class CreativeFramesRequest(BaseModel):
     scenes: List[Dict[str, Any]]
@@ -6832,6 +6835,7 @@ async def generate_creative_storyboard(
         target_platform=request.target_platform,
         target_duration_seconds=request.target_duration_seconds,
         video_style=request.video_style,
+        creative_direction_override=request.creative_direction_override,
     )
 
     if not result.get("status"):
