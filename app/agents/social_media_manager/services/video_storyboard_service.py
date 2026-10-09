@@ -351,7 +351,7 @@ class VideoStoryboardService:
             return {"status": False, "error": "Storyboard generation is not configured."}
 
         brand_images = brand_images[:5]
-        target_duration_seconds = max(5, min(target_duration_seconds, 30))
+        target_duration_seconds = max(5, min(target_duration_seconds, 60))
         num_scenes = max(1, round(target_duration_seconds / 5))
 
         brand_colors = brand_context.get("brand_colors") or []
@@ -413,11 +413,12 @@ class VideoStoryboardService:
             config = genai_types.GenerateContentConfig(
                 system_instruction=system_prompt,
                 temperature=0.7,
-                # Bumped from 2000: each scene now carries two more fields
-                # (continuity_note, dialogue) — 2000 was already close to the
-                # ceiling for a 6-scene storyboard and risked truncated/
-                # unparseable JSON once those fields were added.
-                max_output_tokens=3000,
+                # 3000 was already close to the ceiling for a 6-scene (30s)
+                # storyboard once continuity_note/dialogue were added to each
+                # scene. Duration now goes up to 60s (12 scenes) — doubled
+                # the budget rather than risk the same truncated-JSON failure
+                # at the new, larger size.
+                max_output_tokens=6000,
                 response_mime_type="application/json",
             )
 

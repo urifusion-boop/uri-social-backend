@@ -149,7 +149,7 @@ class StoryboardRequest(BaseModel):
     brand_images: List[str] = Field(..., min_items=1, max_items=5)
     optional_text: Optional[str] = Field(None, max_length=1000)
     target_platform: str = "instagram_reels"
-    target_duration_seconds: int = Field(15, ge=5, le=30)
+    target_duration_seconds: int = Field(15, ge=5, le=60)
     video_style: Optional[str] = "clean_commercial"
 
 class StoryboardFramesRequest(BaseModel):
@@ -160,7 +160,7 @@ class CreativeStoryboardRequest(BaseModel):
     brief: str = Field(..., min_length=10, max_length=2000)
     reference_images: List[str] = Field(default_factory=list, max_items=5)
     target_platform: str = "instagram_reels"
-    target_duration_seconds: int = Field(15, ge=5, le=30)
+    target_duration_seconds: int = Field(15, ge=5, le=60)
     # None (the describe-it UI's default — it has no style picker) lets the
     # model infer the best-fitting style from the brief itself; pass a slug
     # to force one instead.

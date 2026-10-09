@@ -119,7 +119,7 @@ class VideoCreativeService:
             return {"status": False, "error": "Describe what the video should be about."}
 
         reference_images = reference_images[:5]
-        target_duration_seconds = max(5, min(target_duration_seconds, 30))
+        target_duration_seconds = max(5, min(target_duration_seconds, 60))
         num_scenes = max(1, round(target_duration_seconds / 5))
 
         brand_colors = brand_context.get("brand_colors") or []
@@ -197,8 +197,10 @@ class VideoCreativeService:
                     # supported with this model. Use 'max_completion_tokens'
                     # instead." The one other gpt-5.4 call site in this
                     # codebase (auto_content_service.py) never hit this
-                    # because it never passes a token limit at all.
-                    max_completion_tokens=3000,
+                    # because it never passes a token limit at all. Doubled
+                    # from 3000 — duration now goes up to 60s (12 scenes,
+                    # same scene-count increase as video_storyboard_service.py).
+                    max_completion_tokens=6000,
                     response_format={"type": "json_object"},
                 ),
             )
