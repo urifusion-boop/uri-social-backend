@@ -2046,6 +2046,7 @@ class ApprovalWorkflowService:
                 # once TikTok has actually confirmed it, not just accepted it.
                 if success and platform == "tiktok" and post_id:
                     published = False
+                    failure_reason = None
                     for _ in range(90):
                         await asyncio.sleep(8)
                         try:
@@ -2059,27 +2060,40 @@ class ApprovalWorkflowService:
                         if check_post.get("publishedAt") and not check_post.get("isDraft"):
                             published = True
                             break
-                        if check_post.get("status") == "failed":
-                            print(f"⚠️ TikTok post {post_id} failed after acceptance: {check}")
+                        # The failure reason lives per-account, not on the post
+                        # itself — live-confirmed 2026-10-10 via Outstand's own
+                        # dashboard: socialAccounts[].status == "failed" with
+                        # socialAccounts[].error holding the real detail (e.g.
+                        # "picture_size_check_failed", a TikTok-side rejection
+                        # of one of the images, not a stuck/pending state).
+                        failed_acct = next(
+                            (a for a in (check_post.get("socialAccounts") or []) if a.get("status") == "failed"),
+                            None,
+                        )
+                        if failed_acct:
+                            failure_reason = failed_acct.get("error") or "unknown reason"
+                            print(f"⚠️ TikTok post {post_id} failed: {failure_reason}")
                             break
                     if published:
                         print(f"✅ TikTok post {post_id} confirmed published")
                     else:
                         success = False
-                        print(f"⚠️ TikTok post {post_id} was accepted but never confirmed published after "
-                              f"12 min — likely awaiting manual confirmation in the TikTok app, or genuinely "
-                              f"failed. Not marking this draft as published.")
+                        error_msg = (
+                            f"TikTok rejected the post: {failure_reason}"
+                            if failure_reason
+                            else (
+                                "TikTok accepted the post but has not confirmed it's actually published after "
+                                "12 minutes. This usually means it's waiting for manual confirmation in the "
+                                "TikTok app's inbox — check there."
+                            )
+                        )
+                        print(f"⚠️ TikTok post {post_id} not published — {error_msg} Not marking this draft as published.")
                         return {
                             "success": False,
                             "post_id": post_id,
                             "outstand_status": post_status,
                             "raw_response": result,
-                            "error": (
-                                "TikTok accepted the post but has not confirmed it's actually published after "
-                                "12 minutes. This usually means it's waiting for manual confirmation in the "
-                                "TikTok app's inbox — check there. The post was NOT marked as published here "
-                                "since we can't confirm it actually went live."
-                            ),
+                            "error": error_msg,
                         }
 
                 return {"success": success, "post_id": post_id, "outstand_status": post_status, "raw_response": result}
