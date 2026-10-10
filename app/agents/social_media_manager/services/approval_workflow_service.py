@@ -1243,6 +1243,75 @@ class ApprovalWorkflowService:
         return url
 
     @staticmethod
+    async def _normalize_image_for_tiktok(url: str) -> str:
+        """
+        Make an image compliant with TikTok's Content Posting API photo
+        requirements before it's sent — confirmed from TikTok's own Media
+        Transfer Guide: JPEG or WebP only (no PNG), max 1080p, max 20MB per
+        image. Live-confirmed 2026-10-10: a real carousel post failed with
+        "picture_size_check_failed" — these are exactly the checks that
+        error covers, and nothing in the upload pipeline validated or
+        resized a user's photo against them before this.
+
+        Downloads, re-encodes to JPEG if needed, resizes so neither
+        dimension exceeds 1080px (preserving aspect ratio), and re-uploads.
+        Returns the original url unchanged if it already complies — avoids
+        a pointless re-upload/quality loss on images that were already fine.
+        On any failure, logs and returns the original url so a normalization
+        bug never blocks a publish that might otherwise have succeeded.
+        """
+        try:
+            import io
+            import httpx as _httpx
+            from PIL import Image as _Image
+
+            async with _httpx.AsyncClient(timeout=30) as client:
+                resp = await client.get(url)
+                resp.raise_for_status()
+            raw_bytes = resp.content
+
+            img = _Image.open(io.BytesIO(raw_bytes))
+            fmt = (img.format or "").upper()
+            needs_format_fix = fmt not in ("JPEG", "WEBP")
+            needs_resize = max(img.size) > 1080
+            needs_size_fix = len(raw_bytes) > 20 * 1024 * 1024
+
+            if not (needs_format_fix or needs_resize or needs_size_fix):
+                return url
+
+            if needs_resize:
+                scale = 1080 / max(img.size)
+                new_size = (round(img.width * scale), round(img.height * scale))
+                img = img.resize(new_size, _Image.LANCZOS)
+                print(f"🔧 TikTok image resized {url} -> {new_size}")
+
+            img = img.convert("RGB")
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=90)
+            jpeg_bytes = buf.getvalue()
+
+            if len(jpeg_bytes) > 20 * 1024 * 1024:
+                # Re-encode at a lower quality rather than give up — a 1080px-
+                # capped JPEG this large would be unusual, but stay inside
+                # TikTok's limit if it happens.
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=70)
+                jpeg_bytes = buf.getvalue()
+
+            import base64 as _b64
+            data_url = f"data:image/jpeg;base64,{_b64.b64encode(jpeg_bytes).decode()}"
+            normalized_url = await ApprovalWorkflowService._upload_base64_to_imgbb(data_url)
+            if normalized_url:
+                print(f"🔧 TikTok image normalized: {url} -> {normalized_url} "
+                      f"(format_fix={needs_format_fix}, resize={needs_resize}, size_fix={needs_size_fix})")
+                return normalized_url
+            print(f"⚠️ TikTok image normalization: re-upload failed, using original url: {url}")
+            return url
+        except Exception as e:
+            print(f"⚠️ TikTok image normalization failed for {url}, using original: {e}")
+            return url
+
+    @staticmethod
     async def _upload_base64_image_to_facebook(
         page_id: str,
         page_token: str,
@@ -1814,6 +1883,16 @@ class ApprovalWorkflowService:
                 # so route TikTok media through Outstand's own upload flow instead.
                 platform_config = None
                 if platform == "tiktok" and media_urls:
+                    # Photo-only: normalize each image against TikTok's own
+                    # documented photo requirements (JPEG/WebP, max 1080p, max
+                    # 20MB) before handing off to Outstand — see
+                    # _normalize_image_for_tiktok's own docstring for why.
+                    # Skipped for a video draft; TikTok's video requirements
+                    # are a different, unverified spec this doesn't cover.
+                    if not draft.get("video_url"):
+                        media_urls = [
+                            await ApprovalWorkflowService._normalize_image_for_tiktok(u) for u in media_urls
+                        ]
                     media_urls = [await outstand.upload_media_from_url(u) for u in media_urls]
                     # DIRECT_POST so it goes live instead of sitting as an inbox draft.
                     # PUBLIC_TO_EVERYONE — the app's Content Posting API audit passed
