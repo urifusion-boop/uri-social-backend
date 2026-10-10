@@ -1865,6 +1865,58 @@ class ApprovalWorkflowService:
                     print(f"⚠️ Outstand returned no post ID — possible publish failure: {result}")
                 else:
                     print(f"✅ Outstand post accepted | post_id={post_id} status={post_status or 'unknown'}")
+
+                # TikTok specifically: acceptance ≠ published. Live-confirmed
+                # 2026-10-10 — a real TikTok DIRECT_POST came back with no
+                # "status" field at all (post_status above was ""), so the
+                # logic above declared success the instant Outstand accepted
+                # the submission, while the post's own publishedAt stayed
+                # null — it never actually went live (TikTok commonly holds a
+                # direct-posted item for the creator to manually confirm in
+                # their own TikTok app inbox before it's really published).
+                # video_publish_service.py's TikTok path already polls for
+                # exactly this; this path never did. Same poll budget as that
+                # file's _OUTSTAND_POLL_INTERVAL/_OUTSTAND_MAX_POLLS (8s × 90
+                # = 12 min) so a draft is only marked "published" in our DB
+                # once TikTok has actually confirmed it, not just accepted it.
+                if success and platform == "tiktok" and post_id:
+                    published = False
+                    for _ in range(90):
+                        await asyncio.sleep(8)
+                        try:
+                            check = await outstand.get_post(post_id)
+                        except Exception as poll_err:
+                            print(f"⚠️ TikTok publish-status poll failed for {post_id}: {poll_err}")
+                            continue
+                        check_post = check.get("post") or check.get("data") or {}
+                        if isinstance(check_post, list):
+                            check_post = check_post[0] if check_post else {}
+                        if check_post.get("publishedAt") and not check_post.get("isDraft"):
+                            published = True
+                            break
+                        if check_post.get("status") == "failed":
+                            print(f"⚠️ TikTok post {post_id} failed after acceptance: {check}")
+                            break
+                    if published:
+                        print(f"✅ TikTok post {post_id} confirmed published")
+                    else:
+                        success = False
+                        print(f"⚠️ TikTok post {post_id} was accepted but never confirmed published after "
+                              f"12 min — likely awaiting manual confirmation in the TikTok app, or genuinely "
+                              f"failed. Not marking this draft as published.")
+                        return {
+                            "success": False,
+                            "post_id": post_id,
+                            "outstand_status": post_status,
+                            "raw_response": result,
+                            "error": (
+                                "TikTok accepted the post but has not confirmed it's actually published after "
+                                "12 minutes. This usually means it's waiting for manual confirmation in the "
+                                "TikTok app's inbox — check there. The post was NOT marked as published here "
+                                "since we can't confirm it actually went live."
+                            ),
+                        }
+
                 return {"success": success, "post_id": post_id, "outstand_status": post_status, "raw_response": result}
             except Exception as e:
                 print(f"❌ Outstand publish exception: {e}")
