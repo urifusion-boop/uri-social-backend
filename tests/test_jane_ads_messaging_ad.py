@@ -82,3 +82,29 @@ def test_a_radius_the_plan_already_set_is_kept():
     out = _with_city_radius({"geo_locations": {"cities": [{"key": "1", "radius": 10,
                                                            "distance_unit": "kilometer"}]}})
     assert out["geo_locations"]["cities"][0]["radius"] == 10
+
+
+def test_the_client_s_age_becomes_the_advantage_audience_suggestion():
+    """With Advantage+ audience Meta rejects a hard max age below 65 (subcode 1870189)
+    and caps a hard minimum at 25 — the manual campaign shows the accepted shape."""
+    from app.agents.jane_ads.adapters.meta import _advantage_age
+
+    out = _advantage_age({"age_min": 23, "age_max": 55})
+    assert out["age_range"] == [23, 55]          # the client's choice, intact
+    assert out["age_max"] == 65                   # the only hard max Meta accepts
+    assert out["age_min"] == 23
+
+    assert _advantage_age({"age_min": 30, "age_max": 50})["age_min"] == 25
+    assert _advantage_age({"age_min": 25, "age_max": 65}) == {
+        "age_min": 25, "age_max": 65, "age_range": [25, 65]}   # exactly the manual ad set
+    assert _advantage_age({"geo_locations": {}}) == {"geo_locations": {}}
+
+
+def test_editing_another_field_keeps_the_client_s_age_range():
+    """A live Advantage+ ad set reads back with the range in age_range. Re-deriving it
+    from the hard fences would turn 23-55 into 23-65 on every unrelated edit."""
+    from app.agents.jane_ads.adapters.meta import _advantage_age
+
+    live = {"age_min": 23, "age_max": 65, "age_range": [23, 55]}
+    assert _advantage_age(live)["age_range"] == [23, 55]
+    assert _advantage_age({"age_min": 25, "age_max": 65, "age_range": [30, 50]})["age_range"] == [30, 50]

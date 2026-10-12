@@ -152,6 +152,15 @@ async def build_targeting_edit(
         return None, [], rejections
 
     targeting = {**(current or {}), **new_plan.audience_targeting}
+    # An age edit is the client choosing a NEW range. On an Advantage+ ad set the range
+    # lives in age_range (the hard min/max are only outer fences), so it is set here
+    # explicitly; without this the adapter would keep the old range and the edit would
+    # read back as applied while changing nothing Meta delivers against.
+    if {"age_min", "age_max"} & set(applied):
+        lo = new_plan.audience_targeting.get("age_min", targeting.get("age_min"))
+        hi = new_plan.audience_targeting.get("age_max", targeting.get("age_max"))
+        if lo is not None or hi is not None:
+            targeting["age_range"] = [int(lo or 18), int(hi or 65)]
     # apply_edits DELETES these to mean "broad"; a merge would resurrect the old value.
     for key in ("genders", "publisher_platforms", "flexible_spec"):
         if key not in new_plan.audience_targeting:
