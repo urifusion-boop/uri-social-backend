@@ -43,8 +43,10 @@ def test_creative_enhancements_match_the_manual_ad_exactly():
     opted_in = {k for k, v in feats.items() if v["enroll_status"] == "OPT_IN"}
     opted_out = {k for k, v in feats.items() if v["enroll_status"] == "OPT_OUT"}
     assert opted_in == {"enhance_cta", "inline_comment", "show_destination_blurbs",
-                        "standard_enhancements", "video_auto_crop", "video_filtering",
-                        "video_uncrop"}
+                        "video_auto_crop", "video_filtering", "video_uncrop"}
+    # The API refuses the bundle key itself (subcode 3858504); the features above are
+    # what Ads Manager expands it into.
+    assert "standard_enhancements" not in feats
     assert opted_out == {"ads_with_benefits", "advantage_plus_creative", "text_optimizations"}
     assert M.creative_extras()["contextual_multi_ads"] == {"enroll_status": "OPT_IN"}
 
