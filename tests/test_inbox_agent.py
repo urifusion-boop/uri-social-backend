@@ -333,3 +333,27 @@ def test_another_workspaces_conversation_is_invisible():
                                      fake_llm(CLS_FAQ, {}), _sent_transport([])))
     assert out["status"] == "skipped"
     assert not _run(agent.record_correction(db, "ws_other", conv_id, "spam", None, "u"))
+
+
+def _history(*rows):
+    return [{"id": str(i), "direction": d, "text": "x", "actor_id": a, "received_at": t}
+            for i, (d, a, t) in enumerate(rows)]
+
+
+def test_a_team_reply_blocks_auto_replies_for_a_day_not_forever():
+    s = _settings()
+    recent = _history(("outbound", "user_1", OPEN_HOURS - timedelta(hours=2)), ("inbound", "", OPEN_HOURS))
+    old = _history(("outbound", "user_1", OPEN_HOURS - timedelta(days=3)), ("inbound", "", OPEN_HOURS))
+    assert agent.verdict(s, _conv(), recent, _cls(), _draft(), OPEN_HOURS)[0] is False
+    assert agent.verdict(s, _conv(), old, _cls(), _draft(), OPEN_HOURS) == (True, "")
+
+
+def test_a_redraft_explains_why_it_was_not_sent_and_never_sends():
+    db = Db()
+    conv_id, msg_id = _seed(db, faq=False)
+    llm = fake_llm(CLS_FAQ, {"reply": "We offer X.", "cited": [], "confidence": 90})
+    result = _run(agent.suggest(db, WS, conv_id, llm))
+    reason = _run(agent.explain(db, WS, result))
+    assert reason == "No approved FAQ answers this"
+    assert db[CONVERSATIONS].docs[0]["handoff_reason"] == reason
+    assert not [m for m in db[MESSAGES].docs if m["direction"] == "outbound"]
