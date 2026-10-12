@@ -17,11 +17,12 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.core.config import settings
 from app.dependencies import get_active_brand_context, get_db_dependency
 
-from .entities import CHANNEL_ACCOUNTS, CONVERSATIONS, IDENTITIES, MESSAGES
+from .entities import CHANNEL_ACCOUNTS, CONVERSATIONS, IDENTITIES, MESSAGES, now
 from .channels import (
     SOCIAL_CONNECTIONS, _workspace_of, account_for_event, fetch_contact_name,
     link_workspace_channels,
 )
+from . import agent
 from .meta_transport import meta_transport
 from .send import SendRefused, send_reply
 from .ingest import (
@@ -111,6 +112,13 @@ async def receive_meta_webhook(
             account.get("platform") or "facebook", ev)
         if msg_id:
             stored += 1
+            # After the message is safely stored, never before: a model outage must
+            # not cost a customer message (PRD §8.7).
+            stored_msg = await db[MESSAGES].find_one(
+                {"_id": ObjectId(msg_id)}, {"conversation_id": 1})
+            if stored_msg:
+                agent.schedule(agent.process_inbound(
+                    db, account["workspace_id"], stored_msg["conversation_id"], msg_id))
     print(f"[Inbox] webhook stored {stored}/{len(events)} event(s)", flush=True)
     return {"status": "ok", "events": len(events), "stored": stored}
 
@@ -162,8 +170,31 @@ async def list_conversations(
             # Present only when the provider supplied it (PRD §8.6).
             "source_post_id": r.get("source_post_id", ""),
             "source_ad_id": r.get("source_ad_id", ""),
+            "last_direction": (last[0].get("direction") if last else ""),
+            **_agent_view(r),
         })
     return {"conversations": out}
+
+
+def _agent_view(conv: dict) -> dict:
+    """What the agent concluded about a conversation, as the inbox shows it."""
+    language = conv.get("language") or ""
+    return {
+        "intent": conv.get("intent") or "",
+        "intent_confidence": conv.get("intent_confidence"),
+        "intent_rationale": conv.get("intent_rationale") or "",
+        "intent_corrected": bool(conv.get("intent_corrected")),
+        "urgency": conv.get("urgency") or "",
+        "sentiment": conv.get("sentiment") or "",
+        # Only languages validated so far get a label (PRD §5).
+        "language": language if language in agent.SHOWN_LANGUAGES else "",
+        "exclusions": [agent.EXCLUSIONS[e] for e in conv.get("exclusions") or []
+                       if e in agent.EXCLUSIONS],
+        "priority": conv.get("priority") or "normal",
+        "needs_human": bool(conv.get("needs_human")),
+        "handoff_reason": conv.get("handoff_reason") or "",
+        "ai_suggestion": conv.get("ai_suggestion"),
+    }
 
 
 @router.get("/conversations/{conversation_id}/messages")
@@ -184,6 +215,7 @@ async def list_messages(
         "text": r.get("text", ""),
         "attachments": r.get("attachments", []),
         "delivery": r.get("delivery"),
+        "by_agent": r.get("actor_id") == agent.AGENT_ACTOR,
         "provider_timestamp": r.get("provider_timestamp"),
         "received_at": r.get("received_at"),
     } for r in rows]}
@@ -204,6 +236,7 @@ async def reply_to_conversation(
     conversation_id: str,
     text: str = Body(..., embed=True),
     idempotency_key: str = Body("", embed=True),
+    suggestion_id: str = Body("", embed=True),
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
     brand_ctx: dict = Depends(get_active_brand_context),
 ) -> dict:
@@ -233,6 +266,9 @@ async def reply_to_conversation(
     except SendRefused as e:
         raise HTTPException(status_code=409 if e.reason == "window_closed" else 400,
                             detail=e.detail)
+
+    if record.get("delivery") == "accepted":
+        await agent.record_outcome(db, workspace_id, conversation_id, suggestion_id, text)
 
     return {
         "delivery": record.get("delivery"),
@@ -322,3 +358,123 @@ async def list_channels(
             "last_event_at": (last[0].get("received_at") if last else None),
         })
     return {"channels": out}
+
+
+@router.get("/agent/settings")
+async def get_agent_settings(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    return {"settings": await agent.load_settings(db, brand_ctx.get("brand_id"))}
+
+
+@router.put("/agent/settings")
+async def put_agent_settings(
+    payload: dict = Body(...),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    saved = await agent.save_settings(
+        db, brand_ctx.get("brand_id"), payload, brand_ctx.get("user_id", ""))
+    return {"settings": saved}
+
+
+@router.get("/knowledge")
+async def list_knowledge(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    return {"entries": await agent.list_knowledge(db, brand_ctx.get("brand_id"))}
+
+
+def _knowledge_fields(question: str, answer: str) -> dict:
+    question, answer = (question or "").strip(), (answer or "").strip()
+    if not question or not answer:
+        raise HTTPException(status_code=400, detail="A question and an answer are both needed.")
+    return {"question": question[:300], "answer": answer[:2000]}
+
+
+@router.post("/knowledge")
+async def create_knowledge(
+    question: str = Body(..., embed=True),
+    answer: str = Body(..., embed=True),
+    approved: bool = Body(True, embed=True),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    doc = {"workspace_id": brand_ctx.get("brand_id"), **_knowledge_fields(question, answer),
+           "approved": approved, "created_at": now(), "updated_at": now(),
+           "updated_by": brand_ctx.get("user_id", "")}
+    res = await db[agent.KNOWLEDGE].insert_one(doc)
+    return {"id": str(res.inserted_id)}
+
+
+@router.put("/knowledge/{entry_id}")
+async def update_knowledge(
+    entry_id: str,
+    question: str = Body(..., embed=True),
+    answer: str = Body(..., embed=True),
+    approved: bool = Body(True, embed=True),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    if not ObjectId.is_valid(entry_id):
+        raise HTTPException(status_code=404, detail="Not found.")
+    res = await db[agent.KNOWLEDGE].update_one(
+        {"_id": ObjectId(entry_id), "workspace_id": brand_ctx.get("brand_id")},
+        {"$set": {**_knowledge_fields(question, answer), "approved": approved,
+                  "updated_at": now(), "updated_by": brand_ctx.get("user_id", "")}})
+    if not res.matched_count:
+        raise HTTPException(status_code=404, detail="Not found.")
+    return {"status": "ok"}
+
+
+@router.delete("/knowledge/{entry_id}")
+async def delete_knowledge(
+    entry_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    if not ObjectId.is_valid(entry_id):
+        raise HTTPException(status_code=404, detail="Not found.")
+    res = await db[agent.KNOWLEDGE].delete_one(
+        {"_id": ObjectId(entry_id), "workspace_id": brand_ctx.get("brand_id")})
+    if not res.deleted_count:
+        raise HTTPException(status_code=404, detail="Not found.")
+    return {"status": "ok"}
+
+
+@router.post("/conversations/{conversation_id}/suggestion")
+async def regenerate_suggestion(
+    conversation_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Draft again — after the knowledge base changed, or for a thread from before the
+    agent existed. Never sends."""
+    try:
+        result = await agent.suggest(db, brand_ctx.get("brand_id"), conversation_id)
+    except Exception as e:
+        print(f"[InboxAgent] suggestion failed: {type(e).__name__}: {str(e)[:200]}", flush=True)
+        raise HTTPException(status_code=503, detail="Couldn't draft a reply right now. Try again.")
+    if not result:
+        raise HTTPException(status_code=404, detail="Nothing to reply to in this thread yet.")
+    conv = await db[CONVERSATIONS].find_one({"_id": ObjectId(conversation_id)})
+    return _agent_view(conv or {})
+
+
+@router.patch("/conversations/{conversation_id}/classification")
+async def correct_classification(
+    conversation_id: str,
+    intent: str = Body(..., embed=True),
+    urgency: Optional[str] = Body(None, embed=True),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    ok = await agent.record_correction(
+        db, brand_ctx.get("brand_id"), conversation_id, intent, urgency,
+        brand_ctx.get("user_id", ""))
+    if not ok:
+        raise HTTPException(status_code=400, detail="Unknown conversation or label.")
+    conv = await db[CONVERSATIONS].find_one({"_id": ObjectId(conversation_id)})
+    return _agent_view(conv or {})
