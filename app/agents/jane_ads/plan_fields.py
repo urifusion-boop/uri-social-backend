@@ -135,7 +135,11 @@ def describe(plan: CampaignPlan, req: CampaignRequest) -> list[dict[str, Any]]:
             "key": "interests", "label": "Interests and behaviours", "type": "list",
             "value": _interest_names(targeting),
             "editable": True, "max_items": MAX_INTERESTS,
-            "help": "Checked against Meta's own targeting catalogue when you save.",
+            # Advantage+ audience is on (as Ads Manager sets it), so the interests
+            # steer delivery rather than fence it.
+            "help": ("Where Meta starts looking — it may also reach similar people it "
+                     "expects to respond. Checked against Meta's targeting catalogue "
+                     "when you save."),
         },
         {
             "key": "gender", "label": "Gender", "type": "select",

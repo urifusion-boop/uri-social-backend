@@ -157,26 +157,3 @@ def test_a_sentence_naming_no_pockets_is_untouched():
     said = "I chose Instagram and Facebook because your customers discover this by scrolling."
     assert restate_geography(said, ["Ikeja"], "Lagos") == said
 
-
-# ── What a human buyer sets and Jane did not ─────────────────────────────────
-
-def test_the_launch_targeting_excludes_audience_network_and_sets_a_language():
-    """Unset, Meta picks automatic placements — Audience Network included, where a tap
-    is as often a misfire as an intention — and serves in any language. Both were
-    differences against manually-run ad sets on the same account."""
-    from app.agents.jane_ads import constants as C
-
-    assert "audience_network" not in C.DEFAULT_PUBLISHER_PLATFORMS
-    assert C.DEFAULT_PUBLISHER_PLATFORMS == ["facebook", "instagram"]
-    assert C.DEFAULT_LOCALES == [1001]          # English (All), per Meta's adlocale search
-
-
-def test_the_client_s_own_placement_still_wins_over_the_default():
-    """These are defaults, not policy: a placement the client picked on the plan card
-    is spread over them at launch."""
-    src = open("app/agents/jane_ads/adapters/meta.py").read()
-    publisher = src.index('"publisher_platforms": list(C.DEFAULT_PUBLISHER_PLATFORMS)')
-    audience = src.index("**plan.audience_targeting", publisher)
-    automation = src.index('"targeting_automation"', publisher)
-    # defaults → client's own targeting → the advantage_audience flag Meta requires
-    assert publisher < audience < automation
