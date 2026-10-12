@@ -274,7 +274,7 @@ def test_launch_campaign_creates_full_chain_and_stores_record():
     assert "page_welcome_message" in creative_spec["link_data"]
     assert creative_json["asset_feed_spec"]["optimization_type"] == "DOF_MESSAGING_DESTINATION"
     assert creative_json["degrees_of_freedom_spec"]["creative_features_spec"][
-        "standard_enhancements"] == {"enroll_status": "OPT_IN"}
+        "enhance_cta"] == {"enroll_status": "OPT_IN"}
     assert creative_json["contextual_multi_ads"] == {"enroll_status": "OPT_IN"}
     ad_json = mock_client.post.call_args_list[3].kwargs["json"]
     assert ad_json  # ad creation call still happens after creative
