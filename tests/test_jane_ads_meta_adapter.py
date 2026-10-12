@@ -1037,24 +1037,3 @@ def test_a_refused_optional_creative_piece_is_dropped_not_fatal():
     retried = mock_client.post.call_args_list[3].kwargs["json"]
     assert "instagram_user_id" not in retried["object_story_spec"]
     assert "asset_feed_spec" in retried          # only the first piece was shed
-
-
-def test_a_page_without_messaging_access_relaunches_as_the_whatsapp_only_ad():
-    """A client Page shared for ADVERTISE only can't carry a Messenger-destination ad
-    — Meta refuses the creative as a permission error however much is shed. That must
-    end as the WhatsApp-only ad that worked before, never a failed launch."""
-    refused = {"error": {"message": "Permission error", "code": 200, "error_subcode": 1487194}}
-    responses = [
-        {"id": "cmp_1"}, {"id": "adset_1"},          # multi-inbox ad set accepted
-        refused, refused, refused, refused, refused, refused,   # creative + 5 sheds refused
-        {"success": True},                           # rollback: the campaign (no creative exists)
-        {"id": "cmp_2"}, {"id": "adset_2"}, {"id": "creative_2"}, {"id": "ad_2"},
-    ]
-    with patch("httpx.AsyncClient") as MockClient:
-        mock_client = _mock_client(responses)
-        MockClient.return_value.__aenter__.return_value = mock_client
-        result = _run(_adapter().launch_campaign(_plan(), _auth()))
-    assert result.campaign_id == "cmp_2"
-    relaunch_adset = [c.kwargs["json"] for c in mock_client.post.call_args_list
-                      if c.kwargs.get("json", {}).get("campaign_id") == "cmp_2"][0]
-    assert relaunch_adset["destination_type"] == "WHATSAPP"

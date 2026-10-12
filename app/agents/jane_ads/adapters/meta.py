@@ -142,10 +142,6 @@ def _wants_multi_destination(destination_type, is_followers_goal: bool) -> bool:
             and destination_type in (DestinationType.WHATSAPP, DestinationType.INSTAGRAM_DM))
 
 
-class _MultiDestinationRefused(Exception):
-    """The multi-inbox creative could not be created for this Page, even stripped down."""
-
-
 # Words Meta uses when it refuses a messaging DESTINATION rather than the ad set.
 _ROUTING_WORDS = ("whatsapp", "instagram", "messenger", "destination", "messaging")
 
@@ -268,7 +264,7 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
         return video_id, thumbnail_url
 
     async def launch_campaign(
-        self, plan: CampaignPlan, auth: SpendAuthorization, *, _allow_multi: bool = True,
+        self, plan: CampaignPlan, auth: SpendAuthorization
     ) -> LaunchResult:
         meta_plans = [p for p in plan.platforms if p.platform == Platform.META]
         if not meta_plans:
@@ -373,8 +369,7 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
         use_native_whatsapp = want_native_whatsapp
         # Any campaign whose tap opens a chat gets the manual campaign's
         # multi-destination format first (see the ad set create below).
-        use_multi_destination = _allow_multi and _wants_multi_destination(
-            destination.type, is_followers_goal)
+        use_multi_destination = _wants_multi_destination(destination.type, is_followers_goal)
 
         campaign_id = ""
         adset_id = ""
@@ -733,9 +728,6 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                 if use_multi_destination and (creative_data.get("error") or {}).get("code") == 200:
                     creative_body, creative_data = await self._shed_refused_extras(
                         client, creative_body, creative_data)
-                if use_multi_destination and creative_data.get("error"):
-                    raise _MultiDestinationRefused(
-                        (creative_data.get("error") or {}).get("message") or "refused")
                 _raise_for_error(creative_data, "ad creative creation")
                 creative_id = creative_data["id"]
 
@@ -752,16 +744,6 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                 ad_data = ad_resp.json()
                 _raise_for_error(ad_data, "ad creation")
                 ad_id = ad_data["id"]
-        except _MultiDestinationRefused as e:
-            # The multi-inbox creative needs MESSAGING access to the Page, and a client
-            # Page shared with URI for ADVERTISE only does not grant it — Meta refuses
-            # the Messenger leg as a permission error even with every optional piece
-            # shed. Undo the partial launch and run the WhatsApp-only one that worked
-            # before, so a Page without messaging access is never a failed launch.
-            await self._rollback_partial_launch(campaign_id, creative_id)
-            print(f"[MetaAds] multi-inbox creative refused for page {plan.page_id} ({e}) — "
-                  f"relaunching as the WhatsApp-only ad", flush=True)
-            return await self.launch_campaign(plan, auth, _allow_multi=False)
         except Exception:
             await self._rollback_partial_launch(campaign_id, creative_id)
             raise
