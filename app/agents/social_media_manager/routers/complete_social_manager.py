@@ -155,7 +155,7 @@ class ContentGenerationRequest(BaseModel):
     # product cutout onto an AI-generated background instead of asking the AI to
     # redraw the product — see ImageContentService._generate_platform_image_composited.
     use_true_compositing: bool = False
-    num_slides: int = 3        # carousel only (2–5)
+    num_slides: int = 3        # carousel only (2–10; 10 is Instagram's carousel limit)
     acknowledged_incomplete_profile: bool = False  # OPTION 1: User acknowledged incomplete profile warning
     override_cta: Optional[str] = None  # One-time CTA for this generation only (not saved to brand playbook)
     style_override: Optional[List[str]] = None  # One-time visual style slug(s) for this generation only (not saved to brand playbook). Carousel: cycles per slide. Single post: uses the first slug.
@@ -390,11 +390,11 @@ async def generate_content(
     # Carousels bill 1 credit per slide, not the flat 1-credit-per-generation
     # rate everything else uses — computed once, up front, so the pre-check
     # below and the actual deduction later can't drift out of sync with each
-    # other (a UI-facing slide-count picker offers 2-5; the service layer
+    # other (a UI-facing slide-count picker offers 2-10; the service layer
     # itself clamps to 2-10, so mirror that wider bound here for whatever the
     # request actually carries).
     post_type = request.post_type or "feed"
-    num_slides = max(2, min(5, request.num_slides or 3)) if post_type == "carousel" else 1
+    num_slides = max(2, min(10, request.num_slides or 3)) if post_type == "carousel" else 1
     required_credits = num_slides if post_type == "carousel" else 1
 
     try:
@@ -604,7 +604,7 @@ async def generate_content(
             from ..services.carousel_generation_service import CarouselGenerationService
             # force_num_slides=True — this is the interactive "Create Post" flow
             # (ContentGeneratorForm.tsx), which always sends a real, deliberate
-            # value (2-5, defaulting to 3 if untouched — see num_slides above).
+            # value (2-10, defaulting to 3 if untouched — see num_slides above).
             # Without this flag, generate()'s own default value (also 3) is
             # indistinguishable from "user explicitly picked 3," so picking 3
             # silently fell through to content-based auto-detection instead —
