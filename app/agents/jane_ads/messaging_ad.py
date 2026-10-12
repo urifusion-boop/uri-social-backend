@@ -36,6 +36,12 @@ _INSTAGRAM_LINK = "https://www.instagram.com/"
 
 # Exactly the manual ad's set — opt-ins AND the explicit opt-outs, since an omitted
 # feature is not the same as one the manual ad declined.
+#
+# Minus "standard_enhancements". Ads Manager still SHOWS that bundle on the manual ad,
+# but the API refuses it outright ("Including standard enhancements field in creative
+# has been deprecated. Please choose to set individual features instead", subcode
+# 3858504 — caught on the first real launch). The individual features Ads Manager
+# expands it into are the ones listed here.
 DEGREES_OF_FREEDOM_SPEC = {
     "creative_features_spec": {
         "ads_with_benefits": {"enroll_status": "OPT_OUT"},
@@ -43,7 +49,6 @@ DEGREES_OF_FREEDOM_SPEC = {
         "enhance_cta": {"enroll_status": "OPT_IN"},
         "inline_comment": {"enroll_status": "OPT_IN"},
         "show_destination_blurbs": {"enroll_status": "OPT_IN"},
-        "standard_enhancements": {"enroll_status": "OPT_IN"},
         "text_optimizations": {"enroll_status": "OPT_OUT"},
         "video_auto_crop": {"enroll_status": "OPT_IN"},
         "video_filtering": {"enroll_status": "OPT_IN"},
