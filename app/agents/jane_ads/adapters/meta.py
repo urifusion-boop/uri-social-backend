@@ -719,6 +719,15 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                     json=creative_body,
                 )
                 creative_data = creative_resp.json()
+                # A permission refusal (code 200) on the manual-style creative means
+                # this account may not use one of its optional pieces — typically the
+                # Page's Instagram identity, which the ads system user is not always
+                # granted. Drop them one at a time, cheapest-to-lose first, and log
+                # exactly which one Meta refused, so the ad still launches as close to
+                # the manual campaign as this account allows.
+                if use_multi_destination and (creative_data.get("error") or {}).get("code") == 200:
+                    creative_body, creative_data = await self._shed_refused_extras(
+                        client, creative_body, creative_data)
                 _raise_for_error(creative_data, "ad creative creation")
                 creative_id = creative_data["id"]
 
@@ -774,6 +783,37 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
             platforms=[Platform.META],
             launched=True,
         )
+
+    async def _shed_refused_extras(self, client, body: dict, data: dict) -> tuple[dict, dict]:
+        """Retry the creative without each optional piece in turn; first success wins."""
+        def without(b: dict, piece: str) -> dict:
+            b = json.loads(json.dumps(b))
+            story = b.get("object_story_spec") or {}
+            if piece == "instagram_user_id":
+                story.pop("instagram_user_id", None)
+            elif piece == "page_welcome_message":
+                for leg in ("link_data", "video_data"):
+                    (story.get(leg) or {}).pop("page_welcome_message", None)
+            else:
+                b.pop(piece, None)
+            return b
+
+        trimmed = body
+        for piece in ("instagram_user_id", "contextual_multi_ads",
+                      "degrees_of_freedom_spec", "page_welcome_message", "asset_feed_spec"):
+            trimmed = without(trimmed, piece)
+            resp = await client.post(
+                f"{self._graph_base}/act_{self._ad_account_id}/adcreatives",
+                params={"access_token": self._access_token}, json=trimmed,
+            )
+            attempt = resp.json()
+            if not attempt.get("error"):
+                print(f"[MetaAds] creative accepted after dropping up to {piece!r} — "
+                      f"Meta refused it for this account: {(data.get('error') or {}).get('message')}",
+                      flush=True)
+                return trimmed, attempt
+            data = attempt
+        return trimmed, data
 
     async def _instagram_ids(self, page_id: str) -> dict:
         """The Page's Instagram business id and LEGACY id, or {} if unknowable.
