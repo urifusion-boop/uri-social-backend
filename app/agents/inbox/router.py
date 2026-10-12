@@ -459,6 +459,7 @@ async def regenerate_suggestion(
         raise HTTPException(status_code=503, detail="Couldn't draft a reply right now. Try again.")
     if not result:
         raise HTTPException(status_code=404, detail="Nothing to reply to in this thread yet.")
+    await agent.explain(db, brand_ctx.get("brand_id"), result)
     conv = await db[CONVERSATIONS].find_one({"_id": ObjectId(conversation_id)})
     return _agent_view(conv or {})
 
