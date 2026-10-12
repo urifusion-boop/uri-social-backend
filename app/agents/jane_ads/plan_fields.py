@@ -187,9 +187,14 @@ def describe(plan: CampaignPlan, req: CampaignRequest) -> list[dict[str, Any]]:
             "key": "interests", "label": "Interests and behaviours", "type": "list",
             "value": _interest_names(targeting),
             "editable": True, "max_items": MAX_INTERESTS,
+            # Advantage+ audience is on for Meta (as Ads Manager sets it), so there
+            # the interests steer delivery rather than fence it — saying they are the
+            # exact audience would be the card overstating what Meta will do.
             "help": ("Checked against TikTok's own targeting catalogue when you save."
                      if is_tiktok else
-                     "Checked against Meta's own targeting catalogue when you save."),
+                     "Where Meta starts looking — it may also reach similar people it "
+                     "expects to respond. Checked against Meta's targeting catalogue "
+                     "when you save."),
         },
     ]
     if not is_tiktok:
