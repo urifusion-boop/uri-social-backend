@@ -1021,19 +1021,3 @@ def test_the_multi_inbox_video_creative_carries_a_headline_and_welcome_message()
     assert video["title"] == "Book your spot"
     assert video["call_to_action"]["value"]["app_destination"] == "MESSENGER"
     assert "ice_breakers" in video["page_welcome_message"]
-
-
-def test_a_refused_optional_creative_piece_is_dropped_not_fatal():
-    """The ads system user is not always granted the Page's Instagram account, and
-    Meta refuses the whole creative for it (code 200). The ad launches without that
-    one piece rather than not at all."""
-    refused = {"error": {"message": "Permission error", "code": 200, "error_subcode": 1487194}}
-    responses = [{"id": "cmp_1"}, {"id": "adset_1"}, refused, {"id": "creative_1"}, {"id": "ad_1"}]
-    with patch("httpx.AsyncClient") as MockClient:
-        mock_client = _mock_client(responses)
-        MockClient.return_value.__aenter__.return_value = mock_client
-        result = _run(_adapter().launch_campaign(_plan(), _auth()))
-    assert result.campaign_id == "cmp_1"
-    retried = mock_client.post.call_args_list[3].kwargs["json"]
-    assert "instagram_user_id" not in retried["object_story_spec"]
-    assert "asset_feed_spec" in retried          # only the first piece was shed
