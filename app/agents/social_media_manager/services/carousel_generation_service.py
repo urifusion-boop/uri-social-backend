@@ -195,7 +195,9 @@ This is a {content_analysis['type'].upper()} carousel. Build a cohesive narrativ
                     {"role": "user", "content": user_prompt},
                 ],
                 temperature=0.75,
-                max_tokens=800,
+                # Scale with slide count: a fixed 800 can cut the JSON off mid-way
+                # on 8-10 slide carousels, which then fails json.loads.
+                max_tokens=max(800, 200 + 150 * num_slides),
                 response_format={"type": "json_object"},
             )
             raw = response.choices[0].message.content or "{}"

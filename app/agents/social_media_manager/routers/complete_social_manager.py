@@ -215,7 +215,7 @@ class ContentGenerationRequest(BaseModel):
     # product cutout onto an AI-generated background instead of asking the AI to
     # redraw the product — see ImageContentService._generate_platform_image_composited.
     use_true_compositing: bool = False
-    num_slides: int = 3        # carousel only (2–5)
+    num_slides: int = 3        # carousel only (2–10; 10 is Instagram's carousel limit)
     acknowledged_incomplete_profile: bool = False  # OPTION 1: User acknowledged incomplete profile warning
     override_cta: Optional[str] = None  # One-time CTA for this generation only (not saved to brand playbook)
     style_override: Optional[List[str]] = None  # One-time visual style slug(s) for this generation only (not saved to brand playbook). Carousel: cycles per slide. Single post: uses the first slug.
@@ -548,7 +548,7 @@ async def generate_content(
             brand_context_dict = {**brand_context_dict, **overrides}
 
         post_type = request.post_type or "feed"
-        num_slides = max(2, min(5, request.num_slides or 3))
+        num_slides = max(2, min(10, request.num_slides or 3))
 
         # ── Reference images: normalise to a list, keep old single-image field working ──
         ref_images: List[str] = request.reference_images or (
@@ -597,7 +597,7 @@ async def generate_content(
             from ..services.carousel_generation_service import CarouselGenerationService
             # force_num_slides=True — this is the interactive "Create Post" flow
             # (ContentGeneratorForm.tsx), which always sends a real, deliberate
-            # value (2-5, defaulting to 3 if untouched — see num_slides above).
+            # value (2-10, defaulting to 3 if untouched — see num_slides above).
             # Without this flag, generate()'s own default value (also 3) is
             # indistinguishable from "user explicitly picked 3," so picking 3
             # silently fell through to content-based auto-detection instead —
