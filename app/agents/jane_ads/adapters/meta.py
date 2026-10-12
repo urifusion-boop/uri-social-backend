@@ -159,6 +159,33 @@ def _is_routing_refusal(error: dict) -> bool:
 _CITY_RADIUS = {"radius": 25, "distance_unit": "mile"}
 
 
+def _advantage_age(targeting: dict) -> dict:
+    """The client's age range, expressed the way Advantage+ audience accepts it.
+
+    With Advantage+ audience on, Meta rejects a hard maximum age below 65 ("You can add
+    a lower maximum age as a suggestion instead", subcode 1870189) and caps a hard
+    minimum at 25. The manual campaign on the account shows the shape it wants: hard
+    age_min/age_max as the outer fence, and the intended range in age_range, which
+    Meta treats as the suggestion it starts from. The client's choice is kept intact
+    there — it still drives delivery, it just is not a wall.
+    """
+    # An age_range already present IS the client's choice — a live ad set read back
+    # from Meta, or an age edit that set it explicitly (live_edit). Only the hard
+    # fences are derived from it; re-deriving the range from the fences would replace
+    # "23-55" with "23-65" every time an unrelated field was edited.
+    if targeting.get("age_range"):
+        lo, hi = (int(v) for v in targeting["age_range"])
+    else:
+        lo, hi = targeting.get("age_min"), targeting.get("age_max")
+        if lo is None and hi is None:
+            return targeting
+        lo, hi = int(lo or 18), int(hi or 65)
+    return {**targeting,
+            "age_min": min(lo, 25),
+            "age_max": 65,
+            "age_range": [lo, hi]}
+
+
 def _with_city_radius(targeting: dict) -> dict:
     geo = (targeting or {}).get("geo_locations") or {}
     cities = geo.get("cities")
@@ -403,7 +430,7 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                     # Placements and language are left to Meta, as on the manual ad set.
                     # They were briefly forced to Facebook+Instagram and English, which
                     # moved Jane AWAY from the campaign that worked — it has neither.
-                    "targeting": _with_city_radius({
+                    "targeting": _advantage_age(_with_city_radius({
                         **(await meta_targeting_from_geo_named(
                             plan.geo,
                             region=(plan.geo.city if plan.geo else ""),
@@ -414,7 +441,7 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
                         "user_age_unknown": False,
                         "targeting_automation": {"advantage_audience": 1,
                                                  "individual_setting": {"geo": 1}},
-                    }),
+                    })),
                     "regional_regulated_categories": ["VOLUNTARY_VERIFICATION"],
                     "status": "PAUSED",
                     "start_time": start_time.isoformat(),
@@ -1120,6 +1147,9 @@ class MetaAdPlatformAdapter(AdPlatformAdapter):
         are both rejected, unlike the creative endpoint which ignores the Instagram
         identity entirely.
         """
+        # A live Advantage+ ad set takes age only as a suggestion (see _advantage_age).
+        if ((targeting.get("targeting_automation") or {}).get("advantage_audience") == 1):
+            targeting = _advantage_age(targeting)
         payload = {"targeting": json.dumps(targeting),
                    "access_token": self._access_token}
         if validate_only:
