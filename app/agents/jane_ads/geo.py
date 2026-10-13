@@ -385,6 +385,42 @@ def whole_area_request(text: str) -> str:
     return ""
 
 
+# A reply that is nothing but a state or major city. Asked "which city?", a client
+# answers "Lagos" — not "all of Lagos" — and Jane took that as a cue to ask which
+# pockets inside it, every time. Live-reported. Only a WHOLE reply counts: "Lagos" in a
+# sentence is still read by the consultant, and a neighbourhood ("Ikeja") is a pocket.
+_NG_REGIONS = {
+    "abia", "adamawa", "akwa ibom", "anambra", "bauchi", "bayelsa", "benue", "borno",
+    "cross river", "delta", "ebonyi", "edo", "ekiti", "enugu", "gombe", "imo", "jigawa",
+    "kaduna", "kano", "katsina", "kebbi", "kogi", "kwara", "lagos", "nasarawa", "niger",
+    "ogun", "ondo", "osun", "oyo", "plateau", "rivers", "sokoto", "taraba", "yobe",
+    "zamfara", "abuja", "fct", "port harcourt", "ibadan", "benin", "benin city", "warri",
+    "uyo", "calabar", "abeokuta", "ilorin", "jos", "owerri", "onitsha", "akure", "asaba",
+}
+_REGION_ALIASES = {"fct": "Abuja", "benin city": "Benin City"}
+_REPLY_PADDING = {"in", "just", "only", "the", "state", "city", "metropolis"}
+
+
+def bare_place_answer(text: str) -> str:
+    """The state or major city a reply consists of, or "" — see _NG_REGIONS."""
+    raw = re.sub(r"[^a-z\s'-]", " ", (text or "").lower().replace("\u2019", "'"))
+    words = [w for w in raw.split() if w not in _FILLER]
+    while words and words[0] in _REPLY_PADDING:
+        words.pop(0)
+    while words and words[-1] in _REPLY_PADDING:
+        words.pop()
+    name = " ".join(words)
+    if name not in _NG_REGIONS:
+        return ""
+    return _REGION_ALIASES.get(name, name.title())
+
+
+def whole_area_answer(text: str) -> str:
+    """A client reply that settles the geography as one whole area: "all of Lagos",
+    "Lagos statewide", or just "Lagos"."""
+    return whole_area_request(text) or bare_place_answer(text)
+
+
 def whole_area_plan(area: str, mode: GeoMode = GeoMode.WATERING_HOLE) -> GeoPlan:
     """Cover the whole of one named area, because the client asked to.
 

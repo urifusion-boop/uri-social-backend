@@ -6,6 +6,8 @@ The critical property: NEVER pin a place that can't be validated.
 """
 import asyncio
 
+import pytest
+
 from app.agents.jane_ads.geo import (
     StaticGeocoder,
     StaticPinProposer,
@@ -259,3 +261,23 @@ def test_trailing_politeness_is_not_part_of_the_place_name():
 def test_prose_inside_a_longer_message_is_still_not_a_request():
     assert whole_area_request("I spent all of my budget in Lagos") == ""
     assert whole_area_request("all of our customers in Lagos are students") == ""
+
+
+# ── A bare city is a whole-area answer ────────────────────────────────────────
+
+@pytest.mark.parametrize("reply,area", [
+    ("Lagos", "Lagos"), ("lagos state", "Lagos"), ("Lagos.", "Lagos"),
+    ("just Abuja please", "Abuja"), ("FCT", "Abuja"), ("port harcourt", "Port Harcourt"),
+    ("in Rivers", "Rivers"),
+])
+def test_a_reply_that_is_only_a_city_settles_the_geography(reply, area):
+    from app.agents.jane_ads.geo import whole_area_answer
+    assert whole_area_answer(reply) == area
+
+
+@pytest.mark.parametrize("reply", [
+    "Ikeja", "I sell shoes in Lagos", "Lagos and Abuja", "5500", "Lekki and Yaba",
+])
+def test_a_pocket_or_a_sentence_is_not_a_whole_area_answer(reply):
+    from app.agents.jane_ads.geo import whole_area_answer
+    assert whole_area_answer(reply) == ""
