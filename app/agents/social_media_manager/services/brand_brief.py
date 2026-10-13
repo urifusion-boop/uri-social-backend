@@ -102,16 +102,14 @@ def languages_rule(bc: Optional[Dict[str, Any]]) -> Optional[str]:
     if len(langs) == 1:
         return f"Write in {langs[0]} — the whole piece, not English."
     others = ", ".join(langs[1:])
-    # "Naturally mix in" alone was ignored: on dev, nine pieces in a row came
-    # back in plain English. It has to be a requirement the model can check.
-    return (f"Languages: {', '.join(langs)}. Write mainly in {langs[0]} and naturally mix in "
-            f"{others} the way this audience actually speaks — not a translation, a natural blend. "
-            f"REQUIRED: every piece must contain at least one genuine {others} phrase or sentence; "
-            f"a piece written only in {langs[0]} is wrong. "
-            # Seen on dev once the requirement was added: whole captions came back
-            # in Pidgin. The first language stays the main one.
-            f"{langs[0]} stays the main language: most sentences are in {langs[0]}, "
-            f"with {others} in a few natural phrases — never the whole piece.")
+    # Two failures seen on dev, in order. "Naturally mix in" alone was ignored:
+    # nine pieces in a row came back in plain English. Once it was made a
+    # requirement, whole captions came back in Pidgin. So both ends are stated.
+    return (f"Languages: {', '.join(langs)}. Write in {langs[0]} with a light, natural touch of {others}, "
+            f"the way this audience actually speaks — not a translation. "
+            f"REQUIRED: at least one genuine {others} phrase or sentence in every piece; a piece written only "
+            f"in {langs[0]} is wrong. LIMIT: {langs[0]} stays the main language — at most about one sentence "
+            f"in four carries any {others}; a piece written mostly in {others} is just as wrong.")
 
 
 def hard_rules(bc: Optional[Dict[str, Any]], captions: bool = False, language: bool = True) -> List[str]:
@@ -246,6 +244,27 @@ def missing_languages(text: str, bc: Optional[Dict[str, Any]]) -> List[str]:
     return missing
 
 
+def overused_languages(text: str, bc: Optional[Dict[str, Any]]) -> List[str]:
+    """Secondary languages that have taken the piece over: the brand asked for
+    a blend with its first language as the main one, not a piece written in the
+    second. Counted by sentence, and only for pieces long enough to judge."""
+    langs = _list((bc or {}).get("languages"))
+    if len(langs) < 2:
+        return []
+    sentences = [x for x in re.split(r"(?<=[.!?])\s+|\n+", (text or "").lower()) if len(x.split()) >= 3]
+    if len(sentences) < 4:
+        return []
+    over = []
+    for lang in langs[1:]:
+        key = next((k for k in _LANGUAGE_MARKERS if k in lang.lower()), None)
+        if not key:
+            continue
+        hits = sum(1 for x in sentences if re.search(_LANGUAGE_MARKERS[key], x))
+        if hits / len(sentences) > 0.5:
+            over.append(lang)
+    return over
+
+
 _STATISTIC = re.compile(
     r"(\d+(?:[.,]\d+)?)\s?(?:%|percent\b|per cent\b)"
     r"|\b(\d+)\s+(?:out of|in every|in)\s+(\d+)\b"
@@ -283,8 +302,12 @@ def audit(text: str, bc: Optional[Dict[str, Any]], sources: str = "") -> List[Di
     langs = _list(bc.get("languages"))
     for lang in missing_languages(text, bc):
         issues.append({"code": "missing_language", "detail": lang,
-                       "fix": f"Work in at least one natural {lang} phrase or sentence — this brand writes in "
-                              f"{' + '.join(langs)}, the way its audience actually speaks."})
+                       "fix": f"Add ONE short, natural {lang} phrase (a few words) — this brand's audience mixes "
+                              f"{' and '.join(langs)}. Keep every other sentence in {langs[0]}."})
+    for lang in overused_languages(text, bc):
+        issues.append({"code": "language_overused", "detail": lang,
+                       "fix": f"Too much {lang}: {langs[0]} is this brand's main language. Rewrite it in "
+                              f"{langs[0]} and keep {lang} to one or two short phrases."})
     if not has_cta(text, bc):
         cta = ctas(bc)[0]
         issues.append({"code": "missing_cta", "detail": cta,
