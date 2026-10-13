@@ -91,6 +91,71 @@ class LowClicksWarning(Exception):
         self.estimated_clicks_per_day = estimated_clicks_per_day
 
 
+_FILLER_HEADLINES = ("Chat With Us On WhatsApp", "Get A Quick Reply Today", "Message Us Now")
+_FILLER_DESCRIPTIONS = ("Message us on WhatsApp to get started today.",
+                        "Friendly, fast replies. Tell us what you need and we will help.")
+
+
+def _fit(text: str, limit: int) -> str:
+    """Trim to Google's limit on a word boundary, never mid-word."""
+    text = " ".join(str(text or "").split())
+    if len(text) <= limit:
+        return text
+    cut = text[:limit + 1].rsplit(" ", 1)[0].rstrip(" ,.;:-")
+    return cut or text[:limit]
+
+
+def rsa_assets(headlines: list, descriptions: list, keywords: dict) -> tuple:
+    """Headlines and descriptions Google will accept for a Responsive Search Ad:
+    at least 3 headlines (max 30 characters each) and 2 descriptions (max 90),
+    all different. One headline and one description used to be sent whenever
+    Jane had written the ad, which Google rejects outright. Jane's own lines
+    stay first; the rest are filled from the keywords, then from neutral lines."""
+    def unique(items, limit):
+        out, seen = [], set()
+        for item in items:
+            text = _fit(item, limit)
+            if text and text.lower() not in seen:
+                seen.add(text.lower())
+                out.append(text)
+        return out
+
+    terms = [t.title() for t in (keywords.get("head_terms") or []) + (keywords.get("geo_terms") or [])]
+    heads = unique(list(headlines) + terms + list(_FILLER_HEADLINES), 30)[:15]
+    descs = unique(list(descriptions) + list(_FILLER_DESCRIPTIONS), 90)[:4]
+    return heads, descs
+
+
+def budget_micros(daily_budget_ngn: float, currency_code: str) -> str:
+    """The daily budget in the ACCOUNT's currency, as Google's micros string.
+
+    Plans are in naira; Google reads amountMicros in whatever currency the Ads
+    account is set to. This used to send the naira figure as-is, so a ₦20,000
+    a day plan on a US-dollar account would have been created as $20,000 a day
+    (found when the first real account linked on dev turned out to be USD).
+    NGN passes through, USD converts at constants.USD_TO_NGN, and any other or
+    unknown currency refuses to launch — there is no safe guess with money.
+    Rounded to whole cents/kobo, as Google requires."""
+    currency = (currency_code or "").upper()
+    if currency == "NGN":
+        amount = daily_budget_ngn
+    elif currency == "USD":
+        amount = daily_budget_ngn / C.USD_TO_NGN
+    elif not currency:
+        raise GoogleAdsAPIError(
+            "The Google Ads account's currency isn't known yet, so a budget can't be set safely. "
+            "Press Check again on the Google Ads connection, then retry."
+        )
+    else:
+        raise GoogleAdsAPIError(
+            f"This Google Ads account is in {currency}. Budgets can only be set on NGN or USD accounts for now."
+        )
+    cents = int(round(amount * 100))
+    if cents < 1:
+        raise GoogleAdsAPIError("That daily budget is too small for this Google Ads account's currency.")
+    return str(cents * 10_000)
+
+
 def _raise_for_error(data: dict, context: str) -> None:
     if "error" in data:
         err = data["error"]
@@ -230,11 +295,15 @@ class GoogleAdsAdapter(AdPlatformAdapter):
         customer_id: str,
         login_customer_id: str,
         access_token: str,
+        currency_code: str = "",
     ) -> None:
         self._db = db
         self._customer_id = customer_id
         self._login_customer_id = login_customer_id
         self._access_token = access_token
+        # The Ads account's own currency (from the connection, read from Google
+        # when the link is checked). Budgets are sent in THIS currency.
+        self._currency_code = (currency_code or "").upper()
         self._api_base = f"https://googleads.googleapis.com/{settings.GOOGLE_ADS_API_VERSION}"
         if not self._customer_id:
             raise GoogleAdsAPIError("customer_id is required — resolve via resolve_customer_id_for_launch()")
@@ -305,7 +374,7 @@ class GoogleAdsAdapter(AdPlatformAdapter):
                     headers=self._headers(),
                     json={"operations": [{"create": {
                         "name": f"JaneAds-{plan.business_id}-budget-{uuid.uuid4().hex[:8]}",
-                        "amountMicros": str(int(daily_budget_ngn * 1_000_000)),
+                        "amountMicros": budget_micros(daily_budget_ngn, self._currency_code),
                         "deliveryMethod": "STANDARD",
                     }}]},
                 )
@@ -398,6 +467,7 @@ class GoogleAdsAdapter(AdPlatformAdapter):
                 else:
                     headlines = [t.title() for t in (keywords.get("head_terms") or ["Chat With Us"])[:3]]
                     descriptions = ["Message us on WhatsApp to get started today."]
+                headlines, descriptions = rsa_assets(headlines, descriptions, keywords)
                 ad_resp = await client.post(
                     f"{self._api_base}/customers/{self._customer_id}/adGroupAds:mutate",
                     headers=self._headers(),
@@ -407,8 +477,8 @@ class GoogleAdsAdapter(AdPlatformAdapter):
                         "ad": {
                             "finalUrls": [dest_link],
                             "responsiveSearchAd": {
-                                "headlines": [{"text": h[:30]} for h in headlines],
-                                "descriptions": [{"text": d[:90]} for d in descriptions],
+                                "headlines": [{"text": h} for h in headlines],
+                                "descriptions": [{"text": d} for d in descriptions],
                             },
                         },
                     }}]},

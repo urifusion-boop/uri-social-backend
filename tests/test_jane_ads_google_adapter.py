@@ -104,7 +104,8 @@ def _mock_client(responses):
 
 
 def _adapter(db=None) -> GoogleAdsAdapter:
-    return GoogleAdsAdapter(db or FakeDb(), customer_id="1234567890", login_customer_id="9999999999", access_token="tok")
+    return GoogleAdsAdapter(db or FakeDb(), customer_id="1234567890", login_customer_id="9999999999",
+                            access_token="tok", currency_code="NGN")
 
 
 _KEYWORD_SET = {
@@ -269,7 +270,8 @@ def test_launch_campaign_with_creative_uses_its_headline():
         _run(adapter.launch_campaign(plan, _auth()))
     ad_json = mock_client.post.call_args_list[5].kwargs["json"]["operations"][0]["create"]
     headlines = [h["text"] for h in ad_json["ad"]["responsiveSearchAd"]["headlines"]]
-    assert headlines == ["Fast Plumbing Fixes"]
+    # Jane's own headline leads; Google needs at least three, so the rest are filled in.
+    assert headlines[0] == "Fast Plumbing Fixes" and len(headlines) >= 3
 
 
 def test_launch_campaign_raises_low_clicks_warning_before_any_http_call():
