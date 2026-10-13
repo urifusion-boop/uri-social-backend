@@ -97,6 +97,7 @@ class CreditService:
         low_credit_warning = wallet.credits_remaining <= 3
 
         return CreditBalanceResponse(
+            has_had_plan=bool(wallet.subscription_tier) or await self.has_had_plan(user_id),
             total_credits=wallet.total_credits,
             credits_used=wallet.credits_used,
             credits_remaining=wallet.credits_remaining,
@@ -107,6 +108,17 @@ class CreditService:
             next_renewal=wallet.next_renewal,
             low_credit_warning=low_credit_warning
         )
+
+    async def has_had_plan(self, user_id: str) -> bool:
+        """Has this user ever had a plan or bought credits — a subscription,
+        a credit purchase or bonus, or a redeemed access code? A trial alone
+        doesn't count. (An access-code plan ends when its credits run out, so
+        the wallet's current tier alone can't answer this.)"""
+        if await self.credit_transactions_collection.find_one(
+            {"user_id": user_id, "type": {"$in": ["allocation", "bonus"]}}, {"_id": 1}
+        ):
+            return True
+        return bool(await self.db["access_code_redemptions"].find_one({"user_id": user_id}, {"_id": 1}))
 
     async def create_wallet(
         self,
