@@ -75,7 +75,7 @@ class TestLanguages:
 
     def test_first_language_leads_others_mixed_in(self):
         block = build({"brand_name": "B", "languages": ["English", "Pidgin"]})
-        assert "Write mainly in English and naturally mix in Pidgin" in block
+        assert "Write in English with a light, natural touch of Pidgin" in block
 
 
 class TestCarouselsGetFullPlaybook:
