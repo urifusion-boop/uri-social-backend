@@ -579,10 +579,10 @@ class GoogleAdsAdapter(AdPlatformAdapter):
                 resp = await client.post(
                     f"{self._api_base}/customers/{self._customer_id}/campaigns:mutate",
                     headers=self._headers(),
-                    json={"operations": [{
-                        "update": {"resourceName": campaign_resource_name, "status": "REMOVED"},
-                        "updateMask": "status",
-                    }]},
+                    # A real "remove" operation. Setting status=REMOVED through an
+                    # update is rejected by Google (INVALID_ENUM_VALUE, seen live), so
+                    # this rollback never actually removed anything before.
+                    json={"operations": [{"remove": campaign_resource_name}]},
                 )
                 data = resp.json()
                 if "error" in data:
@@ -590,6 +590,7 @@ class GoogleAdsAdapter(AdPlatformAdapter):
                           f"rollback rejected: {data['error'].get('message')}", flush=True)
                 else:
                     print(f"[GoogleAdsAdapter] rolled back partial launch: removed {campaign_resource_name}", flush=True)
+                    await self._remove_budget(budget_resource_name)
         except Exception as e:
             print(f"[GoogleAdsAdapter] ORPHANED campaign {campaign_resource_name} — rollback failed: {e}", flush=True)
 
@@ -682,8 +683,7 @@ class GoogleAdsAdapter(AdPlatformAdapter):
             resp = await client.post(
                 f"{self._api_base}/customers/{self._customer_id}/campaigns:mutate",
                 headers=self._headers(),
-                json={"operations": [{"update": {"resourceName": resource, "status": "REMOVED"},
-                                      "updateMask": "status"}]},
+                json={"operations": [{"remove": resource}]},
             )
         _raise_for_error(resp.json(), "remove campaign")
         await self._remove_budget(info.get("budget_resource") or "")
