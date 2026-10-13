@@ -126,6 +126,20 @@ def rsa_assets(headlines: list, descriptions: list, keywords: dict) -> tuple:
     return heads, descs
 
 
+def to_ngn(amount: float, currency_code: str) -> float:
+    """An amount in the Ads account's currency, in naira. NGN passes through,
+    USD converts at constants.USD_TO_NGN; anything else is logged loudly and
+    returned as-is (no safe guess without a live FX source)."""
+    currency = (currency_code or "").upper()
+    if currency in ("", "NGN"):
+        return amount
+    if currency == "USD":
+        return amount * C.USD_TO_NGN
+    print(f"[GoogleAdsAdapter] unhandled account currency {currency!r} — "
+          f"returning un-converted amount, verify manually", flush=True)
+    return amount
+
+
 def budget_micros(daily_budget_ngn: float, currency_code: str) -> str:
     """The daily budget in the ACCOUNT's currency, as Google's micros string.
 
@@ -598,6 +612,87 @@ class GoogleAdsAdapter(AdPlatformAdapter):
         _raise_for_error(data, "GAQL search")
         return data.get("results", [])
 
+    async def describe_campaign(self, campaign_id: str) -> dict:
+        """What Google actually holds for a campaign we created: status, daily
+        budget (in the account's currency and in naira), the ad and its status,
+        keywords and location targeting. For verifying a launch end to end."""
+        cid = "".join(ch for ch in str(campaign_id) if ch.isdigit())
+        camp = await self._gaql_search(
+            "SELECT campaign.id, campaign.name, campaign.status, campaign.advertising_channel_type, "
+            "campaign.campaign_budget, campaign_budget.amount_micros, customer.currency_code, "
+            f"metrics.clicks, metrics.impressions, metrics.cost_micros FROM campaign WHERE campaign.id = {cid}"
+        )
+        if not camp:
+            raise GoogleAdsAPIError(f"campaign {cid} was not found in this Google Ads account")
+        row = camp[0]
+        currency = row.get("customer", {}).get("currencyCode", "") or self._currency_code
+        daily = float(row.get("campaignBudget", {}).get("amountMicros", 0)) / 1_000_000
+        ads = await self._gaql_search(
+            "SELECT ad_group.status, ad_group_ad.status, ad_group_ad.ad.id, ad_group_ad.ad.final_urls, "
+            "ad_group_ad.ad.responsive_search_ad.headlines, ad_group_ad.ad.responsive_search_ad.descriptions, "
+            f"ad_group_ad.policy_summary.approval_status FROM ad_group_ad WHERE campaign.id = {cid}"
+        )
+        kws = await self._gaql_search(
+            "SELECT ad_group_criterion.keyword.text, ad_group_criterion.keyword.match_type, "
+            f"ad_group_criterion.negative FROM ad_group_criterion WHERE campaign.id = {cid} "
+            "AND ad_group_criterion.type = 'KEYWORD'"
+        )
+        geo = await self._gaql_search(
+            "SELECT campaign_criterion.location.geo_target_constant, campaign_criterion.negative "
+            f"FROM campaign_criterion WHERE campaign.id = {cid} AND campaign_criterion.type = 'LOCATION'"
+        )
+        ad_list = []
+        for a in ads:
+            ad = a.get("adGroupAd", {})
+            rsa = ad.get("ad", {}).get("responsiveSearchAd", {})
+            ad_list.append({
+                "ad_id": ad.get("ad", {}).get("id"),
+                "status": ad.get("status"),
+                "ad_group_status": a.get("adGroup", {}).get("status"),
+                "approval": (ad.get("policySummary") or {}).get("approvalStatus"),
+                "final_urls": ad.get("ad", {}).get("finalUrls") or [],
+                "headlines": [h.get("text") for h in rsa.get("headlines") or []],
+                "descriptions": [d.get("text") for d in rsa.get("descriptions") or []],
+            })
+        keywords = [k.get("adGroupCriterion", {}) for k in kws]
+        return {
+            "campaign_id": cid,
+            "name": row.get("campaign", {}).get("name"),
+            "status": row.get("campaign", {}).get("status"),
+            "channel": row.get("campaign", {}).get("advertisingChannelType"),
+            "budget_resource": row.get("campaign", {}).get("campaignBudget"),
+            "currency_code": currency,
+            "daily_budget": daily,
+            "daily_budget_ngn": round(to_ngn(daily, currency), 2),
+            "clicks": int(row.get("metrics", {}).get("clicks", 0)),
+            "impressions": int(row.get("metrics", {}).get("impressions", 0)),
+            "spend_ngn": round(to_ngn(float(row.get("metrics", {}).get("costMicros", 0)) / 1_000_000, currency), 2),
+            "ads": ad_list,
+            "keywords": [k.get("keyword", {}).get("text") for k in keywords if not k.get("negative")],
+            "negative_keywords": [k.get("keyword", {}).get("text") for k in keywords if k.get("negative")],
+            "locations": [g.get("campaignCriterion", {}).get("location", {}).get("geoTargetConstant") for g in geo],
+        }
+
+    async def remove_campaign(self, campaign_id: str) -> dict:
+        """Remove a campaign we created (Google's REMOVED status — it cascades to
+        the ad group and ads) and the budget it used."""
+        info = await self.describe_campaign(campaign_id)
+        resource = f"customers/{self._customer_id}/campaigns/{info['campaign_id']}"
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.post(
+                f"{self._api_base}/customers/{self._customer_id}/campaigns:mutate",
+                headers=self._headers(),
+                json={"operations": [{"update": {"resourceName": resource, "status": "REMOVED"},
+                                      "updateMask": "status"}]},
+            )
+        _raise_for_error(resp.json(), "remove campaign")
+        await self._remove_budget(info.get("budget_resource") or "")
+        await self._db[COLLECTION].update_one(
+            {"campaign_id": info["campaign_id"]},
+            {"$set": {"removed_at": datetime.now(timezone.utc)}},
+        )
+        return {"removed": True, "campaign_id": info["campaign_id"]}
+
     async def fetch_per_ad_spend(self, campaign_id: str) -> list[PerAdSpend]:
         """Current CUMULATIVE spend per ad (matches the interface contract). Reads the
         account's own currency rather than assuming NGN — converts via
@@ -616,14 +711,7 @@ class GoogleAdsAdapter(AdPlatformAdapter):
             )]
 
         def _to_ngn(cost_micros: float, currency: str) -> float:
-            amount = cost_micros / 1_000_000
-            if currency in ("", "NGN"):
-                return amount
-            if currency == "USD":
-                return amount * C.USD_TO_NGN
-            print(f"[GoogleAdsAdapter] unhandled account currency {currency!r} — "
-                  f"returning un-converted amount, verify manually", flush=True)
-            return amount
+            return to_ngn(cost_micros / 1_000_000, currency or self._currency_code)
 
         return [
             PerAdSpend(
@@ -650,7 +738,8 @@ class GoogleAdsAdapter(AdPlatformAdapter):
         out of scope here; this method only produces the event."""
         record = await self._get_campaign_record(campaign_id)
         rows = await self._gaql_search(
-            f"SELECT metrics.clicks, metrics.cost_micros FROM campaign WHERE campaign.id = {campaign_id}"
+            f"SELECT metrics.clicks, metrics.cost_micros, customer.currency_code "
+            f"FROM campaign WHERE campaign.id = {campaign_id}"
         )
         if not rows:
             return []
@@ -668,7 +757,10 @@ class GoogleAdsAdapter(AdPlatformAdapter):
             {"$set": {"last_click_count": total_clicks}},
         )
 
-        spend_ngn = cost_micros / 1_000_000
+        # Google reports cost in the ACCOUNT's currency. This used to be read as
+        # naira, so a $0.50 click on a dollar account was charged as ₦0.50.
+        currency = row.get("customer", {}).get("currencyCode", "") or self._currency_code
+        spend_ngn = to_ngn(cost_micros / 1_000_000, currency)
         cost_per_click = (spend_ngn / total_clicks) if total_clicks else 0.0
         now = datetime.now(timezone.utc)
         return [
