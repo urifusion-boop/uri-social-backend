@@ -251,8 +251,15 @@ Write one caption. No alternatives, no meta-commentary.
         platform_prompt = ContentGenerationService.PLATFORM_PROMPTS[platform].format(seed_content=seed_content)
         voice_instructions = ""
         if brand_context and brand_context.get("voice_profile"):
+            voice_profile = dict(brand_context["voice_profile"])
+            # The voice profile's defaults ("1-2 emojis", "1-3 hashtags") used to
+            # contradict a Playbook that said none, in the same prompt.
+            if brand_brief.emoji_mode(brand_context) == "no":
+                voice_profile["emoji_usage"] = "none"
+            if brand_brief.hashtag_limit(brand_context) == 0:
+                voice_profile["hashtag_style"] = "none"
             voice_instructions = build_voice_profile_instructions(
-                brand_context["voice_profile"],
+                voice_profile,
                 brand_context.get("voice_sample_analysis"),
                 platform,
                 language_rule=brand_brief.languages_rule(brand_context),
@@ -285,7 +292,7 @@ Write one caption. No alternatives, no meta-commentary.
             brand_brief.PRIORITY_ORDER,
             brand_brief.TRUTH_RULE,
         ]
-        rules = brand_brief.hard_rules(brand_context, captions=True)
+        rules = brand_brief.hard_rules(brand_context, captions=True, platform=platform)
         if rules:
             parts.append("HARD RULES (never break these):")
             parts.extend(f"- {r}" for r in rules)
@@ -813,7 +820,7 @@ Create social media content about THIS SPECIFIC PRODUCT based on the image analy
                 return style, brand_brief.audit(text, brand_context, sources=sources)
 
             validation_result, playbook_issues = _check(content)
-            brand_rules = brand_brief.hard_rules(brand_context, captions=True)
+            brand_rules = brand_brief.hard_rules(brand_context, captions=True, platform=platform)
             attempt = 0
             # One rewrite for style, as before. A second only if a Playbook rule is still broken.
             while attempt < 2 and (playbook_issues or (attempt == 0 and not validation_result["passed"])):

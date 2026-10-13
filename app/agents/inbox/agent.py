@@ -338,7 +338,7 @@ def brand_style(profile: Optional[dict]) -> tuple[str, list[str]]:
     from app.agents.social_media_manager.services.brand_profile_service import BrandProfileService
 
     bc = BrandProfileService.to_brand_context(profile)
-    lines = brand_brief.voice(bc, sample=False) + brand_brief.hard_rules(bc, language=False)
+    lines = brand_brief.voice(bc, sample=False) + brand_brief.hard_rules(bc, language=False, kind="replies")
     if not lines:
         return "", []
     section = ("7. Sound like this business. This shapes WORDING only — it never overrides rules 1-6 "

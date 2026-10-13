@@ -29,7 +29,7 @@ from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional
 
 PRIORITY_ORDER = (
-    "PRIORITY when instructions conflict: (1) HARD RULES are never broken; "
+    "PRIORITY when instructions conflict: (1) HARD RULES — including the owner's own instructions — are never broken; "
     "(2) BRAND VOICE decides how it sounds; (3) AUDIENCE adapts that voice, it never replaces it; "
     "(4) everything else."
 )
@@ -51,6 +51,50 @@ def _list(value: Any, limit: int = 0) -> List[str]:
         value = re.split(r"[,\n]", value)
     items = [str(v).strip() for v in (value or []) if str(v).strip()]
     return items[:limit] if limit else items
+
+
+# ── 0. The owner's own instructions ──────────────────────────────────────────
+# What the owner told Jane in their own words ("captions start with a one-line
+# hook", "always write prices with the ₦ sign"), kept on the profile as
+# playbook_instructions by playbook_instructions.py. Each says which kind of
+# writing it is for and, optionally, which platforms.
+
+INSTRUCTION_SCOPES = ("posts", "ads", "blog", "video", "replies")
+_PLATFORM_ALIASES = {"x": "twitter", "x / twitter": "twitter", "twitter / x": "twitter", "ig": "instagram",
+                     "fb": "facebook"}
+_PLATFORM_LABELS = {"instagram": "Instagram", "facebook": "Facebook", "linkedin": "LinkedIn",
+                    "twitter": "X (Twitter)", "tiktok": "TikTok", "pinterest": "Pinterest", "youtube": "YouTube"}
+
+
+def _platform_key(p: str) -> str:
+    k = str(p or "").strip().lower()
+    return _PLATFORM_ALIASES.get(k, k)
+
+
+def owner_instructions(bc: Optional[Dict[str, Any]], kind: str = "posts", platform: str = "") -> List[str]:
+    """The owner's standing instructions that apply to this kind of writing
+    (posts, ads, blog, video, replies) on this platform. With no platform
+    (e.g. a calendar covering several), platform-specific ones are kept and
+    say which platform they are for."""
+    out: List[str] = []
+    here = _platform_key(platform)
+    for item in (bc or {}).get("playbook_instructions") or []:
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("text") or "").strip()
+        if not text:
+            continue
+        scope = [str(x).lower() for x in (item.get("applies_to") or ["all"])]
+        if "all" not in scope and kind not in scope:
+            continue
+        platforms = [_platform_key(x) for x in (item.get("platforms") or []) if str(x).strip()]
+        if platforms:
+            if here and here not in platforms:
+                continue
+            if not here:
+                text = f"On {', '.join(_PLATFORM_LABELS.get(x, x) for x in platforms)}: {text}"
+        out.append(text)
+    return out
 
 
 # ── 1. Hard rules ────────────────────────────────────────────────────────────
@@ -95,6 +139,28 @@ def find_banned(text: str, words: Iterable[str]) -> List[str]:
     return [w for w in words if str(w).strip() and banned_pattern(str(w)).search(lowered)]
 
 
+_NO_WORDS = ("no", "none", "never", "zero", "0", "off", "nil", "nothing", "don't", "dont", "avoid")
+_FEW_WORDS = ("some", "minimal", "light", "sparing", "few", "little", "1", "2", "one", "two", "occasional", "rare")
+
+
+def emoji_mode(bc: Optional[Dict[str, Any]]) -> str:
+    """The Playbook's emoji setting as "no", "some", "free" (anything else the
+    owner wrote) or "" (not set). The page's field is free text, so "None",
+    "No emojis" and "never" all have to mean no — only the exact value "no"
+    used to, and a brand that typed "None" still got emojis."""
+    raw = str(((bc or {}).get("guardrails") or {}).get("emoji_usage") or "").strip().lower()
+    if not raw:
+        return ""
+    words = re.findall(r"[a-z0-9']+", raw)
+    if raw in ("yes", "any", "lots", "heavy", "plenty", "moderate"):
+        return "free"
+    if words and (words[0] in _NO_WORDS or raw.startswith("no ") or "none" in words or "never" in words):
+        return "no"
+    if any(w in _FEW_WORDS for w in words):
+        return "some"
+    return "free"
+
+
 def languages_rule(bc: Optional[Dict[str, Any]]) -> Optional[str]:
     langs = _list((bc or {}).get("languages"))
     if not langs or langs == ["English"]:
@@ -112,10 +178,12 @@ def languages_rule(bc: Optional[Dict[str, Any]]) -> Optional[str]:
             f"in four carries any {others}; a piece written mostly in {others} is just as wrong.")
 
 
-def hard_rules(bc: Optional[Dict[str, Any]], captions: bool = False, language: bool = True) -> List[str]:
+def hard_rules(bc: Optional[Dict[str, Any]], captions: bool = False, language: bool = True,
+               kind: str = "posts", platform: str = "") -> List[str]:
     """captions=True adds the caption-only format rules (emoji, hashtag limit).
     language=False for writers that must answer in the reader's own language
-    (the inbox replies in the customer's language, not the brand's)."""
+    (the inbox replies in the customer's language, not the brand's).
+    kind/platform pick which of the owner's own instructions apply."""
     bc = bc or {}
     g = bc.get("guardrails") or {}
     rules: List[str] = []
@@ -129,15 +197,26 @@ def hard_rules(bc: Optional[Dict[str, Any]], captions: bool = False, language: b
         rules.append(f"Compliance requirement: {g['compliance_notes']}.")
     if language and languages_rule(bc):
         rules.append(languages_rule(bc))
-    emoji = g.get("emoji_usage")
+    emoji = emoji_mode(bc)
     if emoji == "no":
         rules.append("Use NO emojis under any circumstances.")
     elif emoji == "some":
         rules.append("Use emojis very sparingly — maximum 1-2, only if they add genuine meaning.")
+    elif emoji == "free":
+        rules.append(f"Emoji usage: {g.get('emoji_usage')}.")
     if captions:
-        max_hash = g.get("max_hashtags")
-        if max_hash and max_hash not in ("No limit", ""):
-            rules.append(f"Use a maximum of {max_hash} hashtags.")
+        limit = hashtag_limit(bc)
+        raw = str(g.get("max_hashtags") or "").strip()
+        if limit == 0:
+            rules.append("Use NO hashtags.")
+        elif limit:
+            rules.append(f"Use a maximum of {limit} hashtags.")
+        elif raw and raw.lower() not in ("no limit", "unlimited", "any"):
+            rules.append(f"Hashtags: {raw}.")
+    owner = owner_instructions(bc, kind=kind, platform=platform)
+    if owner:
+        rules.append("THE OWNER'S OWN INSTRUCTIONS — follow every one exactly, they override any default "
+                     "style or format: " + " | ".join(owner))
     return rules
 
 
@@ -171,9 +250,13 @@ def strip_emojis(text: str) -> str:
 
 def hashtag_limit(bc: Optional[Dict[str, Any]]) -> Optional[int]:
     """The Playbook's "max hashtags" as a number; None when there is no limit."""
-    raw = str(((bc or {}).get("guardrails") or {}).get("max_hashtags") or "").strip()
-    m = re.match(r"\d+", raw)
-    return int(m.group()) if m else None
+    raw = str(((bc or {}).get("guardrails") or {}).get("max_hashtags") or "").strip().lower()
+    m = re.search(r"\d+", raw)
+    if m:
+        return int(m.group())
+    if raw in ("none", "no", "zero", "no hashtags", "never") or raw.startswith("no hashtag"):
+        return 0
+    return None
 
 
 def limit_hashtags(hashtags: Optional[List[str]], bc: Optional[Dict[str, Any]]) -> List[str]:
@@ -356,7 +439,7 @@ def enforce(text: str, bc: Optional[Dict[str, Any]], append_cta: bool = True) ->
         line can't simply be added, e.g. a tweet thread)."""
     bc = bc or {}
     out = text or ""
-    if ((bc.get("guardrails") or {}).get("emoji_usage")) == "no":
+    if emoji_mode(bc) == "no":
         out = strip_emojis(out)
     if append_cta and out.strip() and not has_cta(out, bc):
         cta = ctas(bc)[0].strip()
@@ -539,6 +622,7 @@ def build(
     captions: bool = False,
     language: bool = True,
     now: Optional[datetime] = None,
+    kind: str = "posts",
 ) -> str:
     """The brief as prompt text. Empty string when the Playbook has nothing
     for the requested sections, so callers can append it unconditionally."""
@@ -553,7 +637,8 @@ def build(
 
     name = bc.get("brand_name")
     if "rules" in sections:
-        block("HARD RULES (never break these):", hard_rules(bc, captions=captions, language=language))
+        block("HARD RULES (never break these):",
+              hard_rules(bc, captions=captions, language=language, kind=kind, platform=platform))
     if "voice" in sections:
         block("BRAND VOICE:", voice(bc, platform=platform))
     if "audience" in sections:
