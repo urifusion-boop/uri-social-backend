@@ -223,7 +223,7 @@ def has_cta(text: str, bc: Optional[Dict[str, Any]]) -> bool:
 # A language with no entry here is simply not checked.
 _LANGUAGE_MARKERS = {
     "pidgin": r"\b(dey|abeg|wahala|wetin|una|sabi|na|no be|go fit|make we|make una|we go|e go|don dey|"
-              r"(?:e|we|i|dem) don(?!['’])|sef|sha|oga|sharp sharp|how far|comot|wey|dem|chop|shey|abi|pikin|wan|naija|omo)\b",
+              r"sef|sha|oga|sharp sharp|how far|comot|wey|dem|chop|shey|abi|pikin|wan|naija|omo)\b",
     "yoruba": r"[ẹọṣ]|\b(e ku|bawo|jowo|e se|pele|oya|owo|aje|ore mi|a dupe|e kaaro|e kaasan|ise|ile wa)\b",
     "igbo": r"[ịụṅ]|\b(ndewo|biko|daalu|kedu|nnoo|nwanne|ego|ahia|imela|ka anyi|unu|nke oma)\b",
     "hausa": r"[ɓɗƙ]|\b(sannu|nagode|na gode|yaya|barka|kasuwa|kudi|yauwa|madalla|ina kwana|don allah|ku zo)\b",
@@ -286,6 +286,30 @@ def unverified_numbers(text: str, sources: str) -> List[str]:
     return found
 
 
+_CITATION = re.compile(
+    r"\b(?:according to (?!our\b|the brand\b)[a-z]"
+    r"|(?:stud(?:y|ies)|surveys?|reports?|research|polls?)\s+(?:by|from|conducted|published|shows?|showed|found|finds|"
+    r"highlight(?:s|ed)|reveal(?:s|ed)|suggest(?:s|ed)?|indicate(?:s|d)?|confirm(?:s|ed)?)\b"
+    r"|(?:statistics|data|experts?|analysts?)\s+(?:shows?|says?|suggests?|indicates?|reveals?|agree|believe))", re.I)
+
+
+def unverified_sources(text: str, sources: str) -> List[str]:
+    """References to a study, survey, report or "experts" that the writer was
+    never given — e.g. "a study by the International Finance Corporation
+    highlighted..." (seen in a blog on dev). No number, so the statistics check
+    can't see it, but it is an invented fact all the same."""
+    given = (sources or "").lower()
+    found: List[str] = []
+    for sentence in re.split(r"(?<=[.!?])\s+|\n+", text or ""):
+        m = _CITATION.search(sentence)
+        if m and m.group(0).lower() not in given:
+            snippet = sentence.strip()
+            snippet = snippet if len(snippet) <= 140 else snippet[:137].rstrip() + "..."
+            if snippet not in found:
+                found.append(snippet)
+    return found
+
+
 def audit(text: str, bc: Optional[Dict[str, Any]], sources: str = "") -> List[Dict[str, str]]:
     """What a finished piece got wrong against the Playbook. Each issue says how
     to fix it, so the rewrite is specific. `sources` is everything the writer
@@ -299,6 +323,11 @@ def audit(text: str, bc: Optional[Dict[str, Any]], sources: str = "") -> List[Di
         issues.append({"code": "unverified_number", "detail": phrase,
                        "fix": f'Remove "{phrase}" — that figure was never provided, so it is invented. '
                               f'Make the same point without a number.'})
+    # Only a brand that has set up its Playbook gets this check, like the rest.
+    for sentence in (unverified_sources(text, sources) if bc else []):
+        issues.append({"code": "unverified_source", "detail": sentence,
+                       "fix": f'This sentence cites a study, report or experts nobody provided: "{sentence}" '
+                              f"Remove the citation and make the point as the brand's own observation."})
     langs = _list(bc.get("languages"))
     for lang in missing_languages(text, bc):
         issues.append({"code": "missing_language", "detail": lang,
