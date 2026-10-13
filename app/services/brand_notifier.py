@@ -46,7 +46,10 @@ CHANNELS = {
 # In-app panel types the frontend already knows how to show.
 _PANEL_TYPE = {"post_ready": "content_created", "post_published": "content_posted"}
 
-_LEGACY_EVENTS = {"post_ready", "post_published"}  # what unconfigured brands already got (email)
+# The two alerts every brand has always received. They stay on until the brand
+# picks its own list of alerts — choosing only a channel (the normal state
+# after onboarding) must not silence them.
+_DEFAULT_EVENTS = {"post_ready", "post_published"}
 
 
 def preferences(profile: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -56,20 +59,37 @@ def preferences(profile: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     channel = CHANNELS.get(profile.get("notification_channel") or "")
     approval = [CHANNELS[c] for c in (profile.get("approval_channels") or []) if c in CHANNELS]
     configured = bool(events or channel or approval)
-    return {"configured": configured, "events": events, "channel": channel, "approval_channels": approval}
+    return {
+        "configured": configured,
+        "events": events,
+        # What's actually switched on: the brand's own list, or the defaults if it never made one.
+        "enabled": events or set(_DEFAULT_EVENTS),
+        "channel": channel,
+        "approval_channels": approval,
+    }
+
+
+def is_customised(prefs: Dict[str, Any]) -> bool:
+    """True when the brand's choices differ from what every brand has always
+    had (the two post alerts, by email, shown in the app). Only then do post
+    alerts leave the original email path — a brand that merely has "Email"
+    saved keeps its branded email and the original limits unchanged."""
+    if prefs["events"]:
+        return True
+    if prefs["channel"] not in (None, "email"):
+        return True
+    return any(c not in ("dashboard", "email") for c in prefs["approval_channels"])
 
 
 def channels_for(event: str, prefs: Dict[str, Any]) -> List[str]:
     """Which external channels an event goes to (in-app is always added)."""
-    if not prefs["configured"]:
-        return ["email"] if event in _LEGACY_EVENTS else []
-    if event not in prefs["events"]:
+    if event not in prefs["enabled"]:
         return []
     out: List[str] = []
     if prefs["channel"]:
         out.append(prefs["channel"])
-    elif event in _LEGACY_EVENTS:
-        out.append("email")  # chose the alert but no channel yet: don't go silent
+    elif event in _DEFAULT_EVENTS:
+        out.append("email")  # no channel chosen: these two have always gone by email
     if event == "post_ready":
         out += prefs["approval_channels"]
     seen: List[str] = []
@@ -158,9 +178,9 @@ async def notify(
     (used by the new alerts, which were never on by default)."""
     profile = profile if profile is not None else await _profile(db, user_id, brand_id)
     prefs = preferences(profile)
-    if only_if_configured and (not prefs["configured"] or event not in prefs["events"]):
-        return {"skipped": "not enabled"}
-    if prefs["configured"] and event not in prefs["events"]:
+    if only_if_configured and event not in prefs["events"]:
+        return {"skipped": "not enabled"}   # the newer alerts are opt-in: only if explicitly ticked
+    if event not in prefs["enabled"]:
         return {"skipped": "not enabled"}
     if dedupe_key and dedupe_hours and await _recently_sent(db, user_id, event, dedupe_key, dedupe_hours):
         return {"skipped": "already sent"}
