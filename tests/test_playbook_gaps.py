@@ -113,6 +113,117 @@ class TestAdFormatRotation:
         assert self._pick(["a", "b"], 7, {"a", "b"}) == ("b", 0)
 
 
+class TestApprovalMode:
+    """The Playbook page saved "Auto-publish"/"Review before publishing" and
+    onboarding saved "auto"/"review"/"hybrid" — and nothing read either."""
+
+    def _mode(self, value):
+        from app.agents.social_media_manager.services.posting_preferences import approval_mode
+        return approval_mode({"approval_workflow": value})
+
+    def test_both_spellings_map_to_one_mode(self):
+        assert self._mode("Auto-publish") == self._mode("auto") == "auto"
+        assert self._mode("Review before publishing") == self._mode("review") == "review"
+        assert self._mode("hybrid") == "hybrid"
+
+    def test_unknown_or_unset_is_review(self):
+        assert self._mode("") == "review"
+        assert self._mode("something else") == "review"
+        from app.agents.social_media_manager.services.posting_preferences import approval_mode
+        assert approval_mode(None) == "review"
+
+    def test_only_auto_and_hybrid_publish_recurring_posts(self):
+        from app.agents.social_media_manager.services.posting_preferences import auto_publishes_recurring
+        assert auto_publishes_recurring({"approval_workflow": "auto"})
+        assert auto_publishes_recurring({"approval_workflow": "hybrid"})
+        assert not auto_publishes_recurring({"approval_workflow": "review"})
+        assert not auto_publishes_recurring({})
+
+
+class TestCadence:
+    def _interval(self, cadence, fallback="daily"):
+        from app.agents.social_media_manager.services.posting_preferences import cadence_interval
+        return cadence_interval({"posting_cadence": cadence}, fallback)
+
+    def test_playbook_cadence_sets_auto_interval(self):
+        from datetime import timedelta
+        assert self._interval("Daily") == timedelta(days=1)
+        assert self._interval("3–4x per week") == timedelta(days=2)
+        assert self._interval("2–3x per week") == timedelta(days=3)
+        assert self._interval("Weekly") == timedelta(weeks=1)
+        assert self._interval("Bi-weekly") == timedelta(weeks=2)
+
+    def test_no_cadence_keeps_auto_tab_setting(self):
+        from datetime import timedelta
+        assert self._interval("", "weekly") == timedelta(weeks=1)
+        assert self._interval("", "daily") == timedelta(days=1)
+
+
+class TestNextPostTime:
+    """Preferred time-of-day slots, in the brand's local time (Lagos = UTC+1)."""
+
+    def _next(self, profile, platform, now):
+        from app.agents.social_media_manager.services.posting_preferences import next_post_time
+        return next_post_time(profile, platform, now=now)
+
+    def test_general_slot_same_day(self):
+        from datetime import datetime
+        profile = {"region": "Nigeria", "posting_time_mode": "general",
+                   "posting_time_prefs": {"general": "Evening (4-8pm),"}}
+        # 08:00 UTC = 09:00 Lagos -> 18:00 Lagos = 17:00 UTC
+        assert self._next(profile, "instagram", datetime(2026, 10, 14, 8, 0)) == datetime(2026, 10, 14, 17, 0)
+
+    def test_rolls_to_next_day_when_slot_passed(self):
+        from datetime import datetime
+        profile = {"region": "Nigeria", "posting_time_mode": "general",
+                   "posting_time_prefs": {"general": "Late Morning (9am-12pm),"}}
+        # 12:00 UTC = 13:00 Lagos, 10:00 slot gone -> tomorrow 10:00 Lagos = 09:00 UTC
+        assert self._next(profile, "facebook", datetime(2026, 10, 14, 12, 0)) == datetime(2026, 10, 15, 9, 0)
+
+    def test_per_platform_slot_wins(self):
+        from datetime import datetime
+        profile = {"region": "Nigeria", "posting_time_mode": "custom",
+                   "posting_time_prefs": {"linkedin": "Early Morning (6-9am),", "general": "Night (8pm-12am),"}}
+        assert self._next(profile, "linkedin", datetime(2026, 10, 14, 3, 0)) == datetime(2026, 10, 14, 6, 0)
+        # platform without its own slot falls back to the general one (21:00 Lagos)
+        assert self._next(profile, "facebook", datetime(2026, 10, 14, 3, 0)) == datetime(2026, 10, 14, 20, 0)
+
+    def test_respects_minimum_lead_time(self):
+        from datetime import datetime
+        profile = {"region": "Nigeria", "posting_time_mode": "general",
+                   "posting_time_prefs": {"general": "Evening (4-8pm),"}}
+        # 16:45 UTC = 17:45 Lagos: 18:00 is only 15 min away -> tomorrow
+        assert self._next(profile, "x", datetime(2026, 10, 14, 16, 45)) == datetime(2026, 10, 15, 17, 0)
+
+    def test_ai_mode_uses_platform_defaults(self):
+        from datetime import datetime
+        # LinkedIn defaults 09:00 / 12:00 Lagos
+        assert self._next({"region": "Nigeria"}, "linkedin", datetime(2026, 10, 14, 5, 0)) == datetime(2026, 10, 14, 8, 0)
+
+    def test_region_sets_timezone(self):
+        from app.agents.social_media_manager.services.posting_preferences import brand_timezone
+        assert str(brand_timezone({"region": "United Kingdom"})) == "Europe/London"
+        assert str(brand_timezone({"region": "West Africa"})) == "Africa/Lagos"
+        assert str(brand_timezone({})) == "Africa/Lagos"
+
+
+class TestAutoTabUsesPlaybook:
+    def test_auto_run_schedules_when_playbook_says_so(self):
+        import inspect
+        from app.agents.social_media_manager.services.auto_content_service import AutoContentService
+
+        source = inspect.getsource(AutoContentService.generate_for_user)
+        assert "posting_preferences.auto_publishes_recurring(profile_data)" in source
+        assert "posting_preferences.cadence_interval(profile_data, frequency)" in source
+
+    def test_auto_schedule_goes_through_normal_approve_and_schedule(self):
+        import inspect
+        from app.agents.social_media_manager.services.auto_content_service import AutoContentService
+
+        source = inspect.getsource(AutoContentService._auto_schedule)
+        assert 'schedule_option="schedule"' in source
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
