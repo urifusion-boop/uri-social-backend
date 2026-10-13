@@ -522,24 +522,36 @@ async def write_ad_copy(business_name: str, category: str, goal: str = "messages
             # Never ship a known leak and never loop silently — strip and move on.
             copy.headline = _strip_leaked_terms(copy.headline, leaked)
             copy.primary_text = _strip_leaked_terms(copy.primary_text, leaked)
-    # Brand Playbook hard rule: words the brand said never to use. One rewrite,
-    # same as captions get; if the model still uses them the copy is kept (a
-    # human reviews every ad plan before launch) and the miss is logged.
+    # Brand Playbook hard rules, checked on what was actually written: words the
+    # brand never uses (in any form) and statistics nobody gave the writer — an
+    # invented "70% of businesses..." in a paid ad is the advertiser's liability.
+    # One rewrite, same as captions get; if the model still breaks a rule the copy
+    # is kept (a human reviews every ad plan before launch) and the miss is logged.
     from app.agents.social_media_manager.services import brand_brief
-    banned = brand_brief.violations(f"{copy.headline} {copy.primary_text}", bc)
-    if banned:
+
+    def _copy_issues(headline: str, primary: str) -> list:
+        return [i for i in brand_brief.audit(f"{headline}\n{primary}", bc, sources=prompt)
+                if i["code"] in ("banned_word", "unverified_number")]
+
+    issues = _copy_issues(copy.headline, copy.primary_text)
+    if issues:
         d3 = await _call_ad_copy_model(
-            prompt + f"\n\nCORRECTION: your last attempt used {banned!r}, which this brand never "
-            "uses. Rewrite headline and primary_text without those words."
+            prompt + "\n\nCORRECTION: your last attempt broke this brand's rules. Rewrite headline "
+            "and primary_text with these fixes:\n" + "\n".join(f"- {i['fix']}" for i in issues)
         )
         if d3 is not None:
             headline = str(d3.get("headline", "")).strip()
             primary = str(d3.get("primary_text", "")).strip()
-            if headline and primary and not _check_leakage(headline, primary, leak_terms):
+            if (headline and primary and not _check_leakage(headline, primary, leak_terms)
+                    and len(_copy_issues(headline, primary)) < len(issues)):
                 copy.headline, copy.primary_text = headline, primary
-        still = brand_brief.violations(f"{copy.headline} {copy.primary_text}", bc)
+        still = _copy_issues(copy.headline, copy.primary_text)
         if still:
-            print(f"[Creative] ad copy still uses brand-banned words after retry: {still}", flush=True)
+            print(f"[Creative] ad copy still breaks Playbook rules after retry: "
+                  f"{[i['code'] + ':' + i['detail'] for i in still]}", flush=True)
+    # "No emojis" can be guaranteed without a model.
+    copy.headline = brand_brief.enforce(copy.headline, bc, append_cta=False)
+    copy.primary_text = brand_brief.enforce(copy.primary_text, bc, append_cta=False)
     # image_prompt needs the SAME deterministic guarantee, not just the instruction
     # above. It becomes the content engine's seed_content, and that engine renders
     # text INTO the graphic (that's how organic posts look) — so a place name left
