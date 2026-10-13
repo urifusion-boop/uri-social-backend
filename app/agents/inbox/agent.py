@@ -455,8 +455,8 @@ def decide_auto_reply(settings: dict, conv: dict, cls: dict, draft: dict,
         return False, "Draft used words your Brand Playbook says to avoid"
     if draft["unanswered"]:
         return False, "No approved FAQ answers what they asked"
-    if draft["unverified"] or draft["cites_price_or_stock"]:
-        return False, "Relies on Brand Playbook details that aren't verified"
+    if draft["cites_price_or_stock"]:
+        return False, "Quotes a price range from the Brand Playbook, not an approved FAQ"
     threshold = settings["confidence_threshold"]
     if cls["confidence"] < threshold or draft["confidence"] < threshold:
         return False, f"Below the {threshold}% confidence threshold"
@@ -477,8 +477,17 @@ async def _history(db, workspace_id: str, conversation_id: str) -> list[dict]:
     rows = await db[MESSAGES].find(
         {"workspace_id": workspace_id, "conversation_id": conversation_id}
     ).sort("received_at", 1).to_list(200)
+    # Replies that were URI's draft sent unchanged, including ones sent before
+    # messages carried the approved_draft flag.
+    drafts = await db[CLASSIFICATIONS].find(
+        {"workspace_id": workspace_id, "conversation_id": conversation_id}
+    ).sort("created_at", -1).to_list(50)
+    sent_drafts = {((d.get("draft") or {}).get("text") or "").strip() for d in drafts
+                   if (d.get("outcome") or {}).get("type") == "sent_as_is"} - {""}
     return [{"id": str(r["_id"]), "direction": r.get("direction"), "text": r.get("text") or "",
-             "actor_id": r.get("actor_id", ""), "approved_draft": bool(r.get("approved_draft")),
+             "actor_id": r.get("actor_id", ""),
+             "approved_draft": bool(r.get("approved_draft"))
+             or (r.get("text") or "").strip() in sent_drafts,
              "provider_message_id": r.get("provider_message_id"),
              "received_at": r.get("received_at")}
             for r in rows]

@@ -135,12 +135,11 @@ def test_playbook_only_answers_are_drafted_not_sent():
                 "approved": False}
     ok, reason = decide(draft=_draft(sources=[playbook], unverified=[playbook["label"]],
                                      cites_price_or_stock=True))
-    assert not ok and "aren't verified" in reason
+    assert not ok and "price range" in reason
 
 
-def test_a_draft_mixing_faq_and_unverified_playbook_is_reviewed():
-    ok, reason = decide(draft=_draft(unverified=["Brand Playbook · Price range"]))
-    assert not ok and "aren't verified" in reason
+def test_playbook_facts_other_than_price_can_auto_reply():
+    assert decide(draft=_draft(unverified=["Brand Playbook · Products and services"])) == (True, "")
 
 
 def test_below_the_threshold_is_drafted():
