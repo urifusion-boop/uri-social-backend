@@ -5,6 +5,7 @@ so most of these pin down when it must NOT send.
 """
 from datetime import datetime, timedelta, timezone
 
+import pytest
 from bson import ObjectId
 
 from app.agents.inbox import agent
@@ -357,3 +358,17 @@ def test_a_redraft_explains_why_it_was_not_sent_and_never_sends():
     assert reason == "No approved FAQ answers this"
     assert db[CONVERSATIONS].docs[0]["handoff_reason"] == reason
     assert not [m for m in db[MESSAGES].docs if m["direction"] == "outbound"]
+
+
+@pytest.mark.parametrize("text", ["i'm interested", "Im interested", "I am very interested!",
+                                  "how do I get started?", "count me in"])
+def test_saying_youre_interested_is_a_lead_not_engagement(text):
+    from app.agents.inbox.agent import coerce_classification
+    out = coerce_classification({"intent": "engagement", "confidence": 85}, text)
+    assert out["intent"] == "purchase"
+
+
+def test_small_talk_stays_engagement():
+    from app.agents.inbox.agent import coerce_classification
+    assert coerce_classification({"intent": "engagement"}, "hello, how are you")["intent"] == "engagement"
+    assert coerce_classification({"intent": "complaint"}, "I'm interested in why this broke")["intent"] == "complaint"
