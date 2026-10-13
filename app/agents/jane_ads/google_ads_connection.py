@@ -68,7 +68,9 @@ class ConnectionState(str, Enum):
                                                      # sent to Google to wait on yet, the brand hasn't picked
                                                      # link-existing vs. create-new
     MANAGER_LINK_PENDING = "manager_link_pending"   # link request sent, awaiting client accept
-    MANAGER_LINK_REFUSED = "manager_link_refused"   # client account already linked to another manager
+    MANAGER_LINK_REFUSED = "manager_link_refused"   # Google wouldn't let us invite this account at all
+    MANAGER_LINK_DECLINED = "manager_link_declined"  # the invitation was declined/cancelled, or an
+                                                     # accepted link was later removed in Google Ads
     READY = "ready"                                 # customer_id + active manager link
 
     # No OAUTH_PENDING/EXPIRED here — those described a per-brand OAuth token's own
@@ -99,6 +101,12 @@ class InvalidCustomerId(GoogleAdsConnectionError):
     so this is a client input problem, not a Google API failure. Kept as its
     own type so the router can return 400 with a clean message instead of the
     502 it uses for an actual rejected REST call."""
+
+
+class AccountNotLinkable(GoogleAdsConnectionError):
+    """Google refused the invitation for a reason the owner can act on (no such
+    account, it's a manager account, it has no admin user...). A 400 with the
+    reason, not a 502."""
 
 
 class MccNotEligibleToCreateAccounts(GoogleAdsConnectionError):
@@ -380,6 +388,8 @@ async def resolve_connection_state(
 
     if conn.get("manager_link_status") == "refused":
         return ConnectionState.MANAGER_LINK_REFUSED, conn
+    if conn.get("manager_link_status") in _ENDED_LINK_STATUSES and conn.get("customer_id"):
+        return ConnectionState.MANAGER_LINK_DECLINED, conn
     if not conn.get("customer_id"):
         # Connected, but nothing has been sent to Google to wait on yet — the brand
         # hasn't chosen link-existing vs. create-new. Checked BEFORE the "pending"
@@ -410,7 +420,9 @@ async def resolve_customer_id_for_launch(db, user_id: Optional[str], brand_id: O
     if not wa_number:
         raise AdsConnectionRequired(ConnectionState.NO_WHATSAPP)
 
-    state, conn = await resolve_connection_state(db, user_id, brand_id)
+    # Checked against Google, not just our record: a link the owner removed in
+    # Google Ads since we last looked must stop a launch here, not fail mid-way.
+    state, conn, _ = await refresh_connection(db, user_id, brand_id, force=True)
     if state != ConnectionState.READY:
         raise AdsConnectionRequired(state, (conn or {}).get("account_name", ""))
 
@@ -494,7 +506,37 @@ async def request_manager_link(
             }}},
         )
     data = _parse_json_response(resp, "manager-link request")
-    if "error" in data:
+    if "error" in data and isinstance(data["error"], dict):
+        raw = json.dumps(data["error"]).upper()
+        # Google's own ManagerLinkError codes say exactly what happened. Reading
+        # only the English message lumped "you already invited this account" in
+        # with "another manager has it" and told the owner to remove a manager
+        # that didn't exist.
+        if "ALREADY_INVITED_BY_THIS_MANAGER" in raw:
+            # An invitation from us is already waiting — that IS the pending state.
+            await db[CONNECTIONS].update_one({"id": conn["id"]}, {"$set": {
+                "manager_link_status": "pending", "manager_link_error": "",
+                "customer_id": client_customer_id, "login_customer_id": mcc_id,
+                "updated_at": datetime.now(timezone.utc)}})
+            return {"manager_link_status": "pending"}
+        if "ALREADY_MANAGED_BY_THIS_MANAGER" in raw or "ALREADY_MANAGED_IN_HIERARCHY" in raw:
+            # Already linked to us — record it and read the real state back.
+            await db[CONNECTIONS].update_one({"id": conn["id"]}, {"$set": {
+                "manager_link_status": "pending", "manager_link_error": "",
+                "customer_id": client_customer_id, "login_customer_id": mcc_id,
+                "updated_at": datetime.now(timezone.utc)}})
+            synced = await sync_manager_link(db, {**conn, "customer_id": client_customer_id})
+            return {"manager_link_status": synced.get("manager_link_status", "pending")}
+        for code, reason in _NOT_LINKABLE.items():
+            if code in raw:
+                raise AccountNotLinkable(reason)
+        if "TOO_MANY_MANAGERS" in raw:
+            reason = ("This Google Ads account already has the maximum number of managers. Remove one in "
+                      "Google Ads (Admin → Access and security → Managers), then try again.")
+            await db[CONNECTIONS].update_one({"id": conn["id"]}, {"$set": {
+                "manager_link_status": "refused", "manager_link_error": reason,
+                "customer_id": client_customer_id, "updated_at": datetime.now(timezone.utc)}})
+            return {"manager_link_status": "refused", "detail": reason, "reason": reason}
         message = (data["error"].get("message") or "").lower()
         if "already" in message and ("link" in message or "manager" in message):
             await db[CONNECTIONS].update_one(
@@ -513,12 +555,190 @@ async def request_manager_link(
         {"id": conn["id"]},
         {"$set": {
             "manager_link_status": "pending",
+            "manager_link_error": "",
+            "manager_link_resource": ((data.get("result") or {}).get("resourceName") or ""),
             "customer_id": client_customer_id,
             "login_customer_id": mcc_id,
+            "invited_at": datetime.now(timezone.utc),
             "updated_at": datetime.now(timezone.utc),
         }},
     )
     return {"manager_link_status": "pending"}
+
+
+# ── Keeping our record true to Google's ──────────────────────────────────────
+# An invitation is accepted (or declined) in the client's own Google Ads, so the
+# only way to know is to ask. Nothing used to: a brand that linked an existing
+# account stayed "waiting for you to accept" forever, even after accepting.
+
+_ENDED_LINK_STATUSES = ("declined", "cancelled", "inactive")
+_GOOGLE_LINK_STATUS = {"ACTIVE": "active", "PENDING": "pending", "REFUSED": "declined",
+                       "CANCELED": "cancelled", "INACTIVE": "inactive"}
+_LINK_PRIORITY = {"active": 0, "pending": 1, "declined": 2, "cancelled": 3, "inactive": 4}
+_NOT_LINKABLE = {
+    "CUSTOMER_NOT_FOUND": "We couldn't find a Google Ads account with that Customer ID. Check the number at the "
+                          "top right of your Google Ads dashboard.",
+    "INVALID_CUSTOMER_ID": "We couldn't find a Google Ads account with that Customer ID. Check the number at the "
+                           "top right of your Google Ads dashboard.",
+    "CUSTOMER_NOT_ENABLED": "That Google Ads account isn't active (it may be cancelled or suspended). Reactivate it "
+                            "in Google Ads, or use a different account.",
+    "CLIENT_HAS_NO_ADMIN_USER": "That Google Ads account has no admin user to accept the request. Add an admin in "
+                                "Google Ads (Admin → Access and security), then try again.",
+    "ACCOUNTS_NOT_COMPATIBLE_FOR_LINKING": "That account can't be linked — it looks like a manager or test account. "
+                                           "Use the Customer ID of the Google Ads account that runs your ads.",
+    "CUSTOMER_CANNOT_MANAGE_SELF": "That's URI's own manager account. Enter the Customer ID of your own Google Ads "
+                                   "account.",
+    "TOO_MANY_INVITES": "That Google Ads account has too many pending manager requests. Clear some in Google Ads "
+                        "(Admin → Access and security → Managers), then try again.",
+}
+SYNC_MIN_INTERVAL_SECONDS = 20
+
+
+def _mcc_headers(access_token: str) -> dict:
+    return {
+        "Authorization": f"Bearer {access_token}",
+        "developer-token": settings.GOOGLE_ADS_DEVELOPER_TOKEN,
+        "login-customer-id": settings.GOOGLE_ADS_MCC_CUSTOMER_ID,
+    }
+
+
+async def _mcc_call(db, path: str, body: dict, context: str) -> dict:
+    """One REST call against URI's manager account, as the admin identity."""
+    access_token = await get_admin_valid_access_token(db)
+    url = f"https://googleads.googleapis.com/{_API_VERSION()}/customers/{settings.GOOGLE_ADS_MCC_CUSTOMER_ID}{path}"
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.post(url, headers=_mcc_headers(access_token), json=body)
+    data = _parse_json_response(resp, context)
+    _raise_for_error(data, context)
+    return data
+
+
+async def _mcc_search(db, query: str, context: str) -> list:
+    data = await _mcc_call(db, "/googleAds:search", {"query": query}, context)
+    return data.get("results") or []
+
+
+async def sync_manager_link(db, conn: dict) -> dict:
+    """Ask Google what the link between URI's manager account and this brand's
+    Ads account really is, and store it: accepted → active (with the account's
+    own name), still waiting → pending, declined/cancelled/removed → ended.
+    Returns the updated connection doc. Raises GoogleAdsConnectionError if
+    Google can't be asked right now (the stored state is left as it was)."""
+    customer_id = "".join(ch for ch in str(conn.get("customer_id") or "") if ch.isdigit())
+    if not customer_id:
+        return conn
+    rows = await _mcc_search(
+        db,
+        "SELECT customer_client_link.resource_name, customer_client_link.status, "
+        "customer_client_link.manager_link_id FROM customer_client_link "
+        f"WHERE customer_client_link.client_customer = 'customers/{customer_id}'",
+        "manager-link status",
+    )
+    now = datetime.now(timezone.utc)
+    update: dict = {"manager_link_synced_at": now, "updated_at": now}
+    links = []
+    for row in rows:
+        link = row.get("customerClientLink") or {}
+        status = _GOOGLE_LINK_STATUS.get(str(link.get("status") or "").upper())
+        if status:
+            links.append((status, link))
+    if links:
+        # An account can carry an old cancelled invitation next to a live one —
+        # the live one is what counts.
+        status, link = sorted(links, key=lambda x: (_LINK_PRIORITY[x[0]], -int(x[1].get("managerLinkId") or 0)))[0]
+        update["manager_link_status"] = status
+        update["manager_link_resource"] = link.get("resourceName") or ""
+        if status == "active":
+            update["manager_link_error"] = ""
+            try:
+                clients = await _mcc_search(
+                    db,
+                    "SELECT customer_client.descriptive_name, customer_client.currency_code, "
+                    "customer_client.time_zone, customer_client.manager, customer_client.test_account "
+                    f"FROM customer_client WHERE customer_client.id = {customer_id}",
+                    "linked account details",
+                )
+                info = (clients[0].get("customerClient") if clients else None) or {}
+                update["account_name"] = info.get("descriptiveName") or conn.get("account_name") or ""
+                update["currency_code"] = info.get("currencyCode") or ""
+                update["time_zone"] = info.get("timeZone") or ""
+                update["linked_at"] = conn.get("linked_at") or now
+            except GoogleAdsConnectionError as e:   # the link is real even if the name lookup isn't
+                print(f"[GoogleAds] linked account details unavailable: {e}")
+    elif conn.get("manager_link_status") == "pending":
+        # We believe an invitation is out, Google has none: it was withdrawn.
+        update["manager_link_status"] = "cancelled"
+    await db[CONNECTIONS].update_one({"id": conn["id"]}, {"$set": update})
+    return {**conn, **update}
+
+
+async def refresh_connection(db, user_id: Optional[str], brand_id: Optional[str], force: bool = False
+                             ) -> tuple[ConnectionState, Optional[dict], str]:
+    """The connection state, checked against Google when it could have changed:
+    while an invitation is pending (the owner accepts it in Google Ads, not
+    here), or whenever the caller asks (force — the "Check again" button).
+    Returns (state, doc, sync_error) — sync_error is a plain reason when Google
+    couldn't be asked, in which case the stored state is what's returned."""
+    state, conn = await resolve_connection_state(db, user_id, brand_id)
+    if not conn or not conn.get("customer_id"):
+        return state, conn, ""
+    waiting = state == ConnectionState.MANAGER_LINK_PENDING
+    if not (waiting or force):
+        return state, conn, ""
+    last = conn.get("manager_link_synced_at")
+    if last is not None and not force:
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=timezone.utc)
+        if (datetime.now(timezone.utc) - last).total_seconds() < SYNC_MIN_INTERVAL_SECONDS:
+            return state, conn, ""
+    try:
+        await sync_manager_link(db, conn)
+    except GoogleAdsConnectionError as e:
+        print(f"[GoogleAds] could not check link status: {e}")
+        return state, conn, "We couldn't reach Google Ads to check just now — try again in a minute."
+    state, conn = await resolve_connection_state(db, user_id, brand_id)
+    return state, conn, ""
+
+
+async def release_account(db, user_id: Optional[str], brand_id: Optional[str], remove: bool = False) -> dict:
+    """Change account / disconnect. Ends the link on Google's side too — a
+    pending invitation is withdrawn, an accepted link is removed — so URI never
+    keeps access to an account the brand has let go of. An account URI created
+    for the brand is left linked (unlinking would orphan it with no owner), and
+    can't be released from here.
+
+    remove=False: back to "choose your account". remove=True: Google Ads is
+    disconnected for this brand altogether."""
+    conn = await get_any_google_ads_connection(db, user_id, brand_id)
+    if not conn:
+        raise AdsConnectionRequired(ConnectionState.NONE)
+    if conn.get("created_account_by_uri") and conn.get("customer_id"):
+        raise AccountNotLinkable("This Google Ads account was created for you by URI, so it can't be swapped "
+                                 "out here. Contact support if you need to move to a different account.")
+    google_note = ""
+    if conn.get("customer_id") and conn.get("manager_link_status") in ("pending", "active"):
+        try:
+            fresh = await sync_manager_link(db, conn)
+            resource, status = fresh.get("manager_link_resource"), fresh.get("manager_link_status")
+            if resource and status in ("pending", "active"):
+                await _mcc_call(db, "/customerClientLinks:mutate", {"operation": {
+                    "update": {"resourceName": resource, "status": "CANCELED" if status == "pending" else "INACTIVE"},
+                    "updateMask": "status",
+                }}, "end manager link")
+        except GoogleAdsConnectionError as e:
+            # Our side is still released; say plainly that Google's may not be.
+            print(f"[GoogleAds] could not end the link at Google: {e}")
+            google_note = ("We couldn't remove the link on Google's side just now. You can remove URI in Google "
+                           "Ads under Admin → Access and security → Managers.")
+    now = datetime.now(timezone.utc)
+    if remove:
+        await db[CONNECTIONS].delete_one({"id": conn["id"]})
+    else:
+        await db[CONNECTIONS].update_one({"id": conn["id"]}, {"$set": {
+            "customer_id": "", "manager_link_status": "none", "manager_link_error": "",
+            "manager_link_resource": "", "account_name": "", "currency_code": "", "time_zone": "",
+            "updated_at": now}})
+    return {"released": True, "removed": remove, "google_note": google_note}
 
 
 async def create_client_account_under_mcc(
