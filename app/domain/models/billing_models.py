@@ -404,6 +404,11 @@ class CreditBalanceResponse(BaseModel):
     end_date: Optional[datetime] = Field(default=None, description="Subscription end date")
     next_renewal: Optional[datetime] = None
     low_credit_warning: bool = Field(default=False, description="True if credits <= 3 (PRD 7.3)")
+    has_had_plan: bool = Field(
+        default=False,
+        description="True if the user has ever had a plan or bought credits (beyond the free trial). Lets the app "
+                    "tell 'trial ended' from 'your credits ran out' — the second must never be called a trial.",
+    )
     trial_credits_included: int = Field(
         default=0,
         description="Portion of credits_remaining/total_credits coming from an unexpired trial, not the subscription/bonus wallet. Not yet populated by get_credit_balance on this branch — always 0 today, kept as a real field so admin_router.py's tier-labeling logic has something safe to read rather than erroring.",
