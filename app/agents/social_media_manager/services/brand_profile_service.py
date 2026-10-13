@@ -619,6 +619,8 @@ class BrandProfileService:
             "secondary_custom_font_selected_url": profile.get("secondary_custom_font_selected_url", ""),
             # Caption Voice System fields
             "voice_profile":        profile.get("voice_profile") or {},
+            # What the owner told Jane in their own words (playbook_instructions.py)
+            "playbook_instructions": [i for i in (profile.get("playbook_instructions") or []) if isinstance(i, dict)],
             "voice_sample_analysis": profile.get("voice_sample_analysis") or {},
             # Business Pulse — raw passthrough only, no freshness math here (this is
             # a pure profile→context transform; freshness is computed by whichever
