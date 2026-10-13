@@ -114,9 +114,20 @@ def test_a_price_question_the_faqs_dont_answer_is_reviewed():
     assert not ok and "stock or price" in reason
 
 
-def test_complaints_and_support_go_to_a_person():
-    for intent in ("complaint", "support", "other", "spam"):
-        assert decide(cls=_cls(intent=intent))[0] is False
+def test_every_label_but_spam_can_auto_reply():
+    for intent in ("complaint", "support", "other", "praise", "engagement", "purchase"):
+        assert decide(cls=_cls(intent=intent)) == (True, "")
+    assert decide(cls=_cls(intent="spam"))[0] is False
+
+
+def test_a_greeting_with_no_source_can_auto_reply():
+    assert decide(cls=_cls(intent="engagement"),
+                  draft=_draft(text="Hi! How can we help?", sources=[])) == (True, "")
+
+
+def test_a_question_no_faq_answers_is_drafted():
+    ok, reason = decide(draft=_draft(sources=[], unanswered=True))
+    assert not ok and "No approved FAQ" in reason
 
 
 def test_playbook_only_answers_are_drafted_not_sent():
@@ -124,7 +135,7 @@ def test_playbook_only_answers_are_drafted_not_sent():
                 "approved": False}
     ok, reason = decide(draft=_draft(sources=[playbook], unverified=[playbook["label"]],
                                      cites_price_or_stock=True))
-    assert not ok and "approved FAQ" in reason
+    assert not ok and "aren't verified" in reason
 
 
 def test_a_draft_mixing_faq_and_unverified_playbook_is_reviewed():
@@ -298,6 +309,7 @@ def test_citations_the_model_invents_are_dropped():
     out = _run(agent.process_inbound(db, WS, conv_id, msg_id, llm, _sent_transport(sent)))
     assert out["status"] == "drafted" and not sent
     assert db[CONVERSATIONS].docs[0]["ai_suggestion"]["sources"] == []
+    assert db[CONVERSATIONS].docs[0]["ai_suggestion"]["confidence"] == 0
 
 
 def test_a_person_sending_the_draft_records_the_outcome_and_clears_the_flag():
@@ -352,10 +364,11 @@ def test_a_team_reply_blocks_auto_replies_for_a_day_not_forever():
 def test_a_redraft_explains_why_it_was_not_sent_and_never_sends():
     db = Db()
     conv_id, msg_id = _seed(db, faq=False)
-    llm = fake_llm(CLS_FAQ, {"reply": "We offer X.", "cited": [], "confidence": 90})
+    llm = fake_llm(CLS_FAQ, {"reply": "Someone will confirm.", "cited": [], "confidence": 90,
+                             "unanswered": True})
     result = _run(agent.suggest(db, WS, conv_id, llm))
     reason = _run(agent.explain(db, WS, result))
-    assert reason == "No approved FAQ answers this"
+    assert reason == "No approved FAQ answers what they asked"
     assert db[CONVERSATIONS].docs[0]["handoff_reason"] == reason
     assert not [m for m in db[MESSAGES].docs if m["direction"] == "outbound"]
 
