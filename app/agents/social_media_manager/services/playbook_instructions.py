@@ -154,7 +154,8 @@ Turn the owner's message into changes. Return ONLY a JSON object:
   "remember": [{"text": "<instruction>", "applies_to": ["posts"|"ads"|"blog"|"video"|"replies"|"all"], "platforms": []}],
   "forget": ["<id of an existing instruction>"],
   "reply": "<one or two short sentences to the owner saying what you changed, in plain words>",
-  "question": "<only when understood is false: what you need to know, or what you can help with>"
+  "not_a_preference": "content_request"|"question"|"vague"|null,
+  "question": "<only when the request is vague: one short, specific question>"
 }
 
 RULES
@@ -162,11 +163,16 @@ RULES
 "stop saying 'game-changer'" → words_to_avoid add; "end posts with 'Order on WhatsApp'" → cta_styles; \
 "be formal on LinkedIn" → platform_tones.linkedin; "keep captions short" → voice_profile.caption_length). \
 For list fields use "add"/"remove" with a string or list; "set" replaces the whole list — only when the \
-owner clearly wants to replace it. For text and enum fields use "set". To clear a text field set "".
+owner clearly wants to replace it. For text and enum fields use "set". To clear a text field set "". \
+Emit a change for EVERYTHING the owner states that a field covers, even if you think it is already set or \
+is the default — what the owner says must be saved explicitly. A tone for one platform ("formal on \
+LinkedIn", "playful on Instagram") ALWAYS goes in platform_tones.<platform>, described in a few words.
 2. Everything about HOW content should be written that has no field (structure, format, things to always or \
 never do, how to talk about the product, how to address customers) goes in "remember". Write each as one \
 clear, self-contained instruction for the writer — e.g. "Start every caption with a one-line hook in capital \
-letters." Keep the owner's exact words, phrases, names, prices and numbers. One idea per instruction.
+letters." Keep the owner's exact words, phrases, names, prices and numbers. One idea per instruction. \
+NEVER also add a "remember" instruction for something a field change already covers (hook style, caption \
+length, emoji usage, a platform's tone, words to avoid) — that would say the same thing twice.
 3. applies_to: "posts" = social captions, carousels and calendar posts; "replies" = answers to customer DMs and \
 comments; "all" when the owner speaks about the brand in general ("we never…", "always…"). If they say \
 "captions"/"posts" use posts. platforms only when the owner names one (instagram, facebook, linkedin, twitter, \
@@ -176,10 +182,10 @@ contradicts or cancels it (e.g. a newer "long captions" replaces an older "short
 removes the instruction to do X). Never repeat an instruction that already exists.
 5. Change ONLY what the owner asked about. Never invent business facts, prices, offers or claims. Never touch \
 a field because you think it could be better.
-6. If the message is not a preference — a question, small talk, or a request for a piece of content \
-("write a post about our sale") — set understood false, make no changes, and use "question" to say briefly \
-that this box is for telling Jane how to write and what to remember, with an example. If it is a preference \
-but too vague to act on ("make it better"), set understood false and ask one short specific question.
+6. If the message is not a preference, set understood false and make no changes: not_a_preference = \
+"content_request" when they ask for a piece of content ("write a post about our sale"), "question" for a \
+question or small talk. If it is a preference but too vague to act on ("make it better"), set \
+not_a_preference = "vague" and ask one short, specific question with two or three concrete options.
 7. reply: talk to the owner ("Done — captions will be short, …"). Mention anything significant, e.g. that \
 Auto-tab posts will now publish without review.
 
@@ -285,7 +291,17 @@ def _new_value(key: str, op: str, value: Any, current: Any) -> Tuple[bool, Any]:
     return False, None
 
 
+_FIELD_VALUE_LABELS = {
+    ("voice_profile.hook_style", "question"): "A question",
+    ("voice_profile.hook_style", "controversial"): "A contrarian take",
+    ("voice_profile.cta_style", "question"): "A question",
+    ("voice_profile.humor_level", "none"): "None",
+}
+
+
 def _display(key: str, value: Any) -> str:
+    if (key, str(value)) in _FIELD_VALUE_LABELS:
+        return _FIELD_VALUE_LABELS[(key, str(value))]
     if value in (None, "", [], {}):
         return "—"
     if FIELDS.get(key, {}).get("kind") == "slots":
@@ -294,7 +310,8 @@ def _display(key: str, value: Any) -> str:
         return ", ".join(str(v) for v in value)
     if key == "guardrails.max_hashtags" and str(value) == "0":
         return "None"
-    return _VALUE_LABELS.get(str(value), str(value))
+    text = _VALUE_LABELS.get(str(value), str(value))
+    return text[:1].upper() + text[1:] if FIELDS.get(key, {}).get("kind") == "enum" else text
 
 
 # ── Turning the model's proposal into a safe update ──────────────────────────
@@ -389,6 +406,10 @@ def plan_update(proposal: Dict[str, Any], profile: Dict[str, Any], now: Optional
 
 # ── Public operations ────────────────────────────────────────────────────────
 
+_HOW_TO = ("Tell Jane how you'd like your content written or what to always or never do — e.g. \"Keep captions "
+           "short and never use emojis\" or \"Be more formal on LinkedIn\".")
+
+
 class InstructError(Exception):
     def __init__(self, message: str, status: int = 400):
         super().__init__(message)
@@ -430,9 +451,15 @@ async def instruct(db: AsyncIOMotorDatabase, user_id: str, brand_id: Optional[st
         raise InstructError("Jane couldn't read that just now — please try again in a minute.", status=503)
 
     if not proposal.get("understood", True) and not proposal.get("changes") and not proposal.get("remember"):
-        return {"understood": False, "reply": _clean_text(proposal.get("question") or proposal.get("reply"), 600)
-                or "Tell Jane how you'd like your content written, e.g. \"Keep captions short and never use emojis\".",
-                "changes": [], "added": [], "removed": [], "change_id": None}
+        kind = proposal.get("not_a_preference")
+        if kind == "content_request":
+            reply = ("This box changes how Jane writes for you — to make a post, use Create Content. Here you can "
+                     "say things like \"Always mention free delivery\" or \"Keep captions under 3 lines\".")
+        elif kind == "vague":
+            reply = _clean_text(proposal.get("question"), 600) or _HOW_TO
+        else:
+            reply = _HOW_TO
+        return {"understood": False, "reply": reply, "changes": [], "added": [], "removed": [], "change_id": None}
 
     plan = plan_update(proposal, profile)
     if not plan["set"]:
