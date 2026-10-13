@@ -87,6 +87,17 @@ async def reconcile_ad_spend_charges(db) -> dict:
         for k in result:
             result[k] += tiktok_result[k]
 
+    # Google: each campaign lives in its brand's OWN Google Ads account, so one
+    # dispatcher finds the right account per campaign (google_flow.GoogleCampaigns).
+    from . import google_flow
+    if google_flow.configured() and await db[google_flow.GOOGLE_CAMPAIGNS].find_one({"brand_id": {"$ne": None}}):
+        google_result = await _sweep_platform(
+            db, wallet, notification_service, adapter=google_flow.GoogleCampaigns(db),
+            collection=google_flow.GOOGLE_CAMPAIGNS, api_error_cls=google_flow.GoogleAdsAPIError,
+        )
+        for k in result:
+            result[k] += google_result[k]
+
     return result
 
 

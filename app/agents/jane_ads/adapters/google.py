@@ -49,6 +49,10 @@ from .. import constants as C
 
 COLLECTION = "jane_ads_google_campaigns"
 
+_NIGERIA = "geoTargetConstants/2566"
+# Google campaign.status -> the labels the campaign list already uses for Meta/TikTok.
+_DELIVERY_LABELS = {"ENABLED": "Active", "PAUSED": "Paused", "REMOVED": "Deleted"}
+
 # Standing negative-keyword list (§3.3 of the source design doc) — filtered out of the
 # model's own output only when the category itself legitimately IS one of these (e.g.
 # a training business shouldn't negative "training").
@@ -432,15 +436,17 @@ class GoogleAdsAdapter(AdPlatformAdapter):
                 _raise_for_error(campaign_data, "campaign creation")
                 campaign_resource_name = campaign_data["results"][0]["resourceName"]
 
-                # 3. Geo targeting — Nigeria-scoped, matching Meta's ["NG"] default.
-                # (Real per-brand geo targeting from plan.geo is a follow-up; Nigeria-
-                # wide is the safe starting default, never narrower than intended.)
+                # 3. Geo targeting — the plan's own city/state when Google knows it
+                # (see _resolve_geo), otherwise Nigeria. Every campaign used to target
+                # the whole country, so a Lagos-only business paid for clicks from
+                # everywhere.
+                geo_constant = await self._resolve_geo(geo)
                 geo_resp = await client.post(
                     f"{self._api_base}/customers/{self._customer_id}/campaignCriteria:mutate",
                     headers=self._headers(),
                     json={"operations": [{"create": {
                         "campaign": campaign_resource_name,
-                        "location": {"geoTargetConstant": "geoTargetConstants/2566"},  # Nigeria
+                        "location": {"geoTargetConstant": geo_constant},
                     }}]},
                 )
                 _raise_for_error(geo_resp.json(), "geo targeting creation")
@@ -531,6 +537,10 @@ class GoogleAdsAdapter(AdPlatformAdapter):
                 "ad_id": ad_id,
                 "business_id": plan.business_id,
                 "customer_id": self._customer_id,
+                "login_customer_id": self._login_customer_id,
+                "currency_code": self._currency_code,
+                "budget_resource_name": budget_resource_name,
+                "geo_target": geo_constant,
                 "platform": "google",
                 "last_click_count": 0,
                 "created_at": datetime.now(timezone.utc),
@@ -544,6 +554,98 @@ class GoogleAdsAdapter(AdPlatformAdapter):
             platforms=[Platform.GOOGLE],
             launched=True,
         )
+
+    async def _resolve_geo(self, geo: str) -> str:
+        """Google's location id for the plan's place ("Lagos", "Ikeja, Lagos",
+        "Abuja"...), from Google's own location search limited to Nigeria.
+        Falls back to the whole country when there's no place, no match or the
+        lookup fails — never blocks a launch."""
+        place = (geo or "").split(",")[0].strip()
+        if not place or place.lower() in ("nigeria", "ng", "nationwide", "all of nigeria"):
+            return _NIGERIA
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.post(
+                    f"{self._api_base}/geoTargetConstants:suggest",
+                    headers=self._headers(),
+                    json={"locale": "en", "countryCode": "NG", "locationNames": {"names": [place]}},
+                )
+            data = resp.json()
+            for suggestion in (data.get("geoTargetConstantSuggestions") or []):
+                constant = suggestion.get("geoTargetConstant") or {}
+                if constant.get("status", "ENABLED") == "ENABLED" and constant.get("resourceName"):
+                    return constant["resourceName"]
+        except Exception as e:
+            print(f"[GoogleAdsAdapter] location lookup for {place!r} failed, using Nigeria: {e}", flush=True)
+        return _NIGERIA
+
+    async def fetch_campaign_summary(self, campaign_id: str) -> dict:
+        """One snapshot for the campaign list and the hourly spend sweep — the same
+        dict shape MetaAdPlatformAdapter/TikTokAdsAdapter return, which billing.py
+        and the campaign list read directly. Spend comes back in the account's
+        currency and is converted to naira. A click stands in for a conversation
+        (Google has no "conversation started" signal), as poll_conversations says."""
+        cid = "".join(ch for ch in str(campaign_id) if ch.isdigit())
+        rows = await self._gaql_search(
+            "SELECT campaign.status, campaign.end_date, customer.currency_code, metrics.cost_micros, "
+            f"metrics.impressions, metrics.clicks FROM campaign WHERE campaign.id = {cid}"
+        )
+        if not rows:
+            return {"delivery": "Deleted", "spend_ngn": 0.0, "impressions": 0, "reach": 0,
+                    "conversations": 0, "cost_per_conversation_ngn": None, "ends_at": None}
+        row = rows[0]
+        currency = row.get("customer", {}).get("currencyCode", "") or self._currency_code
+        metrics = row.get("metrics", {})
+        clicks = int(metrics.get("clicks", 0))
+        spend_ngn = to_ngn(float(metrics.get("costMicros", 0)) / 1_000_000, currency)
+        impressions = int(metrics.get("impressions", 0))
+        return {
+            "delivery": _DELIVERY_LABELS.get(row.get("campaign", {}).get("status", ""), "Paused"),
+            "spend_ngn": spend_ngn,
+            "impressions": impressions,
+            "reach": impressions,          # Search reports impressions, not unique reach
+            "conversations": clicks,
+            "cost_per_conversation_ngn": (spend_ngn / clicks) if clicks else None,
+            "ends_at": row.get("campaign", {}).get("endDate") or None,
+        }
+
+    async def set_delivery(self, campaign_id: str, active: bool) -> dict:
+        """Turn a campaign on or off from the campaign list. Like Meta and TikTok,
+        Google only delivers when the campaign, its ad group AND its ad are all
+        enabled — everything is created paused — so the same status is set on all
+        three. Going active is the one consequential action: budget can start
+        being spent from then on."""
+        record = await self._get_campaign_record(campaign_id)
+        status = "ENABLED" if active else "PAUSED"
+        cid = "".join(ch for ch in str(campaign_id) if ch.isdigit())
+        ad_group = record.get("ad_group_id") or ""
+        ad_id = record.get("ad_id") or ""
+        targets = [("campaign", "campaigns", f"customers/{self._customer_id}/campaigns/{cid}")]
+        if ad_group:
+            targets.append(("ad_group", "adGroups", ad_group))
+            if ad_id:
+                targets.append(("ad", "adGroupAds",
+                                f"customers/{self._customer_id}/adGroupAds/{ad_group.split('/')[-1]}~{ad_id}"))
+        updated: dict = {}
+        async with httpx.AsyncClient(timeout=30) as client:
+            for name, service, resource in targets:
+                resp = await client.post(
+                    f"{self._api_base}/customers/{self._customer_id}/{service}:mutate",
+                    headers=self._headers(),
+                    json={"operations": [{"update": {"resourceName": resource, "status": status},
+                                          "updateMask": "status"}]},
+                )
+                data = resp.json()
+                _raise_for_error(data, f"{name} status update")
+                updated[name] = bool(data.get("results"))
+        return {"status": status, "updated": updated}
+
+    async def delete_campaign(self, campaign_id: str) -> bool:
+        """Permanently remove the campaign (and the budget it used) from the
+        client's Google Ads account. Raises on failure — a delete the caller
+        asked for must not fail silently."""
+        result = await self.remove_campaign(campaign_id)
+        return bool(result.get("removed"))
 
     async def _remove_budget(self, budget_resource_name: str) -> None:
         """Best-effort removal of a budget a failed launch left behind (it costs

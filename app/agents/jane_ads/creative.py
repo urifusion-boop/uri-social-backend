@@ -495,7 +495,7 @@ async def write_ad_copy(business_name: str, category: str, goal: str = "messages
            f"{service_area}\n" if service_area else "")
         + f"- the_action: {copy_action(coerce_type(destination_type))}\n"
     )
-    ad_label = "TikTok" if platform == "tiktok" else "Meta/Instagram"
+    ad_label = "TikTok" if platform == "tiktok" else "Google Search" if platform == "google" else "Meta/Instagram"
     # TikTok's own feed is dominated by phone-shot, unstaged footage — an obviously
     # art-directed brand photoshoot reads as an ad and gets scrolled past. Meta's
     # image brief stays exactly as it was (still additive-only per platform).
@@ -980,6 +980,27 @@ def assemble_creative(copy: AdCopy, image_url: Optional[str],
         shows_service_area=bool(service_area) and service_area.lower() in combined.lower(),
         copy_length=len(combined),
     )
+
+
+async def search_ad_creative(
+    business_name: str, category: str, goal: str = "messages", description: str = "",
+    user_id: str = "", db=None, brand_id: Optional[str] = None, city: str = "",
+    behaviour: str = "", service_area: str = "", audience_segment: str = "", who_its_for: str = "",
+    geo_pockets: Optional[list[str]] = None, destination_type: str = DEFAULT_DESTINATION.value,
+    destination_cta: str = "",
+) -> AdCreative:
+    """The creative for a Google SEARCH ad: Jane's headline and description,
+    voice-matched to the Brand Playbook like every other ad — and no image,
+    because a search ad is text. Nothing is generated, so it costs no content
+    credit. The adapter turns this into the 3+ headlines and 2+ descriptions
+    Google requires (adapters/google.rsa_assets)."""
+    brand_context = await get_brand_context(user_id, db, brand_id) if db is not None and user_id else {}
+    copy = await write_ad_copy(business_name, category, goal, description, brand_context,
+                               city, behaviour, service_area, audience_segment, who_its_for,
+                               geo_pockets=geo_pockets, destination_type=destination_type, platform="google")
+    return assemble_creative(copy, "", source=CreativeSource.GENERATE, is_video=False,
+                             service_area=service_area, destination_type=destination_type,
+                             destination_cta=destination_cta)
 
 
 # ── The three entry points ────────────────────────────────────────────────────

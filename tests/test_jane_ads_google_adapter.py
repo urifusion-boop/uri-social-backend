@@ -103,6 +103,15 @@ def _mock_client(responses):
     return client
 
 
+@pytest.fixture(autouse=True)
+def _nigeria_wide(monkeypatch):
+    """These tests count the launch's HTTP calls in order; the location lookup is
+    covered on its own (tests/test_jane_ads_google_flow.py), so it's pinned here."""
+    async def nigeria(self, geo):
+        return "geoTargetConstants/2566"
+    monkeypatch.setattr(GoogleAdsAdapter, "_resolve_geo", nigeria)
+
+
 def _adapter(db=None) -> GoogleAdsAdapter:
     return GoogleAdsAdapter(db or FakeDb(), customer_id="1234567890", login_customer_id="9999999999",
                             access_token="tok", currency_code="NGN")
