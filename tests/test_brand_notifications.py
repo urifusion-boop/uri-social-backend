@@ -19,6 +19,24 @@ class TestPreferences:
         assert bn.channels_for("post_published", prefs) == ["email"]
         assert bn.channels_for("weekly_report", prefs) == []
 
+    def test_channel_chosen_but_no_alerts_ticked_keeps_the_standard_two(self):
+        """The normal state after onboarding (a channel saved, no alert list) must
+        not silence the emails every brand has always received."""
+        prefs = bn.preferences({"notification_channel": "Email", "notification_events": []})
+        assert bn.channels_for("post_ready", prefs) == ["email"]
+        assert bn.channels_for("post_published", prefs) == ["email"]
+        assert bn.channels_for("weekly_report", prefs) == []      # newer alerts stay opt-in
+        slack = bn.preferences({"notification_channel": "Slack"})
+        assert bn.channels_for("post_published", slack) == ["slack"]
+
+    def test_only_real_changes_leave_the_original_email_path(self):
+        assert not bn.is_customised(bn.preferences({}))
+        assert not bn.is_customised(bn.preferences({"notification_channel": "Email"}))
+        assert not bn.is_customised(bn.preferences({"notification_channel": "Email", "approval_channels": ["Dashboard", "Email"]}))
+        assert bn.is_customised(bn.preferences({"notification_channel": "Slack"}))
+        assert bn.is_customised(bn.preferences({"notification_events": ["Post published"]}))
+        assert bn.is_customised(bn.preferences({"approval_channels": ["WhatsApp"]}))
+
     def test_chosen_channel_is_used(self):
         prefs = bn.preferences({"notification_events": ["Post published"], "notification_channel": "Slack"})
         assert bn.channels_for("post_published", prefs) == ["slack"]
@@ -193,6 +211,10 @@ class TestNotifyEndToEnd:
         result, sent, records = self._run({"notification_events": ["Weekly performance report"],
                                            "notification_channel": "Email"}, monkeypatch)
         assert result == {"skipped": "not enabled"} and sent == [] and records == []
+
+    def test_channel_only_brand_still_gets_post_alerts(self, monkeypatch):
+        result, sent, records = self._run({"notification_channel": "Email", "notification_events": []}, monkeypatch)
+        assert sent == ["send_email"] and len(records) == 1
 
     def test_unconfigured_brand_gets_email(self, monkeypatch):
         result, sent, records = self._run({}, monkeypatch)

@@ -389,13 +389,15 @@ class NotificationService:
     # ==================== PRD 4.2: Content Created Notification ====================
 
     async def _brand_prefs_configured(self, user_id: str, brand_id: Optional[str]) -> bool:
-        """Has this brand chosen its own notifications in the Brand Playbook?"""
+        """Has this brand chosen notifications that differ from the defaults in
+        the Brand Playbook? (Just having "Email" saved doesn't count — that
+        brand keeps the original branded email and limits.)"""
         from app.services import brand_notifier
         try:
             profile = await brand_notifier._profile(self.db, user_id, brand_id)
         except Exception:
             return False
-        return brand_notifier.preferences(profile)["configured"]
+        return brand_notifier.is_customised(brand_notifier.preferences(profile))
 
     async def notify_content_created(
         self,
@@ -409,6 +411,9 @@ class NotificationService:
         its own notification choices in the Brand Playbook gets them instead."""
         if await self._brand_prefs_configured(user_id, brand_id):
             from app.services import brand_notifier
+            # Same window as the original email: one "content ready" per 4 hours.
+            if await self._was_recently_sent(user_id, "content_created", hours=4):
+                return
             app_url = (settings.WEB_APP_URL or "https://www.urisocial.com").strip("'\"")
             await brand_notifier.notify(
                 self.db, user_id, brand_id, "post_ready",
@@ -477,6 +482,9 @@ class NotificationService:
         set its own notification choices in the Brand Playbook gets them instead."""
         if await self._brand_prefs_configured(user_id, brand_id):
             from app.services import brand_notifier
+            # Same window as the original email: one "published" per 2 hours.
+            if await self._was_recently_sent(user_id, "content_posted", hours=2):
+                return
             app_url = (settings.WEB_APP_URL or "https://www.urisocial.com").strip("'\"")
             await brand_notifier.notify(
                 self.db, user_id, brand_id, "post_published",
