@@ -409,6 +409,14 @@ class VideoStoryboardService:
             _brief = brand_brief.build(brand_context, sections=("rules", "audience", "offer", "pulse"))
             if _brief:
                 preamble_lines.append("")
+                # The brief is about WORDS. video_prompt goes to the video model and must stay
+                # plain-English and visual, or rules/promotions get rendered into the footage.
+                preamble_lines.append(
+                    "The BRAND BRIEF below governs the words people will read or hear — every "
+                    "text_overlay — and which ideas the video is built around. Each video_prompt "
+                    "stays a plain-English VISUAL description: never write rules, promotions, prices "
+                    "or brand copy into a video_prompt."
+                )
                 preamble_lines.append(_brief)
             contents: List[Any] = [genai_types.Part.from_text(text="\n".join(preamble_lines))]
 
