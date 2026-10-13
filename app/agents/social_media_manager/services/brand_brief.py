@@ -33,6 +33,14 @@ PRIORITY_ORDER = (
     "(4) everything else."
 )
 
+# Seen in real output on dev: a caption invented "over 60% of small businesses
+# lose track of contract renewal dates". A made-up number published under a
+# brand's name is the brand's liability, so this is stated wherever the brief is.
+TRUTH_RULE = (
+    "NEVER invent facts: no made-up statistics, percentages, prices, customer names, results, awards "
+    "or dates. Use only what is given here; if a claim needs a number you weren't given, make the point without one."
+)
+
 PULSE_FRESH_DAYS = 21    # same threshold the content calendar uses
 PULSE_EXPIRY_DAYS = 45   # older than this, a "current" promotion is no longer mentioned at all
 
@@ -62,14 +70,43 @@ def banned_words(bc: Optional[Dict[str, Any]]) -> List[str]:
     return out
 
 
+def banned_pattern(word: str) -> "re.Pattern":
+    """Matches a banned word in its common forms, or a banned phrase exactly.
+    Banning "streamline" also has to catch "streamlined" and "streamlining" —
+    seen on dev, where the exact-word check let those through — but must not
+    catch unrelated words that merely contain it ("ok" in "book")."""
+    w = word.strip().lower()
+    if re.fullmatch(r"[a-z]{3,}", w):
+        if w.endswith("e"):
+            core = f"(?:{re.escape(w)}(?:s|d|r|rs)?|{re.escape(w[:-1])}(?:ing|ed|er|ers))"
+        elif w.endswith("y"):
+            core = f"(?:{re.escape(w)}|{re.escape(w[:-1])}(?:ies|ied|ier))"
+        else:
+            core = f"{re.escape(w)}(?:s|es|ed|ing|er|ers)?"
+    else:
+        core = re.escape(w)
+    return re.compile(r"(?<!\w)" + core + r"(?!\w)")
+
+
+def find_banned(text: str, words: Iterable[str]) -> List[str]:
+    """Which of `words` appear in `text`, in any common form."""
+    lowered = (text or "").lower()
+    return [w for w in words if str(w).strip() and banned_pattern(str(w)).search(lowered)]
+
+
 def languages_rule(bc: Optional[Dict[str, Any]]) -> Optional[str]:
     langs = _list((bc or {}).get("languages"))
     if not langs or langs == ["English"]:
         return None
     if len(langs) == 1:
-        return f"Write in {langs[0]}."
+        return f"Write in {langs[0]} — the whole piece, not English."
+    others = ", ".join(langs[1:])
+    # "Naturally mix in" alone was ignored: on dev, nine pieces in a row came
+    # back in plain English. It has to be a requirement the model can check.
     return (f"Languages: {', '.join(langs)}. Write mainly in {langs[0]} and naturally mix in "
-            f"{', '.join(langs[1:])} the way this audience actually speaks — not a translation, a natural blend.")
+            f"{others} the way this audience actually speaks — not a translation, a natural blend. "
+            f"REQUIRED: every piece must contain at least one genuine {others} phrase or sentence; "
+            f"a piece written only in {langs[0]} is wrong.")
 
 
 def hard_rules(bc: Optional[Dict[str, Any]], captions: bool = False, language: bool = True) -> List[str]:
@@ -83,7 +120,8 @@ def hard_rules(bc: Optional[Dict[str, Any]], captions: bool = False, language: b
         rules.append(f"NEVER mention or reference: {g['avoid_topics']}.")
     words = banned_words(bc)
     if words:
-        rules.append(f"NEVER use these words or phrases: {', '.join(words)}.")
+        rules.append(f"NEVER use these words or phrases: {', '.join(words)}. "
+                     f"This covers every form of each word (plural, -ed, -ing...).")
     if g.get("compliance_notes"):
         rules.append(f"Compliance requirement: {g['compliance_notes']}.")
     if language and languages_rule(bc):
@@ -103,12 +141,7 @@ def hard_rules(bc: Optional[Dict[str, Any]], captions: bool = False, language: b
 def violations(text: str, bc: Optional[Dict[str, Any]]) -> List[str]:
     """Banned words/phrases that appear in `text` (whole words, any case).
     For checking a piece of writing after the model produced it."""
-    lowered = (text or "").lower()
-    found = []
-    for w in banned_words(bc):
-        if re.search(r"(?<!\w)" + re.escape(w.lower()) + r"(?!\w)", lowered):
-            found.append(w)
-    return found
+    return find_banned(text, banned_words(bc))
 
 
 # ── 2. Voice ─────────────────────────────────────────────────────────────────
@@ -309,5 +342,5 @@ def build(
         block("HAPPENING RIGHT NOW (use where it genuinely fits; quote the real terms, never invent any):", pulse(bc, now=now))
     if not parts:
         return ""
-    header = f"BRAND BRIEF{f' — {name}' if name else ''}\n{PRIORITY_ORDER}"
+    header = f"BRAND BRIEF{f' — {name}' if name else ''}\n{PRIORITY_ORDER}\n{TRUTH_RULE}"
     return header + "\n\n" + "\n\n".join(parts)

@@ -30,7 +30,8 @@ class TestHardRules:
     def test_all_sources_of_banned_words_in_one_rule(self):
         assert bb.banned_words(FULL) == ["synergy", "deal of the century", "cheap", "hack"]
         rules = bb.hard_rules(FULL)
-        assert "NEVER use these words or phrases: synergy, deal of the century, cheap, hack." in rules
+        assert any(r.startswith("NEVER use these words or phrases: synergy, deal of the century, cheap, hack.") for r in rules)
+        assert any("every form of each word" in r for r in rules)
 
     def test_avoid_topics_compliance_language_emoji(self):
         rules = " ".join(bb.hard_rules(FULL))
@@ -54,8 +55,20 @@ class TestViolations:
     def test_finds_banned_words_and_phrases_any_case(self):
         assert bb.violations("A CHEAP lunch — the deal of the century!", FULL) == ["deal of the century", "cheap"]
 
-    def test_whole_words_only(self):
-        assert bb.violations("We love cheapskates... no: cheaper is fine", {"words_to_avoid": ["cheap"]}) == []
+    def test_unrelated_words_containing_it_are_not_flagged(self):
+        assert bb.violations("We love cheapskates and a good book", {"words_to_avoid": ["cheap", "ok"]}) == []
+
+    def test_every_form_of_a_banned_word_is_caught(self):
+        """Seen on dev: "streamline" was banned, and posts used "streamlining" and "streamlined"."""
+        for text in ("streamline your work", "streamlines everything", "streamlined ops", "by streamlining paperwork"):
+            assert bb.violations(text, {"words_to_avoid": ["streamline"]}) == ["streamline"], text
+        assert bb.violations("we empowered teams", {"words_to_avoid": ["empower"]}) == ["empower"]
+        assert bb.violations("two synergies", {"words_to_avoid": ["synergy"]}) == ["synergy"]
+        assert bb.violations("a cheaper option", {"words_to_avoid": ["cheap"]}) == ["cheap"]
+
+    def test_phrases_match_exactly(self):
+        assert bb.violations("the deal of the century!", {"words_to_avoid": ["deal of the century"]}) == ["deal of the century"]
+        assert bb.violations("a great deal this century", {"words_to_avoid": ["deal of the century"]}) == []
 
     def test_clean_text(self):
         assert bb.violations("Fresh jollof, every morning.", FULL) == []
@@ -327,7 +340,8 @@ class TestPlaybookWinsOverOlderDefaults:
         import inspect
         from app.agents.social_media_manager.routers import complete_social_manager as csm
 
-        assert "build_caption_prompt(" in inspect.getsource(csm.preview_playbook_voice)
+        # The preview runs the very function real posts are written by.
+        assert "ContentGenerationService._generate_platform_content(" in inspect.getsource(csm.preview_playbook_voice)
         assert "build_caption_prompt(seed_content, platform, brand_context)" in inspect.getsource(
             ContentGenerationService._generate_platform_content)
 
@@ -338,6 +352,26 @@ class TestPlaybookWinsOverOlderDefaults:
         assert "No slang or pidgin" not in prompt
         assert prompt.count("naturally mix in Pidgin") >= 2      # voice profile line + hard rule
         assert "FINAL line of the post" in prompt
+
+
+class TestTruthAndLanguageAreRequirements:
+    def test_never_invent_facts_is_stated_with_the_priority_order(self):
+        assert "NEVER invent facts" in bb.build(FULL)
+        assert "NEVER invent facts" in ContentGenerationService._build_brand_block({"brand_name": "B"})
+
+    def test_mixed_languages_are_a_checkable_requirement(self):
+        rule = bb.languages_rule({"languages": ["English", "Pidgin"]})
+        assert "REQUIRED: every piece must contain at least one genuine Pidgin phrase" in rule
+        assert "written only in English is wrong" in rule
+
+    def test_single_language_means_the_whole_piece(self):
+        assert bb.languages_rule({"languages": ["Yoruba"]}) == "Write in Yoruba — the whole piece, not English."
+
+    def test_caption_validator_catches_other_forms_of_a_brand_word(self):
+        from app.agents.social_media_manager.services.caption_validator_service import CaptionValidatorService
+
+        result = CaptionValidatorService.validate_caption("We are streamlining your paperwork.", ["streamline"])
+        assert any("banned_word: 'streamline'" in i for i in result["issues"])
 
 
 if __name__ == "__main__":
