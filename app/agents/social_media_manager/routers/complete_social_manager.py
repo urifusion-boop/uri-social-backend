@@ -353,6 +353,9 @@ class BrandProfileRequest(BaseModel):
     # Approval
     approval_workflow: Optional[str] = None
     approval_channels: Optional[List[str]] = None
+    # Slack incoming-webhook URL for Playbook notifications (Telegram's chat id
+    # is set only by the bot link flow, never from the client).
+    slack_webhook_url: Optional[str] = None
     notification_events: Optional[List[str]] = None
     notification_channel: Optional[str] = None
     # Team
@@ -704,6 +707,7 @@ async def generate_content(
                     content_preview=preview,
                     platforms=platforms_str,
                     campaign_id=request_id or "",
+                    brand_id=active_brand_id,
                 )
             except Exception as e:
                 print(f"⚠️ Content created notification failed: {e}")
@@ -1403,6 +1407,7 @@ Create engaging social media captions for THIS UPLOADED CONTENT. Base your writi
                     content_preview=preview,
                     platforms=platforms_str,
                     campaign_id=request_id or "",
+                    brand_id=active_brand_id,
                 )
             except Exception as e:
                 print(f"⚠️ Content created notification failed: {e}")

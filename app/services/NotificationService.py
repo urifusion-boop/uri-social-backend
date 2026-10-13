@@ -388,14 +388,37 @@ class NotificationService:
 
     # ==================== PRD 4.2: Content Created Notification ====================
 
+    async def _brand_prefs_configured(self, user_id: str, brand_id: Optional[str]) -> bool:
+        """Has this brand chosen its own notifications in the Brand Playbook?"""
+        from app.services import brand_notifier
+        try:
+            profile = await brand_notifier._profile(self.db, user_id, brand_id)
+        except Exception:
+            return False
+        return brand_notifier.preferences(profile)["configured"]
+
     async def notify_content_created(
         self,
         user_id: str,
         content_preview: str = "",
         platforms: str = "",
         campaign_id: str = "",
+        brand_id: Optional[str] = None,
     ):
-        """PRD 4.2: Email when content generation completes."""
+        """PRD 4.2: Email when content generation completes. A brand that set
+        its own notification choices in the Brand Playbook gets them instead."""
+        if await self._brand_prefs_configured(user_id, brand_id):
+            from app.services import brand_notifier
+            app_url = (settings.WEB_APP_URL or "https://www.urisocial.com").strip("'\"")
+            await brand_notifier.notify(
+                self.db, user_id, brand_id, "post_ready",
+                title="Your post is ready for review",
+                message=(f"New draft for {platforms}: " if platforms else "New draft: ") + (content_preview or "")[:200],
+                link=f"{app_url}/workspace",
+                metadata={"campaign_id": campaign_id, "platforms": platforms},
+                dedupe_key=campaign_id or None, dedupe_hours=1 if campaign_id else 0,
+            )
+            return
         user = await self._get_user(user_id)
         if not user or user.get("notification_opt_out"):
             return
@@ -448,8 +471,21 @@ class NotificationService:
         platform: str = "",
         content_preview: str = "",
         campaign_id: str = "",
+        brand_id: Optional[str] = None,
     ):
-        """PRD 4.3: Email when content is successfully published."""
+        """PRD 4.3: Email when content is successfully published. A brand that
+        set its own notification choices in the Brand Playbook gets them instead."""
+        if await self._brand_prefs_configured(user_id, brand_id):
+            from app.services import brand_notifier
+            app_url = (settings.WEB_APP_URL or "https://www.urisocial.com").strip("'\"")
+            await brand_notifier.notify(
+                self.db, user_id, brand_id, "post_published",
+                title=f"Published on {platform}" if platform else "Your post is live",
+                message=(content_preview or "")[:200],
+                link=f"{app_url}/workspace",
+                metadata={"campaign_id": campaign_id, "platform": platform},
+            )
+            return
         user = await self._get_user(user_id)
         if not user or user.get("notification_opt_out"):
             return
