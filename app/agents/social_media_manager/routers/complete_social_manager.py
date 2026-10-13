@@ -5934,6 +5934,7 @@ async def preview_playbook_voice(
         "caption": caption,
         "platform": platform,
         "banned_words_used": brand_brief.violations(caption, bc),
+        "playbook_issues": (generated.get("ai_metadata") or {}).get("playbook_issues") or [],
     })
 
 

@@ -473,11 +473,24 @@ class ApprovalWorkflowService:
             if regeneration_feedback:
                 enhanced_seed += f"\n\nUser feedback: {regeneration_feedback}"
 
+            # "Regenerate" used to write with no brand at all: the new version
+            # ignored the whole Playbook (voice, banned words, language, CTA).
+            from .brand_profile_service import BrandProfileService
+            _brand_id = draft.get("brand_id") or request.get("brand_id")
+            _profile = await db["brand_profiles"].find_one(
+                {"brand_id": _brand_id} if _brand_id else {"user_id": user_id}
+            )
+            brand_context = None
+            if _profile:
+                _profile.pop("_id", None)
+                brand_context = BrandProfileService.to_brand_context(_profile)
+
             result = await ContentGenerationService._generate_platform_content(
                 platform=draft["platform"],
                 seed_content=enhanced_seed,
                 request_id=draft["request_id"],
-                user_id=user_id
+                user_id=user_id,
+                brand_context=brand_context,
             )
 
             if result.get('status'):
