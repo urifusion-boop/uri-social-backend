@@ -5653,6 +5653,80 @@ async def save_brand_profile(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/brand-profile/health")
+async def get_playbook_health(
+    ctx: dict = Depends(get_active_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """
+    How complete the active brand's Playbook is: a weighted score, the most
+    valuable things still missing (and which of Jane's jobs each improves),
+    and the "used in" map shown under each Playbook field.
+    """
+    from ..services import playbook_health
+    try:
+        profile_result = await BrandProfileService.get(ctx["user_id"], db, brand_id=ctx["brand_id"])
+        profile = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
+        return UriResponse.get_single_data_response("playbook_health", playbook_health.assess(profile))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+PLAYBOOK_PREVIEWS_PER_DAY = 20
+
+
+class PlaybookPreviewRequest(BaseModel):
+    platform: Optional[str] = "instagram"
+
+
+@router.post("/brand-profile/preview-voice")
+async def preview_playbook_voice(
+    request: PlaybookPreviewRequest,
+    ctx: dict = Depends(get_active_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """
+    "Preview Jane's voice": one sample caption written from the Playbook as
+    it is saved right now, through the same brand instructions real posts
+    get. Nothing is saved as a draft and no credits are used; capped per day.
+    """
+    from app.services.AIService import AIService
+    from ..services import brand_brief
+    from ..services.content_generation_service import ContentGenerationService
+
+    user_id = ctx["user_id"]
+    day_key = f"{user_id}:{datetime.utcnow().strftime('%Y-%m-%d')}"
+    usage = await db["playbook_preview_usage"].find_one_and_update(
+        {"_id": day_key}, {"$inc": {"count": 1}, "$setOnInsert": {"created_at": datetime.utcnow()}},
+        upsert=True, return_document=True,
+    )
+    if (usage or {}).get("count", 1) > PLAYBOOK_PREVIEWS_PER_DAY:
+        raise HTTPException(status_code=429, detail="You've previewed a lot today — try again tomorrow.")
+
+    profile_result = await BrandProfileService.get(user_id, db, brand_id=ctx["brand_id"])
+    profile = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
+    if not profile:
+        raise HTTPException(status_code=400, detail="Fill in your Brand Playbook first.")
+    bc = BrandProfileService.to_brand_context(profile)
+    platform = (request.platform or "instagram").lower()
+    brand_block = ContentGenerationService._build_brand_block(bc, platform=platform)
+    prompt = (
+        f"{brand_block}\n"
+        f"Write ONE short {platform} caption (2-4 sentences) introducing what this business offers and "
+        f"inviting people to take the next step. Follow every instruction above. Return only the caption."
+    )
+    ai_request = AIService.build_ai_model(messages=[{"role": "user", "content": prompt}], temperature=0.7)
+    response = await AIService.chat_completion(ai_request)
+    if isinstance(response, dict) and "error" in response:
+        raise HTTPException(status_code=503, detail="Jane is busy right now — try again in a minute.")
+    caption = response.choices[0].message.content.strip()
+    return UriResponse.get_single_data_response("playbook_preview", {
+        "caption": caption,
+        "platform": platform,
+        "banned_words_used": brand_brief.violations(caption, bc),
+    })
+
+
 @router.get("/brand-profile/next-posting-time")
 async def get_next_posting_time(
     platform: str = "",
