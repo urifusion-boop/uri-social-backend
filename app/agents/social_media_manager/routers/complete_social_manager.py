@@ -5877,6 +5877,104 @@ async def dismiss_playbook_suggestion(
     return UriResponse.get_single_data_response("playbook_suggestions", {"dismissed": request.id})
 
 
+class PlaybookInstructRequest(BaseModel):
+    text: str
+    source: Optional[str] = "playbook"   # where the owner said it: playbook | create | drafts
+
+
+class PlaybookUndoRequest(BaseModel):
+    change_id: str
+
+
+async def _active_profile(ctx: dict, db: AsyncIOMotorDatabase) -> Dict[str, Any]:
+    profile_result = await BrandProfileService.get(ctx["user_id"], db, brand_id=ctx["brand_id"])
+    profile = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
+    if not profile:
+        raise HTTPException(status_code=404, detail="Set up your Brand Playbook first.")
+    return profile
+
+
+@router.post("/brand-profile/instruct")
+async def instruct_playbook(
+    request: PlaybookInstructRequest,
+    ctx: dict = Depends(get_active_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """
+    "Tell Jane": the owner describes what they want in their own words; Jane
+    updates the matching Playbook fields and remembers the rest as standing
+    instructions that every writer follows from then on. Returns what changed
+    (with a change_id that can be undone) and the updated profile.
+    """
+    from ..services import playbook_instructions as pi
+    profile = await _active_profile(ctx, db)
+    source = request.source if request.source in ("playbook", "create", "drafts") else "playbook"
+    try:
+        result = await pi.instruct(db, ctx["user_id"], ctx["brand_id"], profile, request.text, source=source)
+    except pi.InstructError as e:
+        raise HTTPException(status_code=e.status, detail=str(e))
+    fresh = await BrandProfileService.get(ctx["user_id"], db, brand_id=ctx["brand_id"])
+    return UriResponse.get_single_data_response("playbook_instruct", {
+        **{k: result[k] for k in ("understood", "reply", "changes", "change_id")},
+        "added": [pi.public_instruction(i) for i in result["added"]],
+        "removed": [pi.public_instruction(i) for i in result["removed"]],
+        "profile": fresh.get("responseData") or {},
+    })
+
+
+@router.get("/brand-profile/instructions")
+async def list_playbook_instructions(
+    ctx: dict = Depends(get_active_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """What Jane is remembering for this brand, and the recent changes made by telling her."""
+    from ..services import playbook_instructions as pi
+    profile_result = await BrandProfileService.get(ctx["user_id"], db, brand_id=ctx["brand_id"])
+    profile = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
+    items = [pi.public_instruction(i) for i in (profile.get("playbook_instructions") or []) if isinstance(i, dict)]
+    return UriResponse.get_single_data_response("playbook_instructions", {
+        "instructions": items,
+        "history": await pi.history(db, ctx["user_id"], ctx["brand_id"]),
+    })
+
+
+@router.delete("/brand-profile/instructions/{instruction_id}")
+async def delete_playbook_instruction(
+    instruction_id: str,
+    ctx: dict = Depends(get_active_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """Stop following one remembered instruction."""
+    from ..services import playbook_instructions as pi
+    profile = await _active_profile(ctx, db)
+    try:
+        kept = await pi.remove_instruction(db, ctx["user_id"], profile, instruction_id)
+    except pi.InstructError as e:
+        raise HTTPException(status_code=e.status, detail=str(e))
+    return UriResponse.get_single_data_response("playbook_instructions", {
+        "instructions": [pi.public_instruction(i) for i in kept],
+    })
+
+
+@router.post("/brand-profile/instruct/undo")
+async def undo_playbook_instruct(
+    request: PlaybookUndoRequest,
+    ctx: dict = Depends(get_active_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """Put back everything one "Tell Jane" update changed (fields edited again since are left alone)."""
+    from ..services import playbook_instructions as pi
+    profile = await _active_profile(ctx, db)
+    try:
+        result = await pi.undo(db, ctx["user_id"], ctx["brand_id"], profile, request.change_id)
+    except pi.InstructError as e:
+        raise HTTPException(status_code=e.status, detail=str(e))
+    fresh = await BrandProfileService.get(ctx["user_id"], db, brand_id=ctx["brand_id"])
+    return UriResponse.get_single_data_response("playbook_instruct_undo", {
+        **result, "profile": fresh.get("responseData") or {},
+    })
+
+
 PLAYBOOK_PREVIEWS_PER_DAY = 20
 
 
