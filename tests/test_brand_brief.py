@@ -153,6 +153,100 @@ class TestPostsUseTheBrief:
         assert self.build({}) == "" and self.build(None) == ""
 
 
+class TestAdsUseTheBrief:
+    def test_ads_get_rules_offer_and_promos_but_not_the_audience_tier(self):
+        from app.agents.jane_ads.creative import _brand_prompt_bits
+
+        bits = _brand_prompt_bits({**FULL, "business_pulse": {"current_promotions": ["20% off this week"]},
+                                   "business_pulse_updated_at": datetime.utcnow()})
+        assert "HARD RULES (never" in bits
+        assert "NEVER mention or reference: politics." in bits
+        assert "cooked fresh every morning" in bits       # offer
+        assert "20% off this week" in bits                # current promo
+        # Who an ad targets is delivery context — it must not be fed in as copy guidance.
+        assert "AUDIENCE:" not in bits and "Pain points" not in bits
+
+    def test_no_playbook_is_unchanged(self):
+        from app.agents.jane_ads.creative import _brand_prompt_bits
+
+        assert _brand_prompt_bits({}) == ""
+
+    def test_ad_copy_is_checked_for_banned_words(self):
+        import inspect
+        from app.agents.jane_ads import creative
+
+        assert "brand_brief.violations(" in inspect.getsource(creative.write_ad_copy)
+
+
+class TestInboxSoundsLikeTheBrand:
+    PROFILE = {"brand_name": "Bukka", "derived_voice": "playful and warm",
+               "guardrails": {"banned_words": "cheap", "emoji_usage": "no", "avoid_topics": "politics"},
+               "languages": ["Yoruba"]}
+
+    def test_style_has_voice_and_rules_but_not_brand_language(self):
+        from app.agents.inbox.agent import brand_style
+
+        section, banned = brand_style(self.PROFILE)
+        assert "playful and warm" in section
+        assert "NEVER mention or reference: politics." in section and "Use NO emojis" in section
+        assert "Yoruba" not in section      # replies stay in the customer's own language
+        assert "never overrides rules 1-6" in section
+        assert banned == ["cheap"]
+
+    def test_no_profile_no_style(self):
+        from app.agents.inbox.agent import brand_style
+
+        assert brand_style(None) == ("", [])
+        assert brand_style({"brand_name": "X"}) == ("", [])
+
+    def test_prompt_takes_the_style_section(self):
+        from app.agents.inbox.agent import _DRAFT_SYSTEM
+
+        text = _DRAFT_SYSTEM.format(channel="Instagram", public_note="", brand_style="7. Sound like this business.\n")
+        assert "7. Sound like this business." in text
+        assert "Use ONLY facts from the numbered SOURCES" in text
+
+    def test_banned_word_in_draft_is_never_auto_sent(self):
+        import inspect
+        from app.agents.inbox import agent
+
+        src = inspect.getsource(agent.decide_auto_reply)
+        assert 'draft.get("banned_words")' in src
+
+
+class TestCalendarPlanUsesRulesPillarsAndDates:
+    def test_rules_block(self):
+        from app.agents.content_calendar_v2.services.content_calendar_v2_service import _brand_rules_block
+
+        block = _brand_rules_block({**FULL, "content_pillars": ["Behind the scenes", "Tips"],
+                                    "key_dates": "Anniversary (2026-11-02)"})
+        assert "NEVER mention or reference: politics." in block
+        assert "CONTENT PILLARS: Behind the scenes, Tips." in block
+        assert "Anniversary (2026-11-02)" in block
+
+    def test_empty_profile_adds_nothing(self):
+        from app.agents.content_calendar_v2.services.content_calendar_v2_service import _brand_rules_block
+
+        assert _brand_rules_block({}) == ""
+
+
+class TestVideoAndBlogUseTheBrief:
+    def test_wired_in(self):
+        import inspect
+        from app.agents.social_media_manager.services import (
+            blog_generation_service, video_creative_service, video_storyboard_service, voiceover_service,
+        )
+
+        for module in (video_creative_service, video_storyboard_service, voiceover_service, blog_generation_service):
+            assert "brand_brief.build(" in inspect.getsource(module), module.__name__
+
+    def test_voiceover_keeps_the_voices_language(self):
+        import inspect
+        from app.agents.social_media_manager.services import voiceover_service
+
+        assert "language=False" in inspect.getsource(voiceover_service)
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
