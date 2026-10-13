@@ -279,6 +279,7 @@ Write one caption. No alternatives, no meta-commentary.
         parts = [
             "BRAND INSTRUCTIONS — you are writing on behalf of this specific brand. Apply every rule below.",
             brand_brief.PRIORITY_ORDER,
+            brand_brief.TRUTH_RULE,
         ]
         rules = brand_brief.hard_rules(brand_context, captions=True)
         if rules:
@@ -559,7 +560,7 @@ Write one caption. No alternatives, no meta-commentary.
                 f'If any of these are relevant to the post topic, reference them naturally.'
             )
 
-        if len(parts) == 2:
+        if len(parts) == 3:
             # No brand instructions, but still check for voice profile
             brand_block = ""
         else:
