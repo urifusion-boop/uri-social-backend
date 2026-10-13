@@ -5914,11 +5914,12 @@ async def preview_playbook_voice(
         raise HTTPException(status_code=400, detail="Fill in your Brand Playbook first.")
     bc = BrandProfileService.to_brand_context(profile)
     platform = (request.platform or "instagram").lower()
-    brand_block = ContentGenerationService._build_brand_block(bc, platform=platform)
-    prompt = (
-        f"{brand_block}\n"
-        f"Write ONE short {platform} caption (2-4 sentences) introducing what this business offers and "
-        f"inviting people to take the next step. Follow every instruction above. Return only the caption."
+    if platform not in ContentGenerationService.PLATFORM_PROMPTS:
+        platform = "instagram"
+    # Exactly the prompt a real post is written from (same rules, voice profile
+    # and platform format) — a preview that used anything else would mislead.
+    prompt = ContentGenerationService.build_caption_prompt(
+        "Introduce what this business offers and invite people to take the next step.", platform, bc,
     )
     ai_request = AIService.build_ai_model(messages=[{"role": "user", "content": prompt}], temperature=0.7)
     response = await AIService.chat_completion(ai_request)
