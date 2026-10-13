@@ -1964,6 +1964,27 @@ def _vsg01_candidate_params(
     return NO_PHOTO_FORMAT_IDS, False, False, None
 
 
+def pick_preferred_ad_format(preferred: list, rotation_index: int, eligible_ids: set) -> tuple:
+    """Next of the brand's preferred ad formats (Brand Playbook "Visual Styles —
+    Ads") that's eligible for this ad, taking turns from rotation_index.
+
+    Returns (format_id, next_rotation_index), or (None, None) when no preferred
+    format is eligible — ranking then proceeds exactly as without a preference.
+    """
+    preferred = [p for p in preferred if p]
+    if not preferred:
+        return None, None
+    try:
+        start = int(rotation_index or 0) % len(preferred)
+    except (TypeError, ValueError):
+        start = 0
+    for offset in range(len(preferred)):
+        position = (start + offset) % len(preferred)
+        if preferred[position] in eligible_ids:
+            return preferred[position], (position + 1) % len(preferred)
+    return None, None
+
+
 async def select_and_render_vsg01_creative(
     db, business_name: str, category: str, description: str,
     brand_context: Optional[dict] = None, *,
@@ -2024,10 +2045,19 @@ async def select_and_render_vsg01_creative(
     ranked_ids = {s.strategy_id for s in ranked}
     effective_forced = forced_format_id if forced_format_id in ranked_ids else None
     if effective_forced is None:
-        for preferred_id in (brand_context or {}).get("ad_format_selections") or []:
-            if preferred_id in ranked_ids:
-                effective_forced = preferred_id
-                break
+        effective_forced, next_rotation = pick_preferred_ad_format(
+            (brand_context or {}).get("ad_format_selections") or [],
+            (brand_context or {}).get("ad_format_rotation_index") or 0,
+            ranked_ids,
+        )
+        scope = (brand_context or {}).get("_profile_scope")
+        if effective_forced and next_rotation is not None and scope and db is not None:
+            # Take turns through the Playbook's preferred ad formats instead of
+            # always leading with the first one.
+            try:
+                await db["brand_profiles"].update_one(scope, {"$set": {"ad_format_rotation_index": next_rotation}})
+            except Exception as exc:
+                print(f"[VSG01] ad format rotation save failed: {exc}", flush=True)
     if effective_forced:
         ranked = (
             [s for s in ranked if s.strategy_id == effective_forced]

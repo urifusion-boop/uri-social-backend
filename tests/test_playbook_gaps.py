@@ -87,6 +87,32 @@ class TestCarouselsGetFullPlaybook:
         assert "ContentGenerationService._build_brand_block(bc, platform=platform)" in source
 
 
+class TestAdFormatRotation:
+    """The Playbook's preferred ad formats used to always lead with the first
+    one; a rotation index was saved but never read."""
+
+    def _pick(self, *args):
+        from app.agents.jane_ads.vsg01_orchestrator import pick_preferred_ad_format
+        return pick_preferred_ad_format(*args)
+
+    def test_takes_turns(self):
+        assert self._pick(["a", "b", "c"], 0, {"a", "b", "c"}) == ("a", 1)
+        assert self._pick(["a", "b", "c"], 1, {"a", "b", "c"}) == ("b", 2)
+        assert self._pick(["a", "b", "c"], 2, {"a", "b", "c"}) == ("c", 0)
+
+    def test_skips_ineligible_formats(self):
+        assert self._pick(["a", "b", "c"], 1, {"a", "c"}) == ("c", 0)
+
+    def test_none_eligible_falls_back_to_normal_ranking(self):
+        assert self._pick(["a", "b"], 0, {"x"}) == (None, None)
+
+    def test_no_preferences(self):
+        assert self._pick([], 3, {"a"}) == (None, None)
+
+    def test_stale_index_wraps(self):
+        assert self._pick(["a", "b"], 7, {"a", "b"}) == ("b", 0)
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
