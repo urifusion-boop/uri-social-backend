@@ -327,6 +327,14 @@ class VideoStoryboardService:
         if style_directive:
             system_prompt = f"{_SYSTEM_PROMPT}\n\n{style_directive}"
 
+        # Shared Brand Brief: hard rules (avoid topics, banned words, compliance,
+        # language), who it's for, what the business offers and what's on now —
+        # video scripts used to get only name, industry, region, voice and colours.
+        from . import brand_brief
+        _brief = brand_brief.build(brand_context, sections=("rules", "audience", "offer", "pulse"))
+        if _brief:
+            preamble_lines.append("")
+            preamble_lines.append(_brief)
         content: List[Dict] = [{"type": "text", "text": "\n".join(preamble_lines)}]
 
         for i, img_data in enumerate(brand_images):
