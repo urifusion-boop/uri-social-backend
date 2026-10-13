@@ -322,6 +322,11 @@ def foreign_contacts(reply: str, sources: list[dict]) -> list[str]:
     return out
 
 
+def _find_banned(text: str, words: list[str]) -> list[str]:
+    from app.agents.social_media_manager.services.brand_brief import find_banned
+    return find_banned(text, words)
+
+
 def brand_style(profile: Optional[dict]) -> tuple[str, list[str]]:
     """How replies should SOUND for this brand, from the Brand Playbook: its
     voice plus its hard rules (topics/words to avoid, compliance, emoji). Tone
@@ -378,8 +383,7 @@ async def draft_reply(text: str, history: list[dict], sources: list[dict], kind:
         "cites_price_or_stock": any(known[c]["price_or_stock"] for c in cited),
         "foreign_contacts": leaked,
         # Words the brand said never to use that still made it into the draft.
-        "banned_words": [w for w in (banned or [])
-                         if re.search(r"(?<!\w)" + re.escape(w.lower()) + r"(?!\w)", reply.lower())],
+        "banned_words": _find_banned(reply, banned or []),
     }
 
 
