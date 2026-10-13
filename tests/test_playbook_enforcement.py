@@ -141,7 +141,9 @@ class TestInventedSources:
 
     def test_ordinary_sentences_are_left_alone(self):
         for line in ("Send us a report of your invoices.", "We study your workflow first.",
-                     "Your data stays safe.", "Book a free demo to see the reports."):
+                     "Your data stays safe.", "Book a free demo to see the reports.",
+                     "Our reports show your spend.", "Your data shows up in one place.",
+                     "Get reports from every invoice.", "Our monthly reports show trends."):
             assert bb.unverified_sources(line, "") == [], line
 
     def test_audit_flags_it_with_a_fix(self):
