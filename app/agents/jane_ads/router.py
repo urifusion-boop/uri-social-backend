@@ -1916,6 +1916,94 @@ async def tiktok_test_launch(
     }
 
 
+class GoogleTestLaunchBody(BaseModel):
+    business_name: str = "Test Business"
+    category: str = ""            # what the business is, e.g. "document automation software"
+    description: str = ""         # a sentence about what it sells — Jane derives the keywords from this
+    geo: str = "Lagos"            # where customers search from
+    budget_ngn: float = Field(35_000, gt=0)
+    days: int = Field(7, gt=0)
+    headline: str = ""            # optional; keywords fill the rest
+    primary_text: str = ""
+
+
+@router.post("/google/test-launch")
+async def google_test_launch(
+    body: GoogleTestLaunchBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Creates a REAL Google Search campaign in the active brand's OWN linked
+    Google Ads account, entirely PAUSED (campaign, ad group and ad) — zero
+    spend until a human enables it in Google Ads. Mirrors /meta/test-launch and
+    /tiktok/test-launch: the way to prove the live adapter against a real
+    account before the campaign flow relies on it.
+
+    Uses the same pre-flight gate a real launch will (linked account checked
+    against Google, WhatsApp number present) and never a shared account."""
+    import uuid
+    from .adapters.google import GoogleAdsAdapter, GoogleAdsAPIError, LowClicksWarning
+    from .google_ads_connection import (
+        AdsConnectionRequired, GoogleAdsConnectionError, resolve_customer_id_for_launch,
+    )
+    from .models import (
+        ABTestScope, AdCreative, CampaignPlan, CampaignObjective, Goal, PlatformPlan,
+        PurchaseBehaviour, SpendAuthorization,
+    )
+
+    try:
+        conn = await resolve_customer_id_for_launch(db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"))
+    except AdsConnectionRequired as e:
+        raise HTTPException(status_code=409, detail=f"google_ads_connection_{e.state.value}")
+    except GoogleAdsConnectionError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+    business_id = f"google_test_{uuid.uuid4().hex[:8]}"
+    creative = None
+    if body.headline.strip():
+        creative = AdCreative(image_url="", headline=body.headline.strip(),
+                              primary_text=body.primary_text.strip() or body.headline.strip())
+    plan = CampaignPlan(
+        business_id=business_id,
+        goal=Goal.MESSAGES,
+        behaviour=PurchaseBehaviour.SEARCH,
+        platforms=[PlatformPlan(
+            platform=Platform.GOOGLE, budget_ngn=body.budget_ngn, days=body.days,
+            variants=1, test_scope=ABTestScope.NONE, objective=CampaignObjective.CONVERSATIONS,
+        )],
+        per_business_cap_ngn=body.budget_ngn,
+        account_cap_ngn=body.budget_ngn,
+        whatsapp_number=conn["whatsapp_number"],
+        creative=creative,
+        google_keyword_context={"category": body.category or body.business_name,
+                                "description": body.description, "geo": body.geo},
+        explanation=f"Real Google Ads test launch for {body.business_name}",
+    )
+    auth = SpendAuthorization(business_id=business_id, funded_amount_ngn=body.budget_ngn,
+                              account_cap_ngn=body.budget_ngn)
+    adapter = GoogleAdsAdapter(
+        db, customer_id=conn["customer_id"], login_customer_id=conn["login_customer_id"],
+        access_token=conn["access_token"], currency_code=conn.get("currency_code", ""),
+    )
+    try:
+        result = await adapter.launch_campaign(plan, auth)
+    except LowClicksWarning as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except GoogleAdsAPIError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    except (ValueError, NotImplementedError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {
+        "campaign_id": result.campaign_id,
+        "ad_ids": result.ad_ids,
+        "customer_id": conn["customer_id"],
+        "currency_code": conn.get("currency_code", ""),
+        "note": "Created PAUSED — zero spend. Review it in Google Ads and enable it yourself if you want it live.",
+        "ads_manager_url": f"https://ads.google.com/aw/campaigns?__c={conn['customer_id']}",
+    }
+
+
 class MetaLaunchFromMessageBody(BaseModel):
     message: str                          # plain-English ask, e.g. "get me lunch customers in Surulere, ₦15k"
     # The CLIENT's Meta campaign objective, picked at the start of the conversation.

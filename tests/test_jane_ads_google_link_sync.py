@@ -241,6 +241,55 @@ class TestChangeAndDisconnect:
         assert google.calls == [] and brand_doc(db)["customer_id"] == "1234567890"
 
 
+class TestBudgetIsInTheAccountsCurrency:
+    """A naira plan on a dollar account must not become a dollar budget of the same number."""
+
+    def test_naira_account_passes_through(self):
+        from app.agents.jane_ads.adapters.google import budget_micros
+        assert budget_micros(20000, "NGN") == str(20000 * 1_000_000)
+
+    def test_dollar_account_is_converted(self):
+        from app.agents.jane_ads import constants as C
+        from app.agents.jane_ads.adapters.google import budget_micros
+        micros = int(budget_micros(20000, "usd"))
+        assert micros == int(round(20000 / C.USD_TO_NGN * 100)) * 10_000      # about $12.90, not $20,000
+        assert micros < 20 * 1_000_000 and micros % 10_000 == 0
+
+    @pytest.mark.parametrize("currency", ["", "GBP", "EUR"])
+    def test_unknown_or_other_currency_refuses_to_launch(self, currency):
+        from app.agents.jane_ads.adapters.google import GoogleAdsAPIError, budget_micros
+        with pytest.raises(GoogleAdsAPIError):
+            budget_micros(20000, currency)
+
+    def test_launch_gate_hands_over_the_accounts_currency(self):
+        db = db_with(manager_link_status="active")
+        usd = {"results": [{"customerClient": {"descriptiveName": "Uri Social", "currencyCode": "USD"}}]}
+        with WhatsAppPatched("2348012345678"), Google({"results": [link("ACTIVE")]}, usd):
+            out = run(g.resolve_customer_id_for_launch(db, "u1", "b1"))
+        assert out["currency_code"] == "USD"
+
+
+class TestSearchAdMeetsGooglesMinimums:
+    KW = {"head_terms": ["invoice scanning", "contract summaries"], "geo_terms": ["document software Lagos"]}
+
+    def test_one_headline_from_jane_is_filled_out(self):
+        from app.agents.jane_ads.adapters.google import rsa_assets
+        heads, descs = rsa_assets(["Paperwork, handled"], ["Turn invoices into clean data."], self.KW)
+        assert heads[0] == "Paperwork, handled" and len(heads) >= 3 and len(descs) >= 2
+        assert all(len(h) <= 30 for h in heads) and all(len(d) <= 90 for d in descs)
+        assert len({h.lower() for h in heads}) == len(heads)
+
+    def test_long_lines_are_cut_on_a_word_not_mid_word(self):
+        from app.agents.jane_ads.adapters.google import rsa_assets
+        heads, _ = rsa_assets(["Document automation software for small businesses"], ["x"], {})
+        assert heads[0] == "Document automation software" and len(heads) >= 3
+
+    def test_no_keywords_still_gives_three_headlines(self):
+        from app.agents.jane_ads.adapters.google import rsa_assets
+        heads, descs = rsa_assets(["Chat With Us"], ["Message us on WhatsApp to get started today."], {})
+        assert len(heads) >= 3 and len(descs) >= 2
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))

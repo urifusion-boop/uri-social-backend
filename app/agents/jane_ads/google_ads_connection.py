@@ -435,6 +435,8 @@ async def resolve_customer_id_for_launch(db, user_id: Optional[str], brand_id: O
         "login_customer_id": conn.get("login_customer_id") or settings.GOOGLE_ADS_MCC_CUSTOMER_ID,
         "access_token": access_token,
         "whatsapp_number": wa_number,
+        # Budgets must be sent in the account's own currency (see adapters/google.budget_micros).
+        "currency_code": conn.get("currency_code") or "",
     }
 
 
@@ -797,6 +799,7 @@ async def create_client_account_under_mcc(
             "customer_id": new_customer_id,
             "login_customer_id": mcc_id,
             "manager_link_status": "active",
+            "currency_code": "NGN",   # as created above
             "created_account_by_uri": True,
             "updated_at": datetime.now(timezone.utc),
         }},
