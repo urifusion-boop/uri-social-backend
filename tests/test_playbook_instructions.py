@@ -62,6 +62,12 @@ class TestPlanUpdate:
         assert labels["Emoji usage"] == ("A few (1–2)", "None")
         assert labels["Caption length"] == ("Medium (5–8 lines)", "Short (3–5 lines)")
 
+    def test_values_are_labelled_by_their_field(self):
+        out = plan({"changes": [{"field": "voice_profile.hook_style", "op": "set", "value": "question"},
+                                {"field": "voice_profile.cta_style", "op": "set", "value": "urgent"}]})
+        assert {c["label"]: c["after"] for c in out["changes"]} == {"Opening line": "A question",
+                                                                     "Call-to-action style": "Urgent"}
+
     def test_rejects_what_it_does_not_know_or_allow(self):
         out = plan({"changes": [
             {"field": "brand_name", "op": "set", "value": "Hacked"},           # not editable by text
@@ -285,13 +291,20 @@ class TestTellJaneEndpoint:
         p = stored(client, db)
         assert p["cta_styles"] == ["Call 0800 BUKKA"] and p["guardrails"]["emoji_usage"] == "some"
 
-    def test_not_a_preference(self, env):
+    def test_a_content_request_is_pointed_to_create_content(self, env):
         client, db, replies, _ = env
-        replies.append({"understood": False, "changes": [], "remember": [],
-                        "question": "This box is for telling Jane how to write — e.g. 'never use emojis'."})
+        replies.append({"understood": False, "not_a_preference": "content_request", "changes": [], "remember": [],
+                        "question": "What style do you want for feature announcements?"})
         out = data(client.post("/social-media/brand-profile/instruct", json={"text": "write a post about rice"}))
-        assert out["understood"] is False and "never use emojis" in out["reply"] and out["change_id"] is None
+        assert out["understood"] is False and "Create Content" in out["reply"] and out["change_id"] is None
         assert stored(client, db)["cta_styles"] == ["DM us"]
+
+    def test_vague_gets_the_models_specific_question(self, env):
+        client, _, replies, _ = env
+        replies.append({"understood": False, "not_a_preference": "vague",
+                        "question": "Better how — shorter, more playful, or more formal?"})
+        out = data(client.post("/social-media/brand-profile/instruct", json={"text": "make it better"}))
+        assert out["reply"] == "Better how — shorter, more playful, or more formal?"
 
     def test_nothing_to_change(self, env):
         client, db, replies, _ = env
