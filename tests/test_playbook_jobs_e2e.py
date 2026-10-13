@@ -229,6 +229,41 @@ class TestPostNotificationRouting:
         assert [name for name, _ in sent] == ["send_telegram"]
         assert len(notes) == 1 and notes[0]["type"] == "content_posted"
 
+    def test_repeat_within_the_window_is_not_sent_twice(self, db, sent, monkeypatch):
+        prof = profile(notification_events=["Post published"], notification_channel="Telegram", telegram_chat_id="555")
+        service = self._service(db, monkeypatch)
+
+        async def go():
+            await seed(db, prof)
+            for _ in range(3):
+                await service.notify_content_posted(user_id=USER, platform="Instagram", brand_id=BRAND)
+            return await notifications(db)
+
+        assert len(run(go())) == 1 and len(sent) == 1
+
+    def test_default_setup_keeps_the_original_branded_email(self, db, sent, monkeypatch):
+        """A brand with just "Email" saved (normal after onboarding) must stay on
+        the original path: the branded template, not the generic sender."""
+        from app.services import NotificationService as ns_module
+
+        templated = []
+
+        async def fake_send_email(**kwargs):
+            templated.append(kwargs["template_name"])
+            return True
+
+        monkeypatch.setattr(ns_module.email_service, "send_email", fake_send_email)
+        service = self._service(db, monkeypatch)
+
+        async def go():
+            await seed(db, profile(notification_channel="Email", notification_events=[]))
+            await service.notify_content_posted(user_id=USER, platform="Instagram", brand_id=BRAND)
+            return await notifications(db)
+
+        notes = run(go())
+        assert templated == ["content_posted"] and sent == []
+        assert len(notes) == 1 and notes[0]["channel"] == "email"
+
     def test_alert_switched_off_sends_nothing(self, db, sent, monkeypatch):
         prof = profile(notification_events=["Weekly performance report"], notification_channel="Email")
         service = self._service(db, monkeypatch)
