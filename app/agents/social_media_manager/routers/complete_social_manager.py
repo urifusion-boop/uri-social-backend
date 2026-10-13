@@ -5773,6 +5773,31 @@ async def save_brand_profile(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/brand-profile/next-posting-time")
+async def get_next_posting_time(
+    platform: str = "",
+    ctx: dict = Depends(get_active_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """
+    The brand's next preferred posting time for `platform`, from the Brand
+    Playbook's posting-time preferences in the brand's local timezone. The
+    schedule picker uses it as its default time.
+    """
+    from ..services import posting_preferences
+    try:
+        profile_result = await BrandProfileService.get(ctx["user_id"], db, brand_id=ctx["brand_id"])
+        profile = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
+        when = posting_preferences.next_post_time(profile, platform)
+        return UriResponse.get_single_data_response("next_posting_time", {
+            "scheduled_datetime": when.isoformat() + "Z",
+            "timezone": str(posting_preferences.brand_timezone(profile)),
+            "mode": (profile or {}).get("posting_time_mode") or "ai",
+        })
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/brand-profile/business-pulse")
 async def get_business_pulse(
     ctx: dict = Depends(get_active_brand_context),
