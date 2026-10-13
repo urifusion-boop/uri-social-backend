@@ -71,6 +71,19 @@ async def get_brand_context(user_id: str, db, brand_id: Optional[str] = None) ->
         bc = BrandProfileService.to_brand_context(profile)
         if not bc:
             return bc
+        # Where this brand's profile lives, so ad generation can save rotation
+        # state (e.g. which preferred ad format is next) back to it. A private
+        # key on purpose: brand_id/user_id on brand_context already mean
+        # "which business" to the ad caps and must not change.
+        profile_brand_id = (profile or {}).get("brand_id")
+        bc = {
+            **bc,
+            "_profile_scope": (
+                {"brand_id": profile_brand_id} if profile_brand_id
+                # Older personal profiles carry no brand_id at all.
+                else {"user_id": user_id, "brand_id": {"$exists": False}}
+            ),
+        }
         # Organic content always picks a style (the brand's own rotation, or a
         # sensible default) before generating — ads never did, silently falling
         # back to _generate_platform_image's generic "immersive" composition with
