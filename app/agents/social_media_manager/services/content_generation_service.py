@@ -224,6 +224,26 @@ Write one caption. No alternatives, no meta-commentary.
     }
 
     @staticmethod
+    def _brand_banned_words(brand_context: Optional[Dict[str, Any]]) -> List[str]:
+        """Every word the brand has said never to use: the voice profile's banned
+        words, the Playbook's "Words to avoid", and the guardrails' banned words
+        (a free-text, comma/newline separated field). Checked after writing."""
+        if not brand_context:
+            return []
+        words = list((brand_context.get("voice_profile") or {}).get("banned_words") or [])
+        words += list(brand_context.get("words_to_avoid") or [])
+        guardrail_words = (brand_context.get("guardrails") or {}).get("banned_words") or ""
+        if isinstance(guardrail_words, str):
+            words += guardrail_words.replace("\n", ",").split(",")
+        seen, out = set(), []
+        for w in words:
+            w = str(w).strip()
+            if w and w.lower() not in seen:
+                seen.add(w.lower())
+                out.append(w)
+        return out
+
+    @staticmethod
     def _build_brand_block(brand_context: Optional[Dict[str, Any]], platform: str = "") -> str:
         """
         Build directive brand instructions from every onboarding field.
@@ -306,6 +326,82 @@ Write one caption. No alternatives, no meta-commentary.
                 f'Tailor all content specifically to resonate with this exact persona — their interests, pain points, and aspirations.'
             )
 
+        # Target Customer Detail — a short combined line in aggregate (occupation/
+        # location/income), plus pain points and "why they choose us" separately,
+        # since those two are directly actionable for a single post's hook/angle.
+        cust_bits = []
+        if brand_context.get("customer_gender"):
+            cust_bits.append(brand_context["customer_gender"])
+        if brand_context.get("customer_occupation"):
+            cust_bits.append(brand_context["customer_occupation"])
+        if brand_context.get("customer_location"):
+            cust_bits.append(f'in {brand_context["customer_location"]}')
+        if brand_context.get("customer_income_level"):
+            cust_bits.append(f'{brand_context["customer_income_level"]} income')
+        if cust_bits:
+            parts.append(
+                f'- Customer profile: {", ".join(cust_bits)}. '
+                f'Reflect this in the references and examples you use.'
+            )
+
+        pain_points = brand_context.get("customer_pain_points")
+        if isinstance(pain_points, list) and pain_points:
+            parts.append(
+                f'- Customer pain points: {", ".join(pain_points[:4])}. '
+                f'Speak to at least one of these where relevant.'
+            )
+
+        interests = brand_context.get("customer_interests")
+        if isinstance(interests, list) and interests:
+            parts.append(
+                f'- Customer interests: {", ".join(interests[:4])}. '
+                f'Draw references or analogies from these where it fits naturally.'
+            )
+
+        needs = brand_context.get("customer_needs")
+        if isinstance(needs, list) and needs:
+            parts.append(
+                f'- Customer needs: {", ".join(needs[:4])}. '
+                f'Frame the value of the product/service around meeting these.'
+            )
+
+        objections = brand_context.get("customer_objections")
+        if isinstance(objections, list) and objections:
+            parts.append(
+                f'- Common objections customers have: {", ".join(objections[:4])}. '
+                f'Where the post is persuasive in nature, preempt or address at least one.'
+            )
+
+        if brand_context.get("why_customers_choose_us"):
+            parts.append(
+                f'- Why customers choose this brand: {brand_context["why_customers_choose_us"]}. '
+                f'Let this reasoning surface naturally, especially in CTAs.'
+            )
+
+        # The rest of the Playbook's customer psychology (until now only the
+        # 30-day Calendar read these). Short, top-3 lists so a full profile
+        # doesn't drown the prompt.
+        psychology = [
+            ("What they want", "customer_desires"),
+            ("What they fear", "customer_fears"),
+            ("What frustrates them", "customer_frustrations"),
+            ("What they aspire to", "customer_aspirations"),
+            ("Why they hesitate", "customer_hesitations"),
+            ("Questions they often ask", "common_questions"),
+            ("What makes them buy", "buying_triggers"),
+        ]
+        psych_lines = []
+        for label, key in psychology:
+            vals = [str(v).strip() for v in (brand_context.get(key) or []) if str(v).strip()]
+            if vals:
+                psych_lines.append(f'{label}: {"; ".join(vals[:3])}')
+        if psych_lines:
+            parts.append(
+                '- More about the customer: ' + ' | '.join(psych_lines) + '. '
+                'Where it fits the post, speak to one of these directly — use the customer\'s own words '
+                'from the questions rather than generic marketing phrasing.'
+            )
+
         if brand_context.get("audience_age_range"):
             age_range = brand_context["audience_age_range"]
             print(f"🎯 Audience age range detected: '{age_range}'")
@@ -383,12 +479,16 @@ Write one caption. No alternatives, no meta-commentary.
             )
 
         if brand_context.get("languages"):
-            langs = brand_context["languages"]
-            if isinstance(langs, list) and langs and langs != ["English"]:
-                parts.append(
-                    f'- Write in: {", ".join(langs)}. '
-                    f'Default to English but naturally weave in local expressions where appropriate.'
-                )
+            langs = [str(l).strip() for l in brand_context["languages"] if str(l).strip()]
+            if langs and langs != ["English"]:
+                if len(langs) == 1:
+                    parts.append(f'- Write this post in {langs[0]}.')
+                else:
+                    parts.append(
+                        f'- Languages: {", ".join(langs)}. Write mainly in {langs[0]} and naturally mix in '
+                        f'{", ".join(langs[1:])} the way this audience actually speaks — '
+                        f'not a translation, a natural blend.'
+                    )
 
         # ── Content strategy ─────────────────────────────────────────────────
         if brand_context.get("content_pillars"):
@@ -432,6 +532,10 @@ Write one caption. No alternatives, no meta-commentary.
                 parts.append(f'- Use a maximum of {max_hash} hashtags.')
             if guardrails.get("compliance_notes"):
                 parts.append(f'- Compliance requirement: {guardrails["compliance_notes"]}.')
+
+        words_to_avoid = [str(w).strip() for w in (brand_context.get("words_to_avoid") or []) if str(w).strip()]
+        if words_to_avoid:
+            parts.append(f'- NEVER use these words or phrases: {", ".join(words_to_avoid)}.')
 
         # ── CTAs & links ─────────────────────────────────────────────────────
         # Priority order: override_cta > selected_cta (from image) > cta_styles (all CTAs)
@@ -774,9 +878,7 @@ Create social media content about THIS SPECIFIC PRODUCT based on the image analy
 
             # ── Caption Validation & Auto-Fix (PRD Section 7) ──────────────────────
             # Extract custom banned words from voice profile
-            custom_banned_words = []
-            if brand_context and brand_context.get("voice_profile"):
-                custom_banned_words = brand_context["voice_profile"].get("banned_words", [])
+            custom_banned_words = ContentGenerationService._brand_banned_words(brand_context)
 
             # Validate the caption
             validation_result = CaptionValidatorService.validate_caption(content, custom_banned_words)
