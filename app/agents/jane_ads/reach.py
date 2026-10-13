@@ -30,6 +30,12 @@ from __future__ import annotations
 import re
 from typing import Any, Optional
 
+from .geo import _LAGOS_PLACES
+
+# What "the ___ of" can say about a place, so "the commercial hubs of all of Lagos"
+# reads "all of Lagos" — and "the businesses in all of Lagos" keeps its businesses.
+_PLACE_NOUNS = r"(?:hubs?|areas?|districts?|pockets?|neighbou?rhoods?|parts?|axis|centres?|centers?)"
+
 # Below this, Meta's own UI calls the audience "very narrow". Not a hard Meta limit —
 # it accepts far smaller — but the point where delivery gets uneven enough that a
 # small daily budget stops finding people at a stable price. Chosen to sit just above
@@ -66,19 +72,29 @@ def restate_geography(text: str, dropped: list[str], city: str) -> str:
     """
     if not text or not dropped or not city:
         return text
+    # Jane's sentence names more places than the plan pinned: "Ikeja, Lekki, and
+    # Victoria Island" over a two-pin plan left "all of Lagos, and Victoria Island in
+    # Lagos" behind. Any neighbourhood of the city is just as gone once it is widened.
+    known = list(_LAGOS_PLACES) if city.strip().lower() == "lagos" else []
     # Longest first, so "Lekki Phase 1" is consumed before the "Lekki" inside it.
-    names = sorted({n.strip() for n in dropped if n and n.strip()}, key=len, reverse=True)
-    one = "|".join(re.escape(n) for n in names)
+    names = sorted({n.strip() for n in [*dropped, *known] if n and n.strip()},
+                   key=len, reverse=True)
+    one = r"(?<![A-Za-z])(?:" + "|".join(re.escape(n) for n in names) + r")(?![A-Za-z])"
     # A run of them: "A, B and C", "A and B", "A, B, C".
-    run = re.compile(rf"(?:{one})(?:\s*(?:,|,?\s*and)\s*(?:{one}))*", re.IGNORECASE)
+    run = re.compile(rf"{one}(?:\s*(?:,|,?\s*and)\s*{one})*", re.IGNORECASE)
     replacement = f"all of {city}"
     out, replaced = run.subn(replacement, text)
     if not replaced:
         return text
+    same = re.escape(replacement)
     # "all of Lagos, all of Lagos and all of Lagos" if the names were scattered.
-    collapse = re.compile(rf"(?:{re.escape(replacement)})(?:\s*(?:,|,?\s*and)\s*{re.escape(replacement)})+",
-                          re.IGNORECASE)
-    return collapse.sub(replacement, out)
+    out = re.sub(rf"{same}(?:\s*(?:,|,?\s*and)\s*{same})+", replacement, out,
+                 flags=re.IGNORECASE)
+    # "the commercial hubs of all of Lagos in Lagos" — the city was already named.
+    out = re.sub(rf"(?:the\s+(?:\w+\s+)?{_PLACE_NOUNS}\s+(?:of|in)\s+)?{same}"
+                 rf"(?:\s*,?\s*(?:in|,)\s*{re.escape(city)}(?:\s+state)?)?(?![A-Za-z])",
+                 replacement, out, flags=re.IGNORECASE)
+    return out
 
 
 def reach_bounds(estimate: Optional[dict]) -> tuple[Optional[int], Optional[int]]:
