@@ -71,7 +71,7 @@ class TestLanguages:
         assert "Languages" not in build({"brand_name": "B", "languages": ["English"]})
 
     def test_single_language_is_written_in(self):
-        assert "Write this post in Yoruba." in build({"brand_name": "B", "languages": ["Yoruba"]})
+        assert "Write in Yoruba." in build({"brand_name": "B", "languages": ["Yoruba"]})
 
     def test_first_language_leads_others_mixed_in(self):
         block = build({"brand_name": "B", "languages": ["English", "Pidgin"]})
