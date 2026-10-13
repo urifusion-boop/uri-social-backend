@@ -360,6 +360,40 @@ class TestThePromptGivenToTheModel:
         assert "'storytelling'" in pi.SYSTEM_PROMPT
 
 
+class TestPreviewLimit:
+    """Only previews that were actually written count toward the daily limit."""
+
+    def _fake(self, monkeypatch, ok=True):
+        async def gen(platform, seed, request_id, user_id, brand_context=None):
+            if not ok:
+                return {"status": False, "responseMessage": "model down"}
+            return {"status": True, "responseData": {"content": "Hello from Bukka.", "hashtags": ["food"]}}
+        monkeypatch.setattr(ContentGenerationService, "_generate_platform_content", staticmethod(gen))
+
+    def test_failures_do_not_use_up_the_limit(self, env, monkeypatch):
+        client, db, _, _ = env
+        self._fake(monkeypatch, ok=False)
+        for _ in range(25):
+            assert client.post("/social-media/brand-profile/preview-voice", json={}).status_code == 503
+        self._fake(monkeypatch, ok=True)
+        r = client.post("/social-media/brand-profile/preview-voice", json={})
+        assert r.status_code == 200 and "Hello from Bukka." in r.json()["responseData"]["caption"]
+
+    def test_twenty_written_then_a_clear_message(self, env, monkeypatch):
+        client, _, _, _ = env
+        self._fake(monkeypatch)
+        for _ in range(20):
+            assert client.post("/social-media/brand-profile/preview-voice", json={}).status_code == 200
+        r = client.post("/social-media/brand-profile/preview-voice", json={})
+        assert r.status_code == 429 and "today's 20 voice previews" in r.json()["detail"]
+
+    def test_hammering_is_still_capped(self, env, monkeypatch):
+        client, _, _, _ = env
+        self._fake(monkeypatch, ok=False)
+        codes = [client.post("/social-media/brand-profile/preview-voice", json={}).status_code for _ in range(61)]
+        assert codes[59] == 503 and codes[60] == 429
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
