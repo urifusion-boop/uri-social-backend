@@ -104,6 +104,16 @@ def _brand_alert_job(job_id: str, fn_name: str):
     _run_async(job_id, _run)
 
 
+def _job_google_ads_link_reminders():
+    """A day after a Google Ads link request that's still waiting, remind the owner once."""
+    async def _run():
+        from app.database import get_db
+        from app.agents.jane_ads.google_ads_connection import remind_pending_links
+        result = await remind_pending_links(get_db())
+        print(f"🔔 google_ads_link_reminders: {result}")
+    _run_async("google_ads_link_reminders", _run)
+
+
 def _job_weekly_reports():
     _brand_alert_job("brand_weekly_reports", "run_weekly_reports")
 
@@ -410,8 +420,16 @@ def start_notification_scheduler():
         **_JOB_DEFAULTS,
     )
 
+    # Google Ads: one reminder when a link request is still waiting a day later.
+    _scheduler.add_job(
+        _job_google_ads_link_reminders,
+        CronTrigger(minute=20),
+        id="google_ads_link_reminders",
+        **_JOB_DEFAULTS,
+    )
+
     _scheduler.start()
-    print("📅 Notification scheduler started with 12 jobs")
+    print("📅 Notification scheduler started with 13 jobs")
 
 
 def stop_notification_scheduler():
