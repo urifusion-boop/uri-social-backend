@@ -101,7 +101,7 @@ def test_admin_callback_saves_single_fixed_doc_on_success():
          patch(
              "app.agents.jane_ads.google_ads_connection.exchange_code_for_tokens",
              new=AsyncMock(return_value={"access_token": "at", "refresh_token": "rt", "expires_in": 3600}),
-         ):
+         ), patch("app.agents.jane_ads.google_ads_connection.identity_manages_mcc", new=AsyncMock(return_value=True)):
         resp = _run(jane_google_ads_admin_connect_callback(code="abc123", db=db))
     assert resp.status_code == 200
     assert len(db["social_connections"].docs) == 1
@@ -109,6 +109,20 @@ def test_admin_callback_saves_single_fixed_doc_on_success():
     assert doc["platform"] == "google_ads_admin"
     assert doc["id"] == "gads_admin"
     assert doc["refresh_token"] == "rt"
+
+
+def test_admin_callback_refuses_an_identity_without_the_manager_account():
+    """The link needs no login — a stranger signing in with their own Google
+    account must not be able to replace URI's admin connection."""
+    db = FakeDb()
+    with patch("app.core.config.settings.PUBLIC_API_URL", "https://api.example.com"), \
+         patch(
+             "app.agents.jane_ads.google_ads_connection.exchange_code_for_tokens",
+             new=AsyncMock(return_value={"access_token": "at", "refresh_token": "rt", "expires_in": 3600}),
+         ), patch("app.agents.jane_ads.google_ads_connection.identity_manages_mcc", new=AsyncMock(return_value=False)):
+        resp = _run(jane_google_ads_admin_connect_callback(code="abc123", db=db))
+    assert resp.status_code == 403
+    assert db["social_connections"].docs == []
 
 
 def test_admin_callback_fails_loudly_with_no_refresh_token():

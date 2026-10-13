@@ -39,6 +39,8 @@ how to authenticate as them (there is no "as them").
 from __future__ import annotations
 
 import json
+import secrets
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Optional
@@ -805,3 +807,284 @@ async def create_client_account_under_mcc(
         }},
     )
     return {"customer_id": new_customer_id}
+
+
+# ── "Continue with Google": pick your account, no Customer ID, no admin screens ──
+# The owner signs in to Google once. We read which Google Ads accounts they
+# manage (by name), they pick one, URI's manager account sends the link request
+# and — because the owner is signed in — we accept it on their behalf with
+# THEIR token. They never look up a Customer ID or open Google Ads.
+#
+# This does NOT bring back per-brand API access (see the module docstring: every
+# real Ads call still authenticates as URI's admin identity). The owner's token
+# is used only to list their accounts and accept the link, is kept at most an
+# hour on the connection doc, has no refresh token, and is deleted the moment
+# an account is linked.
+
+OAUTH_STATES = "jane_ads_google_oauth_states"
+_AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
+_ADWORDS_SCOPE = "https://www.googleapis.com/auth/adwords"
+SIGNIN_STATE_TTL_MINUTES = 15
+SIGNIN_TOKEN_TTL_MINUTES = 50
+_MAX_ACCOUNTS_LISTED = 25
+
+
+def oauth_redirect_uri() -> str:
+    """The ONE redirect URI registered with Google for this OAuth client — the
+    admin connect and the owner sign-in share it, told apart by `state`."""
+    base = (settings.PUBLIC_API_URL or settings.URI_GATEWAY_BASE_API_URL).rstrip("/")
+    return f"{base}/jane-ads/google/admin/connect/callback"
+
+
+def safe_return_to(url: str) -> str:
+    """Where to send the browser after Google — only ever back into our own app."""
+    fallback = (settings.WEB_APP_URL or "").strip("'\"").rstrip("/") or "https://www.urisocial.com"
+    try:
+        parsed = urllib.parse.urlparse(url or "")
+    except ValueError:
+        return fallback
+    host = (parsed.hostname or "").lower()
+    ours = host == "urisocial.com" or host.endswith(".urisocial.com") or host in ("localhost", "127.0.0.1")
+    if parsed.scheme in ("https", "http") and ours and (parsed.scheme == "https" or host in ("localhost", "127.0.0.1")):
+        return f"{parsed.scheme}://{parsed.netloc}"
+    return fallback
+
+
+async def ensure_brand_connection(db, user_id: Optional[str], brand_id: Optional[str]) -> dict:
+    """The brand's google_ads connection doc, created if this is the first time."""
+    conn = await get_any_google_ads_connection(db, user_id, brand_id)
+    if conn:
+        return conn
+    now = datetime.now(timezone.utc)
+    doc = {
+        "id": f"gads_{secrets.token_hex(6)}", "user_id": user_id, "brand_id": brand_id,
+        "platform": "google_ads", "connected_via": "google_ads_direct", "customer_id": "",
+        "manager_link_status": "none", "account_name": "", "created_account_by_uri": False,
+        "connection_status": "active", "connected_at": now, "updated_at": now,
+    }
+    await db[CONNECTIONS].insert_one(dict(doc))
+    return doc
+
+
+async def start_signin(db, user_id: Optional[str], brand_id: Optional[str], return_to: str) -> str:
+    """The Google sign-in URL for this brand's owner. `state` is a one-time
+    random value we keep server-side, so the callback knows which brand it is
+    for and can't be replayed or forged."""
+    if not settings.GOOGLE_ADS_CLIENT_ID:
+        raise GoogleAdsConnectionError("Google sign-in isn't configured yet.")
+    await ensure_brand_connection(db, user_id, brand_id)
+    state = "b_" + secrets.token_urlsafe(24)
+    await db[OAUTH_STATES].insert_one({
+        "state": state, "user_id": user_id, "brand_id": brand_id,
+        "return_to": safe_return_to(return_to), "created_at": datetime.now(timezone.utc), "used": False,
+    })
+    return _AUTH_ENDPOINT + "?" + urllib.parse.urlencode({
+        "client_id": settings.GOOGLE_ADS_CLIENT_ID,
+        "redirect_uri": oauth_redirect_uri(),
+        "scope": _ADWORDS_SCOPE,
+        "response_type": "code",
+        "access_type": "online",          # no refresh token: we don't keep access
+        "prompt": "select_account",
+        "include_granted_scopes": "false",
+        "state": state,
+    })
+
+
+async def take_signin_state(db, state: str) -> Optional[dict]:
+    """The pending sign-in this `state` belongs to — once, and only while fresh."""
+    doc = await db[OAUTH_STATES].find_one({"state": state})
+    if not doc or doc.get("used"):
+        return None
+    created = doc.get("created_at")
+    if created is not None and created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    await db[OAUTH_STATES].update_one({"state": state}, {"$set": {"used": True}})
+    if created is None or datetime.now(timezone.utc) - created > timedelta(minutes=SIGNIN_STATE_TTL_MINUTES):
+        return None
+    return doc
+
+
+def _user_headers(access_token: str) -> dict:
+    return {"Authorization": f"Bearer {access_token}", "developer-token": settings.GOOGLE_ADS_DEVELOPER_TOKEN}
+
+
+async def list_user_accounts(access_token: str) -> list:
+    """The Google Ads accounts the signed-in person can use, with their names.
+    Accounts Google won't let us read (cancelled, suspended) are left out."""
+    api = f"https://googleads.googleapis.com/{_API_VERSION()}"
+    async with httpx.AsyncClient(timeout=25) as client:
+        resp = await client.get(f"{api}/customers:listAccessibleCustomers", headers=_user_headers(access_token))
+        data = _parse_json_response(resp, "list Google Ads accounts")
+        _raise_for_error(data, "list Google Ads accounts")
+        accounts = []
+        for resource in (data.get("resourceNames") or [])[:_MAX_ACCOUNTS_LISTED]:
+            cid = resource.split("/")[-1]
+            try:
+                r = await client.post(
+                    f"{api}/customers/{cid}/googleAds:search", headers=_user_headers(access_token),
+                    json={"query": "SELECT customer.id, customer.descriptive_name, customer.currency_code, "
+                                   "customer.manager, customer.test_account, customer.status FROM customer LIMIT 1"},
+                )
+                body = r.json()
+            except Exception:
+                continue
+            if not isinstance(body, dict) or "error" in body:
+                continue
+            info = ((body.get("results") or [{}])[0]).get("customer") or {}
+            accounts.append({
+                "customer_id": cid,
+                "name": info.get("descriptiveName") or "",
+                "currency_code": info.get("currencyCode") or "",
+                "is_manager": bool(info.get("manager")),
+                "is_test": bool(info.get("testAccount")),
+                "status": info.get("status") or "",
+            })
+    return accounts
+
+
+def usable_accounts(accounts: list) -> list:
+    """Accounts ads can actually run in: not a manager, not a test account, enabled."""
+    mcc = "".join(ch for ch in str(settings.GOOGLE_ADS_MCC_CUSTOMER_ID or "") if ch.isdigit())
+    return [a for a in accounts or []
+            if not a.get("is_manager") and not a.get("is_test")
+            and (a.get("status") or "ENABLED") == "ENABLED" and a.get("customer_id") != mcc]
+
+
+def _fresh_signin(conn: Optional[dict]) -> Optional[dict]:
+    signin = (conn or {}).get("google_signin") or None
+    if not signin:
+        return None
+    at = signin.get("at")
+    if at is not None and at.tzinfo is None:
+        at = at.replace(tzinfo=timezone.utc)
+    if at is None or datetime.now(timezone.utc) - at > timedelta(minutes=SIGNIN_TOKEN_TTL_MINUTES):
+        return None
+    return signin
+
+
+async def accept_link_as_owner(access_token: str, customer_id: str) -> bool:
+    """Accept URI's pending manager-link request from inside the owner's own
+    account, using the owner's sign-in. True when it was accepted. False when
+    there was nothing pending or the signed-in person isn't an admin of the
+    account (the request then simply stays waiting — they can accept it in
+    Google Ads, or an admin can)."""
+    mcc = "".join(ch for ch in str(settings.GOOGLE_ADS_MCC_CUSTOMER_ID or "") if ch.isdigit())
+    api = f"https://googleads.googleapis.com/{_API_VERSION()}"
+    async with httpx.AsyncClient(timeout=25) as client:
+        r = await client.post(
+            f"{api}/customers/{customer_id}/googleAds:search", headers=_user_headers(access_token),
+            json={"query": "SELECT customer_manager_link.resource_name, customer_manager_link.manager_customer, "
+                           "customer_manager_link.status FROM customer_manager_link"},
+        )
+        data = _parse_json_response(r, "read manager requests")
+        if "error" in data:
+            print(f"[GoogleAds] owner could not read manager requests: {json.dumps(data['error'])[:300]}")
+            return False
+        pending = [
+            (row.get("customerManagerLink") or {}) for row in (data.get("results") or [])
+            if (row.get("customerManagerLink") or {}).get("managerCustomer") == f"customers/{mcc}"
+            and (row.get("customerManagerLink") or {}).get("status") == "PENDING"
+        ]
+        if not pending:
+            return False
+        r = await client.post(
+            f"{api}/customers/{customer_id}/customerManagerLinks:mutate", headers=_user_headers(access_token),
+            json={"operations": [{"update": {"resourceName": pending[0]["resourceName"], "status": "ACTIVE"},
+                                  "updateMask": "status"}]},
+        )
+        data = _parse_json_response(r, "accept manager request")
+        if "error" in data:
+            print(f"[GoogleAds] owner could not accept the request: {json.dumps(data['error'])[:300]}")
+            return False
+    return True
+
+
+async def link_selected_account(db, user_id: Optional[str], brand_id: Optional[str], customer_id: str) -> dict:
+    """The owner picked one of the accounts their Google sign-in showed: send
+    the link request from URI's manager account, accept it as the owner, and
+    read the result back from Google. Returns {state, auto_accepted, account_name}."""
+    conn = await get_any_google_ads_connection(db, user_id, brand_id)
+    signin = _fresh_signin(conn)
+    if not conn or not signin:
+        raise AccountNotLinkable("Your Google sign-in has expired. Press Continue with Google again.")
+    customer_id = "".join(ch for ch in str(customer_id) if ch.isdigit())
+    chosen = next((a for a in usable_accounts(signin.get("accounts")) if a["customer_id"] == customer_id), None)
+    if not chosen:
+        raise AccountNotLinkable("That isn't one of the Google Ads accounts your sign-in can use.")
+
+    result = await request_manager_link(db, user_id, brand_id, customer_id)
+    auto_accepted = False
+    if result.get("manager_link_status") == "pending":
+        try:
+            auto_accepted = await accept_link_as_owner(signin["access_token"], customer_id)
+        except GoogleAdsConnectionError as e:
+            print(f"[GoogleAds] auto-accept unavailable: {e}")
+    fresh = await get_any_google_ads_connection(db, user_id, brand_id) or conn
+    if result.get("manager_link_status") != "refused":
+        try:
+            fresh = await sync_manager_link(db, fresh)
+        except GoogleAdsConnectionError as e:
+            print(f"[GoogleAds] could not read the link back: {e}")
+    update: dict = {"updated_at": datetime.now(timezone.utc)}
+    if not fresh.get("account_name") and chosen.get("name"):
+        update["account_name"] = chosen["name"]
+    if not fresh.get("currency_code") and chosen.get("currency_code"):
+        update["currency_code"] = chosen["currency_code"]
+    if fresh.get("manager_link_status") == "active":
+        # Linked: the owner's token has done its job. Don't keep it.
+        await db[CONNECTIONS].update_one({"id": conn["id"]}, {"$set": {**update, "google_signin": None}})
+    else:
+        await db[CONNECTIONS].update_one({"id": conn["id"]}, {"$set": update})
+    state, final = await resolve_connection_state(db, user_id, brand_id)
+    return {"state": state.value, "auto_accepted": auto_accepted,
+            "account_name": (final or {}).get("account_name", ""), "detail": result.get("reason", "")}
+
+
+async def finish_signin(db, state_doc: dict, code: str) -> dict:
+    """After Google sends the owner back: read their accounts and, when there
+    is exactly one usable account, link it straight away. Returns
+    {return_to, outcome, detail} — outcome is linked | pending | choose |
+    no_accounts | error."""
+    user_id, brand_id = state_doc.get("user_id"), state_doc.get("brand_id")
+    return_to = state_doc.get("return_to") or safe_return_to("")
+    try:
+        tokens = await exchange_code_for_tokens(code, oauth_redirect_uri())
+        accounts = await list_user_accounts(tokens["access_token"])
+    except GoogleAdsConnectionError as e:
+        print(f"[GoogleAds] sign-in could not be completed: {e}")
+        return {"return_to": return_to, "outcome": "error",
+                "detail": "We couldn't read your Google Ads accounts. Please try again."}
+    conn = await ensure_brand_connection(db, user_id, brand_id)
+    await db[CONNECTIONS].update_one({"id": conn["id"]}, {"$set": {
+        "google_signin": {"access_token": tokens["access_token"], "accounts": accounts,
+                          "at": datetime.now(timezone.utc)},
+        "updated_at": datetime.now(timezone.utc),
+    }})
+    usable = usable_accounts(accounts)
+    if not usable:
+        return {"return_to": return_to, "outcome": "no_accounts", "detail": ""}
+    if len(usable) > 1:
+        return {"return_to": return_to, "outcome": "choose", "detail": ""}
+    try:
+        linked = await link_selected_account(db, user_id, brand_id, usable[0]["customer_id"])
+    except GoogleAdsConnectionError as e:
+        return {"return_to": return_to, "outcome": "error", "detail": str(e)}
+    outcome = "linked" if linked["state"] == ConnectionState.READY.value else "pending"
+    return {"return_to": return_to, "outcome": outcome, "detail": linked.get("detail", "")}
+
+
+async def identity_manages_mcc(access_token: str) -> bool:
+    """Can this Google identity actually use URI's manager account? The admin
+    connection may only ever be replaced by one that can — otherwise anyone who
+    opened the admin connect link and signed in with their own Google account
+    would overwrite it and take Google Ads down for every brand."""
+    mcc = "".join(ch for ch in str(settings.GOOGLE_ADS_MCC_CUSTOMER_ID or "") if ch.isdigit())
+    if not mcc:
+        return False
+    api = f"https://googleads.googleapis.com/{_API_VERSION()}"
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.get(f"{api}/customers:listAccessibleCustomers", headers=_user_headers(access_token))
+    data = _parse_json_response(resp, "check admin identity")
+    if "error" in data:
+        return False
+    return f"customers/{mcc}" in (data.get("resourceNames") or [])
