@@ -237,7 +237,9 @@ class CaptionValidatorService:
         }
 
     @staticmethod
-    def generate_fix_prompt(caption: str, validation_result: Dict[str, Any]) -> str:
+    def generate_fix_prompt(caption: str, validation_result: Dict[str, Any],
+                            playbook_issues: List[Dict[str, str]] = None,
+                            brand_rules: List[str] = None, platform: str = "") -> str:
         """
         Generate a specific fix prompt based on validation issues.
 
@@ -248,12 +250,14 @@ class CaptionValidatorService:
         Returns:
             A detailed prompt instructing the model how to fix the issues
         """
-        if validation_result["passed"]:
+        playbook_issues = playbook_issues or []
+        if validation_result["passed"] and not playbook_issues:
             return ""
 
-        issues = validation_result["issues"]
+        issues = list(validation_result["issues"]) + [f"{i['code']}: '{i['detail']}'" for i in playbook_issues]
 
-        fix_instructions = []
+        # The brand's own rules come first: they are the ones a customer set.
+        fix_instructions = [f"- {i['fix']}" for i in playbook_issues]
 
         # Build specific fix instructions based on issues
         if any("em_dash" in issue for issue in issues):
@@ -323,6 +327,19 @@ class CaptionValidatorService:
         if any("insufficient_line_breaks" in issue for issue in issues):
             fix_instructions.append("- Add blank lines (double line break) between sections. Need at least 2-3 blank line separators")
 
+        if platform in ("twitter", "x"):
+            layout_rules = ("- This is a thread: keep each tweet as its own paragraph separated by a blank line, "
+                            "each under 280 characters, and keep the (1/4)-style numbering")
+        else:
+            layout_rules = ("- The caption should look good on a phone screen\n"
+                            "- Break after every 1-2 sentences with blank lines between sections")
+        # The rewrite used to know nothing about the brand, so fixing a comma
+        # could undo the Playbook (language, banned words, emoji rule).
+        brand_rules_block = ""
+        if brand_rules:
+            brand_rules_block = ("\nTHIS BRAND'S RULES STILL APPLY TO THE REWRITE:\n"
+                                 + "\n".join(f"- {r}" for r in brand_rules) + "\n")
+
         fix_prompt = f"""The caption you wrote has these problems:
 {chr(10).join(f'  {issue}' for issue in issues)}
 
@@ -337,17 +354,11 @@ CRITICAL FORMATTING RULES:
 - Keep the same core message and tone
 - Maintain the brand voice
 - Sound like a real person, not AI
-- The caption should look good on a phone screen (short paragraphs, lots of white space)
-
-EXAMPLE FORMAT:
-Opening sentence here.
-
-Next thought on its own line.
-
-Another sentence or two here.
-
-Final call to action.
-
+{layout_rules}
+- Read it out loud - if it sounds like a press release, try again
+- Change only what is needed to fix the problems above. Keep everything else, including any call-to-action
+- Do not add facts, numbers or statistics that are not already in the caption
+{brand_rules_block}
 Original caption:
 {caption}
 
