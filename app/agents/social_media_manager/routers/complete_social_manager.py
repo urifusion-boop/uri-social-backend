@@ -809,6 +809,31 @@ async def regenerate_content(
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+def _upload_slide_image_indices(
+    num_images: int, num_slides: Any = None, slide_image_map: Any = None
+) -> List[int]:
+    """Which uploaded image (by index) each carousel slide shows.
+
+    Mirrors Create Post: the user picks a slide count (2-10, Instagram's
+    limit) and optionally which image goes on each slide. Unset or invalid
+    entries fall back to cycling the uploads (image 1 -> slide 1, ...).
+    With no slide count given it's one slide per upload, as before.
+    """
+    if num_images <= 0:
+        return []
+    try:
+        count = max(2, min(10, int(num_slides))) if num_slides else num_images
+    except (TypeError, ValueError):
+        count = num_images
+    mapping = slide_image_map if isinstance(slide_image_map, list) else []
+    indices = []
+    for i in range(count):
+        chosen = mapping[i] if i < len(mapping) else None
+        if isinstance(chosen, int) and not isinstance(chosen, bool) and 0 <= chosen < num_images:
+            indices.append(chosen)
+        else:
+            indices.append(i % num_images)
+    return indices
 
 
 @router.post("/upload-user-content")
@@ -840,6 +865,11 @@ async def upload_user_content(
         context_text = request.get("context_text", "")
         platforms = request.get("platforms", [])
         post_type = request.get("post_type", "feed")
+        # Carousel only, same idea as Create Post: how many slides, and which
+        # uploaded image (by index) each slide shows. Both optional — without
+        # them it's one slide per upload, in upload order, as before.
+        requested_num_slides = request.get("num_slides")
+        slide_image_map = request.get("slide_image_map")
 
         # New options: logo and CTA overlays
         add_logo = request.get("add_logo", False)
@@ -1255,9 +1285,10 @@ Create engaging social media captions for THIS UPLOADED CONTENT. Base your writi
                     # by either, so uploaded carousels silently rendered/published
                     # as a single post.
                     slides = []
-                    for i, url in enumerate(media_urls):
+                    for img_idx in _upload_slide_image_indices(len(media_urls), requested_num_slides, slide_image_map):
+                        url = media_urls[img_idx]
                         slide = {"headline": "", "body": "", "image_url": url, "image_failed": False}
-                        bg = item_logo_backgrounds[i] if i < len(item_logo_backgrounds) else None
+                        bg = item_logo_backgrounds[img_idx] if img_idx < len(item_logo_backgrounds) else None
                         if bg:
                             slide["background_image_url"] = bg["background_url"]
                             slide["logo_placement"] = bg["logo_placement"]
