@@ -73,7 +73,7 @@ async def generate_voiceover_script(
     # Shared Brand Brief. Language is left out on purpose: this script is read
     # aloud by a text-to-speech voice, so it stays in the voice's own language.
     from . import brand_brief
-    _brief = brand_brief.build(brand_context, sections=("rules", "audience", "offer", "pulse"), language=False)
+    _brief = brand_brief.build(brand_context, sections=("rules", "audience", "offer", "pulse"), language=False, kind="video")
     if _brief:
         context_lines.append("")
         context_lines.append(_brief)

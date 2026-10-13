@@ -257,7 +257,7 @@ class BlogGenerationService:
         # language), the offer and what's happening now. The blog's voice stays
         # with its own Writing DNA, so the voice tier is left out.
         from . import brand_brief
-        _brief = brand_brief.build(brand_ctx, sections=("rules", "offer", "pulse"))
+        _brief = brand_brief.build(brand_ctx, sections=("rules", "offer", "pulse"), kind="blog")
         if _brief:
             prompt = f"{prompt}\n\n{_brief}"
 

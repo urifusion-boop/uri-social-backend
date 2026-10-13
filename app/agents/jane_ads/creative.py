@@ -134,7 +134,7 @@ def _brand_copy_bits(bc: dict) -> str:
     check in write_ad_copy)."""
     from app.agents.social_media_manager.services import brand_brief
     bits = _brand_prompt_bits(bc)
-    brief = brand_brief.build(bc, sections=("rules", "offer", "pulse"))
+    brief = brand_brief.build(bc, sections=("rules", "offer", "pulse"), kind="ads")
     return bits + (("\n" + brief) if brief else "")
 
 

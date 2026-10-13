@@ -406,7 +406,7 @@ class VideoStoryboardService:
             # language), who it's for, what the business offers and what's on now —
             # video scripts used to get only name, industry, region, voice and colours.
             from . import brand_brief
-            _brief = brand_brief.build(brand_context, sections=("rules", "audience", "offer", "pulse"))
+            _brief = brand_brief.build(brand_context, sections=("rules", "audience", "offer", "pulse"), kind="video")
             if _brief:
                 preamble_lines.append("")
                 # The brief is about WORDS. video_prompt goes to the video model and must stay
