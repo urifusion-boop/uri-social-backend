@@ -38,6 +38,7 @@ how to authenticate as them (there is no "as them").
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import secrets
 import urllib.parse
@@ -825,6 +826,8 @@ OAUTH_STATES = "jane_ads_google_oauth_states"
 _AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
 _ADWORDS_SCOPE = "https://www.googleapis.com/auth/adwords"
 SIGNIN_STATE_TTL_MINUTES = 15
+_ACCEPT_SETTLE_ATTEMPTS = 5
+_ACCEPT_SETTLE_SECONDS = 1.5
 SIGNIN_TOKEN_TTL_MINUTES = 50
 _MAX_ACCOUNTS_LISTED = 25
 
@@ -1021,10 +1024,21 @@ async def link_selected_account(db, user_id: Optional[str], brand_id: Optional[s
             print(f"[GoogleAds] auto-accept unavailable: {e}")
     fresh = await get_any_google_ads_connection(db, user_id, brand_id) or conn
     if result.get("manager_link_status") != "refused":
-        try:
-            fresh = await sync_manager_link(db, fresh)
-        except GoogleAdsConnectionError as e:
-            print(f"[GoogleAds] could not read the link back: {e}")
+        # Right after we approve it, Google can still answer "pending" for a few
+        # seconds. Reading once told an owner whose link had just been approved
+        # that "an admin needs to approve it" — then it flipped to linked on its
+        # own (seen on the first real sign-in). So when we approved it ourselves,
+        # give Google a moment to catch up before believing "pending".
+        attempts = _ACCEPT_SETTLE_ATTEMPTS if auto_accepted else 1
+        for attempt in range(attempts):
+            try:
+                fresh = await sync_manager_link(db, fresh)
+            except GoogleAdsConnectionError as e:
+                print(f"[GoogleAds] could not read the link back: {e}")
+                break
+            if fresh.get("manager_link_status") != "pending" or attempt == attempts - 1:
+                break
+            await asyncio.sleep(_ACCEPT_SETTLE_SECONDS)
     update: dict = {"updated_at": datetime.now(timezone.utc)}
     if not fresh.get("account_name") and chosen.get("name"):
         update["account_name"] = chosen["name"]
@@ -1069,7 +1083,12 @@ async def finish_signin(db, state_doc: dict, code: str) -> dict:
         linked = await link_selected_account(db, user_id, brand_id, usable[0]["customer_id"])
     except GoogleAdsConnectionError as e:
         return {"return_to": return_to, "outcome": "error", "detail": str(e)}
-    outcome = "linked" if linked["state"] == ConnectionState.READY.value else "pending"
+    if linked["state"] == ConnectionState.READY.value:
+        outcome = "linked"
+    elif linked.get("auto_accepted"):
+        outcome = "finishing"      # we approved it; Google just hasn't caught up yet
+    else:
+        outcome = "pending"        # the signed-in person couldn't approve it — an admin must
     return {"return_to": return_to, "outcome": outcome, "detail": linked.get("detail", "")}
 
 

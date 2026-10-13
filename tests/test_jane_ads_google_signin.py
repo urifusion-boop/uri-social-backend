@@ -129,6 +129,37 @@ class TestLinkingThePickedAccount:
         assert out["state"] == "manager_link_pending" and out["auto_accepted"] is False
         assert brand_doc(db)["account_name"] == "Uri Social"      # shown by name while waiting
 
+    def test_google_still_saying_pending_right_after_we_approve_is_waited_out(self, monkeypatch):
+        """Seen on the first real sign-in: we approved the link, Google answered
+        "pending" for a moment, and the owner was told an admin had to approve."""
+        monkeypatch.setattr(g, "_ACCEPT_SETTLE_SECONDS", 0)
+        db = signin_db([MINE])
+        still_pending = {"results": [link("PENDING", "55", "4052658060")]}
+        with Google({"result": {}}, PENDING_AT_OWNER, {"result": {}},
+                    still_pending, still_pending, ACTIVE_AT_URI, DETAILS):
+            out = run(g.link_selected_account(db, "u1", "b1", "4052658060"))
+        assert out["state"] == "ready" and out["auto_accepted"] is True
+
+    def test_if_google_stays_slow_it_is_reported_as_finishing_not_as_needing_an_admin(self, monkeypatch):
+        monkeypatch.setattr(g, "_ACCEPT_SETTLE_SECONDS", 0)
+        db = db_with(manager_link_status="none", customer_id="", account_name="")
+        still_pending = {"results": [link("PENDING", "55", "4052658060")]}
+        with patch.object(g, "exchange_code_for_tokens", new=AsyncMock(return_value={"access_token": "owner_token"})), \
+             patch.object(g, "list_user_accounts", new=AsyncMock(return_value=[MINE])), \
+             Google({"result": {}}, PENDING_AT_OWNER, {"result": {}}, *[still_pending] * 5):
+            out = run(g.finish_signin(db, {"user_id": "u1", "brand_id": "b1", "return_to": "https://app"}, "code"))
+        assert out["outcome"] == "finishing"
+
+    def test_someone_who_could_not_approve_is_still_told_an_admin_must(self, monkeypatch):
+        monkeypatch.setattr(g, "_ACCEPT_SETTLE_SECONDS", 0)
+        db = db_with(manager_link_status="none", customer_id="", account_name="")
+        with patch.object(g, "exchange_code_for_tokens", new=AsyncMock(return_value={"access_token": "owner_token"})), \
+             patch.object(g, "list_user_accounts", new=AsyncMock(return_value=[MINE])), \
+             Google({"result": {}}, {"error": {"message": "permission denied"}},
+                    {"results": [link("PENDING", "55", "4052658060")]}) as google:
+            out = run(g.finish_signin(db, {"user_id": "u1", "brand_id": "b1", "return_to": "https://app"}, "code"))
+        assert out["outcome"] == "pending" and len(google.calls) == 3      # read once, no waiting around
+
     def test_an_account_the_sign_in_did_not_show_is_refused(self):
         db = signin_db([MINE])
         with Google() as google, pytest.raises(g.AccountNotLinkable):
