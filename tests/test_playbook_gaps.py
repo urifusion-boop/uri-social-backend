@@ -224,6 +224,44 @@ class TestAutoTabUsesPlaybook:
         assert 'schedule_option="schedule"' in source
 
 
+class TestWorkInProgressAdFormat:
+    """Seen on dev: a document-software brand got an ad of plumbers fixing a
+    burst pipe, because this trades-only format copied an example from its
+    own prompt. It must decline businesses with no hands-on work."""
+
+    def _run(self, monkeypatch, model_reply):
+        import asyncio
+        from app.agents.jane_ads import vsg01_orchestrator as vo
+
+        seen = {}
+
+        async def fake_model(prompt):
+            seen["prompt"] = prompt
+            return model_reply
+
+        monkeypatch.setattr(vo, "_call_content_model", fake_model)
+        result = asyncio.run(vo._content_work_in_progress("Docerity", "Tech & SaaS", "document automation software"))
+        return result, seen["prompt"], vo
+
+    def test_declines_a_business_with_no_hands_on_work(self, monkeypatch):
+        result, prompt, _ = self._run(monkeypatch, {"applies": False, "trade_activity": "", "statement": "", "nigerian_setting": ""})
+        assert result is None
+        assert "Never reuse them" in prompt and "false for software" in prompt
+
+    def test_declines_when_the_model_does_not_say(self, monkeypatch):
+        from app.agents.jane_ads import vsg01_orchestrator as vo
+        result, _, _ = self._run(monkeypatch, {"trade_activity": "fixing a burst pipe", "statement": "Burst pipe repair underway",
+                                                "nigerian_setting": vo._NIGERIAN_SETTINGS[0]})
+        assert result is None
+
+    def test_still_works_for_a_trade(self, monkeypatch):
+        from app.agents.jane_ads import vsg01_orchestrator as vo
+        result, _, _ = self._run(monkeypatch, {"applies": "true", "trade_activity": "hands fitting a solar panel",
+                                               "statement": "Solar install underway", "nigerian_setting": vo._NIGERIAN_SETTINGS[0]})
+        assert result == {"trade_activity": "hands fitting a solar panel", "statement": "Solar install underway",
+                          "nigerian_setting": vo._NIGERIAN_SETTINGS[0]}
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
