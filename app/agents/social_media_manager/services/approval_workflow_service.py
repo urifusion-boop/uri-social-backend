@@ -1103,6 +1103,7 @@ class ApprovalWorkflowService:
                                 platform=draft.get("platform", ""),
                                 content_preview=(draft.get("content") or "")[:120],
                                 campaign_id=draft.get("campaign_id", ""),
+                                brand_id=draft.get("brand_id"),
                             )
                         except Exception as e:
                             print(f"⚠️ Content posted notification failed: {e}")
@@ -1388,6 +1389,7 @@ class ApprovalWorkflowService:
                                 platform=platform,
                                 content_preview=(draft.get("content") or "")[:120],
                                 campaign_id=draft.get("campaign_id", ""),
+                                brand_id=draft.get("brand_id"),
                             )
                         except Exception as e:
                             print(f"⚠️ Content posted notification failed: {e}")

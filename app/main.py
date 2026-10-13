@@ -23,6 +23,7 @@ from app.agents.social_media_manager.routers.canvas_editor import router as canv
 from app.routers.auth_router import router as auth_router
 from app.routers.billing_router import router as billing_router
 from app.routers.notification_router import router as notification_router
+from app.routers.notification_channels_router import router as notification_channels_router
 from app.routers.bug_report_router import router as bug_report_router
 from app.routers.client_router import router as client_router
 from app.routers.workspace_router import router as workspace_router
@@ -274,6 +275,13 @@ app.include_router(
     notification_router,
     prefix="/social-media",
     tags=["Notifications"],
+)
+
+# Brand Playbook notification channels (Slack/Telegram/Push/SMS setup + test)
+app.include_router(
+    notification_channels_router,
+    prefix="/social-media",
+    tags=["Notification channels"],
 )
 
 # Include bug report router under /social-media prefix
