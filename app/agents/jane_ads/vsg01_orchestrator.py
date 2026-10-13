@@ -1332,6 +1332,11 @@ async def _build_text_only(business_name: str, category: str, description: str, 
 # ── SEED-098: Work In Progress (generated scene — see module
 # docstring on why this doesn't yet accept a real work photo) ─────────────
 
+def _is_true(value) -> bool:
+    """A model's boolean, which may come back as true or as the string "true"."""
+    return value is True or str(value).strip().lower() in ("true", "yes", "1")
+
+
 async def _content_work_in_progress(business_name: str, category: str, description: str,
                                     brand_context: Optional[dict] = None) -> Optional[dict]:
     prompt = (
@@ -1344,10 +1349,23 @@ async def _content_work_in_progress(business_name: str, category: str, descripti
         "- statement: the short line, 6 words or fewer\n"
         f"- nigerian_setting: pick the single best-fitting option, copied EXACTLY, from this list: "
         f"{list(_NIGERIAN_SETTINGS)}\n"
-        "Return ONLY the JSON with exactly these 3 keys."
+        "- applies: true ONLY if THIS business itself does visible, hands-on physical work a camera "
+        "could photograph on site (trades, repairs, installation, construction, food preparation, "
+        "tailoring, cleaning, farming...). false for software, apps, online services, consulting, "
+        "finance, education, agencies and anything done at a screen or desk.\n"
+        "The examples above only show the STYLE. Never reuse them: the activity must be this "
+        "business's own real work. If applies is false, leave the other fields empty.\n"
+        "Return ONLY the JSON with exactly these 4 keys."
     )
     d = await _call_content_model(prompt)
     if not d:
+        return None
+    # This format shows a tradesperson mid-job. For a business with no such work
+    # the model used to copy an example from the prompt — a software company got
+    # an ad of plumbers fixing a burst pipe (seen on dev). Returning None makes
+    # select_and_render_vsg01_creative move on to the next format.
+    if not _is_true(d.get("applies")):
+        print(f"[VSG01] Work In Progress doesn't fit {business_name or 'this business'} (no hands-on work) — skipping", flush=True)
         return None
     trade_activity = str(d.get("trade_activity", "")).strip()
     statement = str(d.get("statement", "")).strip()

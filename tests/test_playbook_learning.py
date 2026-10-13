@@ -35,7 +35,7 @@ class TestEmoji:
     def test_habit_of_removing_emojis(self):
         s = pl.detect_from_edits(self._edits(4, 1), {})
         assert "emoji_none" in ids(s)
-        assert "4 of the last 5" in s[0]["evidence"]
+        assert "In 4 of your last 5 edits" in s[0]["evidence"]
         assert s[0]["apply"] == {"guardrails": {"emoji_usage": "no"}}
 
     def test_not_a_habit_if_mostly_kept(self):
