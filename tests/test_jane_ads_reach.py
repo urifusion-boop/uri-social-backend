@@ -157,3 +157,21 @@ def test_a_sentence_naming_no_pockets_is_untouched():
     said = "I chose Instagram and Facebook because your customers discover this by scrolling."
     assert restate_geography(said, ["Ikeja"], "Lagos") == said
 
+
+
+def test_a_place_jane_named_but_never_pinned_is_restated_too():
+    """Live-caught: two pins (Ikeja, Lekki), a sentence naming three, and the widened
+    plan read "the commercial hubs of all of Lagos, and Victoria Island in Lagos"."""
+    from app.agents.jane_ads.reach import restate_geography
+
+    said = ("I'll focus on the commercial hubs of Ikeja, Lekki, and Victoria Island in "
+            "Lagos, where there is a high concentration of SMEs.")
+    out = restate_geography(said, ["Ikeja", "Lekki"], "Lagos")
+    assert out == "I'll focus on all of Lagos, where there is a high concentration of SMEs."
+
+
+def test_restating_keeps_the_audience_words_and_whole_words():
+    from app.agents.jane_ads.reach import restate_geography
+
+    out = restate_geography("Reaching the businesses in Yaba via vivid video.", ["Ikeja"], "Lagos")
+    assert out == "Reaching the businesses in all of Lagos via vivid video."
