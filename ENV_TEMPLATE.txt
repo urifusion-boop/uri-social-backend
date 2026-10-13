@@ -56,3 +56,14 @@ DEFAULT_RATE_LIMIT_CONTENT_PER_HOUR=100
 # - CORS_ALLOWED_ORIGINS
 #
 # ============================================
+
+# Brand Playbook notifications (app/services/notification_channels.py).
+# All optional: a channel left unset shows as "Not set up on URI's side yet".
+TWILIO_SMS_FROM=
+TWILIO_WHATSAPP_NOTIFY_TEMPLATE_SID=
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_BOT_USERNAME=
+TELEGRAM_WEBHOOK_SECRET=
+VAPID_PUBLIC_KEY=
+VAPID_PRIVATE_KEY=
+VAPID_SUBJECT=mailto:support@urisocial.com
