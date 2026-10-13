@@ -288,7 +288,7 @@ def unverified_numbers(text: str, sources: str) -> List[str]:
 
 _CITATION = re.compile(
     r"\b(?:according to (?!our\b|the brand\b)[a-z]"
-    r"|(?:stud(?:y|ies)|surveys?|reports?|research|polls?)\s+(?:by|from|conducted|published|shows?|showed|found|finds|"
+    r"|(?:stud(?:y|ies)|surveys?|reports?|research|polls?)\s+(?:by|conducted|published|shows?|showed|found|finds|"
     r"highlight(?:s|ed)|reveal(?:s|ed)|suggest(?:s|ed)?|indicate(?:s|d)?|confirm(?:s|ed)?)\b"
     r"|(?:statistics|data|experts?|analysts?)\s+(?:shows?|says?|suggests?|indicates?|reveals?|agree|believe))", re.I)
 
@@ -302,6 +302,10 @@ def unverified_sources(text: str, sources: str) -> List[str]:
     found: List[str] = []
     for sentence in re.split(r"(?<=[.!?])\s+|\n+", text or ""):
         m = _CITATION.search(sentence)
+        # "Our reports show your spend" / "your data shows up here" is the
+        # product talking about itself, not a citation.
+        if m and re.search(r"(?:our|your|my|their|its|these|those)\s+(?:\w+\s+)?$", sentence[:m.start()], re.I):
+            continue
         if m and m.group(0).lower() not in given:
             snippet = sentence.strip()
             snippet = snippet if len(snippet) <= 140 else snippet[:137].rstrip() + "..."
