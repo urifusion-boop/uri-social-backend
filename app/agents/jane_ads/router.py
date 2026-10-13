@@ -1449,6 +1449,7 @@ async def jane_google_ads_link_existing(
     invitation. On the known 'already linked to another manager' friction, returns
     a specific, actionable message instead of a generic failure."""
     from .google_ads_connection import (
+        AccountNotLinkable,
         AdsConnectionRequired,
         GoogleAdsConnectionError,
         InvalidCustomerId,
@@ -1461,6 +1462,11 @@ async def jane_google_ads_link_existing(
         )
     except AdsConnectionRequired as e:
         raise HTTPException(status_code=409, detail=f"google_ads_connection_{e.state.value}")
+    except AccountNotLinkable as e:
+        # Google refused for a reason the owner can fix (no such account, a
+        # manager account, no admin user...) — say which, as a 400.
+        print(f"ℹ️  Google Ads account not linkable: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
     except InvalidCustomerId as e:
         # Caught before any Google API call was even made — a client input
         # problem, not a rejected REST call, so 400 (not the 502 below).
@@ -1473,13 +1479,46 @@ async def jane_google_ads_link_existing(
     if result.get("manager_link_status") == "refused":
         return {
             "manager_link_status": "refused",
-            "detail": (
+            # A specific reason from Google when there is one; otherwise the
+            # general guidance for an account another manager is holding.
+            "detail": result.get("reason") or (
                 "This Google Ads account is already linked to another manager. "
                 "Ask the client to remove that link in their account "
                 "(Admin → Access and security → Managers) before reconnecting."
             ),
         }
     return result
+
+
+@router.post("/google/connection/change-account")
+async def jane_google_ads_change_account(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Let go of the chosen Google Ads account and go back to "choose your
+    account". Withdraws a pending invitation / removes an accepted link on
+    Google's side too."""
+    return await _release_google_ads(db, brand_ctx, remove=False)
+
+
+@router.delete("/google/connection")
+async def jane_google_ads_disconnect(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Disconnect Google Ads for this brand altogether (also ends the link on Google's side)."""
+    return await _release_google_ads(db, brand_ctx, remove=True)
+
+
+async def _release_google_ads(db, brand_ctx: dict, remove: bool) -> dict:
+    from .google_ads_connection import AccountNotLinkable, AdsConnectionRequired, release_account
+
+    try:
+        return await release_account(db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"), remove=remove)
+    except AdsConnectionRequired as e:
+        raise HTTPException(status_code=409, detail=f"google_ads_connection_{e.state.value}")
+    except AccountNotLinkable as e:
+        raise HTTPException(status_code=409, detail=str(e))
 
 
 class GoogleAdsCreateAccountBody(BaseModel):
@@ -1527,6 +1566,7 @@ async def jane_google_ads_create_account(
 
 @router.get("/google/connection/status")
 async def jane_google_ads_connection_status(
+    refresh: bool = False,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
     brand_ctx: dict = Depends(get_active_brand_context),
 ) -> dict:
@@ -1534,11 +1574,15 @@ async def jane_google_ads_connection_status(
     state in the body — this is a pure status read, not a pre-flight gate inside a
     build flow, so there's never a reason to raise here (unlike
     resolve_customer_id_for_launch, which does)."""
-    from .google_ads_connection import get_admin_connection, resolve_connection_state
+    from .google_ads_connection import get_admin_connection, refresh_connection
     from .whatsapp import get_brand_whatsapp
 
-    state, conn = await resolve_connection_state(
-        db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"),
+    # While an invitation is pending (or on "Check again", refresh=true) this
+    # asks Google whether it was accepted — the owner accepts it in Google Ads,
+    # so our own record can't know. It used to only re-read our record, which
+    # left every linked account "waiting" forever.
+    state, conn, sync_error = await refresh_connection(
+        db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"), force=refresh,
     )
     wa_number = await get_brand_whatsapp(db, brand_ctx.get("brand_id"))
     # URI-wide, not per-brand (URI has exactly one MCC) — a previously
@@ -1555,7 +1599,22 @@ async def jane_google_ads_connection_status(
         "customer_id": (conn or {}).get("customer_id", ""),
         "whatsapp_number": wa_number,
         "can_create_account": can_create_account,
+        "currency_code": (conn or {}).get("currency_code", ""),
+        "manager_link_status": (conn or {}).get("manager_link_status", ""),
+        "detail": (conn or {}).get("manager_link_error", ""),
+        "created_by_uri": bool((conn or {}).get("created_account_by_uri")),
+        "manager_customer_id": settings_mcc_display(),
+        "sync_error": sync_error,
     }
+
+
+def settings_mcc_display() -> str:
+    """URI's manager account ID as Google shows it (123-456-7890), so the owner
+    can recognise the request waiting in their Google Ads."""
+    from app.core.config import settings
+
+    digits = "".join(ch for ch in str(settings.GOOGLE_ADS_MCC_CUSTOMER_ID or "") if ch.isdigit())
+    return f"{digits[:3]}-{digits[3:6]}-{digits[6:]}" if len(digits) == 10 else digits
 
 
 @router.get("/instrumentation/{business_id}")
