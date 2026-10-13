@@ -360,6 +360,28 @@ def _customer_psychology_block(brand: Dict[str, Any]) -> str:
     )
 
 
+def _brand_rules_block(brand: Dict[str, Any]) -> str:
+    """The Playbook's hard rules, content pillars and important dates for the
+    PLAN itself. Drafts made from an idea always applied these, but the ideas
+    were generated without them — a plan could be off-pillar, miss the brand's
+    own key dates, or pitch a topic the brand said never to touch."""
+    from app.agents.social_media_manager.services import brand_brief
+
+    parts: List[str] = []
+    rules = brand_brief.hard_rules(brand)
+    if rules:
+        parts.append("HARD RULES (never break these — an idea that needs to break one is not usable):\n"
+                     + "\n".join(f"- {r}" for r in rules))
+    pillars = [str(x) for x in (brand.get("content_pillars") or []) if x]
+    if pillars:
+        parts.append(f"CONTENT PILLARS: {', '.join(pillars)}. Every idea must sit under one of these, "
+                     f"and the plan should be spread across them rather than leaning on one.")
+    if brand.get("key_dates"):
+        parts.append(f"IMPORTANT DATES for this brand: {brand['key_dates']}. Plan a post for any that "
+                     f"fall inside this plan's period, on or just before the date.")
+    return ("\n\n" + "\n\n".join(parts)) if parts else ""
+
+
 def _visual_guide_block(brand: Dict[str, Any]) -> str:
     """Addendum §5: the client's selected Visual Guide is the design system
     — the model must stop inventing a new visual style per post. Confirmed
@@ -445,7 +467,7 @@ async def _generate_candidate_concepts(
         f"Business stage: {business_stage} — {_STAGE_GUIDANCE.get(business_stage, '')}"
         if business_stage else ""
     )
-    psychology_block = _customer_psychology_block(brand)
+    psychology_block = _customer_psychology_block(brand) + _brand_rules_block(brand)
 
     territories_block = "\n".join(
         f"- {key} ({t['label']}): {t['description']} Example subjects: {', '.join(t['subjects'][:8])}"
@@ -1289,7 +1311,7 @@ async def _generate_final_copy(
     price_range = brand.get("price_range", "")
     business_pulse = brand.get("business_pulse") or {}
     business_pulse_updated_at = brand.get("business_pulse_updated_at")
-    psychology_block = _customer_psychology_block(brand)
+    psychology_block = _customer_psychology_block(brand) + _brand_rules_block(brand)
     visual_guide_block = _visual_guide_block(brand)
 
     bp_freshness = _business_pulse_freshness_str(business_pulse_updated_at)

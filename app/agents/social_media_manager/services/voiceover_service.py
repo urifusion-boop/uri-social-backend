@@ -70,6 +70,13 @@ async def generate_voiceover_script(
         context_lines.append(f"Existing footage transcript: {transcript.strip()[:2000]}")
     if user_note and user_note.strip():
         context_lines.append(f"What the user wants said (use this if given): {user_note.strip()[:1000]}")
+    # Shared Brand Brief. Language is left out on purpose: this script is read
+    # aloud by a text-to-speech voice, so it stays in the voice's own language.
+    from . import brand_brief
+    _brief = brand_brief.build(brand_context, sections=("rules", "audience", "offer", "pulse"), language=False)
+    if _brief:
+        context_lines.append("")
+        context_lines.append(_brief)
 
     prompt = (
         "You are writing a short voiceover script for a Nigerian small business's video, "

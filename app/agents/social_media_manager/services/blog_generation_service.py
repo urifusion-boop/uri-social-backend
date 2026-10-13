@@ -250,6 +250,13 @@ class BlogGenerationService:
             word_count=word_count,
             secondary_keywords=secondary_keywords,
         )
+        # Shared Brand Brief: hard rules (avoid topics, banned words, compliance,
+        # language), the offer and what's happening now. The blog's voice stays
+        # with its own Writing DNA, so the voice tier is left out.
+        from . import brand_brief
+        _brief = brand_brief.build(brand_ctx, sections=("rules", "offer", "pulse"))
+        if _brief:
+            prompt = f"{prompt}\n\n{_brief}"
 
         # max_tokens = word_count * 2 gives ample headroom (1 word ≈ 1.3 tokens).
         # Cap at 8000 to stay within gpt-4o's output limit.

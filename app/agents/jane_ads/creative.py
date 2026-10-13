@@ -119,7 +119,13 @@ def _brand_prompt_bits(bc: dict) -> str:
         bits.append(f"Market: {bc['region']}.")
     if bc.get("brand_colors"):
         bits.append(f"Brand colours: {', '.join(bc['brand_colors'][:3])}.")
-    return " ".join(bits)
+    # The shared Brand Brief's hard rules (avoid topics, banned words, compliance,
+    # language), what the business offers, and what's happening right now. NOT the
+    # audience tier — who an ad targets is delivery context and must never be
+    # written into ad copy (see the leakage check in write_ad_copy).
+    from app.agents.social_media_manager.services import brand_brief
+    brief = brand_brief.build(bc, sections=("rules", "offer", "pulse"))
+    return " ".join(bits) + (("\n" + brief) if brief else "")
 
 
 def _brand_color_directive(bc: dict) -> str:
@@ -541,6 +547,24 @@ async def write_ad_copy(business_name: str, category: str, goal: str = "messages
             # Never ship a known leak and never loop silently — strip and move on.
             copy.headline = _strip_leaked_terms(copy.headline, leaked)
             copy.primary_text = _strip_leaked_terms(copy.primary_text, leaked)
+    # Brand Playbook hard rule: words the brand said never to use. One rewrite,
+    # same as captions get; if the model still uses them the copy is kept (a
+    # human reviews every ad plan before launch) and the miss is logged.
+    from app.agents.social_media_manager.services import brand_brief
+    banned = brand_brief.violations(f"{copy.headline} {copy.primary_text}", bc)
+    if banned:
+        d3 = await _call_ad_copy_model(
+            prompt + f"\n\nCORRECTION: your last attempt used {banned!r}, which this brand never "
+            "uses. Rewrite headline and primary_text without those words."
+        )
+        if d3 is not None:
+            headline = str(d3.get("headline", "")).strip()
+            primary = str(d3.get("primary_text", "")).strip()
+            if headline and primary and not _check_leakage(headline, primary, leak_terms):
+                copy.headline, copy.primary_text = headline, primary
+        still = brand_brief.violations(f"{copy.headline} {copy.primary_text}", bc)
+        if still:
+            print(f"[Creative] ad copy still uses brand-banned words after retry: {still}", flush=True)
     # image_prompt needs the SAME deterministic guarantee, not just the instruction
     # above. It becomes the content engine's seed_content, and that engine renders
     # text INTO the graphic (that's how organic posts look) — so a place name left
