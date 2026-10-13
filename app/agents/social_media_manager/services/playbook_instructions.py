@@ -147,8 +147,9 @@ SYSTEM_PROMPT = """You update a business's Brand Playbook from what the owner te
 The Playbook is what an AI assistant ("Jane") follows whenever she writes for this business: social posts, \
 carousels, the content calendar, ads, blog posts, video scripts and replies to customer messages.
 
-Turn the owner's message into changes. Return ONLY a JSON object:
+Turn the owner's message into changes. Return ONLY a JSON object, filling "clauses" FIRST:
 {
+  "clauses": [{"said": "<one thing the owner asked for, in their words>", "handled_by": "<field key> | remember | not_actionable"}],
   "understood": true|false,
   "changes": [{"field": "<field key>", "op": "set"|"add"|"remove", "value": <value>}],
   "remember": [{"text": "<instruction>", "applies_to": ["posts"|"ads"|"blog"|"video"|"replies"|"all"], "platforms": []}],
@@ -186,7 +187,13 @@ a field because you think it could be better.
 "content_request" when they ask for a piece of content ("write a post about our sale"), "question" for a \
 question or small talk. If it is a preference but too vague to act on ("make it better"), set \
 not_a_preference = "vague" and ask one short, specific question with two or three concrete options.
-7. reply: talk to the owner ("Done — captions will be short, …"). Mention anything significant, e.g. that \
+7. Split the message into "clauses" — one per thing asked for — and handle EVERY clause: each one must \
+appear in "changes" (as the field named in handled_by) or in "remember". "Keep captions short" is a clause and \
+must produce voice_profile.caption_length "short" even if that might already be the case.
+8. Call to action: "always end with X", "our CTA is X", "use X as the call to action" → cta_styles op "set" \
+to [X] (posts rotate through the list, so anything else stays in the rotation); "also use X" → op "add".
+9. reply: describe ONLY what is in changes, remember and forget — never claim something you did not change. \
+Talk to the owner ("Done — captions will be short, …"). Mention anything significant, e.g. that \
 Auto-tab posts will now publish without review.
 
 FIELDS
@@ -462,6 +469,8 @@ async def instruct(db: AsyncIOMotorDatabase, user_id: str, brand_id: Optional[st
         return {"understood": False, "reply": reply, "changes": [], "added": [], "removed": [], "change_id": None}
 
     plan = plan_update(proposal, profile)
+    print(f"[PlaybookInstruct] clauses={json.dumps(proposal.get('clauses'), ensure_ascii=False)[:600]} "
+          f"applied={[c['field'] for c in plan['changes']]} added={len(plan['added'])} removed={len(plan['removed'])}")
     if not plan["set"]:
         return {"understood": True,
                 "reply": "That's already how your Playbook is set — nothing needed changing.",
