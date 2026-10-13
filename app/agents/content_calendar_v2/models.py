@@ -77,6 +77,9 @@ class PlanGenerateRequestV2(BaseModel):
 class CreateDraftRequestV2(BaseModel):
     platforms: List[str] = ["facebook", "instagram"]
     include_images: bool = False
+    # Carousel items only: the user's own slide count (2-10). The plan still
+    # suggests 2-5; this lets the user pick more before drafting.
+    num_slides: Optional[int] = None
 
 
 class RegenerateItemRequestV2(BaseModel):
