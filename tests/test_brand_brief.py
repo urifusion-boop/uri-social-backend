@@ -155,9 +155,9 @@ class TestPostsUseTheBrief:
 
 class TestAdsUseTheBrief:
     def test_ads_get_rules_offer_and_promos_but_not_the_audience_tier(self):
-        from app.agents.jane_ads.creative import _brand_prompt_bits
+        from app.agents.jane_ads.creative import _brand_copy_bits
 
-        bits = _brand_prompt_bits({**FULL, "business_pulse": {"current_promotions": ["20% off this week"]},
+        bits = _brand_copy_bits({**FULL, "business_pulse": {"current_promotions": ["20% off this week"]},
                                    "business_pulse_updated_at": datetime.utcnow()})
         assert "HARD RULES (never" in bits
         assert "NEVER mention or reference: politics." in bits
@@ -167,9 +167,26 @@ class TestAdsUseTheBrief:
         assert "AUDIENCE:" not in bits and "Pain points" not in bits
 
     def test_no_playbook_is_unchanged(self):
-        from app.agents.jane_ads.creative import _brand_prompt_bits
+        from app.agents.jane_ads.creative import _brand_copy_bits, _brand_prompt_bits
 
-        assert _brand_prompt_bits({}) == ""
+        assert _brand_prompt_bits({}) == "" and _brand_copy_bits({}) == ""
+
+    def test_image_prompts_never_get_rules_or_promotions(self):
+        """Words in an image prompt get painted into the picture."""
+        from app.agents.jane_ads.creative import _as_ad_content, _brand_prompt_bits
+
+        bc = {**FULL, "business_pulse": {"current_promotions": ["20% off this week"]},
+              "business_pulse_updated_at": datetime.utcnow()}
+        for text in (_brand_prompt_bits(bc), _as_ad_content("A chef plating jollof", bc)):
+            assert "HARD RULES" not in text and "20% off" not in text and "politics" not in text
+            assert "cooked fresh every morning" not in text
+
+    def test_only_writing_prompts_use_the_copy_bits(self):
+        import inspect
+        from app.agents.jane_ads import creative
+
+        assert "_brand_copy_bits(" not in inspect.getsource(creative._as_ad_content)
+        assert "_brand_copy_bits(bc)" in inspect.getsource(creative.write_ad_copy)
 
     def test_ad_copy_is_checked_for_banned_words(self):
         import inspect
@@ -239,6 +256,13 @@ class TestVideoAndBlogUseTheBrief:
 
         for module in (video_creative_service, video_storyboard_service, voiceover_service, blog_generation_service):
             assert "brand_brief.build(" in inspect.getsource(module), module.__name__
+
+    def test_storyboards_keep_video_prompts_visual(self):
+        import inspect
+        from app.agents.social_media_manager.services import video_creative_service, video_storyboard_service
+
+        for module in (video_creative_service, video_storyboard_service):
+            assert "never write rules, promotions, prices" in inspect.getsource(module), module.__name__
 
     def test_voiceover_keeps_the_voices_language(self):
         import inspect
