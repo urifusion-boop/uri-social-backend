@@ -11,7 +11,8 @@ Tiers, in priority order (also stated to the model, so conflicts resolve the
 same way everywhere):
 
   1. HARD RULES   never broken: avoid-topics, banned words, compliance,
-                  language. Checked again after writing with violations().
+                  language. Checked again after writing with audit() and
+                  applied with enforce().
   2. VOICE        how the brand sounds.
   3. AUDIENCE     who it's for; adapts the voice, never replaces it.
   4. OFFER        what the business sells and why people choose it.
@@ -142,6 +143,165 @@ def violations(text: str, bc: Optional[Dict[str, Any]]) -> List[str]:
     """Banned words/phrases that appear in `text` (whole words, any case).
     For checking a piece of writing after the model produced it."""
     return find_banned(text, banned_words(bc))
+
+
+# ── 1b. After writing: check, then enforce ───────────────────────────────────
+# Asking for a rule is not the same as getting it. On dev, with every rule in
+# the prompt, captions still came back with an invented "Over 70% of small
+# businesses...", no call to action and no Pidgin. audit() finds what a piece
+# got wrong so it can be rewritten; enforce() then applies what can be applied
+# with certainty, without a model.
+
+_EMOJI = re.compile(
+    "[\U0001F000-\U0001FAFF\U00002600-\U000027BF\U00002B00-\U00002BFF"
+    "\U000023E9-\U000023FA\U0000FE0F\U0000200D]"
+)
+
+
+def strip_emojis(text: str) -> str:
+    out = _EMOJI.sub("", text or "")
+    out = re.sub(r"[ \t]{2,}", " ", out)
+    out = re.sub(r"[ \t]+([.,!?])", r"\1", out)
+    return "\n".join(line.strip() for line in out.split("\n")).strip()
+
+
+def hashtag_limit(bc: Optional[Dict[str, Any]]) -> Optional[int]:
+    """The Playbook's "max hashtags" as a number; None when there is no limit."""
+    raw = str(((bc or {}).get("guardrails") or {}).get("max_hashtags") or "").strip()
+    m = re.match(r"\d+", raw)
+    return int(m.group()) if m else None
+
+
+def limit_hashtags(hashtags: Optional[List[str]], bc: Optional[Dict[str, Any]]) -> List[str]:
+    limit = hashtag_limit(bc)
+    tags = list(hashtags or [])
+    return tags if limit is None else tags[:limit]
+
+
+def ctas(bc: Optional[Dict[str, Any]]) -> List[str]:
+    """The call(s) to action this piece may end with: a one-off override, else
+    the one already used on the image, else the Playbook's own."""
+    bc = bc or {}
+    for key in ("override_cta", "selected_cta"):
+        if bc.get(key):
+            return [str(bc[key]).strip()]
+    return _list(bc.get("cta_styles"))
+
+
+def _norm(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).strip()
+
+
+_CTA_FILLER = {"a", "an", "the", "your", "our", "us", "to", "now", "today", "for", "of", "and", "with", "on", "in"}
+
+
+def has_cta(text: str, bc: Optional[Dict[str, Any]]) -> bool:
+    """True if the piece carries one of the brand's CTAs: the exact phrase
+    anywhere, or all of its meaningful words in the closing lines ("Book your
+    free demo today" satisfies "Book a free demo")."""
+    wanted = [c for c in ctas(bc) if _norm(c)]
+    if not wanted:
+        return True
+    whole = _norm(text)
+    closing = [l for l in (text or "").split("\n") if l.strip() and not l.strip().startswith("#")][-2:]
+    closing_words = set(_norm(" ".join(closing)).split())
+    for cta in wanted:
+        if _norm(cta) in whole:
+            return True
+        words = [w for w in _norm(cta).split() if w not in _CTA_FILLER]
+        if words and all(w in closing_words for w in words):
+            return True
+    return False
+
+
+# Words that only appear when a piece really uses the language. Enough to tell
+# "none at all" from "some" — it triggers a rewrite, it doesn't grade fluency.
+# A language with no entry here is simply not checked.
+_LANGUAGE_MARKERS = {
+    "pidgin": r"\b(dey|abeg|wahala|wetin|una|sabi|na|no be|go fit|make we|make una|we go|e go|don dey|"
+              r"(?:e|we|i|dem) don(?!['’])|sef|sha|oga|sharp sharp|how far|comot|wey|dem|chop|shey|abi|pikin|wan|naija|omo)\b",
+    "yoruba": r"[ẹọṣ]|\b(e ku|bawo|jowo|e se|pele|oya|owo|aje|ore mi|a dupe|e kaaro|e kaasan|ise|ile wa)\b",
+    "igbo": r"[ịụṅ]|\b(ndewo|biko|daalu|kedu|nnoo|nwanne|ego|ahia|imela|ka anyi|unu|nke oma)\b",
+    "hausa": r"[ɓɗƙ]|\b(sannu|nagode|na gode|yaya|barka|kasuwa|kudi|yauwa|madalla|ina kwana|don allah|ku zo)\b",
+}
+
+
+def missing_languages(text: str, bc: Optional[Dict[str, Any]]) -> List[str]:
+    """Languages the brand mixes in that this piece doesn't use at all."""
+    langs = _list((bc or {}).get("languages"))
+    if len(langs) < 2:
+        return []
+    lowered = (text or "").lower()
+    missing = []
+    for lang in langs[1:]:
+        key = next((k for k in _LANGUAGE_MARKERS if k in lang.lower()), None)
+        if key and not re.search(_LANGUAGE_MARKERS[key], lowered):
+            missing.append(lang)
+    return missing
+
+
+_STATISTIC = re.compile(
+    r"(\d+(?:[.,]\d+)?)\s?(?:%|percent\b|per cent\b)"
+    r"|\b(\d+)\s+(?:out of|in every|in)\s+(\d+)\b"
+    r"|\b(\d+)x\b", re.I)
+
+
+def unverified_numbers(text: str, sources: str) -> List[str]:
+    """Statistics in `text` (percentages, "3 in 5", "10x") whose numbers appear
+    nowhere in what the writer was given — i.e. probably made up."""
+    known = set(re.findall(r"\d+(?:[.,]\d+)?", sources or ""))
+    found: List[str] = []
+    for m in _STATISTIC.finditer(text or ""):
+        numbers = [g for g in m.groups() if g]
+        phrase = m.group(0).strip()
+        if phrase.replace(" ", "").lower() in ("100%", "100percent"):
+            continue  # "100% Nigerian" is an expression, not a statistic
+        if any(n not in known for n in numbers) and phrase not in found:
+            found.append(phrase)
+    return found
+
+
+def audit(text: str, bc: Optional[Dict[str, Any]], sources: str = "") -> List[Dict[str, str]]:
+    """What a finished piece got wrong against the Playbook. Each issue says how
+    to fix it, so the rewrite is specific. `sources` is everything the writer
+    was given (topic + brand), used to tell real numbers from invented ones."""
+    bc = bc or {}
+    issues: List[Dict[str, str]] = []
+    for word in violations(text, bc):
+        issues.append({"code": "banned_word", "detail": word,
+                       "fix": f'Remove "{word}" in every form (plural, -ed, -ing) and say it another way.'})
+    for phrase in unverified_numbers(text, sources):
+        issues.append({"code": "unverified_number", "detail": phrase,
+                       "fix": f'Remove "{phrase}" — that figure was never provided, so it is invented. '
+                              f'Make the same point without a number.'})
+    langs = _list(bc.get("languages"))
+    for lang in missing_languages(text, bc):
+        issues.append({"code": "missing_language", "detail": lang,
+                       "fix": f"Work in at least one natural {lang} phrase or sentence — this brand writes in "
+                              f"{' + '.join(langs)}, the way its audience actually speaks."})
+    if not has_cta(text, bc):
+        cta = ctas(bc)[0]
+        issues.append({"code": "missing_cta", "detail": cta,
+                       "fix": f'End with this call-to-action as the final line: "{cta}".'})
+    return issues
+
+
+def enforce(text: str, bc: Optional[Dict[str, Any]], append_cta: bool = True) -> str:
+    """The rules that can be guaranteed without a model. Runs last, so whatever
+    the writer or the rewrite did, these hold on what is saved:
+      • "no emojis" — every emoji is removed
+      • the brand's call-to-action closes the piece (append_cta=False where a
+        line can't simply be added, e.g. a tweet thread)."""
+    bc = bc or {}
+    out = text or ""
+    if ((bc.get("guardrails") or {}).get("emoji_usage")) == "no":
+        out = strip_emojis(out)
+    if append_cta and out.strip() and not has_cta(out, bc):
+        cta = ctas(bc)[0].strip()
+        if cta[-1:] not in ".!?":
+            cta += "."
+        out = f"{out.rstrip()}\n\n{cta}"
+    return out
 
 
 # ── 2. Voice ─────────────────────────────────────────────────────────────────
