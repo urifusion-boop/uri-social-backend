@@ -3,6 +3,7 @@
 import asyncio
 import json
 from typing import List, Dict, Optional, Any, Tuple
+from . import brand_brief
 from datetime import datetime
 from bson import ObjectId
 from motor.motor_asyncio import AsyncIOMotorDatabase
@@ -225,23 +226,8 @@ Write one caption. No alternatives, no meta-commentary.
 
     @staticmethod
     def _brand_banned_words(brand_context: Optional[Dict[str, Any]]) -> List[str]:
-        """Every word the brand has said never to use: the voice profile's banned
-        words, the Playbook's "Words to avoid", and the guardrails' banned words
-        (a free-text, comma/newline separated field). Checked after writing."""
-        if not brand_context:
-            return []
-        words = list((brand_context.get("voice_profile") or {}).get("banned_words") or [])
-        words += list(brand_context.get("words_to_avoid") or [])
-        guardrail_words = (brand_context.get("guardrails") or {}).get("banned_words") or ""
-        if isinstance(guardrail_words, str):
-            words += guardrail_words.replace("\n", ",").split(",")
-        seen, out = set(), []
-        for w in words:
-            w = str(w).strip()
-            if w and w.lower() not in seen:
-                seen.add(w.lower())
-                out.append(w)
-        return out
+        """Every word the brand has said never to use (see brand_brief.banned_words)."""
+        return brand_brief.banned_words(brand_context)
 
     @staticmethod
     def _build_brand_block(brand_context: Optional[Dict[str, Any]], platform: str = "") -> str:
@@ -252,7 +238,16 @@ Write one caption. No alternatives, no meta-commentary.
         if not brand_context:
             return ""
 
-        parts = ["BRAND INSTRUCTIONS — you are writing on behalf of this specific brand. Apply every rule below:"]
+        # Hard rules, voice and audience come from the shared Brand Brief so
+        # every generator states them the same way, in the same priority order.
+        parts = [
+            "BRAND INSTRUCTIONS — you are writing on behalf of this specific brand. Apply every rule below.",
+            brand_brief.PRIORITY_ORDER,
+        ]
+        rules = brand_brief.hard_rules(brand_context, captions=True)
+        if rules:
+            parts.append("HARD RULES (never break these):")
+            parts.extend(f"- {r}" for r in rules)
 
         # ── Core identity ─────────────────────────────────────────────────────
         if brand_context.get("brand_name"):
@@ -402,61 +397,8 @@ Write one caption. No alternatives, no meta-commentary.
                 'from the questions rather than generic marketing phrasing.'
             )
 
-        if brand_context.get("audience_age_range"):
-            age_range = brand_context["audience_age_range"]
-            print(f"🎯 Audience age range detected: '{age_range}'")
-
-            # Build age-specific voice instructions for each demographic
-            if "Gen Z" in age_range or "18-24" in age_range:
-                print(f"✅ Applying Gen Z voice adaptation")
-                parts.insert(0,
-                    f'🎯 TARGET AUDIENCE: Gen Z (18-24) - CRITICAL\n'
-                    f'Write like you\'re a Gen Z person talking to friends:\n'
-                    f'  • Use Gen Z slang naturally (lowkey, highkey, no cap, fr, ngl, tbh, iykyk)\n'
-                    f'  • Keep it short and punchy\n'
-                    f'  • Casual tone - like TikTok/Instagram captions\n'
-                    f'  • Reference trends and internet culture\n'
-                    f'  • Avoid corporate jargon\n'
-                    f'This takes priority over other tone instructions.'
-                )
-            elif "Millennials" in age_range or "25-40" in age_range:
-                print(f"✅ Applying Millennials voice adaptation")
-                parts.insert(0,
-                    f'🎯 TARGET AUDIENCE: Millennials (25-40) - CRITICAL\n'
-                    f'Write for millennials who value authenticity:\n'
-                    f'  • Conversational but polished\n'
-                    f'  • Reference millennial culture (nostalgia, work-life balance, experiences)\n'
-                    f'  • Balance casual and professional\n'
-                    f'  • Relatable without being too corporate or too trendy\n'
-                    f'This takes priority over other tone instructions.'
-                )
-            elif "Gen X" in age_range or "41-56" in age_range:
-                print(f"✅ Applying Gen X voice adaptation")
-                parts.insert(0,
-                    f'🎯 TARGET AUDIENCE: Gen X (41-56) - CRITICAL\n'
-                    f'Write for Gen X who value authenticity and directness:\n'
-                    f'  • Straightforward, no-nonsense tone\n'
-                    f'  • Skip the hype - be genuine and practical\n'
-                    f'  • Professional but not stiff\n'
-                    f'  • Focus on value, quality, and results\n'
-                    f'This takes priority over other tone instructions.'
-                )
-            elif "Boomers" in age_range or "57+" in age_range:
-                print(f"✅ Applying Boomers voice adaptation")
-                parts.insert(0,
-                    f'🎯 TARGET AUDIENCE: Boomers (57+) - CRITICAL\n'
-                    f'Write for baby boomers with respect and clarity:\n'
-                    f'  • Professional, respectful tone\n'
-                    f'  • Clear, well-structured sentences\n'
-                    f'  • Emphasize trust, reliability, expertise\n'
-                    f'  • Avoid slang and internet jargon\n'
-                    f'This takes priority over other tone instructions.'
-                )
-            elif "Everyone" not in age_range:
-                # Fallback for custom age ranges
-                parts.append(
-                    f'- Target audience age: {age_range}. Adjust language and references to match this demographic.'
-                )
+        for line in brand_brief.audience_adaptation(brand_context):
+            parts.append(f"- {line}")
 
         if brand_context.get("primary_goal"):
             parts.append(
@@ -477,18 +419,6 @@ Write one caption. No alternatives, no meta-commentary.
                 f'- Market/region: {brand_context["region"]}. '
                 f'Use cultural references and examples that resonate specifically in this market.'
             )
-
-        if brand_context.get("languages"):
-            langs = [str(l).strip() for l in brand_context["languages"] if str(l).strip()]
-            if langs and langs != ["English"]:
-                if len(langs) == 1:
-                    parts.append(f'- Write this post in {langs[0]}.')
-                else:
-                    parts.append(
-                        f'- Languages: {", ".join(langs)}. Write mainly in {langs[0]} and naturally mix in '
-                        f'{", ".join(langs[1:])} the way this audience actually speaks — '
-                        f'not a translation, a natural blend.'
-                    )
 
         # ── Content strategy ─────────────────────────────────────────────────
         if brand_context.get("content_pillars"):
@@ -515,27 +445,11 @@ Write one caption. No alternatives, no meta-commentary.
                     f'Let the tone and energy of the post feel consistent with this visual palette.'
                 )
 
-        # ── Guardrails ───────────────────────────────────────────────────────
-        guardrails = brand_context.get("guardrails")
-        if guardrails and isinstance(guardrails, dict):
-            if guardrails.get("avoid_topics"):
-                parts.append(f'- NEVER mention or reference: {guardrails["avoid_topics"]}.')
-            if guardrails.get("banned_words"):
-                parts.append(f'- NEVER use these words or phrases: {guardrails["banned_words"]}.')
-            emoji_rule = guardrails.get("emoji_usage")
-            if emoji_rule == "no":
-                parts.append('- Use NO emojis under any circumstances.')
-            elif emoji_rule == "some":
-                parts.append('- Use emojis very sparingly — maximum 1-2 only if they add genuine meaning.')
-            max_hash = guardrails.get("max_hashtags")
-            if max_hash and max_hash not in ("No limit", ""):
-                parts.append(f'- Use a maximum of {max_hash} hashtags.')
-            if guardrails.get("compliance_notes"):
-                parts.append(f'- Compliance requirement: {guardrails["compliance_notes"]}.')
-
-        words_to_avoid = [str(w).strip() for w in (brand_context.get("words_to_avoid") or []) if str(w).strip()]
-        if words_to_avoid:
-            parts.append(f'- NEVER use these words or phrases: {", ".join(words_to_avoid)}.')
+        # ── Happening right now (Business Pulse) ─────────────────────────────
+        pulse = brand_brief.pulse(brand_context)
+        if pulse:
+            parts.append("- Happening right now at this business — use it where it genuinely fits this post, "
+                         "quote the real terms and never invent any: " + " ".join(pulse))
 
         # ── CTAs & links ─────────────────────────────────────────────────────
         # Priority order: override_cta > selected_cta (from image) > cta_styles (all CTAs)
@@ -585,7 +499,7 @@ Write one caption. No alternatives, no meta-commentary.
                 f'If any of these are relevant to the post topic, reference them naturally.'
             )
 
-        if len(parts) == 1:
+        if len(parts) == 2:
             # No brand instructions, but still check for voice profile
             brand_block = ""
         else:
