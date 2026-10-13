@@ -59,6 +59,17 @@ _PLACEMENT_LABELS = {
 }
 
 
+def _location_names(geo: Optional[GeoPlan]) -> list[str]:
+    """What the ad set will actually target. A pinless plan targets its whole city
+    (meta_targeting_from_geo_named), and showing "—" for it read as "nowhere"."""
+    if not geo:
+        return []
+    if geo.pins:
+        return [p.name for p in geo.pins]
+    area = geo.city or ("" if geo.fallback_area == "the wider area" else geo.fallback_area)
+    return [area] if area else []
+
+
 def _gender_of(targeting: dict) -> str:
     return _CODES_TO_GENDER.get(tuple(targeting.get("genders") or []), "all")
 
@@ -170,7 +181,7 @@ def describe(plan: CampaignPlan, req: CampaignRequest) -> list[dict[str, Any]]:
     fields += [
         {
             "key": "locations", "label": "Locations", "type": "list",
-            "value": [p.name for p in (geo.pins if geo else [])],
+            "value": _location_names(geo),
             "editable": True, "max_items": MAX_LOCATIONS,
             "help": (f"Up to {MAX_LOCATIONS} areas. Each must be somewhere TikTok can name — "
                      "we never target raw coordinates."
