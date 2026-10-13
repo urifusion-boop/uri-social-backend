@@ -302,10 +302,11 @@ class TestCostsComeBackInNaira:
         from app.agents.jane_ads.adapters.google import COLLECTION, GoogleAdsAdapter
         db = db_with(manager_link_status="active")
         db["x"].docs.append({"campaign_id": "77", "business_id": "biz", "ad_id": "9", "last_click_count": 0})
-        adapter = GoogleAdsAdapter(db, customer_id="1234567890", login_customer_id="9999999999",
-                                   access_token="t", currency_code="USD")
         with patch("app.agents.jane_ads.adapters.google.settings") as st:
             st.GOOGLE_ADS_DEVELOPER_TOKEN = "dev"
+            st.GOOGLE_ADS_API_VERSION = "v24"
+            adapter = GoogleAdsAdapter(db, customer_id="1234567890", login_customer_id="9999999999",
+                                       access_token="t", currency_code="USD")
             with Google({"results": [{"metrics": {"clicks": "2", "costMicros": "1000000"},
                                       "customer": {"currencyCode": "USD"}}]}):
                 events = run(adapter.poll_conversations("77"))

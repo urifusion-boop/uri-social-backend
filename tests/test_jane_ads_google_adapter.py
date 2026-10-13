@@ -316,8 +316,8 @@ def test_launch_campaign_rolls_back_partial_launch_on_failure_and_preserves_orig
             _run(adapter.launch_campaign(_plan(), _auth()))
 
     rollback_json = mock_client.post.call_args_list[3].kwargs["json"]["operations"][0]
-    assert rollback_json["update"]["status"] == "REMOVED"
-    assert rollback_json["update"]["resourceName"] == "customers/1234567890/campaigns/111"
+    # Google rejects status=REMOVED via update; the rollback uses a real remove operation.
+    assert rollback_json["remove"] == "customers/1234567890/campaigns/111"
 
 
 # ── fetch_per_ad_spend ──────────────────────────────────────────────────────────
