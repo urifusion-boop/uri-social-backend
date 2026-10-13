@@ -493,6 +493,56 @@ class TestAdCopyIsCheckedToo:
         assert copy.headline == "Paperwork, handled" and copy.primary_text == "Try Docerity today"
 
 
+class TestCarouselIsCheckedToo:
+    def _run(self, monkeypatch, replies, brand=BRAND):
+        import json as _json
+        from app.agents.social_media_manager.services import carousel_generation_service as car
+        calls = []
+
+        async def fake_create(**kwargs):
+            calls.append(kwargs["messages"])
+            data = replies[min(len(calls) - 1, len(replies) - 1)]
+            return _reply(_json.dumps(data))
+
+        monkeypatch.setattr(car._client.chat.completions, "create", fake_create)
+        result = asyncio.run(car.CarouselGenerationService.generate(
+            "Introduce Docerity", "instagram", brand_context=brand, num_slides=3, force_num_slides=True))
+        return result, calls
+
+    BAD = {"caption": "Streamline your day 🎉 #a #b #c #d #e",
+           "slides": [{"headline": "70% lose invoices 🔥", "body": "Research shows it."},
+                      {"headline": "Two", "body": "Body"}, {"headline": "Three", "body": "Body"}]}
+    GOOD = {"caption": "Paperwork no be your work again.\n\nBook a free demo. #a #b #c #d #e",
+            "slides": [{"headline": "Paperwork, handled", "body": "Invoices become clean data."},
+                       {"headline": "Two", "body": "Body"}, {"headline": "Three", "body": "Body"}]}
+
+    def test_broken_carousel_is_rewritten_once(self, monkeypatch):
+        result, calls = self._run(monkeypatch, [self.BAD, self.GOOD])
+        assert len(calls) == 2
+        correction = calls[1][1]["content"]
+        assert 'Remove "streamline"' in correction and '"70%"' in correction and "cites a study" in correction
+        assert result["slides"][0]["headline"] == "Paperwork, handled"
+        assert result["playbook_issues"] == []
+
+    def test_guarantees_hold_even_if_the_model_never_complies(self, monkeypatch):
+        result, calls = self._run(monkeypatch, [self.BAD])
+        assert len(calls) == 2
+        assert result["hashtags"] == ["a", "b", "c"]
+        assert "🎉" not in result["caption"] and "🔥" not in result["slides"][0]["headline"]
+        assert result["caption"].endswith("Book a free demo.")
+        assert any(i.startswith("banned_word") for i in result["playbook_issues"])
+
+    def test_clean_carousel_costs_no_rewrite(self, monkeypatch):
+        result, calls = self._run(monkeypatch, [self.GOOD])
+        assert len(calls) == 1 and len(result["slides"]) == 3
+
+    def test_prompt_asks_for_the_brands_hashtag_limit(self, monkeypatch):
+        _, calls = self._run(monkeypatch, [self.GOOD])
+        assert "up to 3 relevant" in calls[0][0]["content"]
+        _, calls = self._run(monkeypatch, [self.GOOD], brand={"brand_name": "Plain"})
+        assert "3-6 relevant" in calls[0][0]["content"]
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
