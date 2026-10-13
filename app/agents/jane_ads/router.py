@@ -1675,6 +1675,7 @@ async def jane_google_ads_connection_status(
     resolve_customer_id_for_launch, which does)."""
     from .google_ads_connection import get_admin_connection, refresh_connection
     from .whatsapp import get_brand_whatsapp
+    from app.core.config import settings as _settings
 
     # While an invitation is pending (or on "Check again", refresh=true) this
     # asks Google whether it was accepted — the owner accepts it in Google Ads,
@@ -1704,6 +1705,7 @@ async def jane_google_ads_connection_status(
         "created_by_uri": bool((conn or {}).get("created_account_by_uri")),
         "manager_customer_id": settings_mcc_display(),
         "sync_error": sync_error,
+        "signin_verified": bool(_settings.GOOGLE_ADS_OAUTH_VERIFIED),
     }
 
 
