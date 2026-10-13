@@ -998,9 +998,11 @@ async def search_ad_creative(
     copy = await write_ad_copy(business_name, category, goal, description, brand_context,
                                city, behaviour, service_area, audience_segment, who_its_for,
                                geo_pockets=geo_pockets, destination_type=destination_type, platform="google")
-    return assemble_creative(copy, "", source=CreativeSource.GENERATE, is_video=False,
-                             service_area=service_area, destination_type=destination_type,
-                             destination_cta=destination_cta)
+    ad = assemble_creative(copy, "", source=CreativeSource.GENERATE, is_video=False,
+                           service_area=service_area, destination_type=destination_type,
+                           destination_cta=destination_cta)
+    ad.video_recommendation = ""    # "a video would work better" means nothing for a text ad
+    return ad
 
 
 # ── The three entry points ────────────────────────────────────────────────────

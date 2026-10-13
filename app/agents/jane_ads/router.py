@@ -3028,7 +3028,8 @@ async def _build_campaign_plan(
     # Image-selection step (PRD §2): don't silently generate once budget is set — ask the
     # user how to source the image (upload their own / pick a past post / let Jane generate).
     # Only when the caller hasn't already chosen ("ask"); a concrete source skips through.
-    if body.creative_source == "ask":
+    # (Not for Google: a Search ad is text, so there is no image to choose.)
+    if body.creative_source == "ask" and not use_google:
         from .creative import list_recent_drafts
         drafts = await list_recent_drafts(user_id, db, brand_id, limit=6) if user_id else []
         return {"early_return": {
