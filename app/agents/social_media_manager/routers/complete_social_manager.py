@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import re
 import subprocess
 import traceback
 from fastapi import APIRouter, Body, Depends, HTTPException, BackgroundTasks, Query, Request, Response, UploadFile, File, Form
@@ -5795,6 +5796,85 @@ async def get_playbook_health(
         return UriResponse.get_single_data_response("playbook_health", playbook_health.assess(profile))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def _playbook_profile_filter(profile: Dict[str, Any], user_id: str) -> Dict[str, Any]:
+    """The exact brand_profiles document a profile came from (older personal
+    profiles carry no brand_id)."""
+    if profile.get("brand_id"):
+        return {"brand_id": profile["brand_id"]}
+    return {"user_id": user_id, "brand_id": {"$exists": False}}
+
+
+@router.get("/brand-profile/suggestions")
+async def get_playbook_suggestions(
+    ctx: dict = Depends(get_active_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """
+    Playbook changes Jane suggests from what the user actually does: how they
+    keep editing her drafts, and when their posts perform best. Each one names
+    its evidence. Nothing changes until one is applied.
+    """
+    from ..services import playbook_learning
+    try:
+        profile_result = await BrandProfileService.get(ctx["user_id"], db, brand_id=ctx["brand_id"])
+        profile = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
+        found = await playbook_learning.suggestions_for(db, ctx["user_id"], ctx["brand_id"], profile) if profile else []
+        public = [{k: s[k] for k in ("id", "title", "evidence", "change")} for s in found]
+        return UriResponse.get_single_data_response("playbook_suggestions", {"suggestions": public})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class PlaybookSuggestionAction(BaseModel):
+    id: str
+
+
+@router.post("/brand-profile/suggestions/apply")
+async def apply_playbook_suggestion(
+    request: PlaybookSuggestionAction,
+    ctx: dict = Depends(get_active_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """Apply one suggestion. The change is recomputed on the server from the
+    current evidence — the client only says which one — so a stale or made-up
+    id can't write anything."""
+    from ..services import playbook_learning
+    profile_result = await BrandProfileService.get(ctx["user_id"], db, brand_id=ctx["brand_id"])
+    profile = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
+    if not profile:
+        raise HTTPException(status_code=404, detail="Brand Playbook not found")
+    found = await playbook_learning.suggestions_for(db, ctx["user_id"], ctx["brand_id"], profile)
+    match = next((s for s in found if s["id"] == request.id), None)
+    if not match:
+        raise HTTPException(status_code=404, detail="That suggestion no longer applies.")
+    update = playbook_learning.build_update(match["apply"], profile)
+    update["updated_at"] = datetime.utcnow()
+    await db["brand_profiles"].update_one(_playbook_profile_filter(profile, ctx["user_id"]), {"$set": update})
+    fresh = await BrandProfileService.get(ctx["user_id"], db, brand_id=ctx["brand_id"])
+    return UriResponse.get_single_data_response("brand_profile", fresh.get("responseData") or {})
+
+
+@router.post("/brand-profile/suggestions/dismiss")
+async def dismiss_playbook_suggestion(
+    request: PlaybookSuggestionAction,
+    ctx: dict = Depends(get_active_brand_context),
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+):
+    """Hide a suggestion for a couple of months."""
+    profile_result = await BrandProfileService.get(ctx["user_id"], db, brand_id=ctx["brand_id"])
+    profile = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
+    if not profile:
+        raise HTTPException(status_code=404, detail="Brand Playbook not found")
+    if not re.fullmatch(r"[a-z0-9_'-]{1,120}", request.id):
+        raise HTTPException(status_code=400, detail="Invalid suggestion id")
+    dismissed = {**(profile.get("playbook_suggestions_dismissed") or {}), request.id: datetime.utcnow()}
+    await db["brand_profiles"].update_one(
+        _playbook_profile_filter(profile, ctx["user_id"]),
+        {"$set": {"playbook_suggestions_dismissed": dismissed}},
+    )
+    return UriResponse.get_single_data_response("playbook_suggestions", {"dismissed": request.id})
 
 
 PLAYBOOK_PREVIEWS_PER_DAY = 20
