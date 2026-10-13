@@ -13,6 +13,7 @@ This validator catches:
 - Repetitive parallel structures
 """
 
+import re
 from typing import Dict, List, Any
 
 
@@ -132,13 +133,15 @@ class CaptionValidatorService:
 
         # Check for banned words
         caption_lower = caption.lower()
-        all_banned_words = CaptionValidatorService.BANNED_WORDS.copy()
-        if custom_banned_words:
-            all_banned_words.extend([w.lower() for w in custom_banned_words])
-
-        for word in all_banned_words:
+        for word in CaptionValidatorService.BANNED_WORDS:
             if word in caption_lower:
                 issues.append(f"banned_word: '{word}'")
+        # Brand-specific words are matched as whole words/phrases, so a short
+        # entry like "ok" doesn't flag "book".
+        for word in custom_banned_words or []:
+            w = str(word).strip().lower()
+            if w and re.search(r"(?<!\w)" + re.escape(w) + r"(?!\w)", caption_lower):
+                issues.append(f"banned_word: '{w}'")
 
         # Check for banned closers
         last_lines = caption.split("\n")[-2:]  # Check last 2 lines

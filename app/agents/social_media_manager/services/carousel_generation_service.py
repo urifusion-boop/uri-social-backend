@@ -135,15 +135,16 @@ class CarouselGenerationService:
 
         print(f"📊 Carousel analysis: type={content_analysis['type']}, optimal_slides={content_analysis['optimal_slides']}, using={num_slides}")
 
-        brand_block = ""
-        if brand_name:
-            brand_block += f"Brand name: {brand_name}\n"
-        if industry:
-            brand_block += f"Industry: {industry}\n"
-        if brand_voice:
-            brand_block += f"Brand voice: {brand_voice}\n"
-        if target_audience:
-            brand_block += f"Target audience: {target_audience}\n"
+        # Same full Brand Playbook instructions single posts get (voice, audience,
+        # customer psychology, guardrails, words to avoid, CTAs, languages...) —
+        # carousels used to get only name/industry/voice/audience.
+        from .content_generation_service import ContentGenerationService
+        brand_block = ContentGenerationService._build_brand_block(bc, platform=platform)
+        if not brand_block:
+            for label, value in (("Brand name", brand_name), ("Industry", industry),
+                                 ("Brand voice", brand_voice), ("Target audience", target_audience)):
+                if value:
+                    brand_block += f"{label}: {value}\n"
 
         # Build content-type-specific structure instructions
         if content_analysis["type"] == "list" and content_analysis["numbered"]:
