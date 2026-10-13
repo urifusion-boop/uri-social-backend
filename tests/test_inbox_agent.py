@@ -153,8 +153,8 @@ def test_once_a_person_has_replied_the_agent_steps_back():
 
 
 def test_auto_replies_stop_after_the_cap():
-    ok, reason = decide(auto_sent=agent.MAX_AUTO_REPLIES_PER_CONVERSATION)
-    assert not ok and "limit" in reason
+    ok, reason = decide(auto_sent=agent.MAX_AUTO_REPLIES_PER_HOUR)
+    assert not ok and "another bot" in reason
 
 
 def test_a_draft_with_invented_contact_details_is_not_sent():
@@ -412,3 +412,9 @@ def test_replies_are_always_english_even_to_pidgin():
     _run(agent.draft_reply("abeg una dey deliver?", [], [], "dm", "facebook", "Shop", llm, "pcm"))
     assert "Always write in clear, correct, professional English" in seen["system"]
     assert "Pidgin" not in seen["user"]
+
+
+def test_earlier_auto_replies_dont_stop_new_ones():
+    s = _settings()
+    rows = [("outbound", agent.AGENT_ACTOR, OPEN_HOURS - timedelta(hours=2))] * 5 + [("inbound", "", OPEN_HOURS)]
+    assert agent.verdict(s, _conv(), _history(*rows), _cls(), _draft(), OPEN_HOURS) == (True, "")

@@ -17,7 +17,7 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.core.config import settings
 from app.dependencies import get_active_brand_context, get_db_dependency
 
-from .entities import CHANNEL_ACCOUNTS, CONVERSATIONS, IDENTITIES, MESSAGES, now
+from .entities import CHANNEL_ACCOUNTS, CONVERSATIONS, IDENTITIES, MESSAGES, OUTBOX, now
 from .channels import (
     SOCIAL_CONNECTIONS, _workspace_of, account_for_event, fetch_contact_name,
     link_workspace_channels,
@@ -446,6 +446,27 @@ async def delete_knowledge(
         {"_id": ObjectId(entry_id), "workspace_id": brand_ctx.get("brand_id")})
     if not res.deleted_count:
         raise HTTPException(status_code=404, detail="Not found.")
+    return {"status": "ok"}
+
+
+@router.delete("/conversations/{conversation_id}")
+async def delete_conversation(
+    conversation_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Clear URI's copy of a conversation. The thread on Facebook or Instagram is
+    untouched; the customer's next message starts a fresh conversation here."""
+    workspace_id = brand_ctx.get("brand_id")
+    if not ObjectId.is_valid(conversation_id):
+        raise HTTPException(status_code=404, detail="Not found.")
+    res = await db[CONVERSATIONS].delete_one(
+        {"_id": ObjectId(conversation_id), "workspace_id": workspace_id})
+    if not res.deleted_count:
+        raise HTTPException(status_code=404, detail="Not found.")
+    scoped = {"workspace_id": workspace_id, "conversation_id": conversation_id}
+    for name in (MESSAGES, agent.CLASSIFICATIONS, OUTBOX):
+        await db[name].delete_many(scoped)
     return {"status": "ok"}
 
 
