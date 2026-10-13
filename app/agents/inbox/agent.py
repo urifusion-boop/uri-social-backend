@@ -60,7 +60,9 @@ EXCLUSIONS = {
 # Intents an FAQ answer can settle. Support and complaints always need a person.
 # Every label but spam: answering spam only invites more of it.
 AUTO_INTENTS = tuple(i for i in INTENTS if i != "spam")
-MAX_AUTO_REPLIES_PER_CONVERSATION = 3
+# Not a cap on customers: every message they send gets a reply. This only stops two
+# bots answering each other forever.
+MAX_AUTO_REPLIES_PER_HOUR = 10
 # After a person replies, the agent stays out of that conversation for this long, so
 # it never talks over someone mid-conversation but does pick up a customer who comes
 # back days later.
@@ -427,8 +429,8 @@ def decide_auto_reply(settings: dict, conv: dict, cls: dict, draft: dict,
         return False, "Assigned to a team member"
     if human_replied:
         return False, "A team member is handling this conversation"
-    if auto_sent >= MAX_AUTO_REPLIES_PER_CONVERSATION:
-        return False, "Auto-reply limit reached for this conversation"
+    if auto_sent >= MAX_AUTO_REPLIES_PER_HOUR:
+        return False, "Paused: 10 auto-replies in the last hour looks like another bot replying"
     if not within_business_hours(settings["business_hours"], at):
         return False, "Outside business hours"
     try:
@@ -551,7 +553,8 @@ def verdict(settings: dict, conv: dict, history: list[dict], cls: dict, draft: d
     """The auto-reply decision for this conversation as it stands."""
     at = at or now()
     outbound = [m for m in history if m["direction"] == Direction.OUTBOUND.value]
-    auto_sent = sum(1 for m in outbound if m["actor_id"] == AGENT_ACTOR)
+    auto_sent = sum(1 for m in outbound if m["actor_id"] == AGENT_ACTOR
+                    and (_aware(m.get("received_at")) or at) > at - timedelta(hours=1))
     # Sending URI's draft unchanged is approving it, not taking the conversation over.
     human_replied = any(
         m["actor_id"] != AGENT_ACTOR and not m.get("approved_draft") and (_aware(m.get("received_at")) or at) > at - HUMAN_HANDOFF
