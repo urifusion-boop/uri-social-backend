@@ -37,7 +37,7 @@ class TestHardRules:
         rules = " ".join(bb.hard_rules(FULL))
         assert "NEVER mention or reference: politics." in rules
         assert "Compliance requirement: never promise delivery times." in rules
-        assert "Write mainly in English and naturally mix in Pidgin" in rules
+        assert "Write in English with a light, natural touch of Pidgin" in rules
         assert "Use NO emojis" in rules
 
     def test_hashtag_limit_is_caption_only(self):
@@ -315,7 +315,7 @@ class TestPlaybookWinsOverOlderDefaults:
         rule = bb.languages_rule({"languages": ["English", "Pidgin"]})
         text = build_voice_profile_instructions({"slang_level": "pure_english"}, None, "instagram", language_rule=rule)
         assert "No slang or pidgin" not in text
-        assert "naturally mix in Pidgin" in text
+        assert "natural touch of Pidgin" in text
 
     def test_english_only_brand_keeps_pure_english(self):
         from app.agents.social_media_manager.services.caption_voice_system import build_voice_profile_instructions
@@ -350,7 +350,7 @@ class TestPlaybookWinsOverOlderDefaults:
               "cta_styles": ["Book a free demo"]}
         prompt = ContentGenerationService.build_caption_prompt("Announce a feature", "linkedin", bc)
         assert "No slang or pidgin" not in prompt
-        assert prompt.count("naturally mix in Pidgin") >= 2      # voice profile line + hard rule
+        assert prompt.count("natural touch of Pidgin") >= 2      # voice profile line + hard rule
         assert "FINAL line of the post" in prompt
 
 
@@ -361,7 +361,7 @@ class TestTruthAndLanguageAreRequirements:
 
     def test_mixed_languages_are_a_checkable_requirement(self):
         rule = bb.languages_rule({"languages": ["English", "Pidgin"]})
-        assert "REQUIRED: every piece must contain at least one genuine Pidgin phrase" in rule
+        assert "REQUIRED: at least one genuine Pidgin phrase" in rule
         assert "written only in English is wrong" in rule
 
     def test_single_language_means_the_whole_piece(self):
