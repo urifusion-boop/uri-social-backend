@@ -290,6 +290,30 @@ class TestSearchAdMeetsGooglesMinimums:
         assert len(heads) >= 3 and len(descs) >= 2
 
 
+class TestCostsComeBackInNaira:
+    def test_dollar_cost_is_converted_for_billing(self):
+        from app.agents.jane_ads import constants as C
+        from app.agents.jane_ads.adapters.google import to_ngn
+        assert to_ngn(0.5, "USD") == 0.5 * C.USD_TO_NGN
+        assert to_ngn(500, "NGN") == 500 and to_ngn(500, "") == 500
+
+    def test_click_charge_on_a_dollar_account_is_in_naira(self):
+        from app.agents.jane_ads import constants as C
+        from app.agents.jane_ads.adapters.google import COLLECTION, GoogleAdsAdapter
+        db = db_with(manager_link_status="active")
+        db["x"].docs.append({"campaign_id": "77", "business_id": "biz", "ad_id": "9", "last_click_count": 0})
+        adapter = GoogleAdsAdapter(db, customer_id="1234567890", login_customer_id="9999999999",
+                                   access_token="t", currency_code="USD")
+        with patch("app.agents.jane_ads.adapters.google.settings") as st:
+            st.GOOGLE_ADS_DEVELOPER_TOKEN = "dev"
+            with Google({"results": [{"metrics": {"clicks": "2", "costMicros": "1000000"},
+                                      "customer": {"currencyCode": "USD"}}]}):
+                events = run(adapter.poll_conversations("77"))
+        assert len(events) == 2
+        assert events[0].charge_ngn == pytest.approx(0.5 * C.USD_TO_NGN)     # $0.50 a click, in naira
+        assert COLLECTION
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))

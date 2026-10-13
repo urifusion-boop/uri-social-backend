@@ -2004,6 +2004,74 @@ async def google_test_launch(
     }
 
 
+async def _google_test_adapter(db, brand_ctx: dict, campaign_id: str):
+    """The adapter for a campaign THIS brand's test launch created — never
+    anything else in their Google Ads account."""
+    from .adapters.google import COLLECTION as GOOGLE_CAMPAIGNS, GoogleAdsAdapter
+    from .google_ads_connection import (
+        AdsConnectionRequired, GoogleAdsConnectionError, resolve_customer_id_for_launch,
+    )
+
+    try:
+        conn = await resolve_customer_id_for_launch(db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"))
+    except AdsConnectionRequired as e:
+        raise HTTPException(status_code=409, detail=f"google_ads_connection_{e.state.value}")
+    except GoogleAdsConnectionError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    record = await db[GOOGLE_CAMPAIGNS].find_one({"campaign_id": campaign_id, "customer_id": conn["customer_id"]})
+    if not record or not str(record.get("business_id", "")).startswith("google_test_"):
+        raise HTTPException(status_code=404, detail="That isn't a test campaign created from here.")
+    return GoogleAdsAdapter(
+        db, customer_id=conn["customer_id"], login_customer_id=conn["login_customer_id"],
+        access_token=conn["access_token"], currency_code=conn.get("currency_code", ""),
+    ), record
+
+
+@router.get("/google/test-launch/{campaign_id}")
+async def google_test_launch_read(
+    campaign_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Reads a test campaign back from Google — status, budget (account
+    currency and naira), ad, keywords, locations — and exercises the calls the
+    live flow depends on afterwards: spend, new clicks, and pausing the ad."""
+    from .adapters.google import GoogleAdsAPIError
+
+    adapter, record = await _google_test_adapter(db, brand_ctx, campaign_id)
+    try:
+        info = await adapter.describe_campaign(campaign_id)
+        spend = await adapter.fetch_per_ad_spend(campaign_id)
+        clicks = await adapter.poll_conversations(campaign_id)
+        paused = await adapter.pause_ad(campaign_id, str(record.get("ad_id") or ""))
+    except GoogleAdsAPIError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    return {
+        **info,
+        "checks": {
+            "spend_read_ngn": [round(x.spend_ngn, 2) for x in spend],
+            "new_clicks": len(clicks),
+            "pause_ad_call_ok": paused,
+        },
+    }
+
+
+@router.delete("/google/test-launch/{campaign_id}")
+async def google_test_launch_remove(
+    campaign_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Removes a test campaign (and its budget) from the brand's Google Ads account."""
+    from .adapters.google import GoogleAdsAPIError
+
+    adapter, _ = await _google_test_adapter(db, brand_ctx, campaign_id)
+    try:
+        return await adapter.remove_campaign(campaign_id)
+    except GoogleAdsAPIError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
 class MetaLaunchFromMessageBody(BaseModel):
     message: str                          # plain-English ask, e.g. "get me lunch customers in Surulere, ₦15k"
     # The CLIENT's Meta campaign objective, picked at the start of the conversation.
