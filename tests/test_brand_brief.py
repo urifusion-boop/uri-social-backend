@@ -247,6 +247,28 @@ class TestVideoAndBlogUseTheBrief:
         assert "language=False" in inspect.getsource(voiceover_service)
 
 
+class TestCompetitors:
+    BC = {"brand_name": "Bukka", "competitor_handles": ["@chickenhub", "@mamaput"]}
+
+    def test_positioning_without_naming(self):
+        line = bb.competitors_line(self.BC)
+        assert "@chickenhub, @mamaput" in line
+        assert "NEVER name, tag or directly compare" in line
+
+    def test_part_of_the_offer_tier_for_every_writer(self):
+        assert any("Competitors:" in l for l in bb.offer(self.BC))
+        assert "Competitors:" in bb.build(self.BC, sections=("offer",))
+
+    def test_posts_get_the_same_rule(self):
+        block = ContentGenerationService._build_brand_block(self.BC)
+        assert "NEVER name, tag or directly compare" in block
+        assert "Be aware of this competitive landscape" not in block
+
+    def test_none_listed(self):
+        assert bb.competitors_line({}) is None
+        assert bb.competitors_line({"competitor_handles": ["", " "]}) is None
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
