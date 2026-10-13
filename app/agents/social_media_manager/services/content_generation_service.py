@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import re
 from typing import List, Dict, Optional, Any, Tuple
 from . import brand_brief
 
@@ -256,11 +257,14 @@ Write one caption. No alternatives, no meta-commentary.
                 platform,
                 language_rule=brand_brief.languages_rule(brand_context),
             )
+        # Without this the model wrote "if you're still typing invoices by hand in 2023" (seen on dev).
+        today = f"Today's date is {datetime.utcnow():%d %B %Y}. Never refer to an earlier year as the current one."
         parts = [
             BANNED_PATTERNS_RULES,
             get_platform_formatting_rules(platform),
             voice_instructions,
             brand_block,
+            today,
             platform_prompt,
         ]
         return "\n".join(p for p in parts if p)
@@ -825,44 +829,76 @@ Create social media content about THIS SPECIFIC PRODUCT based on the image analy
                 processed_content['content'], platform
             )
 
-            # ── Caption Validation & Auto-Fix (PRD Section 7) ──────────────────────
-            # Extract custom banned words from voice profile
+            # ── Check against the universal rules and the Brand Playbook, rewrite
+            # if needed, then enforce what can be guaranteed (PRD Section 7) ────
             custom_banned_words = ContentGenerationService._brand_banned_words(brand_context)
+            is_thread = platform in ("twitter", "x")
+            # Everything the writer was given — a statistic that isn't in here was invented.
+            sources = f"{seed_content}\n{json.dumps(brand_context or {}, default=str, ensure_ascii=False)}"
 
-            # Validate the caption
-            validation_result = CaptionValidatorService.validate_caption(content, custom_banned_words)
+            def _check(text: str):
+                style = CaptionValidatorService.validate_caption(
+                    ContentGenerationService._for_validation(text, platform), custom_banned_words)
+                if is_thread:
+                    # A thread is laid out as tweets, not as one phone-screen caption.
+                    kept = [i for i in style["issues"] if i not in ("wall_of_text", "insufficient_line_breaks")]
+                    style = {**style, "issues": kept, "passed": not kept}
+                return style, brand_brief.audit(text, brand_context, sources=sources)
 
-            # If validation fails, attempt auto-fix (one retry)
-            if not validation_result["passed"]:
-                print(f"[CAPTION] Validation failed for {platform}: {validation_result['issues']}")
-
-                # Generate fix prompt
-                fix_prompt = CaptionValidatorService.generate_fix_prompt(content, validation_result)
-
-                # Regenerate with fix instructions
+            validation_result, playbook_issues = _check(content)
+            brand_rules = brand_brief.hard_rules(brand_context, captions=True)
+            attempt = 0
+            # One rewrite for style, as before. A second only if a Playbook rule is still broken.
+            while attempt < 2 and (playbook_issues or (attempt == 0 and not validation_result["passed"])):
+                attempt += 1
+                print(f"[CAPTION] {platform} rewrite {attempt}: style={validation_result['issues'][:4]} "
+                      f"playbook={[i['code'] + ':' + i['detail'] for i in playbook_issues]}")
+                fix_prompt = CaptionValidatorService.generate_fix_prompt(
+                    content, validation_result, playbook_issues=playbook_issues,
+                    brand_rules=brand_rules, platform=platform,
+                )
                 fix_ai_request = AIService.build_ai_model(
                     messages=[{"role": "user", "content": fix_prompt}],
                     temperature=0.7,
                 )
-
                 fix_ai_response = await AIService.chat_completion(fix_ai_request)
-                if not (isinstance(fix_ai_response, dict) and "error" in fix_ai_response):
-                    fixed_content = fix_ai_response.choices[0].message.content.strip()
+                if isinstance(fix_ai_response, dict) and "error" in fix_ai_response:
+                    break
+                fixed_raw = fix_ai_response.choices[0].message.content.strip()
+                fixed_processed = ContentGenerationService._post_process_content(fixed_raw, platform)
+                fixed_content, fixed_hashtags = ContentGenerationService._extract_and_clean_hashtags(
+                    fixed_processed['content'], platform
+                )
+                if not fixed_content:
+                    break
+                new_validation, new_playbook = _check(fixed_content)
+                # Never trade a rewrite that breaks more of the brand's rules for the original.
+                if len(new_playbook) > len(playbook_issues):
+                    print(f"[CAPTION] ⚠ rewrite {attempt} for {platform} broke more Playbook rules — kept the previous version")
+                    continue
+                content, processed_content = fixed_content, fixed_processed
+                # The caption is rewritten without its hashtags, so a rewrite that
+                # returns none must not wipe the ones already written.
+                hashtags = fixed_hashtags or hashtags
+                validation_result, playbook_issues = new_validation, new_playbook
 
-                    # Re-extract hashtags from fixed content
-                    content, hashtags = ContentGenerationService._extract_and_clean_hashtags(
-                        fixed_content, platform
-                    )
-
-                    # Validate again
-                    revalidation = CaptionValidatorService.validate_caption(content, custom_banned_words)
-                    if revalidation["passed"]:
-                        print(f"[CAPTION] ✓ Fixed and validated for {platform}")
-                    else:
-                        print(f"[CAPTION] ⚠ Still has issues after fix: {revalidation['issues'][:3]}")
-                        # Proceed with content anyway, but flag it
-            else:
+            if validation_result["passed"] and not playbook_issues:
                 print(f"[CAPTION] ✓ Passed validation for {platform}")
+            else:
+                print(f"[CAPTION] ⚠ {platform} still has issues: style={validation_result['issues'][:3]} "
+                      f"playbook={[i['code'] for i in playbook_issues]}")
+
+            # Guaranteed, whatever the model did: no emojis if the brand said none,
+            # the hashtag limit, and the brand's call-to-action as the close.
+            content = brand_brief.enforce(content, brand_context, append_cta=not is_thread)
+            hashtags = brand_brief.limit_hashtags(hashtags, brand_context)
+            if is_thread and processed_content.get('tweets'):
+                processed_content['tweets'] = [
+                    brand_brief.enforce(t, brand_context, append_cta=False) for t in processed_content['tweets']
+                ]
+            remaining_issues = [
+                f"{i['code']}: {i['detail']}" for i in brand_brief.audit(content, brand_context, sources=sources)
+            ]
 
             # Generate a draft ID
             draft_id = str(ObjectId())
@@ -877,7 +913,9 @@ Create social media content about THIS SPECIFIC PRODUCT based on the image analy
                 'seed_length': len(seed_content),
                 'output_length': len(content),
                 'hashtag_count': len(hashtags),
-                'nigerian_context': True  # Flag for Nigerian-optimized content
+                'nigerian_context': True,  # Flag for Nigerian-optimized content
+                'playbook_issues': remaining_issues,  # Playbook rules still broken after rewriting (normally empty)
+                'rewrites': attempt,
             }
             
             return UriResponse.get_single_data_response("platform_content", {
@@ -897,18 +935,30 @@ Create social media content about THIS SPECIFIC PRODUCT based on the image analy
             return UriResponse.error_response(f"Generation failed: {str(e)}")
     
     @staticmethod
+    def _for_validation(text: str, platform: str) -> str:
+        """The text the style validator should judge. A thread's "(1/4)" numbering
+        is structure, not a "slash construction" or a "parenthetical"."""
+        if platform in ("twitter", "x"):
+            return re.sub(r'\(\d+/\d+\)', '', text)
+        return text
+
+    @staticmethod
     def _post_process_content(raw_content: str, platform: str) -> Dict[str, Any]:
         """
         Post-process AI-generated content based on platform requirements
         """
         
         if platform in ("twitter", "x"):
+            # The model often wraps the thread in a ```json fence; without this the
+            # fence and brackets became "tweets" of their own (seen on dev).
+            raw_content = re.sub(r'^```[a-zA-Z]*\s*|\s*```$', '', raw_content.strip()).strip()
             # Handle X/Twitter thread format
             try:
                 # Try to parse as JSON array first
                 if raw_content.strip().startswith('['):
                     tweets = json.loads(raw_content)
                     if isinstance(tweets, list):
+                        tweets = [str(t).strip() for t in tweets if str(t).strip()]
                         return {
                             'content': '\n\n'.join(tweets),
                             'tweets': tweets,
@@ -959,9 +1009,15 @@ Create social media content about THIS SPECIFIC PRODUCT based on the image analy
         
         # Remove hashtags from content (we'll add them separately)
         cleaned_content = re.sub(r'#\w+', '', content)
-        
-        # Clean up extra whitespace
-        cleaned_content = ' '.join(cleaned_content.split())
+
+        # Tidy spaces inside each line but KEEP the line breaks. This used to be
+        # ' '.join(text.split()), which flattened every caption into one block:
+        # the paragraphs the prompts ask for never reached the draft, and the
+        # validator's "needs line breaks" check then failed on every caption.
+        lines = [re.sub(r'[ \t]+', ' ', line).strip() for line in cleaned_content.replace('\r', '').split('\n')]
+        # A line holding only a dot is the old Instagram spacer trick, not content.
+        lines = ['' if line in ('.', '·', '•', '-', '_') else line for line in lines]
+        cleaned_content = re.sub(r'\n{3,}', '\n\n', '\n'.join(lines))
         
         # Platform-specific hashtag limits optimized for Nigerian audience
         limits = {
@@ -986,7 +1042,8 @@ Create social media content about THIS SPECIFIC PRODUCT based on the image analy
         user_id: str,
         feedback: Optional[str] = None,
         platform: Optional[str] = None,
-        original_seed: Optional[str] = None
+        original_seed: Optional[str] = None,
+        brand_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Regenerate content for a specific draft with optional feedback
@@ -1004,7 +1061,7 @@ Create social media content about THIS SPECIFIC PRODUCT based on the image analy
         
         # Generate new content
         result = await ContentGenerationService._generate_platform_content(
-            platform, enhanced_seed, f"regen_{draft_id}", user_id
+            platform, enhanced_seed, f"regen_{draft_id}", user_id, brand_context=brand_context
         )
         
         if result.get('status'):
