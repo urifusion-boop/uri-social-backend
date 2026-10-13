@@ -160,6 +160,14 @@ class TestLinkingThePickedAccount:
             out = run(g.finish_signin(db, {"user_id": "u1", "brand_id": "b1", "return_to": "https://app"}, "code"))
         assert out["outcome"] == "pending" and len(google.calls) == 3      # read once, no waiting around
 
+    def test_the_app_is_told_it_is_finishing_only_for_a_few_minutes(self):
+        now = datetime.now(timezone.utc)
+        assert g.owner_approval_settling({"manager_link_status": "pending", "owner_approved_at": now}) is True
+        assert g.owner_approval_settling({"manager_link_status": "pending",
+                                          "owner_approved_at": now - timedelta(minutes=10)}) is False
+        assert g.owner_approval_settling({"manager_link_status": "pending"}) is False       # nobody approved it
+        assert g.owner_approval_settling({"manager_link_status": "active", "owner_approved_at": now}) is False
+
     def test_an_account_the_sign_in_did_not_show_is_refused(self):
         db = signin_db([MINE])
         with Google() as google, pytest.raises(g.AccountNotLinkable):

@@ -1040,6 +1040,10 @@ async def link_selected_account(db, user_id: Optional[str], brand_id: Optional[s
                 break
             await asyncio.sleep(_ACCEPT_SETTLE_SECONDS)
     update: dict = {"updated_at": datetime.now(timezone.utc)}
+    if auto_accepted:
+        # So the app can say "approved, finishing" rather than "approve it" while
+        # Google catches up (see owner_approval_settling).
+        update["owner_approved_at"] = datetime.now(timezone.utc)
     if not fresh.get("account_name") and chosen.get("name"):
         update["account_name"] = chosen["name"]
     if not fresh.get("currency_code") and chosen.get("currency_code"):
@@ -1052,6 +1056,24 @@ async def link_selected_account(db, user_id: Optional[str], brand_id: Optional[s
     state, final = await resolve_connection_state(db, user_id, brand_id)
     return {"state": state.value, "auto_accepted": auto_accepted,
             "account_name": (final or {}).get("account_name", ""), "detail": result.get("reason", "")}
+
+
+OWNER_APPROVAL_SETTLE_MINUTES = 3
+
+
+def owner_approval_settling(conn: Optional[dict]) -> bool:
+    """True while a link we approved with the owner's sign-in still reads as
+    pending at Google — i.e. nothing is needed from anyone, it is just
+    finishing. After a few minutes we stop assuming that and show the normal
+    "approve it" steps, in case the approval didn't actually take."""
+    if not conn or conn.get("manager_link_status") != "pending":
+        return False
+    at = conn.get("owner_approved_at")
+    if at is None:
+        return False
+    if at.tzinfo is None:
+        at = at.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) - at < timedelta(minutes=OWNER_APPROVAL_SETTLE_MINUTES)
 
 
 async def finish_signin(db, state_doc: dict, code: str) -> dict:

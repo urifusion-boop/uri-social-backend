@@ -1673,7 +1673,7 @@ async def jane_google_ads_connection_status(
     state in the body — this is a pure status read, not a pre-flight gate inside a
     build flow, so there's never a reason to raise here (unlike
     resolve_customer_id_for_launch, which does)."""
-    from .google_ads_connection import get_admin_connection, refresh_connection
+    from .google_ads_connection import get_admin_connection, owner_approval_settling, refresh_connection
     from .whatsapp import get_brand_whatsapp
     from app.core.config import settings as _settings
 
@@ -1706,6 +1706,8 @@ async def jane_google_ads_connection_status(
         "manager_customer_id": settings_mcc_display(),
         "sync_error": sync_error,
         "signin_verified": bool(_settings.GOOGLE_ADS_OAUTH_VERIFIED),
+        # We approved the link with the owner's sign-in and Google is still catching up.
+        "finishing": owner_approval_settling(conn),
     }
 
 
