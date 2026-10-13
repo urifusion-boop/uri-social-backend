@@ -124,6 +124,42 @@ class TestInventedNumbers:
         assert bb.unverified_numbers("100% Nigerian owned.", "") == []
 
 
+class TestInventedSources:
+    def test_a_study_nobody_provided(self):
+        text = "Renewals get missed. A study by the International Finance Corporation highlighted this. Fix it."
+        assert bb.unverified_sources(text, "Docerity") == [
+            "A study by the International Finance Corporation highlighted this."]
+
+    def test_other_ways_of_citing(self):
+        for line in ("According to McKinsey, paperwork is slow.", "Research shows teams lose hours.",
+                     "Experts agree it matters.", "Recent surveys suggest otherwise.", "Studies show it works."):
+            assert bb.unverified_sources(line, ""), line
+
+    def test_a_source_that_was_given_is_fine(self):
+        text = "According to our 2025 customer survey, setup takes ten minutes."
+        assert bb.unverified_sources(text, "Facts: according to our 2025 customer survey, setup is quick") == []
+
+    def test_ordinary_sentences_are_left_alone(self):
+        for line in ("Send us a report of your invoices.", "We study your workflow first.",
+                     "Your data stays safe.", "Book a free demo to see the reports."):
+            assert bb.unverified_sources(line, "") == [], line
+
+    def test_audit_flags_it_with_a_fix(self):
+        text = "No wahala. Research shows SMEs lose contracts.\n\nBook a free demo."
+        issues = bb.audit(text, BRAND, sources="Docerity")
+        assert codes(issues) == ["unverified_source"] and "Remove the citation" in issues[0]["fix"]
+
+    def test_dont_is_not_pidgin(self):
+        assert bb.missing_languages("I don't know. We don't stop.", BRAND) == ["Pidgin"]
+
+
+class TestBlogLabels:
+    def test_echoed_label_is_not_part_of_the_post(self):
+        from app.agents.social_media_manager.services.blog_generation_service import _parse_blog_output
+        parsed = _parse_blog_output("TITLE: T\nMETA: M\nBLOG:  \n\nFirst paragraph.\n\nSecond.")
+        assert parsed == {"title": "T", "meta": "M", "body": "First paragraph.\n\nSecond."}
+
+
 class TestAudit:
     def test_everything_wrong_at_once(self):
         text = "Streamlining operations matters. Over 70% of SMEs struggle.\n\nWhat do you think?"

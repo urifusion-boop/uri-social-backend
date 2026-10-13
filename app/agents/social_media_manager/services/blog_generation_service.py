@@ -197,6 +197,9 @@ def _parse_blog_output(raw: str) -> Dict[str, str]:
     body = "\n".join(
         ln for ln in body_lines
         if not re.match(r"^(TITLE:|META:)", ln.strip(), re.IGNORECASE)
+        # Labels from our own prompts, which a rewrite sometimes echoes back
+        # (a blog on dev opened with "BLOG:").
+        and not re.match(r"^(BLOG|CURRENT BLOG TO EXPAND|BODY|CONTENT)\s*:\s*$", ln.strip(), re.IGNORECASE)
     ).strip()
 
     return {"title": title, "meta": meta, "body": body}
