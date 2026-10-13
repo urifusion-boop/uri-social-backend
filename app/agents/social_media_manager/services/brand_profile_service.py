@@ -107,6 +107,7 @@ class BrandProfileService:
             "approval_channels": [],
             "notification_events": [],
             "notification_channel": "",
+            "slack_webhook_url": "",
             "team_members": [],
             "languages": [],
             "region": "",

@@ -261,6 +261,15 @@ class Settings(BaseSettings):
     TWILIO_ACCOUNT_SID: str = ""
     TWILIO_AUTH_TOKEN: str = ""
     TWILIO_WHATSAPP_FROM: str = ""  # e.g. whatsapp:+14155238886
+    # Brand Playbook notifications (app/services/notification_channels.py)
+    TWILIO_WHATSAPP_NOTIFY_TEMPLATE_SID: str = ""  # approved template, {{1}}=title {{2}}=message
+    TWILIO_SMS_FROM: str = ""                      # SMS sender number, e.g. +15005550006
+    TELEGRAM_BOT_TOKEN: str = ""
+    TELEGRAM_BOT_USERNAME: str = ""                # without @, for the "Connect Telegram" link
+    TELEGRAM_WEBHOOK_SECRET: str = ""              # checked on every Telegram webhook call
+    VAPID_PUBLIC_KEY: str = ""                     # Web Push
+    VAPID_PRIVATE_KEY: str = ""
+    VAPID_SUBJECT: str = ""                        # e.g. mailto:support@urisocial.com
 
     # Email (SMTP) — Notification System PRD
     SMTP_HOST: str = ""

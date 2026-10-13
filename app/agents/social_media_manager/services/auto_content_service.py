@@ -566,6 +566,18 @@ class AutoContentService:
                     )
                     if posting_preferences.auto_publishes_recurring(profile_data):
                         await AutoContentService._auto_schedule(user_id, db, drafts, profile_data)
+                    else:
+                        try:
+                            from app.services.NotificationService import notification_service
+                            await notification_service.notify_content_created(
+                                user_id=user_id,
+                                content_preview=(drafts[0].get("content") or "")[:120],
+                                platforms=", ".join(sorted({d.get("platform", "") for d in drafts if d.get("platform")})),
+                                campaign_id=rd.get("request_id") or "",
+                                brand_id=brand_id,
+                            )
+                        except Exception as exc:
+                            print(f"[AutoContent] post-ready notification failed: {exc}")
 
         # Update settings — next run follows the Playbook's posting cadence.
         now = datetime.utcnow()
