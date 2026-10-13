@@ -276,6 +276,71 @@ class TestRegenerateKeepsThePlaybook:
         assert seen["brand_context"] is BRAND
 
 
+class TestCalendarUsesTheSameBannedWordCheck:
+    def test_other_forms_and_the_guardrail_list(self):
+        from app.agents.content_calendar_v2.services import content_calendar_v2_service as cal
+        words = cal._all_banned_words(BRAND)
+        assert set(words) == {"streamline", "synergy"}
+        idea = {"exact_copy": {"caption": "Streamlining your week with real synergies.", "headline": "Book it"}}
+        assert set(cal._find_banned_words(idea, words)) == {"streamline", "synergy"}
+
+    def test_short_word_does_not_flag_a_longer_one(self):
+        from app.agents.content_calendar_v2.services import content_calendar_v2_service as cal
+        assert cal._find_banned_words({"exact_copy": {"caption": "Book a table"}}, ["ok"]) == []
+
+
+class TestRegenerateEndToEnd:
+    """Regenerate used to fail on the unique (request_id, platform) index and
+    write with no Playbook. It now rewrites the caller's own draft in place."""
+
+    def _db(self):
+        from mongomock_motor import AsyncMongoMockClient
+        db = AsyncMongoMockClient()["t"]
+
+        async def seed():
+            await db["content_drafts"].create_index([("request_id", 1), ("platform", 1)], unique=True)
+            await db["content_drafts"].insert_one({
+                "id": "d1", "request_id": "r1", "platform": "linkedin", "user_id": "u1", "brand_id": "b1",
+                "content": "Old caption", "hashtags": ["old"], "image_url": "https://img/1.png"})
+            await db["content_requests"].insert_one({"id": "r1", "user_id": "u1", "seed_content": "Seed", "retry_count": 0})
+            await db["brand_profiles"].insert_one({"brand_id": "b1", "user_id": "u1", **BRAND})
+        asyncio.run(seed())
+        return db
+
+    def _regenerate(self, monkeypatch, db, user="u1"):
+        from app.agents.social_media_manager.services.approval_workflow_service import ApprovalWorkflowService
+        seen = {}
+
+        async def fake_generate(platform, seed_content, request_id, user_id, brand_context=None):
+            seen["brand_context"] = brand_context
+            return {"status": True, "responseData": {"content": "New caption", "hashtags": ["new"], "ai_metadata": {"rewrites": 0}}}
+
+        monkeypatch.setattr(ContentGenerationService, "_generate_platform_content", staticmethod(fake_generate))
+        result = asyncio.run(ApprovalWorkflowService.regenerate_content(db=db, user_id=user, draft_id="d1",
+                                                                        regeneration_feedback="shorter"))
+        return result, seen
+
+    def test_rewrites_in_place_with_the_playbook(self, monkeypatch):
+        db = self._db()
+        result, seen = self._regenerate(monkeypatch, db)
+        assert result["status"], result
+        assert seen["brand_context"]["cta_styles"] == ["Book a free demo"]
+        drafts = asyncio.run(db["content_drafts"].find({}).to_list(10))
+        assert len(drafts) == 1
+        d = drafts[0]
+        assert d["content"] == "New caption" and d["hashtags"] == ["new"]
+        assert d["image_url"] == "https://img/1.png" and d["user_id"] == "u1"
+        assert d["previous_versions"][0]["content"] == "Old caption"
+        assert result["responseData"]["new_draft_id"] == "d1"
+        assert asyncio.run(db["content_requests"].find_one({"id": "r1"}))["retry_count"] == 1
+
+    def test_someone_elses_draft_is_not_found(self, monkeypatch):
+        db = self._db()
+        result, seen = self._regenerate(monkeypatch, db, user="intruder")
+        assert not result["status"] and seen == {}
+        assert asyncio.run(db["content_drafts"].find_one({"id": "d1"}))["content"] == "Old caption"
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))

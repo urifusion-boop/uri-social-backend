@@ -1233,6 +1233,13 @@ def _collect_item_text(idea: Dict[str, Any]) -> str:
     return " \n ".join(p for p in parts if p)
 
 
+def _all_banned_words(brand: Dict[str, Any]) -> List[str]:
+    """Words to avoid AND the guardrails' banned words — the Playbook has both,
+    and only the first list was being checked here."""
+    from app.agents.social_media_manager.services.brand_brief import banned_words
+    return banned_words(brand)
+
+
 def _find_banned_words(idea: Dict[str, Any], words_to_avoid: List[str]) -> List[str]:
     """The brand's words_to_avoid was only ever a prompt instruction (soft
     guidance the model can and does ignore under pressure to hit other
@@ -1243,8 +1250,10 @@ def _find_banned_words(idea: Dict[str, Any], words_to_avoid: List[str]) -> List[
     same validation-failure → regenerate loop everything else here uses."""
     if not words_to_avoid:
         return []
-    haystack = _collect_item_text(idea).lower()
-    return [str(w).strip() for w in words_to_avoid if str(w).strip() and str(w).strip().lower() in haystack]
+    # Same matcher every other writer uses: catches other forms of a word
+    # ("streamlining" for "streamline") without flagging "book" for "ok".
+    from app.agents.social_media_manager.services.brand_brief import find_banned
+    return [str(w).strip() for w in find_banned(_collect_item_text(idea), words_to_avoid)]
 
 
 def _validate_item_v2(
@@ -1500,7 +1509,7 @@ business's actual customers, not a generic reader?
                 _clamp_carousel(idea, expected_slides)  # deterministically enforce the 2-5 hard rule
             issues = _validate_item_v2(
                 idea, is_carousel=is_carousel, expected_slides=expected_slides,
-                words_to_avoid=brand.get("words_to_avoid"),
+                words_to_avoid=_all_banned_words(brand),
             )
             if issues:
                 failures[i] = issues

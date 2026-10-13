@@ -107,7 +107,11 @@ def languages_rule(bc: Optional[Dict[str, Any]]) -> Optional[str]:
     return (f"Languages: {', '.join(langs)}. Write mainly in {langs[0]} and naturally mix in "
             f"{others} the way this audience actually speaks — not a translation, a natural blend. "
             f"REQUIRED: every piece must contain at least one genuine {others} phrase or sentence; "
-            f"a piece written only in {langs[0]} is wrong.")
+            f"a piece written only in {langs[0]} is wrong. "
+            # Seen on dev once the requirement was added: whole captions came back
+            # in Pidgin. The first language stays the main one.
+            f"{langs[0]} stays the main language: most sentences are in {langs[0]}, "
+            f"with {others} in a few natural phrases — never the whole piece.")
 
 
 def hard_rules(bc: Optional[Dict[str, Any]], captions: bool = False, language: bool = True) -> List[str]:
