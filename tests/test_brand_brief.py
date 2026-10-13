@@ -205,7 +205,7 @@ class TestAdsUseTheBrief:
         import inspect
         from app.agents.jane_ads import creative
 
-        assert "brand_brief.violations(" in inspect.getsource(creative.write_ad_copy)
+        assert "brand_brief.audit(" in inspect.getsource(creative.write_ad_copy)
 
 
 class TestInboxSoundsLikeTheBrand:
