@@ -5850,7 +5850,8 @@ async def undo_playbook_instruct(
     })
 
 
-PLAYBOOK_PREVIEWS_PER_DAY = 20
+PLAYBOOK_PREVIEWS_PER_DAY = 20          # previews actually written
+PLAYBOOK_PREVIEW_ATTEMPTS_PER_DAY = 60  # every request, as a guard against hammering the model
 
 
 class PlaybookPreviewRequest(BaseModel):
@@ -5874,12 +5875,20 @@ async def preview_playbook_voice(
 
     user_id = ctx["user_id"]
     day_key = f"{user_id}:{datetime.utcnow().strftime('%Y-%m-%d')}"
+    # Only previews that were actually written count toward the daily limit
+    # ("written"). Every click used to count, including ones that failed or
+    # were refused, so the limit ran out without the user seeing 20 previews.
     usage = await db["playbook_preview_usage"].find_one_and_update(
         {"_id": day_key}, {"$inc": {"count": 1}, "$setOnInsert": {"created_at": datetime.utcnow()}},
         upsert=True, return_document=True,
     )
-    if (usage or {}).get("count", 1) > PLAYBOOK_PREVIEWS_PER_DAY:
-        raise HTTPException(status_code=429, detail="You've previewed a lot today — try again tomorrow.")
+    if (usage or {}).get("written", 0) >= PLAYBOOK_PREVIEWS_PER_DAY \
+            or (usage or {}).get("count", 1) > PLAYBOOK_PREVIEW_ATTEMPTS_PER_DAY:
+        raise HTTPException(
+            status_code=429,
+            detail=f"You've used today's {PLAYBOOK_PREVIEWS_PER_DAY} voice previews — more tomorrow. "
+                   f"Your Playbook still applies to everything Jane writes.",
+        )
 
     profile_result = await BrandProfileService.get(user_id, db, brand_id=ctx["brand_id"])
     profile = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
@@ -5898,6 +5907,7 @@ async def preview_playbook_voice(
     )
     if not result.get("status"):
         raise HTTPException(status_code=503, detail="Jane is busy right now — try again in a minute.")
+    await db["playbook_preview_usage"].update_one({"_id": day_key}, {"$inc": {"written": 1}})
     generated = result.get("responseData") or {}
     hashtags = [str(h).lstrip("#") for h in (generated.get("hashtags") or [])]
     caption = (generated.get("content") or "").strip()
