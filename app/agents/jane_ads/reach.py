@@ -131,6 +131,10 @@ def _without_interests(audience_targeting: dict) -> dict:
             if k not in ("flexible_spec", "interests", "behaviors")}
 
 
+def _capitalised(sentence: str) -> str:
+    return sentence[:1].upper() + sentence[1:]
+
+
 def _names(geo_targeting: dict) -> str:
     """The places in this targeting, as the client would name them."""
     geo = (geo_targeting or {}).get("geo_locations") or {}
@@ -189,9 +193,9 @@ async def widen_for_delivery(
         if wider_size is not None and wider_size > size:
             result.update(geo_targeting=wider_geo_targeting, estimate=wider_estimate,
                           widened=True,
-                          note=_WIDENED_GEO.format(
+                          note=_capitalised(_WIDENED_GEO.format(
                               where=_names(geo_targeting), size=f"{size:,}",
-                              budget=budget_label, city=city or "the city"))
+                              budget=budget_label, city=city or "the city")))
             estimate, size = wider_estimate, wider_size
             if size >= floor:
                 return result
