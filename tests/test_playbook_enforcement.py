@@ -213,6 +213,15 @@ class TestCleaning:
         assert content == "First line here.\n\nSecond line."
         assert tags == ["One", "Two"]
 
+    def test_dot_spacer_lines_are_removed(self):
+        content, _ = ContentGenerationService._extract_and_clean_hashtags(
+            "Order on WhatsApp today!\n\n. . . . .\n•••\n- - -\n\n#Docerity", "instagram")
+        assert content == "Order on WhatsApp today!"
+
+    def test_a_real_line_starting_with_a_dash_is_kept(self):
+        content, _ = ContentGenerationService._extract_and_clean_hashtags("Fresh today\n- jollof\n- suya", "instagram")
+        assert content == "Fresh today\n- jollof\n- suya"
+
     def test_thread_in_a_code_fence(self):
         raw = '```json\n["First tweet (1/2)", "Second tweet (2/2)"]\n```'
         out = ContentGenerationService._post_process_content(raw, "twitter")
