@@ -807,6 +807,33 @@ async def regenerate_content(
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+def _upload_slide_image_indices(
+    num_images: int, num_slides: Any = None, slide_image_map: Any = None
+) -> List[int]:
+    """Which uploaded image (by index) each carousel slide shows.
+
+    Mirrors Create Post: the user picks a slide count (2-10, Instagram's
+    limit) and optionally which image goes on each slide. Unset or invalid
+    entries fall back to cycling the uploads (image 1 -> slide 1, ...).
+    With no slide count given it's one slide per upload, as before.
+    """
+    if num_images <= 0:
+        return []
+    try:
+        count = max(2, min(10, int(num_slides))) if num_slides else num_images
+    except (TypeError, ValueError):
+        count = num_images
+    mapping = slide_image_map if isinstance(slide_image_map, list) else []
+    indices = []
+    for i in range(count):
+        chosen = mapping[i] if i < len(mapping) else None
+        if isinstance(chosen, int) and not isinstance(chosen, bool) and 0 <= chosen < num_images:
+            indices.append(chosen)
+        else:
+            indices.append(i % num_images)
+    return indices
+
+
 @router.post("/upload-user-content")
 async def upload_user_content(
     request: Dict[str, Any],
@@ -836,6 +863,11 @@ async def upload_user_content(
         context_text = request.get("context_text", "")
         platforms = request.get("platforms", [])
         post_type = request.get("post_type", "feed")
+        # Carousel only, same idea as Create Post: how many slides, and which
+        # uploaded image (by index) each slide shows. Both optional — without
+        # them it's one slide per upload, in upload order, as before.
+        requested_num_slides = request.get("num_slides")
+        slide_image_map = request.get("slide_image_map")
 
         # New options: logo and CTA overlays
         add_logo = request.get("add_logo", False)
@@ -1291,9 +1323,12 @@ Create engaging social media captions for THIS UPLOADED CONTENT. Base your writi
                         # needs a per-slide video field added on the frontend too;
                         # out of scope here.
                         slides = []
-                        for i, url in enumerate(urls_for_platform):
+                        for i, img_idx in enumerate(
+                            _upload_slide_image_indices(len(urls_for_platform), requested_num_slides, slide_image_map)
+                        ):
+                            url = urls_for_platform[img_idx]
                             slide = {"headline": "", "body": "", "image_url": url, "image_failed": False}
-                            bg = backgrounds_for_platform[i] if backgrounds_for_platform else None
+                            bg = backgrounds_for_platform[img_idx] if backgrounds_for_platform else None
                             if bg:
                                 slide["background_image_url"] = bg["background_url"]
                                 slide["logo_placement"] = bg["logo_placement"]
@@ -3717,6 +3752,7 @@ class CalendarGenerateRequest(BaseModel):
 class CalendarCreateDraftRequest(BaseModel):
     platforms: List[str] = ["facebook", "instagram"]
     include_images: bool = False
+    num_slides: Optional[int] = None  # carousel days only: user's slide count (2-10)
 
 
 @router.get("/content-calendar/plan")
@@ -3861,12 +3897,19 @@ async def create_draft_from_calendar_day(
         # image/text post even though the calendar copy describes slides.
         if day.get("format") == "carousel":
             from app.agents.social_media_manager.services.carousel_generation_service import CarouselGenerationService
+            # A user-chosen slide count (2-10) is forced; otherwise the
+            # service picks one from the copy, as before.
+            slide_kwargs = (
+                {"num_slides": max(2, min(10, int(request.num_slides))), "force_num_slides": True}
+                if request.num_slides else {}
+            )
             result = await CarouselGenerationService.generate_multi_platform(
                 user_id=user_id,
                 seed_content=seed_content,
                 platforms=request.platforms,
                 brand_context=brand_context,
                 db=db,
+                **slide_kwargs,
             )
         else:
             result = await ContentGenerationService.generate_multi_platform_content(

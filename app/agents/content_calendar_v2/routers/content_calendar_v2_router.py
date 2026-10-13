@@ -182,6 +182,10 @@ async def create_draft_from_item_v2(
             len(((item.get("carousel") or {}).get("slides")) or [])
             or int(item.get("carousel_slide_count") or 3)
         ) if is_carousel else 1
+        if is_carousel and request.num_slides:
+            # The user picked their own slide count — it wins over the plan's
+            # 2-5 suggestion. 10 is Instagram's carousel limit.
+            planned_slides = max(2, min(10, int(request.num_slides)))
         estimated_credits = planned_slides if is_carousel else 1
 
         is_trial_user = await trial_service.has_active_trial(user_id)
@@ -242,8 +246,8 @@ async def create_draft_from_item_v2(
         if is_carousel:
             from app.agents.social_media_manager.services.carousel_generation_service import CarouselGenerationService
             # planned_slides was computed above (before the credit check) —
-            # the V2 pipeline already committed to a slide count (2-5, PRD
-            # rule) and wrote that many slides. Pass it through with
+            # the V2 pipeline's planned count (2-5, PRD rule) unless the user
+            # chose their own (2-10). Pass it through with
             # force_num_slides so the draft doesn't re-run content detection
             # and expand a 3-slide idea into 7 (confirmed live bug).
             result = await CarouselGenerationService.generate_multi_platform(
