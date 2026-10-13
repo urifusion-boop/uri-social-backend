@@ -513,13 +513,8 @@ Write one caption. No alternatives, no meta-commentary.
             )
 
         # ── Competitive context ───────────────────────────────────────────────
-        if brand_context.get("competitor_handles"):
-            handles = brand_context["competitor_handles"]
-            if isinstance(handles, list) and handles:
-                parts.append(
-                    f'- Competitor accounts: {", ".join(handles[:5])}. '
-                    f'Be aware of this competitive landscape — differentiate the brand\'s voice and value clearly.'
-                )
+        if brand_brief.competitors_line(brand_context):
+            parts.append(f"- {brand_brief.competitors_line(brand_context)}")
 
         # ── Key dates / upcoming events ───────────────────────────────────────
         if brand_context.get("key_dates"):
