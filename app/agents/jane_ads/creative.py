@@ -119,13 +119,23 @@ def _brand_prompt_bits(bc: dict) -> str:
         bits.append(f"Market: {bc['region']}.")
     if bc.get("brand_colors"):
         bits.append(f"Brand colours: {', '.join(bc['brand_colors'][:3])}.")
-    # The shared Brand Brief's hard rules (avoid topics, banned words, compliance,
-    # language), what the business offers, and what's happening right now. NOT the
-    # audience tier — who an ad targets is delivery context and must never be
-    # written into ad copy (see the leakage check in write_ad_copy).
+    return " ".join(bits)
+
+
+def _brand_copy_bits(bc: dict) -> str:
+    """_brand_prompt_bits plus the shared Brand Brief, for prompts that WRITE
+    (ad copy, shoot scripts): hard rules (avoid topics, banned words, compliance,
+    language), what the business offers, and what's happening right now.
+
+    Never use this for an image prompt — rules and promotions are words, and
+    words in an image prompt get painted into the picture. Image prompts keep
+    _brand_prompt_bits. And no audience tier here either: who an ad targets is
+    delivery context and must never be written into ad copy (see the leakage
+    check in write_ad_copy)."""
     from app.agents.social_media_manager.services import brand_brief
+    bits = _brand_prompt_bits(bc)
     brief = brand_brief.build(bc, sections=("rules", "offer", "pulse"))
-    return " ".join(bits) + (("\n" + brief) if brief else "")
+    return bits + (("\n" + brief) if brief else "")
 
 
 def _brand_color_directive(bc: dict) -> str:
@@ -463,7 +473,7 @@ async def write_ad_copy(business_name: str, category: str, goal: str = "messages
     if not settings.jane_ads_openai_key:
         return AdCopy()
     bc = brand_context or {}
-    brand_bits = _brand_prompt_bits(bc)
+    brand_bits = _brand_copy_bits(bc)
     geo_target = city or bc.get("region", "")
     audience_segment = audience_segment or bc.get("target_audience", "")
     location_bit = _location_prompt_bit(geo_target, category)
@@ -589,7 +599,7 @@ async def write_shoot_script(business_name: str, category: str, goal: str,
     if not settings.jane_ads_openai_key:
         return ShootScript()
     bc = brand_context or {}
-    brand_bits = _brand_prompt_bits(bc)
+    brand_bits = _brand_copy_bits(bc)
     prompt = (
         f"Write a short phone-filmable shoot script for a Meta/Instagram ad for "
         f"'{business_name or bc.get('brand_name') or 'a business'}' (a "
@@ -796,7 +806,7 @@ async def write_ad_copy_for_image(image_summary: str, business_name: str, catego
     if not settings.jane_ads_openai_key or not image_summary.strip():
         return AdCopy()
     bc = brand_context or {}
-    brand_bits = _brand_prompt_bits(bc)
+    brand_bits = _brand_copy_bits(bc)
     geo_target = city or bc.get("region", "")
     audience_segment = audience_segment or bc.get("target_audience", "")
     # NOTE: `category` is deliberately NOT passed as the Zone A interest-category term
