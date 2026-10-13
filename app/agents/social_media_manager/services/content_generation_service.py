@@ -1023,7 +1023,8 @@ Create social media content about THIS SPECIFIC PRODUCT based on the image analy
         # validator's "needs line breaks" check then failed on every caption.
         lines = [re.sub(r'[ \t]+', ' ', line).strip() for line in cleaned_content.replace('\r', '').split('\n')]
         # A line holding only a dot is the old Instagram spacer trick, not content.
-        lines = ['' if line in ('.', '·', '•', '-', '_') else line for line in lines]
+        # Also ". . . . ." on one line (seen in a dev preview), with or without spaces.
+        lines = ['' if re.fullmatch(r'[.·•\-_~*\s]+', line or ' ') else line for line in lines]
         cleaned_content = re.sub(r'\n{3,}', '\n\n', '\n'.join(lines))
         
         # Platform-specific hashtag limits optimized for Nigerian audience
