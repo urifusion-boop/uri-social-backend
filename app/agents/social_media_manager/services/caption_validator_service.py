@@ -138,10 +138,9 @@ class CaptionValidatorService:
                 issues.append(f"banned_word: '{word}'")
         # Brand-specific words are matched as whole words/phrases, so a short
         # entry like "ok" doesn't flag "book".
-        for word in custom_banned_words or []:
-            w = str(word).strip().lower()
-            if w and re.search(r"(?<!\w)" + re.escape(w) + r"(?!\w)", caption_lower):
-                issues.append(f"banned_word: '{w}'")
+        from .brand_brief import find_banned
+        for word in find_banned(caption_lower, custom_banned_words or []):
+            issues.append(f"banned_word: '{str(word).strip().lower()}'")
 
         # Check for banned closers
         last_lines = caption.split("\n")[-2:]  # Check last 2 lines

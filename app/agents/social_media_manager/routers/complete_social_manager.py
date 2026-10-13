@@ -5791,16 +5791,20 @@ async def preview_playbook_voice(
     platform = (request.platform or "instagram").lower()
     if platform not in ContentGenerationService.PLATFORM_PROMPTS:
         platform = "instagram"
-    # Exactly the prompt a real post is written from (same rules, voice profile
-    # and platform format) — a preview that used anything else would mislead.
-    prompt = ContentGenerationService.build_caption_prompt(
-        "Introduce what this business offers and invite people to take the next step.", platform, bc,
+    # The very function real posts are written by — same prompt, same banned-word
+    # check and one auto-fix — so the preview can't look better or worse than a
+    # real post. It writes nothing to the database.
+    result = await ContentGenerationService._generate_platform_content(
+        platform, "Introduce what this business offers and invite people to take the next step.",
+        request_id="playbook_preview", user_id=user_id, brand_context=bc,
     )
-    ai_request = AIService.build_ai_model(messages=[{"role": "user", "content": prompt}], temperature=0.7)
-    response = await AIService.chat_completion(ai_request)
-    if isinstance(response, dict) and "error" in response:
+    if not result.get("status"):
         raise HTTPException(status_code=503, detail="Jane is busy right now — try again in a minute.")
-    caption = response.choices[0].message.content.strip()
+    generated = result.get("responseData") or {}
+    hashtags = [str(h).lstrip("#") for h in (generated.get("hashtags") or [])]
+    caption = (generated.get("content") or "").strip()
+    if hashtags:
+        caption = f"{caption}\n\n{' '.join('#' + h for h in hashtags)}"
     return UriResponse.get_single_data_response("playbook_preview", {
         "caption": caption,
         "platform": platform,
