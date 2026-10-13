@@ -268,7 +268,12 @@ async def reply_to_conversation(
                             detail=e.detail)
 
     if record.get("delivery") == "accepted":
-        await agent.record_outcome(db, workspace_id, conversation_id, suggestion_id, text)
+        kind = await agent.record_outcome(db, workspace_id, conversation_id, suggestion_id, text)
+        if kind == "sent_as_is" and record.get("provider_message_id"):
+            await db[MESSAGES].update_one(
+                {"workspace_id": workspace_id, "conversation_id": conversation_id,
+                 "provider_message_id": record["provider_message_id"]},
+                {"$set": {"approved_draft": True}})
 
     return {
         "delivery": record.get("delivery"),

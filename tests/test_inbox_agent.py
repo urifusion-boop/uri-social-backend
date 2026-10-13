@@ -385,3 +385,19 @@ def test_small_talk_stays_engagement():
     from app.agents.inbox.agent import coerce_classification
     assert coerce_classification({"intent": "engagement"}, "hello, how are you")["intent"] == "engagement"
     assert coerce_classification({"intent": "complaint"}, "I'm interested in why this broke")["intent"] == "complaint"
+
+
+def test_english_isnt_answered_in_pidgin():
+    from app.agents.inbox.agent import coerce_classification
+    assert coerce_classification({"language": "pcm"}, "i'm interested")["language"] == "en"
+    assert coerce_classification({"language": "pcm"}, "abeg how much e cost")["language"] == "pcm"
+
+
+def test_sending_the_draft_unchanged_doesnt_hand_the_chat_to_a_person():
+    s = _settings()
+    approved = [{"id": "0", "direction": "outbound", "text": "x", "actor_id": "user_1",
+                 "approved_draft": True, "received_at": OPEN_HOURS - timedelta(minutes=5)},
+                {"id": "1", "direction": "inbound", "text": "x", "actor_id": "", "received_at": OPEN_HOURS}]
+    assert agent.verdict(s, _conv(), approved, _cls(), _draft(), OPEN_HOURS) == (True, "")
+    approved[0]["approved_draft"] = False
+    assert agent.verdict(s, _conv(), approved, _cls(), _draft(), OPEN_HOURS)[0] is False

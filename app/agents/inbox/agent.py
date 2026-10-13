@@ -267,6 +267,19 @@ def keyword_exclusions(text: str) -> list[str]:
     return [k for k, pattern in _EXCLUSION_WORDS.items() if re.search(pattern, lower)]
 
 
+# The model called "i'm interested" Pidgin and the reply came back in Pidgin. A reply
+# only switches to Pidgin when the customer's own words are Pidgin.
+_PIDGIN_WORDS = (r"\b(dey|wetin|abeg|una|sabi|wahala|abi|sef|oya|comot|pikin|wan|na im|"
+                 r"how far|e don|no vex|shey|wey|dem|una|ehn|biko|jare|o\s*jare|kuku|nko)\b")
+
+
+def _language(model_said: Any, text: str) -> str:
+    said = str(model_said or "other")[:8]
+    if said == "pcm" and not re.search(_PIDGIN_WORDS, (text or "").lower()):
+        return "en"
+    return said
+
+
 def coerce_classification(data: dict, text: str) -> dict:
     def pick(value: Any, allowed: tuple, fallback: str) -> str:
         return value if value in allowed else fallback
@@ -287,7 +300,7 @@ def coerce_classification(data: dict, text: str) -> dict:
         "intent": intent,
         "urgency": urgency,
         "sentiment": pick(data.get("sentiment"), SENTIMENTS, "neutral"),
-        "language": str(data.get("language") or "other")[:8],
+        "language": _language(data.get("language"), text),
         "exclusions": exclusions,
         "confidence": confidence,
         "rationale": str(data.get("rationale") or "")[:300],
@@ -465,7 +478,8 @@ async def _history(db, workspace_id: str, conversation_id: str) -> list[dict]:
         {"workspace_id": workspace_id, "conversation_id": conversation_id}
     ).sort("received_at", 1).to_list(200)
     return [{"id": str(r["_id"]), "direction": r.get("direction"), "text": r.get("text") or "",
-             "actor_id": r.get("actor_id", ""), "provider_message_id": r.get("provider_message_id"),
+             "actor_id": r.get("actor_id", ""), "approved_draft": bool(r.get("approved_draft")),
+             "provider_message_id": r.get("provider_message_id"),
              "received_at": r.get("received_at")}
             for r in rows]
 
@@ -530,8 +544,9 @@ def verdict(settings: dict, conv: dict, history: list[dict], cls: dict, draft: d
     at = at or now()
     outbound = [m for m in history if m["direction"] == Direction.OUTBOUND.value]
     auto_sent = sum(1 for m in outbound if m["actor_id"] == AGENT_ACTOR)
+    # Sending URI's draft unchanged is approving it, not taking the conversation over.
     human_replied = any(
-        m["actor_id"] != AGENT_ACTOR and (_aware(m.get("received_at")) or at) > at - HUMAN_HANDOFF
+        m["actor_id"] != AGENT_ACTOR and not m.get("approved_draft") and (_aware(m.get("received_at")) or at) > at - HUMAN_HANDOFF
         for m in outbound)
     return decide_auto_reply(settings, conv, cls, draft, auto_sent, human_replied, at)
 
@@ -636,15 +651,16 @@ async def record_correction(db, workspace_id: str, conversation_id: str, intent:
 
 
 async def record_outcome(db, workspace_id: str, conversation_id: str,
-                         suggestion_id: str, sent_text: str) -> None:
+                         suggestion_id: str, sent_text: str) -> str:
     """A person replied: note whether they used the draft as-is, edited it, or wrote
     their own (PRD §8.7), and clear the handoff flag — the conversation is handled."""
     if not ObjectId.is_valid(conversation_id):
-        return
+        return ""
     conv = await db[CONVERSATIONS].find_one(
         {"_id": ObjectId(conversation_id), "workspace_id": workspace_id})
     if not conv:
-        return
+        return ""
+    kind = ""
     sid = suggestion_id or (conv.get("ai_suggestion") or {}).get("id") or ""
     row = await db[CLASSIFICATIONS].find_one(
         {"_id": ObjectId(sid), "workspace_id": workspace_id}) if ObjectId.is_valid(sid) else None
@@ -660,6 +676,7 @@ async def record_outcome(db, workspace_id: str, conversation_id: str,
             "outcome": {"type": kind, "at": now()}}})
     await db[CONVERSATIONS].update_one({"_id": conv["_id"]}, {"$set": {
         "ai_suggestion": None, "needs_human": False, "handoff_reason": ""}})
+    return kind
 
 
 # Background work holds a reference so the event loop can't collect it mid-run.
