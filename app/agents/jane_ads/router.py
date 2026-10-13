@@ -1260,6 +1260,7 @@ async def jane_google_ads_admin_connect_initiate():
 async def jane_google_ads_admin_connect_callback(
     code: Optional[str] = None,
     error: Optional[str] = None,
+    state: Optional[str] = None,
     db: AsyncIOMotorDatabase = Depends(get_db_dependency),
 ):
     """Exchanges the code and stores it as THE single admin connection (upsert on a
@@ -1267,7 +1268,28 @@ async def jane_google_ads_admin_connect_callback(
     the app: this isn't part of any brand-facing flow, there's nowhere in the UI to
     land."""
     from app.core.config import settings
-    from .google_ads_connection import exchange_code_for_tokens, save_admin_connection, GoogleAdsConnectionError
+    from .google_ads_connection import (
+        exchange_code_for_tokens, save_admin_connection, GoogleAdsConnectionError,
+        finish_signin, identity_manages_mcc, safe_return_to, take_signin_state,
+    )
+
+    # A brand owner coming back from "Continue with Google" — same registered
+    # redirect URI as the admin connect, told apart by the one-time state we issued.
+    if state and state.startswith("b_"):
+        import urllib.parse as _up
+        state_doc = await take_signin_state(db, state)
+        if not state_doc:
+            return RedirectResponse(f"{safe_return_to('')}/workspace/?tab=connections&google=error"
+                                    f"&reason={_up.quote('That sign-in link expired. Please try again.')}")
+        back = f"{state_doc.get('return_to') or safe_return_to('')}/workspace/?tab=connections"
+        if error or not code:
+            reason = "You cancelled the Google sign-in." if error == "access_denied" else "Google sign-in didn't complete."
+            return RedirectResponse(f"{back}&google=error&reason={_up.quote(reason)}")
+        outcome = await finish_signin(db, state_doc, code)
+        url = f"{back}&google={outcome['outcome']}"
+        if outcome.get("detail"):
+            url += f"&reason={_up.quote(outcome['detail'])}"
+        return RedirectResponse(url)
 
     if error:
         return HTMLResponse(f"<p>Google Ads admin connect failed: {error}</p>", status_code=400)
@@ -1291,6 +1313,19 @@ async def jane_google_ads_admin_connect_callback(
             "already granted this app access before. Revoke access at "
             "myaccount.google.com/permissions and try again.</p>",
             status_code=502,
+        )
+
+    # This link needs no login, so check the identity before trusting it: only
+    # someone who really has URI's manager account may become the admin connection.
+    try:
+        allowed = await identity_manages_mcc(tokens["access_token"])
+    except GoogleAdsConnectionError:
+        allowed = False
+    if not allowed:
+        return HTMLResponse(
+            "<p>That Google account doesn't have access to URI's Google Ads manager account, "
+            "so it can't be used as the admin connection. Nothing was changed.</p>",
+            status_code=403,
         )
 
     await save_admin_connection(db, tokens)
@@ -1488,6 +1523,70 @@ async def jane_google_ads_link_existing(
             ),
         }
     return result
+
+
+class GoogleSigninStartBody(BaseModel):
+    return_to: str = ""     # the app's own origin, so the browser comes back to the same site
+
+
+@router.post("/google/connect/signin/start")
+async def jane_google_ads_signin_start(
+    body: GoogleSigninStartBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """ "Continue with Google": returns the Google sign-in URL. After signing in the
+    owner lands back on Connected Accounts with their account linked (one usable
+    account) or a list to choose from — no Customer ID to find."""
+    from .google_ads_connection import GoogleAdsConnectionError, start_signin
+
+    try:
+        url = await start_signin(db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"), body.return_to)
+    except GoogleAdsConnectionError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    return {"auth_url": url}
+
+
+@router.get("/google/connect/signin/accounts")
+async def jane_google_ads_signin_accounts(
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """The Google Ads accounts the owner's sign-in found, by name. Empty once the
+    sign-in is used up or older than its short lifetime."""
+    from .google_ads_connection import _fresh_signin, get_any_google_ads_connection, usable_accounts
+
+    conn = await get_any_google_ads_connection(db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"))
+    signin = _fresh_signin(conn)
+    found = (signin or {}).get("accounts") or []
+    return {
+        "signed_in": bool(signin),
+        "accounts": [{k: a.get(k) for k in ("customer_id", "name", "currency_code")} for a in usable_accounts(found)],
+        "other_accounts": len(found) - len(usable_accounts(found)),
+    }
+
+
+class GoogleSigninSelectBody(BaseModel):
+    customer_id: str
+
+
+@router.post("/google/connect/signin/select")
+async def jane_google_ads_signin_select(
+    body: GoogleSigninSelectBody,
+    db: AsyncIOMotorDatabase = Depends(get_db_dependency),
+    brand_ctx: dict = Depends(get_active_brand_context),
+) -> dict:
+    """Link the account the owner picked: URI sends the request and accepts it on
+    their behalf, so it is usually linked by the time this returns."""
+    from .google_ads_connection import AccountNotLinkable, GoogleAdsConnectionError, link_selected_account
+
+    try:
+        return await link_selected_account(db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"), body.customer_id)
+    except AccountNotLinkable as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except GoogleAdsConnectionError as e:
+        print(f"⚠️  Google Ads REST failure: {e}")
+        raise HTTPException(status_code=502, detail=str(e))
 
 
 @router.post("/google/connection/change-account")
