@@ -400,3 +400,15 @@ def test_sending_the_draft_unchanged_doesnt_hand_the_chat_to_a_person():
     assert agent.verdict(s, _conv(), approved, _cls(), _draft(), OPEN_HOURS) == (True, "")
     approved[0]["approved_draft"] = False
     assert agent.verdict(s, _conv(), approved, _cls(), _draft(), OPEN_HOURS)[0] is False
+
+
+def test_replies_are_always_english_even_to_pidgin():
+    seen = {}
+
+    async def llm(system, user):
+        seen.update(system=system, user=user)
+        return {"reply": "We deliver across Lagos.", "cited": [], "confidence": 90}
+
+    _run(agent.draft_reply("abeg una dey deliver?", [], [], "dm", "facebook", "Shop", llm, "pcm"))
+    assert "Always write in clear, correct, professional English" in seen["system"]
+    assert "Pidgin" not in seen["user"]
