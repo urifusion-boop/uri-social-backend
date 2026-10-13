@@ -224,7 +224,20 @@ def offer(bc: Optional[Dict[str, Any]]) -> List[str]:
         lines.append(f"Price positioning: {bc['price_range']} — match the wording to this price tier.")
     if bc.get("primary_goal"):
         lines.append(f"The brand's main goal: {bc['primary_goal']}.")
+    if competitors_line(bc):
+        lines.append(competitors_line(bc))
     return lines
+
+
+def competitors_line(bc: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Competitors are for positioning, never for naming: the writing should
+    make clear what this brand does differently, and must not mention, tag or
+    compare against them by name."""
+    names = _list((bc or {}).get("competitor_handles"), 5)
+    if not names:
+        return None
+    return (f"Competitors: {', '.join(names)}. NEVER name, tag or directly compare against them. "
+            f"Use this only to make what THIS brand does differently unmistakable.")
 
 
 # ── 5. Right now (Business Pulse) ────────────────────────────────────────────
