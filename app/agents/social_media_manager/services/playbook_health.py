@@ -105,6 +105,10 @@ FIELDS: List[Dict[str, Any]] = [
      "used_in": [AUTO], "why": "How often the Auto tab creates posts for you."},
     {"key": "approval_workflow", "label": "Approval workflow", "section": "Posting & Workflow", "weight": 1,
      "used_in": [AUTO], "why": "Whether Auto-tab posts wait for you or go out on schedule."},
+    {"key": "posting_time_mode", "label": "Posting times", "section": "Posting & Workflow", "weight": 0,
+     "used_in": [SCHEDULING, AUTO], "why": "When your posts go out."},
+    {"key": "primary_font", "label": "Fonts", "section": "Typography", "weight": 0,
+     "used_in": [IMAGES], "why": "The typefaces on your images."},
     # Right now
     {"key": "business_pulse", "label": "Business Pulse", "section": "Business Pulse", "weight": 2,
      "used_in": [POSTS, CALENDAR, ADS, VIDEO, BLOG], "why": "Tell Jane about this week's promotion and she'll use it everywhere."},
@@ -140,6 +144,18 @@ def used_in_by_label() -> Dict[str, List[str]]:
     return out
 
 
+def labels_by_section() -> Dict[str, List[str]]:
+    """Playbook section title -> its settings' labels, so the page can list
+    what a section powers for settings that don't sit in a labelled row.
+    Guardrails is left out: its rows (Topics to avoid, Banned words, ...) each
+    already carry the note."""
+    out: Dict[str, List[str]] = {}
+    for f in FIELDS:
+        if f["key"] != "guardrails":
+            out.setdefault(f["section"], []).append(f["label"])
+    return out
+
+
 def _has(value: Any) -> bool:
     if isinstance(value, dict):
         return any(_has(v) for v in value.values())
@@ -170,8 +186,9 @@ def assess(profile: Optional[Dict[str, Any]], now: Optional[datetime] = None) ->
     the per-field "used in" map for the Playbook page."""
     profile = profile or {}
     now = now or datetime.utcnow()
-    total = sum(f["weight"] for f in FIELDS)
-    missing = [f for f in FIELDS if not _filled(profile, f["key"], now)]
+    scored = [f for f in FIELDS if f["weight"] > 0]   # weight 0 = information only
+    total = sum(f["weight"] for f in scored)
+    missing = [f for f in scored if not _filled(profile, f["key"], now)]
     earned = total - sum(f["weight"] for f in missing)
     score = round(earned / total * 100) if total else 0
     level = ("Excellent" if score >= 90 else "Strong" if score >= 75 else "Good start" if score >= 50 else "Needs attention")
@@ -189,9 +206,10 @@ def assess(profile: Optional[Dict[str, Any]], now: Optional[datetime] = None) ->
     return {
         "score": score,
         "level": level,
-        "filled": len(FIELDS) - len(missing),
-        "total": len(FIELDS),
+        "filled": len(scored) - len(missing),
+        "total": len(scored),
         "suggestions": [suggestion(f) for f in ranked[:5]],
         "missing_count": len(missing),
         "used_in": used_in_by_label(),
+        "sections": labels_by_section(),
     }

@@ -68,6 +68,22 @@ class TestUsedIn:
         assert used["Topics to avoid"] == used["Guardrails"]
         assert used["Max hashtags"] == ["Posts"]
 
+    def test_every_section_title_matches_a_playbook_section(self):
+        # Titles as rendered by the Playbook page's <PbSection title="…">.
+        page_sections = {"Brand Identity", "Business Details", "Brand Colors", "Brand Voice", "Content Strategy",
+                         "Important Dates", "Audience", "Language & Region", "Guardrails", "Call to Action",
+                         "Posting & Workflow", "Visual Style", "Typography", "Business Pulse"}
+        assert {f["section"] for f in ph.FIELDS} <= page_sections
+        sections = ph.labels_by_section()
+        assert "Guardrails" not in sections            # its rows carry the note themselves
+        assert "Brand colors" in sections["Brand Colors"] and "Fonts" in sections["Typography"]
+
+    def test_information_only_settings_are_not_scored(self):
+        result = ph.assess({}, now=NOW)
+        assert result["total"] == len([f for f in ph.FIELDS if f["weight"] > 0])
+        assert not {"posting_time_mode", "primary_font"} & {s["key"] for s in result["suggestions"]}
+        assert result["used_in"]["Posting times"] == ["Scheduling", "Auto tab"]
+
     def test_labels_are_unique(self):
         labels = [f["label"] for f in ph.FIELDS]
         assert len(labels) == len(set(labels))
