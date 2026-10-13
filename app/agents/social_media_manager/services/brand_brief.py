@@ -163,6 +163,8 @@ _EMOJI = re.compile(
 
 
 def strip_emojis(text: str) -> str:
+    if not _EMOJI.search(text or ""):
+        return text or ""  # nothing to remove — leave the layout exactly as written
     out = _EMOJI.sub("", text or "")
     out = re.sub(r"[ \t]{2,}", " ", out)
     out = re.sub(r"[ \t]+([.,!?])", r"\1", out)

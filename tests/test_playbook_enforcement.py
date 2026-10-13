@@ -341,6 +341,93 @@ class TestRegenerateEndToEnd:
         assert asyncio.run(db["content_drafts"].find_one({"id": "d1"}))["content"] == "Old caption"
 
 
+BLOG_HEAD = "TITLE: Stop Missing Renewals\nMETA: A guide.\n\n"
+BLOG_BAD = (BLOG_HEAD + "Docerity dey help you. " * 30
+            + "SMEs make up 96% of businesses. Streamlined work matters.")
+BLOG_GOOD = BLOG_HEAD + "Docerity dey help you. " * 32
+
+
+class TestBlogIsCheckedToo:
+    def _run(self, monkeypatch, replies):
+        from mongomock_motor import AsyncMongoMockClient
+        from app.agents.social_media_manager.services import blog_generation_service as blog
+        db = AsyncMongoMockClient()["t"]
+        prompts = []
+
+        async def fake_chat(request):
+            prompts.append(request.messages[0]["content"])
+            return _reply(replies[min(len(prompts) - 1, len(replies) - 1)])
+
+        async def no_dna(*a, **k):
+            return ""
+
+        monkeypatch.setattr(blog.AIService, "chat_completion", staticmethod(fake_chat))
+        monkeypatch.setattr(blog.AIService, "build_ai_model",
+                            staticmethod(lambda messages, **kw: SimpleNamespace(messages=messages)))
+        monkeypatch.setattr(blog.WritingDNAService, "get_prompt", staticmethod(no_dna))
+
+        async def go():
+            await db["brand_profiles"].insert_one({"brand_id": "b1", "user_id": "u1", **BRAND})
+            result = await blog.BlogGenerationService.generate(
+                user_id="u1", topic="Renewals", primary_keyword="renewal", secondary_keywords=[],
+                word_count=100, db=db, brand_id="b1")
+            return result, await db[blog.BLOG_POSTS_COLLECTION].find_one({})
+        result, saved = asyncio.run(go())
+        return result, saved, prompts
+
+    def test_invented_statistic_and_banned_word_are_rewritten(self, monkeypatch):
+        result, saved, prompts = self._run(monkeypatch, [BLOG_BAD, BLOG_GOOD])
+        assert result["status"] and len(prompts) == 2
+        assert '"96%"' in prompts[1] and 'Remove "streamline"' in prompts[1]
+        assert "96%" not in result["responseData"]["content"]
+        assert saved["playbook_issues"] == []
+
+    def test_clean_blog_costs_no_rewrite(self, monkeypatch):
+        result, saved, prompts = self._run(monkeypatch, [BLOG_GOOD])
+        assert len(prompts) == 1 and saved["playbook_issues"] == []
+
+    def test_a_rewrite_that_is_no_better_is_not_used_and_is_flagged(self, monkeypatch):
+        result, saved, prompts = self._run(monkeypatch, [BLOG_BAD])
+        assert result["status"]
+        assert any(i.startswith("unverified_number") for i in saved["playbook_issues"])
+
+    def test_expansion_pass_carries_the_brand_rules(self, monkeypatch):
+        short = "TITLE: T\nMETA: M\n\nDocerity dey help you."
+        result, saved, prompts = self._run(monkeypatch, [short, BLOG_GOOD])
+        assert "needs to be at least" in prompts[1]
+        assert "real numbers" not in prompts[1]
+        assert "streamline" in prompts[1] and "NEVER invent facts" in prompts[1]
+
+
+class TestAdCopyIsCheckedToo:
+    def _run(self, monkeypatch, replies):
+        from app.agents.jane_ads import creative
+        prompts = []
+
+        async def fake_model(prompt):
+            prompts.append(prompt)
+            return replies[min(len(prompts) - 1, len(replies) - 1)]
+
+        monkeypatch.setattr(creative, "_call_ad_copy_model", fake_model)
+        copy = asyncio.run(creative.write_ad_copy("Docerity", "software", brand_context=BRAND))
+        return copy, prompts
+
+    def test_invented_statistic_is_rewritten(self, monkeypatch):
+        bad = {"headline": "Paperwork, handled 🎉", "primary_text": "Over 70% of SMEs lose invoices. Try Docerity.",
+               "image_prompt": "an office"}
+        good = {"headline": "Paperwork, handled", "primary_text": "Stop losing invoices. Try Docerity.",
+                "image_prompt": "an office"}
+        copy, prompts = self._run(monkeypatch, [bad, good])
+        assert len(prompts) == 2 and '"70%"' in prompts[1]
+        assert copy.primary_text == "Stop losing invoices. Try Docerity."
+
+    def test_emojis_removed_even_if_the_model_keeps_them(self, monkeypatch):
+        reply = {"headline": "Paperwork, handled 🎉", "primary_text": "Try Docerity today ✅", "image_prompt": "an office"}
+        copy, prompts = self._run(monkeypatch, [reply])
+        assert len(prompts) == 1
+        assert copy.headline == "Paperwork, handled" and copy.primary_text == "Try Docerity today"
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
