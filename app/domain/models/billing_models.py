@@ -112,7 +112,7 @@ class CreditTransaction(BaseModel):
     amount: int = Field(..., description="Credit amount (negative for deduction)")
     balance_before: int = Field(..., description="Credit balance before transaction")
     balance_after: int = Field(..., description="Credit balance after transaction")
-    reason: Literal["subscription", "retry", "campaign_generation", "refund", "bonus", "trial", "whatsapp_content_generation", "whatsapp_graphic_generation", "upload_user_content", "custom_credit_purchase", "video_editing", "admin_adjustment"] = Field(..., description="Why credits changed")
+    reason: Literal["subscription", "retry", "campaign_generation", "refund", "bonus", "trial", "whatsapp_content_generation", "whatsapp_graphic_generation", "upload_user_content", "custom_credit_purchase", "video_editing", "admin_adjustment", "blog_generation", "image_retry", "whatsapp_image_edit"] = Field(..., description="Why credits changed")
     campaign_id: Optional[str] = Field(default=None, description="Reference to content_requests if applicable")
     retry_count: Optional[int] = Field(default=0, description="Retry number if applicable")
     notes: Optional[str] = Field(default=None, description="Free-text context — e.g. an admin's stated reason for a manual credit/trial adjustment, distinct from the fixed `reason` category")
