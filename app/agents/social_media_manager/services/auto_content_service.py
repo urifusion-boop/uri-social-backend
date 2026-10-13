@@ -9,6 +9,7 @@ from app.services.AIService import AIService
 from .content_generation_service import ContentGenerationService
 from .image_content_service import ImageContentService
 from .brand_profile_service import BrandProfileService
+from . import posting_preferences
 
 
 class AutoContentService:
@@ -72,8 +73,9 @@ class AutoContentService:
     ) -> dict:
         now = datetime.utcnow()
         frequency = payload.get("frequency", "daily")
-        delta = timedelta(days=1) if frequency == "daily" else timedelta(weeks=1)
-        next_run_at = now + delta
+        profile_result = await BrandProfileService.get(user_id, db)
+        profile = (profile_result.get("responseData") or {}) if profile_result.get("status") else {}
+        next_run_at = now + posting_preferences.cadence_interval(profile, frequency)
 
         update_fields = {
             "enabled": payload.get("enabled", False),
@@ -401,6 +403,33 @@ class AutoContentService:
     # -------------------------------------------------------------------------
 
     @staticmethod
+    async def _auto_schedule(user_id: str, db: AsyncIOMotorDatabase, drafts: List[dict], profile: dict) -> None:
+        """Brand Playbook approval = Auto-publish or Hybrid: the Auto tab's
+        recurring posts skip the review queue and are scheduled for the brand's
+        next preferred posting time on each platform. Goes through the same
+        approve-and-schedule path as the user's own Schedule button, so every
+        publish check still applies; a draft that fails one stays a draft."""
+        from .approval_workflow_service import ApprovalWorkflowService
+
+        by_time: Dict[datetime, List[str]] = {}
+        for d in drafts:
+            draft_id = d.get("id") or d.get("draft_id")
+            if not draft_id:
+                continue
+            when = posting_preferences.next_post_time(profile, d.get("platform", ""))
+            by_time.setdefault(when, []).append(draft_id)
+        for when, ids in by_time.items():
+            try:
+                result = await ApprovalWorkflowService.approve_content(
+                    db=db, user_id=user_id, draft_ids=ids, schedule_option="schedule",
+                    scheduled_datetime=when,
+                    approval_notes="Auto-published — Brand Playbook approval setting",
+                )
+                print(f"[AutoContent] auto-scheduled {ids} for {when.isoformat()}Z: status={result.get('status')}")
+            except Exception as exc:
+                print(f"[AutoContent] auto-schedule failed for {ids}: {exc} — left as drafts for review")
+
+    @staticmethod
     async def generate_for_user(user_id: str, db: AsyncIOMotorDatabase) -> dict:
         """
         Full pipeline:
@@ -481,11 +510,13 @@ class AutoContentService:
                         {"id": {"$in": draft_ids}},
                         {"$set": {"auto_generated": True}},
                     )
+                    if posting_preferences.auto_publishes_recurring(profile_data):
+                        await AutoContentService._auto_schedule(user_id, db, drafts, profile_data)
 
-        # Update settings
+        # Update settings — next run follows the Playbook's posting cadence.
         now = datetime.utcnow()
         frequency = settings_doc.get("frequency", "daily")
-        delta = timedelta(days=1) if frequency == "daily" else timedelta(weeks=1)
+        delta = posting_preferences.cadence_interval(profile_data, frequency)
         await db["auto_content_settings"].update_one(
             {"user_id": user_id},
             {
