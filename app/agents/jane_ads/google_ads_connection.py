@@ -1088,3 +1088,67 @@ async def identity_manages_mcc(access_token: str) -> bool:
     if "error" in data:
         return False
     return f"customers/{mcc}" in (data.get("resourceNames") or [])
+
+
+# ── A nudge when the request is still waiting a day later ────────────────────
+
+REMIND_AFTER_HOURS = 20
+REMIND_GIVE_UP_DAYS = 14
+
+
+async def remind_pending_links(db, now: Optional[datetime] = None) -> dict:
+    """Brands whose link request has waited about a day: check with Google
+    first (it may have been accepted — then nothing is sent), and if it is
+    still waiting, remind the owner ONCE by email and in the app, with the
+    link back to Connected Accounts. Run hourly by the notification scheduler."""
+    from app.services import brand_notifier
+
+    now = now or datetime.now(timezone.utc)
+    sent = accepted = checked = 0
+    cursor = db[CONNECTIONS].find({"platform": "google_ads", "manager_link_status": "pending"})
+    for conn in await cursor.to_list(length=500):
+        if conn.get("link_reminder_sent_at") or not conn.get("customer_id"):
+            continue
+        invited = conn.get("invited_at") or conn.get("updated_at")
+        if invited is None:
+            continue
+        if invited.tzinfo is None:
+            invited = invited.replace(tzinfo=timezone.utc)
+        age = now - invited
+        if age < timedelta(hours=REMIND_AFTER_HOURS) or age > timedelta(days=REMIND_GIVE_UP_DAYS):
+            continue
+        checked += 1
+        try:
+            fresh = await sync_manager_link(db, conn)
+        except GoogleAdsConnectionError as e:
+            print(f"[GoogleAds] reminder: could not check {conn.get('id')}: {e}")
+            continue
+        if fresh.get("manager_link_status") != "pending":
+            accepted += fresh.get("manager_link_status") == "active"
+            continue
+        user_id = conn.get("user_id")
+        if not user_id:
+            continue
+        digits = "".join(ch for ch in str(conn.get("customer_id")) if ch.isdigit())
+        shown = f"{digits[:3]}-{digits[3:6]}-{digits[6:]}" if len(digits) == 10 else digits
+        title = "One step left to run Google ads with URI"
+        message = (
+            f"Your Google Ads account {shown} is still waiting for one approval. The quickest way: open "
+            "Connected Accounts and press Continue with Google — you sign in and it's done. "
+            "Or approve URI in Google Ads under Admin → Access and security → Managers."
+        )
+        web = (settings.WEB_APP_URL or "").strip("'\"").rstrip("/") or "https://www.urisocial.com"
+        link = f"{web}/workspace/?tab=connections"
+        user = await db["users"].find_one({"userId": user_id}) or {}
+        deliveries = {"dashboard": {"sent": True, "error": None}}
+        if not user.get("notification_opt_out"):
+            try:
+                ok, error = await brand_notifier._send(db, "email", user, {}, user_id, title, message, link)
+            except Exception as exc:
+                ok, error = False, str(exc)
+            deliveries["email"] = {"sent": ok, "error": error}
+        await brand_notifier._log(db, user_id, "google_ads_link_reminder", title, message,
+                                  {"brand_id": conn.get("brand_id"), "link": link}, deliveries)
+        await db[CONNECTIONS].update_one({"id": conn["id"]}, {"$set": {"link_reminder_sent_at": now}})
+        sent += 1
+    return {"checked": checked, "reminded": sent, "already_accepted": accepted}

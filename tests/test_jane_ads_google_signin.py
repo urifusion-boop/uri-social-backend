@@ -194,6 +194,63 @@ class TestWhoMayBeTheAdminConnection:
         assert self._check(["customers/1234567890"]) is False
 
 
+class TestReminderADayLater:
+    """One nudge when the request is still waiting — never if it was accepted meanwhile."""
+
+    def _db(self, hours_ago, **conn):
+        db = db_with(manager_link_status="pending", invited_at=datetime.now(timezone.utc) - timedelta(hours=hours_ago),
+                     **conn)
+        coll = db["x"]
+
+        class Cursor:
+            def __init__(self, docs):
+                self.docs = docs
+
+            async def to_list(self, length=None):
+                return [dict(d) for d in self.docs]
+
+        coll.find = lambda q: Cursor([d for d in coll.docs if coll._matches(d, q)])
+        coll.docs.append({"userId": "u1", "email": "owner@docerity.com"})
+        return db
+
+    def _remind(self, db, *google_responses):
+        sent, logged = [], []
+
+        async def fake_send(db_, channel, user, profile, user_id, title, message, link):
+            sent.append({"channel": channel, "to": user.get("email"), "title": title, "message": message, "link": link})
+            return True, None
+
+        async def fake_log(db_, user_id, event, title, message, metadata, deliveries):
+            logged.append({"event": event, "deliveries": deliveries})
+
+        with patch("app.services.brand_notifier._send", new=fake_send), \
+             patch("app.services.brand_notifier._log", new=fake_log), Google(*google_responses):
+            out = run(g.remind_pending_links(db))
+        return out, sent, logged
+
+    def test_still_waiting_after_a_day_gets_one_reminder(self):
+        db = self._db(26, customer_id="4052658060")
+        out, sent, logged = self._remind(db, {"results": [link("PENDING", "55", "4052658060")]})
+        assert out["reminded"] == 1 and sent[0]["to"] == "owner@docerity.com"
+        assert "405-265-8060" in sent[0]["message"] and "Continue with Google" in sent[0]["message"]
+        assert sent[0]["link"].endswith("/workspace/?tab=connections")
+        assert logged[0]["event"] == "google_ads_link_reminder"
+        # and never a second one
+        out2, sent2, _ = self._remind(db, {"results": [link("PENDING", "55", "4052658060")]})
+        assert out2["reminded"] == 0 and sent2 == []
+
+    def test_accepted_in_the_meantime_gets_no_reminder(self):
+        db = self._db(26, customer_id="4052658060")
+        out, sent, _ = self._remind(db, {"results": [link("ACTIVE", "55", "4052658060")]}, DETAILS)
+        assert out == {"checked": 1, "reminded": 0, "already_accepted": 1} and sent == []
+        assert brand_doc(db)["manager_link_status"] == "active"
+
+    def test_too_soon_is_left_alone(self):
+        db = self._db(3)
+        out, sent, _ = self._remind(db)
+        assert out["checked"] == 0 and sent == []
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
