@@ -84,6 +84,8 @@ FIELDS: List[Dict[str, Any]] = [
      "used_in": [POSTS, CALENDAR, INBOX], "why": "Feeds post ideas and helps Jane answer in the inbox."},
     {"key": "words_to_avoid", "label": "Words/phrases to avoid", "section": "Audience", "weight": 1,
      "used_in": _WRITING, "why": "Jane will never use them, anywhere."},
+    {"key": "competitor_handles", "label": "Competitors", "section": "Audience", "weight": 1,
+     "used_in": [POSTS, ADS, VIDEO, BLOG], "why": "Jane positions you against them — without ever naming them."},
     # Language & region
     {"key": "region", "label": "Region", "section": "Language & Region", "weight": 2,
      "used_in": [POSTS, IMAGES, CALENDAR, ADS, INBOX, VIDEO, LEADS, SCHEDULING],
