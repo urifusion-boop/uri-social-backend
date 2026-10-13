@@ -78,6 +78,33 @@ class TestLanguages:
         assert bb.missing_languages("We are open.", {"languages": ["English", "Hausa"]}) == ["Hausa"]
 
 
+class TestLanguageBlend:
+    MOSTLY_PIDGIN = ("Docerity don make am easier for you.\n\nWe fit read invoices wey dem send for WhatsApp.\n\n"
+                     "You go save time and e go reduce errors.\n\nWetin be the challenges wey you dey face?\n\n"
+                     "Book a free demo.")
+    LIGHT_BLEND = ("Are your invoices stuck in WhatsApp?\n\nDocerity reads invoices sent as photos.\n\n"
+                   "No wahala, it takes ten minutes to set up.\n\nYour team gets hours back every week.\n\n"
+                   "Book a free demo.")
+
+    def test_a_piece_taken_over_by_the_second_language(self):
+        assert bb.overused_languages(self.MOSTLY_PIDGIN, BRAND) == ["Pidgin"]
+        assert "language_overused" in codes(bb.audit(self.MOSTLY_PIDGIN, BRAND))
+
+    def test_a_light_blend_is_right(self):
+        assert bb.overused_languages(self.LIGHT_BLEND, BRAND) == []
+        assert bb.audit(self.LIGHT_BLEND, BRAND) == []
+
+    def test_short_pieces_are_not_judged(self):
+        assert bb.overused_languages("We dey for you. Book a free demo.", BRAND) == []
+
+    def test_rule_states_both_ends(self):
+        rule = bb.languages_rule(BRAND)
+        assert "REQUIRED" in rule and "LIMIT" in rule and "main language" in rule
+
+    def test_single_language_brand_is_never_over(self):
+        assert bb.overused_languages(self.MOSTLY_PIDGIN, {"languages": ["Pidgin"]}) == []
+
+
 class TestInventedNumbers:
     def test_statistic_not_in_the_sources(self):
         assert bb.unverified_numbers("Over 70% of small businesses struggle.", "Docerity, ten minutes") == ["70%"]
@@ -180,8 +207,8 @@ class TestFixPrompt:
         assert "phone screen" not in prompt
 
 
-GOOD = ("Paperwork no be your work again.\n\nDocerity dey turn invoices into clean data for you.\n\n"
-        "Set up takes ten minutes.\n\nBook a free demo.\n\n#Docerity #SME #Naija #Extra #More")
+GOOD = ("Paperwork no be your work again.\n\nDocerity turns invoices into clean data for you.\n\n"
+        "Set up takes ten minutes.\n\nYour team gets hours back.\n\nBook a free demo.\n\n#Docerity #SME #Naija #Extra #More")
 BAD = ("Streamlining your paperwork matters 🎉\n\nOver 70% of small businesses struggle with invoices.\n\n"
        "Docerity turns them into clean data.\n\nWhat do you think?\n\n#Docerity #SME #Naija #Extra #More")
 
@@ -342,9 +369,9 @@ class TestRegenerateEndToEnd:
 
 
 BLOG_HEAD = "TITLE: Stop Missing Renewals\nMETA: A guide.\n\n"
-BLOG_BAD = (BLOG_HEAD + "Docerity dey help you. " * 30
+BLOG_BAD = (BLOG_HEAD + "No wahala. " + "Docerity helps you every day. " * 30
             + "SMEs make up 96% of businesses. Streamlined work matters.")
-BLOG_GOOD = BLOG_HEAD + "Docerity dey help you. " * 32
+BLOG_GOOD = BLOG_HEAD + "No wahala. " + "Docerity helps you every day. " * 32
 
 
 class TestBlogIsCheckedToo:
