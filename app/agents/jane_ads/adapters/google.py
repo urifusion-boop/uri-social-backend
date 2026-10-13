@@ -164,6 +164,14 @@ def _raise_for_error(data: dict, context: str) -> None:
         if details:
             inner = (details[0].get("errors") or [{}])[0]
             detail = inner.get("message") or detail
+            # Say WHICH field: "The required field was not present" alone is undiagnosable.
+            path = [e.get("fieldName", "") for e in
+                    ((inner.get("location") or {}).get("fieldPathElements") or []) if e.get("fieldName")]
+            if path:
+                detail = f"{detail} (field: {'.'.join(path)})"
+            code = inner.get("errorCode") or {}
+            if isinstance(code, dict) and code:
+                detail = f"{detail} [{next(iter(code.values()))}]"
         raise GoogleAdsAPIError(f"{context}: {detail}", code=err.get("status"))
 
 
@@ -393,6 +401,11 @@ class GoogleAdsAdapter(AdPlatformAdapter):
                         "advertisingChannelType": "SEARCH",
                         "campaignBudget": budget_resource_name,
                         "targetSpend": {},
+                        # Mandatory on every new campaign in current API versions
+                        # (Google's EU political-ads rules) — without it the create
+                        # fails with a bare "required field was not present"
+                        # (hit on the first real launch against a live account).
+                        "containsEuPoliticalAdvertising": "DOES_NOT_CONTAIN_EU_POLITICAL_ADVERTISING",
                         "networkSettings": {
                             "targetGoogleSearch": True,
                             "targetSearchNetwork": False,
@@ -487,7 +500,7 @@ class GoogleAdsAdapter(AdPlatformAdapter):
                 _raise_for_error(ad_data, "ad creation")
                 ad_resource_name = ad_data["results"][0]["resourceName"]
         except Exception:
-            await self._rollback_partial_launch(campaign_resource_name)
+            await self._rollback_partial_launch(campaign_resource_name, budget_resource_name)
             raise
 
         campaign_id = campaign_resource_name.split("/")[-1] if campaign_resource_name else ""
@@ -518,13 +531,34 @@ class GoogleAdsAdapter(AdPlatformAdapter):
             launched=True,
         )
 
-    async def _rollback_partial_launch(self, campaign_resource_name: str) -> None:
+    async def _remove_budget(self, budget_resource_name: str) -> None:
+        """Best-effort removal of a budget a failed launch left behind (it costs
+        nothing on its own, but it clutters the client's account). Never raises."""
+        if not budget_resource_name:
+            return
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.post(
+                    f"{self._api_base}/customers/{self._customer_id}/campaignBudgets:mutate",
+                    headers=self._headers(),
+                    json={"operations": [{"remove": budget_resource_name}]},
+                )
+                data = resp.json()
+                if isinstance(data, dict) and "error" in data:
+                    print(f"[GoogleAdsAdapter] leftover budget {budget_resource_name}: "
+                          f"{data['error'].get('message')}", flush=True)
+        except Exception as e:
+            print(f"[GoogleAdsAdapter] leftover budget {budget_resource_name}: {e}", flush=True)
+
+    async def _rollback_partial_launch(self, campaign_resource_name: str, budget_resource_name: str = "") -> None:
         """Undo a launch that failed midway. Google Ads has no hard delete via API —
         the correct rollback primitive is setting the campaign's status to REMOVED
         (which cascades to its ad group/ads), distinct from Meta's real DELETE.
         Strictly best-effort and never raises — the caller is already unwinding a real
         failure; a cleanup problem must never mask the ORIGINAL error."""
         if not campaign_resource_name:
+            # Failed before a campaign existed — only the budget was created.
+            await self._remove_budget(budget_resource_name)
             return
         try:
             async with httpx.AsyncClient(timeout=15) as client:
