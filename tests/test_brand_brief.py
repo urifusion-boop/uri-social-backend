@@ -293,6 +293,53 @@ class TestCompetitors:
         assert bb.competitors_line({"competitor_handles": ["", " "]}) is None
 
 
+class TestPlaybookWinsOverOlderDefaults:
+    """Found on dev with real output: older instruction sets were overriding the Playbook."""
+
+    def test_languages_beat_the_voice_profiles_pure_english_default(self):
+        from app.agents.social_media_manager.services.caption_voice_system import build_voice_profile_instructions
+
+        rule = bb.languages_rule({"languages": ["English", "Pidgin"]})
+        text = build_voice_profile_instructions({"slang_level": "pure_english"}, None, "instagram", language_rule=rule)
+        assert "No slang or pidgin" not in text
+        assert "naturally mix in Pidgin" in text
+
+    def test_english_only_brand_keeps_pure_english(self):
+        from app.agents.social_media_manager.services.caption_voice_system import build_voice_profile_instructions
+
+        text = build_voice_profile_instructions({"slang_level": "pure_english"}, None, "instagram",
+                                                language_rule=bb.languages_rule({"languages": ["English"]}))
+        assert "Use standard English only" in text
+
+    def test_an_explicit_pidgin_voice_choice_is_kept(self):
+        from app.agents.social_media_manager.services.caption_voice_system import build_voice_profile_instructions
+
+        text = build_voice_profile_instructions({"slang_level": "heavy_pidgin"}, None, "instagram",
+                                                language_rule="Write in Yoruba.")
+        assert "Use Nigerian pidgin heavily" in text
+
+    def test_cta_closes_the_post_even_when_the_platform_wants_a_question(self):
+        block = ContentGenerationService._build_brand_block({"brand_name": "B", "cta_styles": ["Book a free demo"]})
+        assert "Book a free demo" in block
+        assert "FINAL line of the post" in block and "never instead of it" in block
+
+    def test_preview_and_real_posts_share_one_prompt(self):
+        import inspect
+        from app.agents.social_media_manager.routers import complete_social_manager as csm
+
+        assert "build_caption_prompt(" in inspect.getsource(csm.preview_playbook_voice)
+        assert "build_caption_prompt(seed_content, platform, brand_context)" in inspect.getsource(
+            ContentGenerationService._generate_platform_content)
+
+    def test_full_prompt_carries_language_rule_and_no_contradiction(self):
+        bc = {"brand_name": "B", "languages": ["English", "Pidgin"], "voice_profile": {"slang_level": "pure_english"},
+              "cta_styles": ["Book a free demo"]}
+        prompt = ContentGenerationService.build_caption_prompt("Announce a feature", "linkedin", bc)
+        assert "No slang or pidgin" not in prompt
+        assert prompt.count("naturally mix in Pidgin") >= 2      # voice profile line + hard rule
+        assert "FINAL line of the post" in prompt
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))

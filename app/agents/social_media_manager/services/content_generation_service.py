@@ -4,6 +4,13 @@ import asyncio
 import json
 from typing import List, Dict, Optional, Any, Tuple
 from . import brand_brief
+
+# Platform formats (e.g. LinkedIn's "end with an engaging question") were winning
+# over the brand's own call to action — confirmed on dev. The CTA closes the post.
+_CTA_LAST_LINE = (
+    "The call-to-action is the FINAL line of the post. If the platform format also asks for a "
+    "closing question, put the question just before it — never instead of it."
+)
 from datetime import datetime
 from bson import ObjectId
 from motor.motor_asyncio import AsyncIOMotorDatabase
@@ -228,6 +235,35 @@ Write one caption. No alternatives, no meta-commentary.
     def _brand_banned_words(brand_context: Optional[Dict[str, Any]]) -> List[str]:
         """Every word the brand has said never to use (see brand_brief.banned_words)."""
         return brand_brief.banned_words(brand_context)
+
+    @staticmethod
+    def build_caption_prompt(seed_content: str, platform: str, brand_context: Optional[Dict[str, Any]]) -> str:
+        """The complete prompt a caption is written from. One place, so real
+        posts and "Preview Jane's voice" can never drift apart. Order:
+          1. Banned patterns (universal)
+          2. Formatting rules (universal + platform)
+          3. Voice profile (brand)
+          4. Brand instructions (the Playbook)
+          5. The platform's own prompt, with the topic
+        """
+        brand_block = ContentGenerationService._build_brand_block(brand_context, platform=platform)
+        platform_prompt = ContentGenerationService.PLATFORM_PROMPTS[platform].format(seed_content=seed_content)
+        voice_instructions = ""
+        if brand_context and brand_context.get("voice_profile"):
+            voice_instructions = build_voice_profile_instructions(
+                brand_context["voice_profile"],
+                brand_context.get("voice_sample_analysis"),
+                platform,
+                language_rule=brand_brief.languages_rule(brand_context),
+            )
+        parts = [
+            BANNED_PATTERNS_RULES,
+            get_platform_formatting_rules(platform),
+            voice_instructions,
+            brand_block,
+            platform_prompt,
+        ]
+        return "\n".join(p for p in parts if p)
 
     @staticmethod
     def _build_brand_block(brand_context: Optional[Dict[str, Any]], platform: str = "") -> str:
@@ -460,12 +496,12 @@ Write one caption. No alternatives, no meta-commentary.
         if override_cta:
             # One-time override CTA (highest priority)
             parts.append(
-                f'- Call-to-action: End the post with this exact CTA: "{override_cta}"'
+                f'- Call-to-action: End the post with this exact CTA: "{override_cta}". {_CTA_LAST_LINE}'
             )
         elif selected_cta:
             # Use the SAME CTA that was used in the image (for consistency)
             parts.append(
-                f'- Call-to-action: End the post with this exact CTA: "{selected_cta}"'
+                f'- Call-to-action: End the post with this exact CTA: "{selected_cta}". {_CTA_LAST_LINE}'
             )
             print(f"✅ Caption will use same CTA as image: '{selected_cta}'")
         elif brand_context.get("cta_styles"):
@@ -474,7 +510,7 @@ Write one caption. No alternatives, no meta-commentary.
             if isinstance(ctas, list) and ctas:
                 parts.append(
                     f'- Preferred CTAs: {", ".join(ctas)}. '
-                    f'End the post with the most fitting one.'
+                    f'End the post with the most fitting one. {_CTA_LAST_LINE}'
                 )
 
         if brand_context.get("default_link"):
@@ -729,37 +765,7 @@ Create social media content about THIS SPECIFIC PRODUCT based on the image analy
 
         try:
             # Get platform-specific prompt
-            prompt_template = ContentGenerationService.PLATFORM_PROMPTS[platform]
-            brand_block = ContentGenerationService._build_brand_block(brand_context, platform=platform)
-            platform_prompt = prompt_template.format(seed_content=seed_content)
-
-            # Build voice profile instructions if available
-            voice_instructions = ""
-            if brand_context and brand_context.get("voice_profile"):
-                voice_instructions = build_voice_profile_instructions(
-                    brand_context["voice_profile"],
-                    brand_context.get("voice_sample_analysis"),
-                    platform
-                )
-
-            # Get platform-specific formatting rules
-            platform_formatting = get_platform_formatting_rules(platform)
-
-            # Assemble the complete prompt with proper order:
-            # 1. Banned patterns rules (universal)
-            # 2. Formatting rules (universal + platform-specific)
-            # 3. Voice profile (brand-specific)
-            # 4. Brand context
-            # 5. Platform prompt
-            prompt_parts = [
-                BANNED_PATTERNS_RULES,
-                platform_formatting,
-                voice_instructions,
-                brand_block if brand_block else "",
-                platform_prompt
-            ]
-
-            prompt = "\n".join([p for p in prompt_parts if p])
+            prompt = ContentGenerationService.build_caption_prompt(seed_content, platform, brand_context)
             
             # Use your existing AIService with optimized parameters
             ai_request = AIService.build_ai_model(

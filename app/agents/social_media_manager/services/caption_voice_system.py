@@ -95,7 +95,8 @@ THE TEST:
 """
 
 
-def build_voice_profile_instructions(voice_profile: dict, voice_sample_analysis: dict = None, platform: str = "") -> str:
+def build_voice_profile_instructions(voice_profile: dict, voice_sample_analysis: dict = None, platform: str = "",
+                                     language_rule: str = None) -> str:
     """
     Build natural language voice instructions from voice profile and analysis.
     PRD Section 3.1 & 6
@@ -166,7 +167,14 @@ def build_voice_profile_instructions(voice_profile: dict, voice_sample_analysis:
         "heavy_pidgin": "Use Nigerian pidgin heavily. Mix English and pidgin naturally (code-switching).",
         "industry_jargon": "Use industry-specific terminology and jargon where appropriate.",
     }
-    instructions.append(f"LANGUAGE STYLE: {slang_map.get(slang_level, slang_level)}")
+    if language_rule and slang_level == "pure_english":
+        # The Brand Playbook's Languages setting is a hard rule. "pure_english" is
+        # only this profile's default, and "Use standard English only. No slang or
+        # pidgin." flatly contradicted a brand that chose e.g. English + Pidgin —
+        # confirmed on dev: five captions in a row came back in plain English.
+        instructions.append(f"LANGUAGE STYLE: {language_rule}")
+    else:
+        instructions.append(f"LANGUAGE STYLE: {slang_map.get(slang_level, slang_level)}")
 
     # Nigerian expressions
     if effective_profile.get("nigerian_expressions") and len(effective_profile["nigerian_expressions"]) > 0:
