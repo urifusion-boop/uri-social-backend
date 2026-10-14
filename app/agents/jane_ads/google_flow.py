@@ -125,6 +125,18 @@ def budget_too_low(budget_ngn: float, days: int) -> Optional[str]:
             f"Instagram and Facebook instead.")
 
 
+def budget_too_low_warning(budget_ngn: float, days: int) -> str:
+    """The same point as budget_too_low, for when the owner goes ahead anyway:
+    what to expect, not a refusal."""
+    days = max(int(days or 1), 1)
+    daily = float(budget_ngn or 0) / days
+    clicks = estimate_clicks_per_day(daily, _DEFAULT_ESTIMATED_CPC_NGN)
+    needed = _MIN_USEFUL_CLICKS_PER_DAY * _DEFAULT_ESTIMATED_CPC_NGN * days
+    return (f"About ₦{daily:,.0f} a day — expect only ~{max(clicks, 0):.0f} click{'s' if round(clicks) != 1 else ''} "
+            f"a day, so treat this as a test. For real results on Search, about ₦{needed:,.0f} over "
+            f"{days} day{'s' if days != 1 else ''}.")
+
+
 class GoogleCampaigns:
     """All Google campaigns behind the one-adapter convention the campaign list
     and billing.py's sweep use (fetch_campaign_summary / set_delivery /

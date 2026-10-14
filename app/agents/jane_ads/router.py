@@ -2873,6 +2873,7 @@ async def _build_campaign_plan(
     # when Google was asked for (or is all there is); when it was only Jane's own
     # pick, she quietly uses Instagram/Facebook instead, as she always did.
     wants_google = body.preferred_platform == "google"
+    google_budget_warning = ""
     jane_picked_google = bool(plan.platforms) and all(p.platform == Platform.GOOGLE for p in plan.platforms)
     use_google = False
     if wants_google or google_only or (jane_picked_google and google_ready and body.preferred_platform != "tiktok"):
@@ -2883,10 +2884,15 @@ async def _build_campaign_plan(
         google_plan = apply_platform_override(plan, [Platform.GOOGLE])
         too_low = google_flow.budget_too_low(google_plan.platforms[0].budget_ngn, google_plan.platforms[0].days)
         if too_low and (wants_google or google_only):
-            return {"early_return": {"stage": "google_budget_too_low", "understood": parsed.model_dump(),
-                    "question": too_low if not google_only else too_low.replace(
-                        ", or let me use Instagram and Facebook instead", "")}}
-        use_google = not too_low
+            # Asked for Google by name: their call. A small budget still runs
+            # (a test, a trial) — Jane says what to expect in the plan instead
+            # of refusing and repeating herself.
+            google_budget_warning = google_flow.budget_too_low_warning(
+                google_plan.platforms[0].budget_ngn, google_plan.platforms[0].days)
+            google_plan.trace.append(f"google budget below useful level, kept at owner's request: {too_low}")
+            use_google = True
+        else:
+            use_google = not too_low
 
     if use_google:
         plan = google_plan
@@ -3290,7 +3296,9 @@ async def _build_campaign_plan(
     if creative_platform == Platform.GOOGLE.value:
         # What the keywords are derived from at launch, and where to target.
         plan.google_keyword_context = {"category": category or business_name,
-                                       "description": req.description, "geo": parsed.city or req.geo or ""}
+                                       "description": req.description, "geo": parsed.city or req.geo or "",
+                                       # the owner went ahead with a budget below Search's useful level
+                                       "low_budget_ok": bool(google_budget_warning)}
     plan.whatsapp_number = wa_number
     plan.destination_type = destination_type.value
     plan.destination_link = destination_link
@@ -3395,6 +3403,8 @@ async def _build_campaign_plan(
         summary = build_campaign_summary(plan, req, price_per_result_ngn=price_per_conversation,
                                          delivery_estimate=estimate, audience_text=audience_text)
         summary_dump = summary.model_dump(mode="json")
+        if google_budget_warning:
+            summary_dump["budget_allocation"]["reason"] = google_budget_warning
     except Exception as e:
         print(f"[oneshot] summary skipped: {e}", flush=True)
 
