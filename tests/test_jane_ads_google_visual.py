@@ -126,3 +126,12 @@ def test_youtube_and_discover_sets_its_location_on_the_ad_group():
     kinds = _kinds(_ops("demand_gen"))
     assert "campaignCriterionOperation" not in kinds and "adGroupCriterionOperation" in kinds
     assert "campaignCriterionOperation" in _kinds(_ops("display"))
+
+
+def test_campaigns_get_names_a_person_can_read():
+    from datetime import date
+    from app.agents.jane_ads.adapters.google import campaign_name
+    name = campaign_name("Mama Kitchen", "Search", "leads", date(2026, 10, 14))
+    assert name.startswith("Mama Kitchen · Search · Leads · 14 Oct 2026 · ") and len(name.split(" · ")[-1]) == 4
+    assert campaign_name("Mama Kitchen", "Search", "leads") != campaign_name("Mama Kitchen", "Search", "leads")
+    assert campaign_name("", "Display").startswith("URI campaign · Display")
