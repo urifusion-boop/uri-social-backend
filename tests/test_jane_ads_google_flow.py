@@ -264,3 +264,27 @@ class TestHourlySpendSweep:
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+class TestErrorsAnOwnerCanActOn:
+    @pytest.mark.parametrize("raw, says", [
+        ("campaign create: The customer is not enabled. [CUSTOMER_NOT_ENABLED]", "isn't active"),
+        ("GAQL search: User doesn't have permission [USER_PERMISSION_DENIED]", "Reconnect it"),
+        ("ad create: A policy was violated [POLICY_FINDING]", "Ask Jane to reword"),
+        ("budget create: Too many [RESOURCE_COUNT_LIMIT_EXCEEDED]", "limit on campaigns"),
+    ])
+    def test_googles_codes_become_plain_words(self, raw, says):
+        assert says in gf.friendly_error(gf.GoogleAdsAPIError(raw))
+
+    def test_messages_already_written_for_people_pass_through(self):
+        msg = "This Google Ads account is in EUR. Budgets can only be set on NGN or USD accounts for now."
+        assert gf.friendly_error(gf.GoogleAdsAPIError(msg)) == msg
+
+    def test_anything_else_keeps_googles_reason_and_says_nothing_was_charged(self):
+        out = gf.friendly_error(gf.GoogleAdsAPIError("campaign create: Some new problem [WEIRD]"))
+        assert "Some new problem" in out and "Nothing was charged" in out
+
+    @pytest.mark.parametrize("state", ["none", "needs_account_selection", "manager_link_pending",
+                                       "manager_link_refused", "manager_link_declined"])
+    def test_connection_problems_say_where_to_fix_them(self, state):
+        assert "Connected Accounts → Google Ads" in gf.connection_message(state)

@@ -69,9 +69,63 @@ async def is_ready(db, user_id: Optional[str], brand_id: Optional[str]) -> bool:
     return state == ConnectionState.READY
 
 
+_CONNECT_HERE = "Connected Accounts → Google Ads"
+
+_CONNECTION_MESSAGES = {
+    "none": f"Google Ads isn't connected for this brand yet. Connect it in {_CONNECT_HERE}, then try again.",
+    "needs_account_selection": f"Choose which Google Ads account to use in {_CONNECT_HERE}, then try again.",
+    "manager_link_pending": (f"Your Google Ads account hasn't approved URI yet. {_CONNECT_HERE} shows how "
+                             "to approve it — then try again."),
+    "manager_link_refused": (f"Google won't let URI manage that Google Ads account. Open {_CONNECT_HERE} "
+                             "for why, or choose another account."),
+    "manager_link_declined": ("URI no longer has access to your Google Ads account — the request was declined "
+                              f"or the link was removed in Google Ads. Reconnect it in {_CONNECT_HERE}."),
+    "no_whatsapp": "Add your business WhatsApp number in Settings first, then try again.",
+}
+
+
+def connection_message(state: str) -> str:
+    """Why Google Ads isn't usable right now, and where to fix it."""
+    return _CONNECTION_MESSAGES.get(state, f"Google Ads needs attention in {_CONNECT_HERE}.")
+
+
+# Google's error codes (the [CODE] the adapter appends) → what the owner can do.
+_ERROR_MESSAGES = [
+    (("CUSTOMER_NOT_ENABLED", "CUSTOMER_NOT_ACTIVE"),
+     "Your Google Ads account isn't active — it may be cancelled or suspended. Check it in Google Ads."),
+    (("USER_PERMISSION_DENIED", "CUSTOMER_NOT_FOUND", "NOT_ADS_USER", "ACTION_NOT_PERMITTED"),
+     f"URI can't reach your Google Ads account any more. Reconnect it in {_CONNECT_HERE}."),
+    (("BILLING_SETUP", "NO_BILLING", "PAYMENTS"),
+     "Your Google Ads account has no working payment method. Add one in Google Ads → Billing, then try again."),
+    (("POLICY_FINDING", "POLICY_VIOLATION", "PROHIBITED"),
+     "Google won't accept the ad's wording under its ad policies. Ask Jane to reword it, then try again."),
+    (("RESOURCE_COUNT_LIMIT", "ACCOUNT_LIMIT", "CAMPAIGN_LIMIT"),
+     "Your Google Ads account has reached Google's limit on campaigns. Remove old ones in Google Ads, then try again."),
+    (("RESOURCE_EXHAUSTED", "RATE_EXCEEDED", "QUOTA"),
+     "Google is busy right now. Wait a minute and try again."),
+    (("UNAUTHENTICATED", "OAUTH_TOKEN", "AUTHENTICATION"),
+     "URI's connection to Google needs refreshing. Try again in a minute — if it keeps happening, contact support."),
+]
+
+
+def friendly_error(e: Exception) -> str:
+    """A Google Ads failure in words an owner can act on. Messages the adapter
+    already wrote for people (currency, budget) pass through; Google's own
+    technical text is kept only as a short reference at the end."""
+    text = str(e)
+    upper = text.upper()
+    for codes, message in _ERROR_MESSAGES:
+        if any(code in upper for code in codes):
+            return message
+    if ":" not in text or text.startswith(("This Google Ads account", "That daily budget")):
+        return text
+    detail = text.split(":", 1)[1].strip()
+    return f"Google Ads didn't accept this: {detail[:180]}. Nothing was charged — try again, or contact support."
+
+
 def raise_http(e: Exception) -> None:
     """A Google failure as the HTTP error the campaign flow returns."""
-    raise HTTPException(status_code=502, detail=str(e))
+    raise HTTPException(status_code=502, detail=friendly_error(e))
 
 
 async def adapter_for_launch(db, brand_ctx: dict) -> tuple[GoogleAdsAdapter, dict]:
@@ -81,16 +135,16 @@ async def adapter_for_launch(db, brand_ctx: dict) -> tuple[GoogleAdsAdapter, dic
     try:
         conn = await resolve_customer_id_for_launch(db, brand_ctx.get("user_id"), brand_ctx.get("brand_id"))
     except AdsConnectionRequired as e:
-        raise HTTPException(status_code=409, detail=f"google_ads_connection_{e.state.value}")
+        raise HTTPException(status_code=409, detail=connection_message(e.state.value))
     except GoogleAdsConnectionError as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        raise HTTPException(status_code=502, detail=friendly_error(e))
     try:
         adapter = GoogleAdsAdapter(
             db, customer_id=conn["customer_id"], login_customer_id=conn["login_customer_id"],
             access_token=conn["access_token"], currency_code=conn.get("currency_code", ""),
         )
     except GoogleAdsAPIError as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        raise HTTPException(status_code=502, detail=friendly_error(e))
     return adapter, conn
 
 
