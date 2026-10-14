@@ -52,11 +52,15 @@ class TestBudgetIsEnoughForSearch:
 
     def test_too_little_says_what_would_work(self):
         msg = gf.budget_too_low(7000, 7)                    # ₦1,000 a day ≈ 4 clicks
-        assert "₦1,000 a day" in msg and "₦17,500" in msg and "Instagram and Facebook" in msg
+        from app.agents.jane_ads import constants as C
+        assert f"₦{7000 * C.AD_SPEND_MARKUP:,.0f} over 7 days" in msg                 # the budget they typed
+        assert f"₦{17500 * C.AD_SPEND_MARKUP:,.0f}" in msg and "Instagram and Facebook" in msg
 
     def test_going_ahead_anyway_gets_what_to_expect_not_a_refusal(self):
         msg = gf.budget_too_low_warning(5400, 5)            # ₦1,080 a day ≈ 4 clicks
-        assert "₦1,080 a day" in msg and "~4 clicks" in msg and "test" in msg and "₦12,500" in msg
+        from app.agents.jane_ads import constants as C
+        assert f"₦{1080 * C.AD_SPEND_MARKUP:,.0f} a day" in msg and "~4 clicks" in msg and "test" in msg
+        assert f"₦{12500 * C.AD_SPEND_MARKUP:,.0f}" in msg
 
 
 class TestTargetingThePlansOwnCity:
@@ -270,9 +274,16 @@ class TestErrorsAnOwnerCanActOn:
 
 
 class TestPlacementMinimums:
-    def test_youtube_and_discover_below_googles_floor_says_what_works(self):
-        msg = gf.below_placement_minimum("demand_gen", 35000, 7)       # ₦5,000 a day
-        assert "₦8,000 a day" in msg and "₦56,000" in msg and "4 days" in msg
+    def test_in_the_owners_own_figures_with_a_fix_that_works(self):
+        from app.agents.jane_ads import constants as C
+        msg = gf.below_placement_minimum("demand_gen", 35000, 7)       # ₦5,000 a day of ad spend
+        assert f"₦{8000 * C.AD_SPEND_MARKUP:,.0f} a day" in msg
+        assert f"₦{35000 * C.AD_SPEND_MARKUP:,.0f} over 7 days" in msg
+        assert "run it for 4 days instead" in msg
+
+    def test_too_little_for_even_one_day_says_so(self):
+        msg = gf.below_placement_minimum("demand_gen", 6300, 5)
+        assert "for one day" in msg and "1 days" not in msg and "Display and Search have no minimum" in msg
 
     def test_enough_or_no_floor(self):
         assert gf.below_placement_minimum("demand_gen", 70000, 7) is None
